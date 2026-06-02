@@ -539,11 +539,11 @@ mod tests {
         assert_eq!(v["key"], "t-key");
         assert_eq!(v["hostname"], "test-host");
         ensure!(
-            chrono::DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
+            DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
             "eventTime not RFC 3339"
         );
         ensure!(
-            chrono::DateTime::parse_from_rfc3339(v["scheduledTime"].as_str().unwrap_or("")).is_ok(),
+            DateTime::parse_from_rfc3339(v["scheduledTime"].as_str().unwrap_or("")).is_ok(),
             "scheduledTime not RFC 3339"
         );
         // Optional fields must be absent
@@ -574,7 +574,7 @@ mod tests {
         assert!(v.get("errorCategory").is_none());
         assert!(v.get("exception").is_none());
         ensure!(
-            chrono::DateTime::parse_from_rfc3339(v["scheduledTime"].as_str().unwrap_or("")).is_ok(),
+            DateTime::parse_from_rfc3339(v["scheduledTime"].as_str().unwrap_or("")).is_ok(),
             "scheduledTime not RFC 3339"
         );
         Ok(())
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(v["key"], "m-ok");
         assert_eq!(v["offset"], 10_i32);
         ensure!(
-            chrono::DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
+            DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
             "eventTime not RFC 3339"
         );
         assert!(v.get("errorCategory").is_none());
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(v["source"], "producer-src");
         assert_eq!(v["hostname"], "test-host");
         ensure!(
-            chrono::DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
+            DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
             "eventTime not RFC 3339"
         );
         Ok(())

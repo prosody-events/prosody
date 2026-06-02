@@ -208,9 +208,7 @@ fn transient_errors_always_redeferred_ignoring_decider() {
 
         // Set decider to false - this should NOT affect re-deferral
         harness.decider.set_next(false);
-        harness
-            .inner_handler
-            .set_outcome(super::handler::HandlerOutcome::Transient);
+        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
 
         // Create context and trigger manually
         let trigger_time = harness.capture().get_timer_time(&key)?;

@@ -17,10 +17,13 @@ use crate::state::cassandra::{CassandraValueStore, ValueQueries};
 use crate::state::dirty_value_test_suite::{self, DirtyTrace};
 use crate::state::layered::LayeredValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
+use crate::state::middleware::DurableValueBundle;
 use crate::state::oracle::CommitOracle;
+use crate::state::pending::PendingIndexStore;
+use crate::state::production::ProductionValueDurable;
 use crate::state::recovering::RecoveringValueStore;
 use crate::state::value::{
-    PendingOpSource, StoredPayload, TransactionValueStore, ValueKind, ValueStore,
+    DurableWalStore, PendingOpSource, StoredPayload, TransactionValueStore, ValueKind, ValueStore,
 };
 use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, collection_ref, inline};
 use crate::state::{
@@ -54,15 +57,10 @@ fn make_cache() -> Result<(TempDir, FjallValueStore)> {
 
 fn make_dirty(scope: EventScopeId) -> Result<(TempDir, FjallDirtyValueStore)> {
     let dir = tempfile::tempdir()?;
-    let keyspace = Arc::new(Config::new(dir.path()).open()?);
-    let ops = keyspace.open_partition("value_dirty_ops", PartitionCreateOptions::default())?;
+    let keyspace = Config::new(dir.path()).open()?;
     let overlay =
         keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
-    let meta = keyspace.open_partition("value_dirty_meta", PartitionCreateOptions::default())?;
-    Ok((
-        dir,
-        FjallDirtyValueStore::new(keyspace, ops, overlay, meta, scope),
-    ))
+    Ok((dir, FjallDirtyValueStore::new(overlay, scope)))
 }
 
 fn key(value: &str) -> Key {
@@ -736,20 +734,23 @@ async fn fjall_dirty_untouched_collection_returns_unknown() -> Result<()> {
 }
 
 #[tokio::test]
-async fn fjall_dirty_two_sets_increment_seq() -> Result<()> {
+async fn fjall_dirty_two_sets_compact_to_one_op() -> Result<()> {
     let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("multi")?;
     dirty.set(&id, inline(1)).await?;
     dirty.set(&id, inline(2)).await?;
+    // Last-writer-wins: the second set obviates the first, so the overlay
+    // holds exactly one compacted op and the visible value is the latest.
     let pending = dirty
         .pending_ops(&id)?
         .ok_or_else(|| eyre::eyre!("expected Some(pending)"))?;
-    assert_eq!(pending.count.get(), 2);
+    assert_eq!(pending.count.get(), 1);
+    assert_eq!(dirty.get(&id).await?, Read::Present(inline(2)));
     Ok(())
 }
 
 #[tokio::test]
-async fn fjall_dirty_clear_pending_ops_removes_overlay_meta_and_ops() -> Result<()> {
+async fn fjall_dirty_clear_pending_ops_removes_overlay() -> Result<()> {
     let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("drained")?;
     dirty.set(&id, inline(1)).await?;
@@ -763,22 +764,14 @@ async fn fjall_dirty_clear_pending_ops_removes_overlay_meta_and_ops() -> Result<
 #[tokio::test]
 async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let keyspace = Arc::new(Config::new(dir.path()).open()?);
-    let ops = keyspace.open_partition("value_dirty_ops", PartitionCreateOptions::default())?;
+    let keyspace = Config::new(dir.path()).open()?;
     let overlay =
         keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
-    let meta = keyspace.open_partition("value_dirty_meta", PartitionCreateOptions::default())?;
 
     let scope_a = EventScopeId::fresh();
     let scope_b = EventScopeId::fresh();
-    let dirty_a = FjallDirtyValueStore::new(
-        Arc::clone(&keyspace),
-        ops.clone(),
-        overlay.clone(),
-        meta.clone(),
-        scope_a,
-    );
-    let dirty_b = FjallDirtyValueStore::new(keyspace, ops, overlay, meta, scope_b);
+    let dirty_a = FjallDirtyValueStore::new(overlay.clone(), scope_a);
+    let dirty_b = FjallDirtyValueStore::new(overlay, scope_b);
 
     let id = collection_id("shared")?;
     dirty_a.set(&id, inline(9)).await?;
@@ -852,7 +845,7 @@ fn make_client(dir: &TempDir) -> Result<Arc<FjallClient>> {
 }
 
 #[tokio::test]
-async fn fjall_workspace_drop_deletes_all_four_partitions() -> Result<()> {
+async fn fjall_workspace_drop_deletes_both_partitions() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let client = make_client(&dir)?;
     let topic: Topic = "test-topic".into();
@@ -862,13 +855,13 @@ async fn fjall_workspace_drop_deletes_all_four_partitions() -> Result<()> {
     let before = client.keyspace().partition_count();
     let ws = client.workspace(topic, partition, epoch)?;
     let mid = client.keyspace().partition_count();
-    assert_eq!(mid, before + 4, "workspace should add four partitions");
+    assert_eq!(mid, before + 2, "workspace should add two partitions");
     drop(ws);
     // Drop the workspace; fjall delete_partition is synchronous.
     let after = client.keyspace().partition_count();
     assert_eq!(
         after, before,
-        "workspace Drop should delete all four partitions"
+        "workspace Drop should delete both partitions"
     );
     Ok(())
 }
@@ -928,14 +921,14 @@ async fn fjall_workspace_distinct_epochs_dont_collide() -> Result<()> {
 
     let _ws_a = client.workspace(topic, partition, epoch_a)?;
     let _ws_b = client.workspace(topic, partition, epoch_b)?;
-    // Each workspace minted four distinct partitions: 8 total.
+    // Each workspace minted two distinct partitions: 4 total.
     let value_count = client
         .keyspace()
         .list_partitions()
         .into_iter()
         .filter(|name| name.starts_with("value_"))
         .count();
-    assert_eq!(value_count, 8);
+    assert_eq!(value_count, 4);
     Ok(())
 }
 
@@ -972,4 +965,26 @@ impl ClassifyError for AlwaysCommittedOracleError {
     fn classify_error(&self) -> ErrorCategory {
         match *self {}
     }
+}
+
+// ---- compile-guard: production bundle satisfies the middleware bound
+// ---------
+
+/// Pure type-level assertion that the canonical production durable bundle
+/// `Layered<FjallValueStore, Recovering<CassandraValueStore, O>>` satisfies
+/// the exact bound the keyed-state middleware imposes on its durable `D`
+/// (the `HandlerMiddleware for KeyedStateMiddleware` impl in
+/// `middleware/handler.rs`). This guards the `PendingIndexStore`
+/// pass-throughs on both [`LayeredValueStore`] and [`RecoveringValueStore`]:
+/// without them, `D` fails the bound and this stops compiling. It constructs
+/// no values and needs no live Cassandra, so it runs broker-free.
+fn assert_satisfies_middleware_durable_bound<D>()
+where
+    D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+{
+}
+
+#[test]
+fn production_durable_bundle_satisfies_middleware_bound() {
+    assert_satisfies_middleware_durable_bound::<ProductionValueDurable<AlwaysCommittedOracle>>();
 }

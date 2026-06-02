@@ -37,8 +37,10 @@ use super::value::{
     DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
 };
 use super::{
-    CollectionId, CollectionRef, DurableState, EventRef, Read, SealedCollection, StoreOutcome,
+    CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
+    StoreOutcome,
 };
+use crate::state::pending::PendingIndexStore;
 use tracing::warn;
 
 /// A two-layer Value store: cache + backing.
@@ -261,5 +263,36 @@ where
                 .await;
         }
         Ok(outcome)
+    }
+}
+
+/// Pending-index pass-through.
+///
+/// The cache holds no pending index — pending rows are authoritative state
+/// owned by the backing store — so both methods delegate straight to
+/// `backing`. `Error` is spelled as the backing's [`DurableWalStore`] error
+/// (aligned with the [`DurableWalStore`] impl above) so
+/// `Layered<Cache, Recovering<Backing>>` satisfies the middleware's
+/// `PendingIndexStore<Error = DurableWalStore::Error>` bound.
+impl<Cache, Backing> PendingIndexStore for LayeredValueStore<Cache, Backing>
+where
+    Cache: ValueStore + Clone,
+    Backing: DurableWalStore<ValueKind>
+        + PendingIndexStore<Error = <Backing as DurableWalStore<ValueKind>>::Error>,
+{
+    type Error = <Backing as DurableWalStore<ValueKind>>::Error;
+
+    async fn insert_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        self.backing.insert_pending(id).await
+    }
+
+    async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        self.backing.delete_pending(id).await
     }
 }

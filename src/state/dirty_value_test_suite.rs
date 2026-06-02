@@ -101,6 +101,14 @@ where
     }
 
     if let Some(p) = pending {
+        // Bloat guard: a Value dirty store must compact to exactly one op per
+        // collection (last-writer-wins), never accumulate obviated ops. This
+        // is the invariant that catches an append-only backend; it lives here
+        // (run against every backend via `run_dirty_trace`) rather than in
+        // `run_dirty_parity`, whose fold-to-last masks the count.
+        if p.count.get() != 1 {
+            return Ok(false);
+        }
         let folded = fold_value_ops(None, p.ops.collect::<Vec<_>>().iter());
         let folded_read: Read<StoredPayload> = folded.map_or(Read::Absent, Read::Present);
         if folded_read != read {

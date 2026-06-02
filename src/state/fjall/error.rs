@@ -1,4 +1,4 @@
-//! Errors for the fjall-backed Value cache.
+//! Errors for the fjall-backed Value cache and dirty store.
 
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::encoding::EncodingError;
@@ -33,11 +33,6 @@ pub enum FjallValueStoreError {
     /// The blocking task that ran a fjall call failed (panic or cancel).
     #[error("fjall blocking task failed: {0}")]
     BlockingTaskJoin(#[from] JoinError),
-
-    /// A dirty-meta row carried bytes that did not match the
-    /// `[next_seq u64 LE]` layout.
-    #[error("corrupt dirty meta row: expected 8 bytes, got {0}")]
-    CorruptDirtyMeta(usize),
 }
 
 impl ClassifyError for FjallValueStoreError {
@@ -51,8 +46,7 @@ impl ClassifyError for FjallValueStoreError {
             Self::Encoding(_)
             | Self::UnknownCacheTag(_)
             | Self::EmptyCacheCell
-            | Self::EmptyPresentPayload
-            | Self::CorruptDirtyMeta(_) => ErrorCategory::Permanent,
+            | Self::EmptyPresentPayload => ErrorCategory::Permanent,
         }
     }
 }

@@ -75,4 +75,7 @@ pub use handler::{
     KeyedStateHandler, KeyedStateMiddleware, KeyedStateMiddlewareBuildError,
     KeyedStateMiddlewareBuilder, KeyedStateOutput, KeyedStateProvider,
 };
+// Production code (`RecoveringValueStore::{get, seal}`) calls `resolve_sealed`,
+// so this re-export must not be `#[cfg(test)]`-gated.
+pub(crate) use handler::{ResolveSealedError, resolve_sealed};
 pub use registry::{CollectionDef, CollectionDefRegistry};

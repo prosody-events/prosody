@@ -104,7 +104,7 @@ impl Telemetry {
     /// This method is intended for testing and allows full control
     /// over event timing for testing purposes.
     #[doc(hidden)]
-    pub fn test_emit(&self, event: event::TelemetryEvent) {
+    pub fn test_emit(&self, event: TelemetryEvent) {
         let _ = self.tx.send(event);
     }
 }

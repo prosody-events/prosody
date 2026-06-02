@@ -128,6 +128,7 @@ uuid = { version = "1.16", features = ["v4"] }
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
+unused_qualifications = "warn"
 
 [lints.clippy]
 absolute_paths = "warn"

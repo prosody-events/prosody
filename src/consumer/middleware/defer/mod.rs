@@ -61,7 +61,7 @@ pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
 ///
 /// Full jitter prevents thundering herd when many keys retry simultaneously.
 #[must_use]
-pub fn calculate_backoff(config: &config::DeferConfiguration, retry_count: u32) -> CompactDuration {
+pub fn calculate_backoff(config: &DeferConfiguration, retry_count: u32) -> CompactDuration {
     // No delay for the initial attempt
     if retry_count == 0 {
         return CompactDuration::MIN;

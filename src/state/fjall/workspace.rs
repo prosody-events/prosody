@@ -4,9 +4,10 @@
 //! `docs/keyed-state/design-summary.md`. One
 //! `FjallClient` owns a shared `fjall::Keyspace` rooted at the configured
 //! `cache_dir`; per Kafka partition assignment the client mints a
-//! `FjallWorkspace` carrying four named Fjall partitions tagged with an
-//! `AssignmentEpoch` so a fast assign→revoke→assign cycle cannot collide
-//! even if `delete_partition` is delayed.
+//! `FjallWorkspace` carrying two named Fjall partitions (`cache`,
+//! `dirty_overlay`) tagged with an `AssignmentEpoch` so a fast
+//! assign→revoke→assign cycle cannot collide even if `delete_partition` is
+//! delayed.
 //!
 //! # Partition naming
 //!
@@ -19,7 +20,7 @@
 //!
 //! # Lifecycle
 //!
-//! On revocation, the workspace's `Drop` impl deletes its four named
+//! On revocation, the workspace's `Drop` impl deletes its two named
 //! partitions. The keyspace stays open for other Kafka partitions still
 //! owned by the process. `PartitionHandle` is internally an `Arc`, so
 //! cloning a handle into `delete_partition` is cheap and lets the Drop
@@ -44,9 +45,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 const PARTITION_NAME_PREFIX: &str = "value_";
 const CACHE_ROLE: &str = "cache";
-const DIRTY_OPS_ROLE: &str = "dirty_ops";
 const DIRTY_OVERLAY_ROLE: &str = "dirty_overlay";
-const DIRTY_META_ROLE: &str = "dirty_meta";
 
 /// Per-Kafka-partition workspace creation epoch.
 ///
@@ -134,16 +133,15 @@ impl FjallClient {
 
     /// Mints a fresh per-Kafka-partition workspace tagged with `epoch`.
     ///
-    /// Opens four named Fjall partitions (`cache`, `dirty_ops`,
-    /// `dirty_overlay`, `dirty_meta`) named via `xxh3_128(role, topic,
-    /// partition, epoch)` so concurrent assign/revoke cycles cannot
-    /// collide and arbitrary topic names cannot violate fjall's
-    /// partition-name charset.
+    /// Opens two named Fjall partitions (`cache`, `dirty_overlay`) named via
+    /// `xxh3_128(role, topic, partition, epoch)` so concurrent assign/revoke
+    /// cycles cannot collide and arbitrary topic names cannot violate
+    /// fjall's partition-name charset.
     ///
     /// # Errors
     ///
-    /// Returns [`FjallValueStoreError::Engine`] when any of the four
-    /// partitions cannot be opened.
+    /// Returns [`FjallValueStoreError::Engine`] when either partition cannot
+    /// be opened.
     pub fn workspace(
         self: &Arc<Self>,
         topic: Topic,
@@ -151,15 +149,14 @@ impl FjallClient {
         epoch: AssignmentEpoch,
     ) -> Result<FjallWorkspace, FjallValueStoreError> {
         let cache_name = partition_name(CACHE_ROLE, topic, partition, epoch);
-        let ops_name = partition_name(DIRTY_OPS_ROLE, topic, partition, epoch);
         let overlay_name = partition_name(DIRTY_OVERLAY_ROLE, topic, partition, epoch);
-        let meta_name = partition_name(DIRTY_META_ROLE, topic, partition, epoch);
 
-        let new_opts = PartitionCreateOptions::default;
-        let cache = self.keyspace.open_partition(&cache_name, new_opts())?;
-        let dirty_ops = self.keyspace.open_partition(&ops_name, new_opts())?;
-        let overlay = self.keyspace.open_partition(&overlay_name, new_opts())?;
-        let meta = self.keyspace.open_partition(&meta_name, new_opts())?;
+        let cache = self
+            .keyspace
+            .open_partition(&cache_name, PartitionCreateOptions::default())?;
+        let overlay = self
+            .keyspace
+            .open_partition(&overlay_name, PartitionCreateOptions::default())?;
 
         Ok(FjallWorkspace {
             client: Arc::clone(self),
@@ -167,17 +164,15 @@ impl FjallClient {
             topic,
             partition,
             cache,
-            ops: dirty_ops,
             overlay,
-            meta,
         })
     }
 }
 
 /// Per-Kafka-partition workspace.
 ///
-/// Owns the four named Fjall partitions for one `(topic, partition,
-/// epoch)`. Drop deletes all four; if delete fails it logs and continues
+/// Owns the two named Fjall partitions for one `(topic, partition,
+/// epoch)`. Drop deletes both; if delete fails it logs and continues
 /// — the next process startup will reap the leftovers via
 /// [`FjallClient::open`].
 #[derive(Educe)]
@@ -191,11 +186,7 @@ pub struct FjallWorkspace {
     #[educe(Debug(ignore))]
     cache: PartitionHandle,
     #[educe(Debug(ignore))]
-    ops: PartitionHandle,
-    #[educe(Debug(ignore))]
     overlay: PartitionHandle,
-    #[educe(Debug(ignore))]
-    meta: PartitionHandle,
 }
 
 impl FjallWorkspace {
@@ -229,22 +220,10 @@ impl FjallWorkspace {
         &self.cache
     }
 
-    /// Returns the dirty-ops partition handle.
-    #[must_use]
-    pub fn dirty_ops_handle(&self) -> &PartitionHandle {
-        &self.ops
-    }
-
     /// Returns the dirty-overlay partition handle.
     #[must_use]
     pub fn dirty_overlay_handle(&self) -> &PartitionHandle {
         &self.overlay
-    }
-
-    /// Returns the dirty-meta partition handle.
-    #[must_use]
-    pub fn dirty_meta_handle(&self) -> &PartitionHandle {
-        &self.meta
     }
 }
 
@@ -254,9 +233,7 @@ impl Drop for FjallWorkspace {
         // matches fjall's expected ownership for `delete_partition`.
         for (role, handle) in [
             (CACHE_ROLE, &self.cache),
-            (DIRTY_OPS_ROLE, &self.ops),
             (DIRTY_OVERLAY_ROLE, &self.overlay),
-            (DIRTY_META_ROLE, &self.meta),
         ] {
             if let Err(err) = self.client.keyspace.delete_partition(handle.clone()) {
                 warn!(

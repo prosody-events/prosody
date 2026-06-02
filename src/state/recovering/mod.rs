@@ -2,20 +2,30 @@
 //!
 //! `RecoveringValueStore<Inner, Oracle>` wraps any durable Value store that
 //! implements [`ValueStore`] + [`DurableWalStore<ValueKind>`] +
-//! [`DirectApplyStore<ValueKind>`] together with a [`CommitOracle`]. The
-//! only recovery-triggering method is [`ValueStore::get`]; every other
-//! method passes through unchanged.
+//! [`DirectApplyStore<ValueKind>`] together with a [`CommitOracle`]. Two
+//! methods recover a crashed-but-sealed WAL before proceeding —
+//! [`ValueStore::get`] (read-before-use) and [`DurableWalStore::seal`]
+//! (recover-before-overwrite); every other method passes through unchanged.
+//! Together they cover every durable-touching path: `get` is the only read
+//! that reaches durable, and `seal` is the only write that overwrites the
+//! WAL columns.
 //!
 //! # Recovery flow ([`ValueStore::get`])
 //!
 //! 1. `inner.read_partition(id)`.
-//! 2. [`DurableState::Idle { applied }`] → return `applied` as
+//! 2. `DurableState::Idle` → return `applied` as
 //!    [`Read::Present`]/[`Read::Absent`].
-//! 3. [`DurableState::Sealed { wal, .. }`] → consult the oracle:
-//!    - [`CommitDecision::Committed`] → `inner.apply_sealed(..)` and return
-//!      `inner.get(..)`.
-//!    - [`CommitDecision::NotCommitted`] → `inner.rollback_sealed(..)` and
-//!      return `inner.get(..)`.
+//! 3. `DurableState::Sealed` → resolve the sealed WAL through the shared
+//!    `resolve_sealed` helper (oracle → apply / rollback), then return
+//!    `inner.get(..)`.
+//!
+//! # Recovery flow ([`DurableWalStore::seal`])
+//!
+//! Before overwriting the WAL columns, `seal` reads the partition. A
+//! `Sealed` state owning a **different** event is resolved through
+//! `resolve_sealed` first; a `Sealed` state for the seal's own event is a
+//! redelivery, so recovery is skipped and the idempotent reseal proceeds
+//! (the same-event guard — the oracle is not consulted).
 //!
 //! Recovery writes bind their TTL through a [`CollectionTtl`] resolver `R`,
 //! so first-touch recovery binds the **same per-collection TTL** the
@@ -41,25 +51,28 @@
 //!
 //! | Method                       | Recovers? |
 //! |------------------------------|-----------|
-//! | [`ValueStore::get`]          | **Yes**   |
-//! | [`ValueStore::set`]          | No (pass) |
-//! | [`ValueStore::clear`]        | No (pass) |
-//! | `DurableWalStore::read_partition` | No (pass) — raw visibility for the future recovery scanner |
-//! | `DurableWalStore::seal`            | No (pass) — recovery itself runs through this method |
-//! | `DurableWalStore::apply_sealed`    | No (pass) |
-//! | `DurableWalStore::rollback_sealed` | No (pass) |
+//! | [`ValueStore::get`]          | **Yes** — read-before-use |
+//! | [`ValueStore::set`]          | No (pass) — never touches durable |
+//! | [`ValueStore::clear`]        | No (pass) — never touches durable |
+//! | `DurableWalStore::read_partition` | No (pass) — raw visibility for the recovery scanner |
+//! | `DurableWalStore::seal`            | **Yes** — recover-before-overwrite |
+//! | `DurableWalStore::apply_sealed`    | No (pass) — the resolution itself |
+//! | `DurableWalStore::rollback_sealed` | No (pass) — the resolution itself |
 //! | `DirectApplyStore::direct_apply`   | No (pass) — direct mode never produces a sealed state |
+//! | `PendingIndexStore::insert_pending` | No (pass) — the index rows live in `inner` |
+//! | `PendingIndexStore::delete_pending` | No (pass) — the index rows live in `inner` |
 
 use super::oracle::CommitOracle;
 use super::value::{
     DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
 };
 use super::{
-    CollectionId, CollectionRef, CommitDecision, DurableState, EventRef, Read, SealedCollection,
+    CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
     StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::middleware::CollectionDefRegistry;
+use crate::state::middleware::{CollectionDefRegistry, ResolveSealedError, resolve_sealed};
+use crate::state::pending::PendingIndexStore;
 use crate::timers::duration::CompactDuration;
 use std::error::Error;
 use std::sync::Arc;
@@ -204,22 +217,11 @@ where
         {
             DurableState::Idle { applied } => Ok(applied.map_or(Read::Absent, Read::Present)),
             DurableState::Sealed { wal, .. } => {
-                let decision = self
-                    .oracle
-                    .resolve(collection, wal.event())
-                    .await
-                    .map_err(RecoveringValueStoreError::Oracle)?;
                 let recovery_ref =
                     CollectionRef::new(collection.clone(), self.ttl.ttl_for(collection));
-                match decision {
-                    CommitDecision::Committed => {
-                        self.inner.apply_sealed(&recovery_ref, wal.event()).await
-                    }
-                    CommitDecision::NotCommitted => {
-                        self.inner.rollback_sealed(&recovery_ref, wal.event()).await
-                    }
-                }
-                .map_err(RecoveringValueStoreError::Inner)?;
+                resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event())
+                    .await
+                    .map_err(resolve_into_recovering)?;
                 ValueStore::get(&self.inner, collection)
                     .await
                     .map_err(RecoveringValueStoreError::Inner)
@@ -267,6 +269,22 @@ where
             .map_err(RecoveringValueStoreError::Inner)
     }
 
+    /// Recover-before-seal: resolve any prior crashed-but-sealed WAL on this
+    /// partition before overwriting it.
+    ///
+    /// A WAL-mode seal overwrites the per-collection WAL columns. If a prior
+    /// event sealed and crashed before its commit decision was resolved, that
+    /// decision is recoverable only from the durable `Sealed` state — sealing
+    /// over it loses the decision permanently. So before sealing we read the
+    /// partition; on a `Sealed` state owning a **different** event we resolve
+    /// it through the oracle (apply or rollback) first. A `Sealed` state for
+    /// *our own* `event` is a redelivery: resealing it is idempotent and the
+    /// oracle is not consulted (the same-event guard).
+    ///
+    /// Ordering is load-bearing and free from the sequential `await` plus
+    /// single-writer-per-key (CLAUDE.md): recovery's `delete_pending`
+    /// completes before the new seal's `insert_pending`, both keyed on the
+    /// same per-collection pending row.
     async fn seal<'a, I>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
@@ -276,6 +294,18 @@ where
     where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
+        if let DurableState::Sealed { wal, .. } =
+            DurableWalStore::read_partition(&self.inner, collection.id())
+                .await
+                .map_err(RecoveringValueStoreError::Inner)?
+            && wal.event() != event
+        {
+            let recovery_ref =
+                CollectionRef::new(collection.id().clone(), self.ttl.ttl_for(collection.id()));
+            resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event())
+                .await
+                .map_err(resolve_into_recovering)?;
+        }
         self.inner
             .seal(collection, event, ops)
             .await
@@ -327,6 +357,62 @@ where
             .direct_apply(collection, ops)
             .await
             .map_err(RecoveringValueStoreError::Inner)
+    }
+}
+
+/// Pending-index pass-through.
+///
+/// The wrapper owns no pending index of its own; recovery resolves the
+/// inner store's sealed WALs, and the pending rows that index them live in
+/// `inner`. Delegating keeps `Self::Error` equal to the wrapper's
+/// [`DurableWalStore`] error so `Layered<Cache, Recovering<Backing>>`
+/// satisfies the middleware's
+/// `PendingIndexStore<Error = DurableWalStore::Error>` bound.
+impl<Inner, Oracle, R> PendingIndexStore for RecoveringValueStore<Inner, Oracle, R>
+where
+    Inner: RecoverableValueStore
+        + PendingIndexStore<Error = <Inner as DurableWalStore<ValueKind>>::Error>,
+    Oracle: CommitOracle,
+    R: CollectionTtl,
+{
+    type Error =
+        RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;
+
+    async fn insert_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        self.inner
+            .insert_pending(id)
+            .await
+            .map_err(RecoveringValueStoreError::Inner)
+    }
+
+    async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        self.inner
+            .delete_pending(id)
+            .await
+            .map_err(RecoveringValueStoreError::Inner)
+    }
+}
+
+/// Maps a [`resolve_sealed`] error into the wrapper's error type: a durable
+/// failure becomes [`RecoveringValueStoreError::Inner`], an oracle failure
+/// [`RecoveringValueStoreError::Oracle`]. Shared by the get-side and
+/// seal-side recovery callsites.
+fn resolve_into_recovering<InnerError, OracleError>(
+    error: ResolveSealedError<InnerError, OracleError>,
+) -> RecoveringValueStoreError<InnerError, OracleError>
+where
+    InnerError: ClassifyError + Error + Send + Sync + 'static,
+    OracleError: ClassifyError + Error + Send + Sync + 'static,
+{
+    match error {
+        ResolveSealedError::Durable(e) => RecoveringValueStoreError::Inner(e),
+        ResolveSealedError::Oracle(e) => RecoveringValueStoreError::Oracle(e),
     }
 }
 

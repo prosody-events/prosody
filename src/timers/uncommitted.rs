@@ -602,7 +602,7 @@ mod tests {
             Key::from(key),
             time,
             timer_type,
-            tracing::Span::current(),
+            Span::current(),
         ))
     }
 

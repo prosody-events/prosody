@@ -1,20 +1,21 @@
 //! Fjall-backed dirty Value workspace.
 //!
 //! `FjallDirtyValueStore` implements [`ValueStore`] +
-//! [`PendingOpSource<ValueKind>`] over three named fjall partitions:
+//! [`PendingOpSource<ValueKind>`] over a single named fjall partition:
 //!
-//! * `dirty_ops`     — one row per buffered op, keyed by `[scope][seq]`.
-//! * `dirty_overlay` — one row per collection, encodes the "next read"
-//!   visibility using the cache codec's tagged-cell format.
-//! * `dirty_meta`    — one row per collection, value is `[next_seq u64 LE]`.
+//! * `dirty_overlay` — one row per collection, holding the compacted final
+//!   buffered op as the cache codec's tagged-cell (`0x01` = pending Set with
+//!   payload, `0x00` = pending Clear, key-absent = no pending op).
 //!
-//! All three partitions share the same `[16-byte scope-collection prefix]`
-//! key shape so prefix-scans, prefix-deletes, and overlay/meta point reads
-//! are uniform.
-//!
-//! Every write batches the three partition updates inside a single
-//! [`fjall::Batch`] so a crash mid-write cannot desync ops vs. overlay vs.
-//! meta. Ops are MsgPack-encoded (see [`super::codec::DIRTY_OP_ENCODING`]).
+//! This mirrors
+//! [`MemoryDirtyValueStore`](crate::state::memory::MemoryDirtyValueStore)
+//! exactly: Value's last-writer-wins fold means only the final op matters, so
+//! the store never keeps an op obviated by a later one. Each mutation is a
+//! single atomic overlay insert (or, for
+//! [`PendingOpSource::clear_pending_ops`], a single remove), making the
+//! multi-partition desync class structurally impossible. The single overlay is
+//! the K=Value specialization of the per-element keyed overlay that Map and
+//! Deque-as-indexed-map will use at finer granularity.
 //!
 //! # Concurrency
 //!
@@ -23,16 +24,12 @@
 //! guarantees that at most one event handler is running for a given key
 //! system-wide; concurrent events on different keys share the same Kafka
 //! partition's workspace but cannot collide because the per-event
-//! [`EventScopeId`] is baked into the prefix.
+//! [`EventScopeId`] is baked into the overlay key.
 
-use super::codec::{
-    DIRTY_OP_ENCODING, decode_cell, decode_dirty_meta, dirty_collection_key, dirty_ops_key,
-    encode_absent_cell, encode_dirty_meta, encode_present_cell, scope_collection_prefix,
-};
+use super::codec::{decode_cell, dirty_collection_key, encode_absent_cell, encode_present_cell};
 use super::error::FjallValueStoreError;
 use super::workspace::{AssignmentEpoch, FjallClient, FjallWorkspace};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::encoding::{decode_payload, encode_payload};
 use crate::state::value::{PendingOpSource, StoredPayload, ValueKind, ValueOp, ValueStore};
 use crate::state::{
     CollectionId, DirtyStoreFactory, DirtyStoreProvider, EventScopeId, PendingOps, Read,
@@ -40,10 +37,10 @@ use crate::state::{
 use crate::timers::datetime::CompactDateTimeError;
 use crate::{Partition, Topic};
 use educe::Educe;
-use fjall::{Keyspace, PartitionHandle};
+use fjall::PartitionHandle;
 use std::num::NonZeroU64;
+use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
-use std::vec::IntoIter;
 use thiserror::Error;
 use tokio::task::spawn_blocking;
 
@@ -52,75 +49,21 @@ use tokio::task::spawn_blocking;
 #[educe(Debug)]
 pub struct FjallDirtyValueStore {
     #[educe(Debug(ignore))]
-    keyspace: Arc<Keyspace>,
-    #[educe(Debug(ignore))]
-    ops: PartitionHandle,
-    #[educe(Debug(ignore))]
     overlay: PartitionHandle,
-    #[educe(Debug(ignore))]
-    meta: PartitionHandle,
     scope: EventScopeId,
 }
 
 impl FjallDirtyValueStore {
     /// Creates a Fjall-backed dirty workspace bound to `scope`.
-    ///
-    /// The three partition handles must all sit in the same `keyspace` so
-    /// the batched three-partition write commits atomically.
     #[must_use]
-    pub fn new(
-        keyspace: Arc<Keyspace>,
-        ops: PartitionHandle,
-        overlay: PartitionHandle,
-        meta: PartitionHandle,
-        scope: EventScopeId,
-    ) -> Self {
-        Self {
-            keyspace,
-            ops,
-            overlay,
-            meta,
-            scope,
-        }
+    pub fn new(overlay: PartitionHandle, scope: EventScopeId) -> Self {
+        Self { overlay, scope }
     }
 
     /// Returns the event scope this store is bound to.
     #[must_use]
     pub fn scope(&self) -> EventScopeId {
         self.scope
-    }
-
-    /// Reads the collection's `next_seq` sequence counter, defaulting to 0
-    /// for an absent meta row.
-    fn read_meta(meta: &PartitionHandle, key: &[u8; 16]) -> Result<u64, FjallValueStoreError> {
-        match meta.get(key)? {
-            None => Ok(0),
-            Some(bytes) => decode_dirty_meta(bytes.as_ref()),
-        }
-    }
-
-    fn append_op_sync(
-        &self,
-        collection: &CollectionId<ValueKind>,
-        op: &ValueOp,
-        overlay_cell: &bytes::Bytes,
-    ) -> Result<(), FjallValueStoreError> {
-        let collection_key = dirty_collection_key(self.scope, collection);
-        let next_seq = Self::read_meta(&self.meta, &collection_key)?;
-        let ops_key = dirty_ops_key(self.scope, collection, next_seq);
-        let op_bytes = encode_payload(op, DIRTY_OP_ENCODING)?;
-
-        let mut batch = self.keyspace.batch();
-        batch.insert(&self.ops, ops_key.as_ref(), op_bytes.as_ref());
-        batch.insert(
-            &self.overlay,
-            collection_key.as_ref(),
-            overlay_cell.as_ref(),
-        );
-        let new_meta = encode_dirty_meta(next_seq.wrapping_add(1));
-        batch.insert(&self.meta, collection_key.as_ref(), new_meta.as_ref());
-        batch.commit()?;
-        Ok(())
     }
 }
 
@@ -142,60 +85,48 @@ impl ValueStore for FjallDirtyValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        let overlay_cell = encode_present_cell(&payload)?;
-        let op = ValueOp::Set { payload };
-        let store = self.clone();
-        let collection = collection.clone();
-        spawn_blocking(move || store.append_op_sync(&collection, &op, &overlay_cell)).await?
+        let key = dirty_collection_key(self.scope, collection);
+        let cell = encode_present_cell(&payload)?;
+        let overlay = self.overlay.clone();
+        spawn_blocking(move || overlay.insert(key, cell.as_ref())).await??;
+        Ok(())
     }
 
     async fn clear<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let overlay_cell = encode_absent_cell();
-        let store = self.clone();
-        let collection = collection.clone();
-        spawn_blocking(move || store.append_op_sync(&collection, &ValueOp::Clear, &overlay_cell))
-            .await?
+        let key = dirty_collection_key(self.scope, collection);
+        let cell = encode_absent_cell();
+        let overlay = self.overlay.clone();
+        spawn_blocking(move || overlay.insert(key, cell.as_ref())).await??;
+        Ok(())
     }
 }
 
 impl PendingOpSource<ValueKind> for FjallDirtyValueStore {
     type Error = FjallValueStoreError;
-    type Ops<'a> = IntoIter<ValueOp>;
+    type Ops<'a> = OptionIntoIter<ValueOp>;
 
     fn pending_ops<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error> {
-        let prefix = scope_collection_prefix(self.scope, collection);
-        let mut ops: Vec<ValueOp> = Vec::new();
-        for entry in self.ops.prefix(prefix) {
-            let (_key, value) = entry?;
-            let op: ValueOp = decode_payload(value.as_ref(), DIRTY_OP_ENCODING)?;
-            ops.push(op);
-        }
-        let Some(count) = NonZeroU64::new(ops.len() as u64) else {
-            return Ok(None);
+        let key = dirty_collection_key(self.scope, collection);
+        let op = match decode_cell(self.overlay.get(key)?.as_deref())? {
+            Read::Present(payload) => Some(ValueOp::Set { payload }),
+            Read::Absent => Some(ValueOp::Clear),
+            Read::Unknown => None,
         };
-        Ok(Some(PendingOps {
-            count,
-            ops: ops.into_iter(),
+        Ok(op.map(|op| PendingOps {
+            count: NonZeroU64::MIN,
+            ops: Some(op).into_iter(),
         }))
     }
 
     fn clear_pending_ops(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {
-        let prefix = scope_collection_prefix(self.scope, collection);
-        let collection_key = dirty_collection_key(self.scope, collection);
-        let mut batch = self.keyspace.batch();
-        for entry in self.ops.prefix(prefix) {
-            let (key, _value) = entry?;
-            batch.remove(&self.ops, key.as_ref());
-        }
-        batch.remove(&self.overlay, collection_key.as_ref());
-        batch.remove(&self.meta, collection_key.as_ref());
-        batch.commit()?;
+        let key = dirty_collection_key(self.scope, collection);
+        self.overlay.remove(key)?;
         Ok(())
     }
 }
@@ -224,13 +155,7 @@ impl DirtyStoreProvider<ValueKind> for FjallDirtyValueStoreProvider {
     type Store = FjallDirtyValueStore;
 
     fn for_scope(&self, scope: EventScopeId) -> FjallDirtyValueStore {
-        FjallDirtyValueStore::new(
-            Arc::clone(self.workspace.keyspace()),
-            self.workspace.dirty_ops_handle().clone(),
-            self.workspace.dirty_overlay_handle().clone(),
-            self.workspace.dirty_meta_handle().clone(),
-            scope,
-        )
+        FjallDirtyValueStore::new(self.workspace.dirty_overlay_handle().clone(), scope)
     }
 }
 
@@ -279,7 +204,7 @@ pub enum FjallFactoryError {
 
     /// Opening the workspace partitions failed.
     #[error("fjall workspace open failed")]
-    Workspace(#[source] super::error::FjallValueStoreError),
+    Workspace(#[source] FjallValueStoreError),
 }
 
 impl ClassifyError for FjallFactoryError {

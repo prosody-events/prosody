@@ -276,7 +276,7 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             partition: 0,
             offset: 0,
             key: "test-key".into(),
-            timestamp: chrono::Utc::now(),
+            timestamp: Utc::now(),
             payload: serde_json::json!({}),
         }
     }
@@ -428,10 +428,10 @@ impl<P> ConsumerMessage<P> {
                 partition,
                 offset,
                 key,
-                timestamp: chrono::Utc::now(),
+                timestamp: Utc::now(),
                 payload,
             },
-            tracing::Span::current(),
+            Span::current(),
             permit,
         ))
     }

@@ -55,7 +55,7 @@ impl EventHandler for SlowTimerHandler {
         // Schedule a timer based on the message
         if let Some(delay_ms) = payload
             .get("schedule_timer_delay_ms")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(Value::as_u64)
         {
             let delay_secs = (delay_ms / 1000).max(1) as u32; // Convert to seconds, minimum 1
             let delay = CompactDuration::new(delay_secs);

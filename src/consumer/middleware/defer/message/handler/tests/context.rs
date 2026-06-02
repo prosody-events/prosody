@@ -223,7 +223,7 @@ impl EventContext for KeyedCapturingContext {
         if timer_type == TimerType::DeferredMessage {
             self.capture.record_schedule(self.key.clone(), time);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn clear_and_schedule(
@@ -236,7 +236,7 @@ impl EventContext for KeyedCapturingContext {
             self.capture.record_clear_all(&self.key);
             self.capture.record_schedule(self.key.clone(), time);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn unschedule(
@@ -248,7 +248,7 @@ impl EventContext for KeyedCapturingContext {
             // Remove specific timer by (key, time)
             self.capture.record_clear(&self.key, time);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn clear_scheduled(
@@ -259,7 +259,7 @@ impl EventContext for KeyedCapturingContext {
             // Remove all timers for this key
             self.capture.record_clear_all(&self.key);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn cancel(&self) {

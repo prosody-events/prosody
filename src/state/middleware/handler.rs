@@ -20,7 +20,8 @@ use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::value::{DurableWalStore, ValueKind};
 use crate::state::{
     CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyStoreFactory,
-    DirtyStoreProvider, DurableState, EventRef, EventScopeId, StateKey, StateName, TimerEventRef,
+    DirtyStoreProvider, DurableState, EventRef, EventScopeId, StateKey, StateName, StoreOutcome,
+    TimerEventRef,
 };
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -30,6 +31,7 @@ use crate::timers::store::SegmentId;
 use crate::{EventIdentity, Partition, Topic};
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -56,6 +58,7 @@ pub struct KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     default_commit_mode: CommitMode,
     recovery_delay: CompactDuration,
     defs: HashMap<StateName, CollectionDef>,
+    registry: Option<Arc<CollectionDefRegistry>>,
     _payload: PhantomData<fn() -> P>,
 }
 
@@ -72,6 +75,7 @@ impl<D, Sc, O, F, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
             default_commit_mode: CommitMode::Wal,
             recovery_delay: CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS),
             defs: HashMap::new(),
+            registry: None,
             _payload: PhantomData,
         }
     }
@@ -170,6 +174,25 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
         self
     }
 
+    /// Supplies an explicit, pre-built registry shared with the durable
+    /// bundle's recovery wrapper.
+    ///
+    /// Production wiring builds **one** [`Arc<CollectionDefRegistry>`] and
+    /// passes it both here and to
+    /// [`RecoveringValueStore`](crate::state::recovering::RecoveringValueStore)
+    /// as the [`CollectionTtl`](crate::state::recovering::CollectionTtl)
+    /// resolver, so the get-side (first-touch) and sweep-side recovery paths
+    /// bind the **same** per-collection TTL. When set, [`Self::build`] uses
+    /// this registry verbatim and ignores the per-builder
+    /// [`Self::collection_def`] / [`Self::default_ttl`] /
+    /// [`Self::default_commit_mode`] inputs; when unset, `build` derives a
+    /// fresh registry from those inputs.
+    #[must_use]
+    pub fn registry(mut self, registry: Arc<CollectionDefRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
     /// Builds the middleware.
     ///
     /// # Errors
@@ -197,11 +220,14 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
         let version = self
             .version
             .ok_or(KeyedStateMiddlewareBuildError::Missing("version"))?;
-        let registry = Arc::new(CollectionDefRegistry {
-            defs: self.defs,
-            default_ttl: self.default_ttl,
-            default_commit_mode: self.default_commit_mode,
-        });
+        let registry = match self.registry {
+            Some(registry) => registry,
+            None => Arc::new(CollectionDefRegistry {
+                defs: self.defs,
+                default_ttl: self.default_ttl,
+                default_commit_mode: self.default_commit_mode,
+            }),
+        };
         Ok(KeyedStateMiddleware {
             durable,
             scanner,
@@ -781,24 +807,12 @@ where
                     .map_err(RecoveryError::Durable)?;
             }
             DurableState::Sealed { wal, .. } => {
-                let decision = oracle
-                    .resolve(&id, wal.event())
+                resolve_sealed(durable, oracle, &collection_ref, wal.event())
                     .await
-                    .map_err(RecoveryError::Oracle)?;
-                match decision {
-                    CommitDecision::Committed => {
-                        durable
-                            .apply_sealed(&collection_ref, wal.event())
-                            .await
-                            .map_err(RecoveryError::Durable)?;
-                    }
-                    CommitDecision::NotCommitted => {
-                        durable
-                            .rollback_sealed(&collection_ref, wal.event())
-                            .await
-                            .map_err(RecoveryError::Durable)?;
-                    }
-                }
+                    .map_err(|e| match e {
+                        ResolveSealedError::Durable(e) => RecoveryError::Durable(e),
+                        ResolveSealedError::Oracle(e) => RecoveryError::Oracle(e),
+                    })?;
             }
         }
     }
@@ -807,4 +821,62 @@ where
         .await
         .map_err(|e| RecoveryError::Timer(Box::new(e)))?;
     Ok(())
+}
+
+/// Resolves a single sealed WAL: consult `oracle` for `event`, then apply or
+/// roll back the sealed ops on `durable`.
+///
+/// This is the shared inner decision of every recovery path —
+/// [`RecoveringValueStore`](crate::state::recovering::RecoveringValueStore)'s
+/// first-touch (`get`) and recover-before-overwrite (`seal`) recovery, and
+/// the [`recover_pending_entries`] timer sweep. Each caller maps
+/// [`ResolveSealedError`] into its own error enum and keeps its surrounding
+/// logic (the sweep's `Idle` stale-row `delete_pending`, the get-side
+/// post-resolution re-read) at the callsite.
+///
+/// # Errors
+///
+/// Returns [`ResolveSealedError::Oracle`] if the oracle read fails, or
+/// [`ResolveSealedError::Durable`] if `apply_sealed` / `rollback_sealed`
+/// fails.
+pub(crate) async fn resolve_sealed<D, O>(
+    durable: &D,
+    oracle: &O,
+    collection: &CollectionRef<ValueKind>,
+    event: EventRef,
+) -> Result<StoreOutcome, ResolveSealedError<<D as DurableWalStore<ValueKind>>::Error, O::Error>>
+where
+    D: DurableWalStore<ValueKind>,
+    O: CommitOracle,
+{
+    let decision = oracle
+        .resolve(collection.id(), event)
+        .await
+        .map_err(ResolveSealedError::Oracle)?;
+    match decision {
+        CommitDecision::Committed => durable.apply_sealed(collection, event).await,
+        CommitDecision::NotCommitted => durable.rollback_sealed(collection, event).await,
+    }
+    .map_err(ResolveSealedError::Durable)
+}
+
+/// Error raised by [`resolve_sealed`].
+///
+/// Kept distinct from [`RecoveryError`] and
+/// [`RecoveringValueStoreError`](crate::state::recovering::RecoveringValueStoreError)
+/// so the shared helper carries no caller-specific variants; each callsite
+/// maps it into its own enum.
+#[derive(Debug, Error)]
+pub(crate) enum ResolveSealedError<DurableErr, OracleErr>
+where
+    DurableErr: Error + 'static,
+    OracleErr: Error + 'static,
+{
+    /// The durable apply / rollback failed.
+    #[error("keyed-state durable store failed")]
+    Durable(#[source] DurableErr),
+
+    /// The commit oracle failed.
+    #[error("keyed-state commit oracle failed")]
+    Oracle(#[source] OracleErr),
 }

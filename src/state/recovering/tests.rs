@@ -25,6 +25,7 @@ use color_eyre::eyre::{self, Result};
 use futures::{Stream, executor};
 use parking_lot::Mutex;
 use quickcheck::{QuickCheck, TestResult};
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use thiserror::Error;
@@ -47,7 +48,10 @@ enum MockPolicy {
     AlwaysCommitted,
     AlwaysNotCommitted,
     Failing,
-    Recording(Arc<Mutex<Vec<EventRef>>>),
+    /// Records every resolved event and returns the carried decision, so a
+    /// test can assert which events were consulted while still steering the
+    /// recover-before-seal outcome (commit vs roll back).
+    Recording(Arc<Mutex<Vec<EventRef>>>, CommitDecision),
 }
 
 impl MockOracle {
@@ -69,11 +73,22 @@ impl MockOracle {
         }
     }
 
+    /// Records consulted events and resolves each as `Committed`.
     fn recording() -> (Self, Arc<Mutex<Vec<EventRef>>>) {
+        Self::recording_with(CommitDecision::Committed)
+    }
+
+    /// Records consulted events and resolves each as `NotCommitted`, so a
+    /// rollback test can still assert the resolve path ran.
+    fn recording_not_committed() -> (Self, Arc<Mutex<Vec<EventRef>>>) {
+        Self::recording_with(CommitDecision::NotCommitted)
+    }
+
+    fn recording_with(decision: CommitDecision) -> (Self, Arc<Mutex<Vec<EventRef>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
-                policy: MockPolicy::Recording(Arc::clone(&log)),
+                policy: MockPolicy::Recording(Arc::clone(&log), decision),
             },
             log,
         )
@@ -92,9 +107,9 @@ impl CommitOracle for MockOracle {
             MockPolicy::AlwaysCommitted => Ok(CommitDecision::Committed),
             MockPolicy::AlwaysNotCommitted => Ok(CommitDecision::NotCommitted),
             MockPolicy::Failing => Err(MockOracleError::Injected),
-            MockPolicy::Recording(log) => {
+            MockPolicy::Recording(log, decision) => {
                 log.lock().push(event);
-                Ok(CommitDecision::Committed)
+                Ok(*decision)
             }
         }
     }
@@ -109,6 +124,51 @@ enum MockOracleError {
 impl ClassifyError for MockOracleError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Permanent
+    }
+}
+
+// ---- ScriptedOracle: per-event commit decisions ----------------------------
+
+/// Oracle that returns a per-event decision from a script, defaulting to
+/// `NotCommitted` for unscripted events. Drives an arbitrary
+/// committed/not-committed pattern across a sequence of events for the
+/// seal-chain equivalence property.
+#[derive(Clone, Default)]
+struct ScriptedOracle {
+    decisions: Arc<Mutex<HashMap<Uuid, CommitDecision>>>,
+}
+
+impl ScriptedOracle {
+    fn set_decision(&self, event: EventRef, committed: bool) {
+        if let EventRef::Message { dedup_id } = event {
+            let decision = if committed {
+                CommitDecision::Committed
+            } else {
+                CommitDecision::NotCommitted
+            };
+            self.decisions.lock().insert(dedup_id, decision);
+        }
+    }
+}
+
+impl CommitOracle for ScriptedOracle {
+    type Error = MockOracleError;
+
+    async fn resolve<'a>(
+        &'a self,
+        _collection: &'a CollectionId<ValueKind>,
+        event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        let decision = match event {
+            EventRef::Message { dedup_id } => self
+                .decisions
+                .lock()
+                .get(&dedup_id)
+                .copied()
+                .unwrap_or(CommitDecision::NotCommitted),
+            EventRef::Timer(_) => CommitDecision::NotCommitted,
+        };
+        Ok(decision)
     }
 }
 
@@ -139,6 +199,39 @@ where
     E: Error + Send + Sync + 'static,
 {
     eyre::eyre!(e)
+}
+
+/// Reads `id` and returns the `Sealed` state's `(applied, wal event)`,
+/// erroring if the partition is `Idle`. Callers keep their own
+/// `assert_eq!`s — and their bespoke failure messages — on the returned
+/// values; this only unwraps the expected `Sealed` shape.
+async fn expect_sealed(
+    inner: &MemoryDurableValueStore,
+    id: &CollectionId<ValueKind>,
+) -> Result<(Option<StoredPayload>, EventRef)> {
+    match inner.read_partition(id).await.map_err(into_eyre)? {
+        DurableState::Sealed { applied, wal } => Ok((applied, wal.event())),
+        DurableState::Idle { applied } => {
+            Err(eyre::eyre!("expected Sealed, got Idle{{{applied:?}}}"))
+        }
+    }
+}
+
+/// Registry whose `default_ttl` covers unregistered collections and whose
+/// `"profile"` collection (the name `collection_ref()` uses) carries an
+/// `override_ttl` distinct from that default. The recovery-write TTL tests
+/// assert the per-collection override is bound, not the registry-wide
+/// default, so the two values must differ.
+fn profile_registry(
+    default_ttl: CompactDuration,
+    override_ttl: CompactDuration,
+) -> Result<Arc<CollectionDefRegistry>> {
+    let mut registry = CollectionDefRegistry::new(Some(default_ttl));
+    registry.insert(
+        StateName::try_new("profile")?,
+        CollectionDef::new(Some(override_ttl)),
+    );
+    Ok(Arc::new(registry))
 }
 
 // ---- directed tests --------------------------------------------------------
@@ -418,15 +511,7 @@ async fn recovery_writes_use_default_ttl() -> Result<()> {
 async fn recovery_writes_use_registry_per_collection_ttl() -> Result<()> {
     let override_ttl = CompactDuration::new(7_200);
     let default_ttl = CompactDuration::new(60);
-
-    // `collection_ref()` names the collection "profile"; register an
-    // override distinct from the registry-wide default.
-    let mut registry = CollectionDefRegistry::new(Some(default_ttl));
-    registry.insert(
-        StateName::try_new("profile")?,
-        CollectionDef::new(Some(override_ttl)),
-    );
-    let registry = Arc::new(registry);
+    let registry = profile_registry(default_ttl, override_ttl)?;
 
     let (recording, captures) = TtlRecordingDurable::new();
     let collection = collection_ref()?;
@@ -502,12 +587,7 @@ async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<b
     // A per-collection TTL override distinct from the registry-wide default,
     // so a divergence between the two entry points' TTL binding would show.
     let override_ttl = CompactDuration::new(4_242);
-    let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(60)));
-    registry.insert(
-        StateName::try_new("profile")?,
-        CollectionDef::new(Some(override_ttl)),
-    );
-    let registry = Arc::new(registry);
+    let registry = profile_registry(CompactDuration::new(60), override_ttl)?;
     let expected_ttl = Some(TtlCapture {
         ttl: Some(override_ttl),
     });
@@ -594,6 +674,222 @@ async fn inner_error_during_apply_propagates() -> Result<()> {
         .ok_or_else(|| eyre::eyre!("expected inner error to propagate"))?;
     assert!(matches!(err, RecoveringValueStoreError::Inner(_)));
     Ok(())
+}
+
+// ---- recover-before-seal directed tests ------------------------------------
+//
+// These target the keystone fix: a WAL-mode `seal` must resolve a prior
+// crashed-but-sealed WAL on the same partition *before* overwriting it, or
+// that prior event's commit decision is lost permanently.
+
+/// Committed prior. A prior event sealed and crashed before resolution
+/// (`Sealed{E1}`); the oracle says E1 committed. Sealing a *new* event E2
+/// must apply E1 first — folding its ops into authoritative state — before
+/// E2's WAL overwrites the partition. Asserts the oracle resolved E1 exactly
+/// once and that E1's committed payload survives under E2's WAL.
+#[tokio::test]
+async fn seal_recovers_committed_prior_before_overwrite() -> Result<()> {
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+    let e1 = event(1);
+    let e2 = event(2);
+    let p1 = inline(11);
+
+    // Crash post-seal / pre-resolve on E1.
+    inner
+        .seal(
+            &collection,
+            e1,
+            vec![ValueOp::Set {
+                payload: p1.clone(),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    let (oracle, log) = MockOracle::recording();
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
+    store
+        .seal(
+            &collection,
+            e2,
+            vec![ValueOp::Set {
+                payload: inline(22),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    assert_eq!(
+        *log.lock(),
+        vec![e1],
+        "the prior event E1 must be resolved exactly once before E2 seals"
+    );
+    let (applied, wal_event) = expect_sealed(&inner, &id).await?;
+    assert_eq!(
+        applied,
+        Some(p1),
+        "E1's committed payload must be folded into applied — not lost"
+    );
+    assert_eq!(wal_event, e2, "the new seal must own the WAL");
+    Ok(())
+}
+
+/// Not-committed prior. The oracle says the prior crashed E1 did not commit;
+/// sealing E2 must roll E1 back — leaving the pre-seal applied untouched —
+/// before E2's WAL lands. The end state (`applied == prior`) is reachable by
+/// a naive overwrite that never resolves E1, since rolling back a
+/// not-committed event is a no-op on `applied`; the recording oracle asserts
+/// the resolve path actually ran (E1 consulted exactly once), so this test
+/// discriminates the recover-before-seal fix rather than its absence.
+#[tokio::test]
+async fn seal_rolls_back_not_committed_prior_before_overwrite() -> Result<()> {
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+    let prior = inline(3);
+    inner
+        .direct_apply(
+            &collection,
+            vec![ValueOp::Set {
+                payload: prior.clone(),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+    let e1 = event(1);
+    let e2 = event(2);
+    inner
+        .seal(
+            &collection,
+            e1,
+            vec![ValueOp::Set {
+                payload: inline(99),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    let (oracle, log) = MockOracle::recording_not_committed();
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
+    store
+        .seal(
+            &collection,
+            e2,
+            vec![ValueOp::Set {
+                payload: inline(44),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    assert_eq!(
+        *log.lock(),
+        vec![e1],
+        "the prior event E1 must be resolved exactly once before E2 seals"
+    );
+    let (applied, wal_event) = expect_sealed(&inner, &id).await?;
+    assert_eq!(
+        applied,
+        Some(prior),
+        "rolled-back E1 must leave the pre-seal applied untouched"
+    );
+    assert_eq!(wal_event, e2);
+    Ok(())
+}
+
+/// Same-event guard. Re-sealing the *same* event (redelivery of our own WAL)
+/// must skip recovery entirely — the oracle is consulted zero times — and the
+/// partition stays sealed for that event.
+#[tokio::test]
+async fn seal_same_event_redelivery_skips_oracle() -> Result<()> {
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+    let e1 = event(1);
+    inner
+        .seal(&collection, e1, vec![ValueOp::Set { payload: inline(7) }])
+        .await
+        .map_err(into_eyre)?;
+
+    let (oracle, log) = MockOracle::recording();
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
+    store
+        .seal(&collection, e1, vec![ValueOp::Set { payload: inline(8) }])
+        .await
+        .map_err(into_eyre)?;
+
+    assert!(
+        log.lock().is_empty(),
+        "a same-event reseal must not consult the oracle"
+    );
+    let (_, wal_event) = expect_sealed(&inner, &id).await?;
+    assert_eq!(wal_event, e1, "the partition must stay sealed for E1");
+    Ok(())
+}
+
+/// Crash-recovery equivalence for the seal-chain. Sealing a sequence of
+/// events `E0..En` through the wrapper resolves each prior event before
+/// overwriting its WAL (recover-before-seal), and the final `get` resolves
+/// `En` (read-before-use). The final visible state must equal a reference
+/// model that folds every *committed* event's ops in order — so no committed
+/// event's decision is lost across the chain, and no not-committed event
+/// bleeds through. Every recovery write must also bind the shared resolver's
+/// per-collection TTL. The sweep entry point's equivalence to `get` is
+/// covered separately by [`prop_recovery_entry_points_equivalent`]. Iteration
+/// count comes from `QUICKCHECK_TESTS`.
+#[test]
+fn prop_seal_chain_recovers_every_committed_event() {
+    fn property(decisions: Vec<bool>) -> TestResult {
+        match executor::block_on(run_seal_chain_equivalence(decisions)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(e) => TestResult::error(format!("seal-chain equivalence errored: {e}")),
+        }
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<bool>) -> TestResult);
+}
+
+/// Drives a seal-chain with per-event decisions through the recovery wrapper
+/// and reports whether the final visible state matches the reference fold and
+/// every recovery write bound the resolver's per-collection TTL.
+async fn run_seal_chain_equivalence(decisions: Vec<bool>) -> Result<bool> {
+    let override_ttl = CompactDuration::new(4_242);
+    let registry = profile_registry(CompactDuration::new(60), override_ttl)?;
+
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+
+    let oracle = ScriptedOracle::default();
+    let (store, caps) = TtlRecordingDurable::new();
+    let wrapper = RecoveringValueStore::new(store, oracle.clone(), registry);
+
+    let mut reference: Option<StoredPayload> = None;
+    for (i, &committed) in decisions.iter().enumerate() {
+        let ev = event(i as u128);
+        oracle.set_decision(ev, committed);
+        let payload = inline(i as u8);
+        if committed {
+            reference = Some(payload.clone());
+        }
+        wrapper
+            .seal(&collection, ev, vec![ValueOp::Set { payload }])
+            .await
+            .map_err(into_eyre)?;
+    }
+    // Final read-before-use resolves the last sealed event.
+    let final_state = wrapper.get(&id).await.map_err(into_eyre)?;
+    let expected = reference.map_or(Read::Absent, Read::Present);
+
+    let apply_ttl_ok = caps
+        .last_apply()
+        .is_none_or(|c| c.ttl == Some(override_ttl));
+    let rollback_ttl_ok = caps
+        .last_rollback()
+        .is_none_or(|c| c.ttl == Some(override_ttl));
+
+    Ok(final_state == expected && apply_ttl_ok && rollback_ttl_ok)
 }
 
 // ---- property runners ------------------------------------------------------

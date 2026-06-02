@@ -1550,7 +1550,7 @@ pub enum ConsumerError {
 
     /// Indicates a defer middleware initialization failure.
     #[error("Defer initialization failed: {0:#}")]
-    Defer(#[from] middleware::defer::DeferInitError),
+    Defer(#[from] DeferInitError),
 
     /// Indicates storage backend creation failure.
     #[error("Failed to create storage backend: {0:#}")]

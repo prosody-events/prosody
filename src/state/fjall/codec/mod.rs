@@ -44,10 +44,6 @@ const CACHE_TAG_PRESENT: u8 = 0x01;
 /// Payload encoding used for cached `Present` cells.
 const CACHE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackZstdV1;
 
-/// Payload encoding used for dirty op values. Plain `MsgPack` — ops are
-/// small and ephemeral; compressing them adds CPU for no real saving.
-pub(super) const DIRTY_OP_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackV1;
-
 /// Returns the 16-byte collection prefix for a typed collection identity.
 ///
 /// See module docs for the field layout and rationale.
@@ -132,13 +128,18 @@ pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<StoredPayload>, FjallVal
     }
 }
 
-/// Returns the 16-byte scope-qualified prefix for a dirty workspace key.
+/// Returns the `dirty_overlay` partition key for `(scope, collection)`.
 ///
-/// The prefix folds the event scope into the cache's existing collection
-/// hash so two concurrent events on the same Kafka partition cannot collide
-/// in the shared dirty workspace.
+/// The key folds the event scope into the cache's existing collection hash so
+/// two concurrent events on the same Kafka partition cannot collide in the
+/// shared dirty workspace.
+///
+/// The dirty workspace is a single compacted overlay cell per collection —
+/// the same tagged-cell shape as the committed cache (`0x01` = pending Set,
+/// `0x00` = pending Clear, key-absent = no pending op). It carries the LWW
+/// final op directly, so there is no separate ops log or sequence counter.
 #[must_use]
-pub fn scope_collection_prefix<K>(scope: EventScopeId, id: &CollectionId<K>) -> [u8; 16]
+pub fn dirty_collection_key<K>(scope: EventScopeId, id: &CollectionId<K>) -> [u8; 16]
 where
     K: CollectionKind,
 {
@@ -147,56 +148,6 @@ where
     buf[..16].copy_from_slice(&scope.get().to_be_bytes());
     buf[16..].copy_from_slice(&collection);
     xxh3_128(&buf).to_be_bytes()
-}
-
-/// Returns the `dirty_ops` partition key for `(scope, collection, seq)`.
-///
-/// `seq` is encoded big-endian so the ordered scan over the prefix yields
-/// ops in insertion order.
-#[must_use]
-pub fn dirty_ops_key<K>(scope: EventScopeId, id: &CollectionId<K>, seq: u64) -> [u8; 24]
-where
-    K: CollectionKind,
-{
-    let prefix = scope_collection_prefix(scope, id);
-    let mut buf = [0_u8; 24];
-    buf[..16].copy_from_slice(&prefix);
-    buf[16..].copy_from_slice(&seq.to_be_bytes());
-    buf
-}
-
-/// Returns the `dirty_overlay` / `dirty_meta` partition key for
-/// `(scope, collection)`.
-#[must_use]
-pub fn dirty_collection_key<K>(scope: EventScopeId, id: &CollectionId<K>) -> [u8; 16]
-where
-    K: CollectionKind,
-{
-    scope_collection_prefix(scope, id)
-}
-
-/// Encodes the `dirty_meta` value as `[next_seq u64 LE]`.
-///
-/// `next_seq` is the only field the dirty store reads back; the op count is
-/// derived on demand by iterating the ops prefix (see
-/// [`PendingOpSource::pending_ops`](crate::state::value::PendingOpSource::pending_ops)),
-/// so it is not stored.
-#[must_use]
-pub fn encode_dirty_meta(next_seq: u64) -> [u8; 8] {
-    next_seq.to_le_bytes()
-}
-
-/// Decodes a `dirty_meta` value into `next_seq`.
-///
-/// # Errors
-///
-/// Returns [`FjallValueStoreError::CorruptDirtyMeta`] when the cell does
-/// not have exactly 8 bytes.
-pub fn decode_dirty_meta(bytes: &[u8]) -> Result<u64, FjallValueStoreError> {
-    let arr: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| FjallValueStoreError::CorruptDirtyMeta(bytes.len()))?;
-    Ok(u64::from_le_bytes(arr))
 }
 
 #[cfg(test)]

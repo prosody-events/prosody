@@ -210,7 +210,7 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 /// # Returns
 ///
 /// The resolved message timestamp
-fn resolve_timestamp(message: &BorrowedMessage) -> chrono::DateTime<chrono::Utc> {
+fn resolve_timestamp(message: &BorrowedMessage) -> chrono::DateTime<Utc> {
     match message.timestamp() {
         Timestamp::NotAvailable => Utc::now(),
         Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {

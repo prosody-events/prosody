@@ -91,9 +91,8 @@ impl EventHandler for TimerTestHandler {
             match action {
                 "schedule_timer" => {
                     // Support both absolute time and delay-based scheduling
-                    if let Some(target_time_secs) = payload
-                        .get("target_time_secs")
-                        .and_then(serde_json::Value::as_u64)
+                    if let Some(target_time_secs) =
+                        payload.get("target_time_secs").and_then(Value::as_u64)
                     {
                         // Absolute time scheduling
                         let schedule_time = CompactDateTime::from(target_time_secs as u32);
@@ -105,9 +104,8 @@ impl EventHandler for TimerTestHandler {
                         } else {
                             info!("Scheduled timer for key {key} at time {schedule_time}");
                         }
-                    } else if let Some(delay_secs) = payload
-                        .get("delay_secs")
-                        .and_then(serde_json::Value::as_u64)
+                    } else if let Some(delay_secs) =
+                        payload.get("delay_secs").and_then(Value::as_u64)
                     {
                         // Delay-based scheduling
                         let delay = CompactDuration::new(delay_secs as u32);

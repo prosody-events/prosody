@@ -1407,7 +1407,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time past the trigger time
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         if let Some(pending_timer) = stream.next().await {
@@ -1603,7 +1603,7 @@ mod tests {
         manager.schedule_trigger(retry).await?;
 
         // Allow scheduler to process and verify both types are scheduled
-        time::advance(Duration::from_millis(100)).await;
+        advance(Duration::from_millis(100)).await;
         task::yield_now().await;
         assert_eq!(
             count_scheduled(&manager, &key, TimerType::Application).await?,
@@ -1697,7 +1697,7 @@ mod tests {
         manager.schedule_trigger(retry).await?;
 
         // Allow scheduler to process and verify both scheduled
-        time::advance(Duration::from_millis(100)).await;
+        advance(Duration::from_millis(100)).await;
         task::yield_now().await;
         assert_eq!(
             count_scheduled(&manager, &key, TimerType::Application).await?,
@@ -1761,7 +1761,7 @@ mod tests {
 
         // Schedule and wait for timer to fire
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         // Fire the timer (transition to FIRING state)
@@ -1809,7 +1809,7 @@ mod tests {
 
         // Schedule and fire
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
@@ -1825,7 +1825,7 @@ mod tests {
         guard.commit().await;
 
         // Advance time and verify exactly one more fire
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending2 = timeout(Duration::from_millis(100), stream.next())
@@ -1841,7 +1841,7 @@ mod tests {
         guard2.commit().await;
 
         // No more timers should fire
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
         assert!(
             timeout(Duration::from_millis(100), stream.next())
@@ -1864,7 +1864,7 @@ mod tests {
 
         // Schedule and fire
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
@@ -1881,7 +1881,7 @@ mod tests {
         assert!(times.is_empty(), "Timer should be deleted from DB");
 
         // Verify no more fires
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
         assert!(
             timeout(Duration::from_millis(100), stream.next())
@@ -1904,7 +1904,7 @@ mod tests {
 
         // Schedule, fire, and reschedule
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
@@ -1936,7 +1936,7 @@ mod tests {
 
         // Schedule, fire, and reschedule
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
@@ -1948,7 +1948,7 @@ mod tests {
         guard.abort().await;
 
         // Verify timer fires again
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending2 = timeout(Duration::from_millis(100), stream.next())
@@ -1974,7 +1974,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // 2. Timer fires
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending1 = stream.next().await.ok_or_else(|| eyre!("First timer"))?;
@@ -1988,7 +1988,7 @@ mod tests {
         guard1.commit().await;
 
         // 5. Timer fires again
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending2 = timeout(Duration::from_millis(100), stream.next())
@@ -2010,7 +2010,7 @@ mod tests {
         // Commit without reschedule - timer should be done
         guard2.commit().await;
 
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
         assert!(
             timeout(Duration::from_millis(100), stream.next())
@@ -2037,7 +2037,7 @@ mod tests {
 
         // Schedule and wait for timer to fire
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         // Fire the timer (transition to FIRING state)
@@ -2074,7 +2074,7 @@ mod tests {
         assert!(times.is_empty(), "Timer should be deleted after commit");
 
         // No more fires
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
         assert!(
             timeout(Duration::from_millis(100), stream.next())
@@ -2097,7 +2097,7 @@ mod tests {
 
         // Schedule and wait for timer to fire
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         // Fire the timer (transition to FIRING state)
@@ -2150,7 +2150,7 @@ mod tests {
         assert!(times.is_empty(), "Timer should be deleted after commit");
 
         // Timer should NOT fire again (reschedule was cancelled)
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
         assert!(
             timeout(Duration::from_millis(100), stream.next())
@@ -2190,7 +2190,7 @@ mod tests {
         assert!(times_before.contains(&trigger.time));
 
         // Advance time and fire the timer
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
@@ -2230,7 +2230,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time and fire the timer
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
@@ -2293,7 +2293,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time to trigger emission
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         // Get the pending timer from stream
@@ -2334,7 +2334,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time to trigger emission into queue
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         // Get the pending timer from stream (timer has been delivered)
@@ -2372,7 +2372,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // 2. Timer fires
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending1 = stream
@@ -2392,7 +2392,7 @@ mod tests {
         guard1.abort().await;
 
         // 5. Timer should fire again (already in DelayQueue from reschedule)
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending2 = timeout(Duration::from_millis(100), stream.next())
@@ -2414,7 +2414,7 @@ mod tests {
         // 7. Commit without reschedule - timer should be done
         guard2.commit().await;
 
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
         assert!(
             timeout(Duration::from_millis(100), stream.next())
@@ -2439,7 +2439,7 @@ mod tests {
         manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time and fire the timer
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending = stream
@@ -2501,7 +2501,7 @@ mod tests {
 
         // Step 1: Schedule timer T at time X
         manager.schedule_trigger(trigger.clone()).await?;
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         // Step 2: Timer fires, enters Firing state
@@ -2575,7 +2575,7 @@ mod tests {
         assert!(times.contains(&trigger.time));
 
         // Advance time again and verify the timer fires a second time
-        time::advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(2)).await;
         task::yield_now().await;
 
         let pending2 = timeout(Duration::from_secs(5), stream.next())
