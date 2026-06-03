@@ -4,12 +4,14 @@ use std::error::Error;
 
 mod binary;
 mod json;
+mod state_json;
 
 pub use binary::{
     BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryMetadata, BinaryPayload, JsonBinaryCodec,
     JsonExtractError, JsonExtractor,
 };
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
+pub use state_json::{CodecId, JsonStateCodec, JsonStateCodecError, StateCodec};
 
 /// Wire-format abstraction for encoding and decoding message payloads.
 ///
