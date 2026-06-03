@@ -56,8 +56,11 @@ async fn test_source_system_filtering() -> Result<()> {
 ///
 /// This function returns an error if the test setup, execution, or verification
 /// fails.
-/// Per-event receive ceiling.
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-event hang-guard for a message that will arrive — sized generously so
+/// cluster slowness never trips it (correctness is in the assertions, not the
+/// wait). Distinct from `SILENCE_TIMEOUT`, the bounded window for the negative
+/// "no message arrives" check.
+const RECEIVE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Shorter window for confirming no messages arrive.
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
 

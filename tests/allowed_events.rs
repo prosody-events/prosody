@@ -98,8 +98,10 @@ async fn test_allowed_events_filtering() -> Result<()> {
         .send([], topic, key, payload_allowed.clone())
         .await?;
 
-    // Validate receipt of only the allowed message
-    let received = timeout(Duration::from_secs(30), messages_rx.recv()).await?;
+    // Validate receipt of only the allowed message. The wait is a hang-guard
+    // for an event that will arrive, sized generously so cluster slowness never
+    // trips it; the assertions below on key/payload are what prove correctness.
+    let received = timeout(Duration::from_mins(1), messages_rx.recv()).await?;
     let (received_key, received_payload) =
         received.ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
 

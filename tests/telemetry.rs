@@ -44,13 +44,21 @@ mod common;
 
 const BOOTSTRAP: &str = "localhost:9094";
 const CASSANDRA_HOST: &str = "localhost:9042";
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Top-level timeout for any single integration test.
-const TEST_TIMEOUT: Duration = Duration::from_secs(45);
-/// Timeout for tests that involve timer scheduling (3 s delay + startup).
-const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(1);
-/// Timeout for defer tests: warm-up + 3 s timer + backoff + telemetry drain.
-const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// Hang-guard for an individual wait on an event that *must* arrive (a message
+/// handler completing, a timer firing, a telemetry record landing). These tests
+/// assert on event *content* — scheduled times, lifecycle completeness — which
+/// is deterministic; the wait itself only guards against a genuine hang, so it
+/// is sized generously. A slow or degraded cluster (e.g. late in a long suite)
+/// must never trip it. Kept comfortably below the per-test deadlines so a hung
+/// step surfaces its own granular error before the outer deadline fires.
+const RECEIVE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Top-level deadline for a single non-timer integration test.
+const TEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// Deadline for tests that involve timer scheduling (a few-second timer delay
+/// plus consumer startup and telemetry drain).
+const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(3);
+/// Deadline for defer tests: warm-up + timer + retry backoff + telemetry drain.
+const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 // ── Test Handlers ────────────────────────────────────────────────────────────
 
@@ -1399,7 +1407,7 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         // Wait for timer handler to fire (~3 s delay)
-        let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, timer_rx.recv()).await?;
 
         let events = collect_timer_events_for_key(
             &telemetry_consumer,
@@ -1455,7 +1463,7 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         // Wait for timer handler to fire (~3 s delay)
-        let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, timer_rx.recv()).await?;
 
         let events = collect_timer_events_for_key(
             &telemetry_consumer,
@@ -1518,7 +1526,7 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
             .await?;
 
         // Wait for the retry to succeed
-        let _ = timeout(Duration::from_secs(30), done_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, done_rx.recv()).await?;
 
         // Collect all timer events — there must be a full scheduled → dispatched
         // → succeeded lifecycle for the deferredMessage timer.
@@ -1588,7 +1596,7 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
 
         // Wait for the deferred timer retry to succeed (~3 s application timer
         // + defer backoff)
-        let _ = timeout(Duration::from_secs(30), done_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, done_rx.recv()).await?;
 
         // Collect timer events until both the application and deferredTimer
         // lifecycles are complete (each has scheduled + dispatched + terminal).
@@ -1813,7 +1821,7 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
             .ok_or_else(|| eyre!("replacement_time channel closed"))?;
 
         // Wait for the timer to fire (should be ~5s from step 2)
-        let trigger_time = timeout(Duration::from_secs(15), timer_rx.recv())
+        let trigger_time = timeout(RECEIVE_TIMEOUT, timer_rx.recv())
             .await
             .map_err(|_| eyre!("timeout waiting for on_timer — timer never fired"))?
             .ok_or_else(|| eyre!("timer_fired channel closed"))?;

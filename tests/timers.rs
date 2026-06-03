@@ -232,8 +232,18 @@ impl TestEnvironment {
         let producer =
             ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
-        // Give consumer time to start and subscribe
-        sleep(Duration::from_secs(5)).await;
+        // Wait until Kafka has assigned the consumer its partition before
+        // producing — records sent before the subscription is live can be
+        // missed. Polls the real readiness condition (partition assignment,
+        // per `consumer::probes`) under a generous hang-guard, rather than
+        // guessing a fixed startup delay that is sensitive to load.
+        timeout(Duration::from_secs(30), async {
+            while consumer.assigned_partition_count() == 0 {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("consumer did not receive a partition assignment in time"))?;
 
         Ok(Self {
             topic,
@@ -282,7 +292,7 @@ impl TestEnvironment {
     /// Wait for a message event with timeout
     async fn expect_message(&mut self, timeout_secs: u64) -> Result<MessageEvent> {
         timeout(
-            Duration::from_secs(timeout_secs.max(30)),
+            Duration::from_secs(timeout_secs.max(60)),
             self.message_rx.recv(),
         )
         .await
@@ -298,7 +308,7 @@ impl TestEnvironment {
     /// Wait for a timer event with timeout
     async fn expect_timer(&mut self, timeout_secs: u64) -> Result<TimerEvent> {
         timeout(
-            Duration::from_secs(timeout_secs.max(30)),
+            Duration::from_secs(timeout_secs.max(60)),
             self.timer_rx.recv(),
         )
         .await
@@ -317,7 +327,7 @@ impl TestEnvironment {
 
         for i in 0..count {
             match timeout(
-                Duration::from_secs(timeout_secs.max(30)),
+                Duration::from_secs(timeout_secs.max(60)),
                 self.timer_rx.recv(),
             )
             .await
@@ -448,33 +458,32 @@ impl TestEnvironment {
 }
 
 /// Run a test with timeout and proper error handling
-async fn run_test<F, Fut>(test_name: &str, timeout_secs: u64, test_fn: F) -> Result<()>
+async fn run_test<F, Fut>(test_name: &str, test_fn: F) -> Result<()>
 where
     F: FnOnce(TestEnvironment) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     init_test_logging();
 
-    let result = timeout(Duration::from_secs(timeout_secs), async {
+    // Generous outer hang-guard: bounds total test runtime while staying well
+    // above the per-event waits inside the harness, so a genuinely hung step
+    // surfaces its own granular error before this fires. Sized so a slow or
+    // degraded cluster never trips it on mere slowness.
+    let timeout_dur = Duration::from_mins(3);
+    let result = timeout(timeout_dur, async {
         let env = TestEnvironment::new(test_name).await?;
 
         test_fn(env).await
     })
     .await;
 
-    result.map_err(|_| {
-        eyre!(
-            "Test '{}' timed out after {} seconds",
-            test_name,
-            timeout_secs
-        )
-    })?
+    result.map_err(|_| eyre!("Test '{test_name}' timed out after {timeout_dur:?}"))?
 }
 
 /// Tests basic timer scheduling and triggering functionality.
 #[tokio::test]
 async fn test_timer_scheduling_and_triggering() -> Result<()> {
-    run_test("timer-test", 60, |mut env| async move {
+    run_test("timer-test", |mut env| async move {
         let key = "test-key";
         let delay_secs = 1u32;
         let schedule_message = json!({
@@ -503,7 +512,7 @@ async fn test_timer_scheduling_and_triggering() -> Result<()> {
 /// Tests edge case: scheduling multiple timers for the same key.
 #[tokio::test]
 async fn test_same_key_multiple_timers() -> Result<()> {
-    run_test("timer-same-key-test", 60, |mut env| async move {
+    run_test("timer-same-key-test", |mut env| async move {
         let key = "same-key";
         let delays = vec![1u32, 2u32, 3u32];
 
@@ -540,7 +549,7 @@ async fn test_same_key_multiple_timers() -> Result<()> {
 /// Tests immediate timer scheduling (1 second delay).
 #[tokio::test]
 async fn test_immediate_timer() -> Result<()> {
-    run_test("timer-immediate-test", 60, |mut env| async move {
+    run_test("timer-immediate-test", |mut env| async move {
         let key = "immediate-key";
         let delay_secs = 1u32;
 
@@ -574,7 +583,7 @@ async fn test_immediate_timer() -> Result<()> {
 
 #[tokio::test]
 async fn test_timer_scheduled_time_accuracy() -> Result<()> {
-    run_test("timer-accuracy-test", 60, |mut env| async move {
+    run_test("timer-accuracy-test", |mut env| async move {
         let key = "accuracy-key";
 
         // Calculate a specific target time (2 seconds from now)
@@ -640,7 +649,7 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
 /// Tests timer cancellation functionality.
 #[tokio::test]
 async fn test_timer_cancellation() -> Result<()> {
-    run_test("timer-cancellation-test", 60, |mut env| async move {
+    run_test("timer-cancellation-test", |mut env| async move {
         let key = "cancellation-key";
         let delay_secs = 3u32;
 
@@ -682,7 +691,7 @@ async fn test_timer_cancellation() -> Result<()> {
 /// Tests multiple timers with different keys and timing.
 #[tokio::test]
 async fn test_multiple_timers() -> Result<()> {
-    run_test("timer-multiple-test", 60, |mut env| async move {
+    run_test("timer-multiple-test", |mut env| async move {
         // Schedule multiple timers with staggered delays
         let timers_data = vec![("key1", 1u32), ("key2", 2u32), ("key3", 3u32)];
 
@@ -726,7 +735,7 @@ async fn test_multiple_timers() -> Result<()> {
 /// Tests timer behavior for different keys.
 #[tokio::test]
 async fn test_timer_different_keys() -> Result<()> {
-    run_test("timer-keys-test", 60, |mut env| async move {
+    run_test("timer-keys-test", |mut env| async move {
         // Schedule timers for different keys
         let timers = vec!["key-a", "key-b"];
         let delay_secs = 2u32;

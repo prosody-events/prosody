@@ -109,7 +109,9 @@ async fn quickstart() -> Result<()> {
         .send(topic, "message-key", json!({"value": "Hello, Kafka!"}))
         .await?;
 
-    let message_key = timeout(Duration::from_secs(30), receiver.recv())
+    // Hang-guard for the round-trip; sized generously so cluster slowness never
+    // trips it. Correctness is the `assert_eq!` on the key below, not the wait.
+    let message_key = timeout(Duration::from_mins(1), receiver.recv())
         .await
         .map_err(|_| eyre!("timed out waiting for message"))?
         .ok_or_else(|| eyre!("channel closed before message arrived"))?;

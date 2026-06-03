@@ -301,11 +301,16 @@ async fn test_producer_deduplication() -> Result<()> {
         (consumer, rx)
     };
 
-    let receive_timeout = Duration::from_secs(10);
+    // Per-receive hang-guard: each case awaits a message that will arrive; the
+    // bound only catches a genuine hang, so it is generous and load-insensitive.
+    let receive_timeout = Duration::from_secs(30);
 
     // Capture result so consumer is always shut down, even on failure.
     // Dropping the consumer without shutdown causes a blocking hang in Drop.
-    let result = timeout(Duration::from_secs(20), async {
+    // The outer deadline bounds total runtime and stays above `receive_timeout`
+    // so a single hung case surfaces its own granular error first.
+    let overall_timeout = Duration::from_secs(90);
+    let result = timeout(overall_timeout, async {
         case_duplicate_id_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
         case_same_id_different_keys(&producer, &topic, &mut rx, receive_timeout).await?;
         case_distinct_ids_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
@@ -314,7 +319,7 @@ async fn test_producer_deduplication() -> Result<()> {
         Ok::<(), eyre::Report>(())
     })
     .await
-    .map_err(|_| eyre::eyre!("test timed out after 20 seconds"))
+    .map_err(|_| eyre::eyre!("test timed out after {overall_timeout:?}"))
     .and_then(|r| r);
 
     consumer_client.shutdown().await;
