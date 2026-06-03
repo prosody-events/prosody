@@ -30,12 +30,13 @@ use super::codec::{decode_cell, dirty_collection_key, encode_absent_cell, encode
 use super::error::FjallValueStoreError;
 use super::workspace::{AssignmentEpoch, FjallClient, FjallWorkspace};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::value::{PendingOpSource, StoredPayload, ValueKind, ValueOp, ValueStore};
+use crate::state::value::{PendingOpSource, ValueKind, ValueOp, ValueStore};
 use crate::state::{
     CollectionId, DirtyStoreFactory, DirtyStoreProvider, EventScopeId, PendingOps, Read,
 };
 use crate::timers::datetime::CompactDateTimeError;
 use crate::{Partition, Topic};
+use bytes::Bytes;
 use educe::Educe;
 use fjall::PartitionHandle;
 use std::num::NonZeroU64;
@@ -73,7 +74,7 @@ impl ValueStore for FjallDirtyValueStore {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         let key = dirty_collection_key(self.scope, collection);
         let overlay = self.overlay.clone();
         let raw = spawn_blocking(move || overlay.get(key)).await??;
@@ -83,7 +84,7 @@ impl ValueStore for FjallDirtyValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         let key = dirty_collection_key(self.scope, collection);
         let cell = encode_present_cell(&payload)?;

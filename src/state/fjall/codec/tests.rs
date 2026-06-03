@@ -1,8 +1,7 @@
 use super::{decode_cell, encode_absent_cell, encode_present_cell, value_cache_key};
 use crate::Key;
-use crate::state::value::StoredPayload;
+use crate::state::value_test_suite::bytes;
 use crate::state::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
-use bytes::Bytes;
 use color_eyre::eyre::Result;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -19,22 +18,18 @@ fn collection(name: &str) -> Result<CollectionId<ValueKind>> {
     ))
 }
 
-fn inline(value: u8) -> StoredPayload {
-    StoredPayload::Inline(Bytes::from(vec![value]))
-}
-
 #[test]
 fn absent_round_trip() -> Result<()> {
-    let bytes = encode_absent_cell();
-    assert_eq!(decode_cell(Some(bytes.as_ref()))?, Read::Absent);
+    let cell = encode_absent_cell();
+    assert_eq!(decode_cell(Some(cell.as_ref()))?, Read::Absent);
     Ok(())
 }
 
 #[test]
 fn present_round_trip() -> Result<()> {
-    let payload = inline(7);
-    let bytes = encode_present_cell(&payload)?;
-    assert_eq!(decode_cell(Some(bytes.as_ref()))?, Read::Present(payload));
+    let payload = bytes(7);
+    let cell = encode_present_cell(&payload)?;
+    assert_eq!(decode_cell(Some(cell.as_ref()))?, Read::Present(payload));
     Ok(())
 }
 

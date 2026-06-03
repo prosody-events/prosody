@@ -11,6 +11,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -144,6 +145,15 @@ impl StateName {
 
 impl AsRef<str> for StateName {
     fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Lets registry maps keyed by [`StateName`] resolve `&str` lookups without
+/// allocating. Sound because the derived `Hash`/`Eq` delegate to the inner
+/// `str`, matching `str`'s own implementations.
+impl Borrow<str> for StateName {
+    fn borrow(&self) -> &str {
         self.as_str()
     }
 }

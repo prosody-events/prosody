@@ -1,7 +1,7 @@
-//! `MsgPack` payload and WAL encoding for keyed-state collections.
+//! Payload-cell and `MsgPack` WAL encoding for keyed-state collections.
 //!
-//! Stored payload cells use [`PayloadEncoding`]; WAL blobs use
-//! [`WalFormat`]. Both discriminators round-trip via `i16` so durable
+//! Value cells hold raw codec bytes and use [`PayloadEncoding`]; WAL blobs
+//! use [`WalFormat`]. Both discriminators round-trip via `i16` so durable
 //! Cassandra columns map cleanly onto them.
 //!
 //! WAL stream layout (logical):
@@ -30,18 +30,21 @@ use zstd::stream::{decode_all, encode_all};
 const WAL_HEADER_VERSION: u16 = 1;
 const ZSTD_LEVEL: i32 = 0;
 
-/// Encoding discriminator for [`StoredPayload`](super::StoredPayload) cells.
+/// Encoding discriminator for Value payload cells.
 ///
 /// Mapped to and from `i16` so durable storage can persist a small
 /// integer column without leaking the named enum representation.
+/// Discriminants `1`/`2` belonged to the retired `MsgPack`-wrapped cell
+/// encodings and are never reused — a stale cell carrying one fails
+/// loudly as [`EncodingError::UnknownPayloadEncoding`] (Permanent).
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PayloadEncoding {
-    /// Plain `MsgPack` named-record encoding.
-    MsgpackV1 = 1,
+    /// Raw codec bytes stored verbatim.
+    RawV1 = 3,
 
-    /// `MsgPack` named-record encoding compressed with zstd.
-    MsgpackZstdV1 = 2,
+    /// Raw codec bytes compressed with zstd.
+    RawZstdV1 = 4,
 }
 
 impl PayloadEncoding {
@@ -53,8 +56,8 @@ impl PayloadEncoding {
     /// not match a known variant.
     pub fn try_from_i16(value: i16) -> Result<Self, EncodingError> {
         match value {
-            1 => Ok(Self::MsgpackV1),
-            2 => Ok(Self::MsgpackZstdV1),
+            3 => Ok(Self::RawV1),
+            4 => Ok(Self::RawZstdV1),
             other => Err(EncodingError::UnknownPayloadEncoding(other)),
         }
     }
@@ -120,41 +123,30 @@ struct WalHeader {
     op_count: NonZeroU64,
 }
 
-/// Encodes a stored payload with the requested encoding.
+/// Encodes a raw payload cell with the requested encoding.
+///
+/// The cell bytes are opaque to this layer — whatever codec produced them
+/// (JSON, the Kafka-ref `MsgPack`) lives above the store.
 ///
 /// # Errors
 ///
-/// Returns [`EncodingError`] when `MsgPack` serialization or zstd
-/// compression fails.
-pub fn encode_payload<P>(payload: &P, encoding: PayloadEncoding) -> Result<Bytes, EncodingError>
-where
-    P: Serialize,
-{
-    let raw = rmp_serde::to_vec_named(payload).map_err(EncodingError::BadMsgPackEncode)?;
+/// Returns [`EncodingError`] when zstd compression fails.
+pub fn encode_payload(payload: &Bytes, encoding: PayloadEncoding) -> Result<Bytes, EncodingError> {
     match encoding {
-        PayloadEncoding::MsgpackV1 => Ok(Bytes::from(raw)),
-        PayloadEncoding::MsgpackZstdV1 => compress(&raw),
+        PayloadEncoding::RawV1 => Ok(payload.clone()),
+        PayloadEncoding::RawZstdV1 => compress(payload),
     }
 }
 
-/// Decodes stored payload bytes encoded with `encoding`.
+/// Decodes payload-cell bytes encoded with `encoding`.
 ///
 /// # Errors
 ///
-/// Returns [`EncodingError`] when `MsgPack` deserialization or zstd
-/// decompression fails.
-pub fn decode_payload<P>(bytes: &[u8], encoding: PayloadEncoding) -> Result<P, EncodingError>
-where
-    P: DeserializeOwned,
-{
+/// Returns [`EncodingError`] when zstd decompression fails.
+pub fn decode_payload(bytes: &[u8], encoding: PayloadEncoding) -> Result<Bytes, EncodingError> {
     match encoding {
-        PayloadEncoding::MsgpackV1 => {
-            rmp_serde::from_slice(bytes).map_err(EncodingError::BadMsgPack)
-        }
-        PayloadEncoding::MsgpackZstdV1 => {
-            let raw = decompress(bytes)?;
-            rmp_serde::from_slice(&raw).map_err(EncodingError::BadMsgPack)
-        }
+        PayloadEncoding::RawV1 => Ok(Bytes::copy_from_slice(bytes)),
+        PayloadEncoding::RawZstdV1 => decompress(bytes).map(Bytes::from),
     }
 }
 

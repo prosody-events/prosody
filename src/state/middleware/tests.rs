@@ -7,6 +7,8 @@
 
 #![allow(clippy::wildcard_imports, clippy::match_wildcard_for_single_variants)]
 
+use super::context::{ByteValueHandle, ContextParts};
+use super::descriptor_identity::LazyDescriptorIdentity;
 use super::handler::recover_pending_entries;
 use super::*;
 use crate::Key;
@@ -15,15 +17,15 @@ use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::DurableState;
 use crate::state::StoreOutcome;
+use crate::state::descriptor::{KafkaMessageRef, NoLoader, ValueDescriptor, value_state};
 use crate::state::memory::{
     MemoryDirtyValueStore, MemoryDirtyValueStoreFactory, MemoryDirtyValueStoreProvider,
     MemoryDurableValueStore,
 };
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
-use crate::state::value::{
-    DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
-};
+use crate::state::value::{DirectApplyStore, DurableWalStore, ValueKind, ValueOp, ValueStore};
+use crate::state::value_test_suite::{bytes, finish_trace};
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, CommitMode, EventRef, StateKey, StateName,
     StateType,
@@ -35,7 +37,7 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use futures::executor;
-use quickcheck::{Arbitrary, Gen, QuickCheck};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::fmt::Debug;
 use std::iter;
 use std::marker::PhantomData;
@@ -132,10 +134,6 @@ fn make_collection_id(state_key: &StateKey, name: &str) -> Result<CollectionId<V
     ))
 }
 
-fn inline_bytes(b: u8) -> StoredPayload {
-    StoredPayload::Inline(Bytes::from(vec![b]))
-}
-
 /// A `Message` event keyed by a fixed dedup id; the tests only need
 /// distinct, reproducible events.
 fn msg_event(dedup_id: u128) -> EventRef {
@@ -156,7 +154,7 @@ async fn seal_set(
             collection_ref,
             event,
             vec![ValueOp::Set {
-                payload: inline_bytes(byte),
+                payload: bytes(byte),
             }],
         )
         .await?;
@@ -167,7 +165,7 @@ async fn seal_set(
 async fn read_idle_applied(
     durable: &MemoryDurableValueStore,
     id: &CollectionId<ValueKind>,
-) -> Result<Option<StoredPayload>> {
+) -> Result<Option<Bytes>> {
     match DurableWalStore::read_partition(durable, id).await? {
         DurableState::Idle { applied } => Ok(applied),
         other => Err(eyre!("expected Idle, got {other:?}")),
@@ -184,7 +182,7 @@ fn build_context<C, D>(
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
-) -> KeyedStateContext<C, D, MemoryDirtyValueStore>
+) -> KeyedStateContext<C, D, MemoryDirtyValueStore, NoLoader, TimerScope>
 where
     C: EventContext + Clone + Send + Sync + 'static,
     D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
@@ -196,26 +194,42 @@ where
         + Sync
         + 'static,
 {
-    KeyedStateContext::new(
+    KeyedStateContext::new(ContextParts {
         inner,
         durable,
-        MemoryDirtyValueStore::new(),
+        dirty: MemoryDirtyValueStore::new(),
+        loader: NoLoader,
+        scope: TimerScope,
         registry,
         state_key,
         event,
-    )
+    })
 }
 
 /// Registry that pins `name` to `mode`. Used by tests that exercise a
 /// non-default commit mode without rebuilding the full Builder.
-fn registry_with_mode(name: &str, mode: CommitMode) -> Result<CollectionDefRegistry> {
+fn registry_with_mode(name: &'static str, mode: CommitMode) -> Result<CollectionDefRegistry> {
     let mut r = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
     let def = CollectionDef::new(Some(CompactDuration::new(3_600))).with_commit_mode(mode);
-    r.insert(StateName::try_new(name)?, def);
+    r.register(&value_state::<serde_json::Value>(name), def)?;
     Ok(r)
 }
 
-/// `ctx.value(name).set(...)` should accumulate dirty ops and
+/// Opens the byte-level substrate handle for `name` — the directed tests
+/// below assert raw durable bytes, so they drive the substrate directly;
+/// typed `ctx.state(DESC)` coverage lives in the descriptor tests and the
+/// end-to-end middleware tests.
+fn byte_handle<C, D>(
+    ctx: &KeyedStateContext<C, D, MemoryDirtyValueStore, NoLoader, TimerScope>,
+    name: &str,
+) -> Result<ByteValueHandle<D, MemoryDirtyValueStore>>
+where
+    D: Clone,
+{
+    Ok(ctx.byte_handle(&StateName::try_new(name)?))
+}
+
+/// Substrate `set(...)` should accumulate dirty ops and
 /// `seal_all` should write them to the durable WAL.
 #[tokio::test]
 async fn value_set_then_seal_persists_sealed_wal() -> Result<()> {
@@ -231,8 +245,8 @@ async fn value_set_then_seal_persists_sealed_wal() -> Result<()> {
         event,
     );
 
-    let handle = ctx.value("counter")?;
-    handle.set(inline_bytes(7)).await?;
+    let handle = byte_handle(&ctx, "counter")?;
+    handle.set(bytes(7)).await?;
 
     let sealed = ctx.resolve_per_collection().await?;
     assert_eq!(sealed.len(), 1, "exactly one collection sealed");
@@ -263,8 +277,8 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
         event,
     );
 
-    let handle = ctx.value("counter")?;
-    handle.set(inline_bytes(13)).await?;
+    let handle = byte_handle(&ctx, "counter")?;
+    handle.set(bytes(13)).await?;
     let outcome = handle.flush().await?;
     assert_eq!(
         outcome,
@@ -273,10 +287,7 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
     );
 
     let id = make_collection_id(&state_key, "counter")?;
-    assert_eq!(
-        read_idle_applied(&durable, &id).await?,
-        Some(inline_bytes(13))
-    );
+    assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(13)));
 
     // Second flush is a no-op on Clean.
     let outcome = handle.flush().await?;
@@ -300,11 +311,11 @@ async fn repeat_value_call_returns_same_transaction() -> Result<()> {
         event,
     );
 
-    let first = ctx.value("counter")?;
-    first.set(inline_bytes(5)).await?;
+    let first = byte_handle(&ctx, "counter")?;
+    first.set(bytes(5)).await?;
 
-    let second = ctx.value("counter")?;
-    assert_eq!(second.get().await?, Some(inline_bytes(5)));
+    let second = byte_handle(&ctx, "counter")?;
+    assert_eq!(second.get().await?, Some(bytes(5)));
     Ok(())
 }
 
@@ -324,8 +335,8 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
         event,
     );
 
-    let handle = ctx.value("counter")?;
-    handle.set(inline_bytes(9)).await?;
+    let handle = byte_handle(&ctx, "counter")?;
+    handle.set(bytes(9)).await?;
     let sealed = ctx.resolve_per_collection().await?;
     assert!(
         sealed.is_empty(),
@@ -333,10 +344,7 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
     );
 
     let id = make_collection_id(&state_key, "counter")?;
-    assert_eq!(
-        read_idle_applied(&durable, &id).await?,
-        Some(inline_bytes(9))
-    );
+    assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(9)));
     Ok(())
 }
 
@@ -344,14 +352,13 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
 /// registered, otherwise the default.
 #[test]
 fn registry_lookup_falls_back_to_default() -> Result<()> {
+    const BOUNDED: ValueDescriptor<serde_json::Value> = value_state("bounded");
+    const UNBOUNDED: ValueDescriptor<serde_json::Value> = value_state("unbounded");
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(7_200)));
+    registry.register(&BOUNDED, CollectionDef::new(Some(CompactDuration::new(60))))?;
+    registry.register(&UNBOUNDED, CollectionDef::new(None))?;
     let bounded = StateName::try_new("bounded")?;
     let unbounded = StateName::try_new("unbounded")?;
-    registry.insert(
-        bounded.clone(),
-        CollectionDef::new(Some(CompactDuration::new(60))),
-    );
-    registry.insert(unbounded.clone(), CollectionDef::new(None));
 
     assert_eq!(registry.ttl_for(&bounded), Some(CompactDuration::new(60)));
     assert_eq!(registry.ttl_for(&unbounded), None);
@@ -389,10 +396,7 @@ async fn state_recovery_applies_sealed_when_oracle_says_committed() -> Result<()
     .await
     .map_err(|e| eyre!("recovery failed: {e}"))?;
 
-    assert_eq!(
-        read_idle_applied(&durable, &id).await?,
-        Some(inline_bytes(11))
-    );
+    assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(11)));
     assert!(
         context
             .timer_operations()
@@ -536,18 +540,32 @@ async fn state_recovery_with_empty_partition_clears_timer() -> Result<()> {
     Ok(())
 }
 
-/// `KeyedStateAccessError::Name` is a permanent classification.
+/// N6: a message-scoped context exposes `message_ref()` with the message's
+/// exact Kafka coordinates. The negative side is a type-level fact, not a
+/// runtime check: `message_ref` is defined only on
+/// `KeyedStateContext<_, _, _, _, MessageScope>`, so a timer-scoped context
+/// (the `TimerScope` parameter [`build_context`] uses everywhere else in
+/// this file) cannot name it — referencing it fails to compile.
 #[test]
-fn keyed_state_access_error_classifies_permanent() -> Result<()> {
-    let err = match StateName::try_new("") {
-        Ok(_) => return Err(eyre!("empty state name should fail")),
-        Err(e) => KeyedStateAccessError::Name(e),
-    };
-    assert!(
-        matches!(err.classify_error(), ErrorCategory::Permanent),
-        "permanent classification"
+fn message_scope_context_exposes_message_ref() {
+    let ctx = KeyedStateContext::new(ContextParts {
+        inner: MockEventContext::new(),
+        durable: MemoryDurableValueStore::for_tests(),
+        dirty: MemoryDirtyValueStore::new(),
+        loader: NoLoader,
+        scope: MessageScope::new(crate::Topic::from("orders.v1"), 3, 42),
+        registry: Arc::new(registry()),
+        state_key: make_state_key(),
+        event: msg_event(1),
+    });
+    assert_eq!(
+        ctx.message_ref(),
+        KafkaMessageRef {
+            topic: crate::Topic::from("orders.v1"),
+            partition: 3,
+            offset: 42,
+        }
     );
-    Ok(())
 }
 
 /// Builder validation: `build()` fails fast when required fields are
@@ -644,8 +662,8 @@ impl<H> ValueWritingHandler<H> {
 }
 
 /// The middleware injects a `KeyedStateContext<...>` as the context the
-/// handler sees. To exercise it in tests, the handler downcasts via the
-/// `KeyedStateAccess` extension trait.
+/// handler sees; real handlers bind descriptors against it via
+/// `ctx.state(DESC)`.
 impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
     type Error = RecordingHandlerError;
     type Output = ();
@@ -660,11 +678,10 @@ impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
     where
         C: EventContext,
     {
-        let _ = ctx; // The blanket FallibleHandler bound erases keyed-state access.
-        // Real handlers add `+ KeyedStateAccess` to their bound to recover it.
-        // The non-recovery message arm of the test exercises the handler-shape
-        // contract; the seal-recording branch is exercised by manually
-        // invoking the wrapped context.
+        let _ = ctx; // The blanket `C: EventContext` bound erases the concrete
+        // keyed-state context type. The non-recovery message arm of the test
+        // exercises the handler-shape contract; the seal-recording branch is
+        // exercised by manually invoking the wrapped context.
         Ok(())
     }
 
@@ -695,19 +712,23 @@ fn build_handler(
     MemoryDurableValueStore,
     FixedOracle,
     MemoryDirtyValueStoreProvider,
+    NoLoader,
 > {
-    let registry = registry().with_default_commit_mode(commit_mode);
+    let registry = Arc::new(registry().with_default_commit_mode(commit_mode));
+    let segment_id = Uuid::new_v4();
     KeyedStateHandler {
         inner: ValueWritingHandler::new(),
         durable: durable.clone(),
-        scanner: durable,
+        scanner: durable.clone(),
         oracle,
         provider: Ok(MemoryDirtyValueStoreProvider),
+        loader: NoLoader,
         consumer_group: Arc::from("test-group"),
         version: Arc::from("1"),
-        registry: Arc::new(registry),
-        segment_id: Uuid::new_v4(),
+        registry: registry.clone(),
+        segment_id,
         recovery_delay: CompactDuration::new(30),
+        identity: LazyDescriptorIdentity::new(durable, registry, segment_id),
     }
 }
 
@@ -830,10 +851,7 @@ async fn after_commit_with_sealed_list_clears_state_recovery_timer() -> Result<(
         "exactly one clear_scheduled(StateRecovery) fires"
     );
 
-    assert_eq!(
-        read_idle_applied(&durable, &id).await?,
-        Some(inline_bytes(7))
-    );
+    assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(7)));
     Ok(())
 }
 
@@ -971,17 +989,21 @@ async fn on_message_wal_mode_with_no_seals_does_not_schedule() -> Result<()> {
 #[tokio::test]
 async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
+    let registry = Arc::new(registry());
+    let segment_id = Uuid::new_v4();
     let handler = KeyedStateHandler {
         inner: RecordingHandler,
         durable: durable.clone(),
-        scanner: durable,
+        scanner: durable.clone(),
         oracle: FixedOracle::committed(),
         provider: Ok(MemoryDirtyValueStoreProvider),
+        loader: NoLoader,
         consumer_group: Arc::from("test-group"),
         version: Arc::from("1"),
-        registry: Arc::new(registry()),
-        segment_id: Uuid::new_v4(),
+        registry: registry.clone(),
+        segment_id,
         recovery_delay: CompactDuration::new(30),
+        identity: LazyDescriptorIdentity::new(durable, registry, segment_id),
     };
     let context = MockEventContext::new().with_timer_tracking();
     let msg = test_message()?;
@@ -1077,15 +1099,17 @@ impl Arbitrary for MiddlewareTrace {
 /// constructed a context or handler, so the dispatch path had no coverage.
 ///
 /// (A generic `FallibleHandler::on_message<C: EventContext>` cannot statically
-/// recover `KeyedStateAccess`, so the op is performed on the context directly,
-/// exactly as the directed seal tests do; the seal + apply-hook dispatch is
-/// the middleware-specific logic under test.)
+/// recover the concrete keyed-state context type, so the op is performed on
+/// the context directly, exactly as the directed seal tests do; the seal +
+/// apply-hook dispatch is the middleware-specific logic under test.)
 #[test]
 fn prop_middleware_dispatch_matches_durable_model() {
-    fn property(trace: MiddlewareTrace) -> bool {
-        executor::block_on(run_middleware_dispatch(trace)).unwrap_or(false)
+    fn property(trace: MiddlewareTrace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(run_middleware_dispatch(trace));
+        finish_trace(result, "dispatch diverged from durable model", &input_dbg)
     }
-    QuickCheck::new().quickcheck(property as fn(MiddlewareTrace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(MiddlewareTrace) -> TestResult);
 }
 
 async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
@@ -1095,7 +1119,7 @@ async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
     let id = make_collection_id(&state_key, "v")?;
     let registry = Arc::new(registry());
 
-    let mut model: Option<StoredPayload> = None;
+    let mut model: Option<Bytes> = None;
 
     for (idx, event) in trace.0.into_iter().enumerate() {
         let event_ref = msg_event(idx as u128 + 1);
@@ -1107,11 +1131,11 @@ async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
             state_key.clone(),
             event_ref,
         );
-        let handle = ctx.value("v")?;
+        let handle = byte_handle(&ctx, "v")?;
         let applied_if_committed = match &event.step {
             MiddlewareStep::Set(byte) => {
-                handle.set(inline_bytes(*byte)).await?;
-                Some(inline_bytes(*byte))
+                handle.set(bytes(*byte)).await?;
+                Some(bytes(*byte))
             }
             MiddlewareStep::Clear => {
                 handle.clear().await?;

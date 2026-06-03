@@ -18,7 +18,7 @@
 //!   WAL, per the design summary's Direct-mode invariant.
 
 use super::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, TransactionValueStore,
+    DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore,
     TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
@@ -27,7 +27,11 @@ use super::{
 };
 use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::middleware::{CollectionDefRegistry, recover_pending_entries};
+use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
+use crate::state::middleware::{
+    CollectionDef, CollectionDefRegistry, DescriptorIdentityError, DescriptorIdentityStore,
+    DurableDescriptorIdentity, LazyDescriptorIdentity, recover_pending_entries,
+};
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::timers::TimerType;
@@ -36,7 +40,7 @@ use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
-use quickcheck::{Arbitrary, Gen};
+use quickcheck::{Arbitrary, Gen, TestResult};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -237,6 +241,23 @@ where
     Ok(true)
 }
 
+/// Maps a property-trace outcome to a [`TestResult`], keeping a store/runtime
+/// error (`Err`) distinct from a falsified property (`Ok(false)`) so a
+/// swallowed backend failure can never masquerade as a falsified property.
+/// `falsified` is the diagnostic shown when the property does not hold (e.g.
+/// `"model mismatch"`, `"idempotence violated"`).
+pub(crate) fn finish_trace<E: fmt::Debug>(
+    result: Result<bool, E>,
+    falsified: &str,
+    input_dbg: &str,
+) -> TestResult {
+    match result {
+        Ok(true) => TestResult::passed(),
+        Ok(false) => TestResult::error(format!("{falsified}.\nFailing input:\n{input_dbg}")),
+        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
+    }
+}
+
 pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
     Ok(CollectionRef::new(
         CollectionId::new(
@@ -248,8 +269,10 @@ pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
     ))
 }
 
-pub(crate) fn inline(value: u8) -> StoredPayload {
-    StoredPayload::Inline(Bytes::from(vec![value]))
+/// Canonical single-byte payload cell, shared by every keyed-state test
+/// module (the cell content is opaque to the LWW state machine).
+pub(crate) fn bytes(value: u8) -> Bytes {
+    Bytes::from(vec![value])
 }
 
 /// Commit oracle that records every `resolve` call so the stale-pending
@@ -360,6 +383,116 @@ where
             .any(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery))),
         "the sweep must clear the StateRecovery timer"
     );
+    Ok(())
+}
+
+/// N7/N8 — shared durable descriptor-identity acquisition check, run from
+/// both the memory backend (always) and Cassandra (integration), mirroring
+/// [`run_stale_pending_index`].
+///
+/// Invariants:
+///
+/// 1. **Write-on-absent** — acquiring a segment with no identity row writes the
+///    descriptor's frozen `(kind, cell kind, codec id, schema label)`.
+/// 2. **Mismatch ⇒ Permanent, row untouched** — acquiring against a
+///    pre-existing row with any differing field fails Permanent and does not
+///    overwrite the row.
+/// 3. **Match ⇒ ok, idempotent** — re-acquiring an identical identity succeeds
+///    and writes nothing new.
+/// 4. **Validation is acquisition-only (N8)** — once a partition's validator
+///    initialized, later durable-row drift is not re-checked; reads trust the
+///    frozen identity until the next assignment.
+pub(crate) async fn run_descriptor_identity_acquisition<D>(durable: D) -> Result<()>
+where
+    D: DescriptorIdentityStore + Clone,
+{
+    const PROFILE: ValueDescriptor<serde_json::Value> = value_state("acquisition-profile");
+    let relabeled = value_state::<serde_json::Value>("acquisition-profile").with_schema_label("v2");
+
+    // Fresh segment per run so rows never collide with other iterations or
+    // test functions (the Cassandra keyspace is shared).
+    let segment_id = Uuid::new_v4();
+
+    // Invariant 1: write-on-absent.
+    let mut registry = CollectionDefRegistry::new(None);
+    registry
+        .register(&PROFILE, CollectionDef::new(None))
+        .map_err(|e| eyre!("register failed: {e}"))?;
+    let registry = Arc::new(registry);
+    let lazy = LazyDescriptorIdentity::new(durable.clone(), registry.clone(), segment_id);
+    lazy.ensure()
+        .await
+        .map_err(|e| eyre!("first acquisition failed: {e}"))?;
+    let rows = durable
+        .read_descriptor_identities(segment_id)
+        .await
+        .map_err(|e| eyre!("read identities failed: {e}"))?;
+    let expected = DurableDescriptorIdentity::from_identity(
+        &StateName::try_new(PROFILE.name())?,
+        &PROFILE.structural_identity(),
+    );
+    assert_eq!(
+        rows,
+        vec![expected.clone()],
+        "first use writes the identity row"
+    );
+
+    // Invariant 3: idempotent re-acquire from a fresh validator.
+    let again = LazyDescriptorIdentity::new(durable.clone(), registry, segment_id);
+    again
+        .ensure()
+        .await
+        .map_err(|e| eyre!("idempotent re-acquisition failed: {e}"))?;
+    let rows = durable
+        .read_descriptor_identities(segment_id)
+        .await
+        .map_err(|e| eyre!("read identities failed: {e}"))?;
+    assert_eq!(
+        rows,
+        vec![expected.clone()],
+        "re-acquisition writes nothing"
+    );
+
+    // Invariant 2: mismatch (schema label differs) ⇒ Permanent; row untouched.
+    let mut mismatched = CollectionDefRegistry::new(None);
+    mismatched
+        .register(&relabeled, CollectionDef::new(None))
+        .map_err(|e| eyre!("register failed: {e}"))?;
+    let conflicting =
+        LazyDescriptorIdentity::new(durable.clone(), Arc::new(mismatched), segment_id);
+    match conflicting.ensure().await {
+        Err(error @ DescriptorIdentityError::Mismatch { .. }) => {
+            assert_eq!(
+                error.classify_error(),
+                ErrorCategory::Permanent,
+                "identity mismatch must classify Permanent"
+            );
+        }
+        other => return Err(eyre!("expected Mismatch, got {other:?}")),
+    }
+    let rows = durable
+        .read_descriptor_identities(segment_id)
+        .await
+        .map_err(|e| eyre!("read identities failed: {e}"))?;
+    assert_eq!(
+        rows,
+        vec![expected.clone()],
+        "mismatch must not overwrite the row"
+    );
+
+    // Invariant 4 (N8): the already-initialized validator never re-reads —
+    // drift the durable row out-of-band and assert `ensure` stays Ok.
+    let drifted = DurableDescriptorIdentity {
+        schema_label: Some("drifted".into()),
+        ..expected
+    };
+    durable
+        .write_descriptor_identities(segment_id, vec![drifted])
+        .await
+        .map_err(|e| eyre!("drift write failed: {e}"))?;
+    lazy.ensure()
+        .await
+        .map_err(|e| eyre!("acquisition-only contract violated: {e}"))?;
     Ok(())
 }
 
@@ -538,7 +671,7 @@ where
 async fn durable_applied_state<D>(
     durable: &D,
     collection: &CollectionId<ValueKind>,
-) -> Result<Option<StoredPayload>>
+) -> Result<Option<Bytes>>
 where
     D: DurableBundle,
 {
@@ -547,7 +680,7 @@ where
     })
 }
 
-fn read_applied(read: Read<StoredPayload>) -> Option<StoredPayload> {
+fn read_applied(read: Read<Bytes>) -> Option<Bytes> {
     match read {
         Read::Present(payload) => Some(payload),
         Read::Absent | Read::Unknown => None,
@@ -588,7 +721,7 @@ where
                 collection,
                 model,
                 ValueOp::Set {
-                    payload: inline(byte),
+                    payload: bytes(byte),
                 },
             )
             .await
@@ -820,7 +953,7 @@ where
     S: DirtyBundle,
 {
     match op {
-        DirectTraceOp::Set(byte) => tx.set(collection, inline(byte)).await?,
+        DirectTraceOp::Set(byte) => tx.set(collection, bytes(byte)).await?,
         DirectTraceOp::Clear => tx.clear(collection).await?,
         DirectTraceOp::Read => {
             let _ = tx.get(collection).await?;
@@ -959,10 +1092,10 @@ impl Arbitrary for DirectTraceOp {
 
 #[derive(Default)]
 struct Model {
-    applied: Option<StoredPayload>,
+    applied: Option<Bytes>,
     dirty_ops: Vec<ValueOp>,
     overlay: ValueOverlay,
-    sealed: Option<(Option<StoredPayload>, Vec<ValueOp>)>,
+    sealed: Option<(Option<Bytes>, Vec<ValueOp>)>,
     /// Sealed snapshot captured by [`TraceOp::Crash`] in
     /// [`ModelPhase::Sealed`]: `(pre_seal_applied, sealed_ops, crash_event)`.
     /// Consumed by the runner on the next iteration to drive
@@ -970,12 +1103,12 @@ struct Model {
     /// The event ref is carried because those APIs take the expected event
     /// explicitly. Both halves are always set and consumed together, so
     /// they live in one field.
-    crashed_sealed: Option<(Option<StoredPayload>, Vec<ValueOp>, EventRef)>,
+    crashed_sealed: Option<(Option<Bytes>, Vec<ValueOp>, EventRef)>,
     phase: ModelPhase,
 }
 
 impl Model {
-    fn visible(&self) -> Option<StoredPayload> {
+    fn visible(&self) -> Option<Bytes> {
         match &self.overlay {
             ValueOverlay::BufferedSet(payload) => Some(payload.clone()),
             ValueOverlay::BufferedClear => None,

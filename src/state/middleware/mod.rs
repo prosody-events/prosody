@@ -3,14 +3,10 @@
 //! This middleware is the runtime glue between user handlers and the keyed
 //! state stack. It provides:
 //!
-//! * [`KeyedStateAccess`] — extension trait on
-//!   [`EventContext`](crate::consumer::event_context::EventContext) that lets
-//!   handlers call `ctx.value(name)` to operate on a Value collection.
 //! * [`KeyedStateContext`] — wrapped context constructed per event; delegates
-//!   `EventContext` calls to the inner context and exposes keyed-state access
-//!   through [`KeyedStateAccess`].
-//! * [`ValueHandle`] — the concrete handle returned by
-//!   [`KeyedStateAccess::value`]; drives a
+//!   `EventContext` calls to the inner context and exposes typed keyed-state
+//!   access through descriptors ([`crate::state::descriptor`]). Each bound
+//!   handle drives a
 //!   [`TransactionValueStore`](crate::state::value::TransactionValueStore) per
 //!   `(event, collection)`.
 //! * [`KeyedStateMiddleware`] — the
@@ -57,6 +53,7 @@
 //! match.
 
 mod context;
+mod descriptor_identity;
 mod error;
 mod handler;
 mod registry;
@@ -64,9 +61,16 @@ mod registry;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use context::ByteValueHandle;
+#[cfg(test)]
+pub(crate) use context::ContextParts;
 pub use context::{
-    DirtyValueBundle, DurableValueBundle, KeyedStateAccess, KeyedStateAccessError,
-    KeyedStateContext, ValueAccessor, ValueHandle,
+    DirtyValueBundle, DurableValueBundle, KeyedStateContext, MessageScope, TimerScope,
+};
+#[cfg(test)]
+pub(crate) use descriptor_identity::LazyDescriptorIdentity;
+pub use descriptor_identity::{
+    DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity,
 };
 pub use error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareErrorComponent};
 #[cfg(test)]
@@ -78,4 +82,4 @@ pub use handler::{
 // Production code (`RecoveringValueStore::{get, seal}`) calls `resolve_sealed`,
 // so this re-export must not be `#[cfg(test)]`-gated.
 pub(crate) use handler::{ResolveSealedError, resolve_sealed};
-pub use registry::{CollectionDef, CollectionDefRegistry};
+pub use registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};

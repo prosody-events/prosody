@@ -9,18 +9,20 @@
 use super::{CollectionTtl, CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
 use crate::consumer::middleware::test_support::MockEventContext;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::value_state;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use crate::state::middleware::{CollectionDef, CollectionDefRegistry, recover_pending_entries};
 use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
-use crate::state::value::{DirectApplyStore, DurableWalStore, StoredPayload, ValueOp, ValueStore};
+use crate::state::value::{DirectApplyStore, DurableWalStore, ValueOp, ValueStore};
 use crate::state::value_test_suite::{
-    self, DirectTrace, OraclePolicy, TEST_TTL, Trace, collection_ref, inline,
+    self, DirectTrace, OraclePolicy, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
 };
 use crate::state::{
     CollectionId, CollectionKind, CollectionRef, CommitDecision, DurableState, EventRef, Read,
-    SealedCollection, StateKey, StateName, StoreOutcome, ValueKind,
+    SealedCollection, StateKey, StoreOutcome, ValueKind,
 };
 use crate::timers::duration::CompactDuration;
+use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use futures::{Stream, executor};
 use parking_lot::Mutex;
@@ -208,7 +210,7 @@ where
 async fn expect_sealed(
     inner: &MemoryDurableValueStore,
     id: &CollectionId<ValueKind>,
-) -> Result<(Option<StoredPayload>, EventRef)> {
+) -> Result<(Option<Bytes>, EventRef)> {
     match inner.read_partition(id).await.map_err(into_eyre)? {
         DurableState::Sealed { applied, wal } => Ok((applied, wal.event())),
         DurableState::Idle { applied } => {
@@ -227,10 +229,10 @@ fn profile_registry(
     override_ttl: CompactDuration,
 ) -> Result<Arc<CollectionDefRegistry>> {
     let mut registry = CollectionDefRegistry::new(Some(default_ttl));
-    registry.insert(
-        StateName::try_new("profile")?,
+    registry.register(
+        &value_state::<serde_json::Value>("profile"),
         CollectionDef::new(Some(override_ttl)),
-    );
+    )?;
     Ok(Arc::new(registry))
 }
 
@@ -257,7 +259,7 @@ async fn get_on_sealed_partition_committed_applies_wal() -> Result<()> {
     let collection = collection_ref()?;
     let id = collection.id().clone();
     let event = event(1);
-    let payload = inline(7);
+    let payload = bytes(7);
     inner
         .seal(
             &collection,
@@ -293,11 +295,7 @@ async fn get_on_sealed_partition_not_committed_rolls_back() -> Result<()> {
     let id = collection.id().clone();
     let event = event(2);
     inner
-        .seal(
-            &collection,
-            event,
-            vec![ValueOp::Set { payload: inline(9) }],
-        )
+        .seal(&collection, event, vec![ValueOp::Set { payload: bytes(9) }])
         .await
         .map_err(into_eyre)?;
 
@@ -323,7 +321,7 @@ async fn get_on_sealed_partition_not_committed_preserves_prior_applied() -> Resu
     let inner = MemoryDurableValueStore::for_tests();
     let collection = collection_ref()?;
     let id = collection.id().clone();
-    let prior = inline(3);
+    let prior = bytes(3);
     inner
         .direct_apply(
             &collection,
@@ -335,11 +333,7 @@ async fn get_on_sealed_partition_not_committed_preserves_prior_applied() -> Resu
         .map_err(into_eyre)?;
     let event = event(4);
     inner
-        .seal(
-            &collection,
-            event,
-            vec![ValueOp::Set { payload: inline(5) }],
-        )
+        .seal(&collection, event, vec![ValueOp::Set { payload: bytes(5) }])
         .await
         .map_err(into_eyre)?;
 
@@ -364,7 +358,7 @@ async fn get_idempotent_after_recovery() -> Result<()> {
         .seal(
             &collection,
             event(6),
-            vec![ValueOp::Set { payload: inline(1) }],
+            vec![ValueOp::Set { payload: bytes(1) }],
         )
         .await
         .map_err(into_eyre)?;
@@ -408,7 +402,7 @@ async fn read_partition_returns_sealed_unchanged() -> Result<()> {
     let inner = MemoryDurableValueStore::for_tests();
     let collection = collection_ref()?;
     let id = collection.id().clone();
-    let payload = inline(8);
+    let payload = bytes(8);
     inner
         .seal(
             &collection,
@@ -447,10 +441,10 @@ async fn set_and_clear_pass_through() -> Result<()> {
     let collection = collection_ref()?;
     let id = collection.id().clone();
 
-    store.set(&id, inline(1)).await.map_err(into_eyre)?;
+    store.set(&id, bytes(1)).await.map_err(into_eyre)?;
     assert_eq!(
         store.get(&id).await.map_err(into_eyre)?,
-        Read::Present(inline(1))
+        Read::Present(bytes(1))
     );
 
     store.clear(&id).await.map_err(into_eyre)?;
@@ -467,7 +461,7 @@ async fn recovery_writes_use_default_ttl() -> Result<()> {
         .seal(
             &collection,
             event(9),
-            vec![ValueOp::Set { payload: inline(2) }],
+            vec![ValueOp::Set { payload: bytes(2) }],
         )
         .await
         .map_err(into_eyre)?;
@@ -486,7 +480,7 @@ async fn recovery_writes_use_default_ttl() -> Result<()> {
         .seal(
             &collection,
             event(10),
-            vec![ValueOp::Set { payload: inline(3) }],
+            vec![ValueOp::Set { payload: bytes(3) }],
         )
         .await
         .map_err(into_eyre)?;
@@ -520,7 +514,7 @@ async fn recovery_writes_use_registry_per_collection_ttl() -> Result<()> {
         .seal(
             &collection,
             event(20),
-            vec![ValueOp::Set { payload: inline(5) }],
+            vec![ValueOp::Set { payload: bytes(5) }],
         )
         .await
         .map_err(into_eyre)?;
@@ -568,16 +562,14 @@ fn prop_recovery_entry_points_equivalent() {
 async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<bool> {
     // WAL must be non-empty; derive a deterministic op list from the seed.
     let ops: Vec<ValueOp> = if seed.is_empty() {
-        vec![ValueOp::Set { payload: inline(0) }]
+        vec![ValueOp::Set { payload: bytes(0) }]
     } else {
         seed.iter()
             .map(|b| {
                 if b % 5 == 0 {
                     ValueOp::Clear
                 } else {
-                    ValueOp::Set {
-                        payload: inline(*b),
-                    }
+                    ValueOp::Set { payload: bytes(*b) }
                 }
             })
             .collect()
@@ -606,7 +598,7 @@ async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<b
 
     // First-touch entry point.
     let (store_a, caps_a) = TtlRecordingDurable::new();
-    store_a.set(&id, inline(7)).await.map_err(into_eyre)?;
+    store_a.set(&id, bytes(7)).await.map_err(into_eyre)?;
     store_a
         .seal(&collection, event, ops.clone())
         .await
@@ -621,7 +613,7 @@ async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<b
 
     // Timer-sweep entry point over an identically-sealed partition.
     let (store_b, caps_b) = TtlRecordingDurable::new();
-    store_b.set(&id, inline(7)).await.map_err(into_eyre)?;
+    store_b.set(&id, bytes(7)).await.map_err(into_eyre)?;
     store_b
         .seal(&collection, event, ops.clone())
         .await
@@ -657,7 +649,7 @@ async fn inner_error_during_apply_propagates() -> Result<()> {
         .seal(
             &collection,
             event(11),
-            vec![ValueOp::Set { payload: inline(4) }],
+            vec![ValueOp::Set { payload: bytes(4) }],
         )
         .await
         .map_err(into_eyre)?;
@@ -694,7 +686,7 @@ async fn seal_recovers_committed_prior_before_overwrite() -> Result<()> {
     let id = collection.id().clone();
     let e1 = event(1);
     let e2 = event(2);
-    let p1 = inline(11);
+    let p1 = bytes(11);
 
     // Crash post-seal / pre-resolve on E1.
     inner
@@ -711,13 +703,7 @@ async fn seal_recovers_committed_prior_before_overwrite() -> Result<()> {
     let (oracle, log) = MockOracle::recording();
     let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
     store
-        .seal(
-            &collection,
-            e2,
-            vec![ValueOp::Set {
-                payload: inline(22),
-            }],
-        )
+        .seal(&collection, e2, vec![ValueOp::Set { payload: bytes(22) }])
         .await
         .map_err(into_eyre)?;
 
@@ -748,7 +734,7 @@ async fn seal_rolls_back_not_committed_prior_before_overwrite() -> Result<()> {
     let inner = MemoryDurableValueStore::for_tests();
     let collection = collection_ref()?;
     let id = collection.id().clone();
-    let prior = inline(3);
+    let prior = bytes(3);
     inner
         .direct_apply(
             &collection,
@@ -761,26 +747,14 @@ async fn seal_rolls_back_not_committed_prior_before_overwrite() -> Result<()> {
     let e1 = event(1);
     let e2 = event(2);
     inner
-        .seal(
-            &collection,
-            e1,
-            vec![ValueOp::Set {
-                payload: inline(99),
-            }],
-        )
+        .seal(&collection, e1, vec![ValueOp::Set { payload: bytes(99) }])
         .await
         .map_err(into_eyre)?;
 
     let (oracle, log) = MockOracle::recording_not_committed();
     let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
     store
-        .seal(
-            &collection,
-            e2,
-            vec![ValueOp::Set {
-                payload: inline(44),
-            }],
-        )
+        .seal(&collection, e2, vec![ValueOp::Set { payload: bytes(44) }])
         .await
         .map_err(into_eyre)?;
 
@@ -809,14 +783,14 @@ async fn seal_same_event_redelivery_skips_oracle() -> Result<()> {
     let id = collection.id().clone();
     let e1 = event(1);
     inner
-        .seal(&collection, e1, vec![ValueOp::Set { payload: inline(7) }])
+        .seal(&collection, e1, vec![ValueOp::Set { payload: bytes(7) }])
         .await
         .map_err(into_eyre)?;
 
     let (oracle, log) = MockOracle::recording();
     let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
     store
-        .seal(&collection, e1, vec![ValueOp::Set { payload: inline(8) }])
+        .seal(&collection, e1, vec![ValueOp::Set { payload: bytes(8) }])
         .await
         .map_err(into_eyre)?;
 
@@ -865,11 +839,11 @@ async fn run_seal_chain_equivalence(decisions: Vec<bool>) -> Result<bool> {
     let (store, caps) = TtlRecordingDurable::new();
     let wrapper = RecoveringValueStore::new(store, oracle.clone(), registry);
 
-    let mut reference: Option<StoredPayload> = None;
+    let mut reference: Option<Bytes> = None;
     for (i, &committed) in decisions.iter().enumerate() {
         let ev = event(i as u128);
         oracle.set_decision(ev, committed);
-        let payload = inline(i as u8);
+        let payload = bytes(i as u8);
         if committed {
             reference = Some(payload.clone());
         }
@@ -913,69 +887,74 @@ async fn run_seal_chain_equivalence(decisions: Vec<bool>) -> Result<bool> {
 
 #[test]
 fn prop_recovering_memory_trace() {
-    fn property(trace: Trace) -> bool {
-        executor::block_on(value_test_suite::run_trace(
+    fn property(trace: Trace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(value_test_suite::run_trace(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
-        ))
-        .unwrap_or(false)
+        ));
+        finish_trace(result, "model mismatch", &input_dbg)
     }
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Trace) -> TestResult);
 }
 
 #[test]
 fn prop_recovering_memory_idempotence_trace() {
-    fn property(trace: Trace) -> bool {
-        executor::block_on(value_test_suite::run_idempotence_trace(
+    fn property(trace: Trace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(value_test_suite::run_idempotence_trace(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
-        ))
-        .unwrap_or(false)
+        ));
+        finish_trace(result, "idempotence violated", &input_dbg)
     }
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Trace) -> TestResult);
 }
 
 #[test]
 fn prop_recovering_memory_direct_trace() {
-    fn property(trace: DirectTrace) -> bool {
-        executor::block_on(value_test_suite::run_direct_trace(
+    fn property(trace: DirectTrace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(value_test_suite::run_direct_trace(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
-        ))
-        .unwrap_or(false)
+        ));
+        finish_trace(result, "direct-mode invariant violated", &input_dbg)
     }
-    QuickCheck::new().quickcheck(property as fn(DirectTrace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(DirectTrace) -> TestResult);
 }
 
 #[test]
 fn prop_recovering_memory_crash_committed() {
-    fn property(trace: Trace) -> bool {
-        executor::block_on(value_test_suite::run_trace_with_policy(
+    fn property(trace: Trace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(value_test_suite::run_trace_with_policy(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
             OraclePolicy::AlwaysCommitted,
-        ))
-        .unwrap_or(false)
+        ));
+        finish_trace(result, "model mismatch", &input_dbg)
     }
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Trace) -> TestResult);
 }
 
 #[test]
 fn prop_recovering_memory_crash_not_committed() {
-    fn property(trace: Trace) -> bool {
-        executor::block_on(value_test_suite::run_trace_with_policy(
+    fn property(trace: Trace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(value_test_suite::run_trace_with_policy(
             recovering_memory(MockOracle::always_not_committed()),
             MemoryDirtyValueStore::new,
             trace,
             OraclePolicy::AlwaysNotCommitted,
-        ))
-        .unwrap_or(false)
+        ));
+        finish_trace(result, "model mismatch", &input_dbg)
     }
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Trace) -> TestResult);
 }
 
 // ---- TTL-recording test double ---------------------------------------------
@@ -1041,14 +1020,14 @@ impl ValueStore for TtlRecordingDurable {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         self.inner.get(collection).await
     }
 
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.inner.set(collection, payload).await
     }
@@ -1172,7 +1151,7 @@ impl ValueStore for FailingApplyDurable {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         self.inner
             .get(collection)
             .await
@@ -1182,7 +1161,7 @@ impl ValueStore for FailingApplyDurable {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.inner
             .set(collection, payload)

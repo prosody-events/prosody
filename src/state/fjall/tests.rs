@@ -23,9 +23,11 @@ use crate::state::pending::PendingIndexStore;
 use crate::state::production::ProductionValueDurable;
 use crate::state::recovering::RecoveringValueStore;
 use crate::state::value::{
-    DurableWalStore, PendingOpSource, StoredPayload, TransactionValueStore, ValueKind, ValueStore,
+    DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind, ValueStore,
 };
-use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, collection_ref, inline};
+use crate::state::value_test_suite::{
+    self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
+};
 use crate::state::{
     CollectionId, CommitDecision, CommitMode, EventRef, EventScopeId, Read, StateKey, StateName,
     StateType, StoreOutcome,
@@ -95,7 +97,7 @@ async fn cache_get_returns_unknown_on_missing_key() -> Result<()> {
 async fn cache_set_then_get_returns_present() -> Result<()> {
     let (_dir, cache) = make_cache()?;
     let id = collection_id("present")?;
-    let payload = inline(9);
+    let payload = bytes(9);
     cache.set(&id, payload.clone()).await?;
     assert_eq!(cache.get(&id).await?, Read::Present(payload));
     Ok(())
@@ -114,17 +116,17 @@ async fn cache_clear_then_get_returns_absent() -> Result<()> {
 async fn cache_set_then_clear_then_get_returns_absent() -> Result<()> {
     let (_dir, cache) = make_cache()?;
     let id = collection_id("toggled")?;
-    cache.set(&id, inline(1)).await?;
+    cache.set(&id, bytes(1)).await?;
     cache.clear(&id).await?;
     assert_eq!(cache.get(&id).await?, Read::Absent);
     Ok(())
 }
 
 #[tokio::test]
-async fn cache_present_with_inline_empty_bytes_round_trips() -> Result<()> {
+async fn cache_present_with_empty_bytes_round_trips() -> Result<()> {
     let (_dir, cache) = make_cache()?;
-    let id = collection_id("empty-inline")?;
-    let payload = StoredPayload::Inline(Bytes::new());
+    let id = collection_id("empty-cell")?;
+    let payload = Bytes::new();
     cache.set(&id, payload.clone()).await?;
     assert_eq!(cache.get(&id).await?, Read::Present(payload));
     Ok(())
@@ -141,7 +143,7 @@ async fn cache_populated_on_miss() -> Result<()> {
     let (_dir, cache) = make_cache()?;
     let backing = MemoryDurableValueStore::for_tests();
     let id = collection_id("populated")?;
-    let payload = inline(3);
+    let payload = bytes(3);
     backing.set(&id, payload.clone()).await?;
 
     let layered = LayeredValueStore::new(cache.clone(), backing);
@@ -164,7 +166,7 @@ async fn cache_patched_after_apply_sealed() -> Result<()> {
     let layered = LayeredValueStore::new(cache.clone(), backing);
     let mut tx = TransactionValueStore::new(layered, dirty, collection, event(1), CommitMode::Wal);
 
-    let payload = inline(11);
+    let payload = bytes(11);
     tx.set(&collection_id, payload.clone())
         .await
         .map_err(into_eyre)?;
@@ -191,7 +193,7 @@ async fn cache_patched_after_direct_apply() -> Result<()> {
     let mut tx =
         TransactionValueStore::new(layered, dirty, collection, event(2), CommitMode::Direct);
 
-    let payload = inline(22);
+    let payload = bytes(22);
     tx.set(&collection_id, payload.clone())
         .await
         .map_err(into_eyre)?;
@@ -212,7 +214,7 @@ async fn cache_untouched_after_seal() -> Result<()> {
     let layered = LayeredValueStore::new(cache.clone(), backing);
     let mut tx = TransactionValueStore::new(layered, dirty, collection, event(3), CommitMode::Wal);
 
-    let payload = inline(33);
+    let payload = bytes(33);
     tx.set(&collection_id, payload).await.map_err(into_eyre)?;
     tx.seal().await.map_err(into_eyre)?;
 
@@ -231,7 +233,7 @@ async fn cache_untouched_after_rollback_sealed() -> Result<()> {
     let layered = LayeredValueStore::new(cache.clone(), backing);
     let mut tx = TransactionValueStore::new(layered, dirty, collection, event(4), CommitMode::Wal);
 
-    let payload = inline(44);
+    let payload = bytes(44);
     tx.set(&collection_id, payload).await.map_err(into_eyre)?;
     tx.seal().await.map_err(into_eyre)?;
     let outcome = tx.rollback_sealed().await.map_err(into_eyre)?;
@@ -254,7 +256,7 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
     // Direct call to set: the backing succeeds, the cache fails — the
     // outer call must still report success.
     layered
-        .set(&collection_id, inline(5))
+        .set(&collection_id, bytes(5))
         .await
         .map_err(into_eyre)?;
 
@@ -262,7 +264,7 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
     // a best-effort invalidation. We do not assert the cache reads
     // anything specific — we assert the operation succeeded despite the
     // cache failure and that the backing applied the write.
-    assert_eq!(backing.get(&collection_id).await?, Read::Present(inline(5)));
+    assert_eq!(backing.get(&collection_id).await?, Read::Present(bytes(5)));
     assert!(
         cache.set_was_attempted(),
         "cache.set should have been attempted"
@@ -279,23 +281,6 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
 // These use `TEST_RUNTIME.block_on` (not `futures::executor::block_on`)
 // because every fjall call goes through `tokio::task::spawn_blocking`,
 // which needs a Tokio runtime in scope.
-
-/// Maps a property-trace outcome to a [`TestResult`], keeping a store/runtime
-/// error (`Err`) distinct from a falsified property (`Ok(false)`) so a
-/// swallowed backend failure can never masquerade as a falsified property.
-/// `falsified` is the diagnostic shown when the property does not hold (e.g.
-/// `"model mismatch"`, `"idempotence violated"`).
-fn finish_trace<E: fmt::Debug>(
-    result: Result<bool, E>,
-    falsified: &str,
-    input_dbg: &str,
-) -> TestResult {
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!("{falsified}.\nFailing input:\n{input_dbg}")),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
-}
 
 /// Builds a fresh fjall cache, runs `run` against it, and maps the outcome to a
 /// [`TestResult`] — folding the `make_cache` setup, the `"cache setup failed"`
@@ -442,8 +427,8 @@ fn layered_parity_property(trace: F6Trace) -> TestResult {
             for op in &ops {
                 match op {
                     CacheOp::Set(byte) => {
-                        layered.set(&id, inline(*byte)).await?;
-                        reference.set(&id, inline(*byte)).await?;
+                        layered.set(&id, bytes(*byte)).await?;
+                        reference.set(&id, bytes(*byte)).await?;
                     }
                     CacheOp::Clear => {
                         layered.clear(&id).await?;
@@ -670,14 +655,14 @@ impl ValueStore for FaultyCache {
     async fn get<'a>(
         &'a self,
         _collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         Ok(Read::Unknown)
     }
 
     async fn set<'a>(
         &'a self,
         _collection: &'a CollectionId<ValueKind>,
-        _payload: StoredPayload,
+        _payload: Bytes,
     ) -> Result<(), Self::Error> {
         *self.inner.set_calls.lock() += 1;
         Err(FaultyError::Injected)
@@ -710,7 +695,7 @@ impl ClassifyError for FaultyError {
 async fn fjall_dirty_set_then_get_returns_present() -> Result<()> {
     let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("present")?;
-    let payload = inline(7);
+    let payload = bytes(7);
     dirty.set(&id, payload.clone()).await?;
     assert_eq!(dirty.get(&id).await?, Read::Present(payload));
     Ok(())
@@ -737,15 +722,15 @@ async fn fjall_dirty_untouched_collection_returns_unknown() -> Result<()> {
 async fn fjall_dirty_two_sets_compact_to_one_op() -> Result<()> {
     let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("multi")?;
-    dirty.set(&id, inline(1)).await?;
-    dirty.set(&id, inline(2)).await?;
+    dirty.set(&id, bytes(1)).await?;
+    dirty.set(&id, bytes(2)).await?;
     // Last-writer-wins: the second set obviates the first, so the overlay
     // holds exactly one compacted op and the visible value is the latest.
     let pending = dirty
         .pending_ops(&id)?
         .ok_or_else(|| eyre::eyre!("expected Some(pending)"))?;
     assert_eq!(pending.count.get(), 1);
-    assert_eq!(dirty.get(&id).await?, Read::Present(inline(2)));
+    assert_eq!(dirty.get(&id).await?, Read::Present(bytes(2)));
     Ok(())
 }
 
@@ -753,8 +738,8 @@ async fn fjall_dirty_two_sets_compact_to_one_op() -> Result<()> {
 async fn fjall_dirty_clear_pending_ops_removes_overlay() -> Result<()> {
     let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("drained")?;
-    dirty.set(&id, inline(1)).await?;
-    dirty.set(&id, inline(2)).await?;
+    dirty.set(&id, bytes(1)).await?;
+    dirty.set(&id, bytes(2)).await?;
     dirty.clear_pending_ops(&id)?;
     assert!(dirty.pending_ops(&id)?.is_none());
     assert_eq!(dirty.get(&id).await?, Read::Unknown);
@@ -774,8 +759,8 @@ async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
     let dirty_b = FjallDirtyValueStore::new(overlay, scope_b);
 
     let id = collection_id("shared")?;
-    dirty_a.set(&id, inline(9)).await?;
-    assert_eq!(dirty_a.get(&id).await?, Read::Present(inline(9)));
+    dirty_a.set(&id, bytes(9)).await?;
+    assert_eq!(dirty_a.get(&id).await?, Read::Present(bytes(9)));
     assert_eq!(dirty_b.get(&id).await?, Read::Unknown);
     assert!(dirty_b.pending_ops(&id)?.is_none());
     Ok(())

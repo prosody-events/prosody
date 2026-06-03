@@ -14,7 +14,8 @@
 //! 4. Fold equivalence: `fold_value_ops(None, pending_ops().ops)` converted to
 //!    `Read<T>` equals `get()`.
 
-use super::value::{PendingOpSource, StoredPayload, ValueStore, fold_value_ops};
+use super::value::{PendingOpSource, ValueStore, fold_value_ops};
+use super::value_test_suite::bytes;
 use super::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
@@ -58,7 +59,7 @@ where
     for op in trace.ops {
         match op {
             DirtyTraceOp::Set(byte) => {
-                let payload = inline(byte);
+                let payload = bytes(byte);
                 store.set(&collection, payload.clone()).await?;
                 overlay = Read::Present(payload);
             }
@@ -84,7 +85,7 @@ where
 async fn check_invariants<S>(
     store: &S,
     collection: &CollectionId<ValueKind>,
-    overlay: &Read<StoredPayload>,
+    overlay: &Read<Bytes>,
 ) -> Result<bool>
 where
     S: DirtyStore,
@@ -110,7 +111,7 @@ where
             return Ok(false);
         }
         let folded = fold_value_ops(None, p.ops.collect::<Vec<_>>().iter());
-        let folded_read: Read<StoredPayload> = folded.map_or(Read::Absent, Read::Present);
+        let folded_read: Read<Bytes> = folded.map_or(Read::Absent, Read::Present);
         if folded_read != read {
             return Ok(false);
         }
@@ -125,10 +126,6 @@ fn collection_id() -> Result<CollectionId<ValueKind>> {
         StateType::Application,
         StateName::try_new("profile")?,
     ))
-}
-
-fn inline(value: u8) -> StoredPayload {
-    StoredPayload::Inline(Bytes::from(vec![value]))
 }
 
 /// Drives the same trace against `lhs` and `rhs` and asserts they remain
@@ -147,7 +144,7 @@ where
     for op in trace.ops {
         match op {
             DirtyTraceOp::Set(byte) => {
-                let payload = inline(byte);
+                let payload = bytes(byte);
                 lhs.set(&collection, payload.clone()).await?;
                 rhs.set(&collection, payload).await?;
             }

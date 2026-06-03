@@ -13,8 +13,8 @@ use crate::state::cassandra::error::CorruptUdtError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::memory::MemoryDirtyValueStore;
 use crate::state::pending::PendingIndexStore;
-use crate::state::value::{DurableWalStore, StoredPayload, ValueOp, ValueStore};
-use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, collection_ref, inline};
+use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
+use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref};
 use crate::state::{CollectionId, DurableState, EventRef, StateType, ValueKind};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
@@ -156,7 +156,7 @@ async fn event_mismatch_returns_typed_error() -> Result<()> {
         .seal(
             &collection,
             event_a,
-            vec![ValueOp::Set { payload: inline(1) }],
+            vec![ValueOp::Set { payload: bytes(1) }],
         )
         .await?;
 
@@ -203,6 +203,16 @@ async fn state_recovery_sweeps_stale_pending_row() -> Result<()> {
     init_test_logging();
     let store = setup_value_store().await?;
     value_test_suite::run_stale_pending_index(store).await
+}
+
+/// N7/N8 (Cassandra): the shared durable descriptor-identity acquisition
+/// check against the real descriptor table (fresh `segment_id` per run).
+/// Mirrors the memory invocation in `state::tests`.
+#[tokio::test]
+async fn cassandra_descriptor_identity_acquisition() -> Result<()> {
+    init_test_logging();
+    let store = setup_value_store().await?;
+    value_test_suite::run_descriptor_identity_acquisition(store).await
 }
 
 #[tokio::test]
@@ -331,9 +341,7 @@ async fn set_with_default_ttl_some_writes_via_ttl_arm() -> Result<()> {
     init_test_logging();
     let store = setup_value_store_with_ttl(TEST_TTL).await?;
     let id = collection_ref()?.id().clone();
-    store
-        .set(&id, StoredPayload::Inline(Bytes::from_static(b"x")))
-        .await?;
+    store.set(&id, Bytes::from_static(b"x")).await?;
     Ok(())
 }
 
@@ -346,8 +354,6 @@ async fn set_with_default_ttl_none_writes_via_no_ttl_arm() -> Result<()> {
     init_test_logging();
     let store = setup_value_store_with_ttl(None).await?;
     let id = collection_ref()?.id().clone();
-    store
-        .set(&id, StoredPayload::Inline(Bytes::from_static(b"x")))
-        .await?;
+    store.set(&id, Bytes::from_static(b"x")).await?;
     Ok(())
 }

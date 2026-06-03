@@ -2,20 +2,13 @@ use super::encoding::{
     EncodableOp, EncodingError, PayloadEncoding, WalFormat, decode_payload, decode_wal,
     encode_payload, encode_wal, raw_wal_blob_for_test,
 };
-use super::value::{KafkaMessageRef, StoredPayload, ValueKind, ValueOp};
+use super::value::{ValueKind, ValueOp};
 use super::{CollectionKind, CollectionKindId, NonEmptyOps, WalBlob, WalEnvelope};
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde::Serialize;
 use std::num::NonZeroU64;
-
-const TOPIC_POOL: &[&str] = &[
-    "orders.v1",
-    "billing.events",
-    "telemetry",
-    "shipments.outbound",
-];
 
 /// A hand-rolled WAL header, serialized to craft inputs the production
 /// encoder would never emit (a zero `op_count`, an unsupported `version`).
@@ -45,9 +38,9 @@ struct ArbPayloadEncoding(PayloadEncoding);
 impl Arbitrary for ArbPayloadEncoding {
     fn arbitrary(g: &mut Gen) -> Self {
         Self(if bool::arbitrary(g) {
-            PayloadEncoding::MsgpackV1
+            PayloadEncoding::RawV1
         } else {
-            PayloadEncoding::MsgpackZstdV1
+            PayloadEncoding::RawZstdV1
         })
     }
 }
@@ -66,43 +59,13 @@ impl Arbitrary for ArbWalFormat {
 }
 
 #[derive(Clone, Debug)]
-struct ArbKafkaMessageRef(KafkaMessageRef);
-
-impl Arbitrary for ArbKafkaMessageRef {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let topic_name = g.choose(TOPIC_POOL).copied().unwrap_or(TOPIC_POOL[0]);
-        Self(KafkaMessageRef {
-            topic: crate::Topic::from(topic_name),
-            partition: i32::arbitrary(g),
-            offset: i64::arbitrary(g),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ArbStoredPayload(StoredPayload);
-
-impl Arbitrary for ArbStoredPayload {
-    fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            let bytes = Vec::<u8>::arbitrary(g);
-            Self(StoredPayload::Inline(Bytes::from(bytes)))
-        } else {
-            Self(StoredPayload::KafkaMessage(
-                ArbKafkaMessageRef::arbitrary(g).0,
-            ))
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 struct ArbValueOp(ValueOp);
 
 impl Arbitrary for ArbValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
         if bool::arbitrary(g) {
             Self(ValueOp::Set {
-                payload: ArbStoredPayload::arbitrary(g).0,
+                payload: Bytes::from(Vec::<u8>::arbitrary(g)),
             })
         } else {
             Self(ValueOp::Clear)
@@ -126,18 +89,18 @@ impl Arbitrary for ArbValueEnvelope {
 
 #[test]
 fn prop_payload_roundtrip() {
-    fn property(payload: ArbStoredPayload, encoding: ArbPayloadEncoding) -> bool {
-        let ArbStoredPayload(payload) = payload;
-        let Ok(bytes) = encode_payload(&payload, encoding.0) else {
+    fn property(payload: Vec<u8>, encoding: ArbPayloadEncoding) -> bool {
+        let payload = Bytes::from(payload);
+        let Ok(encoded) = encode_payload(&payload, encoding.0) else {
             return false;
         };
-        let Ok(decoded) = decode_payload::<StoredPayload>(&bytes, encoding.0) else {
+        let Ok(decoded) = decode_payload(&encoded, encoding.0) else {
             return false;
         };
         decoded == payload
     }
 
-    QuickCheck::new().quickcheck(property as fn(ArbStoredPayload, ArbPayloadEncoding) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, ArbPayloadEncoding) -> bool);
 }
 
 #[test]
@@ -163,7 +126,9 @@ fn prop_wal_roundtrip() {
 fn prop_unknown_payload_encoding() {
     fn property(value: i16) -> bool {
         match value {
-            1 | 2 => PayloadEncoding::try_from_i16(value).is_ok(),
+            3 | 4 => PayloadEncoding::try_from_i16(value).is_ok(),
+            // Includes the retired MsgPack discriminants 1/2: stale cells
+            // fail loudly as UnknownPayloadEncoding (Permanent).
             other => matches!(
                 PayloadEncoding::try_from_i16(value),
                 Err(EncodingError::UnknownPayloadEncoding(got)) if got == other
@@ -292,9 +257,9 @@ fn wal_unsupported_header_version_is_rejected() -> Result<()> {
 
 #[test]
 fn zstd_payload_at_most_plain_size_on_compressible_input() -> Result<()> {
-    let inline = StoredPayload::Inline(Bytes::from(vec![0_u8; 4096]));
-    let raw = encode_payload(&inline, PayloadEncoding::MsgpackV1)?;
-    let compressed = encode_payload(&inline, PayloadEncoding::MsgpackZstdV1)?;
+    let payload = Bytes::from(vec![0_u8; 4096]);
+    let raw = encode_payload(&payload, PayloadEncoding::RawV1)?;
+    let compressed = encode_payload(&payload, PayloadEncoding::RawZstdV1)?;
     assert!(
         compressed.len() <= raw.len(),
         "expected compressed payload to be at most plain size: {} vs {}",
@@ -302,6 +267,57 @@ fn zstd_payload_at_most_plain_size_on_compressible_input() -> Result<()> {
         raw.len()
     );
     Ok(())
+}
+
+/// N9 (WAL path): an old-shape `Set` op whose `payload` was the retired
+/// adjacently-tagged `StoredPayload` enum (a `MsgPack` map) must fail
+/// loudly against the new `ValueOp` (whose `payload` is raw bytes) —
+/// `BadMsgPack` ⇒ Permanent, never a silent mis-decode.
+///
+/// The *cell* path has no analogous loud decode failure: a raw-`Bytes`
+/// cell accepts any tail. Stale cells are instead rejected by the
+/// durable descriptor-identity acquisition
+/// (`run_descriptor_identity_acquisition` Invariant 2) and by the
+/// retired `PayloadEncoding` discriminants 1/2 failing
+/// `UnknownPayloadEncoding` (see `prop_unknown_payload_encoding`).
+#[test]
+fn stale_enum_wal_ops_fail_permanent() -> Result<()> {
+    use crate::error::{ClassifyError, ErrorCategory};
+
+    #[derive(Serialize)]
+    #[serde(tag = "v", content = "d", rename_all = "snake_case")]
+    enum LegacyStoredPayload {
+        Inline(Bytes),
+    }
+
+    #[derive(Serialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    enum LegacyValueOp {
+        Set { payload: LegacyStoredPayload },
+    }
+
+    let header = CraftedHeader {
+        version: 1,
+        kind: CollectionKindId::Value,
+        op_count: 1,
+    };
+    let mut raw = rmp_serde::to_vec_named(&header)?;
+    raw.extend(rmp_serde::to_vec_named(&LegacyValueOp::Set {
+        payload: LegacyStoredPayload::Inline(Bytes::from_static(b"stale")),
+    })?);
+    let blob: WalBlob<ValueKind> = WalBlob::new(Bytes::from(raw), WalFormat::MsgpackStreamV1);
+
+    match decode_wal::<ValueKind>(&blob) {
+        Err(error @ EncodingError::BadMsgPack(_)) => {
+            assert_eq!(
+                error.classify_error(),
+                ErrorCategory::Permanent,
+                "stale WAL bytes must classify Permanent"
+            );
+            Ok(())
+        }
+        other => Err(eyre::eyre!("expected BadMsgPack, got {other:?}")),
+    }
 }
 
 #[test]

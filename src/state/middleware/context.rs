@@ -1,77 +1,26 @@
-//! Keyed-state context, value handle, and the access/bundle traits.
+//! Keyed-state context, the byte-handle substrate, and the bundle traits.
 
 use super::registry::CollectionDefRegistry;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::{KafkaMessageRef, StateDescriptor};
 use crate::state::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, TransactionValueStore,
+    DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore,
     TransactionValueStoreError, ValueKind, ValueStore,
 };
 use crate::state::{
-    CollectionId, CollectionRef, CommitMode, EventRef, Read, StateKey, StateName, StateNameError,
-    StateType, StoreOutcome,
+    CollectionId, CollectionRef, CommitMode, EventRef, Read, StateKey, StateName, StateType,
+    StoreOutcome,
 };
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
+use crate::{Offset, Partition, Topic};
+use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
-
-/// Extension trait on [`EventContext`] that exposes keyed-state access.
-///
-/// Handlers that want to read or write Value collections add
-/// `+ KeyedStateAccess` to their context bound. The middleware's wrapped
-/// context [`KeyedStateContext`] satisfies this trait; unwrapped contexts
-/// (e.g. [`crate::consumer::event_context::TimerContext`]) do not.
-pub trait KeyedStateAccess: EventContext {
-    /// Concrete handle returned by [`Self::value`].
-    type ValueHandle: ValueAccessor;
-
-    /// Error returned by [`Self::value`] when the requested handle cannot
-    /// be constructed (e.g. the collection name was empty).
-    type ValueError: ClassifyError + Error + Send + Sync + 'static;
-
-    /// Returns a Value handle bound to the collection identified by
-    /// `name` for the current event scope.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `name` is empty or the handle cannot be
-    /// allocated.
-    fn value(&self, name: &str) -> Result<Self::ValueHandle, Self::ValueError>;
-}
-
-/// Handler-facing operations on a Value collection.
-///
-/// Returned by [`KeyedStateAccess::value`].
-pub trait ValueAccessor: Clone + Send + Sync {
-    /// Error type for value operations.
-    type Error: ClassifyError + Error + Send + Sync + 'static;
-
-    /// Reads the current visible value.
-    fn get(&self) -> impl Future<Output = Result<Option<StoredPayload>, Self::Error>> + Send;
-
-    /// Buffers a set operation for this collection.
-    fn set(&self, payload: StoredPayload) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Buffers a clear operation for this collection.
-    fn clear(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Drains buffered ops directly to authoritative state and returns
-    /// the transaction to `Clean`.
-    ///
-    /// Mirrors the design's `Dirty → flush() → Clean` and
-    /// `Clean → flush() → Clean` transitions: the visible state observed
-    /// before flush is durable afterwards. `flush()` from the
-    /// [`crate::state::CommitMode::Wal`] `Sealed` phase is illegal and
-    /// surfaces [`crate::state::value::TransactionValueStoreError::AlreadySealed`].
-    fn flush(&self) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send;
-}
 
 /// Bundle bound for the dirty Value store the middleware composes with.
 ///
@@ -114,17 +63,45 @@ impl<T> DurableValueBundle for T where
 {
 }
 
-/// Shared per-event transaction handle for a single Value collection.
+/// Event-scope marker for timer handlers.
+///
+/// Carries nothing: a timer event has no Kafka coordinates, so
+/// [`KeyedStateContext::message_ref`] does not exist on timer-scoped
+/// contexts — referencing it is a compile error, not a runtime one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimerScope;
+
+/// Event-scope marker for message handlers: the Kafka coordinates of the
+/// message being processed.
+#[derive(Clone, Copy, Debug)]
+pub struct MessageScope {
+    topic: Topic,
+    partition: Partition,
+    offset: Offset,
+}
+
+impl MessageScope {
+    pub(super) fn new(topic: Topic, partition: Partition, offset: Offset) -> Self {
+        Self {
+            topic,
+            partition,
+            offset,
+        }
+    }
+}
+
+/// Shared per-event byte-transaction handle for a single Value collection —
+/// the substrate every typed descriptor handle wraps.
 ///
 /// Multiple `KeyedStateContext` clones share the inner `Arc<Mutex<...>>` so
-/// repeated `ctx.value(name)` calls in the same handler return handles that
-/// accumulate ops into the same transaction.
-pub struct ValueHandle<D, S> {
+/// repeated bindings of the same collection in one handler return handles
+/// that accumulate ops into the same transaction.
+pub(crate) struct ByteValueHandle<D, S> {
     tx: Arc<AsyncMutex<TransactionValueStore<D, S>>>,
     collection: CollectionId<ValueKind>,
 }
 
-impl<D, S> Clone for ValueHandle<D, S> {
+impl<D, S> Clone for ByteValueHandle<D, S> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -133,17 +110,13 @@ impl<D, S> Clone for ValueHandle<D, S> {
     }
 }
 
-impl<D, S> ValueAccessor for ValueHandle<D, S>
+impl<D, S> ByteValueHandle<D, S>
 where
     D: DurableValueBundle,
     S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    type Error = TransactionValueStoreError<
-        <S as ValueStore>::Error,
-        <D as DurableWalStore<ValueKind>>::Error,
-    >;
-
-    async fn get(&self) -> Result<Option<StoredPayload>, Self::Error> {
+    /// Reads the current visible cell bytes.
+    pub(crate) async fn get(&self) -> Result<Option<Bytes>, ContextTxError<D, S>> {
         let guard = self.tx.lock().await;
         let read = guard.get(&self.collection).await?;
         Ok(match read {
@@ -152,17 +125,27 @@ where
         })
     }
 
-    async fn set(&self, payload: StoredPayload) -> Result<(), Self::Error> {
+    /// Buffers a set operation for this collection.
+    pub(crate) async fn set(&self, payload: Bytes) -> Result<(), ContextTxError<D, S>> {
         let guard = self.tx.lock().await;
         guard.set(&self.collection, payload).await
     }
 
-    async fn clear(&self) -> Result<(), Self::Error> {
+    /// Buffers a clear operation for this collection.
+    pub(crate) async fn clear(&self) -> Result<(), ContextTxError<D, S>> {
         let guard = self.tx.lock().await;
         guard.clear(&self.collection).await
     }
 
-    async fn flush(&self) -> Result<StoreOutcome, Self::Error> {
+    /// Drains buffered ops directly to authoritative state and returns
+    /// the transaction to `Clean`.
+    ///
+    /// Mirrors the design's `Dirty → flush() → Clean` and
+    /// `Clean → flush() → Clean` transitions: the visible state observed
+    /// before flush is durable afterwards. `flush()` from the
+    /// [`crate::state::CommitMode::Wal`] `Sealed` phase is illegal and
+    /// surfaces [`crate::state::value::TransactionValueStoreError::AlreadySealed`].
+    pub(crate) async fn flush(&self) -> Result<StoreOutcome, ContextTxError<D, S>> {
         let mut guard = self.tx.lock().await;
         guard.flush().await
     }
@@ -177,34 +160,43 @@ struct ContextInner<D, S> {
 pub(super) type ContextTxError<D, S> =
     TransactionValueStoreError<<S as ValueStore>::Error, <D as DurableWalStore<ValueKind>>::Error>;
 
-/// Wraps an inner [`EventContext`] with keyed-state access.
+/// Wraps an inner [`EventContext`] with typed keyed-state access.
 ///
 /// One [`KeyedStateContext`] is constructed per handler invocation by
 /// [`KeyedStateMiddleware`](super::KeyedStateMiddleware). Clones share the
-/// inner transaction map so
-/// repeated `ctx.value(name)` calls return handles that accumulate into
-/// the same transaction.
-pub struct KeyedStateContext<C, D, S> {
+/// inner transaction map so repeated [`Self::state`] bindings of the same
+/// collection accumulate into the same transaction.
+///
+/// `L` is the message loader Kafka-message handles resolve through;
+/// `Scope` is [`MessageScope`] or [`TimerScope`], gating
+/// [`Self::message_ref`] at the type level.
+pub struct KeyedStateContext<C, D, S, L, Scope> {
     inner: C,
     durable: D,
     dirty: S,
+    loader: L,
+    scope: Scope,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     pub(super) event: EventRef,
     ctx: Arc<ContextInner<D, S>>,
 }
 
-impl<C, D, S> Clone for KeyedStateContext<C, D, S>
+impl<C, D, S, L, Scope> Clone for KeyedStateContext<C, D, S, L, Scope>
 where
     C: Clone,
     D: Clone,
     S: Clone,
+    L: Clone,
+    Scope: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             durable: self.durable.clone(),
             dirty: self.dirty.clone(),
+            loader: self.loader.clone(),
+            scope: self.scope.clone(),
             registry: self.registry.clone(),
             state_key: self.state_key.clone(),
             event: self.event,
@@ -213,24 +205,41 @@ where
     }
 }
 
-impl<C, D, S> KeyedStateContext<C, D, S>
+/// Construction parameters for [`KeyedStateContext`], bundled so the
+/// constructor stays readable as the context grows.
+pub(crate) struct ContextParts<C, D, S, L, Scope> {
+    pub(crate) inner: C,
+    pub(crate) durable: D,
+    pub(crate) dirty: S,
+    pub(crate) loader: L,
+    pub(crate) scope: Scope,
+    pub(crate) registry: Arc<CollectionDefRegistry>,
+    pub(crate) state_key: StateKey,
+    pub(crate) event: EventRef,
+}
+
+impl<C, D, S, L, Scope> KeyedStateContext<C, D, S, L, Scope>
 where
-    C: EventContext,
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
+    D: Clone,
+    S: Clone,
 {
-    pub(super) fn new(
-        inner: C,
-        durable: D,
-        dirty: S,
-        registry: Arc<CollectionDefRegistry>,
-        state_key: StateKey,
-        event: EventRef,
-    ) -> Self {
+    pub(crate) fn new(parts: ContextParts<C, D, S, L, Scope>) -> Self {
+        let ContextParts {
+            inner,
+            durable,
+            dirty,
+            loader,
+            scope,
+            registry,
+            state_key,
+            event,
+        } = parts;
         Self {
             inner,
             durable,
             dirty,
+            loader,
+            scope,
             registry,
             state_key,
             event,
@@ -238,6 +247,32 @@ where
                 transactions: SyncMutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Binds `descriptor` to this event scope, returning its typed handle.
+    ///
+    /// Repeated bindings of the same collection in one handler share the
+    /// per-event transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the descriptor's bind error when the collection is
+    /// unregistered or asserts a different structural identity.
+    pub fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle, DESC::Error>
+    where
+        DESC: StateDescriptor<Self>,
+    {
+        descriptor.bind(self)
+    }
+
+    /// Returns the registered collections for descriptor validation.
+    pub(crate) fn registry(&self) -> &CollectionDefRegistry {
+        &self.registry
+    }
+
+    /// Returns the loader Kafka-message handles resolve through.
+    pub(crate) fn loader(&self) -> &L {
+        &self.loader
     }
 
     fn collection_id_for(&self, name: &StateName) -> CollectionId<ValueKind> {
@@ -268,6 +303,40 @@ where
         handle
     }
 
+    /// Returns the byte-level handle for `name`, opening (or joining) the
+    /// per-event transaction for that collection.
+    ///
+    /// Internal substrate — typed access goes through descriptors.
+    pub(crate) fn byte_handle(&self, name: &StateName) -> ByteValueHandle<D, S> {
+        ByteValueHandle {
+            tx: self.open_transaction(name),
+            collection: self.collection_id_for(name),
+        }
+    }
+}
+
+impl<C, D, S, L> KeyedStateContext<C, D, S, L, MessageScope> {
+    /// Returns the durable reference to the message this handler is
+    /// processing — the production source of a [`KafkaMessageRef`] for
+    /// Kafka-message collections.
+    ///
+    /// Exists only on message-scoped contexts; timer handlers cannot name
+    /// it.
+    #[must_use]
+    pub fn message_ref(&self) -> KafkaMessageRef {
+        KafkaMessageRef {
+            topic: self.scope.topic,
+            partition: self.scope.partition,
+            offset: self.scope.offset,
+        }
+    }
+}
+
+impl<C, D, S, L, Scope> KeyedStateContext<C, D, S, L, Scope>
+where
+    D: DurableValueBundle,
+    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
+{
     /// Walks every dirty collection and dispatches based on its
     /// per-collection commit mode. `Wal` collections seal; `Direct`
     /// collections direct-apply. Returns the WAL-sealed list so the
@@ -305,11 +374,13 @@ where
     }
 }
 
-impl<C, D, S> TerminationSignals for KeyedStateContext<C, D, S>
+impl<C, D, S, L, Scope> TerminationSignals for KeyedStateContext<C, D, S, L, Scope>
 where
-    C: EventContext + Clone + Send + Sync,
-    D: Clone + Send + Sync,
-    S: Clone + Send + Sync,
+    C: EventContext,
+    D: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
+    Scope: Clone + Send + Sync + 'static,
 {
     fn is_shutdown(&self) -> bool {
         self.inner.is_shutdown()
@@ -328,11 +399,13 @@ where
     }
 }
 
-impl<C, D, S> EventContext for KeyedStateContext<C, D, S>
+impl<C, D, S, L, Scope> EventContext for KeyedStateContext<C, D, S, L, Scope>
 where
-    C: EventContext + Clone + Send + Sync,
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
+    C: EventContext,
+    D: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
+    Scope: Clone + Send + Sync + 'static,
 {
     type Error = C::Error;
 
@@ -389,41 +462,5 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
         self.inner.scheduled(timer_type)
-    }
-}
-
-impl<C, D, S> KeyedStateAccess for KeyedStateContext<C, D, S>
-where
-    C: EventContext + Clone + Send + Sync,
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
-{
-    type ValueError = KeyedStateAccessError;
-    type ValueHandle = ValueHandle<D, S>;
-
-    fn value(&self, name: &str) -> Result<Self::ValueHandle, Self::ValueError> {
-        let parsed = StateName::try_new(name)?;
-        let tx = self.open_transaction(&parsed);
-        let collection_id = self.collection_id_for(&parsed);
-        Ok(ValueHandle {
-            tx,
-            collection: collection_id,
-        })
-    }
-}
-
-/// Error returned by [`KeyedStateAccess::value`].
-#[derive(Debug, Error)]
-pub enum KeyedStateAccessError {
-    /// The collection name was empty or invalid.
-    #[error(transparent)]
-    Name(#[from] StateNameError),
-}
-
-impl ClassifyError for KeyedStateAccessError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Name(e) => e.classify_error(),
-        }
     }
 }

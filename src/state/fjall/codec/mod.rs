@@ -30,7 +30,7 @@
 
 use super::error::FjallValueStoreError;
 use crate::state::encoding::{PayloadEncoding, decode_payload, encode_payload};
-use crate::state::value::{StoredPayload, ValueKind};
+use crate::state::value::ValueKind;
 use crate::state::{CollectionId, CollectionKind, EventScopeId, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128;
@@ -42,7 +42,7 @@ const CACHE_TAG_ABSENT: u8 = 0x00;
 const CACHE_TAG_PRESENT: u8 = 0x01;
 
 /// Payload encoding used for cached `Present` cells.
-const CACHE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackZstdV1;
+const CACHE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::RawZstdV1;
 
 /// Returns the 16-byte collection prefix for a typed collection identity.
 ///
@@ -81,12 +81,12 @@ pub fn encode_absent_cell() -> Bytes {
     Bytes::from_static(&[CACHE_TAG_ABSENT])
 }
 
-/// Encodes a `Present` cache cell from a stored payload.
+/// Encodes a `Present` cache cell from raw payload bytes.
 ///
 /// # Errors
 ///
 /// Returns [`FjallValueStoreError::Encoding`] when payload encoding fails.
-pub fn encode_present_cell(payload: &StoredPayload) -> Result<Bytes, FjallValueStoreError> {
+pub fn encode_present_cell(payload: &Bytes) -> Result<Bytes, FjallValueStoreError> {
     let payload_bytes = encode_payload(payload, CACHE_PAYLOAD_ENCODING)?;
     let mut buf = Vec::with_capacity(1 + payload_bytes.len());
     buf.push(CACHE_TAG_PRESENT);
@@ -101,14 +101,14 @@ pub fn encode_present_cell(payload: &StoredPayload) -> Result<Bytes, FjallValueS
 ///   by passing `None` here).
 /// - `Ok(Read::Absent)` for a `0x00`-tagged cell.
 /// - `Ok(Read::Present(payload))` for a `0x01`-tagged cell with a non-empty
-///   MsgPack+zstd payload tail.
+///   zstd-compressed payload tail.
 /// - `Err(_)` for any malformed cell (empty, unknown tag, empty Present
 ///   payload, codec failure).
 ///
 /// # Errors
 ///
 /// Returns a [`FjallValueStoreError`] when the cell is malformed.
-pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<StoredPayload>, FjallValueStoreError> {
+pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<Bytes>, FjallValueStoreError> {
     let Some(bytes) = bytes else {
         return Ok(Read::Unknown);
     };
@@ -121,7 +121,7 @@ pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<StoredPayload>, FjallVal
             if rest.is_empty() {
                 return Err(FjallValueStoreError::EmptyPresentPayload);
             }
-            let payload: StoredPayload = decode_payload(rest, CACHE_PAYLOAD_ENCODING)?;
+            let payload = decode_payload(rest, CACHE_PAYLOAD_ENCODING)?;
             Ok(Read::Present(payload))
         }
         other => Err(FjallValueStoreError::UnknownCacheTag(other)),

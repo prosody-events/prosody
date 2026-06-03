@@ -293,7 +293,7 @@ async fn commit_manager_drives_recovering_value_store_get() -> Result<()> {
 
     use crate::state::memory::MemoryDurableValueStore;
     use crate::state::recovering::RecoveringValueStore;
-    use crate::state::value::{DurableWalStore, StoredPayload, ValueOp, ValueStore};
+    use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
     use crate::state::{
         CollectionId, CollectionRef, DurableState, EventRef, Read, StateKey, StateName, StateType,
     };
@@ -316,7 +316,7 @@ async fn commit_manager_drives_recovering_value_store_get() -> Result<()> {
         None,
     );
     let id = collection.id().clone();
-    let payload = StoredPayload::Inline(Bytes::from_static(b"recovered"));
+    let payload = Bytes::from_static(b"recovered");
     inner
         .seal(
             &collection,

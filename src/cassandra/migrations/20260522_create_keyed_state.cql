@@ -1,9 +1,9 @@
 -- Migration: create_keyed_state
 -- Timestamp: 20260522
 -- Purpose: Provision the durable storage for keyed-state Value collections
---          plus a shared pending index. The `event_ref` UDT carries the
---          upstream event identity (Kafka message or timer row) that owns
---          a sealed WAL.
+--          plus a shared pending index and the per-segment descriptor
+--          identity table. The `event_ref` UDT carries the upstream event
+--          identity (Kafka message or timer row) that owns a sealed WAL.
 
 CREATE TYPE {{KEYSPACE}}.event_ref (
     kind         tinyint,
@@ -38,5 +38,23 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_PENDING}} (
     name        text,
 
     PRIMARY KEY ((segment_id, key), state_type, kind, name)
+) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
+  AND compression = { 'class': 'ZstdCompressor' };
+
+-- Frozen structural identity per (segment, collection name). Written once
+-- on first use by the partition's single owner (no LWT needed); a process
+-- whose registered descriptor disagrees with the stored identity refuses
+-- to dispatch (Permanent), so an incompatible deploy fails loudly instead
+-- of silently misreading cells.
+CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_DESCRIPTOR}} (
+    segment_id    uuid,
+    name          text,
+
+    kind          tinyint,
+    cell_kind     smallint,
+    codec_id      smallint,
+    schema_label  text,
+
+    PRIMARY KEY ((segment_id), name)
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };

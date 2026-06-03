@@ -3,7 +3,7 @@ use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateE
 use super::value::{
     DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueStore, fold_value_ops,
 };
-use super::value_test_suite::{self, DirectTrace, Trace, collection_ref, inline};
+use super::value_test_suite::{self, DirectTrace, Trace, bytes, collection_ref};
 use super::{
     CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyCollection, EventRef, Read,
     StateKey, StateName, StateType, StoreOutcome, ValueKind, ValueOp, WalEnvelope,
@@ -36,18 +36,18 @@ fn event(id: u128) -> EventRef {
 
 #[test]
 fn value_folding_uses_last_ordered_op() {
-    let initial = Some(inline(1));
+    let initial = Some(bytes(1));
     let ops = vec![
-        ValueOp::Set { payload: inline(2) },
+        ValueOp::Set { payload: bytes(2) },
         ValueOp::Clear,
-        ValueOp::Set { payload: inline(3) },
+        ValueOp::Set { payload: bytes(3) },
     ];
 
-    assert_eq!(fold_value_ops(initial, &ops), Some(inline(3)));
-    assert_eq!(fold_value_ops(Some(inline(1)), &[ValueOp::Clear]), None);
+    assert_eq!(fold_value_ops(initial, &ops), Some(bytes(3)));
+    assert_eq!(fold_value_ops(Some(bytes(1)), &[ValueOp::Clear]), None);
     assert_eq!(
-        fold_value_ops(None, &[ValueOp::Set { payload: inline(9) }]),
-        Some(inline(9))
+        fold_value_ops(None, &[ValueOp::Set { payload: bytes(9) }]),
+        Some(bytes(9))
     );
 }
 
@@ -57,6 +57,15 @@ fn value_folding_uses_last_ordered_op() {
 #[tokio::test]
 async fn memory_sweep_deletes_stale_pending_index() -> Result<()> {
     value_test_suite::run_stale_pending_index(MemoryDurableValueStore::for_tests()).await
+}
+
+/// N7/N8 (memory): the shared durable descriptor-identity acquisition
+/// check. The Cassandra counterpart lives in `state::cassandra::tests` and
+/// drives the identical helper.
+#[tokio::test]
+async fn memory_descriptor_identity_acquisition() -> Result<()> {
+    value_test_suite::run_descriptor_identity_acquisition(MemoryDurableValueStore::for_tests())
+        .await
 }
 
 #[test]
@@ -150,7 +159,7 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
         event(1),
         CommitMode::Wal,
     );
-    tx.set(&collection_id, inline(1)).await?;
+    tx.set(&collection_id, bytes(1)).await?;
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
 
     let applied = match durable.read_partition(&collection_id).await? {
@@ -178,7 +187,7 @@ async fn finished_transaction_rejects_further_transitions() -> Result<()> {
 
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
     let error = tx
-        .set(&collection_id, inline(1))
+        .set(&collection_id, bytes(1))
         .await
         .err()
         .ok_or_else(|| eyre::eyre!("expected finished transaction error"))?;

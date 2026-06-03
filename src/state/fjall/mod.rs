@@ -39,7 +39,7 @@ pub use dirty::{
 pub use error::FjallValueStoreError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
-use crate::state::value::{StoredPayload, ValueKind, ValueStore};
+use crate::state::value::{ValueKind, ValueStore};
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
 use educe::Educe;
@@ -130,7 +130,7 @@ impl ValueStore for FjallValueStore {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         let key = codec::value_cache_key(collection);
         let inner = Arc::clone(&self.inner);
         let raw = spawn_blocking(move || inner.partition.get(key)).await??;
@@ -140,7 +140,7 @@ impl ValueStore for FjallValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.insert_cell(collection, codec::encode_present_cell(&payload)?)
             .await

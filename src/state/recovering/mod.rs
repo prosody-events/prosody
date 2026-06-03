@@ -63,17 +63,20 @@
 //! | `PendingIndexStore::delete_pending` | No (pass) — the index rows live in `inner` |
 
 use super::oracle::CommitOracle;
-use super::value::{
-    DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
-};
+use super::value::{DirectApplyStore, DurableWalStore, ValueKind, ValueOp, ValueStore};
 use super::{
     CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
     StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::middleware::{CollectionDefRegistry, ResolveSealedError, resolve_sealed};
+use crate::state::middleware::{
+    CollectionDefRegistry, DescriptorIdentityStore, DurableDescriptorIdentity, ResolveSealedError,
+    resolve_sealed,
+};
 use crate::state::pending::PendingIndexStore;
 use crate::timers::duration::CompactDuration;
+use crate::timers::store::SegmentId;
+use bytes::Bytes;
 use std::error::Error;
 use std::sync::Arc;
 use thiserror::Error;
@@ -210,7 +213,7 @@ where
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         match DurableWalStore::read_partition(&self.inner, collection)
             .await
             .map_err(RecoveringValueStoreError::Inner)?
@@ -232,7 +235,7 @@ where
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.inner
             .set(collection, payload)
@@ -368,6 +371,41 @@ where
 /// [`DurableWalStore`] error so `Layered<Cache, Recovering<Backing>>`
 /// satisfies the middleware's
 /// `PendingIndexStore<Error = DurableWalStore::Error>` bound.
+/// Descriptor-identity pass-through: identity validation happens before
+/// any state op, so recovery never participates — delegate to `inner` and
+/// lift its error into the wrapper's error type.
+impl<Inner, Oracle, R> DescriptorIdentityStore for RecoveringValueStore<Inner, Oracle, R>
+where
+    Inner: RecoverableValueStore
+        + DescriptorIdentityStore<Error = <Inner as DurableWalStore<ValueKind>>::Error>,
+    Oracle: CommitOracle,
+    R: CollectionTtl,
+{
+    type Error =
+        RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;
+
+    async fn read_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        self.inner
+            .read_descriptor_identities(segment_id)
+            .await
+            .map_err(RecoveringValueStoreError::Inner)
+    }
+
+    async fn write_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+        rows: Vec<DurableDescriptorIdentity>,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write_descriptor_identities(segment_id, rows)
+            .await
+            .map_err(RecoveringValueStoreError::Inner)
+    }
+}
+
 impl<Inner, Oracle, R> PendingIndexStore for RecoveringValueStore<Inner, Oracle, R>
 where
     Inner: RecoverableValueStore

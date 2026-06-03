@@ -1,6 +1,7 @@
 //! Error types and aliases raised by the keyed-state middleware.
 
 use super::context::KeyedStateContext;
+use super::descriptor_identity::DescriptorIdentityError;
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::FallibleHandler;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -52,6 +53,13 @@ where
     #[error("keyed-state dirty factory failed at partition assignment")]
     Factory(#[source] BoxedFactoryError),
 
+    /// Durable descriptor-identity validation failed on first dispatch.
+    /// A mismatch is Permanent and recurs on every dispatch until the
+    /// deployed descriptors match the segment's frozen identity; a store
+    /// failure retries on the next event (the validation is not cached).
+    #[error("keyed-state descriptor identity validation failed")]
+    Identity(#[source] DescriptorIdentityError<DurableErr>),
+
     /// Scheduling or unscheduling the recovery timer failed.
     ///
     /// Carries the type-erased context error (`C::Error` is a per-method
@@ -87,6 +95,7 @@ where
             Self::Scanner(e) => e.classify_error(),
             Self::Oracle(e) => e.classify_error(),
             Self::Factory(e) => e.classify_error(),
+            Self::Identity(e) => e.classify_error(),
             Self::Timer(e) => e.classify_error(),
             Self::Transaction(e) => e.classify_error(),
             Self::DateTime(e) => e.classify_error(),
@@ -136,8 +145,8 @@ pub(super) type MiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
 /// The `build_context` result: the wrapped context or a fully-typed
 /// middleware error. Named so the handler signature reads cleanly without a
 /// `clippy::type_complexity` allow.
-pub(super) type BuildContextResult<C, T, D, Sc, O, S> =
-    Result<KeyedStateContext<C, D, S>, MiddlewareError<T, D, Sc, O, S>>;
+pub(super) type BuildContextResult<C, T, D, Sc, O, S, L, Scope> =
+    Result<KeyedStateContext<C, D, S, L, Scope>, MiddlewareError<T, D, Sc, O, S>>;
 
 /// Errors raised by the shared state-recovery sweep
 /// `recover_pending_entries`.

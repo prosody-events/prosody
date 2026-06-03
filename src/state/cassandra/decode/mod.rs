@@ -27,7 +27,7 @@ use super::error::CassandraValueStoreError;
 use super::udt::RawEventRef;
 use crate::state::encoding::decode_payload;
 use crate::state::value::ValueKind;
-use crate::state::{DurableState, PayloadEncoding, SealedWal, StoredPayload, WalBlob, WalFormat};
+use crate::state::{DurableState, PayloadEncoding, SealedWal, WalBlob, WalFormat};
 use std::fmt;
 use thiserror::Error;
 
@@ -79,7 +79,7 @@ fn decode_idle(
         (None, None) => Ok(DurableState::Idle { applied: None }),
         (Some(bytes), Some(encoding)) => {
             let encoding = PayloadEncoding::try_from_i16(encoding)?;
-            let payload = decode_payload::<StoredPayload>(&bytes, encoding)?;
+            let payload = decode_payload(&bytes, encoding)?;
             Ok(DurableState::Idle {
                 applied: Some(payload),
             })
@@ -113,7 +113,7 @@ fn decode_sealed(
     let encoding = PayloadEncoding::try_from_i16(encoding_raw)?;
 
     let applied = match data {
-        Some(bytes) => Some(decode_payload::<StoredPayload>(&bytes, encoding)?),
+        Some(bytes) => Some(decode_payload(&bytes, encoding)?),
         None => None,
     };
 

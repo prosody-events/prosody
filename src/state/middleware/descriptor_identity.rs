@@ -1,0 +1,237 @@
+//! Durable per-segment descriptor-identity validation.
+//!
+//! Each `(segment, collection name)` pair has one frozen
+//! [`StructuralIdentity`](crate::state::descriptor::StructuralIdentity) row,
+//! written on first use by the partition's single owner (Kafka partition
+//! ownership ⇒ no LWT needed). [`LazyDescriptorIdentity`] mirrors the defer
+//! middleware's `LazySegment` pattern: constructed synchronously in
+//! `handler_for_partition` (no I/O), validated on first dispatch via
+//! `get_or_try_init`, errors **not** cached so transient store failures
+//! retry on the next event.
+//!
+//! Invariant: **no state operation executes under an unvalidated
+//! identity** — the handler runs [`LazyDescriptorIdentity::ensure`] before
+//! building the keyed-state context for any message or timer.
+
+use super::registry::CollectionDefRegistry;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::StateName;
+use crate::state::descriptor::StructuralIdentity;
+use crate::timers::store::SegmentId;
+use std::collections::HashMap;
+use std::error::Error;
+use std::future::Future;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::OnceCell;
+
+/// One durable identity row in wire form.
+///
+/// Comparison happens on the wire encoding (the discriminator integers and
+/// the raw label) rather than on decoded enums, so a row written by a
+/// *future* build with discriminants this build does not know simply
+/// compares unequal — the acquisition fails Permanent instead of being
+/// silently coerced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableDescriptorIdentity {
+    /// Collection name the row freezes.
+    pub name: String,
+
+    /// [`CollectionKindId`](crate::state::CollectionKindId) discriminator.
+    pub kind: i8,
+
+    /// [`CellKind`](crate::state::descriptor::CellKind) discriminator.
+    pub cell_kind: i16,
+
+    /// [`CodecId`](crate::codec::CodecId) discriminator.
+    pub codec_id: i16,
+
+    /// Optional schema version label.
+    pub schema_label: Option<String>,
+}
+
+impl DurableDescriptorIdentity {
+    /// Wire form of a registered descriptor identity.
+    pub(crate) fn from_identity(name: &StateName, identity: &StructuralIdentity) -> Self {
+        Self {
+            name: name.as_str().to_owned(),
+            kind: identity.kind.as_i8(),
+            cell_kind: identity.cell_kind.as_i16(),
+            codec_id: identity.codec_id.as_i16(),
+            schema_label: identity
+                .schema_label
+                .as_ref()
+                .map(|label| label.as_str().to_owned()),
+        }
+    }
+}
+
+/// Durable storage for per-segment descriptor identity rows.
+///
+/// Implemented by every durable Value bundle (memory, Cassandra, and the
+/// layered/recovering combinators by delegation), so the middleware needs
+/// no extra wiring parameter — the handler validates through the same `D`
+/// it stores state in.
+pub trait DescriptorIdentityStore: Send + Sync + 'static {
+    /// Error type for identity reads and writes.
+    type Error: ClassifyError + Error + Send + Sync + 'static;
+
+    /// Reads every identity row for `segment_id`.
+    fn read_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+    ) -> impl Future<Output = Result<Vec<DurableDescriptorIdentity>, Self::Error>> + Send;
+
+    /// Inserts identity rows for `segment_id`.
+    ///
+    /// Single-owner per segment ⇒ a plain write, never an LWT.
+    fn write_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+        rows: Vec<DurableDescriptorIdentity>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Defers durable identity validation until the first dispatch.
+///
+/// Cheap to clone (`Arc` internally); clones share the validated flag.
+pub(crate) struct LazyDescriptorIdentity<St> {
+    inner: Arc<LazyIdentityInner<St>>,
+}
+
+impl<St> Clone for LazyDescriptorIdentity<St> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+struct LazyIdentityInner<St> {
+    cell: OnceCell<()>,
+    store: St,
+    registry: Arc<CollectionDefRegistry>,
+    segment_id: SegmentId,
+}
+
+impl<St> LazyDescriptorIdentity<St>
+where
+    St: DescriptorIdentityStore,
+{
+    /// Creates a lazy validator (no I/O until [`ensure`](Self::ensure)).
+    pub(crate) fn new(
+        store: St,
+        registry: Arc<CollectionDefRegistry>,
+        segment_id: SegmentId,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LazyIdentityInner {
+                cell: OnceCell::new(),
+                store,
+                registry,
+                segment_id,
+            }),
+        }
+    }
+
+    /// Validates every registered descriptor against the segment's durable
+    /// identity rows, writing rows for first-seen names. Runs the I/O once
+    /// per partition assignment; errors are not cached, so a transient
+    /// store failure retries on the next dispatch. An empty registry skips
+    /// the I/O entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescriptorIdentityError::Mismatch`] (Permanent; the row is
+    /// **not** overwritten) when a durable row disagrees with the
+    /// registered identity, or [`DescriptorIdentityError::Store`] when the
+    /// store fails.
+    pub(crate) async fn ensure(&self) -> Result<(), DescriptorIdentityError<St::Error>> {
+        self.inner
+            .cell
+            .get_or_try_init(|| async {
+                let asserted: Vec<DurableDescriptorIdentity> = self
+                    .inner
+                    .registry
+                    .identities()
+                    .map(|(name, identity)| {
+                        DurableDescriptorIdentity::from_identity(name, identity)
+                    })
+                    .collect();
+                if asserted.is_empty() {
+                    return Ok(());
+                }
+
+                let stored = self
+                    .inner
+                    .store
+                    .read_descriptor_identities(self.inner.segment_id)
+                    .await
+                    .map_err(DescriptorIdentityError::Store)?;
+                let by_name: HashMap<&str, &DurableDescriptorIdentity> =
+                    stored.iter().map(|row| (row.name.as_str(), row)).collect();
+
+                let mut missing = Vec::new();
+                for row in asserted {
+                    match by_name.get(row.name.as_str()) {
+                        Some(&existing) if *existing == row => {}
+                        Some(&existing) => {
+                            return Err(DescriptorIdentityError::Mismatch {
+                                stored: existing.clone(),
+                                asserted: row,
+                            });
+                        }
+                        None => missing.push(row),
+                    }
+                }
+                if !missing.is_empty() {
+                    self.inner
+                        .store
+                        .write_descriptor_identities(self.inner.segment_id, missing)
+                        .await
+                        .map_err(DescriptorIdentityError::Store)?;
+                }
+                Ok(())
+            })
+            .await
+            .copied()
+    }
+}
+
+/// Error raised by [`LazyDescriptorIdentity::ensure`].
+#[derive(Debug, Error)]
+pub enum DescriptorIdentityError<StoreErr>
+where
+    StoreErr: ClassifyError + Error + Send + Sync + 'static,
+{
+    /// The durable identity row disagrees with the registered descriptor.
+    /// The row is left untouched; dispatch fails Permanent until the
+    /// deployed descriptors match the segment's frozen identity.
+    #[error(
+        "descriptor identity mismatch for {name:?}: durable {stored:?}, registered {asserted:?}",
+        name = asserted.name
+    )]
+    Mismatch {
+        /// Identity currently frozen in durable storage.
+        stored: DurableDescriptorIdentity,
+
+        /// Identity the registered descriptor asserts.
+        asserted: DurableDescriptorIdentity,
+    },
+
+    /// The identity store failed.
+    #[error("descriptor identity store failed")]
+    Store(#[source] StoreErr),
+}
+
+impl<StoreErr> ClassifyError for DescriptorIdentityError<StoreErr>
+where
+    StoreErr: ClassifyError + Error + Send + Sync + 'static,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Mismatch { .. } => ErrorCategory::Permanent,
+            Self::Store(e) => e.classify_error(),
+        }
+    }
+}

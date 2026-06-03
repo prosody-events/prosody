@@ -3,6 +3,7 @@ use crate::state::EventRef;
 use crate::state::cassandra::error::CorruptUdtError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::encoding::{PayloadEncoding, WalFormat, encode_payload};
+use crate::state::value_test_suite::bytes;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use uuid::Uuid;
@@ -19,13 +20,9 @@ fn message_event_raw() -> RawEventRef {
     RawEventRef::from_event(message_event())
 }
 
-fn inline_payload(byte: u8) -> StoredPayload {
-    StoredPayload::Inline(Bytes::from(vec![byte]))
-}
-
 fn encoded_payload(byte: u8) -> Result<Vec<u8>> {
-    let bytes = encode_payload(&inline_payload(byte), PayloadEncoding::MsgpackZstdV1)?;
-    Ok(bytes.to_vec())
+    let encoded = encode_payload(&bytes(byte), PayloadEncoding::RawZstdV1)?;
+    Ok(encoded.to_vec())
 }
 
 /// Asserts a decode rejected the row as
@@ -58,7 +55,7 @@ fn decodes_idle_with_data() -> Result<()> {
     let data = encoded_payload(7)?;
     let state = try_decode_row((
         Some(data),
-        Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+        Some(PayloadEncoding::RawZstdV1.as_i16()),
         None,
         None,
         None,
@@ -67,7 +64,7 @@ fn decodes_idle_with_data() -> Result<()> {
         DurableState::Idle {
             applied: Some(payload),
         } => {
-            assert_eq!(payload, inline_payload(7));
+            assert_eq!(payload, bytes(7));
             Ok(())
         }
         other => Err(eyre::eyre!("expected Idle with payload, got {other:?}")),
@@ -82,7 +79,7 @@ fn decodes_sealed_with_data_and_wal() -> Result<()> {
     let wal_bytes = vec![0_u8, 1, 2, 3];
     let state = try_decode_row((
         Some(data),
-        Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+        Some(PayloadEncoding::RawZstdV1.as_i16()),
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
@@ -92,11 +89,11 @@ fn decodes_sealed_with_data_and_wal() -> Result<()> {
             applied: Some(payload),
             wal,
         } => {
-            assert_eq!(payload, inline_payload(9));
+            assert_eq!(payload, bytes(9));
             assert_eq!(wal.event(), message_event());
             assert_eq!(wal.wal().bytes(), &Bytes::from(wal_bytes));
             assert_eq!(wal.wal().format(), WalFormat::MsgpackStreamZstdV1);
-            assert_eq!(wal.payload_encoding(), PayloadEncoding::MsgpackZstdV1);
+            assert_eq!(wal.payload_encoding(), PayloadEncoding::RawZstdV1);
             Ok(())
         }
         other => Err(eyre::eyre!("expected Sealed, got {other:?}")),
@@ -108,7 +105,7 @@ fn decodes_sealed_no_data() -> Result<()> {
     let wal_bytes = vec![1_u8, 2, 3];
     let state = try_decode_row((
         None,
-        Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+        Some(PayloadEncoding::RawZstdV1.as_i16()),
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
@@ -135,7 +132,7 @@ fn rejects_payload_encoding_without_data() -> Result<()> {
     assert_corrupt_wal(
         try_decode_row((
             None,
-            Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+            Some(PayloadEncoding::RawZstdV1.as_i16()),
             None,
             None,
             None,
@@ -211,7 +208,7 @@ fn rejects_corrupt_event_ref_udt_as_permanent() -> Result<()> {
     };
     let result = try_decode_row((
         None,
-        Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+        Some(PayloadEncoding::RawZstdV1.as_i16()),
         Some(corrupt),
         Some(vec![1_u8]),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),

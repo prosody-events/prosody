@@ -56,10 +56,10 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::state::encoding::{
     EncodingError, PayloadEncoding, WalFormat, decode_wal, encode_payload, encode_wal,
 };
+use crate::state::middleware::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::pending::PendingIndexStore;
 use crate::state::value::{
-    DirectApplyStore, DurableWalStore, StoredPayload, ValueApplied, ValueKind, ValueOp, ValueStore,
-    fold_value_ops,
+    DirectApplyStore, DurableWalStore, ValueApplied, ValueKind, ValueOp, ValueStore, fold_value_ops,
 };
 use crate::state::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, DurableState, EventRef, Read,
@@ -69,13 +69,15 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
 use bytes::Bytes;
 use decode::RawValueRow;
+use futures::TryStreamExt;
 use scylla::client::session::Session;
 use scylla::serialize::row::SerializeRow;
+use scylla::statement::batch::{Batch, BatchType};
 use scylla::statement::prepared::PreparedStatement;
 use std::sync::Arc;
 
 /// Payload encoding for Value cells written by this build.
-const VALUE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackZstdV1;
+const VALUE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::RawZstdV1;
 
 /// WAL format for Value WALs written by this build.
 const VALUE_WAL_FORMAT: WalFormat = WalFormat::MsgpackStreamZstdV1;
@@ -363,7 +365,7 @@ impl ValueStore for CassandraValueStore {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         let applied = self.extract_applied(collection).await?;
         Ok(applied.map_or(Read::Absent, Read::Present))
     }
@@ -371,7 +373,7 @@ impl ValueStore for CassandraValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
         self.direct_apply(&collection_ref, vec![ValueOp::Set { payload }])
@@ -491,6 +493,68 @@ impl DirectApplyStore<ValueKind> for CassandraValueStore {
         let folded = fold_value_ops(current, &ops);
         self.write_data_only(collection, &folded).await?;
         Ok(StoreOutcome::Applied)
+    }
+}
+
+impl DescriptorIdentityStore for CassandraValueStore {
+    type Error = CassandraValueStoreError;
+
+    async fn read_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        let rows = self
+            .session()
+            .execute_iter(
+                self.queries.read_descriptor_identities.clone(),
+                (segment_id,),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?
+            .rows_stream::<(String, i8, i16, i16, Option<String>)>()
+            .map_err(CassandraStoreError::from)?;
+        futures::pin_mut!(rows);
+        let mut identities = Vec::new();
+        while let Some((name, kind, cell_kind, codec_id, schema_label)) =
+            rows.try_next().await.map_err(CassandraStoreError::from)?
+        {
+            identities.push(DurableDescriptorIdentity {
+                name,
+                kind,
+                cell_kind,
+                codec_id,
+                schema_label,
+            });
+        }
+        Ok(identities)
+    }
+
+    /// Inserts the first-use identity rows in one same-partition
+    /// `UNLOGGED BATCH` — every row shares the `segment_id` partition key,
+    /// so the batch is a single atomic mutation on the replica.
+    async fn write_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+        rows: Vec<DurableDescriptorIdentity>,
+    ) -> Result<(), Self::Error> {
+        let mut batch = Batch::new(BatchType::Unlogged);
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            batch.append_statement(self.queries.insert_descriptor_identity.clone());
+            values.push((
+                segment_id,
+                row.name,
+                row.kind,
+                row.cell_kind,
+                row.codec_id,
+                row.schema_label,
+            ));
+        }
+        self.session()
+            .batch(&batch, values)
+            .await
+            .map_err(CassandraStoreError::from)?;
+        Ok(())
     }
 }
 

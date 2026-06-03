@@ -34,13 +34,16 @@
 //!    success.** Backing is authoritative.
 
 use super::value::{
-    DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
+    DirectApplyStore, DurableWalStore, ValueKind, ValueOp, ValueStore, fold_value_ops,
 };
 use super::{
     CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
     StoreOutcome,
 };
+use crate::state::middleware::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::pending::PendingIndexStore;
+use crate::timers::store::SegmentId;
+use bytes::Bytes;
 use tracing::warn;
 
 /// A two-layer Value store: cache + backing.
@@ -91,7 +94,7 @@ where
     async fn patch_cache_or_invalidate(
         &self,
         id: &CollectionId<ValueKind>,
-        new_applied: Option<StoredPayload>,
+        new_applied: Option<Bytes>,
     ) {
         let write_result = match new_applied {
             Some(payload) => self.cache.set(id, payload).await,
@@ -121,7 +124,7 @@ where
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         let cache_read = match self.cache.get(collection).await {
             Ok(read) => read,
             Err(error) => {
@@ -150,7 +153,7 @@ where
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.backing.set(collection, payload.clone()).await?;
         self.patch_cache_or_invalidate(collection, Some(payload))
@@ -252,17 +255,46 @@ where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
         let ops: Vec<ValueOp> = ops.into_iter().collect();
-        let last_op = ops.last().cloned();
+        let new_applied = fold_value_ops(None, &ops);
         let outcome = self.backing.direct_apply(collection, ops).await?;
         if outcome == StoreOutcome::Applied {
-            let new_applied = match last_op {
-                Some(ValueOp::Set { payload }) => Some(payload),
-                Some(ValueOp::Clear) | None => None,
-            };
             self.patch_cache_or_invalidate(collection.id(), new_applied)
                 .await;
         }
         Ok(outcome)
+    }
+}
+
+/// Descriptor-identity pass-through.
+///
+/// Identity rows are authoritative state owned by the backing store — the
+/// cache holds none — so both methods delegate. `Error` is spelled as the
+/// backing's [`DurableWalStore`] error (aligned with the impls above) so
+/// the layered composition satisfies the middleware's
+/// `DescriptorIdentityStore<Error = DurableWalStore::Error>` bound.
+impl<Cache, Backing> DescriptorIdentityStore for LayeredValueStore<Cache, Backing>
+where
+    Cache: ValueStore + Clone,
+    Backing: DurableWalStore<ValueKind>
+        + DescriptorIdentityStore<Error = <Backing as DurableWalStore<ValueKind>>::Error>,
+{
+    type Error = <Backing as DurableWalStore<ValueKind>>::Error;
+
+    async fn read_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        self.backing.read_descriptor_identities(segment_id).await
+    }
+
+    async fn write_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+        rows: Vec<DurableDescriptorIdentity>,
+    ) -> Result<(), Self::Error> {
+        self.backing
+            .write_descriptor_identities(segment_id, rows)
+            .await
     }
 }
 

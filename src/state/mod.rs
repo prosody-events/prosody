@@ -17,7 +17,9 @@
 //! * [`wal`] — write-ahead-log payloads ([`WalEnvelope`], [`WalBlob`],
 //!   [`SealedWal`], [`NonEmptyOps`], …).
 //! * [`value`] — the Value collection kind ([`ValueKind`], [`ValueOp`],
-//!   [`StoredPayload`], [`ValueOverlay`], …).
+//!   [`ValueOverlay`], …).
+//! * [`descriptor`] — typed descriptors and handles bound over the raw byte
+//!   cells the stores persist.
 //! * [`transaction`] — transaction-side state ([`DurableState`], [`LocalTx`],
 //!   [`CommitMode`], [`SealedCollection`], …).
 //!
@@ -30,6 +32,7 @@ use std::error::Error;
 use std::fmt;
 
 pub mod cassandra;
+pub mod descriptor;
 pub mod encoding;
 pub mod event_ref;
 pub mod fjall;
@@ -63,7 +66,7 @@ pub use identity::{
 pub use transaction::{
     CommitMode, DirtyCollection, DurableState, LocalTx, PendingOps, Read, SealedCollection,
 };
-pub use value::{KafkaMessageRef, StoredPayload, ValueApplied, ValueKind, ValueOp, ValueOverlay};
+pub use value::{ValueApplied, ValueKind, ValueOp, ValueOverlay};
 pub use wal::{
     EmptyOperationsError, NonEmptyOps, NonEmptyOpsSlice, SealedWal, WalBlob, WalEnvelope,
 };

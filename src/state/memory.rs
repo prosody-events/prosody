@@ -1,10 +1,11 @@
 //! In-memory keyed-state stores.
 
 use super::encoding::{EncodingError, decode_wal};
+use super::middleware::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use super::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use super::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, ValueKind, ValueOp,
-    ValueStore, fold_value_ops,
+    DirectApplyStore, DurableWalStore, PendingOpSource, ValueKind, ValueOp, ValueStore,
+    fold_value_ops,
 };
 use super::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, DirtyStoreFactory,
@@ -13,8 +14,10 @@ use super::{
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
+use crate::timers::store::SegmentId;
 use crate::{Partition, Topic};
 use ahash::RandomState;
+use bytes::Bytes;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -55,7 +58,7 @@ impl ValueStore for MemoryDirtyValueStore {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         Ok(self
             .inner
             .lock()
@@ -72,7 +75,7 @@ impl ValueStore for MemoryDirtyValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.inner
             .lock()
@@ -243,7 +246,7 @@ impl ValueStore for MemoryDurableValueStore {
     async fn get<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
+    ) -> Result<Read<Bytes>, Self::Error> {
         let state = self.read_partition(collection).await?;
         Ok(match state {
             DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => {
@@ -255,7 +258,7 @@ impl ValueStore for MemoryDurableValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: StoredPayload,
+        payload: Bytes,
     ) -> Result<(), Self::Error> {
         self.apply_one(collection, ValueOp::Set { payload }).await
     }
@@ -299,7 +302,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
             event,
             collected,
             WalFormat::MsgpackStreamV1,
-            PayloadEncoding::MsgpackV1,
+            PayloadEncoding::RawV1,
         )
         .map_err(MemoryStateError::Encoding)?;
 
@@ -360,6 +363,43 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
         let entry = inner.entries.entry(collection.id().clone()).or_default();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
         Ok(StoreOutcome::Applied)
+    }
+}
+
+impl DescriptorIdentityStore for MemoryDurableValueStore {
+    type Error = MemoryStateError;
+
+    async fn read_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        Ok(self
+            .inner
+            .lock()
+            .identities
+            .get(&segment_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn write_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+        rows: Vec<DurableDescriptorIdentity>,
+    ) -> Result<(), Self::Error> {
+        // Upsert by name, mirroring Cassandra's INSERT-overwrites-row
+        // semantics so the shared acquisition tests observe one row per
+        // collection on both backends.
+        let mut inner = self.inner.lock();
+        let segment = inner.identities.entry(segment_id).or_default();
+        for row in rows {
+            if let Some(existing) = segment.iter_mut().find(|r| r.name == row.name) {
+                *existing = row;
+            } else {
+                segment.push(row);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -426,6 +466,7 @@ struct DirtyInner {
 struct DurableInner {
     entries: HashMap<CollectionId<ValueKind>, DurableValueEntry, RandomState>,
     pending: HashSet<PendingKey, RandomState>,
+    identities: HashMap<SegmentId, Vec<DurableDescriptorIdentity>, RandomState>,
 }
 
 /// Untyped key into the in-memory pending-WAL index.
@@ -466,7 +507,7 @@ impl PendingKey {
 /// sealed event with `entry.wal = None` and no `applied` restoration.
 #[derive(Debug, Default)]
 struct DurableValueEntry {
-    applied: Option<StoredPayload>,
+    applied: Option<Bytes>,
     wal: Option<SealedWal<ValueKind>>,
 }
 

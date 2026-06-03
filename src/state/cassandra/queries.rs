@@ -19,7 +19,9 @@
 //! `USING TTL ?`. `Some(ttl)` picks the TTL variant; `None` picks the
 //! no-TTL variant.
 
-use crate::cassandra::{TABLE_KEYED_STATE_PENDING, TABLE_KEYED_STATE_VALUE};
+use crate::cassandra::{
+    TABLE_KEYED_STATE_DESCRIPTOR, TABLE_KEYED_STATE_PENDING, TABLE_KEYED_STATE_VALUE,
+};
 use crate::cassandra_queries;
 
 cassandra_queries! {
@@ -129,6 +131,25 @@ cassandra_queries! {
             "DELETE FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND kind = ? AND name = ?",
             TABLE_KEYED_STATE_PENDING
+        ),
+
+        /// Reads every frozen descriptor-identity row for one segment
+        /// (single-partition query).
+        read_descriptor_identities: (
+            "SELECT name, kind, cell_kind, codec_id, schema_label \
+             FROM $keyspace.{} WHERE segment_id = ?",
+            TABLE_KEYED_STATE_DESCRIPTOR
+        ),
+
+        /// Inserts one frozen descriptor-identity row. Single owner per
+        /// segment, so a plain INSERT — never an LWT. First-use writes for
+        /// multiple names are grouped into a same-partition `UNLOGGED
+        /// BATCH` at the call site.
+        insert_descriptor_identity: (
+            "INSERT INTO $keyspace.{} \
+             (segment_id, name, kind, cell_kind, codec_id, schema_label) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            TABLE_KEYED_STATE_DESCRIPTOR
         ),
 
         /// Streams the pending-index rows for one `(segment, key)`
