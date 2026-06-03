@@ -23,11 +23,14 @@
 //! * [`transaction`] — transaction-side state ([`DurableState`], [`LocalTx`],
 //!   [`CommitMode`], [`SealedCollection`], …).
 //!
-//! The two cross-cutting factory traits ([`DirtyStoreProvider`],
-//! [`DirtyStoreFactory`]) belong to no leaf and stay here.
+//! The cross-cutting factory traits ([`DirtyStoreProvider`],
+//! [`DirtyStoreFactory`], [`StateBackendFactory`]) belong to no leaf and
+//! stay here.
 
 use crate::error::ClassifyError;
+use crate::state::oracle::CommitOracle;
 use crate::{Partition, Topic};
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -70,6 +73,116 @@ pub use value::{ValueApplied, ValueKind, ValueOp, ValueOverlay};
 pub use wal::{
     EmptyOperationsError, NonEmptyOps, NonEmptyOpsSlice, SealedWal, WalBlob, WalEnvelope,
 };
+
+/// The per-partition keyed-state backend: the durable Value bundle, the
+/// commit oracle it recovers through, and the dirty-workspace provider.
+///
+/// Minted as one unit by [`StateBackendFactory::for_partition`] so the
+/// oracle baked into the durable bundle's recovery wrapper and the oracle
+/// the middleware's sweep consults are the *same* instance, and the
+/// fjall workspace backing the dirty provider and the durable cache is
+/// opened once.
+pub struct StateBackend<D, O, P> {
+    /// Durable Value bundle for this partition.
+    pub durable: D,
+
+    /// Commit oracle for this partition's recovery decisions.
+    pub oracle: O,
+
+    /// Per-event dirty-workspace provider for this partition.
+    pub dirty: P,
+}
+
+/// The backend triple a [`StateBackendFactory`] mints for one partition.
+pub type BackendOf<B> = StateBackend<
+    <B as StateBackendFactory>::Durable,
+    <B as StateBackendFactory>::Oracle,
+    <B as StateBackendFactory>::DirtyProvider,
+>;
+
+/// Process-wide factory minting the per-partition keyed-state backend.
+///
+/// Both the commit oracle's timer-tag reads and the durable stores are
+/// partition-scoped (timer tags live in segment-keyed tables; the fjall
+/// workspace is per assignment), so the backend cannot be a single global
+/// value — the keyed-state middleware calls [`Self::for_partition`] inside
+/// `handler_for_partition` and surfaces failures on first dispatch, the
+/// same shape as [`DirtyStoreFactory`].
+pub trait StateBackendFactory: Clone + Send + Sync + 'static {
+    /// Durable Value bundle minted per partition.
+    type Durable;
+
+    /// Commit oracle minted per partition.
+    type Oracle: CommitOracle;
+
+    /// Per-event dirty-workspace provider minted per partition.
+    type DirtyProvider: DirtyStoreProvider<ValueKind>;
+
+    /// Error returned when a partition's backend cannot be materialized.
+    type Error: ClassifyError + Error + Send + Sync + 'static;
+
+    /// Mints the backend for `(topic, partition)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when partition-scoped state (e.g. the
+    /// fjall workspace) cannot be opened.
+    fn for_partition(
+        &self,
+        topic: Topic,
+        partition: Partition,
+    ) -> Result<BackendOf<Self>, Self::Error>;
+}
+
+/// Partition-agnostic [`StateBackendFactory`]: clones the same durable
+/// bundle, oracle, and dirty provider for every partition.
+///
+/// Suits compositions whose stores are not partition-scoped — memory-backed
+/// tests and bespoke wiring; production uses the partition-scoped factories
+/// in [`production`].
+#[derive(Clone, Debug)]
+pub struct SharedStateBackend<D, O, P> {
+    durable: D,
+    oracle: O,
+    dirty: P,
+}
+
+impl<D, O, P> SharedStateBackend<D, O, P> {
+    /// Creates a backend factory that hands out clones of the supplied
+    /// parts.
+    #[must_use]
+    pub fn new(durable: D, oracle: O, dirty: P) -> Self {
+        Self {
+            durable,
+            oracle,
+            dirty,
+        }
+    }
+}
+
+impl<D, O, P> StateBackendFactory for SharedStateBackend<D, O, P>
+where
+    D: Clone + Send + Sync + 'static,
+    O: CommitOracle,
+    P: DirtyStoreProvider<ValueKind>,
+{
+    type DirtyProvider = P;
+    type Durable = D;
+    type Error = Infallible;
+    type Oracle = O;
+
+    fn for_partition(
+        &self,
+        _topic: Topic,
+        _partition: Partition,
+    ) -> Result<StateBackend<D, O, P>, Self::Error> {
+        Ok(StateBackend {
+            durable: self.durable.clone(),
+            oracle: self.oracle.clone(),
+            dirty: self.dirty.clone(),
+        })
+    }
+}
 
 /// Per-partition factory for dirty stores of one collection kind.
 ///

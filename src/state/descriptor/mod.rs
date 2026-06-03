@@ -1,8 +1,8 @@
 //! Typed descriptors for keyed-state collections.
 //!
-//! Stores speak raw [`Bytes`]; this layer owns the typing. A handler
-//! declares a descriptor once — usually as a `const` — registers it with
-//! the consumer, and binds it to the handler context to obtain a typed
+//! Stores speak raw [`Bytes`](bytes::Bytes); this layer owns the typing. A
+//! handler declares a descriptor once — usually as a `const` — registers it
+//! with the consumer, and binds it to the handler context to obtain a typed
 //! handle:
 //!
 //! ```
@@ -23,9 +23,8 @@
 //!
 //! * [`ValueDescriptor`] — a codec-backed single value (JSON by default via
 //!   [`JsonStateCodec`]); cells hold the codec's bytes verbatim.
-//! * [`KafkaMessageDescriptor`](kafka::KafkaMessageDescriptor) — cells hold a
-//!   [`KafkaMessageRef`] and `get()` resolves the full consumer message through
-//!   the defer message loader.
+//! * [`KafkaMessageDescriptor`] — cells hold a [`KafkaMessageRef`] and `get()`
+//!   resolves the full consumer message through the defer message loader.
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
 //! `(kind, cell kind, codec id, schema label)` tuple. The identity is

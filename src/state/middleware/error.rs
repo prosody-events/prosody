@@ -1,6 +1,5 @@
 //! Error types and aliases raised by the keyed-state middleware.
 
-use super::context::KeyedStateContext;
 use super::descriptor_identity::DescriptorIdentityError;
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::FallibleHandler;
@@ -141,12 +140,6 @@ pub(super) type MiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
     <Sc as PendingIndexScanner>::Error,
     <O as CommitOracle>::Error,
 >;
-
-/// The `build_context` result: the wrapped context or a fully-typed
-/// middleware error. Named so the handler signature reads cleanly without a
-/// `clippy::type_complexity` allow.
-pub(super) type BuildContextResult<C, T, D, Sc, O, S, L, Scope> =
-    Result<KeyedStateContext<C, D, S, L, Scope>, MiddlewareError<T, D, Sc, O, S>>;
 
 /// Errors raised by the shared state-recovery sweep
 /// `recover_pending_entries`.

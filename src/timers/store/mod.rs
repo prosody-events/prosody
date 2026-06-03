@@ -19,12 +19,12 @@
 //! suitable for testing and development. Production storage backends can
 //! implement the same trait to provide durability.
 
-use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
+use crate::{Key, Partition, Topic};
 use educe::Educe;
 use futures::Stream;
 use std::cmp::Ordering;
@@ -177,6 +177,30 @@ pub struct Segment {
 
     /// Schema version determining the table schema.
     pub version: SegmentVersion,
+}
+
+impl Segment {
+    /// Canonical per-Kafka-partition segment: id derived from
+    /// `{group}:{topic}/{partition}`, schema V3.
+    ///
+    /// Single source of the formula so every reader of a partition's timer
+    /// rows — the partition loop and the keyed-state commit oracle — names
+    /// the same segment.
+    #[must_use]
+    pub fn for_partition(
+        group_id: &str,
+        topic: Topic,
+        partition: Partition,
+        slab_size: CompactDuration,
+    ) -> Self {
+        let name = format!("{group_id}:{topic}/{partition}");
+        Self {
+            id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
+            name,
+            slab_size,
+            version: SegmentVersion::V3,
+        }
+    }
 }
 
 /// Factory for segment-scoped [`TriggerStore`] instances.

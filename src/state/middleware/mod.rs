@@ -52,6 +52,7 @@
 //! WARN and skipped; future kinds plug in by extending the dispatch
 //! match.
 
+mod config;
 mod context;
 mod descriptor_identity;
 mod error;
@@ -81,5 +82,6 @@ pub use handler::{
 };
 // Production code (`RecoveringValueStore::{get, seal}`) calls `resolve_sealed`,
 // so this re-export must not be `#[cfg(test)]`-gated.
+pub use config::KeyedStateConfiguration;
 pub(crate) use handler::{ResolveSealedError, resolve_sealed};
 pub use registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};

@@ -22,6 +22,8 @@ use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::state::cassandra::{CassandraValueStore, ValueQueries};
+use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::num::NonZeroUsize;
@@ -139,6 +141,7 @@ impl StorageBackend {
 ///     false,
 ///     Duration::from_secs(7 * 24 * 3600),
 ///     8192,
+///     None,
 ///     SpanRelation::FollowsFrom,
 /// )
 /// .await?;
@@ -158,6 +161,7 @@ impl StorageBackend {
 ///         message_provider,
 ///         timer_provider,
 ///         dedup_provider,
+///         value_store,
 ///     } => {
 ///         // All are Cassandra
 ///     }
@@ -192,6 +196,8 @@ pub enum StorePair {
         /// deduplication is disabled (cache capacity of zero); in that case
         /// no `DeduplicationQueries` are prepared against the session.
         dedup_provider: Option<CassandraDeduplicationStoreProvider>,
+        /// Keyed-state Value store sharing the same session.
+        value_store: CassandraValueStore,
     },
 }
 
@@ -267,6 +273,7 @@ impl StorePair {
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
     ///     8192,
+    ///     None,
     ///     SpanRelation::FollowsFrom,
     /// )
     /// .await?;
@@ -278,6 +285,7 @@ impl StorePair {
         mock: bool,
         dedup_ttl: Duration,
         dedup_cache_capacity: usize,
+        keyed_state_ttl: Option<CompactDuration>,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
         // `NonZeroUsize::new` doubles as the "enabled?" gate: `None` skips all
@@ -348,11 +356,16 @@ impl StorePair {
                     None
                 };
 
+                let value_queries = Arc::new(ValueQueries::new(store.session(), keyspace).await?);
+                let value_store =
+                    CassandraValueStore::new(store.clone(), value_queries, keyed_state_ttl);
+
                 Ok(Self::Cassandra {
                     trigger_provider,
                     message_provider,
                     timer_provider,
                     dedup_provider,
+                    value_store,
                 })
             }
         }

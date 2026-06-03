@@ -198,7 +198,7 @@ where
     }
 }
 
-/// Error raised by [`LazyDescriptorIdentity::ensure`].
+/// Error raised by durable descriptor-identity validation.
 #[derive(Debug, Error)]
 pub enum DescriptorIdentityError<StoreErr>
 where

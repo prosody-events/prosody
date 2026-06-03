@@ -4,10 +4,7 @@ use super::context::{
     ContextParts, DirtyValueBundle, DurableValueBundle, KeyedStateContext, MessageScope, TimerScope,
 };
 use super::descriptor_identity::{DescriptorIdentityStore, LazyDescriptorIdentity};
-use super::error::{
-    BoxedFactoryError, BuildContextResult, KeyedStateMiddlewareError, MiddlewareError,
-    RecoveryError,
-};
+use super::error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareError, RecoveryError};
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::Key;
 use crate::consumer::DemandType;
@@ -15,6 +12,7 @@ use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::deduplication::dedup_uuid_for_message;
+use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -23,9 +21,9 @@ use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::value::{DurableWalStore, ValueKind};
 use crate::state::{
-    CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyStoreFactory,
-    DirtyStoreProvider, DurableState, EventRef, EventScopeId, StateKey, StoreOutcome,
-    TimerEventRef,
+    CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyStoreProvider,
+    DurableState, EventRef, EventScopeId, StateBackend, StateBackendFactory, StateKey,
+    StoreOutcome, TimerEventRef,
 };
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -45,18 +43,33 @@ use uuid::Uuid;
 /// Configurable defaults for [`KeyedStateMiddleware`].
 const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 
+/// The durable Value bundle a backend factory mints.
+type DurableOf<B> = <B as StateBackendFactory>::Durable;
+
+/// The commit oracle a backend factory mints.
+type OracleOf<B> = <B as StateBackendFactory>::Oracle;
+
+/// The per-event dirty store behind a backend factory's provider.
+type DirtyStoreOf<B> =
+    <<B as StateBackendFactory>::DirtyProvider as DirtyStoreProvider<ValueKind>>::Store;
+
+/// The fully-typed middleware error for a backend + scanner pairing.
+type HandlerError<T, B, Sc> = MiddlewareError<T, DurableOf<B>, Sc, OracleOf<B>, DirtyStoreOf<B>>;
+
+/// The wrapped context (or fully-typed error) `build_context` produces.
+type BuiltContext<C, T, B, Sc, L, Scope> =
+    Result<KeyedStateContext<C, DurableOf<B>, DirtyStoreOf<B>, L, Scope>, HandlerError<T, B, Sc>>;
+
 /// Builder for [`KeyedStateMiddleware`].
 ///
-/// Captures the durable bundle, the scanner, the oracle, the dirty-store
-/// factory, the middleware-wide default TTL, the recovery delay, and any
-/// descriptor registrations before producing the middleware. The loader
-/// slot defaults to [`NoLoader`]; consumers with Kafka-message collections
-/// supply a real loader via [`Self::loader`].
-pub struct KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L = NoLoader> {
-    durable: Option<D>,
+/// Captures the per-partition backend factory, the scanner, the
+/// middleware-wide default TTL, the recovery delay, and any descriptor
+/// registrations before producing the middleware. The loader slot defaults
+/// to [`NoLoader`]; consumers with Kafka-message collections supply a real
+/// loader via [`Self::loader`].
+pub struct KeyedStateMiddlewareBuilder<B, Sc, P, L = NoLoader> {
+    backend: Option<B>,
     scanner: Option<Sc>,
-    oracle: Option<O>,
-    factory: Option<F>,
     loader: L,
     consumer_group: Option<Arc<str>>,
     version: Option<Arc<str>>,
@@ -68,13 +81,11 @@ pub struct KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L = NoLoader> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<D, Sc, O, F, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
+impl<B, Sc, P> Default for KeyedStateMiddlewareBuilder<B, Sc, P> {
     fn default() -> Self {
         Self {
-            durable: None,
+            backend: None,
             scanner: None,
-            oracle: None,
-            factory: None,
             loader: NoLoader,
             consumer_group: None,
             version: None,
@@ -88,11 +99,17 @@ impl<D, Sc, O, F, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     }
 }
 
-impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
-    /// Sets the durable Value bundle.
+impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L> {
+    /// Sets the per-partition backend factory (durable bundle + commit
+    /// oracle + dirty-workspace provider).
+    ///
+    /// For in-memory tests pass a
+    /// [`SharedStateBackend`](crate::state::SharedStateBackend); production
+    /// uses the partition-scoped factories in
+    /// [`production`](crate::state::production).
     #[must_use]
-    pub fn durable(mut self, durable: D) -> Self {
-        self.durable = Some(durable);
+    pub fn backend(mut self, backend: B) -> Self {
+        self.backend = Some(backend);
         self
     }
 
@@ -103,35 +120,13 @@ impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
         self
     }
 
-    /// Sets the commit oracle.
-    #[must_use]
-    pub fn oracle(mut self, oracle: O) -> Self {
-        self.oracle = Some(oracle);
-        self
-    }
-
-    /// Sets the dirty-store factory.
-    ///
-    /// The factory mints per-Kafka-partition dirty workspaces during
-    /// partition assignment. For in-memory tests pass
-    /// [`crate::state::memory::MemoryDirtyValueStoreFactory::default()`];
-    /// for production pass a `FjallDirtyValueStoreFactory` constructed
-    /// from a shared [`crate::state::fjall::FjallClient`].
-    #[must_use]
-    pub fn dirty_factory(mut self, factory: F) -> Self {
-        self.factory = Some(factory);
-        self
-    }
-
     /// Sets the message loader Kafka-message collections resolve through,
     /// replacing the [`NoLoader`] default.
     #[must_use]
-    pub fn loader<L2>(self, loader: L2) -> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L2> {
+    pub fn loader<L2>(self, loader: L2) -> KeyedStateMiddlewareBuilder<B, Sc, P, L2> {
         KeyedStateMiddlewareBuilder {
-            durable: self.durable,
+            backend: self.backend,
             scanner: self.scanner,
-            oracle: self.oracle,
-            factory: self.factory,
             loader,
             consumer_group: self.consumer_group,
             version: self.version,
@@ -179,7 +174,7 @@ impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
     }
 
     /// Sets the default [`CommitMode`] applied to collections that are
-    /// not registered via [`Self::collection_def`] (defaults to
+    /// not registered via [`Self::state`] (defaults to
     /// [`CommitMode::Wal`]).
     #[must_use]
     pub fn default_commit_mode(mut self, mode: CommitMode) -> Self {
@@ -218,7 +213,7 @@ impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
     /// resolver, so the get-side (first-touch) and sweep-side recovery paths
     /// bind the **same** per-collection TTL. When set, [`Self::build`] uses
     /// this registry verbatim and ignores the per-builder
-    /// [`Self::collection_def`] / [`Self::default_ttl`] /
+    /// [`Self::state`] / [`Self::default_ttl`] /
     /// [`Self::default_commit_mode`] inputs; when unset, `build` derives a
     /// fresh registry from those inputs.
     #[must_use]
@@ -227,27 +222,17 @@ impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
         self
     }
 
-    /// Builds the middleware.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeyedStateMiddlewareBuildError::Missing`] if a required
-    /// field was not supplied.
-    pub fn build(
+    /// Shared `build` body: field validation + registry assembly. The
+    /// public `build` impls layer the loader-presence check on top.
+    fn build_any(
         self,
-    ) -> Result<KeyedStateMiddleware<D, Sc, O, F, P, L>, KeyedStateMiddlewareBuildError> {
-        let durable = self
-            .durable
-            .ok_or(KeyedStateMiddlewareBuildError::Missing("durable"))?;
+    ) -> Result<KeyedStateMiddleware<B, Sc, P, L>, KeyedStateMiddlewareBuildError> {
+        let backend = self
+            .backend
+            .ok_or(KeyedStateMiddlewareBuildError::Missing("backend"))?;
         let scanner = self
             .scanner
             .ok_or(KeyedStateMiddlewareBuildError::Missing("scanner"))?;
-        let oracle = self
-            .oracle
-            .ok_or(KeyedStateMiddlewareBuildError::Missing("oracle"))?;
-        let factory = self
-            .factory
-            .ok_or(KeyedStateMiddlewareBuildError::Missing("dirty_factory"))?;
         let consumer_group = self
             .consumer_group
             .ok_or(KeyedStateMiddlewareBuildError::Missing("consumer_group"))?;
@@ -265,10 +250,8 @@ impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
             Arc::new(registry)
         };
         Ok(KeyedStateMiddleware {
-            durable,
+            backend,
             scanner,
-            oracle,
-            factory,
             loader: self.loader,
             consumer_group,
             version,
@@ -276,6 +259,47 @@ impl<D, Sc, O, F, P, L> KeyedStateMiddlewareBuilder<D, Sc, O, F, P, L> {
             recovery_delay: self.recovery_delay,
             _payload: PhantomData,
         })
+    }
+}
+
+impl<B, Sc, P> KeyedStateMiddlewareBuilder<B, Sc, P, NoLoader> {
+    /// Builds the middleware without a message loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyedStateMiddlewareBuildError::Missing`] if a required
+    /// field was not supplied, or
+    /// [`KeyedStateMiddlewareBuildError::KafkaCellWithoutLoader`] if a
+    /// Kafka-message collection is registered — its handle cannot resolve
+    /// messages without a loader. (The primary gate is the type system:
+    /// `ctx.state(KAFKA_DESC)` does not compile against a [`NoLoader`]
+    /// context; this check is the belt-and-braces for registries built at
+    /// runtime.)
+    pub fn build(
+        self,
+    ) -> Result<KeyedStateMiddleware<B, Sc, P, NoLoader>, KeyedStateMiddlewareBuildError> {
+        let middleware = self.build_any()?;
+        if middleware.registry.has_kafka_message_cells() {
+            return Err(KeyedStateMiddlewareBuildError::KafkaCellWithoutLoader);
+        }
+        Ok(middleware)
+    }
+}
+
+impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L>
+where
+    L: MessageLoader,
+{
+    /// Builds the middleware with a real message loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyedStateMiddlewareBuildError::Missing`] if a required
+    /// field was not supplied.
+    pub fn build(
+        self,
+    ) -> Result<KeyedStateMiddleware<B, Sc, P, L>, KeyedStateMiddlewareBuildError> {
+        self.build_any()
     }
 }
 
@@ -289,6 +313,14 @@ pub enum KeyedStateMiddlewareBuildError {
     /// A descriptor registration was invalid or conflicted.
     #[error(transparent)]
     Register(#[from] RegisterStateError),
+
+    /// A Kafka-message collection was registered but no message loader was
+    /// supplied.
+    #[error(
+        "a Kafka-message collection is registered but the middleware has no message loader; \
+         supply one via the builder's `loader` method"
+    )]
+    KafkaCellWithoutLoader,
 }
 
 impl ClassifyError for KeyedStateMiddlewareBuildError {
@@ -303,11 +335,9 @@ impl ClassifyError for KeyedStateMiddlewareBuildError {
 /// `Wal` seal + recovery timer scheduling and `Direct` apply, and routes
 /// apply hooks to `apply_sealed` / `rollback_sealed`. See the module docs
 /// for the hook lifecycle.
-pub struct KeyedStateMiddleware<D, Sc, O, F, P, L = NoLoader> {
-    durable: D,
+pub struct KeyedStateMiddleware<B, Sc, P, L = NoLoader> {
+    backend: B,
     scanner: Sc,
-    oracle: O,
-    factory: F,
     loader: L,
     consumer_group: Arc<str>,
     version: Arc<str>,
@@ -316,20 +346,16 @@ pub struct KeyedStateMiddleware<D, Sc, O, F, P, L = NoLoader> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<D, Sc, O, F, P, L> Clone for KeyedStateMiddleware<D, Sc, O, F, P, L>
+impl<B, Sc, P, L> Clone for KeyedStateMiddleware<B, Sc, P, L>
 where
-    D: Clone,
+    B: Clone,
     Sc: Clone,
-    O: Clone,
-    F: Clone,
     L: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            durable: self.durable.clone(),
+            backend: self.backend.clone(),
             scanner: self.scanner.clone(),
-            oracle: self.oracle.clone(),
-            factory: self.factory.clone(),
             loader: self.loader.clone(),
             consumer_group: self.consumer_group.clone(),
             version: self.version.clone(),
@@ -340,7 +366,7 @@ where
     }
 }
 
-impl<D, Sc, O, F, P, L> fmt::Debug for KeyedStateMiddleware<D, Sc, O, F, P, L> {
+impl<B, Sc, P, L> fmt::Debug for KeyedStateMiddleware<B, Sc, P, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyedStateMiddleware")
             .field("consumer_group", &self.consumer_group)
@@ -349,11 +375,11 @@ impl<D, Sc, O, F, P, L> fmt::Debug for KeyedStateMiddleware<D, Sc, O, F, P, L> {
     }
 }
 
-impl<D, Sc, O, F, P> KeyedStateMiddleware<D, Sc, O, F, P> {
+impl<B, Sc, P> KeyedStateMiddleware<B, Sc, P> {
     /// Returns a fresh builder for the middleware (loader slot defaults to
     /// [`NoLoader`]).
     #[must_use]
-    pub fn builder() -> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
+    pub fn builder() -> KeyedStateMiddlewareBuilder<B, Sc, P> {
         KeyedStateMiddlewareBuilder::default()
     }
 }
@@ -390,60 +416,74 @@ pub enum KeyedStateOutput<O> {
     Recovery,
 }
 
+/// Per-partition backend parts minted at assignment time: the durable
+/// bundle, the oracle, the dirty provider, and the lazy durable-identity
+/// validator built over the durable.
+pub(super) struct PartitionBackend<B>
+where
+    B: StateBackendFactory,
+{
+    pub(super) durable: B::Durable,
+    pub(super) oracle: B::Oracle,
+    pub(super) dirty: B::DirtyProvider,
+    pub(super) identity: LazyDescriptorIdentity<B::Durable>,
+}
+
 /// Per-partition keyed-state handler produced by [`KeyedStateMiddleware`].
 ///
-/// `provider` is `Ok` when the factory succeeded at partition assignment
+/// `backend` is `Ok` when the factory succeeded at partition assignment
 /// time; `Err` carries a type-erased clone of the factory error so every
 /// subsequent dispatch can surface it via
 /// [`KeyedStateMiddlewareError::Factory`].
-pub struct KeyedStateHandler<T, D, Sc, O, P, L>
+pub struct KeyedStateHandler<T, B, Sc, L>
 where
-    P: DirtyStoreProvider<ValueKind>,
+    B: StateBackendFactory,
 {
     pub(super) inner: T,
-    pub(super) durable: D,
+    pub(super) backend: Result<PartitionBackend<B>, BoxedFactoryError>,
     pub(super) scanner: Sc,
-    pub(super) oracle: O,
-    pub(super) provider: Result<P, BoxedFactoryError>,
     pub(super) loader: L,
     pub(super) consumer_group: Arc<str>,
     pub(super) version: Arc<str>,
     pub(super) registry: Arc<CollectionDefRegistry>,
     pub(super) segment_id: SegmentId,
     pub(super) recovery_delay: CompactDuration,
-    pub(super) identity: LazyDescriptorIdentity<D>,
 }
 
-impl<T, D, Sc, O, P, L> KeyedStateHandler<T, D, Sc, O, P, L>
+impl<T, B, Sc, L> KeyedStateHandler<T, B, Sc, L>
 where
     T: FallibleHandler,
-    D: DurableValueBundle
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DescriptorIdentityStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    B: StateBackendFactory,
+    B::Durable: DurableValueBundle
+        + PendingIndexStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>
+        + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
+    DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    O: CommitOracle,
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     L: Clone + Send + Sync + 'static,
 {
+    /// Returns the partition backend, surfacing the captured factory error
+    /// when assignment-time minting failed.
+    fn backend(&self) -> Result<&PartitionBackend<B>, HandlerError<T, B, Sc>> {
+        self.backend
+            .as_ref()
+            .map_err(|e| KeyedStateMiddlewareError::Factory(e.clone()))
+    }
+
     fn build_context<C, Scope>(
         &self,
         inner: C,
         key: Key,
         event: EventRef,
         scope: Scope,
-    ) -> BuildContextResult<C, T, D, Sc, O, P::Store, L, Scope>
+    ) -> BuiltContext<C, T, B, Sc, L, Scope>
     where
         C: EventContext + Clone + Send + Sync,
     {
-        let provider = self
-            .provider
-            .as_ref()
-            .map_err(|e| KeyedStateMiddlewareError::Factory(e.clone()))?;
-        let dirty = provider.for_scope(EventScopeId::fresh());
+        let backend = self.backend()?;
+        let dirty = backend.dirty.for_scope(EventScopeId::fresh());
         Ok(KeyedStateContext::new(ContextParts {
             inner,
-            durable: self.durable.clone(),
+            durable: backend.durable.clone(),
             dirty,
             loader: self.loader.clone(),
             scope,
@@ -459,10 +499,10 @@ where
     /// sealed, arms the `StateRecovery` backstop timer.
     async fn finalize_inner<C, Scope>(
         &self,
-        wrapped: KeyedStateContext<C, D, P::Store, L, Scope>,
+        wrapped: KeyedStateContext<C, DurableOf<B>, DirtyStoreOf<B>, L, Scope>,
         context: C,
         inner_output: T::Output,
-    ) -> Result<KeyedStateOutput<T::Output>, MiddlewareError<T, D, Sc, O, P::Store>>
+    ) -> Result<KeyedStateOutput<T::Output>, HandlerError<T, B, Sc>>
     where
         C: EventContext + Clone + Send + Sync + 'static,
     {
@@ -495,16 +535,17 @@ where
         &self,
         context: &C,
         key: Key,
-    ) -> Result<(), MiddlewareError<T, D, Sc, O, P::Store>>
+    ) -> Result<(), HandlerError<T, B, Sc>>
     where
         C: EventContext,
     {
+        let backend = self.backend()?;
         let state_key = StateKey::new(self.segment_id, key);
         recover_pending_entries(
             context,
-            &self.durable,
+            &backend.durable,
             &self.scanner,
-            &self.oracle,
+            &backend.oracle,
             &self.registry,
             state_key,
         )
@@ -527,20 +568,19 @@ where
     }
 }
 
-impl<T, D, Sc, O, P, L> FallibleHandler for KeyedStateHandler<T, D, Sc, O, P, L>
+impl<T, B, Sc, L> FallibleHandler for KeyedStateHandler<T, B, Sc, L>
 where
     T: FallibleHandler,
     T::Payload: EventIdentity,
-    D: DurableValueBundle
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DescriptorIdentityStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    B: StateBackendFactory,
+    B::Durable: DurableValueBundle
+        + PendingIndexStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>
+        + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
+    DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    O: CommitOracle,
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     L: Clone + Send + Sync + 'static,
 {
-    type Error = MiddlewareError<T, D, Sc, O, P::Store>;
+    type Error = HandlerError<T, B, Sc>;
     type Output = KeyedStateOutput<T::Output>;
     type Payload = T::Payload;
 
@@ -554,11 +594,16 @@ where
         C: EventContext,
     {
         // Invariant: no state op executes under an unvalidated identity.
-        self.identity
+        self.backend()?
+            .identity
             .ensure()
             .await
             .map_err(KeyedStateMiddlewareError::Identity)?;
 
+        // The dedup id is derived for every message — even when no
+        // descriptors are registered — because the EventRef must exist
+        // before we know whether the handler touches state. One hash per
+        // message is a deliberate cost of the always-on layer.
         let dedup_id = self.derive_dedup_id_for_message(&message);
         let event = EventRef::Message { dedup_id };
         let key = message.key().clone();
@@ -585,7 +630,8 @@ where
     {
         // Invariant: no state op executes under an unvalidated identity —
         // including the recovery sweep below.
-        self.identity
+        self.backend()?
+            .identity
             .ensure()
             .await
             .map_err(KeyedStateMiddlewareError::Identity)?;
@@ -629,9 +675,11 @@ where
                 sealed_event: Some(event),
                 sealed_collections,
             }) => {
+                // A sealed output cannot exist without a minted backend.
+                let Ok(backend) = &self.backend else { return };
                 let mut all_resolved = true;
                 for collection_ref in &sealed_collections {
-                    if let Err(error) = self.durable.apply_sealed(collection_ref, event).await {
+                    if let Err(error) = backend.durable.apply_sealed(collection_ref, event).await {
                         warn!(error = ?error, "apply_sealed failed in after_commit");
                         all_resolved = false;
                     }
@@ -677,9 +725,12 @@ where
                 sealed_event: Some(event),
                 sealed_collections,
             }) => {
+                // A sealed output cannot exist without a minted backend.
+                let Ok(backend) = &self.backend else { return };
                 let mut all_resolved = true;
                 for collection_ref in &sealed_collections {
-                    if let Err(error) = self.durable.rollback_sealed(collection_ref, event).await {
+                    if let Err(error) = backend.durable.rollback_sealed(collection_ref, event).await
+                    {
                         warn!(error = ?error, "rollback_sealed failed in after_abort");
                         all_resolved = false;
                     }
@@ -712,12 +763,10 @@ where
 }
 
 /// Per-partition provider for [`KeyedStateMiddleware`].
-pub struct KeyedStateProvider<T, D, Sc, O, F, L> {
+pub struct KeyedStateProvider<T, B, Sc, L> {
     inner_provider: T,
-    durable: D,
+    backend: B,
     scanner: Sc,
-    oracle: O,
-    factory: F,
     loader: L,
     consumer_group: Arc<str>,
     version: Arc<str>,
@@ -725,75 +774,87 @@ pub struct KeyedStateProvider<T, D, Sc, O, F, L> {
     recovery_delay: CompactDuration,
 }
 
-impl<T, D, Sc, O, F, L> FallibleHandlerProvider for KeyedStateProvider<T, D, Sc, O, F, L>
+impl<T, B, Sc, L> FallibleHandlerProvider for KeyedStateProvider<T, B, Sc, L>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
     <T::Handler as FallibleHandler>::Payload: EventIdentity,
-    D: DurableValueBundle
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DescriptorIdentityStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    B: StateBackendFactory,
+    B::Durable: DurableValueBundle
+        + PendingIndexStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>
+        + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
+    DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    O: CommitOracle,
-    F: DirtyStoreFactory<ValueKind>,
-    F::Provider: DirtyStoreProvider<ValueKind>,
-    <F::Provider as DirtyStoreProvider<ValueKind>>::Store:
-        DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     L: Clone + Send + Sync + 'static,
 {
-    type Handler = KeyedStateHandler<T::Handler, D, Sc, O, F::Provider, L>;
+    type Handler = KeyedStateHandler<T::Handler, B, Sc, L>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner_provider.handler_for_partition(topic, partition);
         let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
-        let provider = self.factory.for_partition(topic, partition).map_err(|err| {
-            let boxed = BoxedFactoryError::new(&err);
-            tracing::error!(
-                topic = ?topic,
-                partition,
-                error = %err,
-                "keyed-state factory failed to mint dirty workspace; \
-                 every dispatch on this partition will surface the failure"
-            );
-            boxed
-        });
-        // Constructed synchronously (no I/O): the durable identity rows are
-        // validated lazily on the partition's first dispatch.
-        let identity =
-            LazyDescriptorIdentity::new(self.durable.clone(), self.registry.clone(), segment_id);
+        let backend = self
+            .backend
+            .for_partition(topic, partition)
+            .map(
+                |StateBackend {
+                     durable,
+                     oracle,
+                     dirty,
+                 }| {
+                    // Constructed synchronously (no I/O): the durable identity
+                    // rows are validated lazily on the partition's first
+                    // dispatch.
+                    let identity = LazyDescriptorIdentity::new(
+                        durable.clone(),
+                        self.registry.clone(),
+                        segment_id,
+                    );
+                    PartitionBackend {
+                        durable,
+                        oracle,
+                        dirty,
+                        identity,
+                    }
+                },
+            )
+            .map_err(|err| {
+                let boxed = BoxedFactoryError::new(&err);
+                tracing::error!(
+                    topic = ?topic,
+                    partition,
+                    error = %err,
+                    "keyed-state backend factory failed; \
+                     every dispatch on this partition will surface the failure"
+                );
+                boxed
+            });
         KeyedStateHandler {
             inner,
-            durable: self.durable.clone(),
+            backend,
             scanner: self.scanner.clone(),
-            oracle: self.oracle.clone(),
-            provider,
             loader: self.loader.clone(),
             consumer_group: self.consumer_group.clone(),
             version: self.version.clone(),
             registry: self.registry.clone(),
             segment_id,
             recovery_delay: self.recovery_delay,
-            identity,
         }
     }
 }
 
-impl<D, Sc, O, F, P, L> HandlerMiddleware<P> for KeyedStateMiddleware<D, Sc, O, F, P, L>
+impl<B, Sc, P, L> HandlerMiddleware<P> for KeyedStateMiddleware<B, Sc, P, L>
 where
-    D: DurableValueBundle
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DescriptorIdentityStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    B: StateBackendFactory,
+    B::Durable: DurableValueBundle
+        + PendingIndexStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>
+        + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
+    DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    O: CommitOracle,
-    F: DirtyStoreFactory<ValueKind>,
-    F::Provider: DirtyStoreProvider<ValueKind>,
-    <F::Provider as DirtyStoreProvider<ValueKind>>::Store:
-        DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     P: Send + Sync + 'static + EventIdentity,
     L: Clone + Send + Sync + 'static,
 {
     type Provider<T>
-        = KeyedStateProvider<T, D, Sc, O, F, L>
+        = KeyedStateProvider<T, B, Sc, L>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;
@@ -805,10 +866,8 @@ where
     {
         KeyedStateProvider {
             inner_provider,
-            durable: self.durable.clone(),
+            backend: self.backend.clone(),
             scanner: self.scanner.clone(),
-            oracle: self.oracle.clone(),
-            factory: self.factory.clone(),
             loader: self.loader.clone(),
             consumer_group: self.consumer_group.clone(),
             version: self.version.clone(),

@@ -1,7 +1,7 @@
 //! Per-collection definitions and the registry of middleware defaults.
 
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
+use crate::state::descriptor::{CellKind, DescriptorIdentity, StructuralIdentity};
 use crate::state::{CommitMode, StateName, StateNameError};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
@@ -149,6 +149,14 @@ impl CollectionDefRegistry {
     /// Returns every registered `(name, identity)` pair.
     pub(crate) fn identities(&self) -> impl Iterator<Item = (&StateName, &StructuralIdentity)> {
         self.defs.iter().map(|(name, c)| (name, &c.identity))
+    }
+
+    /// Returns whether any registered collection stores Kafka message
+    /// references — such collections need a message loader to resolve.
+    pub(crate) fn has_kafka_message_cells(&self) -> bool {
+        self.defs
+            .values()
+            .any(|c| c.identity.cell_kind == CellKind::KafkaMessageRef)
     }
 
     /// Returns the TTL bound to `name`, falling back to the

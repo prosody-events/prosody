@@ -35,8 +35,7 @@ use crate::timers::{
 use super::CommitManager;
 
 type TestManager = TimerManager<TableAdapter<InMemoryTriggerStore>>;
-type TestCommitManager =
-    CommitManager<MemoryDeduplicationStore, TableAdapter<InMemoryTriggerStore>>;
+type TestCommitManager = CommitManager<MemoryDeduplicationStore, TestManager>;
 
 fn test_semaphores() -> Arc<TimerSemaphores> {
     Arc::new(from_fn(|_| Arc::new(Semaphore::new(64))))

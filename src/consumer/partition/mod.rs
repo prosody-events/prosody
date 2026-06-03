@@ -22,7 +22,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::otel::SpanRelation;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
+use crate::timers::store::{Segment, TriggerStore, TriggerStoreProvider};
 use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
 use crate::{EventType, Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -44,7 +44,6 @@ use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, debug_span, error, info_span, instrument};
-use uuid::Uuid;
 
 mod keyed;
 mod metrics;
@@ -486,16 +485,14 @@ async fn handle_messages<T, S, P>(
         ..
     } = config;
 
-    let name = format!(
-        "{}:{}/{}",
-        group_id, partition_info.topic, partition_info.partition
+    let segment = Segment::for_partition(
+        &group_id,
+        partition_info.topic,
+        partition_info.partition,
+        timer_slab_size,
     );
-    let trigger_store = trigger_provider.create_store(Segment {
-        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
-        name: name.clone(),
-        slab_size: timer_slab_size,
-        version: SegmentVersion::V3,
-    });
+    let name = segment.name.clone();
+    let trigger_store = trigger_provider.create_store(segment);
 
     let params = PartitionParams {
         group_id,

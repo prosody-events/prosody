@@ -9,18 +9,18 @@
 
 use super::context::{ByteValueHandle, ContextParts};
 use super::descriptor_identity::LazyDescriptorIdentity;
-use super::handler::recover_pending_entries;
+use super::handler::{PartitionBackend, recover_pending_entries};
 use super::*;
 use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::DurableState;
+use crate::state::SharedStateBackend;
 use crate::state::StoreOutcome;
 use crate::state::descriptor::{KafkaMessageRef, NoLoader, ValueDescriptor, value_state};
 use crate::state::memory::{
-    MemoryDirtyValueStore, MemoryDirtyValueStoreFactory, MemoryDirtyValueStoreProvider,
-    MemoryDurableValueStore,
+    MemoryDirtyValueStore, MemoryDirtyValueStoreProvider, MemoryDurableValueStore,
 };
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
@@ -573,20 +573,15 @@ fn message_scope_context_exposes_message_ref() {
 #[test]
 fn builder_rejects_missing_fields() -> Result<()> {
     type ProbeOutput = ();
-    let builder: KeyedStateMiddlewareBuilder<
-        MemoryDurableValueStore,
-        MemoryDurableValueStore,
-        FixedOracle,
-        MemoryDirtyValueStoreFactory,
-        ProbeOutput,
-    > = KeyedStateMiddleware::builder();
+    let builder: KeyedStateMiddlewareBuilder<TestBackend, MemoryDurableValueStore, ProbeOutput> =
+        KeyedStateMiddleware::builder();
     let err = builder
         .build()
         .err()
         .ok_or_else(|| eyre!("expected missing field"))?;
     assert!(matches!(
         err,
-        KeyedStateMiddlewareBuildError::Missing("durable")
+        KeyedStateMiddlewareBuildError::Missing("backend")
     ));
     Ok(())
 }
@@ -702,33 +697,36 @@ impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
 
 /// Build a `KeyedStateHandler` over a `ValueWritingHandler` so we can
 /// drive `on_message` / `on_timer` directly in tests.
+type TestBackend =
+    SharedStateBackend<MemoryDurableValueStore, FixedOracle, MemoryDirtyValueStoreProvider>;
+
 fn build_handler(
     durable: MemoryDurableValueStore,
     oracle: FixedOracle,
     commit_mode: CommitMode,
 ) -> KeyedStateHandler<
     ValueWritingHandler<MemoryDurableValueStore>,
+    TestBackend,
     MemoryDurableValueStore,
-    MemoryDurableValueStore,
-    FixedOracle,
-    MemoryDirtyValueStoreProvider,
     NoLoader,
 > {
     let registry = Arc::new(registry().with_default_commit_mode(commit_mode));
     let segment_id = Uuid::new_v4();
     KeyedStateHandler {
         inner: ValueWritingHandler::new(),
-        durable: durable.clone(),
-        scanner: durable.clone(),
-        oracle,
-        provider: Ok(MemoryDirtyValueStoreProvider),
+        backend: Ok(PartitionBackend {
+            durable: durable.clone(),
+            oracle,
+            dirty: MemoryDirtyValueStoreProvider,
+            identity: LazyDescriptorIdentity::new(durable.clone(), registry.clone(), segment_id),
+        }),
+        scanner: durable,
         loader: NoLoader,
         consumer_group: Arc::from("test-group"),
         version: Arc::from("1"),
-        registry: registry.clone(),
+        registry,
         segment_id,
         recovery_delay: CompactDuration::new(30),
-        identity: LazyDescriptorIdentity::new(durable, registry, segment_id),
     }
 }
 
@@ -991,20 +989,27 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = Arc::new(registry());
     let segment_id = Uuid::new_v4();
-    let handler = KeyedStateHandler {
-        inner: RecordingHandler,
-        durable: durable.clone(),
-        scanner: durable.clone(),
-        oracle: FixedOracle::committed(),
-        provider: Ok(MemoryDirtyValueStoreProvider),
-        loader: NoLoader,
-        consumer_group: Arc::from("test-group"),
-        version: Arc::from("1"),
-        registry: registry.clone(),
-        segment_id,
-        recovery_delay: CompactDuration::new(30),
-        identity: LazyDescriptorIdentity::new(durable, registry, segment_id),
-    };
+    let handler: KeyedStateHandler<RecordingHandler, TestBackend, _, NoLoader> =
+        KeyedStateHandler {
+            inner: RecordingHandler,
+            backend: Ok(PartitionBackend {
+                durable: durable.clone(),
+                oracle: FixedOracle::committed(),
+                dirty: MemoryDirtyValueStoreProvider,
+                identity: LazyDescriptorIdentity::new(
+                    durable.clone(),
+                    registry.clone(),
+                    segment_id,
+                ),
+            }),
+            scanner: durable,
+            loader: NoLoader,
+            consumer_group: Arc::from("test-group"),
+            version: Arc::from("1"),
+            registry,
+            segment_id,
+            recovery_delay: CompactDuration::new(30),
+        };
     let context = MockEventContext::new().with_timer_tracking();
     let msg = test_message()?;
 

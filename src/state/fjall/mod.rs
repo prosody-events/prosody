@@ -93,6 +93,19 @@ impl FjallValueStore {
         })
     }
 
+    /// Builds a cache store over `workspace`'s per-partition cache handle,
+    /// sharing the workspace's already-open keyspace — fjall locks the
+    /// cache directory, so opening it a second time would fail.
+    #[must_use]
+    pub fn with_workspace(workspace: &FjallWorkspace) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                _keyspace: workspace.keyspace().as_ref().clone(),
+                partition: workspace.cache_handle().clone(),
+            }),
+        }
+    }
+
     /// Writes an encoded cache cell at `collection`'s key, dispatching the
     /// blocking fjall insert off the async runtime.
     async fn insert_cell(
