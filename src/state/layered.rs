@@ -61,22 +61,6 @@ impl<Cache, Backing> LayeredValueStore<Cache, Backing> {
     pub fn new(cache: Cache, backing: Backing) -> Self {
         Self { cache, backing }
     }
-
-    // TODO: audit `cache()`/`backing()` against the public interface once the
-    // composition stabilizes; drop them if no consumer materializes
-    // (re-addable non-breakingly).
-
-    /// Returns a reference to the cache store.
-    #[must_use]
-    pub fn cache(&self) -> &Cache {
-        &self.cache
-    }
-
-    /// Returns a reference to the backing store.
-    #[must_use]
-    pub fn backing(&self) -> &Backing {
-        &self.backing
-    }
 }
 
 impl<Cache, Backing> LayeredValueStore<Cache, Backing>
