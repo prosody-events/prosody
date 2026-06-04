@@ -21,6 +21,7 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_VALUE}} (
 
     data             blob,
     payload_encoding smallint,
+    identity_version int,
 
     wal_event        frozen<event_ref>,
     wal_ops          blob,
@@ -46,16 +47,20 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_PENDING}} (
 -- whose registered descriptor disagrees with the stored identity refuses
 -- to dispatch (Permanent), so an incompatible deploy fails loudly instead
 -- of silently misreading cells. `codec_id` is the codec's open-dispatch
--- string token (NULL for framework-defined cells).
+-- string token (NULL for framework-defined cells). `version` is an
+-- append-only clustering column: only version 1 is written today; future
+-- identity migrations append new versions and stamp value rows
+-- (`identity_version`) per key as they migrate.
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_DESCRIPTOR}} (
     segment_id    uuid,
     name          text,
+    version       int,
 
     kind          tinyint,
     cell_kind     smallint,
     codec_id      text,
     schema_label  text,
 
-    PRIMARY KEY ((segment_id), name)
+    PRIMARY KEY ((segment_id), name, version)
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };

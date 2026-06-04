@@ -1,7 +1,9 @@
 //! In-memory keyed-state stores.
 
 use super::encoding::{EncodingError, decode_wal};
-use super::middleware::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use super::middleware::{
+    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
+};
 use super::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use super::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, ValueKind, ValueOp, ValueStore,
@@ -189,6 +191,21 @@ impl MemoryDurableValueStore {
         Self::new(Some(CompactDuration::new(3_600)))
     }
 
+    /// Test-only read of the `identity_version` stamp mirroring
+    /// Cassandra's per-row column, so suites can prove the
+    /// `applied` ⇔ stamp pairing on the memory backend.
+    #[cfg(test)]
+    pub(crate) fn identity_version_for_tests(
+        &self,
+        collection: &CollectionId<ValueKind>,
+    ) -> Option<i32> {
+        self.inner
+            .lock()
+            .entries
+            .get(collection)
+            .and_then(|entry| entry.identity_version)
+    }
+
     /// Applies a single op via [`DirectApplyStore`], threading the
     /// constructor-supplied `default_ttl` through the built [`CollectionRef`].
     /// Backs the [`ValueStore::set`] / [`ValueStore::clear`] impls.
@@ -329,7 +346,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         self.resolve_sealed(collection, expected_event, |entry, sealed| {
             let envelope =
                 decode_wal::<ValueKind>(sealed.wal()).map_err(MemoryStateError::Encoding)?;
-            entry.applied = fold_value_ops(entry.applied.clone(), &envelope.into_ops());
+            entry.fold_applied(&envelope.into_ops());
             Ok(())
         })
     }
@@ -361,7 +378,7 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
 
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.id().clone()).or_default();
-        entry.applied = fold_value_ops(entry.applied.clone(), &ops);
+        entry.fold_applied(&ops);
         Ok(StoreOutcome::Applied)
     }
 }
@@ -503,12 +520,30 @@ impl PendingKey {
 ///
 /// Invariant: `applied` always reflects the pre-seal authoritative state.
 /// `seal` writes only `wal`; `applied` is mutated solely by `apply_sealed`
-/// and `direct_apply`. This is what lets `rollback_sealed` resolve a
-/// sealed event with `entry.wal = None` and no `applied` restoration.
+/// and `direct_apply` (through [`Self::fold_applied`]). This is what lets
+/// `rollback_sealed` resolve a sealed event with `entry.wal = None` and no
+/// `applied` restoration.
+///
+/// Invariant: `identity_version` pairs with `applied` (both present or
+/// both absent) — the memory mirror of Cassandra's `data` ⇔
+/// `identity_version` column pairing. `seal` never stamps.
 #[derive(Debug, Default)]
 struct DurableValueEntry {
     applied: Option<Bytes>,
+    identity_version: Option<i32>,
     wal: Option<SealedWal<ValueKind>>,
+}
+
+impl DurableValueEntry {
+    /// Folds `ops` into the applied state, stamping `identity_version` in
+    /// lockstep — the single mutation path for `applied`.
+    fn fold_applied<'a, I>(&mut self, ops: I)
+    where
+        I: IntoIterator<Item = &'a ValueOp>,
+    {
+        self.applied = fold_value_ops(self.applied.clone(), ops);
+        self.identity_version = self.applied.is_some().then_some(INITIAL_IDENTITY_VERSION);
+    }
 }
 
 /// Error returned by memory keyed-state stores.

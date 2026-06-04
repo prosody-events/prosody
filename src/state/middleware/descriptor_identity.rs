@@ -25,6 +25,17 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
+/// The only identity version this build writes or accepts.
+///
+/// Identity rows are versioned (append-only clustering column) and every
+/// authoritative value cell stamps the version its bytes were written
+/// under, but bumping is impossible today: acquisition writes version 1,
+/// any other stored version fails Permanent, and a value row stamped with
+/// a different version is rejected at decode. Version resolution,
+/// bump-append, and per-key migration are future work — the schema is the
+/// hook they build on.
+pub const INITIAL_IDENTITY_VERSION: i32 = 1;
+
 /// One durable identity row in wire form.
 ///
 /// Comparison happens on the wire encoding (the discriminator integers,
@@ -37,6 +48,10 @@ use tokio::sync::OnceCell;
 pub struct DurableDescriptorIdentity {
     /// Collection name the row freezes.
     pub name: String,
+
+    /// Identity version (clustering column). Only
+    /// [`INITIAL_IDENTITY_VERSION`] exists until migration ships.
+    pub version: i32,
 
     /// [`CollectionKindId`](crate::state::CollectionKindId) discriminator.
     pub kind: i8,
@@ -57,6 +72,7 @@ impl DurableDescriptorIdentity {
     pub(crate) fn from_identity(name: &StateName, identity: &StructuralIdentity) -> Self {
         Self {
             name: name.as_str().to_owned(),
+            version: INITIAL_IDENTITY_VERSION,
             kind: identity.kind.as_i8(),
             cell_kind: identity.cell_kind.as_i16(),
             codec_id: identity.codec_id.map(str::to_owned),

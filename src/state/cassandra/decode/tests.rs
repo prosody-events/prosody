@@ -3,6 +3,7 @@ use crate::state::EventRef;
 use crate::state::cassandra::error::CorruptUdtError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::encoding::{PayloadEncoding, WalFormat, encode_payload};
+use crate::state::middleware::INITIAL_IDENTITY_VERSION;
 use crate::state::value_test_suite::bytes;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
@@ -43,7 +44,7 @@ fn assert_corrupt_wal(
 
 #[test]
 fn decodes_idle_no_data() -> Result<()> {
-    let state = try_decode_row((None, None, None, None, None))?;
+    let state = try_decode_row((None, None, None, None, None, None))?;
     match state {
         DurableState::Idle { applied: None } => Ok(()),
         other => Err(eyre::eyre!("expected Idle empty, got {other:?}")),
@@ -56,6 +57,7 @@ fn decodes_idle_with_data() -> Result<()> {
     let state = try_decode_row((
         Some(data),
         Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(INITIAL_IDENTITY_VERSION),
         None,
         None,
         None,
@@ -80,6 +82,7 @@ fn decodes_sealed_with_data_and_wal() -> Result<()> {
     let state = try_decode_row((
         Some(data),
         Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(INITIAL_IDENTITY_VERSION),
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
@@ -106,6 +109,7 @@ fn decodes_sealed_no_data() -> Result<()> {
     let state = try_decode_row((
         None,
         Some(PayloadEncoding::RawZstdV1.as_i16()),
+        None,
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
@@ -122,7 +126,14 @@ fn decodes_sealed_no_data() -> Result<()> {
 #[test]
 fn rejects_data_without_payload_encoding() -> Result<()> {
     assert_corrupt_wal(
-        try_decode_row((Some(vec![0_u8]), None, None, None, None)),
+        try_decode_row((
+            Some(vec![0_u8]),
+            None,
+            Some(INITIAL_IDENTITY_VERSION),
+            None,
+            None,
+            None,
+        )),
         CorruptReason::MissingPayloadEncodingWithData,
     )
 }
@@ -136,6 +147,7 @@ fn rejects_payload_encoding_without_data() -> Result<()> {
             None,
             None,
             None,
+            None,
         )),
         CorruptReason::PayloadEncodingWithoutData,
     )
@@ -144,7 +156,7 @@ fn rejects_payload_encoding_without_data() -> Result<()> {
 #[test]
 fn rejects_partial_wal_columns_event_only() -> Result<()> {
     assert_corrupt_wal(
-        try_decode_row((None, None, Some(message_event_raw()), None, None)),
+        try_decode_row((None, None, None, Some(message_event_raw()), None, None)),
         CorruptReason::PartialWalColumns {
             mask: WalColumnMask {
                 event: true,
@@ -159,6 +171,7 @@ fn rejects_partial_wal_columns_event_only() -> Result<()> {
 fn rejects_partial_wal_columns_ops_and_format_only() -> Result<()> {
     assert_corrupt_wal(
         try_decode_row((
+            None,
             None,
             None,
             None,
@@ -179,6 +192,7 @@ fn rejects_partial_wal_columns_ops_and_format_only() -> Result<()> {
 fn rejects_sealed_without_payload_encoding() -> Result<()> {
     assert_corrupt_wal(
         try_decode_row((
+            None,
             None,
             None,
             Some(message_event_raw()),
@@ -209,6 +223,7 @@ fn rejects_corrupt_event_ref_udt_as_permanent() -> Result<()> {
     let result = try_decode_row((
         None,
         Some(PayloadEncoding::RawZstdV1.as_i16()),
+        None,
         Some(corrupt),
         Some(vec![1_u8]),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
@@ -224,6 +239,70 @@ fn rejects_corrupt_event_ref_udt_as_permanent() -> Result<()> {
         }
         other => Err(eyre::eyre!(
             "expected CorruptUdt(UnknownKind(7)), got {other:?}"
+        )),
+    }
+}
+
+/// `data` without an `identity_version` stamp is a corrupt pairing — every
+/// authoritative cell records the identity version it was written under.
+#[test]
+fn rejects_data_without_identity_version() -> Result<()> {
+    let data = encoded_payload(3)?;
+    assert_corrupt_wal(
+        try_decode_row((
+            Some(data),
+            Some(PayloadEncoding::RawZstdV1.as_i16()),
+            None,
+            None,
+            None,
+            None,
+        )),
+        CorruptReason::MissingIdentityVersionWithData,
+    )
+}
+
+/// An `identity_version` stamp without `data` is the inverse corrupt
+/// pairing.
+#[test]
+fn rejects_identity_version_without_data() -> Result<()> {
+    assert_corrupt_wal(
+        try_decode_row((None, None, Some(INITIAL_IDENTITY_VERSION), None, None, None)),
+        CorruptReason::IdentityVersionWithoutData,
+    )
+}
+
+/// A stamp other than [`INITIAL_IDENTITY_VERSION`] is rejected Permanent —
+/// unreachable until identity migration ships, enforced defensively so a
+/// future-version cell is never misread by this build.
+#[test]
+fn rejects_unrecognized_identity_version_as_permanent() -> Result<()> {
+    use crate::error::{ClassifyError, ErrorCategory};
+
+    let data = encoded_payload(5)?;
+    let result = try_decode_row((
+        Some(data),
+        Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(2_i32),
+        None,
+        None,
+        None,
+    ));
+    match result {
+        Err(
+            error @ CassandraValueStoreError::IdentityVersionMismatch {
+                stored: 2,
+                expected: INITIAL_IDENTITY_VERSION,
+            },
+        ) => {
+            assert_eq!(
+                error.classify_error(),
+                ErrorCategory::Permanent,
+                "identity version mismatch must classify Permanent"
+            );
+            Ok(())
+        }
+        other => Err(eyre::eyre!(
+            "expected IdentityVersionMismatch, got {other:?}"
         )),
     }
 }

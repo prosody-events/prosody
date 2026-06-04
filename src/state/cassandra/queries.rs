@@ -29,7 +29,8 @@ cassandra_queries! {
     pub struct ValueQueries {
         /// Reads the value partition columns (Idle/Sealed/Corrupt shapes).
         read_value_partition: (
-            "SELECT data, payload_encoding, wal_event, wal_ops, wal_format \
+            "SELECT data, payload_encoding, identity_version, \
+             wal_event, wal_ops, wal_format \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
@@ -57,7 +58,8 @@ cassandra_queries! {
         /// same partition, same row, safe under CLAUDE.md's batching rules.
         batch_apply_wal: (
             "BEGIN UNLOGGED BATCH \
-             UPDATE $keyspace.{} USING TTL ? SET data = ?, payload_encoding = ? \
+             UPDATE $keyspace.{} USING TTL ? \
+               SET data = ?, payload_encoding = ?, identity_version = ? \
                WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?; \
              UPDATE $keyspace.{} \
                SET wal_event = null, wal_ops = null, wal_format = null \
@@ -70,7 +72,8 @@ cassandra_queries! {
         /// variant.
         batch_apply_wal_no_ttl: (
             "BEGIN UNLOGGED BATCH \
-             UPDATE $keyspace.{} SET data = ?, payload_encoding = ? \
+             UPDATE $keyspace.{} \
+               SET data = ?, payload_encoding = ?, identity_version = ? \
                WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?; \
              UPDATE $keyspace.{} \
                SET wal_event = null, wal_ops = null, wal_format = null \
@@ -91,14 +94,16 @@ cassandra_queries! {
             TABLE_KEYED_STATE_VALUE
         ),
 
-        /// Clears the WAL columns *and* `payload_encoding`.
+        /// Clears the WAL columns *and* `payload_encoding` +
+        /// `identity_version`.
         ///
         /// Used by `rollback_sealed` when authoritative `data` is also
-        /// NULL: leaving `payload_encoding` set with no `data` would be a
-        /// `PayloadEncodingWithoutData` corruption shape per the decoder.
+        /// NULL: leaving `payload_encoding` or `identity_version` set with
+        /// no `data` would be a corruption shape per the decoder.
         clear_wal_and_encoding: (
             "UPDATE $keyspace.{} \
-             SET wal_event = null, wal_ops = null, wal_format = null, payload_encoding = null \
+             SET wal_event = null, wal_ops = null, wal_format = null, \
+                 payload_encoding = null, identity_version = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -106,7 +111,7 @@ cassandra_queries! {
         /// Writes only the applied cells with TTL (direct-apply path).
         write_data_only: (
             "UPDATE $keyspace.{} USING TTL ? \
-             SET data = ?, payload_encoding = ? \
+             SET data = ?, payload_encoding = ?, identity_version = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -114,7 +119,7 @@ cassandra_queries! {
         /// Writes only the applied cells without TTL (direct-apply path).
         write_data_only_no_ttl: (
             "UPDATE $keyspace.{} \
-             SET data = ?, payload_encoding = ? \
+             SET data = ?, payload_encoding = ?, identity_version = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -136,7 +141,7 @@ cassandra_queries! {
         /// Reads every frozen descriptor-identity row for one segment
         /// (single-partition query).
         read_descriptor_identities: (
-            "SELECT name, kind, cell_kind, codec_id, schema_label \
+            "SELECT name, version, kind, cell_kind, codec_id, schema_label \
              FROM $keyspace.{} WHERE segment_id = ?",
             TABLE_KEYED_STATE_DESCRIPTOR
         ),
@@ -147,8 +152,8 @@ cassandra_queries! {
         /// BATCH` at the call site.
         insert_descriptor_identity: (
             "INSERT INTO $keyspace.{} \
-             (segment_id, name, kind, cell_kind, codec_id, schema_label) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (segment_id, name, version, kind, cell_kind, codec_id, schema_label) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             TABLE_KEYED_STATE_DESCRIPTOR
         ),
 

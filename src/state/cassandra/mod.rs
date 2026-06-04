@@ -20,8 +20,9 @@
 //!    residue shape; recovery resolves it.
 //! 3. **`rollback_sealed` clears the WAL columns first, then deletes the
 //!    pending row.** Same crash residue shape.
-//! 4. **`direct_apply` writes only the `data` + `payload_encoding` columns.**
-//!    Never touches WAL columns or the pending row.
+//! 4. **`direct_apply` writes only the `data` + `payload_encoding` +
+//!    `identity_version` columns.** Never touches WAL columns or the pending
+//!    row.
 //!
 //! # Concurrency
 //!
@@ -56,7 +57,9 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::state::encoding::{
     EncodingError, PayloadEncoding, WalFormat, decode_wal, encode_payload, encode_wal,
 };
-use crate::state::middleware::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use crate::state::middleware::{
+    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
+};
 use crate::state::pending::PendingIndexStore;
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, ValueApplied, ValueKind, ValueOp, ValueStore, fold_value_ops,
@@ -237,7 +240,11 @@ impl CassandraValueStore {
         applied: &ValueApplied,
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let (data, encoding) = encode_applied_payload(applied)?;
+        let AppliedColumns {
+            data,
+            encoding,
+            identity_version,
+        } = encode_applied_payload(applied)?;
         match collection.ttl() {
             Some(ttl) => {
                 let ttl = ttl_to_i32(ttl);
@@ -247,6 +254,7 @@ impl CassandraValueStore {
                         ttl,
                         data.as_ref().map(Bytes::as_ref),
                         encoding,
+                        identity_version,
                         segment_id,
                         key,
                         state_type,
@@ -265,6 +273,7 @@ impl CassandraValueStore {
                     (
                         data.as_ref().map(Bytes::as_ref),
                         encoding,
+                        identity_version,
                         segment_id,
                         key,
                         state_type,
@@ -286,7 +295,11 @@ impl CassandraValueStore {
         applied: &ValueApplied,
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let (data, encoding) = encode_applied_payload(applied)?;
+        let AppliedColumns {
+            data,
+            encoding,
+            identity_version,
+        } = encode_applied_payload(applied)?;
         match collection.ttl() {
             Some(ttl) => {
                 let ttl = ttl_to_i32(ttl);
@@ -296,6 +309,7 @@ impl CassandraValueStore {
                         ttl,
                         data.as_ref().map(Bytes::as_ref),
                         encoding,
+                        identity_version,
                         segment_id,
                         key,
                         state_type,
@@ -310,6 +324,7 @@ impl CassandraValueStore {
                     (
                         data.as_ref().map(Bytes::as_ref),
                         encoding,
+                        identity_version,
                         segment_id,
                         key,
                         state_type,
@@ -536,6 +551,7 @@ impl DescriptorIdentityStore for CassandraValueStore {
             values.push((
                 segment_id,
                 row.name,
+                row.version,
                 row.kind,
                 row.cell_kind,
                 row.codec_id,
@@ -570,21 +586,32 @@ impl PendingIndexStore for CassandraValueStore {
     }
 }
 
-/// Encodes the authoritative applied payload for a `data` write.
-///
-/// Returns the encoded `data` cell and its `payload_encoding`
-/// discriminator, or `(None, None)` when the applied state is empty (a
-/// cleared cell). Shared by `apply_wal_atomic` and `write_data_only`,
-/// which differ only in the query they bind these values into.
+/// The applied-cell column values bound by `apply_wal_atomic` and
+/// `write_data_only`: all `Some` for a present payload, all `None` for a
+/// cleared cell. The `identity_version` stamp pairs with `data` (never
+/// with the WAL columns: `seal` does not stamp), recording which
+/// descriptor identity version the authoritative bytes were written under.
+struct AppliedColumns {
+    data: Option<Bytes>,
+    encoding: Option<PayloadEncoding>,
+    identity_version: Option<i32>,
+}
+
+/// Encodes the authoritative applied payload into its [`AppliedColumns`].
 fn encode_applied_payload(
     applied: &ValueApplied,
-) -> Result<(Option<Bytes>, Option<PayloadEncoding>), CassandraValueStoreError> {
+) -> Result<AppliedColumns, CassandraValueStoreError> {
     Ok(match applied {
-        Some(payload) => (
-            Some(encode_payload(payload, VALUE_PAYLOAD_ENCODING)?),
-            Some(VALUE_PAYLOAD_ENCODING),
-        ),
-        None => (None, None),
+        Some(payload) => AppliedColumns {
+            data: Some(encode_payload(payload, VALUE_PAYLOAD_ENCODING)?),
+            encoding: Some(VALUE_PAYLOAD_ENCODING),
+            identity_version: Some(INITIAL_IDENTITY_VERSION),
+        },
+        None => AppliedColumns {
+            data: None,
+            encoding: None,
+            identity_version: None,
+        },
     })
 }
 

@@ -332,6 +332,79 @@ async fn corrupt_event_ref_udt_classifies_permanent() -> Result<()> {
     Ok(())
 }
 
+/// Reads the raw `identity_version` column for `id`, bypassing the
+/// decoder, so tests can observe the stamp exactly as written.
+async fn read_identity_version_raw(
+    store: &CassandraValueStore,
+    id: &CollectionId<ValueKind>,
+) -> Result<Option<i32>> {
+    let segment_id = &id.state_key().segment_id;
+    let key = id.state_key().key.as_ref();
+    let state_type = match id.state_type() {
+        StateType::Application => 0_i8,
+    };
+    let name = id.name().as_str();
+    let cql = format!(
+        "SELECT identity_version FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id \
+         = ? AND key = ? AND state_type = ? AND name = ?",
+    );
+    let prepared = store.store.session().prepare(cql).await?;
+    let row = store
+        .store
+        .session()
+        .execute_unpaged(&prepared, (segment_id, key, state_type, name))
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<i32>,)>()?;
+    Ok(row.and_then(|(version,)| version))
+}
+
+/// The `identity_version` stamp pairs with `data` through the row's whole
+/// lifecycle: `seal` never stamps (WAL columns carry no version),
+/// `apply_sealed` stamps the folded data, and folding to a cleared cell
+/// nulls the stamp alongside `data`.
+#[tokio::test]
+async fn value_row_stamps_identity_version_with_data() -> Result<()> {
+    use crate::state::middleware::INITIAL_IDENTITY_VERSION;
+    use crate::state::value::DirectApplyStore;
+
+    init_test_logging();
+    let store = setup_value_store().await?;
+    let collection = collection_ref()?;
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(0x1D),
+    };
+
+    // Seal alone must not stamp.
+    store
+        .seal(&collection, event, vec![ValueOp::Set { payload: bytes(4) }])
+        .await?;
+    assert_eq!(
+        read_identity_version_raw(&store, collection.id()).await?,
+        None,
+        "seal must not stamp identity_version"
+    );
+
+    // Applying the WAL stamps the folded data.
+    store.apply_sealed(&collection, event).await?;
+    assert_eq!(
+        read_identity_version_raw(&store, collection.id()).await?,
+        Some(INITIAL_IDENTITY_VERSION),
+        "apply must stamp the authoritative data"
+    );
+
+    // Folding to a cleared cell nulls the stamp with the data.
+    store
+        .direct_apply(&collection, vec![ValueOp::Clear])
+        .await?;
+    assert_eq!(
+        read_identity_version_raw(&store, collection.id()).await?,
+        None,
+        "a cleared cell carries no stamp"
+    );
+    Ok(())
+}
+
 /// Constructing `CassandraValueStore` with `default_ttl = Some(_)` must
 /// route `ValueStore::set` through the with-TTL query arm. The exact TTL
 /// cannot easily be asserted from a `SELECT`, so this test guards against

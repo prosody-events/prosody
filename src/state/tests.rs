@@ -68,6 +68,50 @@ async fn memory_descriptor_identity_acquisition() -> Result<()> {
         .await
 }
 
+/// Memory mirror of Cassandra's `data` ⇔ `identity_version` column
+/// pairing: `seal` never stamps, applying the WAL stamps the folded data,
+/// and folding to a cleared cell drops the stamp with the data. The
+/// Cassandra counterpart (`value_row_stamps_identity_version_with_data`)
+/// reads the raw column; this reads the mirrored entry field.
+#[tokio::test]
+async fn memory_identity_version_stamp_pairs_with_applied() -> Result<()> {
+    use super::middleware::INITIAL_IDENTITY_VERSION;
+    use super::value::DirectApplyStore;
+
+    let durable = MemoryDurableValueStore::for_tests();
+    let collection = collection_ref()?;
+
+    durable
+        .seal(
+            &collection,
+            event(1),
+            vec![ValueOp::Set { payload: bytes(4) }],
+        )
+        .await?;
+    assert_eq!(
+        durable.identity_version_for_tests(collection.id()),
+        None,
+        "seal must not stamp identity_version"
+    );
+
+    durable.apply_sealed(&collection, event(1)).await?;
+    assert_eq!(
+        durable.identity_version_for_tests(collection.id()),
+        Some(INITIAL_IDENTITY_VERSION),
+        "apply must stamp the authoritative data"
+    );
+
+    durable
+        .direct_apply(&collection, vec![ValueOp::Clear])
+        .await?;
+    assert_eq!(
+        durable.identity_version_for_tests(collection.id()),
+        None,
+        "a cleared cell carries no stamp"
+    );
+    Ok(())
+}
+
 #[test]
 fn collection_identity_carries_value_kind() -> Result<()> {
     let collection = collection_id()?;

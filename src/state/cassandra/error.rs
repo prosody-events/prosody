@@ -6,9 +6,10 @@
 //! [`CassandraValueStoreError::Encoding`],
 //! [`CassandraValueStoreError::CorruptWal`],
 //! [`CassandraValueStoreError::CorruptUdt`],
-//! [`CassandraValueStoreError::EventMismatch`] — are all permanent
-//! per-message data errors: retrying them indefinitely will not change the
-//! outcome.
+//! [`CassandraValueStoreError::EventMismatch`],
+//! [`CassandraValueStoreError::IdentityVersionMismatch`] — are all
+//! permanent per-message data errors: retrying them indefinitely will not
+//! change the outcome.
 
 use super::decode::CorruptReason;
 use crate::cassandra::errors::CassandraStoreError;
@@ -50,6 +51,18 @@ pub enum CassandraValueStoreError {
         /// Event sealed on the durable row.
         actual: EventRef,
     },
+
+    /// The value row's `identity_version` stamp is not the version this
+    /// build writes. Unreachable until identity migration ships; rejected
+    /// defensively so a future-version cell is never misread.
+    #[error("identity version mismatch: stored {stored}, expected {expected}")]
+    IdentityVersionMismatch {
+        /// Version stamped on the durable row.
+        stored: i32,
+
+        /// The only version this build accepts.
+        expected: i32,
+    },
 }
 
 impl ClassifyError for CassandraValueStoreError {
@@ -59,7 +72,8 @@ impl ClassifyError for CassandraValueStoreError {
             Self::Encoding(_)
             | Self::CorruptWal { .. }
             | Self::CorruptUdt(_)
-            | Self::EventMismatch { .. } => ErrorCategory::Permanent,
+            | Self::EventMismatch { .. }
+            | Self::IdentityVersionMismatch { .. } => ErrorCategory::Permanent,
         }
     }
 }

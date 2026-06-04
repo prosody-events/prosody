@@ -69,6 +69,7 @@ pub use context::{DirtyValueBundle, DurableValueBundle, KeyedStateContext};
 pub(crate) use descriptor_identity::LazyDescriptorIdentity;
 pub use descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity,
+    INITIAL_IDENTITY_VERSION,
 };
 pub use error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareErrorComponent};
 #[cfg(test)]

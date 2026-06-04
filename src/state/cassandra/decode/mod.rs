@@ -2,8 +2,8 @@
 //!
 //! Cassandra physically allows the value row to land in arbitrary
 //! combinations of NULL/non-NULL across `data`, `payload_encoding`,
-//! `wal_event`, `wal_ops`, and `wal_format`. The decoder collapses any
-//! shape into one of three outcomes:
+//! `identity_version`, `wal_event`, `wal_ops`, and `wal_format`. The
+//! decoder collapses any shape into one of three outcomes:
 //!
 //! | Shape                                                | Decoded as              |
 //! |------------------------------------------------------|-------------------------|
@@ -12,7 +12,15 @@
 //! | `data + payload_encoding`, no WAL columns            | `Idle { applied: Some }` |
 //! | `data + payload_encoding + wal_event + wal_ops + wal_format` (any data presence) | `Sealed { applied, wal }` |
 //! | Semantically-corrupt `event_ref` UDT (e.g. `kind == 7`) | `CorruptUdt { .. }` |
+//! | `identity_version` not paired with `data`            | `CorruptWal { reason }` |
+//! | `identity_version` ≠ [`INITIAL_IDENTITY_VERSION`]    | `IdentityVersionMismatch` |
 //! | Anything else                                        | `CorruptWal { reason }` |
+//!
+//! `identity_version` pairs with `data` (both present or both NULL): the
+//! stamp records which descriptor identity version the authoritative bytes
+//! were written under. `seal` never stamps — WAL columns carry no version.
+//! A stamp other than [`INITIAL_IDENTITY_VERSION`] is unreachable until
+//! identity migration ships and is rejected Permanent defensively.
 //!
 //! The intermediate `Option<...>` tuple [`RawValueRow`] is private to this
 //! module; callers see only the three valid outcomes plus the typed
@@ -26,18 +34,21 @@
 use super::error::CassandraValueStoreError;
 use super::udt::RawEventRef;
 use crate::state::encoding::decode_payload;
+use crate::state::middleware::INITIAL_IDENTITY_VERSION;
 use crate::state::value::ValueKind;
 use crate::state::{DurableState, PayloadEncoding, SealedWal, WalBlob, WalFormat};
 use std::fmt;
 use thiserror::Error;
 
-/// Five-column shape produced by `SELECT data, payload_encoding, wal_event,
-/// wal_ops, wal_format` against `keyed_state_value`.
+/// Six-column shape produced by `SELECT data, payload_encoding,
+/// identity_version, wal_event, wal_ops, wal_format` against
+/// `keyed_state_value`.
 ///
 /// Module-private — callers never observe the intermediate tuple.
 pub(super) type RawValueRow = (
     Option<Vec<u8>>,     // data
     Option<i16>,         // payload_encoding
+    Option<i32>,         // identity_version (paired with data)
     Option<RawEventRef>, // wal_event (validated into EventRef during decode)
     Option<Vec<u8>>,     // wal_ops
     Option<i16>,         // wal_format
@@ -53,7 +64,8 @@ pub(super) type RawValueRow = (
 pub(super) fn try_decode_row(
     row: RawValueRow,
 ) -> Result<DurableState<ValueKind>, CassandraValueStoreError> {
-    let (data, payload_encoding, wal_event, wal_ops, wal_format) = row;
+    let (data, payload_encoding, identity_version, wal_event, wal_ops, wal_format) = row;
+    validate_identity_version(data.as_ref(), identity_version)?;
     let mask =
         WalColumnMask::from_options(wal_event.as_ref(), wal_ops.as_ref(), wal_format.as_ref());
 
@@ -67,6 +79,28 @@ pub(super) fn try_decode_row(
         (None, None, None) => decode_idle(data, payload_encoding),
         _ => Err(CassandraValueStoreError::CorruptWal {
             reason: CorruptReason::PartialWalColumns { mask },
+        }),
+    }
+}
+
+/// Enforces the `data` ⇔ `identity_version` pairing and the frozen version
+/// value, independent of the WAL shape (the stamp belongs to the applied
+/// bytes; `seal` never writes it).
+fn validate_identity_version(
+    data: Option<&Vec<u8>>,
+    identity_version: Option<i32>,
+) -> Result<(), CassandraValueStoreError> {
+    match (data, identity_version) {
+        (None, None) | (Some(_), Some(INITIAL_IDENTITY_VERSION)) => Ok(()),
+        (Some(_), Some(stored)) => Err(CassandraValueStoreError::IdentityVersionMismatch {
+            stored,
+            expected: INITIAL_IDENTITY_VERSION,
+        }),
+        (Some(_), None) => Err(CassandraValueStoreError::CorruptWal {
+            reason: CorruptReason::MissingIdentityVersionWithData,
+        }),
+        (None, Some(_)) => Err(CassandraValueStoreError::CorruptWal {
+            reason: CorruptReason::IdentityVersionWithoutData,
         }),
     }
 }
@@ -172,6 +206,14 @@ pub enum CorruptReason {
     /// `data` is NULL but `payload_encoding` is non-NULL on an Idle row.
     #[error("payload_encoding column is non-NULL but data is NULL")]
     PayloadEncodingWithoutData,
+
+    /// `data` is non-NULL but `identity_version` is NULL.
+    #[error("data column is non-NULL but identity_version is NULL")]
+    MissingIdentityVersionWithData,
+
+    /// `data` is NULL but `identity_version` is non-NULL.
+    #[error("identity_version column is non-NULL but data is NULL")]
+    IdentityVersionWithoutData,
 
     /// WAL columns are partially populated (some NULL, some non-NULL).
     #[error("WAL columns are partially populated: {mask}")]

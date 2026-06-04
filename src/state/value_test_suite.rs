@@ -30,7 +30,8 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::middleware::{
     CollectionDef, CollectionDefRegistry, DescriptorIdentityError, DescriptorIdentityStore,
-    DurableDescriptorIdentity, LazyDescriptorIdentity, recover_pending_entries,
+    DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION, LazyDescriptorIdentity,
+    recover_pending_entries,
 };
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
@@ -435,6 +436,10 @@ where
         rows,
         vec![expected.clone()],
         "first use writes the identity row"
+    );
+    assert_eq!(
+        expected.version, INITIAL_IDENTITY_VERSION,
+        "acquisition writes the initial identity version"
     );
 
     // Invariant 3: idempotent re-acquire from a fresh validator.
