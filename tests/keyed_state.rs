@@ -1,0 +1,377 @@
+//! End-to-end integration test for the keyed-state layer.
+//!
+//! Drives a generic [`FallibleHandler`] through a real pipeline consumer
+//! (Kafka at `localhost:9094`, Cassandra at `localhost:9042`): a value
+//! cell accumulates across messages, a Kafka-message cell records the
+//! last message seen, and an `Application` timer reads both back — the
+//! value cell from durable state, the Kafka-message cell by re-fetching
+//! the original message body from Kafka through the consumer's loader.
+
+#![recursion_limit = "256"]
+
+use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::codec::JsonCodecError;
+use prosody::consumer::event_context::{EventContext, StateAccessError};
+use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::middleware::FallibleHandler;
+use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
+use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
+use prosody::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
+use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
+use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
+use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
+use prosody::consumer::{
+    CommonMiddlewareConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
+    PipelineMiddlewareConfiguration, ProsodyConsumer,
+};
+use prosody::error::{ClassifyError, ErrorCategory};
+use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::state::descriptor::{
+    KafkaMessageDescriptor, KafkaStateError, ValueDescriptor, ValueStateError, kafka_message_state,
+    value_state,
+};
+use prosody::state::middleware::CollectionDef;
+use prosody::telemetry::Telemetry;
+use prosody::timers::datetime::CompactDateTime;
+use prosody::timers::duration::CompactDuration;
+use prosody::timers::{TimerType, Trigger};
+use prosody::tracing::init_test_logging;
+use prosody::{
+    JsonCodec, Offset, Topic,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+};
+use serde_json::{Value, json};
+use std::time::Duration;
+use thiserror::Error;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::time::timeout;
+use tracing::error;
+use uuid::Uuid;
+
+mod common;
+
+/// Number of messages the test produces; the handler schedules the
+/// read-back timer once the cart holds this many items.
+const MESSAGE_COUNT: usize = 2;
+
+const CART: ValueDescriptor = value_state("cart");
+const LAST_SEEN: KafkaMessageDescriptor = kafka_message_state("last_seen");
+
+/// What the handler saw, streamed to the test for content assertions.
+#[derive(Debug)]
+enum Observation {
+    /// `on_message`: the cart value after this message's read-modify-write.
+    Message { cart: Value },
+
+    /// `on_timer`: the accumulated cart plus the re-fetched last-seen
+    /// message (offset and payload), both read through descriptors.
+    Timer {
+        cart: Option<Value>,
+        last_seen: Option<(Offset, Value)>,
+    },
+}
+
+/// A generic handler — no concrete context type named anywhere — that
+/// accumulates message `"item"` fields into the `CART` cell, records the
+/// message in `LAST_SEEN`, and schedules an `Application` timer once the
+/// cart is full. The timer reads both cells back.
+#[derive(Clone)]
+struct CartHandler {
+    observations_tx: Sender<Observation>,
+}
+
+impl CartHandler {
+    async fn handle_message<C>(
+        &self,
+        ctx: C,
+        message: ConsumerMessage<Value>,
+    ) -> Result<(), CartHandlerError>
+    where
+        C: EventContext<Payload = Value>,
+    {
+        // Read-modify-write on the value cell: each message appends its
+        // item to the array committed by the previous event.
+        let cart = ctx.state(CART)?;
+        let mut items = match cart.get().await? {
+            Some(Value::Array(items)) => items,
+            Some(other) => return Err(CartHandlerError::UnexpectedCell(other)),
+            None => Vec::new(),
+        };
+        items.push(
+            message
+                .payload()
+                .get("item")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        let full = items.len() == MESSAGE_COUNT;
+        let updated = Value::Array(items);
+        cart.set(updated.clone()).await?;
+
+        ctx.state(LAST_SEEN)?.set(&message).await?;
+
+        // The final message completes the cart; schedule the timer that
+        // reads the accumulated state back. Per-key serialization
+        // guarantees the fire dispatches only after this event commits.
+        if full {
+            let fire = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(2)))
+                .map_err(|e| CartHandlerError::Schedule(e.to_string()))?;
+            ctx.schedule(fire, TimerType::Application)
+                .await
+                .map_err(|e| CartHandlerError::Schedule(e.to_string()))?;
+        }
+
+        self.observations_tx
+            .send(Observation::Message { cart: updated })
+            .await
+            .map_err(|_| CartHandlerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    async fn handle_timer<C>(&self, ctx: C) -> Result<(), CartHandlerError>
+    where
+        C: EventContext<Payload = Value>,
+    {
+        let cart = ctx.state(CART)?.get().await?;
+        // Re-fetches the original message body from Kafka through the
+        // consumer's loader, decoded by the consumer's own codec.
+        let last_seen = ctx
+            .state(LAST_SEEN)?
+            .get()
+            .await?
+            .map(|message| (message.offset(), message.payload().clone()));
+
+        self.observations_tx
+            .send(Observation::Timer { cart, last_seen })
+            .await
+            .map_err(|_| CartHandlerError::ChannelClosed)?;
+        Ok(())
+    }
+}
+
+impl FallibleHandler for CartHandler {
+    type Error = CartHandlerError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        message: ConsumerMessage<Value>,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let result = self.handle_message(ctx, message).await;
+        if let Err(error) = &result {
+            // Surface the full error chain in the test log; the pipeline's
+            // own logging shows only the outer middleware display.
+            error!(?error, "cart handler failed on message");
+        }
+        result
+    }
+
+    async fn on_timer<C>(
+        &self,
+        ctx: C,
+        _trigger: Trigger,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let result = self.handle_timer(ctx).await;
+        if let Err(error) = &result {
+            error!(?error, "cart handler failed on timer");
+        }
+        result
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Errors the handler can surface; everything classifies Permanent so a
+/// failure fails the test fast instead of retrying into a timeout.
+#[derive(Debug, Error)]
+enum CartHandlerError {
+    /// Binding a descriptor failed.
+    #[error(transparent)]
+    Access(#[from] StateAccessError),
+
+    /// A value-cell access or codec failure.
+    #[error(transparent)]
+    Value(#[from] ValueStateError<JsonCodecError>),
+
+    /// A Kafka-message-cell access or ref-codec failure.
+    #[error(transparent)]
+    Kafka(#[from] KafkaStateError),
+
+    /// The cart cell held something other than an array.
+    #[error("unexpected cart cell: {0}")]
+    UnexpectedCell(Value),
+
+    /// Computing or scheduling the read-back timer failed.
+    #[error("failed to schedule the read-back timer: {0}")]
+    Schedule(String),
+
+    /// The test dropped the observation receiver.
+    #[error("observation channel closed")]
+    ChannelClosed,
+}
+
+impl ClassifyError for CartHandlerError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
+
+async fn next_observation(rx: &mut Receiver<Observation>, secs: u64) -> Result<Observation> {
+    timeout(Duration::from_secs(secs), rx.recv())
+        .await
+        .map_err(|_| eyre!("timed out waiting for an observation"))?
+        .ok_or_else(|| eyre!("observation channel closed"))
+}
+
+/// Cart accumulation across messages, Kafka-message read-back on a timer.
+///
+/// Two messages with the same key flow through the full pipeline stack.
+/// The handler's value cell must show `["apple"]` then
+/// `["apple", "banana"]` (read-your-committed-writes across events), and
+/// the timer fired by the second message must observe the accumulated
+/// cart plus the second message re-fetched from Kafka by offset.
+///
+/// # Errors
+///
+/// Returns an error if topic setup, producer/consumer initialization, or
+/// observation verification fails.
+#[tokio::test]
+async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
+    init_test_logging();
+
+    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let bootstrap = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
+
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
+
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
+        .build()?;
+
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(bootstrap)
+        .group_id(Uuid::new_v4().to_string())
+        .probe_port(None)
+        .subscribed_topics(&[topic.to_string()])
+        .build()?;
+
+    let (observations_tx, mut observations_rx) = channel(10);
+    let handler = CartHandler { observations_tx };
+
+    let telemetry = Telemetry::new();
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, telemetry.sender())?;
+
+    let pipeline_config = PipelineMiddlewareConfiguration {
+        retry: RetryConfigurationBuilder::default().build()?,
+        monopolization: MonopolizationConfigurationBuilder::default().build()?,
+        defer: DeferConfigurationBuilder::default().build()?,
+        dedup: DeduplicationConfigurationBuilder::default().build()?,
+        keyed_state: KeyedStateConfiguration::default()
+            .state(&CART, CollectionDef::new(None))
+            .state(&LAST_SEEN, CollectionDef::new(None)),
+    };
+
+    let common_config = CommonMiddlewareConfiguration {
+        scheduler: SchedulerConfigurationBuilder::default().build()?,
+        timeout: TimeoutConfigurationBuilder::default().build()?,
+    };
+
+    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
+        &consumer_config,
+        &common::create_cassandra_trigger_store_config(),
+        pipeline_config,
+        &common_config,
+        telemetry,
+        handler,
+    )
+    .await?;
+
+    let key = "cart-key";
+    let first = json!({ "id": "evt-1", "item": "apple" });
+    let second = json!({ "id": "evt-2", "item": "banana" });
+
+    // Always shut the consumer down before propagating a failure — an
+    // early return would leave the consumer's client threads alive and
+    // hang the test binary far past the hang-guard timeouts.
+    let outcome = async {
+        producer.send([], topic, key, first).await?;
+        producer.send([], topic, key, second.clone()).await?;
+        verify_observations(&mut observations_rx, &second).await
+    }
+    .await;
+    consumer.shutdown().await;
+    admin_client.delete_topic(&topic).await?;
+    outcome
+}
+
+/// The content assertions, in the deterministic per-key order: message 1,
+/// message 2, then the timer the second message scheduled. Timeouts are
+/// hang-guards only; content assertions decide.
+async fn verify_observations(rx: &mut Receiver<Observation>, second: &Value) -> Result<()> {
+    let obs = next_observation(rx, 60).await?;
+    match obs {
+        Observation::Message { cart } => ensure!(
+            cart == json!(["apple"]),
+            "first message must start the cart, got {cart}"
+        ),
+        other @ Observation::Timer { .. } => {
+            return Err(eyre!("expected first message observation, got {other:?}"));
+        }
+    }
+
+    let obs = next_observation(rx, 60).await?;
+    match obs {
+        Observation::Message { cart } => ensure!(
+            cart == json!(["apple", "banana"]),
+            "second message must read the first's committed cart, got {cart}"
+        ),
+        other @ Observation::Timer { .. } => {
+            return Err(eyre!("expected second message observation, got {other:?}"));
+        }
+    }
+
+    let obs = next_observation(rx, 60).await?;
+    match obs {
+        Observation::Timer { cart, last_seen } => {
+            ensure!(
+                cart == Some(json!(["apple", "banana"])),
+                "timer must observe the accumulated cart, got {cart:?}"
+            );
+            let (offset, payload) =
+                last_seen.ok_or_else(|| eyre!("timer observed no last-seen message"))?;
+            ensure!(
+                offset == 1,
+                "last-seen must reference the second message's offset, got {offset}"
+            );
+            ensure!(
+                payload == *second,
+                "last-seen must re-fetch the second message's payload, got {payload}"
+            );
+        }
+        other @ Observation::Message { .. } => {
+            return Err(eyre!("expected timer observation, got {other:?}"));
+        }
+    }
+    Ok(())
+}

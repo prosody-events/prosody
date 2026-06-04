@@ -6,13 +6,14 @@
 //! typed, owned handle:
 //!
 //! ```
+//! use prosody::codec::JsonCodecError;
 //! use prosody::consumer::DemandType;
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::middleware::FallibleHandler;
-//! use prosody::state::descriptor::{ValueDescriptor, value_state};
+//! use prosody::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
 //! use prosody::timers::Trigger;
-//! use serde_json::{Value, json};
+//! use serde_json::Value;
 //!
 //! const CART: ValueDescriptor = value_state("cart");
 //!
@@ -20,7 +21,7 @@
 //! struct MyHandler;
 //!
 //! impl FallibleHandler for MyHandler {
-//!     type Error = prosody::consumer::event_context::StateAccessError;
+//!     type Error = ValueStateError<JsonCodecError>;
 //!     type Output = ();
 //!     type Payload = Value;
 //!
@@ -33,12 +34,15 @@
 //!     where
 //!         C: EventContext<Payload = Value>,
 //!     {
+//!         // Read-modify-write: each message appends to the cell
+//!         // committed by the previous event on this key.
 //!         let cart = ctx.state(CART)?;
-//!         let mut items = cart.get().await.map_err(|_| Self::Error::Unavailable)?;
-//!         // ... read-modify-write ...
-//!         cart.set(json!({"items": []}))
-//!             .await
-//!             .map_err(|_| Self::Error::Unavailable)?;
+//!         let mut items = match cart.get().await? {
+//!             Some(Value::Array(items)) => items,
+//!             _ => Vec::new(),
+//!         };
+//!         items.push(message.payload().clone());
+//!         cart.set(Value::Array(items)).await?;
 //!         Ok(())
 //!     }
 //!
@@ -53,7 +57,7 @@
 //!     {
 //!         // Timer handlers bind the same way; state persists across
 //!         // event kinds for the key.
-//!         let _cart = ctx.state(CART)?;
+//!         let _cart = ctx.state(CART)?.get().await?;
 //!         Ok(())
 //!     }
 //!

@@ -204,9 +204,12 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// [`StateName`].
     ///
     /// Default: state is unavailable on this context. Only the keyed-state
-    /// middleware's wrapped context overrides the state capabilities;
-    /// every other context reports
-    /// [`StateAccessError::Unavailable`] (Permanent).
+    /// middleware's wrapped context *implements* the state capabilities;
+    /// every leaf context reports [`StateAccessError::Unavailable`]
+    /// (Permanent). Wrapper contexts that sit inside the keyed-state
+    /// middleware (e.g. the timer-defer context) must explicitly forward
+    /// all six capabilities to their inner context — inheriting these
+    /// defaults would mask a live keyed-state context as unavailable.
     ///
     /// # Errors
     ///

@@ -11,7 +11,7 @@ use super::context::ContextParts;
 use super::descriptor_identity::LazyDescriptorIdentity;
 use super::handler::{PartitionBackend, recover_pending_entries};
 use super::*;
-use crate::Key;
+use crate::codec::{Codec, JsonCodec};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
@@ -19,7 +19,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::DurableState;
 use crate::state::SharedStateBackend;
 use crate::state::StoreOutcome;
-use crate::state::descriptor::{ValueDescriptor, value_state};
+use crate::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
 use crate::state::memory::{
     MemoryDirtyValueStore, MemoryDirtyValueStoreProvider, MemoryDurableValueStore,
 };
@@ -34,14 +34,16 @@ use crate::state::{
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::{Key, Offset};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use futures::executor;
+use parking_lot::Mutex as SyncMutex;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::iter;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
@@ -609,37 +611,22 @@ impl FallibleHandler for RecordingHandler {
 /// seals fire — which is exactly the property we want to assert for
 /// the "no seals → no schedule" cases.
 #[derive(Clone)]
-struct ValueWritingHandler<H> {
-    _h: PhantomData<fn() -> H>,
-}
+struct NoOpHandler;
 
-impl<H> ValueWritingHandler<H> {
-    fn new() -> Self {
-        Self { _h: PhantomData }
-    }
-}
-
-/// The middleware injects a `KeyedStateContext<...>` as the context the
-/// handler sees; real handlers bind descriptors against it via
-/// `ctx.state(DESC)`.
-impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
+impl FallibleHandler for NoOpHandler {
     type Error = RecordingHandlerError;
     type Output = ();
     type Payload = serde_json::Value;
 
     async fn on_message<C>(
         &self,
-        ctx: C,
+        _ctx: C,
         _msg: ConsumerMessage<Self::Payload>,
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let _ = ctx; // The blanket `C: EventContext` bound erases the concrete
-        // keyed-state context type. The non-recovery message arm of the test
-        // exercises the handler-shape contract; the seal-recording branch is
-        // exercised by manually invoking the wrapped context.
         Ok(())
     }
 
@@ -658,25 +645,21 @@ impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
     async fn shutdown(self) {}
 }
 
-/// Build a `KeyedStateHandler` over a `ValueWritingHandler` so we can
-/// drive `on_message` / `on_timer` directly in tests.
+/// Backend factory the directed and property tests mint handlers from.
 type TestBackend =
     SharedStateBackend<MemoryDurableValueStore, FixedOracle, MemoryDirtyValueStoreProvider>;
 
-fn build_handler(
+/// Build a `KeyedStateHandler` over `inner` so tests can drive
+/// `on_message` / `on_timer` / the apply hooks directly.
+fn build_handler_with<T>(
+    inner: T,
     durable: MemoryDurableValueStore,
     oracle: FixedOracle,
-    commit_mode: CommitMode,
-) -> KeyedStateHandler<
-    ValueWritingHandler<MemoryDurableValueStore>,
-    TestBackend,
-    MemoryDurableValueStore,
-    MemoryLoader<serde_json::Value>,
-> {
-    let registry = Arc::new(registry().with_default_commit_mode(commit_mode));
+    registry: Arc<CollectionDefRegistry>,
+) -> KeyedStateHandler<T, TestBackend, MemoryDurableValueStore, MemoryLoader<serde_json::Value>> {
     let segment_id = Uuid::new_v4();
     KeyedStateHandler {
-        inner: ValueWritingHandler::new(),
+        inner,
         backend: Ok(PartitionBackend {
             durable: durable.clone(),
             oracle,
@@ -693,11 +676,27 @@ fn build_handler(
     }
 }
 
-fn test_message() -> Result<ConsumerMessage<serde_json::Value>> {
+fn build_handler(
+    durable: MemoryDurableValueStore,
+    oracle: FixedOracle,
+    commit_mode: CommitMode,
+) -> KeyedStateHandler<
+    NoOpHandler,
+    TestBackend,
+    MemoryDurableValueStore,
+    MemoryLoader<serde_json::Value>,
+> {
+    let registry = Arc::new(registry().with_default_commit_mode(commit_mode));
+    build_handler_with(NoOpHandler, durable, oracle, registry)
+}
+
+/// A message keyed `"k"` at `offset`; distinct offsets give distinct
+/// dedup-derived [`EventRef`]s.
+fn test_message(offset: Offset) -> Result<ConsumerMessage<serde_json::Value>> {
     ConsumerMessage::for_testing(
         crate::Topic::from("t"),
         0,
-        0,
+        offset,
         Arc::from("k"),
         serde_json::Value::Null,
     )
@@ -916,7 +915,7 @@ async fn on_message_direct_mode_never_schedules_state_recovery() -> Result<()> {
         CommitMode::Direct,
     );
     let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
-    let msg = test_message()?;
+    let msg = test_message(0)?;
     let _result = handler
         .on_message(context.clone(), msg, DemandType::Normal)
         .await;
@@ -932,7 +931,7 @@ async fn on_message_wal_mode_with_no_seals_does_not_schedule() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
     let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
-    let msg = test_message()?;
+    let msg = test_message(0)?;
     let _result = handler
         .on_message(context.clone(), msg, DemandType::Normal)
         .await;
@@ -950,31 +949,14 @@ async fn on_message_wal_mode_with_no_seals_does_not_schedule() -> Result<()> {
 #[tokio::test]
 async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
-    let registry = Arc::new(registry());
-    let segment_id = Uuid::new_v4();
-    let handler: KeyedStateHandler<
+    let handler = build_handler_with(
         RecordingHandler,
-        TestBackend,
-        _,
-        MemoryLoader<serde_json::Value>,
-    > = KeyedStateHandler {
-        inner: RecordingHandler,
-        backend: Ok(PartitionBackend {
-            durable: durable.clone(),
-            oracle: FixedOracle::committed(),
-            dirty: MemoryDirtyValueStoreProvider,
-            identity: LazyDescriptorIdentity::new(durable.clone(), registry.clone(), segment_id),
-        }),
-        scanner: durable,
-        loader: MemoryLoader::new(),
-        consumer_group: Arc::from("test-group"),
-        version: Arc::from("1"),
-        registry,
-        segment_id,
-        recovery_delay: CompactDuration::new(30),
-    };
+        durable,
+        FixedOracle::committed(),
+        Arc::new(registry()),
+    );
     let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
-    let msg = test_message()?;
+    let msg = test_message(0)?;
 
     let err = handler
         .on_message(context.clone(), msg, DemandType::Normal)
@@ -997,8 +979,18 @@ enum MiddlewareStep {
     Clear,
 }
 
+/// Which dispatch entrypoint carries the step: a Kafka message or an
+/// `Application` timer fire. Both route to the same key, so a trace
+/// interleaving them proves state persists across event kinds.
+#[derive(Clone, Copy, Debug)]
+enum EventKind {
+    Message,
+    Timer,
+}
+
 #[derive(Clone, Debug)]
 struct MiddlewareEvent {
+    kind: EventKind,
     step: MiddlewareStep,
     commit: bool,
 }
@@ -1018,19 +1010,38 @@ impl Arbitrary for MiddlewareStep {
 
 impl Arbitrary for MiddlewareEvent {
     fn arbitrary(g: &mut Gen) -> Self {
+        let kind = if bool::arbitrary(g) {
+            EventKind::Message
+        } else {
+            EventKind::Timer
+        };
         Self {
+            kind,
             step: MiddlewareStep::arbitrary(g),
             commit: bool::arbitrary(g),
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let kind = self.kind;
         let commit = self.commit;
+        // Shrink the kind toward `Message`, then the step.
+        let kind_shrink = match kind {
+            EventKind::Message => None,
+            EventKind::Timer => Some(Self {
+                kind: EventKind::Message,
+                step: self.step.clone(),
+                commit,
+            }),
+        };
         Box::new(
-            self.step
-                .clone()
-                .shrink_step()
-                .map(move |step| Self { step, commit }),
+            kind_shrink
+                .into_iter()
+                .chain(self.step.clone().shrink_step().map(move |step| Self {
+                    kind,
+                    step,
+                    commit,
+                })),
         )
     }
 }
@@ -1057,81 +1068,236 @@ impl Arbitrary for MiddlewareTrace {
     }
 }
 
-/// T4 — middleware dispatch property. Drives a sequence of value ops through
-/// the **actual** keyed-state machinery — a real [`KeyedStateContext`], its
-/// `resolve_per_collection` seal, and the `KeyedStateHandler::after_commit` /
-/// `after_abort` apply hooks (the path the C1 fix lives in) — and asserts the
-/// durable visible state tracks a model after each event: a committed event
-/// applies the WAL, an aborted event rolls it back. The previous version of
-/// this test ran `value_test_suite::run_trace` against raw stores and never
-/// constructed a context or handler, so the dispatch path had no coverage.
+/// The error a [`DescriptorDrivenHandler`] surfaces: access or codec
+/// failure from the `CART` handle.
+type CartError = ValueStateError<<JsonCodec as Codec>::Error>;
+
+const CART: ValueDescriptor = value_state("cart");
+
+/// N10 — the headline shape of the descriptor redesign: a plain
+/// [`FallibleHandler`] whose *generic* methods reach keyed state through
+/// `ctx.state(CART)`. No concrete context type is named anywhere; the
+/// cell typing comes entirely from the descriptor (default [`JsonCodec`]
+/// — [`serde_json::Value`] cells).
 ///
-/// (A generic `FallibleHandler::on_message<C: EventContext>` cannot statically
-/// recover the concrete keyed-state context type, so the op is performed on
-/// the context directly, exactly as the directed seal tests do; the seal +
-/// apply-hook dispatch is the middleware-specific logic under test.)
+/// Each dispatch records the cell value observed *before* applying the
+/// next scripted op, so the property can assert
+/// read-your-committed-writes across message and timer events.
+#[derive(Clone)]
+struct DescriptorDrivenHandler {
+    script: Arc<SyncMutex<VecDeque<MiddlewareStep>>>,
+    observed: Arc<SyncMutex<Vec<Option<serde_json::Value>>>>,
+}
+
+impl DescriptorDrivenHandler {
+    fn new() -> Self {
+        Self {
+            script: Arc::new(SyncMutex::new(VecDeque::new())),
+            observed: Arc::new(SyncMutex::new(Vec::new())),
+        }
+    }
+
+    async fn run_step<C>(&self, ctx: &C) -> Result<(), CartError>
+    where
+        C: EventContext<Payload = serde_json::Value>,
+    {
+        let cart = ctx.state(CART)?;
+        let before = cart.get().await?;
+        self.observed.lock().push(before);
+        let step = self.script.lock().pop_front();
+        match step {
+            Some(MiddlewareStep::Set(byte)) => cart.set(serde_json::Value::from(byte)).await,
+            Some(MiddlewareStep::Clear) => cart.clear().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl FallibleHandler for DescriptorDrivenHandler {
+    type Error = CartError;
+    type Output = ();
+    type Payload = serde_json::Value;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        _msg: ConsumerMessage<Self::Payload>,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.run_step(&ctx).await
+    }
+
+    async fn on_timer<C>(
+        &self,
+        ctx: C,
+        _trigger: Trigger,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.run_step(&ctx).await
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// A wrapper context that sits inside the keyed-state middleware (the
+/// timer-defer context, per the locked ordering) must forward the state
+/// capabilities: a `ctx.state(DESC)` bind through the wrapper reaches the
+/// keyed-state overrides instead of the `Unavailable` trait defaults.
+/// Regression for the bug where `TimerDeferContext` inherited the default
+/// capability bodies and every descriptor bind in a real pipeline failed
+/// Permanent.
+#[tokio::test]
+async fn timer_defer_wrapper_forwards_state_capabilities() -> Result<()> {
+    use crate::consumer::middleware::defer::timer::TimerDeferContext;
+    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
+
+    let durable = MemoryDurableValueStore::for_tests();
+    let registry = Arc::new(registry_with_mode("cart", CommitMode::Wal)?);
+    let keyed = build_context(
+        MockEventContext::<serde_json::Value>::new(),
+        durable,
+        registry,
+        make_state_key(),
+        msg_event(1),
+    );
+    let wrapped = TimerDeferContext::new(keyed, MemoryTimerDeferStore::default(), Arc::from("k"));
+
+    let cart = wrapped
+        .state(CART)
+        .map_err(|e| eyre!("bind through the wrapper failed: {e}"))?;
+    cart.set(serde_json::Value::from(7_u8)).await?;
+    assert_eq!(cart.get().await?, Some(serde_json::Value::from(7_u8)));
+    Ok(())
+}
+
+/// N10/T4 — middleware dispatch property, WAL arm: committed events apply
+/// the WAL, aborted events roll it back. See [`run_descriptor_dispatch`].
 #[test]
-fn prop_middleware_dispatch_matches_durable_model() {
+fn prop_descriptor_dispatch_matches_durable_model_wal() {
     fn property(trace: MiddlewareTrace) -> TestResult {
         let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(run_middleware_dispatch(trace));
-        finish_trace(result, "dispatch diverged from durable model", &input_dbg)
+        let result = executor::block_on(run_descriptor_dispatch(trace, CommitMode::Wal));
+        finish_trace(
+            result,
+            "WAL dispatch diverged from durable model",
+            &input_dbg,
+        )
     }
     QuickCheck::new().quickcheck(property as fn(MiddlewareTrace) -> TestResult);
 }
 
-async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
-    let durable = MemoryDurableValueStore::for_tests();
-    let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let state_key = make_state_key();
-    let id = make_collection_id(&state_key, "v")?;
-    let registry = Arc::new(registry());
+/// N10/T4 — middleware dispatch property, Direct arm: every op applies
+/// during dispatch; the apply hooks have nothing to undo, so an aborted
+/// event leaves the op in place. See [`run_descriptor_dispatch`].
+#[test]
+fn prop_descriptor_dispatch_matches_durable_model_direct() {
+    fn property(trace: MiddlewareTrace) -> TestResult {
+        let input_dbg = format!("{trace:#?}");
+        let result = executor::block_on(run_descriptor_dispatch(trace, CommitMode::Direct));
+        finish_trace(
+            result,
+            "Direct dispatch diverged from durable model",
+            &input_dbg,
+        )
+    }
+    QuickCheck::new().quickcheck(property as fn(MiddlewareTrace) -> TestResult);
+}
 
-    let mut model: Option<Bytes> = None;
+/// Drives a trace end-to-end through the **real** handler chain: the
+/// generic [`DescriptorDrivenHandler`] binds `CART` via `ctx.state(...)`
+/// inside `KeyedStateHandler::on_message` / `on_timer` dispatch (durable
+/// identity acquisition included), the seals resolve through the real
+/// `after_commit` / `after_abort` apply hooks (the path the C1 fix lives
+/// in), and the durable visible state must track a model after every
+/// event. Three invariants per event:
+///
+/// 1. The handler observed the model's pre-state through `cart.get()` — state
+///    persists across interleaved message and timer events on one key.
+/// 2. The durable applied cell decodes to the model value (commit applies /
+///    abort rolls back in `Wal`; both keep the op in `Direct`).
+/// 3. The WAL is resolved — the partition always returns to `Idle`.
+async fn run_descriptor_dispatch(trace: MiddlewareTrace, commit_mode: CommitMode) -> Result<bool> {
+    let durable = MemoryDurableValueStore::for_tests();
+    let inner = DescriptorDrivenHandler::new();
+    let registry = Arc::new(registry_with_mode("cart", commit_mode)?);
+    let handler = build_handler_with(
+        inner.clone(),
+        durable.clone(),
+        FixedOracle::committed(),
+        registry,
+    );
+    let key: Key = Arc::from("k");
+    let state_key = StateKey::new(handler.segment_id, key.clone());
+    let id = make_collection_id(&state_key, "cart")?;
+
+    let mut model: Option<serde_json::Value> = None;
+    let mut expected_observed: Vec<Option<serde_json::Value>> = Vec::new();
 
     for (idx, event) in trace.0.into_iter().enumerate() {
-        let event_ref = msg_event(idx as u128 + 1);
-        // Drive the real per-event context + seal.
-        let ctx = build_context(
-            MockEventContext::<serde_json::Value>::new(),
-            durable.clone(),
-            registry.clone(),
-            state_key.clone(),
-            event_ref,
-        );
-        let name = StateName::try_new("v")?;
-        let applied_if_committed = match &event.step {
-            MiddlewareStep::Set(byte) => {
-                ctx.set_state_cell(&name, bytes(*byte)).await?;
-                Some(bytes(*byte))
-            }
-            MiddlewareStep::Clear => {
-                ctx.clear_state_cell(&name).await?;
-                None
-            }
-        };
-        let sealed = ctx.resolve_per_collection().await?;
+        expected_observed.push(model.clone());
+        inner.script.lock().push_back(event.step.clone());
 
-        // Route through the real apply hooks.
-        let output = KeyedStateOutput::Inner {
-            inner: (),
-            sealed_event: Some(event_ref),
-            sealed_collections: sealed,
+        let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
+        let output = match event.kind {
+            EventKind::Message => {
+                // Distinct offsets give distinct dedup-derived events.
+                let msg = test_message(idx as Offset)?;
+                handler
+                    .on_message(context.clone(), msg, DemandType::Normal)
+                    .await
+            }
+            EventKind::Timer => {
+                // Distinct times give distinct timer events.
+                let trigger = Trigger::for_testing(
+                    key.clone(),
+                    CompactDateTime::from(idx as u32 + 1),
+                    TimerType::Application,
+                );
+                handler
+                    .on_timer(context.clone(), trigger, DemandType::Normal)
+                    .await
+            }
+        }
+        .map_err(|e| eyre!("dispatch failed: {e}"))?;
+
+        let applied_if_committed = match &event.step {
+            MiddlewareStep::Set(byte) => Some(serde_json::Value::from(*byte)),
+            MiddlewareStep::Clear => None,
         };
-        let mock = MockEventContext::<serde_json::Value>::new();
+
+        let hook_context = MockEventContext::<serde_json::Value>::new();
         if event.commit {
-            handler.after_commit(mock, Ok(output)).await;
-            model = applied_if_committed;
+            handler.after_commit(hook_context, Ok(output)).await;
         } else {
-            handler.after_abort(mock, Ok(output)).await;
-            // Rollback leaves pre-event applied state unchanged.
+            handler.after_abort(hook_context, Ok(output)).await;
+        }
+        match commit_mode {
+            CommitMode::Wal => {
+                if event.commit {
+                    model = applied_if_committed;
+                }
+            }
+            // Direct mode applied during dispatch; abort cannot undo it.
+            CommitMode::Direct => model = applied_if_committed,
         }
 
-        // The WAL must be resolved (Idle) and the applied state must match.
-        match DurableWalStore::read_partition(&durable, &id).await? {
-            DurableState::Idle { applied } if applied == model => {}
-            _ => return Ok(false),
+        // Invariants 2 + 3: the WAL must be resolved (Idle) and the
+        // applied cell must decode to the model value.
+        let applied = read_idle_applied(&durable, &id).await?;
+        let decoded = applied
+            .map(|cell| serde_json::from_slice::<serde_json::Value>(&cell))
+            .transpose()?;
+        if decoded != model {
+            return Ok(false);
         }
     }
-    Ok(true)
+
+    // Invariant 1: the handler observed every pre-state.
+    Ok(*inner.observed.lock() == expected_observed)
 }

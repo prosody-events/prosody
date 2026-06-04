@@ -21,7 +21,7 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// use prosody::state::descriptor::{ValueDescriptor, value_state};
 /// use prosody::state::middleware::CollectionDef;
 ///
-/// const CART: ValueDescriptor<serde_json::Value> = value_state("cart");
+/// const CART: ValueDescriptor = value_state("cart");
 ///
 /// let keyed_state = KeyedStateConfiguration::default().state(&CART, CollectionDef::new(None));
 /// ```
