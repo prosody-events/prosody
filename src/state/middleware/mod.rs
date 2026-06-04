@@ -64,7 +64,10 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use context::ContextParts;
-pub use context::{DirtyValueBundle, DurableValueBundle, KeyedStateContext};
+pub use context::KeyedStateContext;
+// The bundle traits moved to the session module; re-exported here so the
+// `state::middleware` paths keep working until the middleware is retired.
+pub use crate::state::session::{DirtyValueBundle, DurableValueBundle};
 #[cfg(test)]
 pub(crate) use descriptor_identity::LazyDescriptorIdentity;
 pub use descriptor_identity::{

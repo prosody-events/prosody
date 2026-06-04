@@ -47,6 +47,7 @@ pub mod oracle;
 pub mod pending;
 pub mod production;
 pub mod recovering;
+pub mod session;
 pub mod transaction;
 pub mod value;
 pub mod wal;

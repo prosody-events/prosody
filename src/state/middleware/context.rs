@@ -5,9 +5,9 @@ use crate::consumer::event_context::{EventContext, StateAccessError, Termination
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::state::descriptor::{KafkaMessageRef, StructuralIdentity};
+use crate::state::session::{DirtyValueBundle, DurableValueBundle};
 use crate::state::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore,
-    TransactionValueStoreError, ValueKind, ValueStore,
+    DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueKind, ValueStore,
 };
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, EventRef, Read, StateKey, StateName, StateType,
@@ -22,47 +22,6 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
-
-/// Bundle bound for the dirty Value store the middleware composes with.
-///
-/// Pulled out so impl blocks downstream can reference the bound without
-/// repeating the eight individual trait constraints. Both
-/// [`crate::state::memory::MemoryDirtyValueStore`] and
-/// [`crate::state::fjall::FjallDirtyValueStore`] satisfy it.
-pub trait DirtyValueBundle:
-    ValueStore + PendingOpSource<ValueKind, Error = <Self as ValueStore>::Error> + Clone
-{
-}
-
-impl<T> DirtyValueBundle for T where
-    T: ValueStore + PendingOpSource<ValueKind, Error = <T as ValueStore>::Error> + Clone
-{
-}
-
-/// Bundle bound for the durable Value store the middleware composes with.
-pub trait DurableValueBundle:
-    ValueStore<Error = <Self as DurableWalStore<ValueKind>>::Error>
-    + DurableWalStore<ValueKind>
-    + DirectApplyStore<ValueKind, Error = <Self as DurableWalStore<ValueKind>>::Error>
-    + fmt::Debug
-    + Clone
-    + Send
-    + Sync
-    + 'static
-{
-}
-
-impl<T> DurableValueBundle for T where
-    T: ValueStore<Error = <T as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <T as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static
-{
-}
 
 type ValueTx<D, S> = Arc<AsyncMutex<TransactionValueStore<D, S>>>;
 

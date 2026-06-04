@@ -1,6 +1,6 @@
 //! Middleware builder, handler, provider, and the recovery sweep.
 
-use super::context::{ContextParts, DirtyValueBundle, DurableValueBundle, KeyedStateContext};
+use super::context::{ContextParts, KeyedStateContext};
 use super::descriptor_identity::{DescriptorIdentityStore, LazyDescriptorIdentity};
 use super::error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareError, RecoveryError};
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
@@ -17,6 +17,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
+use crate::state::session::{DirtyValueBundle, DurableValueBundle};
 use crate::state::value::{DurableWalStore, ValueKind};
 use crate::state::{
     CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyStoreProvider,
