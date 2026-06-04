@@ -52,12 +52,10 @@
 //! WARN and skipped; future kinds plug in by extending the dispatch
 //! match.
 
-mod config;
 mod context;
 mod descriptor_identity;
 mod error;
 mod handler;
-mod registry;
 
 #[cfg(test)]
 mod tests;
@@ -65,15 +63,19 @@ mod tests;
 #[cfg(test)]
 pub(crate) use context::ContextParts;
 pub use context::KeyedStateContext;
-// The bundle traits moved to the session module; re-exported here so the
-// `state::middleware` paths keep working until the middleware is retired.
-pub use crate::state::session::{DirtyValueBundle, DurableValueBundle};
-#[cfg(test)]
-pub(crate) use descriptor_identity::LazyDescriptorIdentity;
-pub use descriptor_identity::{
+// These pieces moved to standalone `state` modules; re-exported here so
+// the `state::middleware` paths keep working until the middleware is
+// retired.
+pub use crate::state::config::KeyedStateConfiguration;
+pub use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity,
     INITIAL_IDENTITY_VERSION,
 };
+pub(crate) use crate::state::manager::{ResolveSealedError, resolve_sealed};
+pub use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
+pub use crate::state::session::{DirtyValueBundle, DurableValueBundle};
+#[cfg(test)]
+pub(crate) use descriptor_identity::LazyDescriptorIdentity;
 pub use error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareErrorComponent};
 #[cfg(test)]
 pub(crate) use handler::recover_pending_entries;
@@ -81,8 +83,3 @@ pub use handler::{
     KeyedStateHandler, KeyedStateMiddleware, KeyedStateMiddlewareBuildError,
     KeyedStateMiddlewareBuilder, KeyedStateOutput, KeyedStateProvider,
 };
-// Production code (`RecoveringValueStore::{get, seal}`) calls `resolve_sealed`,
-// so this re-export must not be `#[cfg(test)]`-gated.
-pub use config::KeyedStateConfiguration;
-pub(crate) use handler::{ResolveSealedError, resolve_sealed};
-pub use registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};

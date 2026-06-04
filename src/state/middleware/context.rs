@@ -1,10 +1,10 @@
 //! Keyed-state context and the bundle traits.
 
-use super::registry::CollectionDefRegistry;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::state::descriptor::{KafkaMessageRef, StructuralIdentity};
+use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{DirtyValueBundle, DurableValueBundle};
 use crate::state::value::{
     DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueKind, ValueStore,

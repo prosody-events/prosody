@@ -1,9 +1,10 @@
 //! Error types and aliases raised by the keyed-state middleware.
 
-use super::descriptor_identity::DescriptorIdentityError;
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::FallibleHandler;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor_identity::DescriptorIdentityError;
+pub(crate) use crate::state::manager::RecoveryError;
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::PendingIndexScanner;
 use crate::state::value::{DurableWalStore, TransactionValueStoreError, ValueKind, ValueStore};
@@ -140,38 +141,6 @@ pub(super) type MiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
     <Sc as PendingIndexScanner>::Error,
     <O as CommitOracle>::Error,
 >;
-
-/// Errors raised by the shared state-recovery sweep
-/// `recover_pending_entries`.
-///
-/// The sweep only ever fails while scanning the pending index, reading or
-/// mutating durable state, consulting the oracle, or clearing the recovery
-/// timer. It never runs the inner handler, drives a transaction, or
-/// computes a fire time, so those variants are absent — the production
-/// caller lifts this into [`KeyedStateMiddlewareError`] via `?`.
-#[derive(Debug, Error)]
-pub(crate) enum RecoveryError<DurableErr, ScannerErr, OracleErr>
-where
-    DurableErr: Error + 'static,
-    ScannerErr: Error + 'static,
-    OracleErr: Error + 'static,
-{
-    /// A durable Value store operation failed.
-    #[error("keyed-state durable store failed")]
-    Durable(#[source] DurableErr),
-
-    /// A scanner pull failed.
-    #[error("keyed-state pending scanner failed")]
-    Scanner(#[source] ScannerErr),
-
-    /// The commit oracle failed.
-    #[error("keyed-state commit oracle failed")]
-    Oracle(#[source] OracleErr),
-
-    /// Clearing the recovery timer failed (type-erased context error).
-    #[error("keyed-state recovery timer failed: {0:#}")]
-    Timer(BoxEventContextError),
-}
 
 impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr>
     From<RecoveryError<DurableErr, ScannerErr, OracleErr>>

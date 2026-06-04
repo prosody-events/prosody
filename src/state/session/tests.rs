@@ -12,7 +12,7 @@ use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
-use crate::state::middleware::{CollectionDef, CollectionDefRegistry};
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::value_test_suite::bytes;
 use crate::state::{DurableState, StateType};
 use color_eyre::eyre::{Result, eyre};

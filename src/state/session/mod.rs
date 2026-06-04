@@ -34,7 +34,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::{KafkaMessageRef, StructuralIdentity};
-use crate::state::middleware::CollectionDefRegistry;
+use crate::state::registry::CollectionDefRegistry;
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind,
     ValueStore,
@@ -418,6 +418,12 @@ where
                 sealed: SyncMutex::new(None),
             }),
         }
+    }
+
+    /// The event this session's seals belong to (test observability).
+    #[cfg(test)]
+    pub(crate) fn event(&self) -> EventRef {
+        self.inner.event
     }
 
     fn collection_id_for(&self, name: &StateName) -> CollectionId<ValueKind> {
