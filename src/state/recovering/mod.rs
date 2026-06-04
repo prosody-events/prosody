@@ -38,7 +38,7 @@
 //! variants. Binding a TTL when the collection opted out would corrupt the
 //! durable retention contract; the wrapper never invents a TTL.
 //!
-//! [`Arc<CollectionDefRegistry>`]: crate::state::middleware::CollectionDefRegistry
+//! [`Arc<CollectionDefRegistry>`]: crate::state::registry::CollectionDefRegistry
 //!
 //! # Concurrency
 //!
@@ -69,11 +69,10 @@ use super::{
     StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::middleware::{
-    CollectionDefRegistry, DescriptorIdentityStore, DurableDescriptorIdentity, ResolveSealedError,
-    resolve_sealed,
-};
+use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use crate::state::manager::{ResolveSealedError, resolve_sealed};
 use crate::state::pending::PendingIndexStore;
+use crate::state::registry::CollectionDefRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
 use bytes::Bytes;
@@ -154,7 +153,7 @@ impl<Inner, Oracle, R> RecoveringValueStore<Inner, Oracle, R> {
     /// recovery-write TTLs through the [`CollectionTtl`] resolver `ttl`.
     ///
     /// Production wiring passes the shared
-    /// [`Arc<CollectionDefRegistry>`](crate::state::middleware::CollectionDefRegistry)
+    /// [`Arc<CollectionDefRegistry>`](crate::state::registry::CollectionDefRegistry)
     /// here so first-touch recovery binds the same per-collection TTL the
     /// timer-sweep recovery does. For a single fixed TTL, prefer
     /// [`Self::with_default_ttl`].

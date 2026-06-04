@@ -5,11 +5,14 @@
 
 use super::*;
 use crate::consumer::Keyed;
+use crate::consumer::event_context::StateAccessError;
 use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::otel::SpanRelation;
+use crate::state::descriptor::StateDescriptor;
+use crate::state::session::UnavailableState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
@@ -92,6 +95,14 @@ impl TerminationSignals for KeyedMockContext {
 impl EventContext for KeyedMockContext {
     type Error = Infallible;
     type Payload = serde_json::Value;
+    type State = UnavailableState<serde_json::Value>;
+
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        descriptor.bind(&UnavailableState::new())
+    }
 
     fn should_cancel(&self) -> bool {
         self.inner.should_cancel()

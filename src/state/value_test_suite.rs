@@ -25,16 +25,16 @@ use super::{
     CollectionId, CollectionRef, CommitDecision, CommitMode, DurableState, EventRef, LocalTx, Read,
     StateKey, StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp, ValueOverlay,
 };
-use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
-use crate::state::middleware::{
-    CollectionDef, CollectionDefRegistry, DescriptorIdentityError, DescriptorIdentityStore,
-    DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION, LazyDescriptorIdentity,
-    recover_pending_entries,
+use crate::state::descriptor_identity::{
+    DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity,
+    INITIAL_IDENTITY_VERSION, acquire_descriptor_identities,
 };
+use crate::state::manager::sweep_pending;
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -349,20 +349,14 @@ where
     assert_eq!(before, 1, "exactly one stale pending row before the sweep");
 
     let oracle = NeverConsultedOracle::default();
-    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let registry = CollectionDefRegistry::new(None);
-    recover_pending_entries(
-        &context,
-        &durable,
-        &durable,
-        &oracle,
-        &registry,
-        state_key.clone(),
-    )
-    .await
-    .map_err(|e| eyre!("recovery sweep failed: {e}"))?;
+    sweep_pending(&durable, &durable, &oracle, &registry, state_key.clone())
+        .await
+        .map_err(|e| eyre!("recovery sweep failed: {e}"))?;
 
-    // Stale row deleted, partition still Idle, oracle untouched, timer cleared.
+    // Stale row deleted, partition still Idle, oracle untouched. (The
+    // StateRecovery timer clear is the caller's last step — covered by the
+    // state-manager tests against a real TimerManager.)
     let after = collect_pending(&durable, &state_key).await?;
     assert_eq!(after, 0, "stale pending row must be deleted by the sweep");
     match DurableWalStore::read_partition(&durable, &id)
@@ -376,13 +370,6 @@ where
         oracle.calls.load(Ordering::Relaxed),
         0,
         "oracle must not be consulted for a stale pending row"
-    );
-    assert!(
-        context
-            .timer_operations()
-            .iter()
-            .any(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery))),
-        "the sweep must clear the StateRecovery timer"
     );
     Ok(())
 }
@@ -400,9 +387,11 @@ where
 ///    overwrite the row.
 /// 3. **Match ⇒ ok, idempotent** — re-acquiring an identical identity succeeds
 ///    and writes nothing new.
-/// 4. **Validation is acquisition-only (N8)** — once a partition's validator
-///    initialized, later durable-row drift is not re-checked; reads trust the
-///    frozen identity until the next assignment.
+///
+/// N8 (validation is acquisition-only) became structural: the partition
+/// loop acquires the state manager — and with it the identities — exactly
+/// once per assignment, so no per-dispatch path exists that could re-check
+/// a drifted row.
 pub(crate) async fn run_descriptor_identity_acquisition<D>(durable: D) -> Result<()>
 where
     D: DescriptorIdentityStore + Clone,
@@ -420,8 +409,7 @@ where
         .register(&PROFILE, CollectionDef::new(None))
         .map_err(|e| eyre!("register failed: {e}"))?;
     let registry = Arc::new(registry);
-    let lazy = LazyDescriptorIdentity::new(durable.clone(), registry.clone(), segment_id);
-    lazy.ensure()
+    acquire_descriptor_identities(&durable, &registry, segment_id)
         .await
         .map_err(|e| eyre!("first acquisition failed: {e}"))?;
     let rows = durable
@@ -442,10 +430,8 @@ where
         "acquisition writes the initial identity version"
     );
 
-    // Invariant 3: idempotent re-acquire from a fresh validator.
-    let again = LazyDescriptorIdentity::new(durable.clone(), registry, segment_id);
-    again
-        .ensure()
+    // Invariant 3: idempotent re-acquire.
+    acquire_descriptor_identities(&durable, &registry, segment_id)
         .await
         .map_err(|e| eyre!("idempotent re-acquisition failed: {e}"))?;
     let rows = durable
@@ -463,9 +449,7 @@ where
     mismatched
         .register(&relabeled, CollectionDef::new(None))
         .map_err(|e| eyre!("register failed: {e}"))?;
-    let conflicting =
-        LazyDescriptorIdentity::new(durable.clone(), Arc::new(mismatched), segment_id);
-    match conflicting.ensure().await {
+    match acquire_descriptor_identities(&durable, &mismatched, segment_id).await {
         Err(error @ DescriptorIdentityError::Mismatch { .. }) => {
             assert_eq!(
                 error.classify_error(),
@@ -479,25 +463,7 @@ where
         .read_descriptor_identities(segment_id)
         .await
         .map_err(|e| eyre!("read identities failed: {e}"))?;
-    assert_eq!(
-        rows,
-        vec![expected.clone()],
-        "mismatch must not overwrite the row"
-    );
-
-    // Invariant 4 (N8): the already-initialized validator never re-reads —
-    // drift the durable row out-of-band and assert `ensure` stays Ok.
-    let drifted = DurableDescriptorIdentity {
-        schema_label: Some("drifted".into()),
-        ..expected
-    };
-    durable
-        .write_descriptor_identities(segment_id, vec![drifted])
-        .await
-        .map_err(|e| eyre!("drift write failed: {e}"))?;
-    lazy.ensure()
-        .await
-        .map_err(|e| eyre!("acquisition-only contract violated: {e}"))?;
+    assert_eq!(rows, vec![expected], "mismatch must not overwrite the row");
     Ok(())
 }
 

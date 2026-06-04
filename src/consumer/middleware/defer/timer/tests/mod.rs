@@ -4,6 +4,7 @@
 //! verifying [`TimerDeferHandler`](super::TimerDeferHandler) behavior.
 
 use crate::consumer::DemandType;
+use crate::consumer::event_context::StateAccessError;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
@@ -14,6 +15,8 @@ use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::otel::SpanRelation;
+use crate::state::descriptor::StateDescriptor;
+use crate::state::session::UnavailableState;
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;
@@ -107,6 +110,14 @@ impl TerminationSignals for MockContext {
 impl EventContext for MockContext {
     type Error = Infallible;
     type Payload = serde_json::Value;
+    type State = UnavailableState<serde_json::Value>;
+
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        descriptor.bind(&UnavailableState::new())
+    }
 
     fn should_cancel(&self) -> bool {
         false

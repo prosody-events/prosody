@@ -1,9 +1,9 @@
 //! In-memory keyed-state stores.
 
-use super::encoding::{EncodingError, decode_wal};
-use super::middleware::{
+use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
 };
+use super::encoding::{EncodingError, decode_wal};
 use super::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use super::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, ValueKind, ValueOp, ValueStore,

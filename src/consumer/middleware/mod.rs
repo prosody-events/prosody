@@ -174,6 +174,7 @@ pub mod optional;
 pub mod providers;
 pub mod retry;
 pub mod scheduler;
+pub mod state_lifecycle;
 pub mod telemetry;
 #[cfg(test)]
 pub mod test_support;

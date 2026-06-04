@@ -40,7 +40,7 @@ use super::{
     CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
     StoreOutcome,
 };
-use crate::state::middleware::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::pending::PendingIndexStore;
 use crate::timers::store::SegmentId;
 use bytes::Bytes;

@@ -13,8 +13,10 @@ use educe::Educe;
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
-use crate::consumer::event_context::{EventContext, TerminationSignals};
+use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::partition::ShutdownPhase;
+use crate::state::descriptor::StateDescriptor;
+use crate::state::session::{StateSession, UnavailableState};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
@@ -51,8 +53,8 @@ pub enum TimerOperation {
 /// let ops = ctx.timer_operations();
 /// ```
 #[derive(Educe)]
-#[educe(Clone(bound()))]
-pub struct MockEventContext<P = serde_json::Value> {
+#[educe(Clone(bound(S: Clone)))]
+pub struct MockEventContext<P = serde_json::Value, S = UnavailableState<P>> {
     /// Partition/consumer shutdown signal (sender for mutations).
     shutdown_tx: Arc<watch::Sender<ShutdownPhase>>,
     /// Partition/consumer shutdown signal (receiver for queries).
@@ -66,6 +68,10 @@ pub struct MockEventContext<P = serde_json::Value> {
     /// Timer operation tracking (None = disabled).
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
 
+    /// Keyed-state session descriptor binds route to; defaults to the
+    /// [`UnavailableState`] stub.
+    session: S,
+
     /// Payload type pin ([`EventContext::Payload`]); defaults to
     /// `serde_json::Value` to match the default consumer codec.
     _payload: PhantomData<fn() -> P>,
@@ -78,7 +84,8 @@ impl<P> Default for MockEventContext<P> {
 }
 
 impl<P> MockEventContext<P> {
-    /// Create a new mock context with default state (no signals active).
+    /// Create a new mock context with default state (no signals active,
+    /// keyed state unavailable).
     #[must_use]
     pub fn new() -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
@@ -89,6 +96,23 @@ impl<P> MockEventContext<P> {
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
             timer_operations: None,
+            session: UnavailableState::new(),
+            _payload: PhantomData,
+        }
+    }
+}
+
+impl<P, S> MockEventContext<P, S> {
+    /// Replaces the keyed-state session descriptor binds route to.
+    #[must_use]
+    pub fn with_session<S2>(self, session: S2) -> MockEventContext<P, S2> {
+        MockEventContext {
+            shutdown_tx: self.shutdown_tx,
+            shutdown_rx: self.shutdown_rx,
+            cancel_tx: self.cancel_tx,
+            cancel_rx: self.cancel_rx,
+            timer_operations: self.timer_operations,
+            session,
             _payload: PhantomData,
         }
     }
@@ -175,7 +199,7 @@ impl<P> MockEventContext<P> {
     }
 }
 
-impl<P> TerminationSignals for MockEventContext<P> {
+impl<P, S> TerminationSignals for MockEventContext<P, S> {
     fn is_shutdown(&self) -> bool {
         *self.shutdown_rx.borrow() >= ShutdownPhase::Cancelling
     }
@@ -199,12 +223,21 @@ impl<P> TerminationSignals for MockEventContext<P> {
     }
 }
 
-impl<P> EventContext for MockEventContext<P>
+impl<P, S> EventContext for MockEventContext<P, S>
 where
     P: Send + Sync + 'static,
+    S: StateSession<Payload = P>,
 {
     type Error = Infallible;
     type Payload = P;
+    type State = S;
+
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<S>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        descriptor.bind(&self.session)
+    }
 
     fn should_cancel(&self) -> bool {
         *self.shutdown_rx.borrow() >= ShutdownPhase::Cancelling || *self.cancel_rx.borrow()

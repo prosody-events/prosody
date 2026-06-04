@@ -17,11 +17,11 @@ use crate::state::cassandra::{CassandraValueStore, ValueQueries};
 use crate::state::dirty_value_test_suite::{self, DirtyTrace};
 use crate::state::layered::LayeredValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
-use crate::state::middleware::DurableValueBundle;
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::PendingIndexStore;
 use crate::state::production::ProductionValueDurable;
 use crate::state::recovering::RecoveringValueStore;
+use crate::state::session::DurableValueBundle;
 use crate::state::value::{
     DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind, ValueStore,
 };

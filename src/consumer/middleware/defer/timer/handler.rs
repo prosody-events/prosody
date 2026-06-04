@@ -29,10 +29,10 @@ use super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
+use crate::consumer::middleware::defer::{calculate_backoff, reset_state_session};
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::telemetry::event::TimerEventType;
@@ -405,6 +405,7 @@ where
             "Deferred timer for timer-based retry"
         );
 
+        reset_state_session(&context);
         Ok(TimerDeferOutput::Deferred(inner_err))
     }
 
@@ -488,6 +489,7 @@ where
                     "Re-deferred timer after transient failure"
                 );
 
+                reset_state_session(context);
                 Ok(TimerDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {

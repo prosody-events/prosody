@@ -33,8 +33,8 @@
 
 use super::error::CassandraValueStoreError;
 use super::udt::RawEventRef;
+use crate::state::descriptor_identity::INITIAL_IDENTITY_VERSION;
 use crate::state::encoding::decode_payload;
-use crate::state::middleware::INITIAL_IDENTITY_VERSION;
 use crate::state::value::ValueKind;
 use crate::state::{DurableState, PayloadEncoding, SealedWal, WalBlob, WalFormat};
 use std::fmt;

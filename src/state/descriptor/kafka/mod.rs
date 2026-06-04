@@ -5,12 +5,13 @@
 use super::{
     CellKind, DescriptorIdentity, SchemaLabel, StateDescriptor, StructuralIdentity, ensure_live,
 };
-use crate::consumer::event_context::{EventContext, StateAccessError};
+use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
 use crate::state::StateName;
 use crate::state::StoreOutcome;
+use crate::state::session::StateSession;
 use crate::{Offset, Partition, Topic};
 use bytes::Bytes;
 use rmp_serde::decode::Error as MsgPackDecodeError;
@@ -70,9 +71,9 @@ mod topic_serde {
 
 /// Descriptor for a collection whose cells reference Kafka message bodies.
 ///
-/// Codec-free: message typing flows from the binding context's
-/// [`EventContext::Payload`] — the consumer's own codec decodes the loaded
-/// message, so the handle returns `ConsumerMessage<Ctx::Payload>` with no
+/// Codec-free: message typing flows from the binding session's
+/// [`StateSession::Payload`] — the consumer's own codec decodes the loaded
+/// message, so the handle returns `ConsumerMessage<S::Payload>` with no
 /// codec parameter. Declare as a `const` via [`kafka_message_state`].
 #[derive(Clone, Copy, Debug)]
 pub struct KafkaMessageDescriptor {
@@ -117,12 +118,12 @@ impl DescriptorIdentity for KafkaMessageDescriptor {
 }
 
 impl StateDescriptor for KafkaMessageDescriptor {
-    type Handle<Ctx: EventContext> = KafkaMessageHandle<Ctx>;
+    type Handle<S: StateSession> = KafkaMessageHandle<S>;
 
-    fn bind<Ctx: EventContext>(self, ctx: &Ctx) -> Result<Self::Handle<Ctx>, StateAccessError> {
-        let name = ctx.verify_state_registration(self.name, &self.structural_identity())?;
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+        let name = session.verify_state_registration(self.name, &self.structural_identity())?;
         Ok(KafkaMessageHandle {
-            ctx: ctx.clone(),
+            session: session.clone(),
             name,
         })
     }
@@ -131,18 +132,18 @@ impl StateDescriptor for KafkaMessageDescriptor {
 /// Typed, owned handle over a Kafka-message collection.
 ///
 /// The cell is the `MsgPack`-encoded [`KafkaMessageRef`]; [`Self::get`]
-/// resolves it to the full message through the context's loader, decoded
-/// by the consumer's own codec. Owns a clone of the binding context; every
-/// operation guards on context termination.
+/// resolves it to the full message through the session's loader, decoded
+/// by the consumer's own codec. Owns a clone of the binding session; every
+/// operation guards on session termination.
 #[derive(Clone)]
-pub struct KafkaMessageHandle<Ctx> {
-    ctx: Ctx,
+pub struct KafkaMessageHandle<S> {
+    session: S,
     name: StateName,
 }
 
-impl<Ctx> KafkaMessageHandle<Ctx>
+impl<S> KafkaMessageHandle<S>
 where
-    Ctx: EventContext,
+    S: StateSession,
 {
     /// Reads the current cell and loads the referenced message.
     ///
@@ -152,47 +153,45 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an access error from the context (including the type-erased
+    /// Returns an access error from the session (including the type-erased
     /// loader failure) or a corrupt-ref error.
-    pub async fn get(&self) -> Result<Option<ConsumerMessage<Ctx::Payload>>, KafkaStateError> {
-        ensure_live(&self.ctx)?;
-        let Some(cell) = self.ctx.state_cell(&self.name).await? else {
+    pub async fn get(&self) -> Result<Option<ConsumerMessage<S::Payload>>, KafkaStateError> {
+        ensure_live(&self.session)?;
+        let Some(cell) = self.session.state_cell(&self.name).await? else {
             return Ok(None);
         };
         let message_ref = decode_ref(&cell)?;
-        Ok(Some(self.ctx.load_state_message(message_ref).await?))
+        Ok(Some(self.session.load_message(message_ref).await?))
     }
 
     /// Buffers a set of the `MsgPack`-encoded reference to `message`.
     ///
     /// The reference is derived from the message in hand; the payload type
-    /// equality between the handler's message and the context is enforced
-    /// by the `C: EventContext<Payload = Self::Payload>` handler bound, so
-    /// this is a compile-time match.
+    /// equality between the handler's message and the session is enforced
+    /// by the `C: EventContext<Payload = Self::Payload>` handler bound
+    /// (contexts pin their session's payload), so this is a compile-time
+    /// match.
     ///
     /// # Errors
     ///
-    /// Returns an encode error or an access error from the context.
-    pub async fn set(
-        &self,
-        message: &ConsumerMessage<Ctx::Payload>,
-    ) -> Result<(), KafkaStateError> {
-        ensure_live(&self.ctx)?;
+    /// Returns an encode error or an access error from the session.
+    pub async fn set(&self, message: &ConsumerMessage<S::Payload>) -> Result<(), KafkaStateError> {
+        ensure_live(&self.session)?;
         let message_ref = KafkaMessageRef::from(message);
         let cell = rmp_serde::to_vec_named(&message_ref)
             .map(Bytes::from)
             .map_err(KafkaStateError::EncodeRef)?;
-        Ok(self.ctx.set_state_cell(&self.name, cell).await?)
+        Ok(self.session.set_state_cell(&self.name, cell).await?)
     }
 
     /// Buffers a clear operation.
     ///
     /// # Errors
     ///
-    /// Returns an access error from the context.
+    /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), KafkaStateError> {
-        ensure_live(&self.ctx)?;
-        Ok(self.ctx.clear_state_cell(&self.name).await?)
+        ensure_live(&self.session)?;
+        Ok(self.session.clear_state_cell(&self.name).await?)
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
@@ -200,10 +199,10 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an access error from the context.
+    /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, KafkaStateError> {
-        ensure_live(&self.ctx)?;
-        Ok(self.ctx.flush_state_cell(&self.name).await?)
+        ensure_live(&self.session)?;
+        Ok(self.session.flush_state_cell(&self.name).await?)
     }
 }
 

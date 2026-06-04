@@ -7,12 +7,12 @@
 //! `RecoveringValueStore<MemoryDurableValueStore, MockOracle>`.
 
 use super::{CollectionTtl, CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
-use crate::consumer::middleware::test_support::MockEventContext;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{ValueDescriptor, value_state};
+use crate::state::manager::sweep_pending;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
-use crate::state::middleware::{CollectionDef, CollectionDefRegistry, recover_pending_entries};
 use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::value::{DirectApplyStore, DurableWalStore, ValueOp, ValueStore};
 use crate::state::value_test_suite::{
     self, DirectTrace, OraclePolicy, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
@@ -496,7 +496,7 @@ async fn recovery_writes_use_default_ttl() -> Result<()> {
 /// C2: when the resolver is the shared `Arc<CollectionDefRegistry>`, a
 /// first-touch recovery write binds the collection's **per-collection** TTL
 /// override — not the middleware-wide default. This is the same value the
-/// timer-sweep recovery (`recover_pending_entries`) reads from
+/// timer-sweep recovery (`sweep_pending`) reads from
 /// `registry.ttl_for(name)`, so the two recovery paths can no longer bind
 /// divergent TTLs for the same collection.
 #[tokio::test]
@@ -534,7 +534,7 @@ async fn recovery_writes_use_registry_per_collection_ttl() -> Result<()> {
 
 /// T2: the two recovery entry points must agree. First-touch
 /// ([`RecoveringValueStore::get`]) and the timer-sweep
-/// ([`recover_pending_entries`]) are driven over the *same* `Sealed`
+/// ([`sweep_pending`]) are driven over the *same* `Sealed`
 /// partition (same pre-seal applied state, same WAL ops, same commit
 /// decision, same per-collection TTL resolver). The property asserts both
 /// produce **equivalent recovered visible state** and bind the **same TTL**
@@ -616,9 +616,7 @@ async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<b
         .seal(&collection, event, ops.clone())
         .await
         .map_err(into_eyre)?;
-    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
-    recover_pending_entries(
-        &context,
+    sweep_pending(
         &store_b,
         &store_b,
         &oracle,
@@ -1099,7 +1097,7 @@ impl DirectApplyStore<ValueKind> for TtlRecordingDurable {
 }
 
 // Delegated so `TtlRecordingDurable` can drive the timer-sweep entry point
-// (`recover_pending_entries`) as well as the first-touch one, letting T2
+// (`sweep_pending`) as well as the first-touch one, letting T2
 // compare both against the same recording store.
 impl PendingIndexStore for TtlRecordingDurable {
     type Error = <MemoryDurableValueStore as DurableWalStore<ValueKind>>::Error;

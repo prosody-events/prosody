@@ -140,6 +140,7 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
+use crate::state::session::LifecycleAccess;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Offset, Partition, Topic};
@@ -443,6 +444,13 @@ impl<T> RetryHandler<T> {
                     // cancellation, treated as transient), we are committing
                     // to another attempt on the next loop iteration.
                     apply_abort(error).await;
+
+                    // Attempt boundary: reset the event's keyed-state
+                    // session so the failed attempt's dirty ops never leak
+                    // into the next attempt's transaction.
+                    if let Ok(lifecycle) = context.state(LifecycleAccess) {
+                        lifecycle.reset();
+                    }
                 }
                 ErrorCategory::Permanent => {
                     log(LogReason::Permanent {

@@ -30,11 +30,23 @@ use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
     ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
 };
+use crate::state::manager::PartitionStateProvider;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{EventType, Topic};
+
+/// The per-partition factories the context threads into each
+/// [`PartitionConfiguration`]: trigger stores for the timer system and
+/// keyed-state managers for the state system.
+pub struct PartitionProviders<P, SP> {
+    /// Factory for per-partition trigger stores.
+    pub triggers: P,
+
+    /// Factory for per-partition keyed-state managers.
+    pub state: SP,
+}
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
@@ -50,13 +62,15 @@ use crate::{EventType, Topic};
 ///   partitions
 /// * `P` - Type implementing `TriggerStoreProvider` for persistent timer
 ///   trigger storage
+/// * `SP` - Type implementing `PartitionStateProvider` for per-partition
+///   keyed-state managers
 /// * `PL` - The payload type carried by consumed messages
-pub struct Context<T, P, PL>
+pub struct Context<T, P, SP, PL>
 where
     T: HandlerProvider,
 {
     /// Partition-level configuration settings
-    config: PartitionConfiguration<P, PL>,
+    config: PartitionConfiguration<P, SP, PL>,
 
     /// Creates message handlers for partitions
     handler_provider: T,
@@ -67,7 +81,7 @@ where
     telemetry: TelemetrySender,
 }
 
-impl<T, P, PL> Context<T, P, PL>
+impl<T, P, SP, PL> Context<T, P, SP, PL>
 where
     T: HandlerProvider,
     PL: Clone + Send + Sync + 'static,
@@ -82,7 +96,7 @@ where
     ///
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
-    /// * `trigger_provider` - Factory for per-partition trigger stores
+    /// * `providers` - Per-partition trigger-store and keyed-state factories
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
     /// * `allowed_events` - Optional filter automaton; payloads supply their
@@ -90,7 +104,7 @@ where
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
-        trigger_provider: P,
+        providers: PartitionProviders<P, SP>,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers<PL>>,
         allowed_events: Option<AhoCorasick>,
@@ -113,7 +127,8 @@ where
             shutdown_timeout: config.shutdown_timeout,
             stall_threshold: config.stall_threshold,
             watermark_version,
-            trigger_provider,
+            trigger_provider: providers.triggers,
+            state_provider: providers.state,
             timer_slab_size,
             timer_semaphores,
             telemetry_sender: telemetry.clone(),
@@ -130,19 +145,21 @@ where
     }
 }
 
-impl<T, P, PL> ClientContext for Context<T, P, PL>
+impl<T, P, SP, PL> ClientContext for Context<T, P, SP, PL>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<PL>,
     PL: Clone + Send + Sync + 'static,
 {
 }
 
-impl<T, P, PL> ConsumerContext for Context<T, P, PL>
+impl<T, P, SP, PL> ConsumerContext for Context<T, P, SP, PL>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<PL>,
     PL: Clone + Send + Sync + 'static + EventType,
 {
     /// Handles partition assignments and revocations during consumer group

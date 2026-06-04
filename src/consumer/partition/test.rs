@@ -5,6 +5,7 @@ use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
+use crate::state::manager::NoState;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
@@ -29,7 +30,11 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider, serde_json::Value> {
+fn default_config() -> PartitionConfiguration<
+    InMemoryTriggerStoreProvider,
+    NoState<serde_json::Value>,
+    serde_json::Value,
+> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
@@ -39,6 +44,7 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider, serd
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_provider: InMemoryTriggerStoreProvider::new(),
+        state_provider: NoState::new(),
         timer_slab_size: CompactDuration::new(30),
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),

@@ -32,10 +32,10 @@ use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCom
 use crate::JsonCodec;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
+use crate::consumer::middleware::defer::{calculate_backoff, reset_state_session};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
@@ -414,6 +414,7 @@ where
                     "Re-deferred message after transient failure"
                 );
 
+                reset_state_session(context);
                 Ok(MessageDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
@@ -590,6 +591,7 @@ where
             "Deferred message for timer-based retry"
         );
 
+        reset_state_session(&context);
         Ok(MessageDeferOutput::Deferred(inner_error))
     }
 

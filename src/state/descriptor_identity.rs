@@ -1,9 +1,9 @@
 //! Durable per-segment descriptor-identity validation.
 //!
 //! Each `(segment, collection name)` pair has one frozen
-//! [`StructuralIdentity`](crate::state::descriptor::StructuralIdentity) row,
-//! written on first use by the partition's single owner (Kafka partition
-//! ownership ⇒ no LWT needed). [`acquire_descriptor_identities`] validates
+//! [`StructuralIdentity`] row, written on first use by the partition's
+//! single owner (Kafka partition ownership ⇒ no LWT needed).
+//! `acquire_descriptor_identities` validates
 //! every registered descriptor against the segment's durable rows; the
 //! state manager runs it eagerly at partition acquisition, and acquisition
 //! failures retry until shutdown, so transient store failures never gate a

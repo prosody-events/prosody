@@ -4,24 +4,25 @@
 //! the real [`TransactionValueStore`](crate::state::value::TransactionValueStore)
 //! machinery, run against both the memory and fjall dirty backends. N4 —
 //! the two-instance interface proof: the JSON and Kafka descriptors bind
-//! through the *same* `ctx.state(DESC)` machinery ([`bind_registered`]).
-//! N5 — registration and bind error surfaces, including the
-//! state-unavailable default on contexts outside the keyed-state
-//! middleware.
+//! through the *same* session machinery ([`bind_registered`]). N5 —
+//! registration and bind error surfaces, including the state-unavailable
+//! stub on contexts without keyed state.
 
 use super::*;
 use crate::codec::JsonCodecError;
+use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::middleware::test_support::MockEventContext;
+use crate::consumer::partition::ShutdownPhase;
 use crate::state::fjall::FjallDirtyValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
-use crate::state::middleware::{
-    CollectionDef, CollectionDefRegistry, ContextParts, DirtyValueBundle, KeyedStateContext,
-    RegisterStateError,
-};
+use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
+use crate::state::session::{DirtyValueBundle, SessionParts, TerminationWatch, ValueStateSession};
+use crate::state::value::{PendingOpSource, ValueKind};
 use crate::state::value_test_suite::finish_trace;
-use crate::state::{EventRef, EventScopeId, StateKey};
+use crate::state::{DirtyStoreProvider, EventRef, EventScopeId, StateKey};
 use crate::test_util::{ArbJson, TEST_RUNTIME};
+use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
 use fjall::{Config, PartitionCreateOptions};
 use futures::executor;
@@ -31,48 +32,70 @@ use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::watch;
 use uuid::Uuid;
 
-pub(crate) type TestCtx<S> =
-    KeyedStateContext<MockEventContext, MemoryDurableValueStore, S, MemoryLoader<Value>>;
+/// Test-only dirty provider handing out clones of one pre-built store, so
+/// the round-trip properties can inject either dirty backend.
+#[derive(Clone, Debug)]
+pub(crate) struct FixedDirtyProvider<S>(S);
 
-/// Builds a context with `descriptor` registered and binds it via
-/// `ctx.state(...)` — the single shared machinery every descriptor kind
-/// runs through (the N4 proof is that both the JSON tests here and the
-/// Kafka tests in [`super::kafka::tests`] call exactly this).
+impl<S> DirtyStoreProvider<ValueKind> for FixedDirtyProvider<S>
+where
+    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
+{
+    type Store = S;
+
+    fn for_scope(&self, _scope: EventScopeId) -> S {
+        self.0.clone()
+    }
+}
+
+pub(crate) type TestSession<S> =
+    ValueStateSession<MemoryDurableValueStore, FixedDirtyProvider<S>, MemoryLoader<Value>>;
+
+/// Builds a session with `descriptor` registered and binds it via
+/// `StateDescriptor::bind` — the single shared machinery every descriptor
+/// kind runs through (the N4 proof is that both the JSON tests here and
+/// the Kafka tests in [`super::kafka::tests`] call exactly this).
 pub(crate) fn bind_registered<DESC, S>(
     descriptor: DESC,
     dirty: S,
     loader: MemoryLoader<Value>,
-) -> Result<DESC::Handle<TestCtx<S>>>
+) -> Result<DESC::Handle<TestSession<S>>>
 where
     DESC: StateDescriptor,
     S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&descriptor, CollectionDef::new(None))?;
-    let ctx = test_context(dirty, loader, registry);
-    ctx.state(descriptor).map_err(|e| eyre!("bind failed: {e}"))
+    let session = test_session(dirty, loader, registry);
+    descriptor
+        .bind(&session)
+        .map_err(|e| eyre!("bind failed: {e}"))
 }
 
-pub(crate) fn test_context<S>(
+pub(crate) fn test_session<S>(
     dirty: S,
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
-) -> TestCtx<S>
+) -> TestSession<S>
 where
-    S: Clone,
+    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
 {
-    KeyedStateContext::new(ContextParts {
-        inner: MockEventContext::new(),
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    ValueStateSession::new(SessionParts {
         durable: MemoryDurableValueStore::for_tests(),
-        dirty,
+        dirty: FixedDirtyProvider(dirty),
         loader,
         registry: Arc::new(registry),
         state_key: StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
+        recovery_delay: CompactDuration::new(30),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }
 
@@ -195,11 +218,12 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
     Ok(())
 }
 
-/// N5: binding against a context without keyed state (every context
-/// outside the keyed-state middleware — here the bare mock) fails with
-/// the Permanent [`StateAccessError::Unavailable`] default.
+/// N5: binding against a context without keyed state (any context whose
+/// session is the [`UnavailableState`](crate::state::session::UnavailableState)
+/// stub — here the bare mock) fails with the Permanent
+/// [`StateAccessError::Unavailable`].
 #[test]
-fn state_unavailable_outside_keyed_state_middleware() -> Result<()> {
+fn state_unavailable_without_keyed_state() -> Result<()> {
     let ctx: MockEventContext = MockEventContext::new();
     let Err(error) = ctx.state(CART) else {
         return Err(eyre!("bind on a state-less context must fail"));
@@ -214,12 +238,12 @@ fn state_unavailable_outside_keyed_state_middleware() -> Result<()> {
 /// registration.
 #[tokio::test]
 async fn state_with_unregistered_descriptor_errors() -> Result<()> {
-    let ctx = test_context(
+    let session = test_session(
         MemoryDirtyValueStore::new(),
         MemoryLoader::new(),
         CollectionDefRegistry::new(None),
     );
-    let Err(error) = ctx.state(CART) else {
+    let Err(error) = CART.bind(&session) else {
         return Err(eyre!("unregistered bind must fail"));
     };
     assert!(matches!(
@@ -237,9 +261,9 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
     const RELABELED: ValueDescriptor = value_state("cart").with_schema_label("v2");
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&CART, CollectionDef::new(None))?;
-    let ctx = test_context(MemoryDirtyValueStore::new(), MemoryLoader::new(), registry);
+    let session = test_session(MemoryDirtyValueStore::new(), MemoryLoader::new(), registry);
 
-    let Err(error) = ctx.state(RELABELED) else {
+    let Err(error) = RELABELED.bind(&session) else {
         return Err(eyre!("mismatched bind must fail"));
     };
     assert!(matches!(error, StateAccessError::IdentityMismatch { .. }));

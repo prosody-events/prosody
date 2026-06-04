@@ -35,6 +35,7 @@ use crate::heartbeat::Heartbeat;
 use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 use crate::related_span;
+use crate::state::manager::PartitionStateProvider;
 
 use crate::timers::store::TriggerStoreProvider;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -51,11 +52,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///   handlers for assigned partitions.
 /// * `P` - A type implementing [`TriggerStoreProvider`] for timer storage.
 /// * `C` - A type implementing [`Codec`] for deserializing message payloads.
-pub struct PollConfig<'a, T, P, C>
+pub struct PollConfig<'a, T, P, SP, C>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<C::Payload>,
     C: Codec,
     C::Payload: Clone + EventType,
 {
@@ -66,7 +68,7 @@ where
     pub max_message_count: usize,
 
     /// The configured Kafka consumer with context
-    pub consumer: BaseConsumer<Context<T, P, C::Payload>>,
+    pub consumer: BaseConsumer<Context<T, P, SP, C::Payload>>,
 
     /// Codec for deserializing message payloads
     pub codec: C,
@@ -103,11 +105,12 @@ where
 /// # Arguments
 ///
 /// * `config` - The configuration for the polling process
-pub fn poll<T, P, C>(config: PollConfig<T, P, C>)
+pub fn poll<T, P, SP, C>(config: PollConfig<T, P, SP, C>)
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<C::Payload>,
     C: Codec,
     C::Payload: Clone + EventType,
 {
@@ -248,8 +251,8 @@ fn dispatch_with_retry<P: Send + Sync + 'static>(
 /// * `watermark_version` - Counter tracking changes to committed offsets
 /// * `managers` - Collection of partition managers that track committed offsets
 /// * `last_version` - The last processed watermark version
-fn store_watermarks<T, P, PL>(
-    consumer: &BaseConsumer<Context<T, P, PL>>,
+fn store_watermarks<T, P, SP, PL>(
+    consumer: &BaseConsumer<Context<T, P, SP, PL>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers<PL>,
     last_version: &mut usize,
@@ -257,6 +260,7 @@ fn store_watermarks<T, P, PL>(
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<PL>,
     PL: Clone + Send + Sync + 'static + EventType,
 {
     // Skip if no watermark updates have occurred
@@ -332,16 +336,17 @@ fn store_watermarks<T, P, PL>(
 /// # Errors
 ///
 /// Returns any error from the underlying Kafka pause/resume operations.
-fn pause_busy_partitions<T, P, PL>(
+fn pause_busy_partitions<T, P, SP, PL>(
     is_paused: &mut bool,
     maybe_permit: Option<&OwnedSemaphorePermit>,
-    consumer: &BaseConsumer<Context<T, P, PL>>,
+    consumer: &BaseConsumer<Context<T, P, SP, PL>>,
     managers: &Managers<PL>,
 ) -> Result<(), KafkaError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<PL>,
     PL: Clone + Send + Sync + 'static + EventType,
 {
     let managers = managers.read();

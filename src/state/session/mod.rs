@@ -33,15 +33,17 @@ use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::ShutdownPhase;
-use crate::state::descriptor::{KafkaMessageRef, StructuralIdentity};
+use crate::state::descriptor::{
+    CellKind, DescriptorIdentity, KafkaMessageRef, StateDescriptor, StructuralIdentity,
+};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind,
     ValueStore,
 };
 use crate::state::{
-    CollectionId, CollectionRef, CommitMode, DirtyStoreProvider, EventRef, EventScopeId, Read,
-    StateKey, StateName, StateType, StoreOutcome,
+    CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyStoreProvider, EventRef,
+    EventScopeId, Read, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -754,6 +756,84 @@ where
 
     fn recovery_fire_delay(&self) -> CompactDuration {
         CompactDuration::MIN
+    }
+}
+
+/// Crate-private descriptor the framework uses to reach a session's
+/// sealed lifecycle through the one public [`EventContext::state`] method.
+///
+/// `bind` skips registration (the lifecycle is registration-independent)
+/// and returns a [`LifecycleView`] unconditionally. Downstream crates can
+/// name neither this type nor the view, so the lifecycle stays
+/// framework-only even though it travels through a public method.
+///
+/// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LifecycleAccess;
+
+impl DescriptorIdentity for LifecycleAccess {
+    fn name(&self) -> &'static str {
+        // Never registered, never persisted: `bind` ignores the identity.
+        "\u{0}lifecycle"
+    }
+
+    fn structural_identity(&self) -> StructuralIdentity {
+        StructuralIdentity {
+            kind: CollectionKindId::Value,
+            cell_kind: CellKind::Codec,
+            codec_id: None,
+            schema_label: None,
+        }
+    }
+}
+
+impl StateDescriptor for LifecycleAccess {
+    type Handle<S: StateSession> = LifecycleView<S>;
+
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+        Ok(LifecycleView {
+            session: session.clone(),
+        })
+    }
+}
+
+/// Crate-private view over a session's sealed lifecycle, returned by
+/// binding [`LifecycleAccess`].
+pub(crate) struct LifecycleView<S> {
+    session: S,
+}
+
+impl<S> LifecycleView<S>
+where
+    S: StateSession,
+{
+    /// See [`StateLifecycle::finalize`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a type-erased store error when sealing or applying fails.
+    pub(crate) async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
+        self.session.finalize().await
+    }
+
+    /// See [`StateLifecycle::commit_apply`].
+    pub(crate) async fn commit_apply(&self) -> ApplyOutcome {
+        self.session.commit_apply().await
+    }
+
+    /// See [`StateLifecycle::rollback_aborted`].
+    pub(crate) async fn rollback_aborted(&self) -> ApplyOutcome {
+        self.session.rollback_aborted().await
+    }
+
+    /// See [`StateLifecycle::reset`].
+    pub(crate) fn reset(&self) {
+        self.session.reset();
+    }
+
+    /// See [`StateLifecycle::recovery_fire_delay`].
+    pub(crate) fn recovery_fire_delay(&self) -> CompactDuration {
+        self.session.recovery_fire_delay()
     }
 }
 

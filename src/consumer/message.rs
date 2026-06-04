@@ -151,6 +151,14 @@ impl<P> UncommittedMessage<P> {
         (self.inner, self.uncommitted_offset)
     }
 
+    /// Returns the wrapped consumer message.
+    ///
+    /// Used by the partition loop to derive the event's keyed-state
+    /// session before dispatch consumes the message.
+    pub(crate) fn message(&self) -> &ConsumerMessage<P> {
+        &self.inner
+    }
+
     fn processing_state(&self) -> Arc<ArcSwapOption<ProcessingState>> {
         self.inner.processing_state.clone()
     }

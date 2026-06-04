@@ -18,15 +18,12 @@
 use crate::Key;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
-use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::{KafkaMessageRef, StructuralIdentity};
-use crate::state::{StateName, StoreOutcome};
+use crate::state::descriptor::StateDescriptor;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use bytes::Bytes;
 use futures::TryFutureExt;
 use std::future::Future;
 use thiserror::Error;
@@ -124,6 +121,17 @@ where
 {
     type Error = TimerDeferContextError<C::Error, S::Error>;
     type Payload = C::Payload;
+    // The keyed-state session rides the inner context; this wrapper only
+    // intercepts timer operations. The compiler enforces the forward — a
+    // wrapper without `state` does not build.
+    type State = C::State;
+
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        self.inner.state(descriptor)
+    }
 
     fn should_cancel(&self) -> bool {
         self.inner.should_cancel()
@@ -278,42 +286,6 @@ where
                 .await
                 .map_err(TimerDeferContextError::Context)
         }
-    }
-
-    // State capabilities forward to the inner context verbatim. This
-    // wrapper sits *inside* the keyed-state middleware, so its inner
-    // context carries the live state overrides — falling back to the
-    // trait defaults here would mask them as `Unavailable`.
-
-    fn verify_state_registration(
-        &self,
-        name: &'static str,
-        identity: &StructuralIdentity,
-    ) -> Result<StateName, StateAccessError> {
-        self.inner.verify_state_registration(name, identity)
-    }
-
-    async fn state_cell(&self, name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
-        self.inner.state_cell(name).await
-    }
-
-    async fn set_state_cell(&self, name: &StateName, cell: Bytes) -> Result<(), StateAccessError> {
-        self.inner.set_state_cell(name, cell).await
-    }
-
-    async fn clear_state_cell(&self, name: &StateName) -> Result<(), StateAccessError> {
-        self.inner.clear_state_cell(name).await
-    }
-
-    async fn flush_state_cell(&self, name: &StateName) -> Result<StoreOutcome, StateAccessError> {
-        self.inner.flush_state_cell(name).await
-    }
-
-    async fn load_state_message(
-        &self,
-        message_ref: KafkaMessageRef,
-    ) -> Result<ConsumerMessage<Self::Payload>, StateAccessError> {
-        self.inner.load_state_message(message_ref).await
     }
 
     fn invalidate(self) {

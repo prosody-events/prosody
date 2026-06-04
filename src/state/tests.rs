@@ -75,7 +75,7 @@ async fn memory_descriptor_identity_acquisition() -> Result<()> {
 /// reads the raw column; this reads the mirrored entry field.
 #[tokio::test]
 async fn memory_identity_version_stamp_pairs_with_applied() -> Result<()> {
-    use super::middleware::INITIAL_IDENTITY_VERSION;
+    use super::descriptor_identity::INITIAL_IDENTITY_VERSION;
     use super::value::DirectApplyStore;
 
     let durable = MemoryDurableValueStore::for_tests();

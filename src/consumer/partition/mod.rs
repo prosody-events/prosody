@@ -13,17 +13,21 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
-use crate::consumer::event_context::{EventContext, TimerContext};
+use crate::consumer::event_context::{EventContext, PartitionEventContext};
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::otel::SpanRelation;
+use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
+use crate::state::session::TerminationWatch;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStore, TriggerStoreProvider};
-use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
+use crate::timers::{
+    PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores, TimerType, UncommittedTimer,
+};
 use crate::{EventType, Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
@@ -114,9 +118,11 @@ struct PartitionContext<P> {
 /// and filtering options.
 ///
 /// `S` is a [`TriggerStoreProvider`] that creates per-partition stores.
-/// `P` is the payload type carried by consumed messages.
+/// `SP` is a [`PartitionStateProvider`] that acquires per-partition
+/// keyed-state managers. `P` is the payload type carried by consumed
+/// messages.
 #[derive(Clone, Debug)]
-pub struct PartitionConfiguration<S, P> {
+pub struct PartitionConfiguration<S, SP, P> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
@@ -141,6 +147,11 @@ pub struct PartitionConfiguration<S, P> {
     /// Trigger store provider — creates per-partition stores with independent
     /// caches.
     pub trigger_provider: S,
+
+    /// Keyed-state provider — acquires per-partition state managers
+    /// ([`NoState`](crate::state::manager::NoState) where keyed state is
+    /// not wired).
+    pub state_provider: SP,
 
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
@@ -215,8 +226,8 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// # Returns
     ///
     /// A new `PartitionManager<P>` instance
-    pub fn new<T, S>(
-        config: PartitionConfiguration<S, P>,
+    pub fn new<T, S, SP>(
+        config: PartitionConfiguration<S, SP, P>,
         handler: T,
         topic: Topic,
         partition: Partition,
@@ -224,6 +235,7 @@ impl<P: Send + 'static> PartitionManager<P> {
     where
         T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
+        SP: PartitionStateProvider<P>,
         P: Sync + EventType,
     {
         // Initialize offset tracker to manage offset state
@@ -449,6 +461,37 @@ where
     }
 }
 
+/// Acquires the partition's keyed-state manager, retrying on failure until
+/// the shutdown signal is received — the same pattern as
+/// [`init_timer_manager`]. Acquisition is eager: descriptor identities are
+/// validated against the segment's durable rows before any event
+/// dispatches.
+///
+/// Returns `None` if shutdown is signaled before acquisition succeeds.
+async fn init_state_manager<SP, P>(
+    state_provider: &SP,
+    topic: Topic,
+    partition: Partition,
+    shutdown_rx: &watch::Receiver<ShutdownPhase>,
+) -> Option<SP::Manager>
+where
+    SP: PartitionStateProvider<P>,
+{
+    loop {
+        if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
+            return None;
+        }
+
+        match state_provider.acquire(topic, partition).await {
+            Ok(manager) => return Some(manager),
+            Err(error) => {
+                error!("failed to acquire keyed-state manager: {error:#}; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// Store-agnostic fields extracted from [`PartitionConfiguration`] for
 /// [`run_partition`].
 struct PartitionParams {
@@ -460,24 +503,27 @@ struct PartitionParams {
     timer_spans: SpanRelation,
 }
 
-/// Extracts the store from the provider `S` then delegates to
-/// [`run_partition`], which is generic only over `S::Store`.  This keeps the
-/// provider type `S` out of the long-lived coroutine state machine, preventing
-/// future-size explosion with the deeply nested middleware handler type `T`.
-async fn handle_messages<T, S, P>(
-    config: PartitionConfiguration<S, P>,
+/// Extracts the store from the provider `S` and the state manager from the
+/// provider `SP`, then delegates to [`run_partition`], which is generic
+/// only over `S::Store` and `SP::Manager`. This keeps the provider types
+/// out of the long-lived coroutine state machine, preventing future-size
+/// explosion with the deeply nested middleware handler type `T`.
+async fn handle_messages<T, S, SP, P>(
+    config: PartitionConfiguration<S, SP, P>,
     partition_info: PartitionInfo,
     handler: T,
     context: PartitionContext<P>,
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
+    SP: PartitionStateProvider<P>,
     P: Send + Sync + 'static + EventType,
 {
     let PartitionConfiguration {
         group_id,
         allowed_events,
         trigger_provider,
+        state_provider,
         timer_slab_size,
         timer_semaphores,
         telemetry_sender,
@@ -494,6 +540,17 @@ async fn handle_messages<T, S, P>(
     let name = segment.name.clone();
     let trigger_store = trigger_provider.create_store(segment);
 
+    let Some(state_manager) = init_state_manager(
+        &state_provider,
+        partition_info.topic,
+        partition_info.partition,
+        &context.shutdown_rx,
+    )
+    .await
+    else {
+        return;
+    };
+
     let params = PartitionParams {
         group_id,
         allowed_events,
@@ -503,12 +560,22 @@ async fn handle_messages<T, S, P>(
         timer_spans,
     };
 
-    run_partition(trigger_store, partition_info, handler, context, params).await;
+    run_partition(
+        trigger_store,
+        state_manager,
+        partition_info,
+        handler,
+        context,
+        params,
+    )
+    .await;
 }
 
-/// Core partition loop, generic over `S: TriggerStore` and `P` (payload type).
-async fn run_partition<T, S, P>(
+/// Core partition loop, generic over `S: TriggerStore`, the keyed-state
+/// manager `M`, and `P` (payload type).
+async fn run_partition<T, S, M, P>(
     trigger_store: S,
+    state_manager: M,
     partition_info: PartitionInfo,
     handler: T,
     context: PartitionContext<P>,
@@ -516,6 +583,7 @@ async fn run_partition<T, S, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
+    M: PartitionStateManager<Payload = P>,
     P: Send + Sync + 'static + EventType,
 {
     let PartitionParams {
@@ -574,7 +642,15 @@ async fn run_partition<T, S, P>(
 
     let process = |event: UncommittedEvent<S, P>| async {
         debug!(?event, "calling handler");
-        process_event(event, &handler, &shutdown_rx, &timer_manager, timer_spans).await;
+        process_event(
+            event,
+            &handler,
+            &shutdown_rx,
+            &timer_manager,
+            &state_manager,
+            timer_spans,
+        )
+        .await;
     };
 
     KeyManager::<UncommittedEvent<S, P>, _, _>::new(process)
@@ -589,23 +665,38 @@ async fn run_partition<T, S, P>(
 }
 
 /// Processes a single event (message or timer) through the handler.
-async fn process_event<T, S, P>(
+///
+/// Each event gets a fresh per-event keyed-state session from the state
+/// manager and a fresh message-cancellation channel; the session's
+/// termination watch shares the channel's receiver with the context, so
+/// descriptor handles observe the same cancellation a timeout middleware
+/// signals through the context.
+async fn process_event<T, S, M, P>(
     event: UncommittedEvent<S, P>,
     handler: &T,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
     timer_manager: &TimerManager<S>,
+    state_manager: &M,
     timer_spans: SpanRelation,
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
+    M: PartitionStateManager<Payload = P>,
     P: Send + Sync + 'static,
 {
     match event {
         UncommittedEvent::Message(message) => {
-            let context = TimerContext::new(
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let session = state_manager.session_for_message(
+                message.message(),
+                TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+            );
+            let context = PartitionEventContext::new(
                 message.key().clone(),
                 shutdown_rx.clone(),
+                (cancel_tx, cancel_rx),
                 timer_manager.clone(),
+                session,
             );
             let cloned_context = context.clone();
             let _guard = message.process_scope();
@@ -617,10 +708,44 @@ async fn process_event<T, S, P>(
         UncommittedEvent::Timer(timer) => {
             if let Some(firing) = timer.fire().await {
                 firing.set_dispatch_span(timer_spans);
-                let context = TimerContext::new(
+
+                // `StateRecovery` is framework-internal: the sweep runs
+                // here, owned by the state manager, and user handlers
+                // structurally never see the trigger. Commit on success;
+                // abort on failure so the trigger redelivers and the
+                // sweep re-runs.
+                if state_manager.intercepts_recovery()
+                    && firing.timer_type() == TimerType::StateRecovery
+                {
+                    let _guard = firing.process_scope();
+                    let (trigger, commit_guard) = firing.into_inner();
+                    match state_manager
+                        .recover(trigger.key.clone(), timer_manager)
+                        .await
+                    {
+                        Ok(()) => commit_guard.commit().await,
+                        Err(error) => {
+                            error!(
+                                key = ?trigger.key,
+                                "keyed-state recovery sweep failed: {error:#}; aborting trigger"
+                            );
+                            commit_guard.abort().await;
+                        }
+                    }
+                    return;
+                }
+
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                let session = state_manager.session_for_timer(
+                    firing.trigger(),
+                    TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+                );
+                let context = PartitionEventContext::new(
                     firing.key().clone(),
                     shutdown_rx.clone(),
+                    (cancel_tx, cancel_rx),
                     timer_manager.clone(),
+                    session,
                 );
                 let cloned_context = context.clone();
                 let _guard = firing.process_scope();

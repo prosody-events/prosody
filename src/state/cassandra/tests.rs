@@ -365,7 +365,7 @@ async fn read_identity_version_raw(
 /// nulls the stamp alongside `data`.
 #[tokio::test]
 async fn value_row_stamps_identity_version_with_data() -> Result<()> {
-    use crate::state::middleware::INITIAL_IDENTITY_VERSION;
+    use crate::state::descriptor_identity::INITIAL_IDENTITY_VERSION;
     use crate::state::value::DirectApplyStore;
 
     init_test_logging();

@@ -2,7 +2,8 @@
 //!
 //! Stores speak raw [`Bytes`]; this layer owns the typing. A
 //! handler declares a descriptor once — usually as a `const` — registers it
-//! with the consumer, and binds it to *any* [`EventContext`] to obtain a
+//! with the consumer, and binds it to *any*
+//! [`EventContext`](crate::consumer::event_context::EventContext) to obtain a
 //! typed, owned handle:
 //!
 //! ```
@@ -84,9 +85,10 @@
 //! silently misreading cells.
 
 use crate::codec::{Codec, JsonCodec};
-use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
+use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
+use crate::state::session::StateSession;
 use crate::state::{StateName, StoreOutcome};
 use bytes::Bytes;
 use std::error::Error;
@@ -191,18 +193,20 @@ pub trait DescriptorIdentity {
 }
 
 /// A typed view over one keyed-state collection, bindable to any
-/// [`EventContext`].
+/// [`StateSession`].
 ///
-/// Binding validates registration + structural identity through the
-/// context's [`verify_state_registration`] capability and returns an
-/// owned, `Clone` handle that wraps the context's byte-cell capabilities
-/// with the descriptor's typing.
+/// Handlers reach this through
+/// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
+/// which binds against the context's per-event session. Binding validates
+/// registration + structural identity through the session's
+/// [`verify_state_registration`] and returns an owned, `Clone` handle that
+/// wraps the session's byte cells with the descriptor's typing.
 ///
-/// [`verify_state_registration`]: EventContext::verify_state_registration
+/// [`verify_state_registration`]: StateSession::verify_state_registration
 pub trait StateDescriptor: DescriptorIdentity + Copy {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the
-    /// binding context.
-    type Handle<Ctx: EventContext>;
+    /// binding session.
+    type Handle<S: StateSession>;
 
     /// Validates registration + structural identity and returns the typed
     /// handle.
@@ -212,12 +216,12 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Unavailable`] when the context provides
+    /// Returns [`StateAccessError::Unavailable`] when the session provides
     /// no keyed state, [`StateAccessError::Unregistered`] when the
     /// collection is unregistered, or
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
-    fn bind<Ctx: EventContext>(self, ctx: &Ctx) -> Result<Self::Handle<Ctx>, StateAccessError>;
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 }
 
 /// Descriptor for a codec-backed single value collection.
@@ -297,12 +301,12 @@ impl<C> StateDescriptor for ValueDescriptor<C>
 where
     C: Codec,
 {
-    type Handle<Ctx: EventContext> = TypedValueHandle<Ctx, C>;
+    type Handle<S: StateSession> = TypedValueHandle<S, C>;
 
-    fn bind<Ctx: EventContext>(self, ctx: &Ctx) -> Result<Self::Handle<Ctx>, StateAccessError> {
-        let name = ctx.verify_state_registration(self.name, &self.structural_identity())?;
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+        let name = session.verify_state_registration(self.name, &self.structural_identity())?;
         Ok(TypedValueHandle {
-            ctx: ctx.clone(),
+            session: session.clone(),
             name,
             _marker: PhantomData,
         })
@@ -311,42 +315,42 @@ where
 
 /// Typed, owned handle over a codec-backed value collection.
 ///
-/// Owns a clone of the binding context (`Clone + Send + Sync + 'static` —
+/// Owns a clone of the binding session (`Clone + Send + Sync + 'static` —
 /// an FFI requirement); the codec runs only at the edges (`get` decodes,
-/// `set` encodes) over the context's byte-cell capabilities. Every
-/// operation first guards on context termination
-/// ([`StateAccessError::Terminated`]); stale post-dispatch use
-/// additionally fails through the per-event transaction state machine.
-pub struct TypedValueHandle<Ctx, C> {
-    ctx: Ctx,
+/// `set` encodes) over the session's byte cells. Every operation first
+/// guards on session termination ([`StateAccessError::Terminated`]); stale
+/// post-dispatch use additionally fails through the per-event transaction
+/// state machine.
+pub struct TypedValueHandle<S, C> {
+    session: S,
     name: StateName,
     _marker: PhantomData<fn() -> C>,
 }
 
-impl<Ctx: Clone, C> Clone for TypedValueHandle<Ctx, C> {
+impl<S: Clone, C> Clone for TypedValueHandle<S, C> {
     fn clone(&self) -> Self {
         Self {
-            ctx: self.ctx.clone(),
+            session: self.session.clone(),
             name: self.name.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<Ctx, C> TypedValueHandle<Ctx, C>
+impl<S, C> TypedValueHandle<S, C>
 where
-    Ctx: EventContext,
+    S: StateSession,
     C: Codec,
 {
     /// Reads and decodes the current visible value.
     ///
     /// # Errors
     ///
-    /// Returns an access error from the context, or a codec error
+    /// Returns an access error from the session, or a codec error
     /// (Permanent) when the cell bytes do not decode as `C::Payload`.
     pub async fn get(&self) -> Result<Option<C::Payload>, ValueStateError<C::Error>> {
-        ensure_live(&self.ctx)?;
-        let Some(cell) = self.ctx.state_cell(&self.name).await? else {
+        ensure_live(&self.session)?;
+        let Some(cell) = self.session.state_cell(&self.name).await? else {
             return Ok(None);
         };
         // `Codec::deserialize` parses in place (destructive); cells live in
@@ -365,14 +369,14 @@ where
     /// # Errors
     ///
     /// Returns a codec error (Permanent) when `value` fails to encode, or
-    /// an access error from the context.
+    /// an access error from the session.
     pub async fn set(&self, value: C::Payload) -> Result<(), ValueStateError<C::Error>> {
-        ensure_live(&self.ctx)?;
+        ensure_live(&self.session)?;
         let mut buf = Vec::new();
         C::with_cached_local(|codec| codec.serialize(value, &mut buf))
             .map_err(ValueStateError::Codec)?;
         Ok(self
-            .ctx
+            .session
             .set_state_cell(&self.name, Bytes::from(buf))
             .await?)
     }
@@ -381,10 +385,10 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an access error from the context.
+    /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), ValueStateError<C::Error>> {
-        ensure_live(&self.ctx)?;
-        Ok(self.ctx.clear_state_cell(&self.name).await?)
+        ensure_live(&self.session)?;
+        Ok(self.session.clear_state_cell(&self.name).await?)
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
@@ -392,22 +396,22 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an access error from the context.
+    /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
-        ensure_live(&self.ctx)?;
-        Ok(self.ctx.flush_state_cell(&self.name).await?)
+        ensure_live(&self.session)?;
+        Ok(self.session.flush_state_cell(&self.name).await?)
     }
 }
 
-/// Guards every handle operation: a context that is shutting down or whose
-/// message is cancelled refuses state access with
+/// Guards every handle operation: a session whose partition is shutting
+/// down or whose event is cancelled refuses state access with
 /// [`StateAccessError::Terminated`]. Shared by the value and Kafka-message
 /// handles.
-pub(crate) fn ensure_live<Ctx>(ctx: &Ctx) -> Result<(), StateAccessError>
+pub(crate) fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
 where
-    Ctx: TerminationSignals,
+    S: StateSession,
 {
-    if ctx.is_shutdown() || ctx.is_message_cancelled() {
+    if session.is_terminated() {
         return Err(StateAccessError::Terminated);
     }
     Ok(())

@@ -126,7 +126,7 @@
 use crate::cassandra::CassandraStore;
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
-use crate::consumer::kafka_context::Context;
+use crate::consumer::kafka_context::{Context, PartitionProviders};
 pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
 pub use crate::consumer::middleware::FallibleHandler;
@@ -152,6 +152,7 @@ use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::scheduler::{
     SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
 };
+use crate::consumer::middleware::state_lifecycle::StateLifecycleMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
@@ -166,13 +167,12 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
+pub use crate::state::config::KeyedStateConfiguration;
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
+use crate::state::manager::{NoState, PartitionStateProvider, StateManagerProvider};
 use crate::state::memory::MemoryDurableValueStore;
-pub use crate::state::middleware::KeyedStateConfiguration;
-use crate::state::middleware::{
-    CollectionDefRegistry, KeyedStateMiddleware, KeyedStateMiddlewareBuildError, RegisterStateError,
-};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
+use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
@@ -792,26 +792,24 @@ impl KeyedStateInputs {
         })
     }
 
-    /// Builds the keyed-state middleware over a branch's backend, scanner,
-    /// and loader.
-    fn middleware<B, Sc, L, P>(
+    /// Builds the per-partition keyed-state provider over a branch's
+    /// backend, scanner, and loader. The partition loop acquires one
+    /// state manager per assignment from it.
+    fn provider<B, Sc, L>(
         &self,
         backend: B,
         scanner: Sc,
         loader: L,
-    ) -> Result<KeyedStateMiddleware<B, Sc, P, L>, KeyedStateInitError>
-    where
-        L: MessageLoader,
-    {
-        Ok(KeyedStateMiddleware::builder()
-            .backend(backend)
-            .scanner(scanner)
-            .loader(loader)
-            .consumer_group(self.group.clone())
-            .version(self.version.clone())
-            .recovery_delay(self.config.recovery_delay)
-            .registry(self.registry.clone())
-            .build()?)
+    ) -> StateManagerProvider<B, Sc, L> {
+        StateManagerProvider::new(
+            backend,
+            scanner,
+            loader,
+            self.registry.clone(),
+            self.group.clone(),
+            self.version.clone(),
+            self.config.recovery_delay,
+        )
     }
 }
 
@@ -832,13 +830,13 @@ struct PipelineMiddlewareStack<CM> {
 }
 
 impl<CM> PipelineMiddlewareStack<CM> {
-    fn build<T, MP, TP, DP, PP, KS, L, C>(
+    fn build<T, MP, TP, DP, PP, SP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: Option<DP>,
         trigger_provider: PP,
-        keyed_state_middleware: KS,
+        state_provider: SP,
         handler: T,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
@@ -848,7 +846,7 @@ impl<CM> PipelineMiddlewareStack<CM> {
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
         PP: TriggerStoreProvider,
-        KS: HandlerMiddleware<C::Payload>,
+        SP: PartitionStateProvider<C::Payload>,
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
@@ -870,24 +868,39 @@ impl<CM> PipelineMiddlewareStack<CM> {
             None => None,
         };
 
-        // Keyed state sits inner to message_defer and dedup — a reloaded
-        // deferred message must reach it as `on_message` (a message-keyed
-        // EventRef), and duplicates must short-circuit before anything
-        // seals — and outer to retry.
+        // `.layer(x)` makes `x` the OUTERMOST layer, so the stack runs
+        // outer→inner as:
+        //
+        //   retry → state_lifecycle → dedup → message_defer → timer_defer
+        //     → monopolization → common(cancellation → scheduler → timeout
+        //     → telemetry) → handler
+        //
+        // Two ordering consequences are load-bearing:
+        //
+        // * retry OUTSIDE state_lifecycle ⇒ every retry attempt is a fresh dispatch
+        //   through the lifecycle layer, and the retry loop resets the event's session
+        //   between attempts, so a failed attempt's dirty ops never leak into the next.
+        // * state_lifecycle OUTSIDE dedup and the defer middlewares ⇒ duplicates
+        //   short-circuit before anything seals (empty session → no seal), and a
+        //   deferred-message reload reaches the handler as `on_message` while its seals
+        //   record under the *timer* EventRef of the reloading `DeferredMessage`
+        //   trigger — which the commit oracle resolves through the timer-tag
+        //   three-state logic, timer-type-agnostic by design.
         let provider = self
             .common_middleware
             .layer(self.monopolization_middleware)
             .layer(timer_defer_middleware)
             .layer(message_defer_middleware)
             .layer(dedup_middleware)
-            .layer(keyed_state_middleware)
+            .layer(StateLifecycleMiddleware)
             .layer(self.retry_middleware)
             .into_provider(handler);
 
-        initialize_consumer_with_provider::<_, _, C>(
+        initialize_consumer_with_provider::<_, _, _, C>(
             &self.consumer_config,
             provider,
             trigger_provider,
+            state_provider,
             &self.telemetry,
             self.heartbeats,
         )
@@ -998,10 +1011,11 @@ fn build_common_middleware<P: Send + Sync + 'static>(
 /// Helper function to initialize a consumer with a trigger store provider.
 ///
 /// The provider creates per-partition stores with independent caches.
-fn initialize_consumer_with_provider<T, S, C>(
+fn initialize_consumer_with_provider<T, S, SP, C>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
     trigger_provider: S,
+    state_provider: SP,
     telemetry: &Telemetry,
     heartbeats: HeartbeatRegistry,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
@@ -1009,6 +1023,7 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     S: TriggerStoreProvider,
+    SP: PartitionStateProvider<C::Payload>,
     C: Codec,
     C::Payload: EventType + Clone,
 {
@@ -1032,10 +1047,11 @@ where
         })
         .transpose()?;
 
-    let (managers, runtime_state) = initialize_consumer::<T, S, C>(ConsumerInitParams {
+    let (managers, runtime_state) = initialize_consumer::<T, S, SP, C>(ConsumerInitParams {
         config: consumer_config.clone(),
         handler_provider,
         trigger_provider,
+        state_provider,
         watermark_version: watermark_version.clone(),
         managers: managers.clone(),
         allowed_events,
@@ -1117,10 +1133,11 @@ where
 
         let (managers, runtime_state) = match trigger_store_config {
             TriggerStoreConfiguration::InMemory => {
-                initialize_consumer::<T, _, C>(ConsumerInitParams::<T, _, C::Payload> {
+                initialize_consumer::<T, _, _, C>(ConsumerInitParams::<T, _, _, C::Payload> {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider: InMemoryTriggerStoreProvider::new(),
+                    state_provider: NoState::new(),
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
@@ -1139,10 +1156,11 @@ where
                     consumer_config.timer_spans,
                 )
                 .await?;
-                initialize_consumer::<T, _, C>(ConsumerInitParams::<T, _, C::Payload> {
+                initialize_consumer::<T, _, _, C>(ConsumerInitParams::<T, _, _, C::Payload> {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider,
+                    state_provider: NoState::new(),
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
@@ -1227,8 +1245,7 @@ where
                     keyed_state.timer_slab_size,
                     keyed_state.registry.clone(),
                 );
-                let keyed_state_middleware =
-                    keyed_state.middleware(backend, durable, loader.clone())?;
+                let state_provider = keyed_state.provider(backend, durable, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
                     &stack.consumer_config,
@@ -1242,7 +1259,7 @@ where
                     timer_provider,
                     dedup_provider,
                     trigger_provider,
-                    keyed_state_middleware,
+                    state_provider,
                     handler,
                 )
             }
@@ -1276,8 +1293,7 @@ where
                     keyed_state.timer_slab_size,
                     keyed_state.registry.clone(),
                 );
-                let keyed_state_middleware =
-                    keyed_state.middleware(backend, value_store, loader.clone())?;
+                let state_provider = keyed_state.provider(backend, value_store, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
                     &stack.consumer_config,
@@ -1291,7 +1307,7 @@ where
                     timer_provider,
                     dedup_provider,
                     trigger_provider,
-                    keyed_state_middleware,
+                    state_provider,
                     handler,
                 )
             }
@@ -1505,7 +1521,7 @@ pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
 }
 
 /// Parameters passed to [`initialize_consumer`] to create a consumer instance.
-struct ConsumerInitParams<T, P, PL>
+struct ConsumerInitParams<T, P, SP, PL>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
@@ -1517,6 +1533,9 @@ where
     handler_provider: T,
     /// Persistent storage backend for timer triggers.
     trigger_provider: P,
+    /// Factory for per-partition keyed-state managers
+    /// ([`NoState`] where keyed state is not wired).
+    state_provider: SP,
     /// Shared atomic counter for tracking watermark changes.
     watermark_version: Arc<WatermarkVersion>,
     /// Thread-safe map of active partition managers.
@@ -1549,13 +1568,14 @@ where
 /// - The Kafka consumer cannot be created with the provided configuration
 /// - Topic subscription fails
 /// - The probe server cannot be started (if enabled)
-fn initialize_consumer<T, P, C>(
-    params: ConsumerInitParams<T, P, C::Payload>,
+fn initialize_consumer<T, P, SP, C>(
+    params: ConsumerInitParams<T, P, SP, C::Payload>,
 ) -> Result<ConsumerComponents<C::Payload>, ConsumerError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    SP: PartitionStateProvider<C::Payload>,
     C: Codec,
     C::Payload: Clone + EventType,
 {
@@ -1563,7 +1583,10 @@ where
     let context = Context::new(
         &params.config,
         params.handler_provider,
-        params.trigger_provider,
+        PartitionProviders {
+            triggers: params.trigger_provider,
+            state: params.state_provider,
+        },
         params.watermark_version.clone(),
         params.managers.clone(),
         params.allowed_events,
@@ -1726,10 +1749,6 @@ pub enum KeyedStateInitError {
     /// A descriptor registration was invalid or conflicted.
     #[error(transparent)]
     Register(#[from] RegisterStateError),
-
-    /// The keyed-state middleware failed to build.
-    #[error(transparent)]
-    Build(#[from] KeyedStateMiddlewareBuildError),
 
     /// The local fjall cache could not be opened.
     #[error("failed to open the keyed-state cache: {0:#}")]

@@ -27,6 +27,8 @@
 //!
 //! Message and timer defer middlewares compose independently via `.layer()`.
 
+use crate::consumer::event_context::EventContext;
+use crate::state::session::LifecycleAccess;
 use crate::timers::duration::CompactDuration;
 use rand::RngExt;
 use std::cmp::min;
@@ -84,4 +86,21 @@ pub fn calculate_backoff(config: &DeferConfiguration, retry_count: u32) -> Compa
     let jittered_seconds = rand::rng().random_range(1..=capped_seconds);
 
     CompactDuration::new(jittered_seconds)
+}
+
+/// Resets the event's keyed-state session at a defer-swallow boundary.
+///
+/// When a transient inner error is absorbed into an `Ok(Deferred…)`
+/// output, the durability marker for this dispatch commits — but the
+/// failed attempt's dirty state ops must not seal under it. Resetting the
+/// session here means the lifecycle middleware (outside the defer layers)
+/// finalizes an empty session and seals nothing; the deferred retry
+/// re-runs the handler from clean state.
+pub(crate) fn reset_state_session<C>(context: &C)
+where
+    C: EventContext,
+{
+    if let Ok(lifecycle) = context.state(LifecycleAccess) {
+        lifecycle.reset();
+    }
 }

@@ -30,7 +30,7 @@ use prosody::state::descriptor::{
     KafkaMessageDescriptor, KafkaStateError, ValueDescriptor, ValueStateError, kafka_message_state,
     value_state,
 };
-use prosody::state::middleware::CollectionDef;
+use prosody::state::registry::CollectionDef;
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::CompactDateTime;
 use prosody::timers::duration::CompactDuration;

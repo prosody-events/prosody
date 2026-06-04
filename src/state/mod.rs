@@ -45,7 +45,6 @@ pub mod identity;
 pub mod layered;
 pub mod manager;
 pub mod memory;
-pub mod middleware;
 pub mod oracle;
 pub mod pending;
 pub mod production;
@@ -219,12 +218,9 @@ where
 /// stays alive for the lifetime of the assignment.
 ///
 /// `for_partition` is fallible (e.g. Fjall workspace open can fail on a
-/// missing cache directory) but
-/// [`crate::consumer::middleware::FallibleHandlerProvider::handler_for_partition`]
-/// is not, so the keyed-state middleware captures the `Result` at
-/// assignment time and surfaces failures through
-/// [`crate::state::middleware::KeyedStateMiddlewareError::Factory`] on
-/// the first event dispatch for that partition.
+/// missing cache directory); the state manager's provider surfaces the
+/// failure at partition acquisition, which the partition loop retries
+/// until shutdown.
 pub trait DirtyStoreFactory<K>: Clone + Send + Sync + 'static
 where
     K: CollectionKind,

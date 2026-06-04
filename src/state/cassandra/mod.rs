@@ -54,11 +54,11 @@ pub use scanner::ScanPendingError;
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::state::descriptor_identity::{
+    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
+};
 use crate::state::encoding::{
     EncodingError, PayloadEncoding, WalFormat, decode_wal, encode_payload, encode_wal,
-};
-use crate::state::middleware::{
-    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
 };
 use crate::state::pending::PendingIndexStore;
 use crate::state::value::{

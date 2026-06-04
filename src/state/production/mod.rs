@@ -42,8 +42,8 @@ use crate::state::fjall::{
 };
 use crate::state::layered::LayeredValueStore;
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
-use crate::state::middleware::CollectionDefRegistry;
 use crate::state::recovering::RecoveringValueStore;
+use crate::state::registry::CollectionDefRegistry;
 use crate::state::{BackendOf, StateBackend, StateBackendFactory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStoreProvider};
@@ -74,11 +74,10 @@ pub type ProductionValueDurable<O> = LayeredValueStore<
 /// from being silently dropped, which would reopen the lost-commit data-loss
 /// window.
 ///
-/// `registry` must be the **same** [`Arc<CollectionDefRegistry>`] passed to
-/// [`KeyedStateMiddlewareBuilder::registry`](crate::state::middleware::KeyedStateMiddlewareBuilder::registry),
-/// so first-touch recovery (driven by the wrapper's resolver) and the
-/// timer-sweep recovery (driven by the middleware registry) bind identical
-/// per-collection TTLs.
+/// `registry` must be the **same** [`Arc<CollectionDefRegistry>`] the
+/// state manager's provider holds, so first-touch recovery (driven by the
+/// wrapper's resolver) and the timer-sweep recovery (driven by the
+/// manager's registry) bind identical per-collection TTLs.
 #[must_use]
 pub fn compose_value_durable<O>(
     cache: FjallValueStore,

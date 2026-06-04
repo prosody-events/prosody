@@ -3,33 +3,30 @@
 //! This module defines abstractions for delivering shutdown signals and
 //! managing timer scheduling within message handlers. It provides:
 //! - `EventContext`: Trait for handler contexts to schedule, unschedule, clear,
-//!   and list timers, as well as detect shutdown.
+//!   and list timers, bind keyed-state descriptors, and detect shutdown.
 //! - `TerminationSignals`: Internal trait for distinguishing shutdown from
 //!   message-level cancellation (used by retry middleware).
-//! - `TimerContext<T>`: Concrete `EventContext` implementation backed by a
-//!   `TimerManager<T>` using a `TriggerStore` backend.
+//! - `PartitionEventContext<T, S>`: Concrete `EventContext` implementation
+//!   backed by a `TimerManager<T>` and a per-event keyed-state session `S`.
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
-use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::{KafkaMessageRef, StateDescriptor, StructuralIdentity};
-use crate::state::{StateName, StoreOutcome};
+use crate::state::descriptor::{StateDescriptor, StructuralIdentity};
+use crate::state::session::StateSession;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
 use crate::timers::{TimerManager, TimerRequest, TimerType};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
-use bytes::Bytes;
 use dyn_clone::DynClone;
 use educe::Educe;
 use futures::FutureExt;
 use serde::de::StdError;
 use std::error::Error;
 use std::future::{Future, ready};
-use std::marker::PhantomData;
 use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use thiserror::Error;
@@ -199,137 +196,42 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static;
 
-    /// Validates that the named keyed-state collection is registered with
-    /// the asserted structural identity, returning the canonical
-    /// [`StateName`].
+    /// The per-event keyed-state session descriptor binds operate over.
     ///
-    /// Default: state is unavailable on this context. Only the keyed-state
-    /// middleware's wrapped context *implements* the state capabilities;
-    /// every leaf context reports [`StateAccessError::Unavailable`]
-    /// (Permanent). Wrapper contexts that sit inside the keyed-state
-    /// middleware (e.g. the timer-defer context) must explicitly forward
-    /// all six capabilities to their inner context — inheriting these
-    /// defaults would mask a live keyed-state context as unavailable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, [`StateAccessError::Unregistered`] for an unknown name,
-    /// or [`StateAccessError::IdentityMismatch`] when the registered
-    /// identity differs from the asserted one.
-    fn verify_state_registration(
-        &self,
-        name: &'static str,
-        identity: &StructuralIdentity,
-    ) -> Result<StateName, StateAccessError> {
-        let _ = (name, identity);
-        Err(StateAccessError::Unavailable)
-    }
+    /// Leaf contexts carry the session the partition loop minted for the
+    /// event ([`UnavailableState`](crate::state::session::UnavailableState)
+    /// where keyed state is not wired);
+    /// wrapper contexts forward their inner context's session type
+    /// (`type State = C::State`). The `Payload` equality keeps
+    /// Kafka-message handles fully typed inside generic handlers.
+    type State: StateSession<Payload = Self::Payload>;
 
-    /// Reads the current visible cell bytes of a keyed-state collection
-    /// within this event's transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, or a [`StateAccessError::Store`] when the underlying
-    /// store fails.
-    fn state_cell(
-        &self,
-        name: &StateName,
-    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send {
-        let _ = name;
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    /// Buffers a set of a keyed-state collection's cell bytes within this
-    /// event's transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, or a [`StateAccessError::Store`] when the underlying
-    /// store fails.
-    fn set_state_cell(
-        &self,
-        name: &StateName,
-        cell: Bytes,
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send {
-        let _ = (name, cell);
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    /// Buffers a clear of a keyed-state collection within this event's
-    /// transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, or a [`StateAccessError::Store`] when the underlying
-    /// store fails.
-    fn clear_state_cell(
-        &self,
-        name: &StateName,
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send {
-        let _ = name;
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    /// Drains a collection's buffered ops directly to authoritative state
-    /// and returns its transaction to `Clean`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, or a [`StateAccessError::Store`] when the underlying
-    /// store fails (including an illegal flush after seal).
-    fn flush_state_cell(
-        &self,
-        name: &StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send {
-        let _ = name;
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    /// Loads the full consumer message referenced by a Kafka-message state
-    /// cell, decoded by the consumer's own codec.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, or a [`StateAccessError::Load`] when the loader fails
-    /// (Permanent for a deleted or compacted-away offset).
-    fn load_state_message(
-        &self,
-        message_ref: KafkaMessageRef,
-    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, StateAccessError>> + Send {
-        let _ = message_ref;
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    /// Binds a keyed-state descriptor to this context, returning its typed
-    /// handle.
+    /// Binds a keyed-state descriptor to this context's session, returning
+    /// its typed handle.
     ///
     /// Works in any handler with a plain `C: EventContext` bound — message
-    /// and timer scopes alike. The handle owns a clone of the context
-    /// (contexts are cheap `Arc`-backed clones), so it is `Clone + Send +
+    /// and timer scopes alike. The handle owns a clone of the session
+    /// (sessions are cheap `Arc`-backed clones), so it is `Clone + Send +
     /// Sync + 'static` and survives FFI boundaries. Repeated bindings of
     /// the same collection in one handler share the per-event transaction.
     ///
+    /// This method is required (no default) so every context — leaf and
+    /// wrapper alike — makes an explicit choice; a wrapper that forgot to
+    /// forward would fail to compile instead of silently degrading state
+    /// to unavailable.
+    ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
-    /// middleware, [`StateAccessError::Unregistered`] for a collection
-    /// never registered with the consumer, or
+    /// Returns [`StateAccessError::Unavailable`] when keyed state is not
+    /// wired, [`StateAccessError::Unregistered`] for a collection never
+    /// registered with the consumer, or
     /// [`StateAccessError::IdentityMismatch`] when the registered identity
     /// differs from the descriptor's.
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self>, StateAccessError>
+    ///
+    /// [`UnavailableState`]: crate::state::session::UnavailableState
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
-        DESC: StateDescriptor,
-        Self: Sized,
-    {
-        descriptor.bind(self)
-    }
+        DESC: StateDescriptor;
 
     /// Return a boxed, type-erased event context
     fn boxed(self) -> BoxEventContext<Self::Payload> {
@@ -476,32 +378,32 @@ pub trait TerminationSignals {
     fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static;
 }
 
-/// Concrete implementation of `EventContext` that uses a `TimerManager<T>`.
+/// Concrete leaf [`EventContext`] constructed once per event by the
+/// partition loop.
 ///
-/// Each `TimerContext` carries:
+/// Each `PartitionEventContext` carries:
 /// - `key`: The message key to scope timers.
 /// - `shutdown_rx`: A watch channel receiver to detect shutdown.
 /// - `timers`: A `TimerManager<T>` for persistent and in-memory timer state.
+/// - `session`: The per-event keyed-state session minted by the partition's
+///   state manager; descriptor binds route to it through
+///   [`EventContext::state`].
 ///
 /// # Type Parameters
 ///
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
-/// * `P`: The consumer's message payload type ([`EventContext::Payload`]);
-///   carried as phantom data — the partition loop pins it to the codec's
-///   payload when constructing the context.
+/// * `S`: The per-event [`StateSession`]; its payload pins
+///   [`EventContext::Payload`].
 #[derive(Educe)]
 #[educe(Clone(bound()), Debug(bound = ""))]
-pub struct TimerContext<T: TriggerStore, P> {
+pub struct PartitionEventContext<T: TriggerStore, S> {
     /// Context state
-    inner: Arc<ArcSwapOption<Inner<T>>>,
-
-    #[educe(Debug(ignore))]
-    _payload: PhantomData<fn() -> P>,
+    inner: Arc<ArcSwapOption<Inner<T, S>>>,
 }
 
 #[derive(Educe)]
 #[educe(Debug)]
-struct Inner<T: TriggerStore> {
+struct Inner<T: TriggerStore, S> {
     /// Key for which timers are scoped.
     key: Key,
 
@@ -516,26 +418,36 @@ struct Inner<T: TriggerStore> {
 
     #[educe(Debug(ignore))]
     timers: TimerManager<T>,
+
+    #[educe(Debug(ignore))]
+    session: S,
 }
 
-impl<T, P> TimerContext<T, P>
+impl<T, S> PartitionEventContext<T, S>
 where
     T: TriggerStore,
 {
-    /// Create a new `TimerContext` binding a message key to timer operations.
+    /// Create a new `PartitionEventContext` binding a message key to timer
+    /// operations and the event's keyed-state session.
     ///
     /// # Arguments
     ///
     /// * `key` – The message key for affinity and timer scoping.
     /// * `shutdown_rx` – Watch channel signaling partition shutdown; operations
     ///   short-circuit at `>= ShutdownPhase::Cancelling`.
+    /// * `message_cancel` – The per-event cancellation channel, created by the
+    ///   partition loop so the session's termination watch shares the same
+    ///   receiver.
     /// * `timers` – The `TimerManager<T>` instance.
+    /// * `session` – The per-event keyed-state session.
     pub(crate) fn new(
         key: Key,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
+        message_cancel: (watch::Sender<bool>, watch::Receiver<bool>),
         timers: TimerManager<T>,
+        session: S,
     ) -> Self {
-        let (message_cancel_tx, message_cancel_rx) = watch::channel(false);
+        let (message_cancel_tx, message_cancel_rx) = message_cancel;
         let inner = ArcSwapOption::new(Some(
             Inner {
                 key,
@@ -543,21 +455,19 @@ where
                 message_cancel_tx,
                 message_cancel_rx,
                 timers,
+                session,
             }
             .into(),
         ))
         .into();
 
-        Self {
-            inner,
-            _payload: PhantomData,
-        }
+        Self { inner }
     }
 
     /// Run a cancellable operation, short-circuiting if already shutdown or
     /// cancelled.
     ///
-    /// Takes an async closure that receives `Arc<Inner<T>>` by value. This
+    /// Takes an async closure that receives `Arc<Inner<T, S>>` by value. This
     /// ensures no work is done when already cancelled, and the caller writes
     /// natural async code without explicit cloning.
     ///
@@ -565,7 +475,7 @@ where
     /// redundantly includes shutdown checking).
     async fn run_cancellable<F, R>(&self, operation: F) -> Result<R, TimerManagerError<T::Error>>
     where
-        F: AsyncFnOnce(Arc<Inner<T>>) -> Result<R, TimerManagerError<T::Error>>,
+        F: AsyncFnOnce(Arc<Inner<T, S>>) -> Result<R, TimerManagerError<T::Error>>,
     {
         let guard = self.inner.load();
         let Some(inner) = guard.as_ref() else {
@@ -594,13 +504,28 @@ where
     }
 }
 
-impl<T, P> EventContext for TimerContext<T, P>
+impl<T, S> EventContext for PartitionEventContext<T, S>
 where
     T: TriggerStore,
-    P: Send + Sync + 'static,
+    S: StateSession,
 {
     type Error = TimerManagerError<T::Error>;
-    type Payload = P;
+    type Payload = S::Payload;
+    type State = S;
+
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<S>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        // Live-guard at bind time: an invalidated context refuses new
+        // handles; handles themselves re-guard per operation through the
+        // session's termination watch.
+        let guard = self.inner.load();
+        let Some(inner) = guard.as_ref() else {
+            return Err(StateAccessError::Terminated);
+        };
+        descriptor.bind(&inner.session)
+    }
 
     fn should_cancel(&self) -> bool {
         let inner = self.inner.load();
@@ -737,7 +662,7 @@ where
     }
 }
 
-impl<T, P> TerminationSignals for TimerContext<T, P>
+impl<T, S> TerminationSignals for PartitionEventContext<T, S>
 where
     T: TriggerStore,
 {

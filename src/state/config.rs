@@ -19,7 +19,7 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// ```
 /// use prosody::consumer::KeyedStateConfiguration;
 /// use prosody::state::descriptor::{ValueDescriptor, value_state};
-/// use prosody::state::middleware::CollectionDef;
+/// use prosody::state::registry::CollectionDef;
 ///
 /// const CART: ValueDescriptor = value_state("cart");
 ///
