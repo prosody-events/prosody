@@ -952,18 +952,17 @@ impl ClassifyError for AlwaysCommittedOracleError {
     }
 }
 
-// ---- compile-guard: production bundle satisfies the middleware bound
-// ---------
+// ---- compile-guard: production bundle satisfies the manager bound -------
 
 /// Pure type-level assertion that the canonical production durable bundle
 /// `Layered<FjallValueStore, Recovering<CassandraValueStore, O>>` satisfies
-/// the exact bound the keyed-state middleware imposes on its durable `D`
-/// (the `HandlerMiddleware for KeyedStateMiddleware` impl in
-/// `middleware/handler.rs`). This guards the `PendingIndexStore`
+/// the exact bound the keyed-state manager imposes on its durable `D`
+/// (the `PartitionStateManager for StateManager` impl in
+/// `state/manager/mod.rs`). This guards the `PendingIndexStore`
 /// pass-throughs on both [`LayeredValueStore`] and [`RecoveringValueStore`]:
 /// without them, `D` fails the bound and this stops compiling. It constructs
 /// no values and needs no live Cassandra, so it runs broker-free.
-fn assert_satisfies_middleware_durable_bound<D>()
+fn assert_satisfies_manager_durable_bound<D>()
 where
     D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
 {
@@ -971,5 +970,5 @@ where
 
 #[test]
 fn production_durable_bundle_satisfies_middleware_bound() {
-    assert_satisfies_middleware_durable_bound::<ProductionValueDurable<AlwaysCommittedOracle>>();
+    assert_satisfies_manager_durable_bound::<ProductionValueDurable<AlwaysCommittedOracle>>();
 }
