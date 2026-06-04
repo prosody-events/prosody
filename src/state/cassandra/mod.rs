@@ -511,20 +511,12 @@ impl DescriptorIdentityStore for CassandraValueStore {
             )
             .await
             .map_err(CassandraStoreError::from)?
-            .rows_stream::<(String, i8, i16, i16, Option<String>)>()
+            .rows_stream::<DurableDescriptorIdentity>()
             .map_err(CassandraStoreError::from)?;
         futures::pin_mut!(rows);
         let mut identities = Vec::new();
-        while let Some((name, kind, cell_kind, codec_id, schema_label)) =
-            rows.try_next().await.map_err(CassandraStoreError::from)?
-        {
-            identities.push(DurableDescriptorIdentity {
-                name,
-                kind,
-                cell_kind,
-                codec_id,
-                schema_label,
-            });
+        while let Some(row) = rows.try_next().await.map_err(CassandraStoreError::from)? {
+            identities.push(row);
         }
         Ok(identities)
     }

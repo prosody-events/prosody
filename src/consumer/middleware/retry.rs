@@ -608,7 +608,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let topic = message.topic();
         let partition = message.partition();
@@ -649,7 +649,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let resolution = self
             .run(
@@ -674,7 +674,7 @@ where
     /// already fired on the inner from inside `run`'s loop.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.handler.after_commit(context, result).await;
     }
@@ -686,7 +686,7 @@ where
     /// already fired on the inner from inside `run`'s loop.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.handler.after_abort(context, result).await;
     }
@@ -722,7 +722,7 @@ where
         message: UncommittedMessage<Self::Payload>,
         demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let topic = message.topic();
         let partition = message.partition();
@@ -767,7 +767,7 @@ where
 
     async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
         U: UncommittedTimer,
     {
         let (trigger, uncommitted) = timer.into_inner();
@@ -922,7 +922,7 @@ mod tests {
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             self.demand_types.lock().push(demand_type);
@@ -944,7 +944,7 @@ mod tests {
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             self.demand_types.lock().push(demand_type);
@@ -961,7 +961,7 @@ mod tests {
 
         async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.hook_log
                 .lock()
@@ -970,7 +970,7 @@ mod tests {
 
         async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.hook_log
                 .lock()

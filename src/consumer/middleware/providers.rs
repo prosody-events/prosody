@@ -183,7 +183,7 @@ where
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Stub: this wrapper does NOT delegate to the inner EventHandler's
         // on_message. It exists only to satisfy the FallibleHandler bound at the
@@ -200,7 +200,7 @@ where
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Stub: this wrapper does NOT delegate to the inner EventHandler's
         // on_timer. It exists only to satisfy the FallibleHandler bound at the

@@ -91,6 +91,7 @@ impl TerminationSignals for KeyedMockContext {
 
 impl EventContext for KeyedMockContext {
     type Error = Infallible;
+    type Payload = serde_json::Value;
 
     fn should_cancel(&self) -> bool {
         self.inner.should_cancel()

@@ -1,8 +1,6 @@
 //! Middleware builder, handler, provider, and the recovery sweep.
 
-use super::context::{
-    ContextParts, DirtyValueBundle, DurableValueBundle, KeyedStateContext, MessageScope, TimerScope,
-};
+use super::context::{ContextParts, DirtyValueBundle, DurableValueBundle, KeyedStateContext};
 use super::descriptor_identity::{DescriptorIdentityStore, LazyDescriptorIdentity};
 use super::error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareError, RecoveryError};
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
@@ -16,7 +14,7 @@ use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::{DescriptorIdentity, NoLoader, StructuralIdentity};
+use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::value::{DurableWalStore, ValueKind};
@@ -57,20 +55,21 @@ type DirtyStoreOf<B> =
 type HandlerError<T, B, Sc> = MiddlewareError<T, DurableOf<B>, Sc, OracleOf<B>, DirtyStoreOf<B>>;
 
 /// The wrapped context (or fully-typed error) `build_context` produces.
-type BuiltContext<C, T, B, Sc, L, Scope> =
-    Result<KeyedStateContext<C, DurableOf<B>, DirtyStoreOf<B>, L, Scope>, HandlerError<T, B, Sc>>;
+type BuiltContext<C, T, B, Sc, L> =
+    Result<KeyedStateContext<C, DurableOf<B>, DirtyStoreOf<B>, L>, HandlerError<T, B, Sc>>;
 
 /// Builder for [`KeyedStateMiddleware`].
 ///
-/// Captures the per-partition backend factory, the scanner, the
-/// middleware-wide default TTL, the recovery delay, and any descriptor
-/// registrations before producing the middleware. The loader slot defaults
-/// to [`NoLoader`]; consumers with Kafka-message collections supply a real
-/// loader via [`Self::loader`].
-pub struct KeyedStateMiddlewareBuilder<B, Sc, P, L = NoLoader> {
+/// Captures the per-partition backend factory, the scanner, the message
+/// loader, the middleware-wide default TTL, the recovery delay, and any
+/// descriptor registrations before producing the middleware. The loader is
+/// **required** — every consumer has a real one (production wires the same
+/// loader the defer middleware uses; tests pass a
+/// [`MemoryLoader`](crate::consumer::middleware::defer::message::loader::MemoryLoader)).
+pub struct KeyedStateMiddlewareBuilder<B, Sc, P, L> {
     backend: Option<B>,
     scanner: Option<Sc>,
-    loader: L,
+    loader: Option<L>,
     consumer_group: Option<Arc<str>>,
     version: Option<Arc<str>>,
     default_ttl: Option<CompactDuration>,
@@ -81,12 +80,12 @@ pub struct KeyedStateMiddlewareBuilder<B, Sc, P, L = NoLoader> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<B, Sc, P> Default for KeyedStateMiddlewareBuilder<B, Sc, P> {
+impl<B, Sc, P, L> Default for KeyedStateMiddlewareBuilder<B, Sc, P, L> {
     fn default() -> Self {
         Self {
             backend: None,
             scanner: None,
-            loader: NoLoader,
+            loader: None,
             consumer_group: None,
             version: None,
             default_ttl: None,
@@ -120,23 +119,12 @@ impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L> {
         self
     }
 
-    /// Sets the message loader Kafka-message collections resolve through,
-    /// replacing the [`NoLoader`] default.
+    /// Sets the message loader Kafka-message collections resolve through
+    /// (required; tests pass a `MemoryLoader`).
     #[must_use]
-    pub fn loader<L2>(self, loader: L2) -> KeyedStateMiddlewareBuilder<B, Sc, P, L2> {
-        KeyedStateMiddlewareBuilder {
-            backend: self.backend,
-            scanner: self.scanner,
-            loader,
-            consumer_group: self.consumer_group,
-            version: self.version,
-            default_ttl: self.default_ttl,
-            default_commit_mode: self.default_commit_mode,
-            recovery_delay: self.recovery_delay,
-            registrations: self.registrations,
-            registry: self.registry,
-            _payload: PhantomData,
-        }
+    pub fn loader(mut self, loader: L) -> Self {
+        self.loader = Some(loader);
+        self
     }
 
     /// Sets the consumer group used to compute the per-partition
@@ -222,9 +210,15 @@ impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L> {
         self
     }
 
-    /// Shared `build` body: field validation + registry assembly. The
-    /// public `build` impls layer the loader-presence check on top.
-    fn build_any(
+    /// Builds the middleware.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyedStateMiddlewareBuildError::Missing`] if a required
+    /// field was not supplied, or
+    /// [`KeyedStateMiddlewareBuildError::Register`] for an invalid or
+    /// conflicting descriptor registration.
+    pub fn build(
         self,
     ) -> Result<KeyedStateMiddleware<B, Sc, P, L>, KeyedStateMiddlewareBuildError> {
         let backend = self
@@ -233,6 +227,9 @@ impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L> {
         let scanner = self
             .scanner
             .ok_or(KeyedStateMiddlewareBuildError::Missing("scanner"))?;
+        let loader = self
+            .loader
+            .ok_or(KeyedStateMiddlewareBuildError::Missing("loader"))?;
         let consumer_group = self
             .consumer_group
             .ok_or(KeyedStateMiddlewareBuildError::Missing("consumer_group"))?;
@@ -252,54 +249,13 @@ impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L> {
         Ok(KeyedStateMiddleware {
             backend,
             scanner,
-            loader: self.loader,
+            loader,
             consumer_group,
             version,
             registry,
             recovery_delay: self.recovery_delay,
             _payload: PhantomData,
         })
-    }
-}
-
-impl<B, Sc, P> KeyedStateMiddlewareBuilder<B, Sc, P, NoLoader> {
-    /// Builds the middleware without a message loader.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeyedStateMiddlewareBuildError::Missing`] if a required
-    /// field was not supplied, or
-    /// [`KeyedStateMiddlewareBuildError::KafkaCellWithoutLoader`] if a
-    /// Kafka-message collection is registered — its handle cannot resolve
-    /// messages without a loader. (The primary gate is the type system:
-    /// `ctx.state(KAFKA_DESC)` does not compile against a [`NoLoader`]
-    /// context; this check is the belt-and-braces for registries built at
-    /// runtime.)
-    pub fn build(
-        self,
-    ) -> Result<KeyedStateMiddleware<B, Sc, P, NoLoader>, KeyedStateMiddlewareBuildError> {
-        let middleware = self.build_any()?;
-        if middleware.registry.has_kafka_message_cells() {
-            return Err(KeyedStateMiddlewareBuildError::KafkaCellWithoutLoader);
-        }
-        Ok(middleware)
-    }
-}
-
-impl<B, Sc, P, L> KeyedStateMiddlewareBuilder<B, Sc, P, L>
-where
-    L: MessageLoader,
-{
-    /// Builds the middleware with a real message loader.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeyedStateMiddlewareBuildError::Missing`] if a required
-    /// field was not supplied.
-    pub fn build(
-        self,
-    ) -> Result<KeyedStateMiddleware<B, Sc, P, L>, KeyedStateMiddlewareBuildError> {
-        self.build_any()
     }
 }
 
@@ -313,14 +269,6 @@ pub enum KeyedStateMiddlewareBuildError {
     /// A descriptor registration was invalid or conflicted.
     #[error(transparent)]
     Register(#[from] RegisterStateError),
-
-    /// A Kafka-message collection was registered but no message loader was
-    /// supplied.
-    #[error(
-        "a Kafka-message collection is registered but the middleware has no message loader; \
-         supply one via the builder's `loader` method"
-    )]
-    KafkaCellWithoutLoader,
 }
 
 impl ClassifyError for KeyedStateMiddlewareBuildError {
@@ -335,7 +283,7 @@ impl ClassifyError for KeyedStateMiddlewareBuildError {
 /// `Wal` seal + recovery timer scheduling and `Direct` apply, and routes
 /// apply hooks to `apply_sealed` / `rollback_sealed`. See the module docs
 /// for the hook lifecycle.
-pub struct KeyedStateMiddleware<B, Sc, P, L = NoLoader> {
+pub struct KeyedStateMiddleware<B, Sc, P, L> {
     backend: B,
     scanner: Sc,
     loader: L,
@@ -375,11 +323,10 @@ impl<B, Sc, P, L> fmt::Debug for KeyedStateMiddleware<B, Sc, P, L> {
     }
 }
 
-impl<B, Sc, P> KeyedStateMiddleware<B, Sc, P> {
-    /// Returns a fresh builder for the middleware (loader slot defaults to
-    /// [`NoLoader`]).
+impl<B, Sc, P, L> KeyedStateMiddleware<B, Sc, P, L> {
+    /// Returns a fresh builder for the middleware.
     #[must_use]
-    pub fn builder() -> KeyedStateMiddlewareBuilder<B, Sc, P> {
+    pub fn builder() -> KeyedStateMiddlewareBuilder<B, Sc, P, L> {
         KeyedStateMiddlewareBuilder::default()
     }
 }
@@ -459,7 +406,7 @@ where
         + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
     DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    L: Clone + Send + Sync + 'static,
+    L: MessageLoader<Payload = T::Payload> + 'static,
 {
     /// Returns the partition backend, surfacing the captured factory error
     /// when assignment-time minting failed.
@@ -469,13 +416,7 @@ where
             .map_err(|e| KeyedStateMiddlewareError::Factory(e.clone()))
     }
 
-    fn build_context<C, Scope>(
-        &self,
-        inner: C,
-        key: Key,
-        event: EventRef,
-        scope: Scope,
-    ) -> BuiltContext<C, T, B, Sc, L, Scope>
+    fn build_context<C>(&self, inner: C, key: Key, event: EventRef) -> BuiltContext<C, T, B, Sc, L>
     where
         C: EventContext + Clone + Send + Sync,
     {
@@ -486,7 +427,6 @@ where
             durable: backend.durable.clone(),
             dirty,
             loader: self.loader.clone(),
-            scope,
             registry: self.registry.clone(),
             state_key: StateKey::new(self.segment_id, key),
             event,
@@ -497,9 +437,9 @@ where
     /// seals for the wrapped context and package them into
     /// [`KeyedStateOutput::Inner`] for the apply hooks. When any collection
     /// sealed, arms the `StateRecovery` backstop timer.
-    async fn finalize_inner<C, Scope>(
+    async fn finalize_inner<C>(
         &self,
-        wrapped: KeyedStateContext<C, DurableOf<B>, DirtyStoreOf<B>, L, Scope>,
+        wrapped: KeyedStateContext<C, DurableOf<B>, DirtyStoreOf<B>, L>,
         context: C,
         inner_output: T::Output,
     ) -> Result<KeyedStateOutput<T::Output>, HandlerError<T, B, Sc>>
@@ -578,7 +518,7 @@ where
         + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
     DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    L: Clone + Send + Sync + 'static,
+    L: MessageLoader<Payload = T::Payload> + 'static,
 {
     type Error = HandlerError<T, B, Sc>;
     type Output = KeyedStateOutput<T::Output>;
@@ -591,7 +531,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Invariant: no state op executes under an unvalidated identity.
         self.backend()?
@@ -607,8 +547,7 @@ where
         let dedup_id = self.derive_dedup_id_for_message(&message);
         let event = EventRef::Message { dedup_id };
         let key = message.key().clone();
-        let scope = MessageScope::new(message.topic(), message.partition(), message.offset());
-        let wrapped = self.build_context(context.clone(), key, event, scope)?;
+        let wrapped = self.build_context(context.clone(), key, event)?;
 
         let inner_output = self
             .inner
@@ -626,7 +565,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Invariant: no state op executes under an unvalidated identity —
         // including the recovery sweep below.
@@ -654,7 +593,7 @@ where
             trigger.tag,
         ));
         let key = trigger.key.clone();
-        let wrapped = self.build_context(context.clone(), key, event, TimerScope)?;
+        let wrapped = self.build_context(context.clone(), key, event)?;
 
         let inner_output = self
             .inner
@@ -667,7 +606,7 @@ where
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             Ok(KeyedStateOutput::Inner {
@@ -717,7 +656,7 @@ where
 
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             Ok(KeyedStateOutput::Inner {
@@ -785,7 +724,7 @@ where
         + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
     DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
-    L: Clone + Send + Sync + 'static,
+    L: MessageLoader<Payload = <T::Handler as FallibleHandler>::Payload> + 'static,
 {
     type Handler = KeyedStateHandler<T::Handler, B, Sc, L>;
 
@@ -851,7 +790,7 @@ where
     DirtyStoreOf<B>: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     Sc: PendingIndexScanner,
     P: Send + Sync + 'static + EventIdentity,
-    L: Clone + Send + Sync + 'static,
+    L: MessageLoader<Payload = P> + 'static,
 {
     type Provider<T>
         = KeyedStateProvider<T, B, Sc, L>

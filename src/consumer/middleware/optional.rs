@@ -123,7 +123,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match self {
             Self::Enabled(handler) => handler
@@ -146,7 +146,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match self {
             Self::Enabled(handler) => handler
@@ -172,7 +172,7 @@ where
     /// consume it.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match (self, result) {
             (Self::Enabled(handler), Ok(OptionOutput::Enabled(o))) => {
@@ -202,7 +202,7 @@ where
     /// `after_abort` fires. Mismatched variants are unreachable.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match (self, result) {
             (Self::Enabled(handler), Ok(OptionOutput::Enabled(o))) => {

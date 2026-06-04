@@ -119,6 +119,7 @@ where
     S: TimerDeferStore + Clone + Send + Sync,
 {
     type Error = TimerDeferContextError<C::Error, S::Error>;
+    type Payload = C::Payload;
 
     fn should_cancel(&self) -> bool {
         self.inner.should_cancel()

@@ -298,7 +298,7 @@ impl<T, Enc> FallibleHandler for FailureTopicHandler<T, Enc>
 where
     T: FallibleHandler,
     Enc: Codec<Payload = T::Payload>,
-    Enc::Payload: Clone + EventIdentity,
+    T::Payload: Clone + EventIdentity,
 {
     type Error = FailureTopicError<T::Error, Enc::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
@@ -351,7 +351,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let topic = message.topic().as_ref();
         let partition = message.partition();
@@ -432,7 +432,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match self.handler.on_timer(context, timer, demand_type).await {
             Ok(output) => Ok(FailureTopicOutput::Inner(output)),
@@ -457,7 +457,7 @@ where
     ///   further down can finalise correctly.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             Ok(FailureTopicOutput::Inner(output)) => {
@@ -488,7 +488,7 @@ where
     ///   error.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             Ok(FailureTopicOutput::Inner(output)) => {
@@ -684,7 +684,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             Ok(0)
         }
@@ -696,21 +696,21 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.timer_result.lock().clone()
         }
 
         async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.log.lock().push(InnerHookEvent::Commit(result));
         }
 
         async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.log.lock().push(InnerHookEvent::Abort(result));
         }

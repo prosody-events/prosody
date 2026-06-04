@@ -369,7 +369,7 @@ pub trait EventHandler {
         demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext;
+        C: EventContext<Payload = Self::Payload>;
 
     /// Handles timer events when they fire.
     ///
@@ -402,7 +402,7 @@ pub trait EventHandler {
         demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         T: UncommittedTimer;
 
     /// Shuts down the message handler.
@@ -871,9 +871,9 @@ impl<CM> PipelineMiddlewareStack<CM> {
         };
 
         // Keyed state sits inner to message_defer and dedup — a reloaded
-        // deferred message must reach it as `on_message` (MessageScope),
-        // and duplicates must short-circuit before anything seals — and
-        // outer to retry.
+        // deferred message must reach it as `on_message` (a message-keyed
+        // EventRef), and duplicates must short-circuit before anything
+        // seals — and outer to retry.
         let provider = self
             .common_middleware
             .layer(self.monopolization_middleware)

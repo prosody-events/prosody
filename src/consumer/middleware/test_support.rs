@@ -6,8 +6,10 @@
 
 use std::convert::Infallible;
 use std::future::{self, Future};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
+use educe::Educe;
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
@@ -48,8 +50,9 @@ pub enum TimerOperation {
 /// // ... use context ...
 /// let ops = ctx.timer_operations();
 /// ```
-#[derive(Clone)]
-pub struct MockEventContext {
+#[derive(Educe)]
+#[educe(Clone(bound()))]
+pub struct MockEventContext<P = serde_json::Value> {
     /// Partition/consumer shutdown signal (sender for mutations).
     shutdown_tx: Arc<watch::Sender<ShutdownPhase>>,
     /// Partition/consumer shutdown signal (receiver for queries).
@@ -62,15 +65,19 @@ pub struct MockEventContext {
 
     /// Timer operation tracking (None = disabled).
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
+
+    /// Payload type pin ([`EventContext::Payload`]); defaults to
+    /// `serde_json::Value` to match the default consumer codec.
+    _payload: PhantomData<fn() -> P>,
 }
 
-impl Default for MockEventContext {
+impl<P> Default for MockEventContext<P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MockEventContext {
+impl<P> MockEventContext<P> {
     /// Create a new mock context with default state (no signals active).
     #[must_use]
     pub fn new() -> Self {
@@ -82,6 +89,7 @@ impl MockEventContext {
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
             timer_operations: None,
+            _payload: PhantomData,
         }
     }
 
@@ -167,7 +175,7 @@ impl MockEventContext {
     }
 }
 
-impl TerminationSignals for MockEventContext {
+impl<P> TerminationSignals for MockEventContext<P> {
     fn is_shutdown(&self) -> bool {
         *self.shutdown_rx.borrow() >= ShutdownPhase::Cancelling
     }
@@ -191,8 +199,12 @@ impl TerminationSignals for MockEventContext {
     }
 }
 
-impl EventContext for MockEventContext {
+impl<P> EventContext for MockEventContext<P>
+where
+    P: Send + Sync + 'static,
+{
     type Error = Infallible;
+    type Payload = P;
 
     fn should_cancel(&self) -> bool {
         *self.shutdown_rx.borrow() >= ShutdownPhase::Cancelling || *self.cancel_rx.borrow()

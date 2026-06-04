@@ -9,7 +9,7 @@
 use super::{CollectionTtl, CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
 use crate::consumer::middleware::test_support::MockEventContext;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::value_state;
+use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use crate::state::middleware::{CollectionDef, CollectionDefRegistry, recover_pending_entries};
 use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
@@ -229,10 +229,8 @@ fn profile_registry(
     override_ttl: CompactDuration,
 ) -> Result<Arc<CollectionDefRegistry>> {
     let mut registry = CollectionDefRegistry::new(Some(default_ttl));
-    registry.register(
-        &value_state::<serde_json::Value>("profile"),
-        CollectionDef::new(Some(override_ttl)),
-    )?;
+    let profile: ValueDescriptor = value_state("profile");
+    registry.register(&profile, CollectionDef::new(Some(override_ttl)))?;
     Ok(Arc::new(registry))
 }
 
@@ -618,7 +616,7 @@ async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<b
         .seal(&collection, event, ops.clone())
         .await
         .map_err(into_eyre)?;
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     recover_pending_entries(
         &context,
         &store_b,

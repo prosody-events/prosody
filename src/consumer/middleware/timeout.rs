@@ -243,7 +243,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.run_with_timeout(
             context.clone(),
@@ -260,7 +260,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.run_with_timeout(
             context.clone(),
@@ -279,7 +279,7 @@ where
     /// the inner exactly when it would have absent this middleware.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.handler.after_commit(context, result).await;
     }
@@ -293,7 +293,7 @@ where
     /// the inner exactly when it would have absent this middleware.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.handler.after_abort(context, result).await;
     }
@@ -397,7 +397,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             if let Some(delay) = self.delay {
@@ -420,7 +420,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             if let Some(delay) = self.delay {

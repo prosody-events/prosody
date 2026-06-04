@@ -598,7 +598,7 @@ async fn process_event<T, S, P>(
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
-    P: Send + 'static,
+    P: Send + Sync + 'static,
 {
     match event {
         UncommittedEvent::Message(message) => {

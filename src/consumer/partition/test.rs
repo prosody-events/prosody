@@ -225,7 +225,7 @@ async fn test_partition_manager_is_stalled() {
             _demand_type: DemandType,
         ) -> impl Future<Output = ()> + Send
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             let offset = message.offset();
             let processed = self.processed_offsets.clone();
@@ -243,7 +243,7 @@ async fn test_partition_manager_is_stalled() {
 
         async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
             U: UncommittedTimer,
         {
             // todo: add timer test
@@ -458,7 +458,7 @@ impl EventHandler for TestHandler {
         _demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = message.key().clone();
         let offset = message.offset();
@@ -491,7 +491,7 @@ impl EventHandler for TestHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
         // todo: add timer test

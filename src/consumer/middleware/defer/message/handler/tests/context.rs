@@ -206,6 +206,7 @@ impl TerminationSignals for KeyedCapturingContext {
 
 impl EventContext for KeyedCapturingContext {
     type Error = Infallible;
+    type Payload = serde_json::Value;
 
     fn should_cancel(&self) -> bool {
         false

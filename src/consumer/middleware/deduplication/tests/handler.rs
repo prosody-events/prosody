@@ -104,7 +104,7 @@ impl FallibleHandler for MockHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         if let Some(ref e) = self.error {
@@ -121,7 +121,7 @@ impl FallibleHandler for MockHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -460,7 +460,7 @@ impl FallibleHandler for ApplyProbe {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::Handler);
         match &self.error {
@@ -476,7 +476,7 @@ impl FallibleHandler for ApplyProbe {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::Handler);
         match &self.error {
@@ -487,14 +487,14 @@ impl FallibleHandler for ApplyProbe {
 
     async fn after_commit<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::InnerAfterCommit);
     }
 
     async fn after_abort<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::InnerAfterAbort);
     }

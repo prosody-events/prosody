@@ -98,7 +98,7 @@ impl FallibleHandler for ForwardHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.tx.send(msg.key().to_string()).await;
         Ok(())
@@ -111,7 +111,7 @@ impl FallibleHandler for ForwardHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -137,7 +137,7 @@ impl FallibleHandler for FailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.tx.send(msg.key().to_string()).await;
         Err(TestError)
@@ -150,7 +150,7 @@ impl FallibleHandler for FailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -177,7 +177,7 @@ impl FallibleHandler for TimerSchedulingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let schedule_time = CompactDateTime::now()
@@ -197,7 +197,7 @@ impl FallibleHandler for TimerSchedulingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.timer_tx.send(trigger.key.to_string()).await;
         Ok(())
@@ -225,7 +225,7 @@ impl FallibleHandler for TimerFailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let schedule_time = CompactDateTime::now()
@@ -245,7 +245,7 @@ impl FallibleHandler for TimerFailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.timer_tx.send(trigger.key.to_string()).await;
         Err(TestError)
@@ -272,7 +272,7 @@ impl FallibleHandler for TimerCancellingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let schedule_time = CompactDateTime::now()
@@ -295,7 +295,7 @@ impl FallibleHandler for TimerCancellingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -322,7 +322,7 @@ impl FallibleHandler for ClearAndScheduleHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let step = msg
@@ -360,7 +360,7 @@ impl FallibleHandler for ClearAndScheduleHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -391,7 +391,7 @@ impl FallibleHandler for InlineReplacementHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let step = msg
@@ -428,7 +428,7 @@ impl FallibleHandler for InlineReplacementHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.timer_fired.send(trigger.time).await;
         Ok(())
@@ -475,7 +475,7 @@ impl FallibleHandler for TransientMessageHandler {
         demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Non-defer keys always succeed (used to seed the FailureTracker).
         if !msg.key().starts_with("defer-") {
@@ -498,7 +498,7 @@ impl FallibleHandler for TransientMessageHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -528,7 +528,7 @@ impl FallibleHandler for TransientTimerHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Non-defer keys don't schedule a timer — just succeed immediately.
         if !msg.key().starts_with("defer-") {
@@ -552,7 +552,7 @@ impl FallibleHandler for TransientTimerHandler {
         demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Fail on Normal for defer keys so retry exhausts and defer activates.
         // Only succeed when re-driven by the DeferredTimer.

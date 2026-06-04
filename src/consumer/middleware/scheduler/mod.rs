@@ -308,7 +308,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
         let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
@@ -326,7 +326,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let tp_key = TopicPartitionKey::new(self.topic, self.partition, trigger.key.clone());
         let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
@@ -349,7 +349,7 @@ where
     ///   invariant, neither apply hook may fire on the inner in this case.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_commit(context, Ok(output)).await,
@@ -373,7 +373,7 @@ where
     /// this layer — the inner did no work, so no apply hook is fired on it.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_abort(context, Ok(output)).await,

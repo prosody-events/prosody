@@ -106,7 +106,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Wrap context so inner handlers see unified timer state
         let wrapped_context =
@@ -126,7 +126,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Wrap context so inner handlers see unified timer state
         let wrapped_context =
@@ -152,7 +152,7 @@ where
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Apply-hook routing (see module docs):
         // - Inner(o):     inner ran and succeeded         -> after_commit(Ok)
@@ -178,7 +178,7 @@ where
 
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Symmetric to after_commit. The only twist: Deferred(e) still
         // routes to after_abort(Err(e)) on the inner — the inner's prior
@@ -229,7 +229,7 @@ where
         demand_type: DemandType,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Check if key is already deferred - queue behind existing entry
         if self
@@ -283,7 +283,7 @@ where
         trigger: Trigger,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let key = &trigger.key;
 
@@ -387,7 +387,7 @@ where
         inner_err: T::Error,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Timer first, then store: ensures timer coverage on partial failure
         self.schedule_retry_timer(&context, 0).await?;
@@ -451,7 +451,7 @@ where
         error: T::Error,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let error_category = error.classify_error();
         let exception = format!("{error:?}").into_boxed_str();
@@ -542,7 +542,7 @@ where
         trigger: &Trigger,
     ) -> Result<(), DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let result = self
             .store
@@ -560,7 +560,7 @@ where
         retry_count: u32,
     ) -> Result<(), DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let fire_time = self.next_retry_time(retry_count)?;
 
@@ -587,7 +587,7 @@ where
         result: TimerRetryCompletionResult,
     ) -> Result<(), DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             TimerRetryCompletionResult::MoreTimers { .. } => {

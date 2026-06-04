@@ -448,7 +448,7 @@ impl EventHandler for TestHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let (msg, uncommitted) = message.into_inner();
 
@@ -466,7 +466,7 @@ impl EventHandler for TestHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
     }
@@ -494,7 +494,7 @@ impl EventHandler for SlowTestHandler {
         message: UncommittedMessage<Value>,
         demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = (context, demand_type);
         let (msg, uncommitted) = message.into_inner();
@@ -512,7 +512,7 @@ impl EventHandler for SlowTestHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
     }
@@ -566,7 +566,7 @@ impl FallibleHandler for FallibleTestHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Forward the message to the channel, ignoring send errors for testing
         let _ = self
@@ -583,7 +583,7 @@ impl FallibleHandler for FallibleTestHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }

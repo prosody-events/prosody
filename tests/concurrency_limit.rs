@@ -92,7 +92,7 @@ impl EventHandler for ConcurrencyTestHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Increment the current processing count and update maximum observed
         // concurrency
@@ -120,7 +120,7 @@ impl EventHandler for ConcurrencyTestHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
     }

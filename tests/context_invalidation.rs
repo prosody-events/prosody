@@ -32,11 +32,11 @@ mod common;
 #[derive(Clone)]
 struct ContextInvalidationHandler {
     /// Channel to send cloned contexts for later testing
-    context_tx: Sender<BoxEventContext>,
+    context_tx: Sender<BoxEventContext<Value>>,
 }
 
 impl ContextInvalidationHandler {
-    fn new(context_tx: Sender<BoxEventContext>) -> Self {
+    fn new(context_tx: Sender<BoxEventContext<Value>>) -> Self {
         Self { context_tx }
     }
 }
@@ -50,7 +50,7 @@ impl EventHandler for ContextInvalidationHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         info!("Processing message in handler");
 
@@ -70,7 +70,7 @@ impl EventHandler for ContextInvalidationHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
         // Not used in this test

@@ -62,12 +62,9 @@ mod registry;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use context::ByteValueHandle;
 #[cfg(test)]
 pub(crate) use context::ContextParts;
-pub use context::{
-    DirtyValueBundle, DurableValueBundle, KeyedStateContext, MessageScope, TimerScope,
-};
+pub use context::{DirtyValueBundle, DurableValueBundle, KeyedStateContext};
 #[cfg(test)]
 pub(crate) use descriptor_identity::LazyDescriptorIdentity;
 pub use descriptor_identity::{

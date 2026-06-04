@@ -166,7 +166,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         if context.is_shutdown() {
             return Err(CancellationError::Shutdown);
@@ -196,7 +196,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         if context.is_shutdown() {
             return Err(CancellationError::Shutdown);
@@ -223,7 +223,7 @@ where
     /// the dispatch was short-circuited before the inner.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_commit(context, Ok(output)).await,
@@ -241,7 +241,7 @@ where
     /// the dispatch was short-circuited before the inner.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_abort(context, Ok(output)).await,
@@ -373,7 +373,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
@@ -386,7 +386,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
@@ -589,7 +589,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.ctx.request_shutdown();
             self.result.clone()
@@ -602,7 +602,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.ctx.request_shutdown();
             self.result.clone()
@@ -730,7 +730,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             Ok(())
         }
@@ -742,21 +742,21 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             Ok(())
         }
 
         async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.commit_calls.lock().push(result);
         }
 
         async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.abort_calls.lock().push(result);
         }

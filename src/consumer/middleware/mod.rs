@@ -590,7 +590,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
-        C: EventContext;
+        C: EventContext<Payload = Self::Payload>;
 
     /// Handles a fired timer trigger, returning a typed [`Result`].
     ///
@@ -616,7 +616,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
-        C: EventContext;
+        C: EventContext<Payload = Self::Payload>;
 
     /// Finalizes staged work after the just-completed invocation has been
     /// committed.
@@ -667,7 +667,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         _result: Result<Self::Output, Self::Error>,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         async {}
     }
@@ -718,7 +718,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         _result: Result<Self::Output, Self::Error>,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         async {}
     }
@@ -832,7 +832,7 @@ where
         message: UncommittedMessage<Self::Payload>,
         demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let (inner_message, uncommitted_offset) = message.into_inner();
 
@@ -881,7 +881,7 @@ where
 
     async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
         U: UncommittedTimer,
     {
         let (trigger, uncommitted_timer) = timer.into_inner();
@@ -1060,7 +1060,7 @@ mod after_hook_tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.log.lock().push(HookEvent::Handler);
             self.result.clone().map(|()| self.sentinel)
@@ -1073,7 +1073,7 @@ mod after_hook_tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.log.lock().push(HookEvent::Handler);
             self.result.clone().map(|()| self.sentinel)
@@ -1081,14 +1081,14 @@ mod after_hook_tests {
 
         async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.log.lock().push(HookEvent::AfterCommit(result));
         }
 
         async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.log.lock().push(HookEvent::AfterAbort(result));
         }
@@ -1371,7 +1371,7 @@ mod after_hook_tests {
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.inner.on_message(context, message, demand_type).await
         }
@@ -1383,21 +1383,21 @@ mod after_hook_tests {
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.inner.on_timer(context, trigger, demand_type).await
         }
 
         async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.inner.after_commit(context, result).await;
         }
 
         async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.inner.after_abort(context, result).await;
         }

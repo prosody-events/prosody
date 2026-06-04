@@ -45,14 +45,15 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_PENDING}} (
 -- on first use by the partition's single owner (no LWT needed); a process
 -- whose registered descriptor disagrees with the stored identity refuses
 -- to dispatch (Permanent), so an incompatible deploy fails loudly instead
--- of silently misreading cells.
+-- of silently misreading cells. `codec_id` is the codec's open-dispatch
+-- string token (NULL for framework-defined cells).
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_DESCRIPTOR}} (
     segment_id    uuid,
     name          text,
 
     kind          tinyint,
     cell_kind     smallint,
-    codec_id      smallint,
+    codec_id      text,
     schema_label  text,
 
     PRIMARY KEY ((segment_id), name)

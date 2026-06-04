@@ -294,7 +294,7 @@ impl FallibleHandler for OutcomeHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         use crate::consumer::Keyed;
         let key = message.key().clone();
@@ -325,7 +325,7 @@ impl FallibleHandler for OutcomeHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let outcome = self.take_outcome();
         tracing::debug!(
@@ -343,14 +343,14 @@ impl FallibleHandler for OutcomeHandler {
 
     async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.record_applied(AppliedHook::Commit, &result);
     }
 
     async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.record_applied(AppliedHook::Abort, &result);
     }

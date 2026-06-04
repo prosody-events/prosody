@@ -348,7 +348,7 @@ where
     assert_eq!(before, 1, "exactly one stale pending row before the sweep");
 
     let oracle = NeverConsultedOracle::default();
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let registry = CollectionDefRegistry::new(None);
     recover_pending_entries(
         &context,
@@ -406,8 +406,8 @@ pub(crate) async fn run_descriptor_identity_acquisition<D>(durable: D) -> Result
 where
     D: DescriptorIdentityStore + Clone,
 {
-    const PROFILE: ValueDescriptor<serde_json::Value> = value_state("acquisition-profile");
-    let relabeled = value_state::<serde_json::Value>("acquisition-profile").with_schema_label("v2");
+    const PROFILE: ValueDescriptor = value_state("acquisition-profile");
+    let relabeled: ValueDescriptor = value_state("acquisition-profile").with_schema_label("v2");
 
     // Fresh segment per run so rows never collide with other iterations or
     // test functions (the Cassandra keyspace is shared).

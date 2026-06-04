@@ -11,22 +11,28 @@
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
+use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::ClassifyError;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::{KafkaMessageRef, StateDescriptor, StructuralIdentity};
+use crate::state::{StateName, StoreOutcome};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
 use crate::timers::{TimerManager, TimerRequest, TimerType};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
+use bytes::Bytes;
 use dyn_clone::DynClone;
 use educe::Educe;
 use futures::FutureExt;
 use serde::de::StdError;
 use std::error::Error;
 use std::future::{Future, ready};
+use std::marker::PhantomData;
 use std::ops::AsyncFnOnce;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::select;
 use tokio::sync::watch;
 use tracing::Span;
@@ -50,6 +56,15 @@ impl<T> EventContextError for T where T: StdError + ClassifyError + Send + Sync 
 /// - Inspect all scheduled timer execution times for the key.
 /// - Check synchronously if cancellation has been requested.
 pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
+    /// The message payload type events on this context carry.
+    ///
+    /// Leaf contexts pin it to the consumer's codec payload; wrapper
+    /// contexts forward their inner context's payload. Handler traits
+    /// bound their contexts with `C: EventContext<Payload = Self::Payload>`,
+    /// which is what lets payload-typed capabilities (e.g. the keyed-state
+    /// Kafka-message handles) stay fully typed inside generic handlers.
+    type Payload: Send + Sync + 'static;
+
     /// Error type returned by timer-related operations.
     type Error: EventContextError;
 
@@ -184,9 +199,237 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static;
 
+    /// Validates that the named keyed-state collection is registered with
+    /// the asserted structural identity, returning the canonical
+    /// [`StateName`].
+    ///
+    /// Default: state is unavailable on this context. Only the keyed-state
+    /// middleware's wrapped context overrides the state capabilities;
+    /// every other context reports
+    /// [`StateAccessError::Unavailable`] (Permanent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, [`StateAccessError::Unregistered`] for an unknown name,
+    /// or [`StateAccessError::IdentityMismatch`] when the registered
+    /// identity differs from the asserted one.
+    fn verify_state_registration(
+        &self,
+        name: &'static str,
+        identity: &StructuralIdentity,
+    ) -> Result<StateName, StateAccessError> {
+        let _ = (name, identity);
+        Err(StateAccessError::Unavailable)
+    }
+
+    /// Reads the current visible cell bytes of a keyed-state collection
+    /// within this event's transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, or a [`StateAccessError::Store`] when the underlying
+    /// store fails.
+    fn state_cell(
+        &self,
+        name: &StateName,
+    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send {
+        let _ = name;
+        ready(Err(StateAccessError::Unavailable))
+    }
+
+    /// Buffers a set of a keyed-state collection's cell bytes within this
+    /// event's transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, or a [`StateAccessError::Store`] when the underlying
+    /// store fails.
+    fn set_state_cell(
+        &self,
+        name: &StateName,
+        cell: Bytes,
+    ) -> impl Future<Output = Result<(), StateAccessError>> + Send {
+        let _ = (name, cell);
+        ready(Err(StateAccessError::Unavailable))
+    }
+
+    /// Buffers a clear of a keyed-state collection within this event's
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, or a [`StateAccessError::Store`] when the underlying
+    /// store fails.
+    fn clear_state_cell(
+        &self,
+        name: &StateName,
+    ) -> impl Future<Output = Result<(), StateAccessError>> + Send {
+        let _ = name;
+        ready(Err(StateAccessError::Unavailable))
+    }
+
+    /// Drains a collection's buffered ops directly to authoritative state
+    /// and returns its transaction to `Clean`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, or a [`StateAccessError::Store`] when the underlying
+    /// store fails (including an illegal flush after seal).
+    fn flush_state_cell(
+        &self,
+        name: &StateName,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send {
+        let _ = name;
+        ready(Err(StateAccessError::Unavailable))
+    }
+
+    /// Loads the full consumer message referenced by a Kafka-message state
+    /// cell, decoded by the consumer's own codec.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, or a [`StateAccessError::Load`] when the loader fails
+    /// (Permanent for a deleted or compacted-away offset).
+    fn load_state_message(
+        &self,
+        message_ref: KafkaMessageRef,
+    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, StateAccessError>> + Send {
+        let _ = message_ref;
+        ready(Err(StateAccessError::Unavailable))
+    }
+
+    /// Binds a keyed-state descriptor to this context, returning its typed
+    /// handle.
+    ///
+    /// Works in any handler with a plain `C: EventContext` bound — message
+    /// and timer scopes alike. The handle owns a clone of the context
+    /// (contexts are cheap `Arc`-backed clones), so it is `Clone + Send +
+    /// Sync + 'static` and survives FFI boundaries. Repeated bindings of
+    /// the same collection in one handler share the per-event transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] outside the keyed-state
+    /// middleware, [`StateAccessError::Unregistered`] for a collection
+    /// never registered with the consumer, or
+    /// [`StateAccessError::IdentityMismatch`] when the registered identity
+    /// differs from the descriptor's.
+    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+        Self: Sized,
+    {
+        descriptor.bind(self)
+    }
+
     /// Return a boxed, type-erased event context
-    fn boxed(self) -> BoxEventContext {
+    fn boxed(self) -> BoxEventContext<Self::Payload> {
         Box::new(self)
+    }
+}
+
+/// Error raised by the [`EventContext`] keyed-state capabilities and by
+/// descriptor binds.
+///
+/// One concrete enum for the whole capability surface: store and loader
+/// errors are type-erased at the boundary (message + captured
+/// [`ErrorCategory`]) so the error type needs no generics.
+#[derive(Debug, Error)]
+pub enum StateAccessError {
+    /// This context does not provide keyed state (the default for every
+    /// context outside the keyed-state middleware).
+    #[error("keyed state is unavailable on this context")]
+    Unavailable,
+
+    /// The collection name was never registered with the consumer.
+    #[error("state collection {name:?} is not registered")]
+    Unregistered {
+        /// The descriptor's collection name.
+        name: &'static str,
+    },
+
+    /// The registry holds a different identity for this name.
+    #[error(
+        "state collection identity mismatch: registered {stored:?}, descriptor asserts \
+         {asserted:?}"
+    )]
+    IdentityMismatch {
+        /// Identity held by the registry.
+        stored: StructuralIdentity,
+
+        /// Identity the binding descriptor asserts.
+        asserted: StructuralIdentity,
+    },
+
+    /// A state handle was used while the context is shutting down or the
+    /// message is cancelled.
+    #[error("state access attempted on a terminated context")]
+    Terminated,
+
+    /// The underlying state store failed (type-erased).
+    #[error("keyed-state store failed: {message}")]
+    Store {
+        /// Rendered store error.
+        message: String,
+
+        /// The store error's captured classification.
+        category: ErrorCategory,
+    },
+
+    /// The message loader failed (type-erased).
+    #[error("keyed-state message loader failed: {message}")]
+    Load {
+        /// Rendered loader error.
+        message: String,
+
+        /// The loader error's captured classification.
+        category: ErrorCategory,
+    },
+}
+
+impl StateAccessError {
+    /// Type-erases a store error into [`Self::Store`], capturing its
+    /// classification.
+    pub(crate) fn store<E>(error: &E) -> Self
+    where
+        E: ClassifyError + Error,
+    {
+        Self::Store {
+            message: error.to_string(),
+            category: error.classify_error(),
+        }
+    }
+
+    /// Type-erases a loader error into [`Self::Load`], capturing its
+    /// classification.
+    pub(crate) fn load<E>(error: &E) -> Self
+    where
+        E: ClassifyError + Error,
+    {
+        Self::Load {
+            message: error.to_string(),
+            category: error.classify_error(),
+        }
+    }
+}
+
+impl ClassifyError for StateAccessError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Unavailable | Self::Unregistered { .. } | Self::IdentityMismatch { .. } => {
+                ErrorCategory::Permanent
+            }
+            // Aligned with the cancellation middleware: a terminated
+            // context is a transient condition (retry decides).
+            Self::Terminated => ErrorCategory::Transient,
+            Self::Store { category, .. } | Self::Load { category, .. } => *category,
+        }
     }
 }
 
@@ -240,11 +483,17 @@ pub trait TerminationSignals {
 /// # Type Parameters
 ///
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
-
-#[derive(Debug, Clone)]
-pub struct TimerContext<T: TriggerStore> {
+/// * `P`: The consumer's message payload type ([`EventContext::Payload`]);
+///   carried as phantom data — the partition loop pins it to the codec's
+///   payload when constructing the context.
+#[derive(Educe)]
+#[educe(Clone(bound()), Debug(bound = ""))]
+pub struct TimerContext<T: TriggerStore, P> {
     /// Context state
     inner: Arc<ArcSwapOption<Inner<T>>>,
+
+    #[educe(Debug(ignore))]
+    _payload: PhantomData<fn() -> P>,
 }
 
 #[derive(Educe)]
@@ -266,7 +515,7 @@ struct Inner<T: TriggerStore> {
     timers: TimerManager<T>,
 }
 
-impl<T> TimerContext<T>
+impl<T, P> TimerContext<T, P>
 where
     T: TriggerStore,
 {
@@ -296,7 +545,10 @@ where
         ))
         .into();
 
-        Self { inner }
+        Self {
+            inner,
+            _payload: PhantomData,
+        }
     }
 
     /// Run a cancellable operation, short-circuiting if already shutdown or
@@ -339,11 +591,13 @@ where
     }
 }
 
-impl<T> EventContext for TimerContext<T>
+impl<T, P> EventContext for TimerContext<T, P>
 where
     T: TriggerStore,
+    P: Send + Sync + 'static,
 {
     type Error = TimerManagerError<T::Error>;
+    type Payload = P;
 
     fn should_cancel(&self) -> bool {
         let inner = self.inner.load();
@@ -480,7 +734,7 @@ where
     }
 }
 
-impl<T> TerminationSignals for TimerContext<T>
+impl<T, P> TerminationSignals for TimerContext<T, P>
 where
     T: TriggerStore,
 {
@@ -530,7 +784,7 @@ where
 }
 
 /// Object-safe boxed event context
-pub type BoxEventContext = Box<dyn DynEventContext>;
+pub type BoxEventContext<P> = Box<dyn DynEventContext<Payload = P>>;
 
 /// Boxed error type for object-safe contexts.
 pub type BoxEventContextError = Box<dyn EventContextError>;
@@ -547,6 +801,11 @@ impl Error for BoxEventContextError {}
 /// check.
 #[async_trait]
 pub trait DynEventContext: DynClone + Send + Sync + 'static {
+    /// The message payload type events on this context carry; mirrors
+    /// [`EventContext::Payload`] so `Box<dyn DynEventContext<Payload = P>>`
+    /// keeps the payload nameable across the type-erased FFI boundary.
+    type Payload: Send + Sync + 'static;
+
     /// Async wait for message cancellation signal (includes partition
     /// shutdown).
     async fn on_cancel(&self);
@@ -612,7 +871,7 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     fn should_cancel(&self) -> bool;
 }
 
-dyn_clone::clone_trait_object!(DynEventContext);
+dyn_clone::clone_trait_object!(<P> DynEventContext<Payload = P>);
 
 #[async_trait]
 impl<C> DynEventContext for C
@@ -620,6 +879,8 @@ where
     C: EventContext + Send + Sync + 'static,
     C::Error: Error + Send + Sync + 'static,
 {
+    type Payload = C::Payload;
+
     async fn on_cancel(&self) {
         EventContext::on_cancel(self).await;
     }

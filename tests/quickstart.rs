@@ -35,7 +35,7 @@ impl FallibleHandler for MyHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.sender.send(message.key().to_string()).await;
         Ok(())
@@ -48,7 +48,7 @@ impl FallibleHandler for MyHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }

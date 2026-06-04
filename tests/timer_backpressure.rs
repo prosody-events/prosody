@@ -46,7 +46,7 @@ impl EventHandler for SlowTimerHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
@@ -79,7 +79,7 @@ impl EventHandler for SlowTimerHandler {
 
     async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
         let timer_key = timer.key().to_string();

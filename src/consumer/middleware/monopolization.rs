@@ -267,7 +267,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
         if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
@@ -287,7 +287,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let tp_key = TopicPartitionKey::new(self.topic, self.partition, trigger.key.clone());
         if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
@@ -316,7 +316,7 @@ where
     ///   outcome for work that never happened.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_commit(context, Ok(output)).await,
@@ -345,7 +345,7 @@ where
     ///   handler must not see a phantom abort for work it never performed.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_abort(context, Ok(output)).await,
@@ -624,7 +624,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.invocations.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -637,7 +637,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.invocations.fetch_add(1, Ordering::Relaxed);
             Ok(())

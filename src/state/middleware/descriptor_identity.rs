@@ -27,12 +27,13 @@ use tokio::sync::OnceCell;
 
 /// One durable identity row in wire form.
 ///
-/// Comparison happens on the wire encoding (the discriminator integers and
-/// the raw label) rather than on decoded enums, so a row written by a
-/// *future* build with discriminants this build does not know simply
-/// compares unequal — the acquisition fails Permanent instead of being
-/// silently coerced.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Comparison happens on the wire encoding (the discriminator integers,
+/// the codec token, and the raw label) rather than on decoded enums, so a
+/// row written by a *future* build with discriminants this build does not
+/// know simply compares unequal — the acquisition fails Permanent instead
+/// of being silently coerced. The scylla row serde is derived here so the
+/// Cassandra store reads this type directly instead of a primitive tuple.
+#[derive(Clone, Debug, PartialEq, Eq, scylla::DeserializeRow)]
 pub struct DurableDescriptorIdentity {
     /// Collection name the row freezes.
     pub name: String,
@@ -43,8 +44,9 @@ pub struct DurableDescriptorIdentity {
     /// [`CellKind`](crate::state::descriptor::CellKind) discriminator.
     pub cell_kind: i16,
 
-    /// [`CodecId`](crate::codec::CodecId) discriminator.
-    pub codec_id: i16,
+    /// Codec token ([`Codec::CODEC_ID`](crate::codec::Codec::CODEC_ID);
+    /// `None` for framework-defined cells).
+    pub codec_id: Option<String>,
 
     /// Optional schema version label.
     pub schema_label: Option<String>,
@@ -57,7 +59,7 @@ impl DurableDescriptorIdentity {
             name: name.as_str().to_owned(),
             kind: identity.kind.as_i8(),
             cell_kind: identity.cell_kind.as_i16(),
-            codec_id: identity.codec_id.as_i16(),
+            codec_id: identity.codec_id.map(str::to_owned),
             schema_label: identity
                 .schema_label
                 .as_ref()
@@ -177,8 +179,8 @@ where
                         Some(&existing) if *existing == row => {}
                         Some(&existing) => {
                             return Err(DescriptorIdentityError::Mismatch {
-                                stored: existing.clone(),
-                                asserted: row,
+                                stored: Box::new(existing.clone()),
+                                asserted: Box::new(row),
                             });
                         }
                         None => missing.push(row),
@@ -213,10 +215,10 @@ where
     )]
     Mismatch {
         /// Identity currently frozen in durable storage.
-        stored: DurableDescriptorIdentity,
+        stored: Box<DurableDescriptorIdentity>,
 
         /// Identity the registered descriptor asserts.
-        asserted: DurableDescriptorIdentity,
+        asserted: Box<DurableDescriptorIdentity>,
     },
 
     /// The identity store failed.

@@ -106,6 +106,7 @@ impl TerminationSignals for MockContext {
 
 impl EventContext for MockContext {
     type Error = Infallible;
+    type Payload = serde_json::Value;
 
     fn should_cancel(&self) -> bool {
         false
@@ -300,7 +301,7 @@ impl FallibleHandler for OutcomeHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -312,7 +313,7 @@ impl FallibleHandler for OutcomeHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.timer_calls.lock().push(trigger.key.clone());
 

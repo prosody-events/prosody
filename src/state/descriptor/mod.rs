@@ -1,30 +1,76 @@
 //! Typed descriptors for keyed-state collections.
 //!
-//! Stores speak raw [`Bytes`](bytes::Bytes); this layer owns the typing. A
+//! Stores speak raw [`Bytes`]; this layer owns the typing. A
 //! handler declares a descriptor once — usually as a `const` — registers it
-//! with the consumer, and binds it to the handler context to obtain a typed
-//! handle:
+//! with the consumer, and binds it to *any* [`EventContext`] to obtain a
+//! typed, owned handle:
 //!
 //! ```
+//! use prosody::consumer::DemandType;
+//! use prosody::consumer::event_context::EventContext;
+//! use prosody::consumer::message::ConsumerMessage;
+//! use prosody::consumer::middleware::FallibleHandler;
 //! use prosody::state::descriptor::{ValueDescriptor, value_state};
-//! use serde::{Deserialize, Serialize};
+//! use prosody::timers::Trigger;
+//! use serde_json::{Value, json};
 //!
-//! #[derive(Serialize, Deserialize)]
-//! struct Cart {
-//!     items: Vec<String>,
+//! const CART: ValueDescriptor = value_state("cart");
+//!
+//! #[derive(Clone)]
+//! struct MyHandler;
+//!
+//! impl FallibleHandler for MyHandler {
+//!     type Error = prosody::consumer::event_context::StateAccessError;
+//!     type Output = ();
+//!     type Payload = Value;
+//!
+//!     async fn on_message<C>(
+//!         &self,
+//!         ctx: C,
+//!         message: ConsumerMessage<Value>,
+//!         _demand: DemandType,
+//!     ) -> Result<(), Self::Error>
+//!     where
+//!         C: EventContext<Payload = Value>,
+//!     {
+//!         let cart = ctx.state(CART)?;
+//!         let mut items = cart.get().await.map_err(|_| Self::Error::Unavailable)?;
+//!         // ... read-modify-write ...
+//!         cart.set(json!({"items": []}))
+//!             .await
+//!             .map_err(|_| Self::Error::Unavailable)?;
+//!         Ok(())
+//!     }
+//!
+//!     async fn on_timer<C>(
+//!         &self,
+//!         ctx: C,
+//!         _trigger: Trigger,
+//!         _demand: DemandType,
+//!     ) -> Result<(), Self::Error>
+//!     where
+//!         C: EventContext<Payload = Value>,
+//!     {
+//!         // Timer handlers bind the same way; state persists across
+//!         // event kinds for the key.
+//!         let _cart = ctx.state(CART)?;
+//!         Ok(())
+//!     }
+//!
+//!     async fn shutdown(self) {}
 //! }
-//!
-//! const CART: ValueDescriptor<Cart> = value_state("cart");
-//! // In a handler: let cart = ctx.state(CART)?;
-//! //               cart.set(Cart { items: vec![] }).await?;
 //! ```
 //!
 //! Two descriptor kinds ship today:
 //!
-//! * [`ValueDescriptor`] — a codec-backed single value (JSON by default via
-//!   [`JsonStateCodec`]); cells hold the codec's bytes verbatim.
-//! * [`KafkaMessageDescriptor`] — cells hold a [`KafkaMessageRef`] and `get()`
-//!   resolves the full consumer message through the defer message loader.
+//! * [`ValueDescriptor`] — a codec-backed single value. The codec **is** the
+//!   typing: the cell type is `C::Payload`, and the default codec is
+//!   [`JsonCodec`] (cells are [`serde_json::Value`]s, exactly like the default
+//!   message payload). A typed cell means writing a `CartCodec: Codec<Payload =
+//!   Cart>` — one codec, one layer of encoding.
+//! * [`KafkaMessageDescriptor`] — codec-free; cells hold a [`KafkaMessageRef`]
+//!   and `get()` resolves the full consumer message (decoded by the consumer's
+//!   own codec) through the message loader.
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
 //! `(kind, cell kind, codec id, schema label)` tuple. The identity is
@@ -33,16 +79,12 @@
 //! process carrying an incompatible descriptor fails loudly instead of
 //! silently misreading cells.
 
-use crate::codec::{CodecId, JsonStateCodec, StateCodec};
+use crate::codec::{Codec, JsonCodec};
+use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
-use crate::state::middleware::{
-    ByteValueHandle, CollectionDefRegistry, DirtyValueBundle, DurableValueBundle, KeyedStateContext,
-};
-use crate::state::value::{DurableWalStore, TransactionValueStoreError, ValueKind, ValueStore};
 use crate::state::{StateName, StoreOutcome};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use bytes::Bytes;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -52,11 +94,9 @@ use thiserror::Error;
 pub mod kafka;
 
 pub use kafka::{
-    KafkaMessageDescriptor, KafkaMessageRef, KafkaValueHandle, NoLoader, kafka_message_state,
+    KafkaMessageDescriptor, KafkaMessageHandle, KafkaMessageRef, KafkaStateError,
+    kafka_message_state,
 };
-
-type DirtyErr<S> = <S as ValueStore>::Error;
-type DurableErr<D> = <D as DurableWalStore<ValueKind>>::Error;
 
 /// Cell-format discriminator persisted in a collection's structural
 /// identity.
@@ -66,7 +106,7 @@ type DurableErr<D> = <D as DurableWalStore<ValueKind>>::Error;
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CellKind {
-    /// Raw bytes produced by a user-facing [`StateCodec`].
+    /// Raw bytes produced by a user-facing [`Codec`].
     Codec = 1,
 
     /// A `MsgPack`-encoded [`KafkaMessageRef`].
@@ -113,7 +153,7 @@ impl From<&str> for SchemaLabel {
 }
 
 /// The frozen structural identity a descriptor asserts for its collection:
-/// collection kind, cell format, codec, and optional schema label.
+/// collection kind, cell format, codec token, and optional schema label.
 ///
 /// Operational settings (TTL, commit mode) are deliberately *not* part of
 /// the identity — they may change between deploys; the identity may not.
@@ -125,8 +165,9 @@ pub struct StructuralIdentity {
     /// Cell format discriminator.
     pub cell_kind: CellKind,
 
-    /// Codec discriminator ([`CodecId::None`] for framework-defined cells).
-    pub codec_id: CodecId,
+    /// Codec token ([`Codec::CODEC_ID`]; `None` for framework-defined
+    /// cells).
+    pub codec_id: Option<&'static str>,
 
     /// Optional user-supplied schema version label.
     pub schema_label: Option<SchemaLabel>,
@@ -135,9 +176,8 @@ pub struct StructuralIdentity {
 /// Context-independent descriptor metadata: the name and frozen identity
 /// that get registered and durably validated.
 ///
-/// Split from [`StateDescriptor`] (which is generic over the binding
-/// context) so registration can consume a descriptor without naming a
-/// context type.
+/// Split from [`StateDescriptor`] so registration can consume a
+/// descriptor without binding it to a context.
 pub trait DescriptorIdentity {
     /// The collection name this descriptor binds to.
     fn name(&self) -> &'static str;
@@ -146,51 +186,59 @@ pub trait DescriptorIdentity {
     fn structural_identity(&self) -> StructuralIdentity;
 }
 
-/// A typed view over one keyed-state collection, bindable to a handler
-/// context.
+/// A typed view over one keyed-state collection, bindable to any
+/// [`EventContext`].
 ///
-/// `Ctx` is the binding context (the middleware's wrapped handler context);
-/// the handle type depends on the stores and loader the context carries,
-/// which is why the trait is parameterized by it.
-pub trait StateDescriptor<Ctx>: DescriptorIdentity {
-    /// Typed handle returned by [`Self::bind`].
-    type Handle;
-
-    /// Error returned when the descriptor cannot bind.
-    type Error: ClassifyError + Error + Send + Sync + 'static;
+/// Binding validates registration + structural identity through the
+/// context's [`verify_state_registration`] capability and returns an
+/// owned, `Clone` handle that wraps the context's byte-cell capabilities
+/// with the descriptor's typing.
+///
+/// [`verify_state_registration`]: EventContext::verify_state_registration
+pub trait StateDescriptor: DescriptorIdentity + Copy {
+    /// Typed handle returned by [`Self::bind`]; owns a clone of the
+    /// binding context.
+    type Handle<Ctx: EventContext>;
 
     /// Validates registration + structural identity and returns the typed
-    /// handle for the current event scope.
+    /// handle.
     ///
     /// Consumes the descriptor — descriptors are cheap `Copy` declarations,
     /// so `ctx.state(DESC)` reads naturally at the call site.
     ///
     /// # Errors
     ///
-    /// Returns an error when the collection is unregistered or registered
-    /// with a different identity.
-    fn bind(self, ctx: &Ctx) -> Result<Self::Handle, Self::Error>;
+    /// Returns [`StateAccessError::Unavailable`] when the context provides
+    /// no keyed state, [`StateAccessError::Unregistered`] when the
+    /// collection is unregistered, or
+    /// [`StateAccessError::IdentityMismatch`] when it is registered with a
+    /// different identity.
+    fn bind<Ctx: EventContext>(self, ctx: &Ctx) -> Result<Self::Handle<Ctx>, StateAccessError>;
 }
 
 /// Descriptor for a codec-backed single value collection.
 ///
-/// `T` is the user's cell type; `C` the [`StateCodec`] that maps it to
-/// cell bytes (JSON by default). Declare as a `const` via [`value_state`].
-pub struct ValueDescriptor<T, C = JsonStateCodec> {
+/// The codec carries the typing: the cell type **is** `C::Payload`. The
+/// default [`JsonCodec`] stores [`serde_json::Value`] cells — the same
+/// default as the consumer's message payload. Declare as a `const` via
+/// [`value_state`]; for a typed cell, declare a codec
+/// (`CartCodec: Codec<Payload = Cart>`) and write
+/// `const CART: ValueDescriptor<CartCodec> = value_state("cart");`.
+pub struct ValueDescriptor<C = JsonCodec> {
     name: &'static str,
     schema_label: Option<&'static str>,
-    _marker: PhantomData<fn() -> (T, C)>,
+    _marker: PhantomData<fn() -> C>,
 }
 
-impl<T, C> Clone for ValueDescriptor<T, C> {
+impl<C> Clone for ValueDescriptor<C> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T, C> Copy for ValueDescriptor<T, C> {}
+impl<C> Copy for ValueDescriptor<C> {}
 
-impl<T, C> fmt::Debug for ValueDescriptor<T, C> {
+impl<C> fmt::Debug for ValueDescriptor<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValueDescriptor")
             .field("name", &self.name)
@@ -199,12 +247,14 @@ impl<T, C> fmt::Debug for ValueDescriptor<T, C> {
     }
 }
 
-/// Declares a JSON-coded value collection named `name`.
+/// Declares a codec-backed value collection named `name` (JSON by
+/// default — annotate the `const` with `ValueDescriptor<MyCodec>` to pick
+/// another codec).
 ///
 /// `name` is not validated here (const contexts cannot fail); an empty
 /// name fails loudly at registration, the fallible boundary.
 #[must_use]
-pub const fn value_state<T>(name: &'static str) -> ValueDescriptor<T> {
+pub const fn value_state<C>(name: &'static str) -> ValueDescriptor<C> {
     ValueDescriptor {
         name,
         schema_label: None,
@@ -212,7 +262,7 @@ pub const fn value_state<T>(name: &'static str) -> ValueDescriptor<T> {
     }
 }
 
-impl<T, C> ValueDescriptor<T, C> {
+impl<C> ValueDescriptor<C> {
     /// Attaches an opt-in schema version label to the frozen identity.
     #[must_use]
     pub const fn with_schema_label(mut self, label: &'static str) -> Self {
@@ -221,9 +271,9 @@ impl<T, C> ValueDescriptor<T, C> {
     }
 }
 
-impl<T, C> DescriptorIdentity for ValueDescriptor<T, C>
+impl<C> DescriptorIdentity for ValueDescriptor<C>
 where
-    C: StateCodec,
+    C: Codec,
 {
     fn name(&self) -> &'static str {
         self.name
@@ -233,80 +283,104 @@ where
         StructuralIdentity {
             kind: CollectionKindId::Value,
             cell_kind: CellKind::Codec,
-            codec_id: C::CODEC_ID,
+            codec_id: Some(C::CODEC_ID),
             schema_label: self.schema_label.map(SchemaLabel::from),
         }
     }
 }
 
-/// Typed handle over a codec-backed value collection.
-///
-/// Wraps the shared byte-transaction substrate; the codec runs only at the
-/// edges (`get` decodes, `set` encodes).
-pub struct TypedValueHandle<T, C, D, S> {
-    inner: ByteValueHandle<D, S>,
-    _marker: PhantomData<fn() -> (T, C)>,
+impl<C> StateDescriptor for ValueDescriptor<C>
+where
+    C: Codec,
+{
+    type Handle<Ctx: EventContext> = TypedValueHandle<Ctx, C>;
+
+    fn bind<Ctx: EventContext>(self, ctx: &Ctx) -> Result<Self::Handle<Ctx>, StateAccessError> {
+        let name = ctx.verify_state_registration(self.name, &self.structural_identity())?;
+        Ok(TypedValueHandle {
+            ctx: ctx.clone(),
+            name,
+            _marker: PhantomData,
+        })
+    }
 }
 
-impl<T, C, D, S> Clone for TypedValueHandle<T, C, D, S> {
+/// Typed, owned handle over a codec-backed value collection.
+///
+/// Owns a clone of the binding context (`Clone + Send + Sync + 'static` —
+/// an FFI requirement); the codec runs only at the edges (`get` decodes,
+/// `set` encodes) over the context's byte-cell capabilities. Every
+/// operation first guards on context termination
+/// ([`StateAccessError::Terminated`]); stale post-dispatch use
+/// additionally fails through the per-event transaction state machine.
+pub struct TypedValueHandle<Ctx, C> {
+    ctx: Ctx,
+    name: StateName,
+    _marker: PhantomData<fn() -> C>,
+}
+
+impl<Ctx: Clone, C> Clone for TypedValueHandle<Ctx, C> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            ctx: self.ctx.clone(),
+            name: self.name.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<T, C, D, S> TypedValueHandle<T, C, D, S>
+impl<Ctx, C> TypedValueHandle<Ctx, C>
 where
-    T: Serialize + DeserializeOwned,
-    C: StateCodec,
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
+    Ctx: EventContext,
+    C: Codec,
 {
-    pub(crate) fn new(inner: ByteValueHandle<D, S>) -> Self {
-        Self {
-            inner,
-            _marker: PhantomData,
-        }
-    }
-
     /// Reads and decodes the current visible value.
     ///
     /// # Errors
     ///
-    /// Returns a transaction error or a codec error when the cell bytes do
-    /// not decode as `T`.
-    pub async fn get(
-        &self,
-    ) -> Result<Option<T>, TypedValueError<DirtyErr<S>, DurableErr<D>, C::Error>> {
-        match self.inner.get().await? {
-            Some(cell) => Ok(Some(C::decode(&cell).map_err(TypedValueError::Codec)?)),
-            None => Ok(None),
-        }
+    /// Returns an access error from the context, or a codec error
+    /// (Permanent) when the cell bytes do not decode as `C::Payload`.
+    pub async fn get(&self) -> Result<Option<C::Payload>, ValueStateError<C::Error>> {
+        ensure_live(&self.ctx)?;
+        let Some(cell) = self.ctx.state_cell(&self.name).await? else {
+            return Ok(None);
+        };
+        // `Codec::deserialize` parses in place (destructive); cells live in
+        // shared `Bytes`, so copy first.
+        let mut buf = cell.to_vec();
+        let payload = C::with_cached_local(|codec| codec.deserialize(&mut buf))
+            .map_err(ValueStateError::Codec)?;
+        Ok(Some(payload))
     }
 
     /// Encodes `value` and buffers a set operation.
     ///
+    /// Takes the value by value — [`Codec::serialize`] consumes its
+    /// payload.
+    ///
     /// # Errors
     ///
-    /// Returns a codec error when `value` fails to encode, or a transaction
-    /// error from the underlying store.
-    pub async fn set(
-        &self,
-        value: T,
-    ) -> Result<(), TypedValueError<DirtyErr<S>, DurableErr<D>, C::Error>> {
-        let cell = C::encode(&value).map_err(TypedValueError::Codec)?;
-        Ok(self.inner.set(cell).await?)
+    /// Returns a codec error (Permanent) when `value` fails to encode, or
+    /// an access error from the context.
+    pub async fn set(&self, value: C::Payload) -> Result<(), ValueStateError<C::Error>> {
+        ensure_live(&self.ctx)?;
+        let mut buf = Vec::new();
+        C::with_cached_local(|codec| codec.serialize(value, &mut buf))
+            .map_err(ValueStateError::Codec)?;
+        Ok(self
+            .ctx
+            .set_state_cell(&self.name, Bytes::from(buf))
+            .await?)
     }
 
     /// Buffers a clear operation.
     ///
     /// # Errors
     ///
-    /// Returns a transaction error from the underlying store.
-    pub async fn clear(&self) -> Result<(), TypedValueError<DirtyErr<S>, DurableErr<D>, C::Error>> {
-        Ok(self.inner.clear().await?)
+    /// Returns an access error from the context.
+    pub async fn clear(&self) -> Result<(), ValueStateError<C::Error>> {
+        ensure_live(&self.ctx)?;
+        Ok(self.ctx.clear_state_cell(&self.name).await?)
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
@@ -314,120 +388,55 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a transaction error from the underlying store.
-    pub async fn flush(
-        &self,
-    ) -> Result<StoreOutcome, TypedValueError<DirtyErr<S>, DurableErr<D>, C::Error>> {
-        Ok(self.inner.flush().await?)
+    /// Returns an access error from the context.
+    pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
+        ensure_live(&self.ctx)?;
+        Ok(self.ctx.flush_state_cell(&self.name).await?)
     }
+}
+
+/// Guards every handle operation: a context that is shutting down or whose
+/// message is cancelled refuses state access with
+/// [`StateAccessError::Terminated`]. Shared by the value and Kafka-message
+/// handles.
+pub(crate) fn ensure_live<Ctx>(ctx: &Ctx) -> Result<(), StateAccessError>
+where
+    Ctx: TerminationSignals,
+{
+    if ctx.is_shutdown() || ctx.is_message_cancelled() {
+        return Err(StateAccessError::Terminated);
+    }
+    Ok(())
 }
 
 /// Error returned by [`TypedValueHandle`] operations.
 #[derive(Debug, Error)]
-pub enum TypedValueError<DirtyE, DurableE, CodecE>
+pub enum ValueStateError<E>
 where
-    DirtyE: ClassifyError + Error + Send + Sync + 'static,
-    DurableE: ClassifyError + Error + Send + Sync + 'static,
-    CodecE: ClassifyError + Error + Send + Sync + 'static,
+    E: Error + Send + Sync + 'static,
 {
-    /// The underlying value transaction failed.
+    /// The context refused or failed the state access.
     #[error(transparent)]
-    Tx(#[from] TransactionValueStoreError<DirtyE, DurableE>),
+    Access(#[from] StateAccessError),
 
-    /// The state codec failed to encode or decode the cell.
+    /// The codec failed to encode or decode the cell.
     #[error("state codec failed")]
-    Codec(#[source] CodecE),
+    Codec(#[source] E),
 }
 
-impl<DirtyE, DurableE, CodecE> ClassifyError for TypedValueError<DirtyE, DurableE, CodecE>
+impl<E> ClassifyError for ValueStateError<E>
 where
-    DirtyE: ClassifyError + Error + Send + Sync + 'static,
-    DurableE: ClassifyError + Error + Send + Sync + 'static,
-    CodecE: ClassifyError + Error + Send + Sync + 'static,
+    E: Error + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Tx(e) => e.classify_error(),
-            Self::Codec(e) => e.classify_error(),
+            Self::Access(e) => e.classify_error(),
+            // Unconditionally Permanent: `Codec` promises no
+            // classification, and a cell that does not round-trip will not
+            // start doing so on retry.
+            Self::Codec(_) => ErrorCategory::Permanent,
         }
     }
-}
-
-/// Error returned when a descriptor cannot bind to a context.
-#[derive(Debug, Error)]
-pub enum BindError {
-    /// The collection name was never registered with the consumer.
-    #[error("state collection {name:?} is not registered")]
-    Unregistered {
-        /// The descriptor's collection name.
-        name: &'static str,
-    },
-
-    /// The registry holds a different identity for this name.
-    #[error(
-        "state collection {name:?} identity mismatch: registered {registered:?}, descriptor \
-         asserts {requested:?}"
-    )]
-    IdentityMismatch {
-        /// The descriptor's collection name.
-        name: &'static str,
-
-        /// Identity held by the registry.
-        registered: StructuralIdentity,
-
-        /// Identity the binding descriptor asserts.
-        requested: StructuralIdentity,
-    },
-}
-
-impl ClassifyError for BindError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
-    }
-}
-
-/// Binds a value descriptor against any event scope and any loader: the
-/// codec needs neither Kafka coordinates nor a message loader.
-impl<C, D, S, L, Scope, T, Cdc> StateDescriptor<KeyedStateContext<C, D, S, L, Scope>>
-    for ValueDescriptor<T, Cdc>
-where
-    T: Serialize + DeserializeOwned,
-    Cdc: StateCodec,
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
-{
-    type Error = BindError;
-    type Handle = TypedValueHandle<T, Cdc, D, S>;
-
-    fn bind(self, ctx: &KeyedStateContext<C, D, S, L, Scope>) -> Result<Self::Handle, BindError> {
-        let name = require_registered(ctx.registry(), &self)?;
-        Ok(TypedValueHandle::new(ctx.byte_handle(&name)))
-    }
-}
-
-/// Validates `descriptor` against the registered collections and returns
-/// the canonical [`StateName`] on success. Shared by every `bind` impl.
-pub(crate) fn require_registered<D>(
-    registry: &CollectionDefRegistry,
-    descriptor: &D,
-) -> Result<StateName, BindError>
-where
-    D: DescriptorIdentity,
-{
-    let Some((name, registered)) = registry.lookup(descriptor.name()) else {
-        return Err(BindError::Unregistered {
-            name: descriptor.name(),
-        });
-    };
-    let requested = descriptor.structural_identity();
-    if registered.identity != requested {
-        return Err(BindError::IdentityMismatch {
-            name: descriptor.name(),
-            registered: registered.identity.clone(),
-            requested,
-        });
-    }
-    Ok(name.clone())
 }
 
 #[cfg(test)]

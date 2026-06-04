@@ -276,7 +276,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let id = self.dedup_uuid_for_message(&message);
 
@@ -327,7 +327,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.inner
             .on_timer(context, trigger, demand_type)
@@ -338,7 +338,7 @@ where
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // The `Err(Store(_))` arm covers two cases:
         //   1. Inner did not run (store read failed before dispatch).
@@ -359,7 +359,7 @@ where
 
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // See `after_commit`: `Err(Store(_))` covers both pre-inner read
         // failure and post-inner write failure. Both suppress the inner hook;

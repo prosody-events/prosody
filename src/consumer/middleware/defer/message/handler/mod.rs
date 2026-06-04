@@ -263,7 +263,7 @@ where
         retry_count: u32,
     ) -> DeferResult<(), M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let fire_time = self.next_retry_time(retry_count)?;
 
@@ -290,7 +290,7 @@ where
         result: MessageRetryCompletionResult,
     ) -> DeferResult<(), M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             MessageRetryCompletionResult::MoreMessages { .. } => {
@@ -316,7 +316,7 @@ where
         offset: Offset,
     ) -> DeferResult<(), M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let result = self
             .store
@@ -375,7 +375,7 @@ where
         error: T::Error,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let error_category = error.classify_error();
         let exception = format!("{error:?}").into_boxed_str();
@@ -469,7 +469,7 @@ where
         retry_count: u32,
     ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let message = match self
             .loader
@@ -517,7 +517,7 @@ where
         error: L::Error,
     ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match error.classify_error() {
             ErrorCategory::Permanent => {
@@ -572,7 +572,7 @@ where
         inner_error: T::Error,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Timer first, then store: ensures timer coverage on partial failure.
         self.schedule_retry_timer(&context, 0).await?;
@@ -612,7 +612,7 @@ where
         message: ConsumerMessage<T::Payload>,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.sender.timer_dispatched(
             trigger.key.clone(),
@@ -702,7 +702,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Already deferred: queue behind existing messages (ordering
         // invariant). Inner does not run -> NoInner.
@@ -768,7 +768,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         if trigger.timer_type != TimerType::DeferredMessage {
             return self
@@ -834,7 +834,7 @@ where
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Apply-hook routing (see module docs):
         // - Inner(o):    inner ran and succeeded           -> after_commit(Ok)
@@ -864,7 +864,7 @@ where
 
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Symmetric to after_commit. Two notes:
         //   - Deferred(e) still routes to after_abort(Err(e)) regardless of the outer

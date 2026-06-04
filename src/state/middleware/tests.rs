@@ -7,18 +7,19 @@
 
 #![allow(clippy::wildcard_imports, clippy::match_wildcard_for_single_variants)]
 
-use super::context::{ByteValueHandle, ContextParts};
+use super::context::ContextParts;
 use super::descriptor_identity::LazyDescriptorIdentity;
 use super::handler::{PartitionBackend, recover_pending_entries};
 use super::*;
 use crate::Key;
 use crate::consumer::event_context::EventContext;
+use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::DurableState;
 use crate::state::SharedStateBackend;
 use crate::state::StoreOutcome;
-use crate::state::descriptor::{KafkaMessageRef, NoLoader, ValueDescriptor, value_state};
+use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{
     MemoryDirtyValueStore, MemoryDirtyValueStoreProvider, MemoryDurableValueStore,
 };
@@ -182,7 +183,7 @@ fn build_context<C, D>(
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
-) -> KeyedStateContext<C, D, MemoryDirtyValueStore, NoLoader, TimerScope>
+) -> KeyedStateContext<C, D, MemoryDirtyValueStore, MemoryLoader<serde_json::Value>>
 where
     C: EventContext + Clone + Send + Sync + 'static,
     D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
@@ -198,8 +199,7 @@ where
         inner,
         durable,
         dirty: MemoryDirtyValueStore::new(),
-        loader: NoLoader,
-        scope: TimerScope,
+        loader: MemoryLoader::new(),
         registry,
         state_key,
         event,
@@ -211,22 +211,9 @@ where
 fn registry_with_mode(name: &'static str, mode: CommitMode) -> Result<CollectionDefRegistry> {
     let mut r = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
     let def = CollectionDef::new(Some(CompactDuration::new(3_600))).with_commit_mode(mode);
-    r.register(&value_state::<serde_json::Value>(name), def)?;
+    let descriptor: ValueDescriptor = value_state(name);
+    r.register(&descriptor, def)?;
     Ok(r)
-}
-
-/// Opens the byte-level substrate handle for `name` — the directed tests
-/// below assert raw durable bytes, so they drive the substrate directly;
-/// typed `ctx.state(DESC)` coverage lives in the descriptor tests and the
-/// end-to-end middleware tests.
-fn byte_handle<C, D>(
-    ctx: &KeyedStateContext<C, D, MemoryDirtyValueStore, NoLoader, TimerScope>,
-    name: &str,
-) -> Result<ByteValueHandle<D, MemoryDirtyValueStore>>
-where
-    D: Clone,
-{
-    Ok(ctx.byte_handle(&StateName::try_new(name)?))
 }
 
 /// Substrate `set(...)` should accumulate dirty ops and
@@ -238,15 +225,15 @@ async fn value_set_then_seal_persists_sealed_wal() -> Result<()> {
     let state_key = make_state_key();
     let event = msg_event(1);
     let ctx = build_context(
-        MockEventContext::new(),
+        MockEventContext::<serde_json::Value>::new(),
         durable.clone(),
         registry,
         state_key.clone(),
         event,
     );
 
-    let handle = byte_handle(&ctx, "counter")?;
-    handle.set(bytes(7)).await?;
+    ctx.set_state_cell(&StateName::try_new("counter")?, bytes(7))
+        .await?;
 
     let sealed = ctx.resolve_per_collection().await?;
     assert_eq!(sealed.len(), 1, "exactly one collection sealed");
@@ -270,16 +257,16 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
     let state_key = make_state_key();
     let event = msg_event(42);
     let ctx = build_context(
-        MockEventContext::new(),
+        MockEventContext::<serde_json::Value>::new(),
         durable.clone(),
         registry,
         state_key.clone(),
         event,
     );
 
-    let handle = byte_handle(&ctx, "counter")?;
-    handle.set(bytes(13)).await?;
-    let outcome = handle.flush().await?;
+    let counter = StateName::try_new("counter")?;
+    ctx.set_state_cell(&counter, bytes(13)).await?;
+    let outcome = ctx.flush_state_cell(&counter).await?;
     assert_eq!(
         outcome,
         StoreOutcome::Applied,
@@ -290,7 +277,7 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
     assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(13)));
 
     // Second flush is a no-op on Clean.
-    let outcome = handle.flush().await?;
+    let outcome = ctx.flush_state_cell(&counter).await?;
     assert_eq!(outcome, StoreOutcome::NoOp);
     Ok(())
 }
@@ -304,18 +291,18 @@ async fn repeat_value_call_returns_same_transaction() -> Result<()> {
     let state_key = make_state_key();
     let event = msg_event(2);
     let ctx = build_context(
-        MockEventContext::new(),
+        MockEventContext::<serde_json::Value>::new(),
         durable.clone(),
         registry,
         state_key.clone(),
         event,
     );
 
-    let first = byte_handle(&ctx, "counter")?;
-    first.set(bytes(5)).await?;
+    let counter = StateName::try_new("counter")?;
+    ctx.set_state_cell(&counter, bytes(5)).await?;
 
-    let second = byte_handle(&ctx, "counter")?;
-    assert_eq!(second.get().await?, Some(bytes(5)));
+    // A later access by the same name joins the same per-event transaction.
+    assert_eq!(ctx.state_cell(&counter).await?, Some(bytes(5)));
     Ok(())
 }
 
@@ -328,15 +315,15 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
     let state_key = make_state_key();
     let event = msg_event(3);
     let ctx = build_context(
-        MockEventContext::new(),
+        MockEventContext::<serde_json::Value>::new(),
         durable.clone(),
         registry,
         state_key.clone(),
         event,
     );
 
-    let handle = byte_handle(&ctx, "counter")?;
-    handle.set(bytes(9)).await?;
+    ctx.set_state_cell(&StateName::try_new("counter")?, bytes(9))
+        .await?;
     let sealed = ctx.resolve_per_collection().await?;
     assert!(
         sealed.is_empty(),
@@ -352,8 +339,8 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
 /// registered, otherwise the default.
 #[test]
 fn registry_lookup_falls_back_to_default() -> Result<()> {
-    const BOUNDED: ValueDescriptor<serde_json::Value> = value_state("bounded");
-    const UNBOUNDED: ValueDescriptor<serde_json::Value> = value_state("unbounded");
+    const BOUNDED: ValueDescriptor = value_state("bounded");
+    const UNBOUNDED: ValueDescriptor = value_state("unbounded");
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(7_200)));
     registry.register(&BOUNDED, CollectionDef::new(Some(CompactDuration::new(60))))?;
     registry.register(&UNBOUNDED, CollectionDef::new(None))?;
@@ -383,7 +370,7 @@ async fn state_recovery_applies_sealed_when_oracle_says_committed() -> Result<()
     // Seal a WAL out-of-band; the recovery handler should apply it.
     seal_set(&durable, &collection_ref, event, 11).await?;
 
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let registry = registry();
     recover_pending_entries(
         &context,
@@ -429,7 +416,7 @@ async fn state_recovery_deletes_stale_pending_over_idle_partition() -> Result<()
     let pending_before: Vec<_> = durable.scan_pending(&state_key).collect().await;
     assert_eq!(pending_before.len(), 1, "the stale pending row is present");
 
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let oracle = CountingOracle::new(CommitDecision::Committed);
     recover_pending_entries(
         &context,
@@ -480,7 +467,7 @@ async fn state_recovery_rolls_back_when_oracle_says_not_committed() -> Result<()
 
     seal_set(&durable, &collection_ref, event, 99).await?;
 
-    let context = MockEventContext::new();
+    let context = MockEventContext::<serde_json::Value>::new();
     let registry = registry();
     recover_pending_entries(
         &context,
@@ -509,7 +496,7 @@ async fn state_recovery_rolls_back_when_oracle_says_not_committed() -> Result<()
 async fn state_recovery_with_empty_partition_clears_timer() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let state_key = make_state_key();
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let registry = registry();
 
     recover_pending_entries(
@@ -540,41 +527,17 @@ async fn state_recovery_with_empty_partition_clears_timer() -> Result<()> {
     Ok(())
 }
 
-/// N6: a message-scoped context exposes `message_ref()` with the message's
-/// exact Kafka coordinates. The negative side is a type-level fact, not a
-/// runtime check: `message_ref` is defined only on
-/// `KeyedStateContext<_, _, _, _, MessageScope>`, so a timer-scoped context
-/// (the `TimerScope` parameter [`build_context`] uses everywhere else in
-/// this file) cannot name it — referencing it fails to compile.
-#[test]
-fn message_scope_context_exposes_message_ref() {
-    let ctx = KeyedStateContext::new(ContextParts {
-        inner: MockEventContext::new(),
-        durable: MemoryDurableValueStore::for_tests(),
-        dirty: MemoryDirtyValueStore::new(),
-        loader: NoLoader,
-        scope: MessageScope::new(crate::Topic::from("orders.v1"), 3, 42),
-        registry: Arc::new(registry()),
-        state_key: make_state_key(),
-        event: msg_event(1),
-    });
-    assert_eq!(
-        ctx.message_ref(),
-        KafkaMessageRef {
-            topic: crate::Topic::from("orders.v1"),
-            partition: 3,
-            offset: 42,
-        }
-    );
-}
-
 /// Builder validation: `build()` fails fast when required fields are
 /// missing.
 #[test]
 fn builder_rejects_missing_fields() -> Result<()> {
     type ProbeOutput = ();
-    let builder: KeyedStateMiddlewareBuilder<TestBackend, MemoryDurableValueStore, ProbeOutput> =
-        KeyedStateMiddleware::builder();
+    let builder: KeyedStateMiddlewareBuilder<
+        TestBackend,
+        MemoryDurableValueStore,
+        ProbeOutput,
+        MemoryLoader<serde_json::Value>,
+    > = KeyedStateMiddleware::builder();
     let err = builder
         .build()
         .err()
@@ -620,7 +583,7 @@ impl FallibleHandler for RecordingHandler {
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = ctx; // suppress unused warning when handler skips value
         Err(RecordingHandlerError)
@@ -633,7 +596,7 @@ impl FallibleHandler for RecordingHandler {
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -671,7 +634,7 @@ impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = ctx; // The blanket `C: EventContext` bound erases the concrete
         // keyed-state context type. The non-recovery message arm of the test
@@ -687,7 +650,7 @@ impl<H: Send + Sync + 'static> FallibleHandler for ValueWritingHandler<H> {
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -708,7 +671,7 @@ fn build_handler(
     ValueWritingHandler<MemoryDurableValueStore>,
     TestBackend,
     MemoryDurableValueStore,
-    NoLoader,
+    MemoryLoader<serde_json::Value>,
 > {
     let registry = Arc::new(registry().with_default_commit_mode(commit_mode));
     let segment_id = Uuid::new_v4();
@@ -721,7 +684,7 @@ fn build_handler(
             identity: LazyDescriptorIdentity::new(durable.clone(), registry.clone(), segment_id),
         }),
         scanner: durable,
-        loader: NoLoader,
+        loader: MemoryLoader::new(),
         consumer_group: Arc::from("test-group"),
         version: Arc::from("1"),
         registry,
@@ -776,7 +739,7 @@ async fn derive_dedup_id_matches_canonical_writer_derivation() -> Result<()> {
 async fn on_timer_state_recovery_returns_recovery_variant() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let key: Key = Arc::from("user-1");
     let trigger = Trigger::for_testing(key, CompactDateTime::from(1_u32), TimerType::StateRecovery);
 
@@ -801,7 +764,7 @@ async fn on_timer_state_recovery_returns_recovery_variant() -> Result<()> {
 async fn after_commit_and_after_abort_suppress_on_recovery_output() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
 
     // No panic, no inner mutation.
     handler
@@ -819,7 +782,7 @@ async fn after_commit_and_after_abort_suppress_on_recovery_output() -> Result<()
 async fn after_commit_with_sealed_list_clears_state_recovery_timer() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
 
     let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
     let id = make_collection_id(&state_key, "x")?;
@@ -863,7 +826,7 @@ async fn after_commit_with_sealed_list_clears_state_recovery_timer() -> Result<(
 async fn after_commit_apply_error_leaves_state_recovery_timer_armed() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
 
     let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
     let id = make_collection_id(&state_key, "x")?;
@@ -909,7 +872,7 @@ async fn after_commit_apply_error_leaves_state_recovery_timer_armed() -> Result<
 async fn after_abort_with_sealed_list_rolls_back() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
 
     let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
     let id = make_collection_id(&state_key, "x")?;
@@ -952,7 +915,7 @@ async fn on_message_direct_mode_never_schedules_state_recovery() -> Result<()> {
         FixedOracle::committed(),
         CommitMode::Direct,
     );
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let msg = test_message()?;
     let _result = handler
         .on_message(context.clone(), msg, DemandType::Normal)
@@ -968,7 +931,7 @@ async fn on_message_direct_mode_never_schedules_state_recovery() -> Result<()> {
 async fn on_message_wal_mode_with_no_seals_does_not_schedule() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
-    let context = MockEventContext::new().with_timer_tracking();
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let msg = test_message()?;
     let _result = handler
         .on_message(context.clone(), msg, DemandType::Normal)
@@ -989,28 +952,28 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = Arc::new(registry());
     let segment_id = Uuid::new_v4();
-    let handler: KeyedStateHandler<RecordingHandler, TestBackend, _, NoLoader> =
-        KeyedStateHandler {
-            inner: RecordingHandler,
-            backend: Ok(PartitionBackend {
-                durable: durable.clone(),
-                oracle: FixedOracle::committed(),
-                dirty: MemoryDirtyValueStoreProvider,
-                identity: LazyDescriptorIdentity::new(
-                    durable.clone(),
-                    registry.clone(),
-                    segment_id,
-                ),
-            }),
-            scanner: durable,
-            loader: NoLoader,
-            consumer_group: Arc::from("test-group"),
-            version: Arc::from("1"),
-            registry,
-            segment_id,
-            recovery_delay: CompactDuration::new(30),
-        };
-    let context = MockEventContext::new().with_timer_tracking();
+    let handler: KeyedStateHandler<
+        RecordingHandler,
+        TestBackend,
+        _,
+        MemoryLoader<serde_json::Value>,
+    > = KeyedStateHandler {
+        inner: RecordingHandler,
+        backend: Ok(PartitionBackend {
+            durable: durable.clone(),
+            oracle: FixedOracle::committed(),
+            dirty: MemoryDirtyValueStoreProvider,
+            identity: LazyDescriptorIdentity::new(durable.clone(), registry.clone(), segment_id),
+        }),
+        scanner: durable,
+        loader: MemoryLoader::new(),
+        consumer_group: Arc::from("test-group"),
+        version: Arc::from("1"),
+        registry,
+        segment_id,
+        recovery_delay: CompactDuration::new(30),
+    };
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
     let msg = test_message()?;
 
     let err = handler
@@ -1130,20 +1093,20 @@ async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
         let event_ref = msg_event(idx as u128 + 1);
         // Drive the real per-event context + seal.
         let ctx = build_context(
-            MockEventContext::new(),
+            MockEventContext::<serde_json::Value>::new(),
             durable.clone(),
             registry.clone(),
             state_key.clone(),
             event_ref,
         );
-        let handle = byte_handle(&ctx, "v")?;
+        let name = StateName::try_new("v")?;
         let applied_if_committed = match &event.step {
             MiddlewareStep::Set(byte) => {
-                handle.set(bytes(*byte)).await?;
+                ctx.set_state_cell(&name, bytes(*byte)).await?;
                 Some(bytes(*byte))
             }
             MiddlewareStep::Clear => {
-                handle.clear().await?;
+                ctx.clear_state_cell(&name).await?;
                 None
             }
         };
@@ -1155,7 +1118,7 @@ async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
             sealed_event: Some(event_ref),
             sealed_collections: sealed,
         };
-        let mock = MockEventContext::new();
+        let mock = MockEventContext::<serde_json::Value>::new();
         if event.commit {
             handler.after_commit(mock, Ok(output)).await;
             model = applied_if_committed;

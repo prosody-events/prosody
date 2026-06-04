@@ -1,37 +1,30 @@
 //! Kafka-message descriptor: cells hold a durable message reference that
-//! resolves to the full consumer message through the defer loader.
+//! resolves to the full consumer message through the consumer's message
+//! loader.
 
 use super::{
-    BindError, CellKind, DescriptorIdentity, DirtyErr, DurableErr, SchemaLabel, StateDescriptor,
-    StructuralIdentity, require_registered,
+    CellKind, DescriptorIdentity, SchemaLabel, StateDescriptor, StructuralIdentity, ensure_live,
 };
-use crate::codec::CodecId;
+use crate::consumer::event_context::{EventContext, StateAccessError};
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
+use crate::state::StateName;
 use crate::state::StoreOutcome;
-use crate::state::middleware::{
-    ByteValueHandle, DirtyValueBundle, DurableValueBundle, KeyedStateContext,
-};
-use crate::state::value::TransactionValueStoreError;
 use crate::{Offset, Partition, Topic};
 use bytes::Bytes;
 use rmp_serde::decode::Error as MsgPackDecodeError;
 use rmp_serde::encode::Error as MsgPackEncodeError;
 use serde::{Deserialize, Serialize};
-use std::error::Error;
-use std::fmt;
 use thiserror::Error;
 
 /// Durable pointer to a Kafka message body.
 ///
 /// Persisted as the `MsgPack`-encoded cell of a Kafka-message collection;
-/// resolved back to the full message via the defer [`MessageLoader`].
-/// Inside a message handler, [`message_ref()`] on the context names the
-/// message being processed — the only production source of a ref.
-///
-/// [`message_ref()`]: crate::state::middleware::KeyedStateContext::message_ref
+/// resolved back to the full message via the consumer's
+/// [`MessageLoader`](crate::consumer::middleware::defer::message::MessageLoader).
+/// Derived from the [`ConsumerMessage`] in hand at
+/// [`KafkaMessageHandle::set`] — the only production source of a ref.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KafkaMessageRef {
     /// Kafka topic.
@@ -43,6 +36,16 @@ pub struct KafkaMessageRef {
 
     /// Kafka offset within the partition.
     pub offset: Offset,
+}
+
+impl<P> From<&ConsumerMessage<P>> for KafkaMessageRef {
+    fn from(message: &ConsumerMessage<P>) -> Self {
+        Self {
+            topic: message.topic(),
+            partition: message.partition(),
+            offset: message.offset(),
+        }
+    }
 }
 
 mod topic_serde {
@@ -65,20 +68,12 @@ mod topic_serde {
     }
 }
 
-/// Placeholder for the loader slot of consumers with no Kafka-message
-/// collections.
-///
-/// Deliberately does **not** implement [`MessageLoader`], so a
-/// [`KafkaMessageDescriptor`] cannot bind against a context carrying it —
-/// `ctx.state(KAFKA_DESC)` fails to compile instead of failing at runtime.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoLoader;
-
 /// Descriptor for a collection whose cells reference Kafka message bodies.
 ///
-/// Declare as a `const` via [`kafka_message_state`]. Binding requires the
-/// context's loader to be a real [`MessageLoader`]; `get()` then returns
-/// the full `ConsumerMessage` with the handler's payload type.
+/// Codec-free: message typing flows from the binding context's
+/// [`EventContext::Payload`] — the consumer's own codec decodes the loaded
+/// message, so the handle returns `ConsumerMessage<Ctx::Payload>` with no
+/// codec parameter. Declare as a `const` via [`kafka_message_state`].
 #[derive(Clone, Copy, Debug)]
 pub struct KafkaMessageDescriptor {
     name: &'static str,
@@ -115,70 +110,40 @@ impl DescriptorIdentity for KafkaMessageDescriptor {
         StructuralIdentity {
             kind: CollectionKindId::Value,
             cell_kind: CellKind::KafkaMessageRef,
-            codec_id: CodecId::None,
+            codec_id: None,
             schema_label: self.schema_label.map(SchemaLabel::from),
         }
     }
 }
 
-/// Binds a Kafka-message descriptor against any event scope, but only a
-/// context whose loader is a real [`MessageLoader`] — with the default
-/// [`NoLoader`] this impl does not exist, so `ctx.state(KAFKA_DESC)` is a
-/// compile error rather than a runtime one. Reading needs no message
-/// coordinates, so timer handlers may bind and `get()`; only `set` needs a
-/// ref, and the only production source of one is the message-scoped
-/// `message_ref()`.
-impl<C, D, S, L, Scope> StateDescriptor<KeyedStateContext<C, D, S, L, Scope>>
-    for KafkaMessageDescriptor
-where
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
-    L: MessageLoader,
-{
-    type Error = BindError;
-    type Handle = KafkaValueHandle<L, D, S>;
+impl StateDescriptor for KafkaMessageDescriptor {
+    type Handle<Ctx: EventContext> = KafkaMessageHandle<Ctx>;
 
-    fn bind(self, ctx: &KeyedStateContext<C, D, S, L, Scope>) -> Result<Self::Handle, BindError> {
-        let name = require_registered(ctx.registry(), &self)?;
-        Ok(KafkaValueHandle::new(
-            ctx.byte_handle(&name),
-            ctx.loader().clone(),
-        ))
+    fn bind<Ctx: EventContext>(self, ctx: &Ctx) -> Result<Self::Handle<Ctx>, StateAccessError> {
+        let name = ctx.verify_state_registration(self.name, &self.structural_identity())?;
+        Ok(KafkaMessageHandle {
+            ctx: ctx.clone(),
+            name,
+        })
     }
 }
 
-/// Typed handle over a Kafka-message collection.
+/// Typed, owned handle over a Kafka-message collection.
 ///
-/// Wraps the shared byte-transaction substrate: the cell is the
-/// `MsgPack`-encoded [`KafkaMessageRef`]; `get()` resolves it to the full
-/// message through the loader.
-pub struct KafkaValueHandle<L, D, S> {
-    inner: ByteValueHandle<D, S>,
-    loader: L,
+/// The cell is the `MsgPack`-encoded [`KafkaMessageRef`]; [`Self::get`]
+/// resolves it to the full message through the context's loader, decoded
+/// by the consumer's own codec. Owns a clone of the binding context; every
+/// operation guards on context termination.
+#[derive(Clone)]
+pub struct KafkaMessageHandle<Ctx> {
+    ctx: Ctx,
+    name: StateName,
 }
 
-impl<L, D, S> Clone for KafkaValueHandle<L, D, S>
+impl<Ctx> KafkaMessageHandle<Ctx>
 where
-    L: Clone,
+    Ctx: EventContext,
 {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            loader: self.loader.clone(),
-        }
-    }
-}
-
-impl<L, D, S> KafkaValueHandle<L, D, S>
-where
-    L: MessageLoader,
-    D: DurableValueBundle,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
-{
-    pub(crate) fn new(inner: ByteValueHandle<D, S>, loader: L) -> Self {
-        Self { inner, loader }
-    }
-
     /// Reads the current cell and loads the referenced message.
     ///
     /// Returns `Ok(None)` for an absent cell. A present cell whose
@@ -187,46 +152,47 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a transaction error, a corrupt-ref error, or the loader's
-    /// error when the message cannot be loaded.
-    pub async fn get(
-        &self,
-    ) -> Result<
-        Option<ConsumerMessage<L::Payload>>,
-        KafkaValueError<DirtyErr<S>, DurableErr<D>, L::Error>,
-    > {
-        let Some(cell) = self.inner.get().await? else {
+    /// Returns an access error from the context (including the type-erased
+    /// loader failure) or a corrupt-ref error.
+    pub async fn get(&self) -> Result<Option<ConsumerMessage<Ctx::Payload>>, KafkaStateError> {
+        ensure_live(&self.ctx)?;
+        let Some(cell) = self.ctx.state_cell(&self.name).await? else {
             return Ok(None);
         };
         let message_ref = decode_ref(&cell)?;
-        let message = self
-            .loader
-            .load_message(message_ref.topic, message_ref.partition, message_ref.offset)
-            .await
-            .map_err(KafkaValueError::Loader)?;
-        Ok(Some(message))
+        Ok(Some(self.ctx.load_state_message(message_ref).await?))
     }
 
-    /// Buffers a set of the `MsgPack`-encoded `message_ref` cell.
+    /// Buffers a set of the `MsgPack`-encoded reference to `message`.
+    ///
+    /// The reference is derived from the message in hand; the payload type
+    /// equality between the handler's message and the context is enforced
+    /// by the `C: EventContext<Payload = Self::Payload>` handler bound, so
+    /// this is a compile-time match.
     ///
     /// # Errors
     ///
-    /// Returns an encode error or a transaction error from the underlying
-    /// store.
+    /// Returns an encode error or an access error from the context.
     pub async fn set(
         &self,
-        message_ref: KafkaMessageRef,
-    ) -> Result<(), KafkaValueError<DirtyErr<S>, DurableErr<D>, L::Error>> {
-        Ok(self.inner.set(encode_ref(&message_ref)?).await?)
+        message: &ConsumerMessage<Ctx::Payload>,
+    ) -> Result<(), KafkaStateError> {
+        ensure_live(&self.ctx)?;
+        let message_ref = KafkaMessageRef::from(message);
+        let cell = rmp_serde::to_vec_named(&message_ref)
+            .map(Bytes::from)
+            .map_err(KafkaStateError::EncodeRef)?;
+        Ok(self.ctx.set_state_cell(&self.name, cell).await?)
     }
 
     /// Buffers a clear operation.
     ///
     /// # Errors
     ///
-    /// Returns a transaction error from the underlying store.
-    pub async fn clear(&self) -> Result<(), KafkaValueError<DirtyErr<S>, DurableErr<D>, L::Error>> {
-        Ok(self.inner.clear().await?)
+    /// Returns an access error from the context.
+    pub async fn clear(&self) -> Result<(), KafkaStateError> {
+        ensure_live(&self.ctx)?;
+        Ok(self.ctx.clear_state_cell(&self.name).await?)
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
@@ -234,51 +200,25 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a transaction error from the underlying store.
-    pub async fn flush(
-        &self,
-    ) -> Result<StoreOutcome, KafkaValueError<DirtyErr<S>, DurableErr<D>, L::Error>> {
-        Ok(self.inner.flush().await?)
+    /// Returns an access error from the context.
+    pub async fn flush(&self) -> Result<StoreOutcome, KafkaStateError> {
+        ensure_live(&self.ctx)?;
+        Ok(self.ctx.flush_state_cell(&self.name).await?)
     }
 }
 
-/// Encodes a [`KafkaMessageRef`] as its `MsgPack` cell bytes.
-fn encode_ref<DirtyE, DurableE, LoaderE>(
-    message_ref: &KafkaMessageRef,
-) -> Result<Bytes, KafkaValueError<DirtyE, DurableE, LoaderE>>
-where
-    DirtyE: ClassifyError + Error + Send + Sync + 'static,
-    DurableE: ClassifyError + Error + Send + Sync + 'static,
-    LoaderE: ClassifyError + Error + Send + Sync + 'static,
-{
-    rmp_serde::to_vec_named(message_ref)
-        .map(Bytes::from)
-        .map_err(KafkaValueError::EncodeRef)
-}
-
 /// Decodes a `MsgPack` cell back into a [`KafkaMessageRef`].
-fn decode_ref<DirtyE, DurableE, LoaderE>(
-    cell: &[u8],
-) -> Result<KafkaMessageRef, KafkaValueError<DirtyE, DurableE, LoaderE>>
-where
-    DirtyE: ClassifyError + Error + Send + Sync + 'static,
-    DurableE: ClassifyError + Error + Send + Sync + 'static,
-    LoaderE: ClassifyError + Error + Send + Sync + 'static,
-{
-    rmp_serde::from_slice(cell).map_err(KafkaValueError::CorruptRef)
+fn decode_ref(cell: &[u8]) -> Result<KafkaMessageRef, KafkaStateError> {
+    rmp_serde::from_slice(cell).map_err(KafkaStateError::CorruptRef)
 }
 
-/// Error returned by [`KafkaValueHandle`] operations.
+/// Error returned by [`KafkaMessageHandle`] operations.
 #[derive(Debug, Error)]
-pub enum KafkaValueError<DirtyE, DurableE, LoaderE>
-where
-    DirtyE: ClassifyError + Error + Send + Sync + 'static,
-    DurableE: ClassifyError + Error + Send + Sync + 'static,
-    LoaderE: ClassifyError + Error + Send + Sync + 'static,
-{
-    /// The underlying value transaction failed.
+pub enum KafkaStateError {
+    /// The context refused or failed the state access (store and loader
+    /// failures arrive here type-erased).
     #[error(transparent)]
-    Tx(#[from] TransactionValueStoreError<DirtyE, DurableE>),
+    Access(#[from] StateAccessError),
 
     /// The cell bytes did not decode as a [`KafkaMessageRef`].
     #[error("kafka message reference cell is corrupt")]
@@ -287,23 +227,13 @@ where
     /// The reference failed to encode.
     #[error("kafka message reference failed to encode")]
     EncodeRef(#[source] MsgPackEncodeError),
-
-    /// The loader failed to resolve the referenced message.
-    #[error("kafka message loader failed")]
-    Loader(#[source] LoaderE),
 }
 
-impl<DirtyE, DurableE, LoaderE> ClassifyError for KafkaValueError<DirtyE, DurableE, LoaderE>
-where
-    DirtyE: ClassifyError + Error + Send + Sync + 'static,
-    DurableE: ClassifyError + Error + Send + Sync + 'static,
-    LoaderE: ClassifyError + Error + Send + Sync + 'static,
-{
+impl ClassifyError for KafkaStateError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Tx(e) => e.classify_error(),
+            Self::Access(e) => e.classify_error(),
             Self::CorruptRef(_) | Self::EncodeRef(_) => ErrorCategory::Permanent,
-            Self::Loader(e) => e.classify_error(),
         }
     }
 }

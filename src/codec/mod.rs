@@ -4,20 +4,24 @@ use std::error::Error;
 
 mod binary;
 mod json;
-mod state_json;
 
 pub use binary::{
     BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryMetadata, BinaryPayload, JsonBinaryCodec,
     JsonExtractError, JsonExtractor,
 };
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
-pub use state_json::{CodecId, JsonStateCodec, JsonStateCodecError, StateCodec};
 
 /// Wire-format abstraction for encoding and decoding message payloads.
 ///
 /// Implement this trait to plug in a custom serialization format. The codec
 /// is stateful to allow implementations to reuse internal buffers across calls.
 pub trait Codec: Default + Send + Sync + 'static {
+    /// Stable open-dispatch token persisted in keyed-state identity rows.
+    /// Never change it once cells exist: the durable per-segment identity
+    /// records the token, and a deploy whose codec asserts a different one
+    /// refuses to dispatch (Permanent).
+    const CODEC_ID: &'static str;
+
     /// The deserialized payload type produced and consumed by this codec.
     type Payload: Send + Sync + 'static;
 
@@ -60,4 +64,17 @@ pub trait Codec: Default + Send + Sync + 'static {
     /// backed by `RefCell::with_borrow_mut` will panic if `f` recurses into
     /// `with_cached_local` for the same codec.
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Codec, JsonBinaryCodec, JsonCodec};
+
+    /// The codec tokens are persisted in keyed-state identity rows; changing
+    /// one orphans every cell written under it. Frozen by construction.
+    #[test]
+    fn codec_ids_are_stable() {
+        assert_eq!(JsonCodec::CODEC_ID, "json");
+        assert_eq!(JsonBinaryCodec::CODEC_ID, "binary");
+    }
 }

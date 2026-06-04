@@ -112,6 +112,8 @@ impl<E: BinaryExtractor> Codec for BinaryCodec<E> {
     type Error = BinaryCodecError<E::Error>;
     type Payload = BinaryPayload;
 
+    const CODEC_ID: &'static str = "binary";
+
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         let bytes = buf.to_vec();
         let metadata = self.extractor.extract(buf)?;

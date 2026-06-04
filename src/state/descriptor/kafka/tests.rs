@@ -3,9 +3,11 @@
 
 use super::super::tests::bind_registered;
 use super::*;
-use crate::consumer::middleware::defer::message::loader::{MemoryLoader, MemoryLoaderError};
+use crate::Key;
+use crate::consumer::event_context::StateAccessError;
+use crate::consumer::middleware::defer::message::loader::MemoryLoader;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::memory::MemoryDirtyValueStore;
-use crate::{Key, Topic};
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::{Value, json};
@@ -38,13 +40,10 @@ fn coords() -> (Topic, i32, i64) {
     (Topic::from("orders.v1"), 3, 42)
 }
 
-fn message_ref() -> KafkaMessageRef {
+fn message_for_testing(payload: Value) -> Result<ConsumerMessage<Value>> {
     let (topic, partition, offset) = coords();
-    KafkaMessageRef {
-        topic,
-        partition,
-        offset,
-    }
+    let key: Key = Arc::from("user-1");
+    ConsumerMessage::for_testing(topic, partition, offset, key, payload)
 }
 
 /// Relocated from the deleted `StoredPayload` enum coverage: the
@@ -62,9 +61,22 @@ fn prop_kafka_message_ref_msgpack_roundtrip() {
     QuickCheck::new().quickcheck(prop as fn(ArbKafkaMessageRef) -> bool);
 }
 
-/// N3 invariant: the descriptor's cell is the ref; `get()` resolves it
-/// through the defer [`MessageLoader`] to the full `ConsumerMessage` with
-/// matching coordinates and payload.
+/// The ref derived from a message carries the message's exact Kafka
+/// coordinates — `set(&message)` persists precisely what `get()` resolves.
+#[test]
+fn ref_from_message_carries_coordinates() -> Result<()> {
+    let (topic, partition, offset) = coords();
+    let message = message_for_testing(json!(1_i32))?;
+    let message_ref = KafkaMessageRef::from(&message);
+    assert_eq!(message_ref.topic, topic);
+    assert_eq!(message_ref.partition, partition);
+    assert_eq!(message_ref.offset, offset);
+    Ok(())
+}
+
+/// N3 invariant: the descriptor's cell is the ref derived from the message
+/// in hand; `get()` resolves it through the message loader to the full
+/// `ConsumerMessage` with matching coordinates and payload.
 #[tokio::test]
 async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
     let (topic, partition, offset) = coords();
@@ -74,7 +86,7 @@ async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
     loader.store_message(topic, partition, offset, key, payload.clone());
 
     let handle = bind_registered(LAST_SEEN, MemoryDirtyValueStore::new(), loader)?;
-    handle.set(message_ref()).await?;
+    handle.set(&message_for_testing(payload.clone())?).await?;
 
     let message = handle
         .get()
@@ -97,7 +109,7 @@ async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
     loader.store_message(topic, partition, offset, Arc::from("user-1"), json!(1_i32));
 
     let handle = bind_registered(LAST_SEEN, MemoryDirtyValueStore::new(), loader.clone())?;
-    handle.set(message_ref()).await?;
+    handle.set(&message_for_testing(json!(1_i32))?).await?;
     loader.remove_message(topic, partition, offset);
 
     let Err(error) = handle.get().await else {
@@ -105,7 +117,7 @@ async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
     };
     assert!(matches!(
         error,
-        KafkaValueError::Loader(MemoryLoaderError::NotFound(..))
+        KafkaStateError::Access(StateAccessError::Load { .. })
     ));
     assert_eq!(error.classify_error(), ErrorCategory::Permanent);
     Ok(())

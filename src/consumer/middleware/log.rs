@@ -170,7 +170,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Attempt to process the message with the wrapped handler
         let error = match self.handler.on_message(context, message, demand_type).await {
@@ -201,7 +201,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Attempt to process the timer with the wrapped handler
         let error = match self.handler.on_timer(context, trigger, demand_type).await {
@@ -233,7 +233,7 @@ where
     /// the framework chose to commit on.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.handler.after_commit(context, result).await;
     }
@@ -247,7 +247,7 @@ where
     /// would see without this middleware in the stack.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.handler.after_abort(context, result).await;
     }

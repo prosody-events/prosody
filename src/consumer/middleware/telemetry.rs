@@ -197,7 +197,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = message.key().clone();
         let offset = message.offset();
@@ -257,7 +257,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = trigger.key.clone();
         let scheduled_time = trigger.time;
@@ -322,7 +322,7 @@ where
     /// commit/abort decision unchanged.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.handler.after_commit(context, result).await;
     }
@@ -340,7 +340,7 @@ where
     /// commit/abort decision unchanged.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.handler.after_abort(context, result).await;
     }
@@ -434,7 +434,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
@@ -447,7 +447,7 @@ mod tests {
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
-            C: EventContext,
+            C: EventContext<Payload = Self::Payload>,
         {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.result.clone()

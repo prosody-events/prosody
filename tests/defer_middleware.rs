@@ -125,7 +125,7 @@ impl FallibleHandler for DeferTestHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = message.key().to_string();
         let payload = message.payload();
@@ -166,7 +166,7 @@ impl FallibleHandler for DeferTestHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // DeferRetry timers are consumed by the defer middleware: it loads
         // the deferred message and re-dispatches it through `on_message`,
@@ -200,7 +200,7 @@ impl FallibleHandler for PermanentErrorHandler {
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let payload = message.payload();
         if payload.get("value").and_then(Value::as_i64) == Some(self.permanent_value) {
@@ -216,7 +216,7 @@ impl FallibleHandler for PermanentErrorHandler {
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.inner.on_timer(context, timer, demand_type).await
     }

@@ -38,7 +38,7 @@ impl EventHandler for TestHandler {
 
     async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage<Value>, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let (inner, uncommitted) = msg.into_inner();
         let key = inner.key().to_string();
@@ -49,7 +49,7 @@ impl EventHandler for TestHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
     }
