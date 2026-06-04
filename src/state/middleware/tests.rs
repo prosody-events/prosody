@@ -1176,6 +1176,163 @@ async fn timer_defer_wrapper_forwards_state_capabilities() -> Result<()> {
     Ok(())
 }
 
+/// Finding #4 (2026-06-04 review): **today's partial-seal-on-defer
+/// behavior, documented before the session rework changes it.**
+///
+/// Stack order puts keyed-state OUTSIDE the timer-defer middleware. When
+/// a handler writes state and then fails Transient, the defer middleware
+/// swallows the error into `Ok(TimerDeferOutput::Deferred)` — so the
+/// keyed-state middleware sees an inner `Ok`, seals the failed attempt's
+/// partial dirty ops, and `after_commit` durably applies them even though
+/// the handler failed and a `DeferredTimer` retry is coming.
+///
+/// The rework fixes this via session reset at the defer-swallow boundary;
+/// this test pins the pre-rework behavior so the fix is a documented,
+/// observable change rather than an assumption.
+#[tokio::test]
+async fn defer_swallow_seals_failed_attempts_partial_writes_today() -> Result<()> {
+    use crate::consumer::middleware::defer::config::DeferConfiguration;
+    use crate::consumer::middleware::defer::decider::TraceBasedDecider;
+    use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
+    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
+    use std::time::Duration;
+
+    /// Writes `CART` then fails Transient — the exact shape the defer
+    /// middleware swallows.
+    #[derive(Clone)]
+    struct WriteThenFail;
+
+    #[derive(Debug, Error)]
+    enum WriteThenFailError {
+        #[error(transparent)]
+        Access(#[from] crate::consumer::event_context::StateAccessError),
+        #[error(transparent)]
+        Cart(#[from] CartError),
+        #[error("simulated transient failure")]
+        Transient,
+    }
+
+    impl ClassifyError for WriteThenFailError {
+        fn classify_error(&self) -> ErrorCategory {
+            match self {
+                Self::Access(e) => e.classify_error(),
+                Self::Cart(e) => e.classify_error(),
+                Self::Transient => ErrorCategory::Transient,
+            }
+        }
+    }
+
+    impl FallibleHandler for WriteThenFail {
+        type Error = WriteThenFailError;
+        type Output = ();
+        type Payload = serde_json::Value;
+
+        async fn on_message<C>(
+            &self,
+            _ctx: C,
+            _msg: ConsumerMessage<Self::Payload>,
+            _demand: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            Ok(())
+        }
+
+        async fn on_timer<C>(
+            &self,
+            ctx: C,
+            _trigger: Trigger,
+            _demand: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            let cart = ctx.state(CART)?;
+            cart.set(serde_json::Value::from(7_u8)).await?;
+            Err(WriteThenFailError::Transient)
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    let decider = TraceBasedDecider::new();
+    decider.set_next(true);
+    let defer_config = DeferConfiguration::builder()
+        .enabled(true)
+        .base(Duration::from_secs(1))
+        .max_delay(Duration::from_hours(1))
+        .failure_threshold(0.9_f64)
+        .build()
+        .map_err(|e| eyre!("config error: {e}"))?;
+    let telemetry = crate::telemetry::Telemetry::new();
+    let topic = crate::Topic::from("t");
+    let defer_handler = TimerDeferHandler {
+        handler: WriteThenFail,
+        store: MemoryTimerDeferStore::default(),
+        decider,
+        config: defer_config,
+        topic,
+        partition: 0,
+        sender: telemetry.partition_sender(topic, 0),
+        source: Arc::from("test"),
+    };
+
+    let durable = MemoryDurableValueStore::for_tests();
+    let registry = Arc::new(registry_with_mode("cart", CommitMode::Wal)?);
+    let handler = build_handler_with(
+        defer_handler,
+        durable.clone(),
+        FixedOracle::committed(),
+        registry,
+    );
+
+    let key: Key = Arc::from("k");
+    let context = MockEventContext::<serde_json::Value>::new().with_timer_tracking();
+    let trigger = Trigger::for_testing(
+        key.clone(),
+        CompactDateTime::from(1_000_u32),
+        TimerType::Application,
+    );
+    let output = handler
+        .on_timer(context.clone(), trigger, DemandType::Normal)
+        .await
+        .map_err(|e| eyre!("defer must swallow the transient error: {e}"))?;
+
+    // The failed attempt's partial write sealed under the timer event.
+    let KeyedStateOutput::Inner {
+        sealed_event: Some(_),
+        ref sealed_collections,
+        ..
+    } = output
+    else {
+        return Err(eyre!("expected a sealed Inner output"));
+    };
+    assert_eq!(
+        sealed_collections.len(),
+        1,
+        "the failed attempt's dirty write sealed"
+    );
+
+    // The blanket impl commits the marker on Ok → after_commit applies.
+    handler
+        .after_commit(MockEventContext::<serde_json::Value>::new(), Ok(output))
+        .await;
+
+    let state_key = StateKey::new(handler.segment_id, key);
+    let id = make_collection_id(&state_key, "cart")?;
+    let applied = read_idle_applied(&durable, &id).await?;
+    assert_eq!(
+        applied
+            .map(|c| serde_json::from_slice::<serde_json::Value>(&c))
+            .transpose()?,
+        Some(serde_json::Value::from(7_u8)),
+        "TODAY: the failed attempt's partial write is durably applied (the latent defect the \
+         session rework fixes via reset)"
+    );
+    Ok(())
+}
+
 /// N10/T4 — middleware dispatch property, WAL arm: committed events apply
 /// the WAL, aborted events roll it back. See [`run_descriptor_dispatch`].
 #[test]
