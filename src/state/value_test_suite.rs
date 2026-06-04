@@ -276,6 +276,49 @@ pub(crate) fn bytes(value: u8) -> Bytes {
     Bytes::from(vec![value])
 }
 
+/// Tiny shared commit oracle whose verdict is fixed at construction; used
+/// by the manager, lifecycle-middleware, and partition-loop tests.
+#[derive(Clone, Debug)]
+pub(crate) struct FixedOracle {
+    decision: CommitDecision,
+}
+
+impl FixedOracle {
+    pub(crate) fn committed() -> Self {
+        Self {
+            decision: CommitDecision::Committed,
+        }
+    }
+
+    pub(crate) fn not_committed() -> Self {
+        Self {
+            decision: CommitDecision::NotCommitted,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("fixed oracle error")]
+pub(crate) struct FixedOracleError;
+
+impl ClassifyError for FixedOracleError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
+
+impl CommitOracle for FixedOracle {
+    type Error = FixedOracleError;
+
+    async fn resolve<'a>(
+        &'a self,
+        _collection: &'a CollectionId<ValueKind>,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        Ok(self.decision)
+    }
+}
+
 /// Commit oracle that records every `resolve` call so the stale-pending
 /// sweep can assert it was never consulted — a pending row over an Idle
 /// partition has no sealed event to resolve.

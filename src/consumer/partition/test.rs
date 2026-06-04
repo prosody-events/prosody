@@ -4,13 +4,31 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
+use crate::consumer::middleware::defer::message::loader::MemoryLoader;
+use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
-use crate::state::manager::NoState;
+use crate::heartbeat::HeartbeatRegistry;
+use crate::state::descriptor::{ValueDescriptor, value_state};
+use crate::state::manager::{NoState, StateManagerProvider};
+use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::value::{DurableWalStore, ValueOp};
+use crate::state::value_test_suite::{FixedOracle, bytes};
+use crate::state::{
+    CollectionId, CollectionRef, DurableState, EventRef, SharedStateBackend, StateKey, StateName,
+    StateType,
+};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::{TimerManagerConfig, TimerRequest};
 use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
+use color_eyre::eyre::eyre;
 use crossbeam_utils::CachePadded;
 use serde_json::json;
 use std::array::from_fn;
@@ -18,10 +36,14 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::task::yield_now;
+use tokio::time::{self, advance};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::Span;
+use uuid::Uuid;
 
 /// Helper trait for waiting on processed offsets.
 trait HasProcessedOffsets {
@@ -581,4 +603,192 @@ async fn test_partition_manager_timer_heartbeat_integration() {
         watermark.is_some() || watermark.is_none(),
         "Shutdown should complete"
     );
+}
+
+/// Handler that records every dispatch it sees; the interception test
+/// asserts it sees none.
+#[derive(Clone, Default)]
+struct RecordingEventHandler {
+    timer_calls: Arc<AtomicUsize>,
+    message_calls: Arc<AtomicUsize>,
+}
+
+impl EventHandler for RecordingEventHandler {
+    type Payload = serde_json::Value;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<serde_json::Value>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.message_calls.fetch_add(1, Ordering::SeqCst);
+        message.commit().await;
+    }
+
+    async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
+    where
+        C: EventContext<Payload = Self::Payload>,
+        U: UncommittedTimer,
+    {
+        self.timer_calls.fetch_add(1, Ordering::SeqCst);
+        let (_trigger, guard) = timer.into_inner();
+        guard.commit().await;
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Builds a real in-memory `TimerManager` for the interception test.
+async fn recovery_timer_manager(
+    shutdown_rx: watch::Receiver<ShutdownPhase>,
+) -> color_eyre::Result<(
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+)> {
+    let segment = Segment {
+        id: Uuid::new_v4(),
+        name: "test".to_owned(),
+        slab_size: CompactDuration::new(300),
+        version: SegmentVersion::V3,
+    };
+    let store = memory_store(segment);
+    let telemetry = Telemetry::new();
+    let timer_config = TimerManagerConfig {
+        name: "test".to_owned(),
+        store,
+        telemetry: telemetry.partition_sender(Topic::from("t"), 0),
+        source: Arc::from(""),
+    };
+    let semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| Arc::new(Semaphore::new(10))));
+    TimerManager::new(
+        timer_config,
+        HeartbeatRegistry::test(),
+        shutdown_rx,
+        semaphores,
+    )
+    .await
+    .map_err(|e| eyre!("{e}"))
+}
+
+/// Acquires a real keyed-state manager over the memory backend with `CART`
+/// registered, returning the durable store alongside.
+async fn recovery_state_manager() -> color_eyre::Result<(
+    impl PartitionStateManager<Payload = serde_json::Value>,
+    MemoryDurableValueStore,
+)> {
+    const CART: ValueDescriptor = value_state("cart");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&CART, CollectionDef::new(None))?;
+    let durable = MemoryDurableValueStore::for_tests();
+    let provider = StateManagerProvider::new(
+        SharedStateBackend::new(
+            durable.clone(),
+            FixedOracle::committed(),
+            MemoryDirtyValueStoreProvider,
+        ),
+        durable.clone(),
+        MemoryLoader::<serde_json::Value>::new(),
+        Arc::new(registry),
+        Arc::from("test-group"),
+        Arc::from("1"),
+        CompactDuration::new(30),
+    );
+    let manager = provider
+        .acquire(Topic::from("t"), 0)
+        .await
+        .map_err(|e| eyre!("acquire failed: {e}"))?;
+    Ok((manager, durable))
+}
+
+/// `StateRecovery` triggers are framework-internal: the partition loop
+/// intercepts them before dispatch, runs the state manager's sweep, and
+/// commits the trigger — the user handler is structurally never invoked.
+/// Also verifies the sweep's `unschedule_all(StateRecovery)` does not
+/// fight the firing trigger's own commit (the trigger row is already in
+/// its firing state when the clear runs).
+#[tokio::test]
+async fn state_recovery_trigger_is_intercepted_by_the_loop() -> color_eyre::Result<()> {
+    init_test_logging();
+    time::pause();
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (stream, timer_manager) = recovery_timer_manager(shutdown_rx.clone()).await?;
+    futures::pin_mut!(stream);
+    let (state_manager, durable) = recovery_state_manager().await?;
+
+    // A crashed seal waits on the pending partition.
+    let key: Key = Arc::from("k");
+    let id = CollectionId::new(
+        StateKey::new(
+            compute_segment_id(Topic::from("t"), 0, "test-group"),
+            key.clone(),
+        ),
+        StateType::Application,
+        StateName::try_new("cart")?,
+    );
+    let collection_ref = CollectionRef::new(id.clone(), None);
+    durable
+        .seal(
+            &collection_ref,
+            EventRef::Message {
+                dedup_id: Uuid::from_u128(1),
+            },
+            vec![ValueOp::Set { payload: bytes(7) }],
+        )
+        .await?;
+
+    // The armed StateRecovery backstop fires.
+    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
+    timer_manager
+        .schedule(TimerRequest::new(
+            key.clone(),
+            fire,
+            TimerType::StateRecovery,
+            Span::current(),
+        ))
+        .await?;
+    advance(Duration::from_secs(30)).await;
+    yield_now().await;
+    let pending = stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("no pending timer fired"))?;
+
+    let handler = RecordingEventHandler::default();
+    process_event(
+        UncommittedEvent::Timer(pending),
+        &handler,
+        &shutdown_rx,
+        &timer_manager,
+        &state_manager,
+        SpanRelation::default(),
+    )
+    .await;
+
+    assert_eq!(
+        handler.timer_calls.load(Ordering::SeqCst),
+        0,
+        "the user handler must never see a StateRecovery trigger"
+    );
+    assert_eq!(handler.message_calls.load(Ordering::SeqCst), 0);
+
+    // The sweep resolved the crashed seal and the trigger committed
+    // cleanly: nothing is scheduled and nothing redelivers.
+    match DurableWalStore::read_partition(&durable, &id).await? {
+        DurableState::Idle { applied } => assert_eq!(applied, Some(bytes(7))),
+        other @ DurableState::Sealed { .. } => {
+            return Err(eyre!("sweep must resolve the seal, got {other:?}"));
+        }
+    }
+    let remaining = timer_manager
+        .scheduled_times(&key, TimerType::StateRecovery)
+        .await?;
+    assert!(
+        remaining.is_empty(),
+        "the recovery trigger must commit without redelivery"
+    );
+    Ok(())
 }

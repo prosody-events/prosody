@@ -62,7 +62,7 @@ mod encoding_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod value_test_suite;
+pub(crate) mod value_test_suite;
 
 pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
 pub use event_ref::{CommitDecision, EventRef, EventScopeId, StoreOutcome, TimerEventRef};

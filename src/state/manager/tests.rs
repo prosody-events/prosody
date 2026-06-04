@@ -17,7 +17,7 @@ use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStor
 use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{FinalizeOutcome, StateLifecycle};
 use crate::state::value::ValueOp;
-use crate::state::value_test_suite::bytes;
+use crate::state::value_test_suite::{FixedOracle, FixedOracleError, bytes};
 use crate::state::{CommitDecision, DurableState, StateName, StateType};
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
@@ -34,48 +34,6 @@ use tracing::Span;
 use uuid::Uuid;
 
 const CART: ValueDescriptor = value_state("cart");
-
-/// Tiny test-only oracle whose verdict is fixed at construction.
-#[derive(Clone, Debug)]
-struct FixedOracle {
-    decision: CommitDecision,
-}
-
-impl FixedOracle {
-    fn committed() -> Self {
-        Self {
-            decision: CommitDecision::Committed,
-        }
-    }
-
-    fn not_committed() -> Self {
-        Self {
-            decision: CommitDecision::NotCommitted,
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-#[error("fixed oracle error")]
-struct FixedOracleError;
-
-impl ClassifyError for FixedOracleError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
-    }
-}
-
-impl CommitOracle for FixedOracle {
-    type Error = FixedOracleError;
-
-    async fn resolve<'a>(
-        &'a self,
-        _collection: &'a CollectionId<ValueKind>,
-        _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(self.decision)
-    }
-}
 
 /// Oracle that counts `resolve` calls so a test can assert it was never
 /// consulted (the stale-pending sweep arm must not touch the oracle).
@@ -472,6 +430,135 @@ async fn no_state_provider_yields_unavailable_sessions() -> Result<()> {
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     manager.recover(Arc::from("k"), &timers).await?;
     Ok(())
+}
+
+/// Deferred-message reload, commit arm: a `DeferredMessage` trigger fires
+/// (the message-defer reload signal), the loop mints the session from the
+/// **firing trigger** — so the reloaded message's state ops seal under the
+/// timer [`EventRef`] — the marker commits, and the apply hook never runs
+/// (crash window). Recovery must resolve **Committed** through the real
+/// [`CommitManager`] timer oracle (row absent → fired-and-removed →
+/// committed) and apply the seal.
+///
+/// This is the deferred-reload path the 2026-06-04 review found had zero
+/// coverage; the oracle's three-state tag logic is timer-type-agnostic by
+/// design, which is what makes sealing under a `DeferredMessage` ref
+/// correct.
+///
+/// [`CommitManager`]: crate::commit_manager::CommitManager
+#[tokio::test]
+async fn deferred_message_seal_commit_resolves_through_timer_oracle() -> Result<()> {
+    let (applied, timers, key) = run_deferred_message_crash(CrashMarker::Commit).await?;
+    assert_eq!(
+        applied,
+        Some(bytes(7)),
+        "committed reload: recovery must apply the seal"
+    );
+    let remaining = timers
+        .scheduled_times(&key, TimerType::DeferredMessage)
+        .await?;
+    assert!(remaining.is_empty(), "the committed trigger is gone");
+    Ok(())
+}
+
+/// Deferred-message reload, abort arm: the marker aborts, leaving the
+/// trigger scheduled under its original tag — the oracle reads
+/// `current_tag == wal_tag` → **`NotCommitted`** → recovery rolls the seal
+/// back, and the redelivered trigger re-runs the reload from clean state.
+#[tokio::test]
+async fn deferred_message_seal_abort_rolls_back_through_timer_oracle() -> Result<()> {
+    let (applied, _timers, _key) = run_deferred_message_crash(CrashMarker::Abort).await?;
+    assert_eq!(
+        applied, None,
+        "aborted reload: recovery must roll the seal back"
+    );
+    Ok(())
+}
+
+/// How the crashed dispatch's durability marker resolved.
+enum CrashMarker {
+    Commit,
+    Abort,
+}
+
+/// Shared body of the deferred-message crash-window tests: schedules a
+/// `DeferredMessage` trigger on a real `TimerManager`, fires it, seals a
+/// state op under the firing trigger's event ref, resolves the marker,
+/// and recovers through a `CommitManager` backed by the same timers.
+/// Returns the recovered applied cell.
+async fn run_deferred_message_crash(
+    marker: CrashMarker,
+) -> Result<(Option<bytes::Bytes>, TestTimerManager, Key)> {
+    use crate::commit_manager::CommitManager;
+    use crate::consumer::Uncommitted;
+    use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
+    use crate::timers::UncommittedTimer;
+    use std::time::Duration;
+    use tokio::task::yield_now;
+    use tokio::time::{self, advance};
+
+    time::pause();
+    let (stream, timers, _shutdown_tx) = timer_manager().await?;
+    futures::pin_mut!(stream);
+
+    let durable = MemoryDurableValueStore::for_tests();
+    let oracle = CommitManager::new(MemoryDeduplicationStore::new(), timers.clone());
+    let manager = acquire(&provider(durable.clone(), oracle, registry_with_cart()?)).await?;
+    let key: Key = Arc::from("k");
+
+    // The message-defer middleware's reload signal.
+    let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
+    timers
+        .schedule(TimerRequest::new(
+            key.clone(),
+            fire_at,
+            TimerType::DeferredMessage,
+            Span::current(),
+        ))
+        .await?;
+
+    advance(Duration::from_secs(30)).await;
+    yield_now().await;
+    let pending = stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("no pending timer fired"))?;
+    let firing = pending
+        .fire()
+        .await
+        .ok_or_else(|| eyre!("pending timer not active"))?;
+
+    // The loop mints the session from the firing trigger (canonical tag);
+    // the reloaded message's handler writes state, which seals under the
+    // timer event ref on finalize.
+    let session = manager.session_for_timer(firing.trigger(), termination());
+    session
+        .set_state_cell(&StateName::try_new("cart")?, bytes(7))
+        .await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Sealed);
+
+    // Crash window: the marker resolves but the apply hook never runs.
+    let (_trigger, guard) = firing.into_inner();
+    match marker {
+        CrashMarker::Commit => guard.commit().await,
+        CrashMarker::Abort => guard.abort().await,
+    }
+
+    manager
+        .recover(key.clone(), &timers)
+        .await
+        .map_err(|e| eyre!("recover failed: {e}"))?;
+
+    let id = CollectionId::new(
+        StateKey::new(
+            compute_segment_id(Topic::from("t"), 0, "test-group"),
+            key.clone(),
+        ),
+        StateType::Application,
+        StateName::try_new("cart")?,
+    );
+    let applied = read_idle_applied(&durable, &id).await?;
+    Ok((applied, timers, key))
 }
 
 /// `sweep_pending` resolves a WAL sealed out-of-band (no session at all) —
