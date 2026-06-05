@@ -638,25 +638,3 @@ impl MessageDeferStoreProvider for CassandraMessageDeferStoreProvider {
 /// live Cassandra-backed store.
 #[cfg(test)]
 mod tests;
-
-/// Invariant tests: directly assert I1 (`next_offset` == model minimum) after
-/// every operation in a property-generated sequence.
-#[cfg(test)]
-mod invariant_tests;
-
-/// Deterministic unit tests for the lazy on-read repair path that fires when
-/// a pre-migration partition (clustering rows, `next_offset = NULL`) is read.
-#[cfg(test)]
-mod legacy_repair_tests;
-
-/// Regression test for `tombstone_warn_threshold` warnings emitted by
-/// `read_next_static` on FIFO-completed partitions.
-///
-/// The query selects only static columns from `deferred_offsets` with
-/// `LIMIT 1`. With no clustering predicate, a forward scan walks the
-/// clustering iterator from the bottom up to materialise the static
-/// row — straight through the tombstone graveyard FIFO completion
-/// leaves at low `offset`. Appending `ORDER BY offset DESC` resolves
-/// on the live tail and skips the graveyard entirely.
-#[cfg(test)]
-mod tombstone_reverse_scan_tests;

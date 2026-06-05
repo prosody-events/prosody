@@ -14,7 +14,6 @@ use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraValueStore, ValueQueries};
-use crate::state::dirty_value_test_suite::{self, DirtyTrace};
 use crate::state::layered::LayeredValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
 use crate::state::oracle::CommitOracle;
@@ -22,11 +21,12 @@ use crate::state::pending::PendingIndexStore;
 use crate::state::production::ProductionValueDurable;
 use crate::state::recovering::RecoveringValueStore;
 use crate::state::session::DurableValueBundle;
+use crate::state::tests::dirty_value_suite::{self, DirtyTrace};
+use crate::state::tests::value_suite::{
+    self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
+};
 use crate::state::value::{
     DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind, ValueStore,
-};
-use crate::state::value_test_suite::{
-    self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
 };
 use crate::state::{
     CollectionId, CommitDecision, CommitMode, EventRef, EventScopeId, Read, StateKey, StateName,
@@ -306,7 +306,7 @@ fn prop_layered_memory_wal(trace: Trace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_layered_property("model mismatch", &input_dbg, |cache| {
         let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        TEST_RUNTIME.block_on(value_test_suite::run_trace(
+        TEST_RUNTIME.block_on(value_suite::run_trace(
             layered,
             MemoryDirtyValueStore::new,
             trace,
@@ -318,7 +318,7 @@ fn prop_layered_memory_idempotence(trace: Trace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_layered_property("model mismatch", &input_dbg, |cache| {
         let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        TEST_RUNTIME.block_on(value_test_suite::run_idempotence_trace(
+        TEST_RUNTIME.block_on(value_suite::run_idempotence_trace(
             layered,
             MemoryDirtyValueStore::new,
             trace,
@@ -330,7 +330,7 @@ fn prop_layered_memory_direct(trace: DirectTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_layered_property("model mismatch", &input_dbg, |cache| {
         let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        TEST_RUNTIME.block_on(value_test_suite::run_direct_trace(
+        TEST_RUNTIME.block_on(value_suite::run_direct_trace(
             layered,
             MemoryDirtyValueStore::new,
             trace,
@@ -362,7 +362,7 @@ fn prop_layered_fjall_recovering_memory(trace: Trace) -> TestResult {
         let recovering =
             RecoveringValueStore::with_default_ttl(inner, AlwaysCommittedOracle, TEST_TTL);
         let layered = LayeredValueStore::new(cache, recovering);
-        TEST_RUNTIME.block_on(value_test_suite::run_trace(
+        TEST_RUNTIME.block_on(value_suite::run_trace(
             layered,
             MemoryDirtyValueStore::new,
             trace,
@@ -527,7 +527,7 @@ fn cassandra_wal_property(trace: Trace) -> TestResult {
     run_cassandra_property("model mismatch", &input_dbg, |span, cache, backing| {
         let layered = LayeredValueStore::new(cache, backing);
         TEST_RUNTIME.block_on(
-            async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
+            async { value_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
                 .instrument(span),
         )
     })
@@ -542,12 +542,8 @@ fn cassandra_idempotence_property(trace: Trace) -> TestResult {
             let layered = LayeredValueStore::new(cache, backing);
             TEST_RUNTIME.block_on(
                 async {
-                    value_test_suite::run_idempotence_trace(
-                        layered,
-                        MemoryDirtyValueStore::new,
-                        trace,
-                    )
-                    .await
+                    value_suite::run_idempotence_trace(layered, MemoryDirtyValueStore::new, trace)
+                        .await
                 }
                 .instrument(span),
             )
@@ -564,8 +560,7 @@ fn cassandra_direct_property(trace: DirectTrace) -> TestResult {
             let layered = LayeredValueStore::new(cache, backing);
             TEST_RUNTIME.block_on(
                 async {
-                    value_test_suite::run_direct_trace(layered, MemoryDirtyValueStore::new, trace)
-                        .await
+                    value_suite::run_direct_trace(layered, MemoryDirtyValueStore::new, trace).await
                 }
                 .instrument(span),
             )
@@ -604,7 +599,7 @@ fn cassandra_recovering_wal_property(trace: Trace) -> TestResult {
             RecoveringValueStore::with_default_ttl(backing, AlwaysCommittedOracle, TEST_TTL);
         let layered = LayeredValueStore::new(cache, recovering);
         TEST_RUNTIME.block_on(
-            async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
+            async { value_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
                 .instrument(span),
         )
     })
@@ -789,7 +784,7 @@ fn run_dirty_property<E: fmt::Debug>(
 fn fjall_dirty_property(trace: DirtyTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_dirty_property("model mismatch", &input_dbg, |dirty| {
-        TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_trace(dirty, trace))
+        TEST_RUNTIME.block_on(dirty_value_suite::run_dirty_trace(dirty, trace))
     })
 }
 
@@ -801,7 +796,7 @@ fn prop_fjall_dirty_satisfies_invariants() {
 fn fjall_dirty_matches_memory_property(trace: DirtyTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_dirty_property("model mismatch", &input_dbg, |fjall_dirty| {
-        TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_parity(
+        TEST_RUNTIME.block_on(dirty_value_suite::run_dirty_parity(
             fjall_dirty,
             MemoryDirtyValueStore::new(),
             trace,

@@ -1,6 +1,6 @@
 use super::{decode_cell, encode_absent_cell, encode_present_cell, value_cache_key};
 use crate::Key;
-use crate::state::value_test_suite::bytes;
+use crate::state::tests::value_suite::bytes;
 use crate::state::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
 use color_eyre::eyre::Result;
 use std::sync::Arc;

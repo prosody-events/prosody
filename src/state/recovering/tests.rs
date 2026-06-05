@@ -3,7 +3,7 @@
 //! The directed tests cover the recovery contract on `get` (Idle vs
 //! Sealed, `Committed` vs `NotCommitted`, error propagation, pass-through
 //! invariants). The property tests reuse the shared
-//! [`crate::state::value_test_suite`] runners against
+//! [`crate::state::tests::value_suite`] runners against
 //! `RecoveringValueStore<MemoryDurableValueStore, MockOracle>`.
 
 use super::{CollectionTtl, CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
@@ -13,10 +13,10 @@ use crate::state::manager::sweep_pending;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::value::{DirectApplyStore, DurableWalStore, ValueOp, ValueStore};
-use crate::state::value_test_suite::{
+use crate::state::tests::value_suite::{
     self, DirectTrace, OraclePolicy, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
 };
+use crate::state::value::{DirectApplyStore, DurableWalStore, ValueOp, ValueStore};
 use crate::state::{
     CollectionId, CollectionKind, CollectionRef, CommitDecision, DurableState, EventRef, Read,
     SealedCollection, StateKey, StoreOutcome, ValueKind,
@@ -539,7 +539,7 @@ async fn recovery_writes_use_registry_per_collection_ttl() -> Result<()> {
 /// decision, same per-collection TTL resolver). The property asserts both
 /// produce **equivalent recovered visible state** and bind the **same TTL**
 /// on the recovery write — the equivalence the C2 resolver guarantees and
-/// that `value_test_suite` previously only example-tested by driving
+/// that `value_suite` previously only example-tested by driving
 /// `apply_sealed`/`rollback_sealed` directly, bypassing both real entry
 /// points. Iteration count comes from `QUICKCHECK_TESTS`.
 #[test]
@@ -873,7 +873,7 @@ async fn run_seal_chain_equivalence(decisions: Vec<bool>) -> Result<bool> {
 // `RecoveringValueStore`'s pass-through behavior under random
 // trace/crash patterns: every non-`get` method delegates unchanged to the
 // inner store, and the combinator does not perturb the
-// [`value_test_suite`] model invariants (durable applied, pending ops,
+// [`value_suite`] model invariants (durable applied, pending ops,
 // dirty/clean visibility). After a `TraceOp::Crash` the shared runner
 // drives recovery explicitly via `durable.apply_sealed` /
 // `rollback_sealed` (per `OraclePolicy`) — the Recovering wrapper sees
@@ -885,7 +885,7 @@ async fn run_seal_chain_equivalence(decisions: Vec<bool>) -> Result<bool> {
 fn prop_recovering_memory_trace() {
     fn property(trace: Trace) -> TestResult {
         let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(value_test_suite::run_trace(
+        let result = executor::block_on(value_suite::run_trace(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
@@ -899,7 +899,7 @@ fn prop_recovering_memory_trace() {
 fn prop_recovering_memory_idempotence_trace() {
     fn property(trace: Trace) -> TestResult {
         let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(value_test_suite::run_idempotence_trace(
+        let result = executor::block_on(value_suite::run_idempotence_trace(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
@@ -913,7 +913,7 @@ fn prop_recovering_memory_idempotence_trace() {
 fn prop_recovering_memory_direct_trace() {
     fn property(trace: DirectTrace) -> TestResult {
         let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(value_test_suite::run_direct_trace(
+        let result = executor::block_on(value_suite::run_direct_trace(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
@@ -927,7 +927,7 @@ fn prop_recovering_memory_direct_trace() {
 fn prop_recovering_memory_crash_committed() {
     fn property(trace: Trace) -> TestResult {
         let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(value_test_suite::run_trace_with_policy(
+        let result = executor::block_on(value_suite::run_trace_with_policy(
             recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
@@ -942,7 +942,7 @@ fn prop_recovering_memory_crash_committed() {
 fn prop_recovering_memory_crash_not_committed() {
     fn property(trace: Trace) -> TestResult {
         let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(value_test_suite::run_trace_with_policy(
+        let result = executor::block_on(value_suite::run_trace_with_policy(
             recovering_memory(MockOracle::always_not_committed()),
             MemoryDirtyValueStore::new,
             trace,

@@ -55,7 +55,7 @@ pub mod offsets;
 mod util;
 
 #[cfg(test)]
-mod test;
+mod tests;
 
 /// Grace period numerator: handlers run uninterrupted for this fraction of
 /// `shutdown_timeout` before the abort signal fires.

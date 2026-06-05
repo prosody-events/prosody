@@ -56,13 +56,7 @@ pub mod value;
 pub mod wal;
 
 #[cfg(test)]
-mod dirty_value_test_suite;
-#[cfg(test)]
-mod encoding_tests;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-pub(crate) mod value_test_suite;
+pub(crate) mod tests;
 
 pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
 pub use event_ref::{CommitDecision, EventRef, EventScopeId, StoreOutcome, TimerEventRef};

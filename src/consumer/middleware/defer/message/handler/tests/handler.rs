@@ -26,7 +26,7 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::test_support::MockEventContext;
+use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::Trigger;
 use crate::{Key, Offset};

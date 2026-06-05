@@ -9,7 +9,7 @@ use crate::consumer::middleware::deduplication::{
     DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
     MemoryDeduplicationStore, MemoryDeduplicationStoreProvider, dedup_uuid, dedup_uuid_for_message,
 };
-use crate::consumer::middleware::test_support::MockEventContext;
+use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
 use crate::timers::TimerType;
 use crate::timers::Trigger;

@@ -26,7 +26,7 @@ use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
-use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
+use crate::consumer::middleware::tests::test_support::{MockEventContext, TimerOperation};
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
@@ -36,8 +36,8 @@ use crate::state::manager::{
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{TerminationWatch, ValueStateSession};
+use crate::state::tests::value_suite::{FixedOracle, finish_trace};
 use crate::state::value::DurableWalStore;
-use crate::state::value_test_suite::{FixedOracle, finish_trace};
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, DurableState, SharedStateBackend, StateKey, StateName,
     StateType, ValueKind,

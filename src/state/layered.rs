@@ -12,7 +12,7 @@
 //! backing fall-through (read path) or to invalidation (write path).
 //! They never become the outer error. This keeps the error type aligned
 //! with `<Backing as DurableWalStore<ValueKind>>::Error`, which the
-//! shared `value_test_suite::DurableBundle` requires.
+//! shared `value_suite::DurableBundle` requires.
 //!
 //! ## Patch rules (load-bearing invariants)
 //!

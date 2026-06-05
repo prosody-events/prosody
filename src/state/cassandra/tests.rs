@@ -2,7 +2,7 @@
 //!
 //! These tests run against a local Cassandra node and use the shared
 //! `prosody_test` keyspace. Each property test iteration mints a fresh
-//! `segment_id` via `value_test_suite::collection_ref()` so rows from
+//! `segment_id` via `value_suite::collection_ref()` so rows from
 //! different iterations and different test functions never collide.
 
 use super::{CassandraValueStore, CassandraValueStoreError, ValueQueries};
@@ -13,8 +13,8 @@ use crate::state::cassandra::error::CorruptUdtError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::memory::MemoryDirtyValueStore;
 use crate::state::pending::PendingIndexStore;
+use crate::state::tests::value_suite::{self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref};
 use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
-use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref};
 use crate::state::{CollectionId, DurableState, EventRef, StateType, ValueKind};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
@@ -65,13 +65,13 @@ where
 
 fn wal_property(trace: Trace) -> TestResult {
     run_cassandra_property(trace, "model mismatch.", |store, trace| {
-        value_test_suite::run_trace(store, MemoryDirtyValueStore::new, trace)
+        value_suite::run_trace(store, MemoryDirtyValueStore::new, trace)
     })
 }
 
 fn idempotence_property(trace: Trace) -> TestResult {
     run_cassandra_property(trace, "idempotence violated.", |store, trace| {
-        value_test_suite::run_idempotence_trace(store, MemoryDirtyValueStore::new, trace)
+        value_suite::run_idempotence_trace(store, MemoryDirtyValueStore::new, trace)
     })
 }
 
@@ -79,7 +79,7 @@ fn direct_property(trace: DirectTrace) -> TestResult {
     run_cassandra_property(
         trace,
         "partition was sealed under direct mode.",
-        |store, trace| value_test_suite::run_direct_trace(store, MemoryDirtyValueStore::new, trace),
+        |store, trace| value_suite::run_direct_trace(store, MemoryDirtyValueStore::new, trace),
     )
 }
 
@@ -202,7 +202,7 @@ async fn stale_pending_row_after_partial_seal() -> Result<()> {
 async fn state_recovery_sweeps_stale_pending_row() -> Result<()> {
     init_test_logging();
     let store = setup_value_store().await?;
-    value_test_suite::run_stale_pending_index(store).await
+    value_suite::run_stale_pending_index(store).await
 }
 
 /// N7/N8 (Cassandra): the shared durable descriptor-identity acquisition
@@ -212,7 +212,7 @@ async fn state_recovery_sweeps_stale_pending_row() -> Result<()> {
 async fn cassandra_descriptor_identity_acquisition() -> Result<()> {
     init_test_logging();
     let store = setup_value_store().await?;
-    value_test_suite::run_descriptor_identity_acquisition(store).await
+    value_suite::run_descriptor_identity_acquisition(store).await
 }
 
 #[tokio::test]

@@ -874,30 +874,3 @@ impl CassandraTimerDeferStore {
 
 #[cfg(test)]
 mod tests;
-
-/// Invariant tests: directly assert I1 (`next_timer.time` == model minimum) and
-/// I4 (`next_timer` present ⟺ live rows present) after every operation.
-#[cfg(test)]
-mod invariant_tests;
-
-/// Deterministic unit tests for the lazy on-read repair path that fires when
-/// a pre-migration partition (clustering rows, `next_timer = NULL`) is read.
-#[cfg(test)]
-mod legacy_repair_tests;
-
-/// Asserts that `next_timer`'s TTL tracks the clustering row it references, so
-/// the static hint never expires before the row it points to.
-#[cfg(test)]
-mod ttl_drift_tests;
-
-/// Regression test for `tombstone_warn_threshold` warnings emitted by
-/// `read_next_static` on FIFO-completed partitions.
-///
-/// The query selects only static columns from `deferred_timers` with
-/// `LIMIT 1`. With no clustering predicate, a forward scan walks the
-/// clustering iterator from the bottom up to materialise the static
-/// row — straight through the tombstone graveyard FIFO completion
-/// leaves at low `original_time`. Appending `ORDER BY original_time DESC`
-/// resolves on the live tail and skips the graveyard entirely.
-#[cfg(test)]
-mod tombstone_reverse_scan_tests;

@@ -1,5 +1,5 @@
 // Re-export from the shared test support module.
-pub use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
+pub use crate::consumer::middleware::tests::test_support::{MockEventContext, TimerOperation};
 pub use crate::test_util::TEST_RUNTIME;
 
 mod context;

@@ -4,7 +4,7 @@ use crate::state::cassandra::error::CorruptUdtError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::descriptor_identity::INITIAL_IDENTITY_VERSION;
 use crate::state::encoding::{PayloadEncoding, WalFormat, encode_payload};
-use crate::state::value_test_suite::bytes;
+use crate::state::tests::value_suite::bytes;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use uuid::Uuid;
