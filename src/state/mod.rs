@@ -17,7 +17,7 @@
 //! * [`wal`] — write-ahead-log payloads ([`WalEnvelope`], [`WalBlob`],
 //!   [`SealedWal`], [`NonEmptyOps`], …).
 //! * [`value`] — the Value collection kind ([`ValueKind`], [`ValueOp`],
-//!   [`ValueOverlay`], …).
+//!   [`ValueApplied`], …).
 //! * [`descriptor`] — typed descriptors and handles bound over the raw byte
 //!   cells the stores persist.
 //! * [`transaction`] — transaction-side state ([`DurableState`], [`LocalTx`],
@@ -64,7 +64,7 @@ pub use identity::{
     StateNameError, StateType,
 };
 pub use transaction::{CommitMode, DurableState, LocalTx, PendingOps, Read, SealedCollection};
-pub use value::{ValueApplied, ValueKind, ValueOp, ValueOverlay};
+pub use value::{ValueApplied, ValueKind, ValueOp};
 pub use wal::{EmptyOperationsError, NonEmptyOps, SealedWal, WalBlob, WalEnvelope};
 
 /// The per-partition keyed-state backend: the durable Value bundle, the

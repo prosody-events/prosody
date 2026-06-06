@@ -23,7 +23,7 @@ use super::super::value::{
 };
 use super::super::{
     CollectionId, CollectionRef, CommitDecision, CommitMode, DurableState, EventRef, LocalTx, Read,
-    StateKey, StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp, ValueOverlay,
+    StateKey, StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
@@ -798,10 +798,6 @@ where
     if matches!(model.phase, ModelPhase::Finished) {
         return Ok(false);
     }
-    let overlay = match &op {
-        ValueOp::Set { payload } => ValueOverlay::BufferedSet(payload.clone()),
-        ValueOp::Clear => ValueOverlay::BufferedClear,
-    };
     let result = match &op {
         ValueOp::Set { payload } => tx.set(collection, payload.clone()).await,
         ValueOp::Clear => tx.clear(collection).await,
@@ -813,7 +809,6 @@ where
             }
             model.dirty_ops.clear();
             model.dirty_ops.push(op);
-            model.overlay = overlay;
             model.phase = ModelPhase::Dirty;
             Ok(true)
         }
@@ -1108,7 +1103,6 @@ impl Arbitrary for DirectTraceOp {
 struct Model {
     applied: Option<Bytes>,
     dirty_ops: Vec<ValueOp>,
-    overlay: ValueOverlay,
     sealed: Option<(Option<Bytes>, Vec<ValueOp>)>,
     /// Sealed snapshot captured by [`TraceOp::Crash`] in
     /// [`ModelPhase::Sealed`]: `(pre_seal_applied, sealed_ops, crash_event)`.
@@ -1122,11 +1116,15 @@ struct Model {
 }
 
 impl Model {
+    /// Independent oracle for the value a read should observe: the last
+    /// buffered dirty op wins, falling back to the applied state when the
+    /// workspace is clean. Deliberately does not call `fold_value_ops` — it
+    /// cross-checks production from a separate derivation.
     fn visible(&self) -> Option<Bytes> {
-        match &self.overlay {
-            ValueOverlay::BufferedSet(payload) => Some(payload.clone()),
-            ValueOverlay::BufferedClear => None,
-            ValueOverlay::Untouched => self.applied.clone(),
+        match self.dirty_ops.last() {
+            Some(ValueOp::Set { payload }) => Some(payload.clone()),
+            Some(ValueOp::Clear) => None,
+            None => self.applied.clone(),
         }
     }
 
@@ -1136,7 +1134,6 @@ impl Model {
 
     fn clear_dirty(&mut self) {
         self.dirty_ops.clear();
-        self.overlay = ValueOverlay::Untouched;
     }
 }
 

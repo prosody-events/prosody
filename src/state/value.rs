@@ -24,20 +24,6 @@ type TxError<S, D> = TransactionValueStoreError<DirtyStoreError<S>, DurableStore
 /// handle boundary.
 pub type ValueApplied = Option<Bytes>;
 
-/// Dirty Value overlay.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum ValueOverlay {
-    /// No buffered operation has been observed for this collection.
-    #[default]
-    Untouched,
-
-    /// A clear is buffered.
-    BufferedClear,
-
-    /// A set is buffered.
-    BufferedSet(Bytes),
-}
-
 /// Type marker for Value collections.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ValueKind;
@@ -45,7 +31,6 @@ pub struct ValueKind;
 impl CollectionKind for ValueKind {
     type Applied = ValueApplied;
     type Op = ValueOp;
-    type Overlay = ValueOverlay;
 
     const ID: CollectionKindId = CollectionKindId::Value;
 }

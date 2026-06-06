@@ -65,9 +65,6 @@ pub trait CollectionKind: Clone + Copy + fmt::Debug + Send + Sync + 'static {
 
     /// Authoritative applied state for this collection kind.
     type Applied: Clone + fmt::Debug + Eq + Send + Sync + 'static;
-
-    /// Dirty read overlay for this collection kind.
-    type Overlay: Clone + fmt::Debug + Eq + Send + Sync + 'static;
 }
 
 /// Key qualified by the timer segment that owns the Kafka partition.

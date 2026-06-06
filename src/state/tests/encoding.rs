@@ -27,7 +27,6 @@ struct SecondaryKind;
 impl CollectionKind for SecondaryKind {
     type Applied = ();
     type Op = ValueOp;
-    type Overlay = ();
 
     const ID: CollectionKindId = CollectionKindId::TestSecondary;
 }
