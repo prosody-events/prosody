@@ -15,11 +15,6 @@
 //!   The `Recovering` layer is load-bearing for crash safety — omitting it
 //!   reopens the lost-commit data-loss window — so funneling construction
 //!   through one composer keeps the layer from being silently dropped.
-//! * [`capped_default_ttl`] applies the Cassandra `USING TTL` ceiling
-//!   ([`MAX_CASSANDRA_TTL_SECS`]) to a configured default TTL. Producers wire
-//!   this once when they read `CassandraStore::base_ttl()`; the result feeds
-//!   every store and wrapper that takes a `default_ttl:
-//!   Option<CompactDuration>`.
 //!
 //! See the [design summary][summary] for the full canonical composition:
 //! `Layered<FjallValueStore, Recovering<CassandraValueStore,
@@ -33,7 +28,6 @@
 //! [`CommitOracle`]: super::oracle::CommitOracle
 
 use crate::ConsumerGroup;
-use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::commit_manager::{CommitManager, StoreTagSource};
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::state::cassandra::CassandraValueStore;
@@ -86,19 +80,6 @@ pub fn compose_value_durable<O>(
     registry: Arc<CollectionDefRegistry>,
 ) -> ProductionValueDurable<O> {
     LayeredValueStore::new(cache, RecoveringValueStore::new(backing, oracle, registry))
-}
-
-/// Caps a configured default TTL at the Cassandra `USING TTL` ceiling.
-///
-/// Returns `Some(base)` when the duration fits within
-/// [`MAX_CASSANDRA_TTL_SECS`]; returns `None` when the
-/// duration would overflow the ceiling. `None` signals "do not bind a TTL
-/// on writes", which the keyed-state stores route through the `*_no_ttl`
-/// Cassandra queries (an indefinite-retention fallback that is preferable
-/// to a silent rejection).
-#[must_use]
-pub fn capped_default_ttl(base: CompactDuration) -> Option<CompactDuration> {
-    (i64::from(base.seconds()) <= MAX_CASSANDRA_TTL_SECS).then_some(base)
 }
 
 /// The oracle both production backend factories mint: a [`CommitManager`]
@@ -313,6 +294,3 @@ where
     )));
     CommitManager::with_optional_dedup(dedup, triggers)
 }
-
-#[cfg(test)]
-mod tests;
