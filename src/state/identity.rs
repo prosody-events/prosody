@@ -19,6 +19,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Stable runtime discriminator for a collection kind.
+///
+/// The wire discriminator persisted beside durable identity is the `i8` the
+/// [`From`]/[`TryFrom`] pair round-trips through, so the on-wire encoding
+/// cannot drift from the type it encodes.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollectionKindId {
@@ -32,23 +36,21 @@ pub enum CollectionKindId {
     TestSecondary = 2,
 }
 
-impl CollectionKindId {
-    /// Wire discriminator persisted beside durable identity.
-    ///
-    /// Paired with [`Self::from_i8`]; the two are inverses by construction,
-    /// so the on-wire encoding cannot drift from the type it encodes.
-    pub(crate) fn as_i8(self) -> i8 {
-        self as u8 as i8
+impl From<CollectionKindId> for i8 {
+    fn from(id: CollectionKindId) -> Self {
+        id as u8 as i8
     }
+}
 
-    /// Recovers a collection kind from its wire discriminator, or `None`
-    /// for an unknown byte. Inverse of [`Self::as_i8`].
-    pub(crate) fn from_i8(value: i8) -> Option<Self> {
+impl TryFrom<i8> for CollectionKindId {
+    type Error = UnknownCollectionKindId;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
-            1 => Some(Self::Value),
+            1 => Ok(Self::Value),
             #[cfg(test)]
-            2 => Some(Self::TestSecondary),
-            _ => None,
+            2 => Ok(Self::TestSecondary),
+            _ => Err(UnknownCollectionKindId(value)),
         }
     }
 }
@@ -87,29 +89,30 @@ impl StateKey {
 }
 
 /// Logical state namespace.
+///
+/// The wire discriminator persisted beside durable identity is the `i8` the
+/// [`From`]/[`TryFrom`] pair round-trips through, so the on-wire encoding
+/// cannot drift from the type it encodes.
+#[repr(i8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum StateType {
     /// User application state.
-    Application,
+    Application = 0,
 }
 
-impl StateType {
-    /// Wire discriminator for the state namespace.
-    ///
-    /// Paired with [`Self::from_i8`]; the two are inverses by construction,
-    /// so the on-wire encoding cannot drift from the type it encodes.
-    pub(crate) fn as_i8(self) -> i8 {
-        match self {
-            Self::Application => 0,
-        }
+impl From<StateType> for i8 {
+    fn from(state_type: StateType) -> Self {
+        state_type as i8
     }
+}
 
-    /// Recovers a state namespace from its wire discriminator, or `None`
-    /// for an unknown byte. Inverse of [`Self::as_i8`].
-    pub(crate) fn from_i8(value: i8) -> Option<Self> {
+impl TryFrom<i8> for StateType {
+    type Error = UnknownStateType;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
-            0 => Some(Self::Application),
-            _ => None,
+            0 => Ok(Self::Application),
+            _ => Err(UnknownStateType(value)),
         }
     }
 }
@@ -304,3 +307,13 @@ impl ClassifyError for StateNameError {
         ErrorCategory::Permanent
     }
 }
+
+/// Error converting an `i8` that matches no [`StateType`] variant.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown state type discriminator: {0}")]
+pub struct UnknownStateType(i8);
+
+/// Error converting an `i8` that matches no [`CollectionKindId`] variant.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown collection kind discriminator: {0}")]
+pub struct UnknownCollectionKindId(i8);

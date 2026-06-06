@@ -47,25 +47,21 @@ pub enum PayloadEncoding {
     RawZstdV1 = 4,
 }
 
-impl PayloadEncoding {
-    /// Recovers a payload encoding from its durable discriminator.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodingError::UnknownPayloadEncoding`] when `value` does
-    /// not match a known variant.
-    pub fn try_from_i16(value: i16) -> Result<Self, EncodingError> {
+impl From<PayloadEncoding> for i16 {
+    fn from(encoding: PayloadEncoding) -> Self {
+        encoding as i16
+    }
+}
+
+impl TryFrom<i16> for PayloadEncoding {
+    type Error = EncodingError;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
             3 => Ok(Self::RawV1),
             4 => Ok(Self::RawZstdV1),
-            other => Err(EncodingError::UnknownPayloadEncoding(other)),
+            _ => Err(EncodingError::UnknownPayloadEncoding(value)),
         }
-    }
-
-    /// Returns the durable `i16` discriminator.
-    #[must_use]
-    pub fn as_i16(self) -> i16 {
-        self as i16
     }
 }
 
@@ -83,28 +79,26 @@ pub enum WalFormat {
 }
 
 impl WalFormat {
-    /// Recovers a WAL format from its durable discriminator.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodingError::UnknownWalFormat`] when `value` does not
-    /// match a known variant.
-    pub fn try_from_i16(value: i16) -> Result<Self, EncodingError> {
+    fn is_compressed(self) -> bool {
+        matches!(self, Self::MsgpackStreamZstdV1)
+    }
+}
+
+impl From<WalFormat> for i16 {
+    fn from(format: WalFormat) -> Self {
+        format as i16
+    }
+}
+
+impl TryFrom<i16> for WalFormat {
+    type Error = EncodingError;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::MsgpackStreamV1),
             2 => Ok(Self::MsgpackStreamZstdV1),
-            other => Err(EncodingError::UnknownWalFormat(other)),
+            _ => Err(EncodingError::UnknownWalFormat(value)),
         }
-    }
-
-    /// Returns the durable `i16` discriminator.
-    #[must_use]
-    pub fn as_i16(self) -> i16 {
-        self as i16
-    }
-
-    fn is_compressed(self) -> bool {
-        matches!(self, Self::MsgpackStreamZstdV1)
     }
 }
 

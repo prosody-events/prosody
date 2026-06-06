@@ -112,7 +112,7 @@ fn decode_idle(
     match (data, payload_encoding) {
         (None, None) => Ok(DurableState::Idle { applied: None }),
         (Some(bytes), Some(encoding)) => {
-            let encoding = PayloadEncoding::try_from_i16(encoding)?;
+            let encoding = PayloadEncoding::try_from(encoding)?;
             let payload = decode_payload(&bytes, encoding)?;
             Ok(DurableState::Idle {
                 applied: Some(payload),
@@ -143,8 +143,8 @@ fn decode_sealed(
             reason: CorruptReason::WalWithoutPayloadEncoding,
         });
     };
-    let format = WalFormat::try_from_i16(format_raw)?;
-    let encoding = PayloadEncoding::try_from_i16(encoding_raw)?;
+    let format = WalFormat::try_from(format_raw)?;
+    let encoding = PayloadEncoding::try_from(encoding_raw)?;
 
     let applied = match data {
         Some(bytes) => Some(decode_payload(&bytes, encoding)?),

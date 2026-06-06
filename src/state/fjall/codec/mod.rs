@@ -54,7 +54,7 @@ where
 {
     let segment_bytes = id.state_key().segment_id.as_bytes();
     let key_bytes = id.state_key().key.as_bytes();
-    let state_type_byte = id.state_type().as_i8() as u8;
+    let state_type_byte = u8::from_le_bytes(i8::from(id.state_type()).to_le_bytes());
     let name_bytes = id.name().as_str().as_bytes();
 
     let mut buf = Vec::with_capacity(segment_bytes.len() + key_bytes.len() + name_bytes.len() + 4);

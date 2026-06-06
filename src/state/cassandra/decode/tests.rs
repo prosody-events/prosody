@@ -56,7 +56,7 @@ fn decodes_idle_with_data() -> Result<()> {
     let data = encoded_payload(7)?;
     let state = try_decode_row((
         Some(data),
-        Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(i16::from(PayloadEncoding::RawZstdV1)),
         Some(INITIAL_IDENTITY_VERSION),
         None,
         None,
@@ -81,11 +81,11 @@ fn decodes_sealed_with_data_and_wal() -> Result<()> {
     let wal_bytes = vec![0_u8, 1, 2, 3];
     let state = try_decode_row((
         Some(data),
-        Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(i16::from(PayloadEncoding::RawZstdV1)),
         Some(INITIAL_IDENTITY_VERSION),
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
-        Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+        Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
     ))?;
     match state {
         DurableState::Sealed {
@@ -108,11 +108,11 @@ fn decodes_sealed_no_data() -> Result<()> {
     let wal_bytes = vec![1_u8, 2, 3];
     let state = try_decode_row((
         None,
-        Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(i16::from(PayloadEncoding::RawZstdV1)),
         None,
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
-        Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+        Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
     ))?;
     match state {
         DurableState::Sealed { applied: None, wal } => {
@@ -143,7 +143,7 @@ fn rejects_payload_encoding_without_data() -> Result<()> {
     assert_corrupt_wal(
         try_decode_row((
             None,
-            Some(PayloadEncoding::RawZstdV1.as_i16()),
+            Some(i16::from(PayloadEncoding::RawZstdV1)),
             None,
             None,
             None,
@@ -176,7 +176,7 @@ fn rejects_partial_wal_columns_ops_and_format_only() -> Result<()> {
             None,
             None,
             Some(vec![1_u8]),
-            Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+            Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
         )),
         CorruptReason::PartialWalColumns {
             mask: WalColumnMask {
@@ -197,7 +197,7 @@ fn rejects_sealed_without_payload_encoding() -> Result<()> {
             None,
             Some(message_event_raw()),
             Some(vec![1_u8]),
-            Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+            Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
         )),
         CorruptReason::WalWithoutPayloadEncoding,
     )
@@ -222,11 +222,11 @@ fn rejects_corrupt_event_ref_udt_as_permanent() -> Result<()> {
     };
     let result = try_decode_row((
         None,
-        Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(i16::from(PayloadEncoding::RawZstdV1)),
         None,
         Some(corrupt),
         Some(vec![1_u8]),
-        Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+        Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
     ));
     match result {
         Err(error @ CassandraValueStoreError::CorruptUdt(CorruptUdtError::UnknownKind(7))) => {
@@ -251,7 +251,7 @@ fn rejects_data_without_identity_version() -> Result<()> {
     assert_corrupt_wal(
         try_decode_row((
             Some(data),
-            Some(PayloadEncoding::RawZstdV1.as_i16()),
+            Some(i16::from(PayloadEncoding::RawZstdV1)),
             None,
             None,
             None,
@@ -281,7 +281,7 @@ fn rejects_unrecognized_identity_version_as_permanent() -> Result<()> {
     let data = encoded_payload(5)?;
     let result = try_decode_row((
         Some(data),
-        Some(PayloadEncoding::RawZstdV1.as_i16()),
+        Some(i16::from(PayloadEncoding::RawZstdV1)),
         Some(2_i32),
         None,
         None,

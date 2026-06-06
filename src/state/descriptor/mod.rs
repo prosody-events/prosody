@@ -119,24 +119,9 @@ pub enum CellKind {
     KafkaMessageRef = 2,
 }
 
-impl CellKind {
-    /// Wire discriminator persisted beside durable identity.
-    ///
-    /// Paired with [`Self::from_i16`]; the two are inverses by construction.
-    #[must_use]
-    pub fn as_i16(self) -> i16 {
-        self as i16
-    }
-
-    /// Recovers a cell kind from its wire discriminator, or `None` for an
-    /// unknown value. Inverse of [`Self::as_i16`].
-    #[must_use]
-    pub fn from_i16(value: i16) -> Option<Self> {
-        match value {
-            1 => Some(Self::Codec),
-            2 => Some(Self::KafkaMessageRef),
-            _ => None,
-        }
+impl From<CellKind> for i16 {
+    fn from(cell_kind: CellKind) -> Self {
+        cell_kind as i16
     }
 }
 

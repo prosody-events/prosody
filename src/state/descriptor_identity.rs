@@ -71,8 +71,8 @@ impl DurableDescriptorIdentity {
         Self {
             name: name.as_str().to_owned(),
             version: INITIAL_IDENTITY_VERSION,
-            kind: identity.kind.as_i8(),
-            cell_kind: identity.cell_kind.as_i16(),
+            kind: identity.kind.into(),
+            cell_kind: identity.cell_kind.into(),
             codec_id: identity.codec_id.map(str::to_owned),
             schema_label: identity
                 .schema_label

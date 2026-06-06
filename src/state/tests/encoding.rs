@@ -126,11 +126,11 @@ fn prop_wal_roundtrip() {
 fn prop_unknown_payload_encoding() {
     fn property(value: i16) -> bool {
         match value {
-            3 | 4 => PayloadEncoding::try_from_i16(value).is_ok(),
+            3 | 4 => PayloadEncoding::try_from(value).is_ok(),
             // Includes the retired MsgPack discriminants 1/2: stale cells
             // fail loudly as UnknownPayloadEncoding (Permanent).
             other => matches!(
-                PayloadEncoding::try_from_i16(value),
+                PayloadEncoding::try_from(value),
                 Err(EncodingError::UnknownPayloadEncoding(got)) if got == other
             ),
         }
@@ -143,9 +143,9 @@ fn prop_unknown_payload_encoding() {
 fn prop_unknown_wal_format() {
     fn property(value: i16) -> bool {
         match value {
-            1 | 2 => WalFormat::try_from_i16(value).is_ok(),
+            1 | 2 => WalFormat::try_from(value).is_ok(),
             other => matches!(
-                WalFormat::try_from_i16(value),
+                WalFormat::try_from(value),
                 Err(EncodingError::UnknownWalFormat(got)) if got == other
             ),
         }

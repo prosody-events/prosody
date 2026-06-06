@@ -4,8 +4,8 @@
 //! through its own `SerializeValue` impl, rather than being hand-converted to
 //! a driver primitive (`i8`/`i16`) at the call site. The impls mirror the
 //! [`TimerType`](crate::timers::TimerType) bridge in
-//! [`crate::cassandra`]: delegate to the discriminator's `as_iN()` and let the
-//! integer's own `serialize` write the cell.
+//! [`crate::cassandra`]: delegate through the discriminator's `From<_> for iN`
+//! impl and let the integer's own `serialize` write the cell.
 //!
 //! These impls are **serialize-only by design**, the same rationale as the
 //! [`EventRef`](crate::state::EventRef) UDT bridge in
@@ -29,7 +29,7 @@ impl SerializeValue for StateType {
         typ: &ColumnType,
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        self.as_i8().serialize(typ, writer)
+        i8::from(*self).serialize(typ, writer)
     }
 }
 
@@ -39,7 +39,7 @@ impl SerializeValue for CollectionKindId {
         typ: &ColumnType,
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        self.as_i8().serialize(typ, writer)
+        i8::from(*self).serialize(typ, writer)
     }
 }
 
@@ -49,7 +49,7 @@ impl SerializeValue for PayloadEncoding {
         typ: &ColumnType,
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        self.as_i16().serialize(typ, writer)
+        i16::from(*self).serialize(typ, writer)
     }
 }
 
@@ -59,6 +59,6 @@ impl SerializeValue for WalFormat {
         typ: &ColumnType,
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        self.as_i16().serialize(typ, writer)
+        i16::from(*self).serialize(typ, writer)
     }
 }

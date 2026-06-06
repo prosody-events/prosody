@@ -76,7 +76,7 @@ fn decode_row(
     kind_i8: i8,
     name: String,
 ) -> Result<Option<PendingEntry>, ScanPendingError> {
-    let Some(state_type) = StateType::from_i8(state_type_i8) else {
+    let Ok(state_type) = StateType::try_from(state_type_i8) else {
         warn!(
             state_type = state_type_i8,
             "skipping unknown state_type in pending scan"
@@ -84,7 +84,7 @@ fn decode_row(
         return Ok(None);
     };
 
-    let Some(kind) = CollectionKindId::from_i8(kind_i8) else {
+    let Ok(kind) = CollectionKindId::try_from(kind_i8) else {
         warn!(
             kind = kind_i8,
             "skipping unknown collection kind in pending scan"
