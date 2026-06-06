@@ -6,7 +6,9 @@
 //! [`crate::state::tests::value_suite`] runners against
 //! `RecoveringValueStore<MemoryDurableValueStore, MockOracle>`.
 
-use super::{CollectionTtl, CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
+use super::{
+    CollectionTtl, CommitOracle, ConstTtl, RecoveringValueStore, RecoveringValueStoreError,
+};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::manager::sweep_pending;
@@ -188,7 +190,7 @@ fn event(id: u128) -> EventRef {
 /// drives.
 fn recovering_memory(
     oracle: MockOracle,
-) -> RecoveringValueStore<MemoryDurableValueStore, MockOracle> {
+) -> RecoveringValueStore<MemoryDurableValueStore, MockOracle, ConstTtl> {
     RecoveringValueStore::with_default_ttl(
         MemoryDurableValueStore::for_tests(),
         oracle,

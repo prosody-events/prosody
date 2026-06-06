@@ -96,8 +96,7 @@ where
     /// `None` means no operations are buffered for this collection;
     /// `Some(PendingOps { count, ops })` means `count` ordered operations
     /// are available and `ops` will yield exactly that many. The non-zero
-    /// count lets callers construct a [`DirtyCollection`] without
-    /// materializing the iterator.
+    /// count lets callers size the seal without materializing the iterator.
     ///
     /// # Errors
     ///

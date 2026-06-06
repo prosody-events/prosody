@@ -29,10 +29,10 @@
 //!
 //! Recovery writes bind their TTL through a [`CollectionTtl`] resolver `R`,
 //! so first-touch recovery binds the **same per-collection TTL** the
-//! middleware's timer-sweep recovery does. The default resolver
-//! [`ConstTtl`] reproduces the historical single-TTL behavior; production
-//! wiring injects the shared [`Arc<CollectionDefRegistry>`] as `R` so a
-//! per-collection override applies identically on both recovery paths.
+//! middleware's timer-sweep recovery does. Production wiring injects the
+//! shared [`Arc<CollectionDefRegistry>`] as `R` so a per-collection
+//! override applies identically on both recovery paths; tests bind a single
+//! fixed TTL through the test-only `ConstTtl` resolver.
 //! `None` means "do not bind a TTL" — passed straight through to the
 //! [`crate::state::cassandra::CassandraValueStore`]'s `*_no_ttl` query
 //! variants. Binding a TTL when the collection opted out would corrupt the
@@ -98,12 +98,14 @@ pub trait CollectionTtl: Clone + Send + Sync + 'static {
 
 /// A [`CollectionTtl`] that binds the same TTL for every collection.
 ///
-/// The default resolver, preserving the wrapper's historical single-TTL
-/// behavior. Use [`RecoveringValueStore::with_default_ttl`] to construct a
-/// store backed by this resolver.
+/// Test-only: production always resolves per-collection TTLs through the
+/// [`Arc<CollectionDefRegistry>`] resolver below. Tests that need a single
+/// fixed TTL construct one via [`RecoveringValueStore::with_default_ttl`].
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub struct ConstTtl(pub Option<CompactDuration>);
 
+#[cfg(test)]
 impl CollectionTtl for ConstTtl {
     fn ttl_for(&self, _id: &CollectionId<ValueKind>) -> Option<CompactDuration> {
         self.0
@@ -142,7 +144,7 @@ impl<T> RecoverableValueStore for T where
 /// `Layered<Cache, Recovering<Backing, Oracle>>` so the cache populates with
 /// post-recovery applied for free.
 #[derive(Clone, Debug)]
-pub struct RecoveringValueStore<Inner, Oracle, R = ConstTtl> {
+pub struct RecoveringValueStore<Inner, Oracle, R> {
     inner: Inner,
     oracle: Oracle,
     ttl: R,
@@ -155,14 +157,14 @@ impl<Inner, Oracle, R> RecoveringValueStore<Inner, Oracle, R> {
     /// Production wiring passes the shared
     /// [`Arc<CollectionDefRegistry>`](crate::state::registry::CollectionDefRegistry)
     /// here so first-touch recovery binds the same per-collection TTL the
-    /// timer-sweep recovery does. For a single fixed TTL, prefer
-    /// [`Self::with_default_ttl`].
+    /// timer-sweep recovery does.
     #[must_use]
     pub fn new(inner: Inner, oracle: Oracle, ttl: R) -> Self {
         Self { inner, oracle, ttl }
     }
 }
 
+#[cfg(test)]
 impl<Inner, Oracle> RecoveringValueStore<Inner, Oracle, ConstTtl> {
     /// Wraps `inner` with first-touch recovery that binds a single fixed
     /// TTL on every recovery write, via a [`ConstTtl`] resolver.
