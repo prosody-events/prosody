@@ -40,7 +40,7 @@ use crate::state::value::{ValueKind, ValueStore};
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
 use educe::Educe;
-use fjall::{Keyspace, PartitionHandle};
+use fjall::PartitionHandle;
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
@@ -54,25 +54,21 @@ pub struct FjallValueStore {
 #[derive(Educe)]
 #[educe(Debug)]
 struct Inner {
-    // Held to keep the keyspace alive for the lifetime of the partition
-    // handle; never accessed directly after construction.
-    #[educe(Debug(ignore))]
-    _keyspace: Keyspace,
     #[educe(Debug(ignore))]
     partition: PartitionHandle,
 }
 
 impl FjallValueStore {
-    /// Builds a cache store over `workspace`'s per-partition cache handle,
-    /// sharing the workspace's already-open keyspace — fjall locks the
-    /// cache directory, so opening it a second time would fail.
+    /// Builds a cache store over an opened cache `PartitionHandle`.
+    ///
+    /// The caller owns the keyspace the handle belongs to and is
+    /// responsible for keeping it alive for the store's lifetime —
+    /// production passes [`FjallWorkspace::cache_handle`], whose keyspace
+    /// the per-process [`FjallClient`] holds open.
     #[must_use]
-    pub fn with_workspace(workspace: &FjallWorkspace) -> Self {
+    pub fn new(partition: PartitionHandle) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                _keyspace: workspace.keyspace().as_ref().clone(),
-                partition: workspace.cache_handle().clone(),
-            }),
+            inner: Arc::new(Inner { partition }),
         }
     }
 
@@ -87,28 +83,6 @@ impl FjallValueStore {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || inner.partition.insert(key, value.as_ref())).await??;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-impl FjallValueStore {
-    /// Opens a fjall cache rooted at `dir`'s path under the partition
-    /// name `"value_cache"`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FjallValueStoreError::Engine`] when the keyspace or
-    /// partition cannot be opened.
-    pub fn for_test(dir: &tempfile::TempDir) -> Result<Self, FjallValueStoreError> {
-        let keyspace = fjall::Config::new(dir.path()).open()?;
-        let partition =
-            keyspace.open_partition("value_cache", fjall::PartitionCreateOptions::default())?;
-        Ok(Self {
-            inner: Arc::new(Inner {
-                _keyspace: keyspace,
-                partition,
-            }),
-        })
     }
 }
 

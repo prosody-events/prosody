@@ -36,7 +36,7 @@ use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
-use fjall::{Config, PartitionCreateOptions};
+use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::env;
@@ -51,18 +51,40 @@ use uuid::Uuid;
 
 // ---- shared helpers ---------------------------------------------------------
 
-fn make_cache() -> Result<(TempDir, FjallValueStore)> {
-    let dir = tempfile::tempdir()?;
-    let store = FjallValueStore::for_test(&dir)?;
-    Ok((dir, store))
+/// Owns the temp dir and keyspace backing a test store, keeping both alive
+/// for the lifetime of the partition handle the store holds.
+struct FjallFixture {
+    _dir: TempDir,
+    keyspace: Keyspace,
 }
 
-fn make_dirty(scope: EventScopeId) -> Result<(TempDir, FjallDirtyValueStore)> {
-    let dir = tempfile::tempdir()?;
-    let keyspace = Config::new(dir.path()).open()?;
-    let overlay =
-        keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
-    Ok((dir, FjallDirtyValueStore::new(overlay, scope)))
+impl FjallFixture {
+    fn open() -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        let keyspace = Config::new(dir.path()).open()?;
+        Ok(Self {
+            _dir: dir,
+            keyspace,
+        })
+    }
+
+    fn partition(&self, name: &str) -> Result<PartitionHandle> {
+        Ok(self
+            .keyspace
+            .open_partition(name, PartitionCreateOptions::default())?)
+    }
+}
+
+fn make_cache() -> Result<(FjallFixture, FjallValueStore)> {
+    let fixture = FjallFixture::open()?;
+    let cache = FjallValueStore::new(fixture.partition("value_cache")?);
+    Ok((fixture, cache))
+}
+
+fn make_dirty(scope: EventScopeId) -> Result<(FjallFixture, FjallDirtyValueStore)> {
+    let fixture = FjallFixture::open()?;
+    let dirty = FjallDirtyValueStore::new(fixture.partition("value_dirty_overlay")?, scope);
+    Ok((fixture, dirty))
 }
 
 fn key(value: &str) -> Key {
@@ -87,7 +109,7 @@ fn event(id: u128) -> EventRef {
 
 #[tokio::test]
 async fn cache_get_returns_unknown_on_missing_key() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let id = collection_id("missing")?;
     assert_eq!(cache.get(&id).await?, Read::Unknown);
     Ok(())
@@ -95,7 +117,7 @@ async fn cache_get_returns_unknown_on_missing_key() -> Result<()> {
 
 #[tokio::test]
 async fn cache_set_then_get_returns_present() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let id = collection_id("present")?;
     let payload = bytes(9);
     cache.set(&id, payload.clone()).await?;
@@ -105,7 +127,7 @@ async fn cache_set_then_get_returns_present() -> Result<()> {
 
 #[tokio::test]
 async fn cache_clear_then_get_returns_absent() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let id = collection_id("cleared")?;
     cache.clear(&id).await?;
     assert_eq!(cache.get(&id).await?, Read::Absent);
@@ -114,7 +136,7 @@ async fn cache_clear_then_get_returns_absent() -> Result<()> {
 
 #[tokio::test]
 async fn cache_set_then_clear_then_get_returns_absent() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let id = collection_id("toggled")?;
     cache.set(&id, bytes(1)).await?;
     cache.clear(&id).await?;
@@ -124,7 +146,7 @@ async fn cache_set_then_clear_then_get_returns_absent() -> Result<()> {
 
 #[tokio::test]
 async fn cache_present_with_empty_bytes_round_trips() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let id = collection_id("empty-cell")?;
     let payload = Bytes::new();
     cache.set(&id, payload.clone()).await?;
@@ -140,7 +162,7 @@ async fn cache_present_with_empty_bytes_round_trips() -> Result<()> {
 
 #[tokio::test]
 async fn cache_populated_on_miss() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let backing = MemoryDurableValueStore::for_tests();
     let id = collection_id("populated")?;
     let payload = bytes(3);
@@ -158,7 +180,7 @@ async fn cache_populated_on_miss() -> Result<()> {
 
 #[tokio::test]
 async fn cache_patched_after_apply_sealed() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
@@ -184,7 +206,7 @@ async fn cache_patched_after_apply_sealed() -> Result<()> {
 
 #[tokio::test]
 async fn cache_patched_after_direct_apply() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
@@ -206,7 +228,7 @@ async fn cache_patched_after_direct_apply() -> Result<()> {
 
 #[tokio::test]
 async fn cache_untouched_after_seal() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
@@ -225,7 +247,7 @@ async fn cache_untouched_after_seal() -> Result<()> {
 
 #[tokio::test]
 async fn cache_untouched_after_rollback_sealed() -> Result<()> {
-    let (_dir, cache) = make_cache()?;
+    let (_fixture, cache) = make_cache()?;
     let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
@@ -285,13 +307,13 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
 /// Builds a fresh fjall cache, runs `run` against it, and maps the outcome to a
 /// [`TestResult`] — folding the `make_cache` setup, the `"cache setup failed"`
 /// early-return, and the [`finish_trace`] mapping shared by every broker-free
-/// runner. The `TempDir` stays alive until `run` returns.
+/// runner. The fixture stays alive until `run` returns.
 fn run_layered_property<E: fmt::Debug>(
     falsified: &str,
     input_dbg: &str,
     run: impl FnOnce(FjallValueStore) -> Result<bool, E>,
 ) -> TestResult {
-    let (_dir, cache) = match make_cache() {
+    let (_fixture, cache) = match make_cache() {
         Ok(c) => c,
         Err(e) => {
             return TestResult::error(format!(
@@ -493,17 +515,19 @@ fn run_cassandra_property<E: fmt::Debug>(
     run: impl FnOnce(Span, FjallValueStore, CassandraValueStore) -> Result<bool, E>,
 ) -> TestResult {
     let span = Span::current();
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return TestResult::error(format!("tempdir failed: {e}\nFailing input:\n{input_dbg}"));
-        }
-    };
-    let cache = match FjallValueStore::for_test(&dir) {
-        Ok(c) => c,
+    let fixture = match FjallFixture::open() {
+        Ok(f) => f,
         Err(e) => {
             return TestResult::error(format!(
-                "cache open failed: {e}\nFailing input:\n{input_dbg}"
+                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
+    };
+    let cache = match fixture.partition("value_cache") {
+        Ok(handle) => FjallValueStore::new(handle),
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache open failed: {e:?}\nFailing input:\n{input_dbg}"
             ));
         }
     };
@@ -518,7 +542,6 @@ fn run_cassandra_property<E: fmt::Debug>(
         }
     };
     let result = run(span, cache, backing);
-    drop(dir);
     finish_trace(result, falsified, input_dbg)
 }
 
@@ -688,7 +711,7 @@ impl ClassifyError for FaultyError {
 
 #[tokio::test]
 async fn fjall_dirty_set_then_get_returns_present() -> Result<()> {
-    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let (_fixture, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("present")?;
     let payload = bytes(7);
     dirty.set(&id, payload.clone()).await?;
@@ -698,7 +721,7 @@ async fn fjall_dirty_set_then_get_returns_present() -> Result<()> {
 
 #[tokio::test]
 async fn fjall_dirty_clear_then_get_returns_absent() -> Result<()> {
-    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let (_fixture, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("absent")?;
     dirty.clear(&id).await?;
     assert_eq!(dirty.get(&id).await?, Read::Absent);
@@ -707,7 +730,7 @@ async fn fjall_dirty_clear_then_get_returns_absent() -> Result<()> {
 
 #[tokio::test]
 async fn fjall_dirty_untouched_collection_returns_unknown() -> Result<()> {
-    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let (_fixture, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("untouched")?;
     assert_eq!(dirty.get(&id).await?, Read::Unknown);
     Ok(())
@@ -715,7 +738,7 @@ async fn fjall_dirty_untouched_collection_returns_unknown() -> Result<()> {
 
 #[tokio::test]
 async fn fjall_dirty_two_sets_compact_to_one_op() -> Result<()> {
-    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let (_fixture, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("multi")?;
     dirty.set(&id, bytes(1)).await?;
     dirty.set(&id, bytes(2)).await?;
@@ -731,7 +754,7 @@ async fn fjall_dirty_two_sets_compact_to_one_op() -> Result<()> {
 
 #[tokio::test]
 async fn fjall_dirty_clear_pending_ops_removes_overlay() -> Result<()> {
-    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let (_fixture, dirty) = make_dirty(EventScopeId::fresh())?;
     let id = collection_id("drained")?;
     dirty.set(&id, bytes(1)).await?;
     dirty.set(&id, bytes(2)).await?;
@@ -743,10 +766,8 @@ async fn fjall_dirty_clear_pending_ops_removes_overlay() -> Result<()> {
 
 #[tokio::test]
 async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let keyspace = Config::new(dir.path()).open()?;
-    let overlay =
-        keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
+    let fixture = FjallFixture::open()?;
+    let overlay = fixture.partition("value_dirty_overlay")?;
 
     let scope_a = EventScopeId::fresh();
     let scope_b = EventScopeId::fresh();
@@ -764,13 +785,13 @@ async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
 /// Builds a fresh `FjallDirtyValueStore` in its own scope, runs `run` against
 /// it, and maps the outcome to a [`TestResult`] — folding the `make_dirty`
 /// setup and the `"dirty setup failed"` early-return shared by the dirty
-/// runners. The `TempDir` stays alive until `run` returns.
+/// runners. The fixture stays alive until `run` returns.
 fn run_dirty_property<E: fmt::Debug>(
     falsified: &str,
     input_dbg: &str,
     run: impl FnOnce(FjallDirtyValueStore) -> Result<bool, E>,
 ) -> TestResult {
-    let (_dir, dirty) = match make_dirty(EventScopeId::fresh()) {
+    let (_fixture, dirty) = match make_dirty(EventScopeId::fresh()) {
         Ok(d) => d,
         Err(e) => {
             return TestResult::error(format!(

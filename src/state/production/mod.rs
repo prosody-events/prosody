@@ -184,7 +184,7 @@ where
                 .workspace(topic, partition, epoch)
                 .map_err(FjallFactoryError::Workspace)?,
         );
-        let cache = FjallValueStore::with_workspace(&workspace);
+        let cache = FjallValueStore::new(workspace.cache_handle().clone());
         let oracle = self.oracle_for(topic, partition);
         let durable = compose_value_durable(
             cache,
