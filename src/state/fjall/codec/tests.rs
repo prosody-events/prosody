@@ -1,4 +1,4 @@
-use super::{decode_cell, encode_absent_cell, encode_present_cell, value_cache_key};
+use super::{collection_prefix, decode_cell, encode_absent_cell, encode_present_cell};
 use crate::Key;
 use crate::state::tests::value_suite::bytes;
 use crate::state::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
@@ -71,7 +71,7 @@ fn present_with_zero_length_payload_is_rejected() {
 #[test]
 fn collection_prefix_is_deterministic() -> Result<()> {
     let id = collection("profile")?;
-    assert_eq!(value_cache_key(&id), value_cache_key(&id));
+    assert_eq!(collection_prefix(&id), collection_prefix(&id));
     Ok(())
 }
 
@@ -79,6 +79,6 @@ fn collection_prefix_is_deterministic() -> Result<()> {
 fn distinct_collections_get_distinct_prefixes() -> Result<()> {
     let a = collection("profile-a")?;
     let b = collection("profile-b")?;
-    assert_ne!(value_cache_key(&a), value_cache_key(&b));
+    assert_ne!(collection_prefix(&a), collection_prefix(&b));
     Ok(())
 }

@@ -22,7 +22,6 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
 use thiserror::Error;
@@ -121,10 +120,7 @@ impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error> {
         let op = self.inner.lock().entries.get(collection).cloned().flatten();
-        Ok(op.map(|op| PendingOps {
-            count: NonZeroU64::MIN,
-            ops: Some(op).into_iter(),
-        }))
+        Ok(op.map(PendingOps::single))
     }
 
     fn clear_pending_ops(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {

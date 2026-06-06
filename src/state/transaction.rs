@@ -9,6 +9,7 @@ use super::event_ref::EventRef;
 use super::identity::{CollectionKind, CollectionRef};
 use super::wal::{EmptyOperationsError, SealedWal};
 use std::num::NonZeroU64;
+use std::option::IntoIter as OptionIntoIter;
 
 /// Persistence mode for local state changes.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -178,4 +179,20 @@ where
 
     /// Ordered pending operations.
     pub ops: I,
+}
+
+impl<T> PendingOps<OptionIntoIter<T>>
+where
+    T: Send,
+{
+    /// Builds a single-operation pending stream (`count` = 1).
+    ///
+    /// The last-writer-wins dirty stores (memory and fjall) buffer at most
+    /// one compacted op per collection, so this is their only constructor.
+    pub fn single(op: T) -> Self {
+        Self {
+            count: NonZeroU64::MIN,
+            ops: Some(op).into_iter(),
+        }
+    }
 }

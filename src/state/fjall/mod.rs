@@ -22,6 +22,7 @@
 //! because fjall's public API is synchronous. Each blocking closure
 //! clones a cheap `Arc<Inner>` so the closure is `'static`.
 
+mod cell_io;
 mod codec;
 mod config;
 mod dirty;
@@ -42,7 +43,6 @@ use bytes::Bytes;
 use educe::Educe;
 use fjall::PartitionHandle;
 use std::sync::Arc;
-use tokio::task::spawn_blocking;
 
 /// Fjall-backed Value cache store.
 #[derive(Clone, Educe)]
@@ -71,19 +71,6 @@ impl FjallValueStore {
             inner: Arc::new(Inner { partition }),
         }
     }
-
-    /// Writes an encoded cache cell at `collection`'s key, dispatching the
-    /// blocking fjall insert off the async runtime.
-    async fn insert_cell(
-        &self,
-        collection: &CollectionId<ValueKind>,
-        value: Bytes,
-    ) -> Result<(), FjallValueStoreError> {
-        let key = codec::value_cache_key(collection);
-        let inner = Arc::clone(&self.inner);
-        spawn_blocking(move || inner.partition.insert(key, value.as_ref())).await??;
-        Ok(())
-    }
 }
 
 impl ValueStore for FjallValueStore {
@@ -93,9 +80,8 @@ impl ValueStore for FjallValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Read<Bytes>, Self::Error> {
-        let key = codec::value_cache_key(collection);
-        let inner = Arc::clone(&self.inner);
-        let raw = spawn_blocking(move || inner.partition.get(key)).await??;
+        let raw =
+            cell_io::read_cell(&self.inner.partition, codec::collection_prefix(collection)).await?;
         codec::decode_cell(raw.as_deref())
     }
 
@@ -104,15 +90,23 @@ impl ValueStore for FjallValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: Bytes,
     ) -> Result<(), Self::Error> {
-        self.insert_cell(collection, codec::encode_present_cell(&payload)?)
-            .await
+        cell_io::write_cell(
+            &self.inner.partition,
+            codec::collection_prefix(collection),
+            codec::encode_present_cell(&payload)?,
+        )
+        .await
     }
 
     async fn clear<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        self.insert_cell(collection, codec::encode_absent_cell())
-            .await
+        cell_io::write_cell(
+            &self.inner.partition,
+            codec::collection_prefix(collection),
+            codec::encode_absent_cell(),
+        )
+        .await
     }
 }

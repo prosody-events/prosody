@@ -26,6 +26,7 @@
 //! partition's workspace but cannot collide because the per-event
 //! [`EventScopeId`] is baked into the overlay key.
 
+use super::cell_io;
 use super::codec::{decode_cell, dirty_collection_key, encode_absent_cell, encode_present_cell};
 use super::error::FjallValueStoreError;
 use super::workspace::FjallWorkspace;
@@ -36,11 +37,9 @@ use crate::timers::datetime::CompactDateTimeError;
 use bytes::Bytes;
 use educe::Educe;
 use fjall::PartitionHandle;
-use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::task::spawn_blocking;
 
 /// Fjall-backed dirty Value workspace, scoped to one event.
 #[derive(Clone, Educe)]
@@ -66,9 +65,8 @@ impl ValueStore for FjallDirtyValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Read<Bytes>, Self::Error> {
-        let key = dirty_collection_key(self.scope, collection);
-        let overlay = self.overlay.clone();
-        let raw = spawn_blocking(move || overlay.get(key)).await??;
+        let raw =
+            cell_io::read_cell(&self.overlay, dirty_collection_key(self.scope, collection)).await?;
         decode_cell(raw.as_deref())
     }
 
@@ -77,22 +75,24 @@ impl ValueStore for FjallDirtyValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: Bytes,
     ) -> Result<(), Self::Error> {
-        let key = dirty_collection_key(self.scope, collection);
-        let cell = encode_present_cell(&payload)?;
-        let overlay = self.overlay.clone();
-        spawn_blocking(move || overlay.insert(key, cell.as_ref())).await??;
-        Ok(())
+        cell_io::write_cell(
+            &self.overlay,
+            dirty_collection_key(self.scope, collection),
+            encode_present_cell(&payload)?,
+        )
+        .await
     }
 
     async fn clear<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let key = dirty_collection_key(self.scope, collection);
-        let cell = encode_absent_cell();
-        let overlay = self.overlay.clone();
-        spawn_blocking(move || overlay.insert(key, cell.as_ref())).await??;
-        Ok(())
+        cell_io::write_cell(
+            &self.overlay,
+            dirty_collection_key(self.scope, collection),
+            encode_absent_cell(),
+        )
+        .await
     }
 }
 
@@ -110,10 +110,7 @@ impl PendingOpSource<ValueKind> for FjallDirtyValueStore {
             Read::Absent => Some(ValueOp::Clear),
             Read::Unknown => None,
         };
-        Ok(op.map(|op| PendingOps {
-            count: NonZeroU64::MIN,
-            ops: Some(op).into_iter(),
-        }))
+        Ok(op.map(PendingOps::single))
     }
 
     fn clear_pending_ops(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {

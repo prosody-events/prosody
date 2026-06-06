@@ -30,7 +30,6 @@
 
 use super::error::FjallValueStoreError;
 use crate::state::encoding::{PayloadEncoding, decode_payload, encode_payload};
-use crate::state::value::ValueKind;
 use crate::state::{CollectionId, CollectionKind, EventScopeId, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128;
@@ -67,12 +66,6 @@ where
     buf.extend_from_slice(name_bytes);
 
     xxh3_128(&buf).to_be_bytes()
-}
-
-/// Returns the cache key for a Value collection.
-#[must_use]
-pub fn value_cache_key(id: &CollectionId<ValueKind>) -> [u8; 16] {
-    collection_prefix(id)
 }
 
 /// Encodes an `Absent` cache cell.
