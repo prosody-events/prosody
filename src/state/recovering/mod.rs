@@ -205,9 +205,7 @@ where
             DurableState::Sealed { wal, .. } => {
                 let recovery_ref =
                     CollectionRef::new(collection.clone(), self.ttl.ttl_for(collection));
-                resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event())
-                    .await
-                    .map_err(resolve_into_recovering)?;
+                resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event()).await?;
                 ValueStore::get(&self.inner, collection)
                     .await
                     .map_err(RecoveringValueStoreError::Inner)
@@ -288,9 +286,7 @@ where
         {
             let recovery_ref =
                 CollectionRef::new(collection.id().clone(), self.ttl.ttl_for(collection.id()));
-            resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event())
-                .await
-                .map_err(resolve_into_recovering)?;
+            resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event()).await?;
         }
         self.inner
             .seal(collection, event, ops)
@@ -420,23 +416,6 @@ where
     }
 }
 
-/// Maps a [`resolve_sealed`] error into the wrapper's error type: a durable
-/// failure becomes [`RecoveringValueStoreError::Inner`], an oracle failure
-/// [`RecoveringValueStoreError::Oracle`]. Shared by the get-side and
-/// seal-side recovery callsites.
-fn resolve_into_recovering<InnerError, OracleError>(
-    error: ResolveSealedError<InnerError, OracleError>,
-) -> RecoveringValueStoreError<InnerError, OracleError>
-where
-    InnerError: ClassifyError + Error + Send + Sync + 'static,
-    OracleError: ClassifyError + Error + Send + Sync + 'static,
-{
-    match error {
-        ResolveSealedError::Durable(e) => RecoveringValueStoreError::Inner(e),
-        ResolveSealedError::Oracle(e) => RecoveringValueStoreError::Oracle(e),
-    }
-}
-
 /// Error returned by [`RecoveringValueStore`].
 ///
 /// The single enum is shared across [`ValueStore`],
@@ -468,6 +447,24 @@ where
         match self {
             Self::Inner(error) => error.classify_error(),
             Self::Oracle(error) => error.classify_error(),
+        }
+    }
+}
+
+/// A [`resolve_sealed`] failure folds into the wrapper's error: a durable
+/// failure becomes [`Inner`](RecoveringValueStoreError::Inner), an oracle
+/// failure [`Oracle`](RecoveringValueStoreError::Oracle). Lets the get-side
+/// and seal-side recovery callsites resolve with `?`.
+impl<InnerError, OracleError> From<ResolveSealedError<InnerError, OracleError>>
+    for RecoveringValueStoreError<InnerError, OracleError>
+where
+    InnerError: ClassifyError + Error + Send + Sync + 'static,
+    OracleError: ClassifyError + Error + Send + Sync + 'static,
+{
+    fn from(error: ResolveSealedError<InnerError, OracleError>) -> Self {
+        match error {
+            ResolveSealedError::Durable(e) => Self::Inner(e),
+            ResolveSealedError::Oracle(e) => Self::Oracle(e),
         }
     }
 }
