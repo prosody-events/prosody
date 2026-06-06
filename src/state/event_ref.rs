@@ -14,10 +14,10 @@ use uuid::Uuid;
 ///
 /// The keyed-state middleware mints a fresh scope per handler invocation
 /// (via [`Self::fresh`]) so dirty workspaces can be keyed by scope without
-/// colliding across events. Keying the Fjall dirty workspace on
-/// [`EventScopeId`] is future work; today this identity is consumed by
-/// the in-memory middleware workspace and is sufficient to distinguish
-/// concurrent events at the type level.
+/// colliding across events. Both the in-memory and the Fjall dirty
+/// workspaces key on this identity — the Fjall overlay prefixes its
+/// collection key with the scope (see `dirty_collection_key`) so concurrent
+/// events on one Kafka partition cannot collide.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct EventScopeId(u128);
 
