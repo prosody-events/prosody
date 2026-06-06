@@ -295,9 +295,22 @@ impl TerminationWatch {
 type ValueTx<D, S> = Arc<AsyncMutex<TransactionValueStore<D, S>>>;
 
 /// The sealed set `finalize` records for the apply hooks.
+///
+/// The owning event is not stored here — it is always `self.inner.event`,
+/// read at apply time.
 struct SealedSet {
-    event: EventRef,
     collections: Vec<CollectionRef<ValueKind>>,
+}
+
+/// Which durable resolution the apply hooks drive the recorded sealed set
+/// through after the event's durability marker settles.
+#[derive(Clone, Copy, Debug)]
+enum Resolution {
+    /// The event committed: apply each sealed collection.
+    Commit,
+
+    /// The event aborted: roll each sealed collection back.
+    Rollback,
 }
 
 /// Construction parameters for [`ValueStateSession`], bundled so the
@@ -550,6 +563,44 @@ where
     }
 }
 
+impl<D, P, L> ValueStateSession<D, P, L>
+where
+    D: DurableValueBundle,
+    P: DirtyStoreProvider<ValueKind>,
+{
+    /// Drives the recorded sealed set through one durable resolution after
+    /// the event's durability marker settles. Best-effort: individual
+    /// failures are logged and surface as [`ApplyOutcome::Incomplete`] so
+    /// the caller leaves the `StateRecovery` timer armed for the sweep.
+    async fn resolve_sealed(&self, resolution: Resolution) -> ApplyOutcome {
+        let Some(set) = self.inner.sealed.lock().take() else {
+            return ApplyOutcome::NothingSealed;
+        };
+        let event = self.inner.event;
+        let mut all_resolved = true;
+        for collection_ref in &set.collections {
+            let result = match resolution {
+                Resolution::Commit => self.inner.durable.apply_sealed(collection_ref, event).await,
+                Resolution::Rollback => {
+                    self.inner
+                        .durable
+                        .rollback_sealed(collection_ref, event)
+                        .await
+                }
+            };
+            if let Err(error) = result {
+                warn!(error = ?error, ?resolution, "sealed resolution failed");
+                all_resolved = false;
+            }
+        }
+        if all_resolved {
+            ApplyOutcome::Resolved
+        } else {
+            ApplyOutcome::Incomplete
+        }
+    }
+}
+
 impl<D, P, L> StateLifecycle for ValueStateSession<D, P, L>
 where
     D: DurableValueBundle,
@@ -589,7 +640,6 @@ where
             Ok(FinalizeOutcome::Clean)
         } else {
             *self.inner.sealed.lock() = Some(SealedSet {
-                event: self.inner.event,
                 collections: sealed,
             });
             Ok(FinalizeOutcome::Sealed)
@@ -597,49 +647,11 @@ where
     }
 
     async fn commit_apply(&self) -> ApplyOutcome {
-        let Some(set) = self.inner.sealed.lock().take() else {
-            return ApplyOutcome::NothingSealed;
-        };
-        let mut all_resolved = true;
-        for collection_ref in &set.collections {
-            if let Err(error) = self
-                .inner
-                .durable
-                .apply_sealed(collection_ref, set.event)
-                .await
-            {
-                warn!(error = ?error, "apply_sealed failed after commit");
-                all_resolved = false;
-            }
-        }
-        if all_resolved {
-            ApplyOutcome::Resolved
-        } else {
-            ApplyOutcome::Incomplete
-        }
+        self.resolve_sealed(Resolution::Commit).await
     }
 
     async fn rollback_aborted(&self) -> ApplyOutcome {
-        let Some(set) = self.inner.sealed.lock().take() else {
-            return ApplyOutcome::NothingSealed;
-        };
-        let mut all_resolved = true;
-        for collection_ref in &set.collections {
-            if let Err(error) = self
-                .inner
-                .durable
-                .rollback_sealed(collection_ref, set.event)
-                .await
-            {
-                warn!(error = ?error, "rollback_sealed failed after abort");
-                all_resolved = false;
-            }
-        }
-        if all_resolved {
-            ApplyOutcome::Resolved
-        } else {
-            ApplyOutcome::Incomplete
-        }
+        self.resolve_sealed(Resolution::Rollback).await
     }
 
     fn reset(&self) {
