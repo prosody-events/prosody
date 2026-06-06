@@ -185,7 +185,14 @@ where
                 .map_err(FjallFactoryError::Workspace)?,
         );
         let cache = FjallValueStore::new(workspace.cache_handle().clone());
-        let oracle = self.oracle_for(topic, partition);
+        let oracle = mint_oracle(
+            self.dedup.as_ref(),
+            &self.triggers,
+            &self.consumer_group,
+            self.timer_slab_size,
+            topic,
+            partition,
+        );
         let durable = compose_value_durable(
             cache,
             self.backing.clone(),
@@ -197,23 +204,6 @@ where
             oracle,
             dirty: FjallDirtyValueStoreProvider::new(workspace),
         })
-    }
-}
-
-impl<DP, TP> CassandraStateBackendFactory<DP, TP>
-where
-    DP: DeduplicationStoreProvider,
-    TP: TriggerStoreProvider,
-{
-    fn oracle_for(&self, topic: Topic, partition: Partition) -> ProductionOracle<DP, TP> {
-        mint_oracle(
-            self.dedup.as_ref(),
-            &self.triggers,
-            &self.consumer_group,
-            self.timer_slab_size,
-            topic,
-            partition,
-        )
     }
 }
 
