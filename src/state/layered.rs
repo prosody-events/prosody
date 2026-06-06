@@ -258,7 +258,7 @@ where
 /// `DescriptorIdentityStore<Error = DurableWalStore::Error>` bound.
 impl<Cache, Backing> DescriptorIdentityStore for LayeredValueStore<Cache, Backing>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueStore,
     Backing: DurableWalStore<ValueKind>
         + DescriptorIdentityStore<Error = <Backing as DurableWalStore<ValueKind>>::Error>,
 {
