@@ -66,7 +66,6 @@ pub(crate) struct RegisteredCollection {
 pub struct CollectionDefRegistry {
     defs: HashMap<StateName, RegisteredCollection>,
     default_ttl: Option<CompactDuration>,
-    default_commit_mode: CommitMode,
 }
 
 impl Default for CollectionDefRegistry {
@@ -76,23 +75,13 @@ impl Default for CollectionDefRegistry {
 }
 
 impl CollectionDefRegistry {
-    /// Creates a registry with the supplied middleware-wide default TTL
-    /// and [`CommitMode::Wal`] as the default commit mode.
+    /// Creates a registry with the supplied middleware-wide default TTL.
     #[must_use]
     pub fn new(default_ttl: Option<CompactDuration>) -> Self {
         Self {
             defs: HashMap::new(),
             default_ttl,
-            default_commit_mode: CommitMode::Wal,
         }
-    }
-
-    /// Overrides the default commit mode used for collections not in the
-    /// registry.
-    #[must_use]
-    pub fn with_default_commit_mode(mut self, mode: CommitMode) -> Self {
-        self.default_commit_mode = mode;
-        self
     }
 
     /// Registers `descriptor`'s collection with operational settings `def`.
@@ -158,13 +147,13 @@ impl CollectionDefRegistry {
         self.defs.get(name).map_or(self.default_ttl, |c| c.def.ttl)
     }
 
-    /// Returns the commit mode bound to `name`, falling back to the
-    /// middleware-wide default.
+    /// Returns the commit mode bound to `name`, falling back to
+    /// [`CommitMode::Wal`] for names not in the registry.
     #[must_use]
     pub fn commit_mode_for(&self, name: &StateName) -> CommitMode {
         self.defs
             .get(name)
-            .map_or(self.default_commit_mode, |c| c.def.commit_mode)
+            .map_or(CommitMode::Wal, |c| c.def.commit_mode)
     }
 }
 
