@@ -41,13 +41,9 @@ impl<T> NonEmptyOps<T> {
         Ok(Self::new(first, items.collect()))
     }
 
-    /// Returns ordered operations.
-    #[must_use]
-    pub fn as_slice(&self) -> NonEmptyOpsSlice<'_, T> {
-        NonEmptyOpsSlice {
-            first: &self.first,
-            rest: &self.rest,
-        }
+    /// Iterates over the operations in order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        iter::once(&self.first).chain(self.rest.iter())
     }
 
     /// Decomposes the list into a vector.
@@ -65,32 +61,6 @@ impl<T> NonEmptyOps<T> {
     #[must_use]
     pub fn len(&self) -> NonZeroU64 {
         NonZeroU64::MIN.saturating_add(self.rest.len() as u64)
-    }
-}
-
-/// Borrowed view of a non-empty operation list.
-#[derive(Clone, Copy, Debug)]
-pub struct NonEmptyOpsSlice<'a, T> {
-    first: &'a T,
-    rest: &'a [T],
-}
-
-impl<'a, T> NonEmptyOpsSlice<'a, T> {
-    /// Returns the first operation.
-    #[must_use]
-    pub fn first(self) -> &'a T {
-        self.first
-    }
-
-    /// Returns operations after the first.
-    #[must_use]
-    pub fn rest(self) -> &'a [T] {
-        self.rest
-    }
-
-    /// Iterates over every operation in order.
-    pub fn iter(self) -> impl Iterator<Item = &'a T> {
-        iter::once(self.first).chain(self.rest.iter())
     }
 }
 
@@ -133,9 +103,8 @@ where
     }
 
     /// Returns ordered WAL operations.
-    #[must_use]
-    pub fn ops(&self) -> NonEmptyOpsSlice<'_, K::Op> {
-        self.ops.as_slice()
+    pub fn ops(&self) -> impl Iterator<Item = &K::Op> {
+        self.ops.iter()
     }
 
     /// Decomposes this WAL into ordered operations.

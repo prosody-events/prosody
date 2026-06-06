@@ -67,9 +67,7 @@ pub use transaction::{
     CommitMode, DirtyCollection, DurableState, LocalTx, PendingOps, Read, SealedCollection,
 };
 pub use value::{ValueApplied, ValueKind, ValueOp, ValueOverlay};
-pub use wal::{
-    EmptyOperationsError, NonEmptyOps, NonEmptyOpsSlice, SealedWal, WalBlob, WalEnvelope,
-};
+pub use wal::{EmptyOperationsError, NonEmptyOps, SealedWal, WalBlob, WalEnvelope};
 
 /// The per-partition keyed-state backend: the durable Value bundle, the
 /// commit oracle it recovers through, and the dirty-workspace provider.

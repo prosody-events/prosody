@@ -457,7 +457,7 @@ impl DurableWalStore<ValueKind> for CassandraValueStore {
             return Ok(StoreOutcome::NoOp);
         };
         let envelope = decode_wal::<ValueKind>(wal.wal())?;
-        let folded = fold_value_ops(applied, envelope.ops().iter());
+        let folded = fold_value_ops(applied, envelope.ops());
 
         self.apply_wal_atomic(collection, &folded).await?;
         self.delete_pending::<ValueKind>(collection.id()).await?;

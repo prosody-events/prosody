@@ -172,7 +172,7 @@ where
 
     let mut buf: Vec<u8> = Vec::new();
     write_named(&mut buf, &header).map_err(EncodingError::BadMsgPackEncode)?;
-    for op in envelope.ops().iter() {
+    for op in envelope.ops() {
         write_named(&mut buf, op).map_err(EncodingError::BadMsgPackEncode)?;
     }
 
