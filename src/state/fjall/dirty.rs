@@ -28,14 +28,11 @@
 
 use super::codec::{decode_cell, dirty_collection_key, encode_absent_cell, encode_present_cell};
 use super::error::FjallValueStoreError;
-use super::workspace::{AssignmentEpoch, FjallClient, FjallWorkspace};
+use super::workspace::FjallWorkspace;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::value::{PendingOpSource, ValueKind, ValueOp, ValueStore};
-use crate::state::{
-    CollectionId, DirtyStoreFactory, DirtyStoreProvider, EventScopeId, PendingOps, Read,
-};
+use crate::state::{CollectionId, DirtyStoreProvider, EventScopeId, PendingOps, Read};
 use crate::timers::datetime::CompactDateTimeError;
-use crate::{Partition, Topic};
 use bytes::Bytes;
 use educe::Educe;
 use fjall::PartitionHandle;
@@ -160,46 +157,12 @@ impl DirtyStoreProvider<ValueKind> for FjallDirtyValueStoreProvider {
     }
 }
 
-/// Process-wide factory that mints per-partition
-/// [`FjallDirtyValueStoreProvider`]s by opening a fresh
-/// [`FjallWorkspace`] for each Kafka partition assignment.
-#[derive(Clone, Educe)]
-#[educe(Debug)]
-pub struct FjallDirtyValueStoreFactory {
-    #[educe(Debug(ignore))]
-    client: Arc<FjallClient>,
-}
-
-impl FjallDirtyValueStoreFactory {
-    /// Creates a factory that mints workspaces from `client`.
-    #[must_use]
-    pub fn new(client: Arc<FjallClient>) -> Self {
-        Self { client }
-    }
-}
-
-impl DirtyStoreFactory<ValueKind> for FjallDirtyValueStoreFactory {
-    type Error = FjallFactoryError;
-    type Provider = FjallDirtyValueStoreProvider;
-
-    fn for_partition(
-        &self,
-        topic: Topic,
-        partition: Partition,
-    ) -> Result<Self::Provider, Self::Error> {
-        let epoch = AssignmentEpoch::now().map_err(FjallFactoryError::Epoch)?;
-        let workspace = self
-            .client
-            .workspace(topic, partition, epoch)
-            .map_err(FjallFactoryError::Workspace)?;
-        Ok(FjallDirtyValueStoreProvider::new(Arc::new(workspace)))
-    }
-}
-
-/// Errors raised by [`FjallDirtyValueStoreFactory::for_partition`].
+/// Errors raised when minting a per-partition
+/// [`FjallDirtyValueStoreProvider`] (see the production state-backend
+/// factory in [`crate::state::production`]).
 #[derive(Debug, Error)]
 pub enum FjallFactoryError {
-    /// The wall-clock read for [`AssignmentEpoch::now`] failed.
+    /// The wall-clock read for the assignment epoch failed.
     #[error("assignment epoch lookup failed")]
     Epoch(#[source] CompactDateTimeError),
 

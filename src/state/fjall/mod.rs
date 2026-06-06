@@ -32,10 +32,7 @@ mod workspace;
 mod tests;
 
 pub use config::{FjallConfiguration, FjallConfigurationBuilder};
-pub use dirty::{
-    FjallDirtyValueStore, FjallDirtyValueStoreFactory, FjallDirtyValueStoreProvider,
-    FjallFactoryError,
-};
+pub use dirty::{FjallDirtyValueStore, FjallDirtyValueStoreProvider, FjallFactoryError};
 pub use error::FjallValueStoreError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 

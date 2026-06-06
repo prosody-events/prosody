@@ -10,20 +10,18 @@ use super::value::{
     fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionKind, CollectionKindId, CollectionRef, DirtyStoreFactory,
-    DirtyStoreProvider, DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read,
-    SealedCollection, SealedWal, StateKey, StateName, StateType, StoreOutcome, WalFormat,
+    CollectionId, CollectionKind, CollectionKindId, CollectionRef, DirtyStoreProvider,
+    DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read, SealedCollection,
+    SealedWal, StateKey, StateName, StateType, StoreOutcome, WalFormat,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
-use crate::{Partition, Topic};
 use ahash::RandomState;
 use bytes::Bytes;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
@@ -111,24 +109,6 @@ impl DirtyStoreProvider<ValueKind> for MemoryDirtyValueStoreProvider {
 
     fn for_scope(&self, _scope: EventScopeId) -> Self::Store {
         MemoryDirtyValueStore::new()
-    }
-}
-
-/// Process-wide factory that hands out
-/// [`MemoryDirtyValueStoreProvider`]s.
-#[derive(Clone, Debug, Default)]
-pub struct MemoryDirtyValueStoreFactory;
-
-impl DirtyStoreFactory<ValueKind> for MemoryDirtyValueStoreFactory {
-    type Error = Infallible;
-    type Provider = MemoryDirtyValueStoreProvider;
-
-    fn for_partition(
-        &self,
-        _topic: Topic,
-        _partition: Partition,
-    ) -> Result<Self::Provider, Self::Error> {
-        Ok(MemoryDirtyValueStoreProvider)
     }
 }
 
