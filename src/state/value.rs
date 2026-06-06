@@ -1,8 +1,8 @@
 //! Value collection contracts and transaction wrapper.
 
 use super::{
-    CollectionId, CollectionKind, CollectionKindId, CollectionRef, CommitMode, DirtyCollection,
-    DurableState, EventRef, LocalTx, PendingOps, Read, SealedCollection, StoreOutcome,
+    CollectionId, CollectionKind, CollectionKindId, CollectionRef, CommitMode, DurableState,
+    EventRef, LocalTx, PendingOps, Read, SealedCollection, StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
@@ -275,7 +275,7 @@ where
 
         match self.local_tx() {
             LocalTx::Clean(_) => Err(TransactionValueStoreError::NoPendingOps),
-            LocalTx::Dirty(_) => {
+            LocalTx::Dirty => {
                 let ops = self
                     .collect_pending_ops()?
                     .ok_or(TransactionValueStoreError::NoPendingOps)?;
@@ -340,7 +340,7 @@ where
     pub async fn flush(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         match self.local_tx() {
             LocalTx::Clean(_) => Ok(StoreOutcome::NoOp),
-            LocalTx::Dirty(_) => {
+            LocalTx::Dirty => {
                 let outcome = self.apply_dirty_directly().await?;
                 self.set_local_tx(LocalTx::Clean(self.collection.clone()));
                 Ok(outcome)
@@ -361,7 +361,7 @@ where
 
         let outcome = match self.local_tx() {
             LocalTx::Clean(_) => StoreOutcome::NoOp,
-            LocalTx::Dirty(_) => self.apply_dirty_directly().await?,
+            LocalTx::Dirty => self.apply_dirty_directly().await?,
             LocalTx::Sealed(_) => return Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => return Err(TransactionValueStoreError::Finished),
         };
@@ -381,7 +381,7 @@ where
                 self.set_local_tx(LocalTx::Finished);
                 Ok(StoreOutcome::NoOp)
             }
-            LocalTx::Dirty(_) => {
+            LocalTx::Dirty => {
                 self.dirty
                     .clear_pending_ops(self.collection.id())
                     .map_err(TransactionValueStoreError::Dirty)?;
@@ -467,19 +467,17 @@ where
     }
 
     fn mark_dirty(&self) -> Result<(), TxError<S, D>> {
-        let pending = self
-            .dirty
+        self.dirty
             .pending_ops(self.collection.id())
             .map_err(TransactionValueStoreError::Dirty)?
             .ok_or(TransactionValueStoreError::NoPendingOps)?;
-        let dirty = DirtyCollection::new(self.collection.clone(), pending.count);
-        *self.tx.lock() = LocalTx::Dirty(dirty);
+        *self.tx.lock() = LocalTx::Dirty;
         Ok(())
     }
 
     fn can_write(&self) -> Result<(), TxError<S, D>> {
         match self.local_tx() {
-            LocalTx::Clean(_) | LocalTx::Dirty(_) => Ok(()),
+            LocalTx::Clean(_) | LocalTx::Dirty => Ok(()),
             LocalTx::Sealed(_) => Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => Err(TransactionValueStoreError::Finished),
         }

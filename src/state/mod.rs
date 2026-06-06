@@ -63,9 +63,7 @@ pub use identity::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,
     StateNameError, StateType,
 };
-pub use transaction::{
-    CommitMode, DirtyCollection, DurableState, LocalTx, PendingOps, Read, SealedCollection,
-};
+pub use transaction::{CommitMode, DurableState, LocalTx, PendingOps, Read, SealedCollection};
 pub use value::{ValueApplied, ValueKind, ValueOp, ValueOverlay};
 pub use wal::{EmptyOperationsError, NonEmptyOps, SealedWal, WalBlob, WalEnvelope};
 

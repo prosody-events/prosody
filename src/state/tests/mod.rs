@@ -9,14 +9,13 @@ use super::value::{
     DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyCollection, EventRef, Read,
-    StateKey, StateName, StateType, StoreOutcome, ValueKind, ValueOp, WalEnvelope,
+    CollectionId, CollectionKindId, CollectionRef, CommitMode, EventRef, Read, StateKey, StateName,
+    StateType, StoreOutcome, ValueKind, ValueOp, WalEnvelope,
 };
 use crate::Key;
 use color_eyre::eyre::{self, Result};
 use futures::executor;
 use quickcheck::QuickCheck;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -151,19 +150,6 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     };
     assert_eq!(hash(&with_ttl), hash(&without_ttl));
     assert_eq!(hash(&with_ttl), hash(&other_ttl));
-    Ok(())
-}
-
-#[test]
-fn dirty_collection_requires_non_zero_operations() -> Result<()> {
-    let reference = CollectionRef::new(collection_id()?, None);
-    assert!(DirtyCollection::try_from_count(reference.clone(), 0).is_err());
-
-    let Some(count) = NonZeroU64::new(1) else {
-        return Err(eyre::eyre!("non-zero literal produced None"));
-    };
-    let dirty = DirtyCollection::new(reference, count);
-    assert_eq!(dirty.operation_count(), count);
     Ok(())
 }
 

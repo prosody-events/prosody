@@ -7,7 +7,7 @@
 
 use super::event_ref::EventRef;
 use super::identity::{CollectionKind, CollectionRef};
-use super::wal::{EmptyOperationsError, SealedWal};
+use super::wal::SealedWal;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 
@@ -66,65 +66,13 @@ where
     Clean(CollectionRef<K>),
 
     /// Dirty operations are buffered in the local pending store.
-    Dirty(DirtyCollection<K>),
+    Dirty,
 
     /// Dirty operations have been sealed durably.
     Sealed(SealedCollection<K>),
 
     /// The transaction was resolved and must not transition again.
     Finished,
-}
-
-/// Dirty collection marker with a statically non-zero operation count.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct DirtyCollection<K>
-where
-    K: CollectionKind,
-{
-    collection: CollectionRef<K>,
-    operation_count: NonZeroU64,
-}
-
-impl<K> DirtyCollection<K>
-where
-    K: CollectionKind,
-{
-    /// Creates a dirty marker from a non-zero operation count.
-    #[must_use]
-    pub fn new(collection: CollectionRef<K>, operation_count: NonZeroU64) -> Self {
-        Self {
-            collection,
-            operation_count,
-        }
-    }
-
-    /// Creates a dirty marker from a pending operation slice length.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EmptyOperationsError`] when `operation_count` is zero.
-    pub fn try_from_count(
-        collection: CollectionRef<K>,
-        operation_count: usize,
-    ) -> Result<Self, EmptyOperationsError> {
-        let Some(operation_count) = NonZeroU64::new(operation_count as u64) else {
-            return Err(EmptyOperationsError);
-        };
-
-        Ok(Self::new(collection, operation_count))
-    }
-
-    /// Returns the collection reference.
-    #[must_use]
-    pub fn collection(&self) -> &CollectionRef<K> {
-        &self.collection
-    }
-
-    /// Returns the number of buffered operations.
-    #[must_use]
-    pub fn operation_count(&self) -> NonZeroU64 {
-        self.operation_count
-    }
 }
 
 /// Local proof that dirty operations were sealed for an event.
@@ -167,9 +115,9 @@ where
 /// wrapped in [`Option`]: `None` means no dirty work is buffered for the
 /// collection, `Some(PendingOps { count, ops })` means at least one
 /// operation exists and `count` matches the iterator. The [`NonZeroU64`]
-/// count lets callers construct a [`DirtyCollection`] without materializing
-/// `ops` first; the iterator yields the operations themselves in order
-/// when the seal or direct-apply path needs them.
+/// count lets callers size the seal without materializing `ops` first; the
+/// iterator yields the operations themselves in order when the seal or
+/// direct-apply path needs them.
 pub struct PendingOps<I>
 where
     I: Iterator + Send,
