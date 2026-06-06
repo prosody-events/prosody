@@ -161,22 +161,6 @@ impl<Inner, Oracle, R> RecoveringValueStore<Inner, Oracle, R> {
     pub fn new(inner: Inner, oracle: Oracle, ttl: R) -> Self {
         Self { inner, oracle, ttl }
     }
-
-    // TODO: audit `inner()`/`oracle()` against the public interface once the
-    // composition stabilizes; drop them if no consumer materializes
-    // (re-addable non-breakingly).
-
-    /// Returns a reference to the wrapped inner store.
-    #[must_use]
-    pub fn inner(&self) -> &Inner {
-        &self.inner
-    }
-
-    /// Returns a reference to the wrapped oracle.
-    #[must_use]
-    pub fn oracle(&self) -> &Oracle {
-        &self.oracle
-    }
 }
 
 impl<Inner, Oracle> RecoveringValueStore<Inner, Oracle, ConstTtl> {
