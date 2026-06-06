@@ -22,8 +22,10 @@ use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::policies::timestamp_generator::MonotonicTimestampGenerator;
 use scylla::serialize::SerializationError;
+use scylla::serialize::row::SerializeRow;
 use scylla::serialize::value::SerializeValue;
 use scylla::statement::Consistency;
+use scylla::statement::prepared::PreparedStatement;
 use std::sync::Arc;
 
 pub mod config;
@@ -188,6 +190,66 @@ impl CassandraStore {
             .try_into()
             .ok()
             .filter(|&ttl: &i32| i64::from(ttl) < MAX_CASSANDRA_TTL_SECS)
+    }
+
+    /// Executes an unpaged mutation and discards the result.
+    ///
+    /// Fire-and-forget wrapper for mutations that need only error
+    /// propagation; shared by the timer and keyed-state stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraStoreError`] when the driver fails to execute.
+    pub async fn execute_unpaged_discard<P>(
+        &self,
+        query: &PreparedStatement,
+        params: P,
+    ) -> Result<(), CassandraStoreError>
+    where
+        P: SerializeRow,
+    {
+        self.session()
+            .execute_unpaged(query, params)
+            .await
+            .map_err(CassandraStoreError::from)?;
+        Ok(())
+    }
+
+    /// Executes `query_with_ttl` when `ttl` is `Some`, otherwise
+    /// `query_no_ttl`, building each statement's params on demand.
+    ///
+    /// `ttl` is the already-resolved TTL in seconds; `None` means indefinite
+    /// retention and routes to the `*_no_ttl` query variant. The two param
+    /// builders let each query carry a different parameter shape — the
+    /// `with_ttl` tuple leads with the TTL, the `no_ttl` tuple omits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraStoreError`] when the driver fails to execute.
+    pub async fn execute_with_optional_ttl<P1, P2, F1, F2>(
+        &self,
+        ttl: Option<i32>,
+        query_with_ttl: &PreparedStatement,
+        query_no_ttl: &PreparedStatement,
+        params_with_ttl: F1,
+        params_no_ttl: F2,
+    ) -> Result<(), CassandraStoreError>
+    where
+        P1: SerializeRow,
+        P2: SerializeRow,
+        F1: FnOnce(i32) -> P1,
+        F2: FnOnce() -> P2,
+    {
+        match ttl {
+            Some(ttl) => {
+                self.execute_unpaged_discard(query_with_ttl, params_with_ttl(ttl))
+                    .await
+            }
+            None => {
+                self.execute_unpaged_discard(query_no_ttl, params_no_ttl())
+                    .await
+            }
+        }
     }
 }
 

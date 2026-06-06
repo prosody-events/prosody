@@ -130,10 +130,9 @@ impl CassandraValueStore {
         statement: &PreparedStatement,
         params: impl SerializeRow,
     ) -> Result<(), CassandraValueStoreError> {
-        self.session()
-            .execute_unpaged(statement, params)
-            .await
-            .map_err(CassandraStoreError::from)?;
+        self.store
+            .execute_unpaged_discard(statement, params)
+            .await?;
         Ok(())
     }
 
@@ -177,11 +176,12 @@ impl CassandraValueStore {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
         let payload_encoding = VALUE_PAYLOAD_ENCODING;
         let wal_format = VALUE_WAL_FORMAT;
-        match collection.ttl() {
-            Some(ttl) => {
-                let ttl = ttl_to_i32(ttl);
-                self.execute_unpaged(
-                    &self.queries.write_wal,
+        self.store
+            .execute_with_optional_ttl(
+                collection.ttl().map(ttl_to_i32),
+                &self.queries.write_wal,
+                &self.queries.write_wal_no_ttl,
+                |ttl| {
                     (
                         ttl,
                         event,
@@ -192,13 +192,9 @@ impl CassandraValueStore {
                         key,
                         state_type,
                         name,
-                    ),
-                )
-                .await
-            }
-            None => {
-                self.execute_unpaged(
-                    &self.queries.write_wal_no_ttl,
+                    )
+                },
+                || {
                     (
                         event,
                         ops_bytes,
@@ -208,11 +204,11 @@ impl CassandraValueStore {
                         key,
                         state_type,
                         name,
-                    ),
-                )
-                .await
-            }
-        }
+                    )
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Clears the WAL columns; selects the variant that also wipes
@@ -245,14 +241,16 @@ impl CassandraValueStore {
             encoding,
             identity_version,
         } = encode_applied_payload(applied)?;
-        match collection.ttl() {
-            Some(ttl) => {
-                let ttl = ttl_to_i32(ttl);
-                self.execute_unpaged(
-                    &self.queries.batch_apply_wal,
+        let data = data.as_ref().map(Bytes::as_ref);
+        self.store
+            .execute_with_optional_ttl(
+                collection.ttl().map(ttl_to_i32),
+                &self.queries.batch_apply_wal,
+                &self.queries.batch_apply_wal_no_ttl,
+                |ttl| {
                     (
                         ttl,
-                        data.as_ref().map(Bytes::as_ref),
+                        data,
                         encoding,
                         identity_version,
                         segment_id,
@@ -263,15 +261,11 @@ impl CassandraValueStore {
                         key,
                         state_type,
                         name,
-                    ),
-                )
-                .await
-            }
-            None => {
-                self.execute_unpaged(
-                    &self.queries.batch_apply_wal_no_ttl,
+                    )
+                },
+                || {
                     (
-                        data.as_ref().map(Bytes::as_ref),
+                        data,
                         encoding,
                         identity_version,
                         segment_id,
@@ -282,11 +276,11 @@ impl CassandraValueStore {
                         key,
                         state_type,
                         name,
-                    ),
-                )
-                .await
-            }
-        }
+                    )
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn write_data_only(
@@ -300,40 +294,38 @@ impl CassandraValueStore {
             encoding,
             identity_version,
         } = encode_applied_payload(applied)?;
-        match collection.ttl() {
-            Some(ttl) => {
-                let ttl = ttl_to_i32(ttl);
-                self.execute_unpaged(
-                    &self.queries.write_data_only,
+        let data = data.as_ref().map(Bytes::as_ref);
+        self.store
+            .execute_with_optional_ttl(
+                collection.ttl().map(ttl_to_i32),
+                &self.queries.write_data_only,
+                &self.queries.write_data_only_no_ttl,
+                |ttl| {
                     (
                         ttl,
-                        data.as_ref().map(Bytes::as_ref),
+                        data,
                         encoding,
                         identity_version,
                         segment_id,
                         key,
                         state_type,
                         name,
-                    ),
-                )
-                .await
-            }
-            None => {
-                self.execute_unpaged(
-                    &self.queries.write_data_only_no_ttl,
+                    )
+                },
+                || {
                     (
-                        data.as_ref().map(Bytes::as_ref),
+                        data,
                         encoding,
                         identity_version,
                         segment_id,
                         key,
                         state_type,
                         name,
-                    ),
-                )
-                .await
-            }
-        }
+                    )
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn extract_applied(
