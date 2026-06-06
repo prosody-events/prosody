@@ -37,7 +37,6 @@ use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::{Partition, Topic};
 use educe::Educe;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
-use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
@@ -73,12 +72,6 @@ impl AssignmentEpoch {
         Ok(Self(CompactDateTime::now()?))
     }
 
-    /// Returns the wall-clock time the workspace was created at.
-    #[must_use]
-    pub fn as_datetime(self) -> CompactDateTime {
-        self.0
-    }
-
     /// Returns the raw epoch-seconds discriminator.
     #[must_use]
     pub fn epoch_seconds(self) -> u32 {
@@ -96,7 +89,6 @@ impl AssignmentEpoch {
 pub struct FjallClient {
     #[educe(Debug(ignore))]
     keyspace: Arc<Keyspace>,
-    cache_dir: PathBuf,
 }
 
 impl FjallClient {
@@ -113,22 +105,13 @@ impl FjallClient {
     pub fn open(config: &FjallConfiguration) -> Result<Arc<Self>, FjallClientError> {
         let keyspace = Arc::new(Config::new(&config.cache_dir).open()?);
         sweep_orphaned(&keyspace)?;
-        Ok(Arc::new(Self {
-            keyspace,
-            cache_dir: config.cache_dir.clone(),
-        }))
+        Ok(Arc::new(Self { keyspace }))
     }
 
     /// Returns the shared keyspace.
     #[must_use]
     pub fn keyspace(&self) -> &Arc<Keyspace> {
         &self.keyspace
-    }
-
-    /// Returns the on-disk cache root.
-    #[must_use]
-    pub fn cache_dir(&self) -> &PathBuf {
-        &self.cache_dir
     }
 
     /// Mints a fresh per-Kafka-partition workspace tagged with `epoch`.
@@ -190,24 +173,6 @@ pub struct FjallWorkspace {
 }
 
 impl FjallWorkspace {
-    /// Returns the workspace creation epoch.
-    #[must_use]
-    pub fn epoch(&self) -> AssignmentEpoch {
-        self.epoch
-    }
-
-    /// Returns the Kafka topic this workspace is bound to.
-    #[must_use]
-    pub fn topic(&self) -> Topic {
-        self.topic
-    }
-
-    /// Returns the Kafka partition this workspace is bound to.
-    #[must_use]
-    pub fn partition(&self) -> Partition {
-        self.partition
-    }
-
     /// Returns the shared keyspace.
     #[must_use]
     pub fn keyspace(&self) -> &Arc<Keyspace> {

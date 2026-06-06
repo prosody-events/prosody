@@ -57,12 +57,6 @@ impl FjallDirtyValueStore {
     pub fn new(overlay: PartitionHandle, scope: EventScopeId) -> Self {
         Self { overlay, scope }
     }
-
-    /// Returns the event scope this store is bound to.
-    #[must_use]
-    pub fn scope(&self) -> EventScopeId {
-        self.scope
-    }
 }
 
 impl ValueStore for FjallDirtyValueStore {
