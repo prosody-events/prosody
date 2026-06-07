@@ -14,5 +14,6 @@ Thumbs.db
 *.swp
 .vscode/
 .ai/
+.agents/
 docs/
 specs/
