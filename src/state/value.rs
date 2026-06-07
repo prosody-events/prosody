@@ -149,6 +149,10 @@ where
     /// safe idempotent no-op after a prior resolution). The collection
     /// ref's TTL is bound onto the durable write that refreshes the
     /// applied cells.
+    ///
+    /// A multi-column kind (Map, Deque) refreshes the applied columns and
+    /// clears the WAL on the one row under the same same-row `UNLOGGED BATCH`
+    /// requirement described on [`DirectApplyStore::direct_apply`].
     fn apply_sealed<'a>(
         &'a self,
         collection: &'a CollectionRef<K>,
@@ -181,6 +185,17 @@ where
     /// folded into authoritative state, or [`StoreOutcome::NoOp`] when
     /// `ops` is empty. The collection ref's TTL is bound onto the
     /// durable write that refreshes the applied cells.
+    ///
+    /// # Batching requirement for multi-column kinds
+    ///
+    /// The Value fold yields at most one operation, so a store applies it as
+    /// a single `UPDATE`. Map and Deque instead keep a collection in a single
+    /// row — one partition, one row key — with a column per entry or slot, and
+    /// a single apply can touch several of those columns. Those writes **must**
+    /// go in one `UNLOGGED BATCH`. Because every statement targets the same row
+    /// key, the batch is atomic on the replica and costs a single coordinator
+    /// round-trip — strictly cheaper and lower-latency than issuing the writes
+    /// separately, and free of the logged-batch penalty.
     fn direct_apply<'a, I>(
         &'a self,
         collection: &'a CollectionRef<K>,
