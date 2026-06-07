@@ -25,6 +25,17 @@
 //! system-wide; concurrent events on different keys share the same Kafka
 //! partition's workspace but cannot collide because the per-event
 //! [`EventScopeId`] is baked into the overlay key.
+//!
+//! # Blocking I/O
+//!
+//! The async [`ValueStore`] methods (`get`/`set`/`clear`) dispatch their
+//! fjall I/O through [`tokio::task::spawn_blocking`] via
+//! [`cell_io`], the same path the cache uses. The
+//! [`PendingOpSource`] methods (`pending_ops`/`clear_pending_ops`) cannot:
+//! that trait is synchronous, so they call fjall directly off the caller's
+//! thread. Each is a single point `get`/`remove` against the overlay cell
+//! that was just written in the same event, so the synchronous call resolves
+//! against the memtable on the hot path rather than blocking on disk.
 
 use super::cell_io;
 use super::codec::{decode_cell, dirty_collection_key, encode_absent_cell, encode_present_cell};

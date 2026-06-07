@@ -3,8 +3,7 @@
 //! `FjallValueStore` implements [`ValueStore`] by storing a per-collection
 //! cell in a fjall partition. It is wired as the **cache** half of
 //! [`LayeredValueStore`](crate::state::layered::LayeredValueStore); the
-//! dirty Value workspace remains the in-memory
-//! [`MemoryDirtyValueStore`](crate::state::memory::MemoryDirtyValueStore).
+//! dirty Value workspace is the Fjall-backed [`FjallDirtyValueStore`].
 //!
 //! # Three-valued reads
 //!
@@ -18,9 +17,13 @@
 //!
 //! # Blocking I/O
 //!
-//! Every fjall call is dispatched through [`tokio::task::spawn_blocking`]
-//! because fjall's public API is synchronous. Each blocking closure
-//! clones a cheap `Arc<Inner>` so the closure is `'static`.
+//! fjall's public API is synchronous, so the cache's reads and writes are
+//! dispatched through [`tokio::task::spawn_blocking`] (in the `cell_io`
+//! submodule), which clones the cheap `Arc`-backed handle into each blocking
+//! closure. The lone exception is the dirty store's synchronous
+//! [`PendingOpSource`](crate::state::value::PendingOpSource) path: that trait
+//! is synchronous, so its methods call fjall directly off the caller's thread
+//! rather than through `spawn_blocking` (see the `dirty` submodule).
 
 mod cell_io;
 mod codec;
