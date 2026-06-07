@@ -15,16 +15,12 @@
 //!    `Read<T>` equals `get()`.
 
 use super::super::value::{PendingOpSource, ValueStore, fold_value_ops};
-use super::super::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
-use super::value_suite::bytes;
+use super::super::{CollectionId, Read, ValueKind};
+use super::value_suite::{MAX_TRACE_OPS, bytes, capped_vec, collection_id};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen};
 use std::fmt;
-use std::sync::Arc;
-use uuid::Uuid;
-
-const MAX_TRACE_OPS: usize = 40;
 
 /// Bundle trait for any dirty Value backend.
 pub(crate) trait DirtyStore:
@@ -53,7 +49,7 @@ pub(crate) async fn run_dirty_trace<S>(store: S, trace: DirtyTrace) -> Result<bo
 where
     S: DirtyStore,
 {
-    let collection = collection_id()?;
+    let collection = collection_id("profile")?;
     let mut overlay = Read::Unknown;
 
     for op in trace.ops {
@@ -120,14 +116,6 @@ where
     Ok(true)
 }
 
-fn collection_id() -> Result<CollectionId<ValueKind>> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        StateType::Application,
-        StateName::try_new("profile")?,
-    ))
-}
-
 /// Drives the same trace against `lhs` and `rhs` and asserts they remain
 /// observationally equivalent at every step. Used to prove cross-backend
 /// equivalence (Memory dirty vs Fjall dirty).
@@ -140,7 +128,7 @@ where
     A: DirtyStore,
     B: DirtyStore,
 {
-    let collection = collection_id()?;
+    let collection = collection_id("profile")?;
     for op in trace.ops {
         match op {
             DirtyTraceOp::Set(byte) => {
@@ -190,11 +178,9 @@ pub(crate) struct DirtyTrace {
 
 impl Arbitrary for DirtyTrace {
     fn arbitrary(g: &mut Gen) -> Self {
-        let ops = Vec::<DirtyTraceOp>::arbitrary(g)
-            .into_iter()
-            .take(MAX_TRACE_OPS)
-            .collect();
-        Self { ops }
+        Self {
+            ops: capped_vec(g, MAX_TRACE_OPS),
+        }
     }
 }
 

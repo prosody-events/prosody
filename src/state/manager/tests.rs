@@ -179,6 +179,23 @@ async fn read_idle_applied(
     }
 }
 
+/// The `"cart"` collection identity for `key` in the fixed test segment.
+///
+/// Deterministic by design — recovery tests re-derive the same identity
+/// across `recover` calls, so this must build the segment from
+/// [`compute_segment_id`] rather than reuse the random-UUID
+/// `value_suite::collection_id` fixture.
+fn cart_id(key: &Key) -> Result<CollectionId<ValueKind>> {
+    Ok(CollectionId::new(
+        StateKey::new(
+            compute_segment_id(Topic::from("t"), 0, "test-group"),
+            key.clone(),
+        ),
+        StateType::Application,
+        StateName::try_new("cart")?,
+    ))
+}
+
 /// Acquisition eagerly writes first-seen identity rows and fails Permanent
 /// when a later deployment asserts a different identity for the same name.
 #[tokio::test]
@@ -309,14 +326,7 @@ async fn recover_applies_sealed_and_clears_timer() -> Result<()> {
         .map_err(|e| eyre!("recover failed: {e}"))?;
 
     // The WAL resolved as committed and the timer is gone.
-    let id = CollectionId::new(
-        StateKey::new(
-            compute_segment_id(Topic::from("t"), 0, "test-group"),
-            key.clone(),
-        ),
-        StateType::Application,
-        StateName::try_new("cart")?,
-    );
+    let id = cart_id(&key)?;
     assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(7)));
     let remaining = timers
         .scheduled_times(&key, TimerType::StateRecovery)
@@ -354,11 +364,7 @@ async fn recover_rolls_back_when_not_committed() -> Result<()> {
         .await
         .map_err(|e| eyre!("recover failed: {e}"))?;
 
-    let id = CollectionId::new(
-        StateKey::new(compute_segment_id(Topic::from("t"), 0, "test-group"), key),
-        StateType::Application,
-        StateName::try_new("cart")?,
-    );
+    let id = cart_id(&key)?;
     assert_eq!(
         read_idle_applied(&durable, &id).await?,
         None,
@@ -382,15 +388,7 @@ async fn recover_deletes_stale_pending_without_consulting_oracle() -> Result<()>
     .await?;
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     let key: Key = Arc::from("k");
-    let state_key = StateKey::new(
-        compute_segment_id(Topic::from("t"), 0, "test-group"),
-        key.clone(),
-    );
-    let id = CollectionId::<ValueKind>::new(
-        state_key.clone(),
-        StateType::Application,
-        StateName::try_new("cart")?,
-    );
+    let id = cart_id(&key)?;
 
     PendingIndexStore::insert_pending::<ValueKind>(&durable, &id).await?;
 
@@ -399,7 +397,7 @@ async fn recover_deletes_stale_pending_without_consulting_oracle() -> Result<()>
         .await
         .map_err(|e| eyre!("recover failed: {e}"))?;
 
-    let pending: Vec<_> = durable.scan_pending(&state_key).collect().await;
+    let pending: Vec<_> = durable.scan_pending(id.state_key()).collect().await;
     assert!(pending.is_empty(), "stale pending row must be deleted");
     assert_eq!(
         oracle.call_count(),
@@ -549,14 +547,7 @@ async fn run_deferred_message_crash(
         .await
         .map_err(|e| eyre!("recover failed: {e}"))?;
 
-    let id = CollectionId::new(
-        StateKey::new(
-            compute_segment_id(Topic::from("t"), 0, "test-group"),
-            key.clone(),
-        ),
-        StateType::Application,
-        StateName::try_new("cart")?,
-    );
+    let id = cart_id(&key)?;
     let applied = read_idle_applied(&durable, &id).await?;
     Ok((applied, timers, key))
 }

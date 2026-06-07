@@ -3,39 +3,18 @@ mod encoding;
 pub(crate) mod value_suite;
 
 use self::dirty_value_suite::DirtyTrace;
-use self::value_suite::{DirectTrace, Trace, bytes, collection_ref};
+use self::value_suite::{DirectTrace, Trace, bytes, collection_id, collection_ref, event};
 use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use super::value::{
     DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionKindId, CollectionRef, CommitMode, EventRef, Read, StateKey, StateName,
-    StateType, StoreOutcome, ValueKind, ValueOp, WalEnvelope,
+    CollectionKindId, CollectionRef, CommitMode, Read, StoreOutcome, ValueKind, ValueOp,
+    WalEnvelope,
 };
-use crate::Key;
 use color_eyre::eyre::{self, Result};
 use futures::executor;
 use quickcheck::QuickCheck;
-use std::sync::Arc;
-use uuid::Uuid;
-
-fn key(value: &str) -> Key {
-    Arc::from(value)
-}
-
-fn collection_id() -> Result<CollectionId<ValueKind>> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), key("user-1")),
-        StateType::Application,
-        StateName::try_new("profile")?,
-    ))
-}
-
-fn event(id: u128) -> EventRef {
-    EventRef::Message {
-        dedup_id: Uuid::from_u128(id),
-    }
-}
 
 #[test]
 fn value_folding_uses_last_ordered_op() {
@@ -116,7 +95,7 @@ async fn memory_identity_version_stamp_pairs_with_applied() -> Result<()> {
 
 #[test]
 fn collection_identity_carries_value_kind() -> Result<()> {
-    let collection = collection_id()?;
+    let collection = collection_id("profile")?;
     assert_eq!(collection.kind(), CollectionKindId::Value);
 
     let envelope = WalEnvelope::<ValueKind>::try_from_ops(vec![ValueOp::Clear])?;
@@ -135,7 +114,7 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let id = collection_id()?;
+    let id = collection_id("profile")?;
     let with_ttl = CollectionRef::new(id.clone(), Some(CompactDuration::new(3_600)));
     let without_ttl = CollectionRef::new(id.clone(), None);
     let other_ttl = CollectionRef::new(id, Some(CompactDuration::new(7_200)));

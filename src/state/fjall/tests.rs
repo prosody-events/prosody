@@ -10,7 +10,6 @@
 //! gated on `INTEGRATION_TESTS` like the other Cassandra tests.
 
 use super::{AssignmentEpoch, FjallClient, FjallDirtyValueStore, FjallValueStore};
-use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraValueStore, ValueQueries};
@@ -23,14 +22,13 @@ use crate::state::recovering::RecoveringValueStore;
 use crate::state::session::DurableValueBundle;
 use crate::state::tests::dirty_value_suite::{self, DirtyTrace};
 use crate::state::tests::value_suite::{
-    self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
+    self, DirectTrace, TEST_TTL, Trace, bytes, collection_id, collection_ref, event, finish_trace,
 };
 use crate::state::value::{
     DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind, ValueStore,
 };
 use crate::state::{
-    CollectionId, CommitDecision, CommitMode, EventRef, EventScopeId, Read, StateKey, StateName,
-    StateType, StoreOutcome,
+    CollectionId, CommitDecision, CommitMode, EventRef, EventScopeId, Read, StoreOutcome,
 };
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -47,7 +45,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 use thiserror::Error;
 use tracing::{Instrument, Span};
-use uuid::Uuid;
 
 // ---- shared helpers ---------------------------------------------------------
 
@@ -85,24 +82,6 @@ fn make_dirty(scope: EventScopeId) -> Result<(FjallFixture, FjallDirtyValueStore
     let fixture = FjallFixture::open()?;
     let dirty = FjallDirtyValueStore::new(fixture.partition("value_dirty_overlay")?, scope);
     Ok((fixture, dirty))
-}
-
-fn key(value: &str) -> Key {
-    Arc::from(value)
-}
-
-fn collection_id(name: &str) -> Result<CollectionId<ValueKind>> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), key("user-1")),
-        StateType::Application,
-        StateName::try_new(name)?,
-    ))
-}
-
-fn event(id: u128) -> EventRef {
-    EventRef::Message {
-        dedup_id: Uuid::from_u128(id),
-    }
 }
 
 // ---- direct FjallValueStore unit tests --------------------------------------

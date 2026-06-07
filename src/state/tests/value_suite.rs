@@ -55,8 +55,11 @@ const TIMER_TYPE_POOL: [TimerType; 3] = [
 ];
 
 const TIMER_TIME_MODULUS: u32 = 1_000_000;
-const MAX_TRACE_OPS: usize = 40;
 const MAX_TRACE_EVENTS: usize = 20;
+
+/// Upper bound on generated trace-op vectors, shared by every keyed-state
+/// trace fixture so no module hardcodes its own shrink ceiling.
+pub(crate) const MAX_TRACE_OPS: usize = 40;
 
 /// Default TTL bound onto fixture [`CollectionRef`]s by [`collection_ref`].
 ///
@@ -259,15 +262,34 @@ pub(crate) fn finish_trace<E: fmt::Debug>(
     }
 }
 
-pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
-    Ok(CollectionRef::new(
-        CollectionId::new(
-            StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-            StateType::Application,
-            StateName::try_new("profile")?,
-        ),
-        TEST_TTL,
+/// Random-keyed fixture identity for the named Value collection.
+///
+/// Shared by every keyed-state test module; the segment is a fresh random
+/// UUID so independent fixtures never collide on the durable store.
+pub(crate) fn collection_id(name: &str) -> Result<CollectionId<ValueKind>> {
+    Ok(CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+        StateType::Application,
+        StateName::try_new(name)?,
     ))
+}
+
+/// The `"profile"` fixture collection carrying the shared [`TEST_TTL`].
+pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
+    Ok(CollectionRef::new(collection_id("profile")?, TEST_TTL))
+}
+
+/// Message event reference fixture keyed by `id`.
+pub(crate) fn event(id: u128) -> EventRef {
+    EventRef::Message {
+        dedup_id: Uuid::from_u128(id),
+    }
+}
+
+/// Generates an [`Arbitrary`] vector capped at `max` elements, keeping trace
+/// lengths bounded without each fixture repeating the take-and-collect dance.
+pub(crate) fn capped_vec<T: Arbitrary>(g: &mut Gen, max: usize) -> Vec<T> {
+    Vec::<T>::arbitrary(g).into_iter().take(max).collect()
 }
 
 /// Canonical single-byte payload cell, shared by every keyed-state test
@@ -985,15 +1007,10 @@ pub(crate) struct Trace {
 
 impl Arbitrary for Trace {
     fn arbitrary(g: &mut Gen) -> Self {
-        let ops = Vec::<TraceOp>::arbitrary(g)
-            .into_iter()
-            .take(MAX_TRACE_OPS)
-            .collect();
-        let events = Vec::<TraceEventKind>::arbitrary(g)
-            .into_iter()
-            .take(MAX_TRACE_EVENTS)
-            .collect();
-        Self { ops, events }
+        Self {
+            ops: capped_vec(g, MAX_TRACE_OPS),
+            events: capped_vec(g, MAX_TRACE_EVENTS),
+        }
     }
 }
 
@@ -1066,15 +1083,10 @@ pub(crate) struct DirectTrace {
 
 impl Arbitrary for DirectTrace {
     fn arbitrary(g: &mut Gen) -> Self {
-        let ops = Vec::<DirectTraceOp>::arbitrary(g)
-            .into_iter()
-            .take(MAX_TRACE_OPS)
-            .collect();
-        let events = Vec::<TraceEventKind>::arbitrary(g)
-            .into_iter()
-            .take(MAX_TRACE_EVENTS)
-            .collect();
-        Self { ops, events }
+        Self {
+            ops: capped_vec(g, MAX_TRACE_OPS),
+            events: capped_vec(g, MAX_TRACE_EVENTS),
+        }
     }
 }
 
