@@ -219,6 +219,10 @@ pub enum StoreCreationError {
     /// Deduplication TTL exceeds Cassandra's maximum.
     #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
     DeduplicationTtl(u64),
+
+    /// Keyed-state default TTL exceeds Cassandra's maximum.
+    #[error("keyed-state default TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
+    KeyedStateTtl(u64),
 }
 
 impl From<CassandraTriggerStoreError> for StoreCreationError {
@@ -356,6 +360,7 @@ impl StorePair {
                     None
                 };
 
+                validate_keyed_state_ttl(keyed_state_ttl)?;
                 let value_queries = Arc::new(ValueQueries::new(store.session(), keyspace).await?);
                 let value_store =
                     CassandraValueStore::new(store.clone(), value_queries, keyed_state_ttl);
@@ -371,3 +376,22 @@ impl StorePair {
         }
     }
 }
+
+/// Rejects a keyed-state default TTL that exceeds Cassandra's `USING TTL`
+/// ceiling before it can reach a write.
+///
+/// Mirrors the dedup and timer-retention checks: an over-ceiling TTL would
+/// make every keyed-state write fail at the coordinator, so we fail fast at
+/// store creation instead. `None` (indefinite retention) is always allowed.
+fn validate_keyed_state_ttl(ttl: Option<CompactDuration>) -> Result<(), StoreCreationError> {
+    if let Some(ttl) = ttl {
+        let seconds = ttl.seconds();
+        if i64::from(seconds) > MAX_CASSANDRA_TTL_SECS {
+            return Err(StoreCreationError::KeyedStateTtl(u64::from(seconds)));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
