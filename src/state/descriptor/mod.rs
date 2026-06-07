@@ -143,6 +143,44 @@ impl From<&str> for SchemaLabel {
     }
 }
 
+/// The context-independent fields every descriptor carries: the collection
+/// name and the opt-in schema label.
+///
+/// Embedded in each descriptor so the shared `name()`/`with_schema_label`
+/// plumbing and the identity-label conversion live in one place rather than
+/// being copy-pasted per descriptor kind.
+#[derive(Clone, Copy, Debug)]
+struct DescriptorMeta {
+    name: &'static str,
+    schema_label: Option<&'static str>,
+}
+
+impl DescriptorMeta {
+    /// Metadata for a collection named `name` with no schema label.
+    const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            schema_label: None,
+        }
+    }
+
+    /// Attaches an opt-in schema version label.
+    const fn with_schema_label(mut self, label: &'static str) -> Self {
+        self.schema_label = Some(label);
+        self
+    }
+
+    /// The collection name.
+    const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The schema label resolved into its frozen-identity form.
+    fn schema_label(&self) -> Option<SchemaLabel> {
+        self.schema_label.map(SchemaLabel::from)
+    }
+}
+
 /// The frozen structural identity a descriptor asserts for its collection:
 /// collection kind, cell format, codec token, and optional schema label.
 ///
@@ -218,8 +256,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
 /// (`CartCodec: Codec<Payload = Cart>`) and write
 /// `const CART: ValueDescriptor<CartCodec> = value_state("cart");`.
 pub struct ValueDescriptor<C = JsonCodec> {
-    name: &'static str,
-    schema_label: Option<&'static str>,
+    meta: DescriptorMeta,
     _marker: PhantomData<fn() -> C>,
 }
 
@@ -234,8 +271,7 @@ impl<C> Copy for ValueDescriptor<C> {}
 impl<C> fmt::Debug for ValueDescriptor<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValueDescriptor")
-            .field("name", &self.name)
-            .field("schema_label", &self.schema_label)
+            .field("meta", &self.meta)
             .finish()
     }
 }
@@ -249,8 +285,7 @@ impl<C> fmt::Debug for ValueDescriptor<C> {
 #[must_use]
 pub const fn value_state<C>(name: &'static str) -> ValueDescriptor<C> {
     ValueDescriptor {
-        name,
-        schema_label: None,
+        meta: DescriptorMeta::new(name),
         _marker: PhantomData,
     }
 }
@@ -259,7 +294,7 @@ impl<C> ValueDescriptor<C> {
     /// Attaches an opt-in schema version label to the frozen identity.
     #[must_use]
     pub const fn with_schema_label(mut self, label: &'static str) -> Self {
-        self.schema_label = Some(label);
+        self.meta = self.meta.with_schema_label(label);
         self
     }
 }
@@ -269,7 +304,7 @@ where
     C: Codec,
 {
     fn name(&self) -> &'static str {
-        self.name
+        self.meta.name()
     }
 
     fn structural_identity(&self) -> StructuralIdentity {
@@ -277,7 +312,7 @@ where
             kind: CollectionKindId::Value,
             cell_kind: CellKind::Codec,
             codec_id: Some(C::CODEC_ID),
-            schema_label: self.schema_label.map(SchemaLabel::from),
+            schema_label: self.meta.schema_label(),
         }
     }
 }
@@ -289,7 +324,8 @@ where
     type Handle<S: StateSession> = TypedValueHandle<S, C>;
 
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        let name = session.verify_state_registration(self.name, &self.structural_identity())?;
+        let name =
+            session.verify_state_registration(self.meta.name(), &self.structural_identity())?;
         Ok(TypedValueHandle {
             session: session.clone(),
             name,

@@ -3,7 +3,7 @@
 //! loader.
 
 use super::{
-    CellKind, DescriptorIdentity, SchemaLabel, StateDescriptor, StructuralIdentity, ensure_live,
+    CellKind, DescriptorIdentity, DescriptorMeta, StateDescriptor, StructuralIdentity, ensure_live,
 };
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
@@ -77,8 +77,7 @@ mod topic_serde {
 /// codec parameter. Declare as a `const` via [`kafka_message_state`].
 #[derive(Clone, Copy, Debug)]
 pub struct KafkaMessageDescriptor {
-    name: &'static str,
-    schema_label: Option<&'static str>,
+    meta: DescriptorMeta,
 }
 
 /// Declares a Kafka-message collection named `name`.
@@ -88,8 +87,7 @@ pub struct KafkaMessageDescriptor {
 #[must_use]
 pub const fn kafka_message_state(name: &'static str) -> KafkaMessageDescriptor {
     KafkaMessageDescriptor {
-        name,
-        schema_label: None,
+        meta: DescriptorMeta::new(name),
     }
 }
 
@@ -97,14 +95,14 @@ impl KafkaMessageDescriptor {
     /// Attaches an opt-in schema version label to the frozen identity.
     #[must_use]
     pub const fn with_schema_label(mut self, label: &'static str) -> Self {
-        self.schema_label = Some(label);
+        self.meta = self.meta.with_schema_label(label);
         self
     }
 }
 
 impl DescriptorIdentity for KafkaMessageDescriptor {
     fn name(&self) -> &'static str {
-        self.name
+        self.meta.name()
     }
 
     fn structural_identity(&self) -> StructuralIdentity {
@@ -112,7 +110,7 @@ impl DescriptorIdentity for KafkaMessageDescriptor {
             kind: CollectionKindId::Value,
             cell_kind: CellKind::KafkaMessageRef,
             codec_id: None,
-            schema_label: self.schema_label.map(SchemaLabel::from),
+            schema_label: self.meta.schema_label(),
         }
     }
 }
@@ -121,7 +119,8 @@ impl StateDescriptor for KafkaMessageDescriptor {
     type Handle<S: StateSession> = KafkaMessageHandle<S>;
 
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        let name = session.verify_state_registration(self.name, &self.structural_identity())?;
+        let name =
+            session.verify_state_registration(self.meta.name(), &self.structural_identity())?;
         Ok(KafkaMessageHandle {
             session: session.clone(),
             name,
