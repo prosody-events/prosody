@@ -5,16 +5,12 @@
 //! map, and the framework drives the seal/apply lifecycle through a sealed
 //! supertrait that downstream crates can neither implement nor call.
 //!
-//! Two implementations ship:
-//!
-//! * [`ValueStateSession`] — the real session, minted per event by the
-//!   partition's state manager. Holds the partition-lifetime durable bundle
-//!   plus a per-event dirty workspace scope; clones share the transaction map,
-//!   so repeated descriptor binds of the same collection accumulate into one
-//!   transaction.
-//! * [`UnavailableState`] — the stateless stub used where keyed state is not
-//!   wired (the plain consumer, most handler tests). Every operation reports
-//!   [`StateAccessError::Unavailable`]; the lifecycle is a no-op.
+//! [`ValueStateSession`] is the sole implementation — the real session,
+//! minted per event by the partition's state manager. It holds the
+//! partition-lifetime durable bundle plus a per-event dirty workspace scope;
+//! clones share the transaction map, so repeated descriptor binds of the same
+//! collection accumulate into one transaction. Keyed state is always wired, so
+//! there is no stateless stub.
 //!
 //! # Lifecycle
 //!
@@ -30,12 +26,10 @@
 //!    the transaction map, and the sealed set so the next attempt starts clean.
 
 use crate::consumer::event_context::StateAccessError;
-use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::message::MessageLoader;
+#[cfg(test)]
+use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::partition::ShutdownPhase;
-use crate::state::descriptor::{
-    CellKind, DescriptorIdentity, KafkaMessageRef, StateDescriptor, StructuralIdentity,
-};
+use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind,
@@ -52,7 +46,6 @@ use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
@@ -109,9 +102,15 @@ impl<T> DurableValueBundle for T where
 /// downstream crates name it in bounds but cannot implement it or call
 /// the lifecycle methods.
 pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
-    /// The consumer's message payload type, used by Kafka-message handles
-    /// to return fully typed [`ConsumerMessage`]s.
-    type Payload: Send + Sync + 'static;
+    /// Opaque per-session capability slot. The keyed-state machinery never
+    /// interprets it; a [`CellResolver`](crate::state::descriptor::CellResolver)
+    /// living *outside* `src/state` reads it from the session at resolve time
+    /// (the consumer pins it to its message loader). Kept fully opaque here so
+    /// nothing in `src/state` couples to how cells are resolved.
+    type Loader: Clone + Send + Sync + 'static;
+
+    /// Returns the session's capability slot for a resolver to read.
+    fn loader(&self) -> &Self::Loader;
 
     /// Validates that the named keyed-state collection is registered with
     /// the asserted structural identity, returning the canonical
@@ -177,19 +176,6 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
         &self,
         name: &StateName,
     ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
-
-    /// Loads the full consumer message referenced by a Kafka-message state
-    /// cell, decoded by the consumer's own codec.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Load`] when the loader fails (Permanent for a
-    /// deleted or compacted-away offset).
-    fn load_message(
-        &self,
-        message_ref: KafkaMessageRef,
-    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, StateAccessError>> + Send;
 
     /// Returns `true` once the partition is shutting down or the event has
     /// been cancelled. Descriptor handles guard every operation on this.
@@ -326,7 +312,10 @@ where
     /// scopes from it.
     pub dirty: P,
 
-    /// Message loader Kafka-message collections resolve through.
+    /// Opaque per-session capability slot a [`CellResolver`] reads at
+    /// resolve time (the consumer pins it to its message loader).
+    ///
+    /// [`CellResolver`]: crate::state::descriptor::CellResolver
     pub loader: L,
 
     /// Registered collection definitions and middleware-wide defaults.
@@ -489,9 +478,13 @@ where
     D: DurableValueBundle,
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + Send + Sync,
-    L: MessageLoader + 'static,
+    L: Clone + Send + Sync + 'static,
 {
-    type Payload = L::Payload;
+    type Loader = L;
+
+    fn loader(&self) -> &L {
+        &self.inner.loader
+    }
 
     fn verify_state_registration(
         &self,
@@ -545,17 +538,6 @@ where
         let tx = self.open_transaction(name);
         let mut guard = tx.lock().await;
         guard.flush().await.map_err(|e| StateAccessError::store(&e))
-    }
-
-    async fn load_message(
-        &self,
-        message_ref: KafkaMessageRef,
-    ) -> Result<ConsumerMessage<L::Payload>, StateAccessError> {
-        self.inner
-            .loader
-            .load_message(message_ref.topic, message_ref.partition, message_ref.offset)
-            .await
-            .map_err(|e| StateAccessError::load(&e))
     }
 
     fn is_terminated(&self) -> bool {
@@ -667,110 +649,6 @@ where
     }
 }
 
-/// Stateless [`StateSession`]: every operation reports
-/// [`StateAccessError::Unavailable`] and the lifecycle is a no-op.
-///
-/// Used wherever keyed state is not wired — the plain consumer's partition
-/// loop and handler tests that never touch state.
-pub struct UnavailableState<P>(PhantomData<fn() -> P>);
-
-impl<P> UnavailableState<P> {
-    /// Creates the stateless session.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<P> Default for UnavailableState<P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<P> Clone for UnavailableState<P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P> Copy for UnavailableState<P> {}
-
-impl<P> fmt::Debug for UnavailableState<P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("UnavailableState")
-    }
-}
-
-impl<P> StateSession for UnavailableState<P>
-where
-    P: Send + Sync + 'static,
-{
-    type Payload = P;
-
-    fn verify_state_registration(
-        &self,
-        _name: &'static str,
-        _identity: &StructuralIdentity,
-    ) -> Result<StateName, StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    async fn state_cell(&self, _name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    async fn set_state_cell(
-        &self,
-        _name: &StateName,
-        _cell: Bytes,
-    ) -> Result<(), StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    async fn clear_state_cell(&self, _name: &StateName) -> Result<(), StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    async fn flush_state_cell(&self, _name: &StateName) -> Result<StoreOutcome, StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    async fn load_message(
-        &self,
-        _message_ref: KafkaMessageRef,
-    ) -> Result<ConsumerMessage<P>, StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    fn is_terminated(&self) -> bool {
-        true
-    }
-}
-
-impl<P> StateLifecycle for UnavailableState<P>
-where
-    P: Send + Sync + 'static,
-{
-    async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        Ok(FinalizeOutcome::Clean)
-    }
-
-    async fn commit_apply(&self) -> ApplyOutcome {
-        ApplyOutcome::NothingSealed
-    }
-
-    async fn rollback_aborted(&self) -> ApplyOutcome {
-        ApplyOutcome::NothingSealed
-    }
-
-    fn reset(&self) {}
-
-    fn recovery_fire_delay(&self) -> CompactDuration {
-        CompactDuration::MIN
-    }
-}
-
 /// Crate-private descriptor the framework uses to reach a session's
 /// sealed lifecycle through the one public [`EventContext::state`] method.
 ///
@@ -846,6 +724,121 @@ where
     /// See [`StateLifecycle::recovery_fire_delay`].
     pub(crate) fn recovery_fire_delay(&self) -> CompactDuration {
         self.session.recovery_fire_delay()
+    }
+}
+
+/// Test-only stateless [`StateSession`]: every state op reports
+/// [`StateAccessError::Unavailable`] and the lifecycle is inert.
+///
+/// Production always wires real keyed state, so this stub exists only for
+/// tests — middleware and handler contexts that never touch state, and the
+/// descriptor-bind error-surface tests. Its loader slot is a never-consulted
+/// [`MemoryLoader`] purely so the session satisfies the consumer's loader
+/// context bound; no op ever reaches it.
+///
+/// [`MemoryLoader`]: crate::consumer::middleware::defer::message::loader::MemoryLoader
+#[cfg(test)]
+#[derive(Clone)]
+pub struct UnavailableState<P> {
+    loader: MemoryLoader<P>,
+}
+
+#[cfg(test)]
+impl<P> UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    /// Creates the stateless stub.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            loader: MemoryLoader::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<P> Default for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl<P> fmt::Debug for UnavailableState<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UnavailableState")
+    }
+}
+
+#[cfg(test)]
+impl<P> StateSession for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    type Loader = MemoryLoader<P>;
+
+    fn loader(&self) -> &Self::Loader {
+        &self.loader
+    }
+
+    fn verify_state_registration(
+        &self,
+        _name: &'static str,
+        _identity: &StructuralIdentity,
+    ) -> Result<StateName, StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn state_cell(&self, _name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn set_state_cell(
+        &self,
+        _name: &StateName,
+        _cell: Bytes,
+    ) -> Result<(), StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn clear_state_cell(&self, _name: &StateName) -> Result<(), StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn flush_state_cell(&self, _name: &StateName) -> Result<StoreOutcome, StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    fn is_terminated(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+impl<P> StateLifecycle for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
+        Ok(FinalizeOutcome::Clean)
+    }
+
+    async fn commit_apply(&self) -> ApplyOutcome {
+        ApplyOutcome::NothingSealed
+    }
+
+    async fn rollback_aborted(&self) -> ApplyOutcome {
+        ApplyOutcome::NothingSealed
+    }
+
+    fn reset(&self) {}
+
+    fn recovery_fire_delay(&self) -> CompactDuration {
+        CompactDuration::MIN
     }
 }
 

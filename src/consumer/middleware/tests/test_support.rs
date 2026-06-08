@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
+use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::StateDescriptor;
 use crate::state::session::{StateSession, UnavailableState};
@@ -77,13 +78,19 @@ pub struct MockEventContext<P = serde_json::Value, S = UnavailableState<P>> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<P> Default for MockEventContext<P> {
+impl<P> Default for MockEventContext<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<P> MockEventContext<P> {
+impl<P> MockEventContext<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
     /// Create a new mock context with default state (no signals active,
     /// keyed state unavailable).
     #[must_use]
@@ -226,7 +233,7 @@ impl<P, S> TerminationSignals for MockEventContext<P, S> {
 impl<P, S> EventContext for MockEventContext<P, S>
 where
     P: Send + Sync + 'static,
-    S: StateSession<Payload = P>,
+    S: StateSession<Loader: MessageLoader<Payload = P>>,
 {
     type Error = Infallible;
     type Payload = P;

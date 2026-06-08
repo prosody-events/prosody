@@ -1,12 +1,18 @@
-//! Kafka-descriptor tests: the relocated [`KafkaMessageRef`] serde
-//! round-trip property and the end-to-end resolve-through-loader path (N3).
+//! Kafka-message keyed-state tests: the [`KafkaMessageRef`] serde round-trip
+//! property and the end-to-end resolve-through-loader path.
+//!
+//! These bind through the *same* [`bind_registered`] machinery the JSON
+//! descriptor tests use — the N4 proof that the Kafka-message descriptor is
+//! just a `ValueDescriptor<C, R>` over a codec + resolver, with no bespoke
+//! binding path.
 
-use super::super::tests::bind_registered;
 use super::*;
 use crate::Key;
 use crate::consumer::event_context::StateAccessError;
+use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::tests::bind_registered;
 use crate::state::memory::MemoryDirtyValueStore;
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
@@ -19,6 +25,8 @@ const TOPIC_POOL: &[&str] = &[
     "telemetry",
     "shipments.outbound",
 ];
+
+const LAST_SEEN: KafkaMessageDescriptor = kafka_message_state("last_seen");
 
 #[derive(Clone, Debug)]
 struct ArbKafkaMessageRef(KafkaMessageRef);
@@ -34,8 +42,6 @@ impl Arbitrary for ArbKafkaMessageRef {
     }
 }
 
-const LAST_SEEN: KafkaMessageDescriptor = kafka_message_state("last_seen");
-
 fn coords() -> (Topic, i32, i64) {
     (Topic::from("orders.v1"), 3, 42)
 }
@@ -46,9 +52,8 @@ fn message_for_testing(payload: Value) -> Result<ConsumerMessage<Value>> {
     ConsumerMessage::for_testing(topic, partition, offset, key, payload)
 }
 
-/// Relocated from the deleted `StoredPayload` enum coverage: the
-/// `MsgPack` serde of [`KafkaMessageRef`] round-trips exactly — this is
-/// the descriptor's cell format.
+/// The `MsgPack` serde of [`KafkaMessageRef`] round-trips exactly — this is
+/// the [`KafkaRefCodec`] cell format.
 #[test]
 fn prop_kafka_message_ref_msgpack_roundtrip() {
     fn prop(message_ref: ArbKafkaMessageRef) -> bool {
@@ -74,8 +79,8 @@ fn ref_from_message_carries_coordinates() -> Result<()> {
     Ok(())
 }
 
-/// N3 invariant: the descriptor's cell is the ref derived from the message
-/// in hand; `get()` resolves it through the message loader to the full
+/// The descriptor's cell is the ref derived from the message in hand;
+/// `get()` resolves it through the message loader to the full
 /// `ConsumerMessage` with matching coordinates and payload.
 #[tokio::test]
 async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
@@ -99,9 +104,9 @@ async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
     Ok(())
 }
 
-/// N3 invariant: a vanished Kafka body (deleted/compacted offset) surfaces
-/// as a Permanent loader error from `get()` — never `None`, never Terminal —
-/// so the row is skipped, not retried and not fatal.
+/// A vanished Kafka body (deleted/compacted offset) surfaces as a Permanent
+/// loader error from `get()` — never `None`, never Terminal — so the row is
+/// skipped, not retried and not fatal.
 #[tokio::test]
 async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
     let (topic, partition, offset) = coords();

@@ -14,7 +14,10 @@ use prosody::{
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
+    consumer::{
+        ConsumerConfiguration, DemandType, EventHandler, Keyed, KeyedStateConfiguration,
+        ProsodyConsumer,
+    },
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
     timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
@@ -143,6 +146,7 @@ async fn test_timer_backpressure() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(slow_timer_handler),
         Telemetry::new(),
     )

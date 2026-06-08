@@ -35,7 +35,8 @@
 //! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::middleware::CloneProvider;
 //! use prosody::consumer::{
-//!     ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+//!     ConsumerConfiguration, DemandType, EventHandler, KeyedStateConfiguration, Keyed,
+//!     ProsodyConsumer, Uncommitted,
 //! };
 //! use prosody::high_level::config::TriggerStoreConfiguration;
 //! use prosody::telemetry::Telemetry;
@@ -93,6 +94,7 @@
 //! let consumer: ProsodyConsumer = ProsodyConsumer::new(
 //!     &config,
 //!     &TriggerStoreConfiguration::InMemory,
+//!     KeyedStateConfiguration::builder().build()?,
 //!     CloneProvider::new(MyHandler),
 //!     telemetry,
 //! )
@@ -123,20 +125,24 @@
 //! - `heartbeat`: Monitoring for stalled processes
 //! - `probes`: HTTP endpoints for health and readiness checking
 
-use crate::cassandra::CassandraStore;
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::{Context, PartitionProviders};
+pub use crate::consumer::kafka_state::{
+    KafkaMessageDescriptor, KafkaMessageRef, KafkaRefCodec, KafkaRefCodecError, KafkaResolver,
+    KafkaStateError, kafka_message_state,
+};
 pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
 pub use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::HandlerMiddleware;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
-    DeduplicationConfiguration, DeduplicationMiddleware, DeduplicationStoreProvider,
+    DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, DeduplicationMiddleware,
+    DeduplicationStoreProvider,
 };
 use crate::consumer::middleware::defer::message::loader::{
-    KafkaLoader, MemoryLoader, MessageLoader,
+    KafkaLoader, LoaderConfiguration, MemoryLoader, MessageLoader,
 };
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
@@ -167,20 +173,20 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
-pub use crate::state::config::KeyedStateConfiguration;
+pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
-use crate::state::manager::{NoState, PartitionStateProvider, StateManagerProvider};
+use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
 use crate::state::memory::MemoryDurableValueStore;
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
+use crate::state::session::StateSession;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::TriggerStoreProvider;
-use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
-use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use crate::timers::store::cassandra::CassandraTriggerStoreError;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -188,7 +194,6 @@ use crate::util::{
 use crate::{Codec, ConsumerGroup, EventIdentity, EventType, JsonCodec};
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 use ahash::HashMap;
-use aho_corasick::{AhoCorasick, StartKind};
 use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
@@ -217,6 +222,7 @@ pub mod decode;
 pub mod event_context;
 mod extractor;
 mod kafka_context;
+pub mod kafka_state;
 pub mod message;
 pub mod middleware;
 pub(crate) mod partition;
@@ -793,21 +799,15 @@ impl KeyedStateInputs {
     }
 
     /// Builds the per-partition keyed-state provider over a branch's
-    /// backend, scanner, and loader. The partition loop acquires one
-    /// state manager per assignment from it.
-    fn provider<B, Sc, L>(
-        &self,
-        backend: B,
-        scanner: Sc,
-        loader: L,
-    ) -> StateManagerProvider<B, Sc, L> {
+    /// backend and loader. The partition loop acquires one state manager
+    /// per assignment from it; the pending-index scanner now travels inside
+    /// the backend the factory mints.
+    fn provider<B, L>(&self, backend: B, loader: L) -> StateManagerProvider<B, L> {
         StateManagerProvider::new(
             backend,
-            scanner,
             loader,
             self.registry.clone(),
             self.group.clone(),
-            self.version.clone(),
             self.config.recovery_delay,
         )
     }
@@ -846,7 +846,9 @@ impl<CM> PipelineMiddlewareStack<CM> {
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
         PP: TriggerStoreProvider,
-        SP: PartitionStateProvider<C::Payload>,
+        SP: PartitionStateProvider,
+        <SP::Manager as PartitionStateManager>::Session:
+            StateSession<Loader: MessageLoader<Payload = C::Payload>>,
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
@@ -859,6 +861,7 @@ impl<CM> PipelineMiddlewareStack<CM> {
             &self.telemetry,
         );
 
+        let version: Arc<str> = Arc::from(self.dedup_config.version.as_str());
         let dedup_middleware = match dedup_provider {
             Some(provider) => DeduplicationMiddleware::new(
                 self.dedup_config,
@@ -898,6 +901,7 @@ impl<CM> PipelineMiddlewareStack<CM> {
 
         initialize_consumer_with_provider::<_, _, _, C>(
             &self.consumer_config,
+            version,
             provider,
             trigger_provider,
             state_provider,
@@ -943,6 +947,7 @@ async fn prepare_pipeline_stack<P: Send + Sync + 'static>(
         dedup: dedup_config,
         keyed_state: keyed_state_config,
     } = pipeline_config;
+    keyed_state_config.validate()?;
     let monopolization_middleware =
         MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
     let heartbeats = HeartbeatRegistry::new(
@@ -1013,6 +1018,7 @@ fn build_common_middleware<P: Send + Sync + 'static>(
 /// The provider creates per-partition stores with independent caches.
 fn initialize_consumer_with_provider<T, S, SP, C>(
     consumer_config: &ConsumerConfiguration,
+    version: Arc<str>,
     handler_provider: T,
     trigger_provider: S,
     state_provider: SP,
@@ -1023,9 +1029,11 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     S: TriggerStoreProvider,
-    SP: PartitionStateProvider<C::Payload>,
+    SP: PartitionStateProvider,
+    <SP::Manager as PartitionStateManager>::Session:
+        StateSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
-    C::Payload: EventType + Clone,
+    C::Payload: EventType + Clone + EventIdentity,
 {
     // Validate the configuration
     consumer_config.validate()?;
@@ -1036,25 +1044,14 @@ where
     let shutdown: Arc<AtomicBool> = Arc::default();
     let telemetry_sender = telemetry.sender();
 
-    // Build event type search automaton for filtering messages
-    let allowed_events = consumer_config
-        .allowed_events
-        .as_ref()
-        .map(|prefixes| {
-            AhoCorasick::builder()
-                .start_kind(StartKind::Anchored)
-                .build(prefixes)
-        })
-        .transpose()?;
-
     let (managers, runtime_state) = initialize_consumer::<T, S, SP, C>(ConsumerInitParams {
         config: consumer_config.clone(),
+        version,
         handler_provider,
         trigger_provider,
         state_provider,
         watermark_version: watermark_version.clone(),
         managers: managers.clone(),
-        allowed_events,
         telemetry: telemetry_sender,
         shutdown: shutdown.clone(),
         heartbeats: heartbeats.clone(),
@@ -1079,10 +1076,19 @@ where
     /// higher-level functions like `pipeline_consumer` or
     /// `low_latency_consumer`.
     ///
+    /// Keyed state is **always wired**, mode-matched to the storage backend:
+    /// mock/in-memory runs over a memory state store with an in-memory
+    /// loader; Cassandra runs over the fjall+Cassandra state store with a
+    /// `KafkaLoader`. Pass `KeyedStateConfiguration::builder().build()?` for an
+    /// always-on but inert layer (no registered collections), or register
+    /// collections on the builder result before passing it.
+    ///
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
+    /// * `keyed_state_config` - The keyed-state configuration (collections,
+    ///   TTLs, cache dir, recovery delay).
     /// * `handler_provider` - The message handler provider.
     ///
     /// # Returns
@@ -1094,89 +1100,136 @@ where
     ///
     /// Returns a `ConsumerError` if:
     /// - The configuration is invalid
+    /// - Keyed-state collections are registered on this dedup-less path (they
+    ///   need the deduplication store for message-event recovery)
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
     pub async fn new<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
+        keyed_state_config: KeyedStateConfiguration,
         handler_provider: T,
         telemetry: Telemetry,
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
         T::Handler: EventHandler<Payload = C::Payload>,
+        C::Payload: EventIdentity + Send + Sync + 'static,
     {
         // Validate the configuration
         consumer_config.validate()?;
+        keyed_state_config.validate()?;
 
-        // Initialize shared state
-        let watermark_version: Arc<WatermarkVersion> = Arc::default();
-        let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let shutdown: Arc<AtomicBool> = Arc::default();
-        let telemetry_sender = telemetry.sender();
         let heartbeats = HeartbeatRegistry::new(
             consumer_config.group_id.clone(),
             consumer_config.stall_threshold,
         );
 
-        // Build event type search automaton for filtering messages
-        let allowed_events = consumer_config
-            .allowed_events
-            .as_ref()
-            .map(|prefixes| {
-                AhoCorasick::builder()
-                    .start_kind(StartKind::Anchored)
-                    .build(prefixes)
-            })
-            .transpose()?;
+        // Always-on keyed state, mode-matched to the trigger store. This raw
+        // path wires no deduplication middleware, so dedup is disabled
+        // (`cache_capacity = 0`); the gate below rejects registered
+        // collections, which would need the dedup store for message-event
+        // recovery. An empty registry is sound: nothing seals, so the oracle
+        // is never consulted.
+        let stores = StorePair::new(
+            trigger_store_config,
+            consumer_config.mock,
+            Duration::default(),
+            0,
+            keyed_state_config.default_ttl,
+            consumer_config.timer_spans,
+        )
+        .await?;
+        let keyed_state = KeyedStateInputs::new(
+            keyed_state_config,
+            consumer_config,
+            DEFAULT_IDEMPOTENCE_VERSION,
+        )?;
+        if keyed_state.config.has_registrations() {
+            return Err(KeyedStateInitError::DeduplicationRequired.into());
+        }
 
-        let (managers, runtime_state) = match trigger_store_config {
-            TriggerStoreConfiguration::InMemory => {
-                initialize_consumer::<T, _, _, C>(ConsumerInitParams::<T, _, _, C::Payload> {
-                    config: consumer_config.clone(),
-                    handler_provider,
-                    trigger_provider: InMemoryTriggerStoreProvider::new(),
-                    state_provider: NoState::new(),
-                    watermark_version: watermark_version.clone(),
-                    managers: managers.clone(),
-                    allowed_events,
-                    telemetry: telemetry_sender,
-                    shutdown: shutdown.clone(),
-                    heartbeats: heartbeats.clone(),
-                })?
-            }
-            TriggerStoreConfiguration::Cassandra(cassandra_config) => {
-                let store = CassandraStore::new(cassandra_config)
-                    .await
-                    .map_err(CassandraTriggerStoreError::from)?;
-                let trigger_provider = CassandraTriggerStoreProvider::with_store(
-                    store,
-                    &cassandra_config.keyspace,
-                    consumer_config.timer_spans,
-                )
-                .await?;
-                initialize_consumer::<T, _, _, C>(ConsumerInitParams::<T, _, _, C::Payload> {
-                    config: consumer_config.clone(),
+        match stores {
+            StorePair::Memory {
+                trigger_provider,
+                dedup_provider,
+                ..
+            } => {
+                let loader = MemoryLoader::<C::Payload>::new();
+                let durable = MemoryDurableValueStore::new(keyed_state.config.default_ttl);
+                let backend = MemoryStateBackendFactory::new(
+                    durable,
+                    dedup_provider,
+                    trigger_provider.clone(),
+                    keyed_state.group.clone(),
+                    keyed_state.timer_slab_size,
+                    keyed_state.registry.clone(),
+                );
+                let state_provider = keyed_state.provider(backend, loader);
+                initialize_consumer_with_provider::<_, _, _, C>(
+                    consumer_config,
+                    keyed_state.version.clone(),
                     handler_provider,
                     trigger_provider,
-                    state_provider: NoState::new(),
-                    watermark_version: watermark_version.clone(),
-                    managers: managers.clone(),
-                    allowed_events,
-                    telemetry: telemetry_sender,
-                    shutdown: shutdown.clone(),
-                    heartbeats: heartbeats.clone(),
-                })?
+                    state_provider,
+                    &telemetry,
+                    heartbeats,
+                )
             }
-        };
-
-        Ok(Self {
-            shutdown,
-            managers,
-            runtime_state,
-            heartbeats,
-        })
+            StorePair::Cassandra {
+                trigger_provider,
+                dedup_provider,
+                value_store,
+                ..
+            } => {
+                // TEMP bridge (Phase 2 removes this): the loader's tuning still
+                // lives on `DeferConfiguration` until it is split into a
+                // top-level `KafkaLoaderConfiguration` on `ConsumerConfiguration`.
+                // Built inline here with the same defaults so the raw path does
+                // not need a `DeferConfiguration`.
+                let loader = KafkaLoader::<C>::new(
+                    LoaderConfiguration {
+                        bootstrap_servers: consumer_config.bootstrap_servers.clone(),
+                        group_id: format!("{}.defer-loader", consumer_config.group_id),
+                        max_permits: consumer_config.max_uncommitted,
+                        cache_size: 1_024,
+                        poll_interval: consumer_config.poll_interval,
+                        seek_timeout: Duration::from_secs(30),
+                        discard_threshold: 100,
+                        message_spans: consumer_config.message_spans,
+                    },
+                    &heartbeats,
+                )
+                .map_err(DeferInitError::from)?;
+                // The fjall workspace root is wiped on restart (Cassandra is
+                // authoritative), so creating the default directory here is safe.
+                fs::create_dir_all(&keyed_state.config.cache_dir)?;
+                let fjall_client = FjallClient::open(&FjallConfiguration {
+                    cache_dir: keyed_state.config.cache_dir.clone(),
+                })
+                .map_err(KeyedStateInitError::from)?;
+                let backend = CassandraStateBackendFactory::new(
+                    fjall_client,
+                    value_store,
+                    dedup_provider,
+                    trigger_provider.clone(),
+                    keyed_state.group.clone(),
+                    keyed_state.timer_slab_size,
+                    keyed_state.registry.clone(),
+                );
+                let state_provider = keyed_state.provider(backend, loader);
+                initialize_consumer_with_provider::<_, _, _, C>(
+                    consumer_config,
+                    keyed_state.version.clone(),
+                    handler_provider,
+                    trigger_provider,
+                    state_provider,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+        }
     }
 
     /// Creates a new `ProsodyConsumer` with a retry strategy for pipeline
@@ -1245,7 +1298,7 @@ where
                     keyed_state.timer_slab_size,
                     keyed_state.registry.clone(),
                 );
-                let state_provider = keyed_state.provider(backend, durable, loader.clone());
+                let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
                     &stack.consumer_config,
@@ -1293,7 +1346,7 @@ where
                     keyed_state.timer_slab_size,
                     keyed_state.registry.clone(),
                 );
-                let state_provider = keyed_state.provider(backend, value_store, loader.clone());
+                let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
                     &stack.consumer_config,
@@ -1355,8 +1408,13 @@ where
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        C::Payload: EventIdentity + Clone,
+        C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
+        // This convenience path exposes no keyed-state registrations; the
+        // always-on layer stays inert with an environment-loaded config.
+        let keyed_state_config = KeyedStateConfiguration::builder()
+            .build()
+            .map_err(KeyedStateInitError::Configuration)?;
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
             failure_topic: topic_config,
@@ -1377,7 +1435,14 @@ where
             .layer(retry_middleware) // retry writing to the failure topic indefinitely
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
+        Self::new(
+            consumer_config,
+            trigger_store_config,
+            keyed_state_config,
+            provider,
+            telemetry,
+        )
+        .await
     }
 
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
@@ -1411,7 +1476,13 @@ where
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
+        // This convenience path exposes no keyed-state registrations; the
+        // always-on layer stays inert with an environment-loaded config.
+        let keyed_state_config = KeyedStateConfiguration::builder()
+            .build()
+            .map_err(KeyedStateInitError::Configuration)?;
         let common_middleware = build_common_middleware::<C::Payload>(
             common_config,
             consumer_config.stall_threshold,
@@ -1424,7 +1495,14 @@ where
             .layer(LogMiddleware::new())
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
+        Self::new(
+            consumer_config,
+            trigger_store_config,
+            keyed_state_config,
+            provider,
+            telemetry,
+        )
+        .await
     }
 }
 
@@ -1529,19 +1607,20 @@ where
 {
     /// Consumer configuration (Kafka settings, buffer sizes, timeouts).
     config: ConsumerConfiguration,
+    /// Deduplication hash version, threaded into each message's
+    /// [`EventRef::Message`](crate::state::EventRef) dedup id so recovery
+    /// resolves a message by the same id the deduplication writer produces.
+    version: Arc<str>,
     /// Factory for creating per-partition message handlers.
     handler_provider: T,
     /// Persistent storage backend for timer triggers.
     trigger_provider: P,
-    /// Factory for per-partition keyed-state managers
-    /// ([`NoState`] where keyed state is not wired).
+    /// Factory for per-partition keyed-state managers.
     state_provider: SP,
     /// Shared atomic counter for tracking watermark changes.
     watermark_version: Arc<WatermarkVersion>,
     /// Thread-safe map of active partition managers.
     managers: Arc<Managers<PL>>,
-    /// Optional event type filter; `None` passes all events through.
-    allowed_events: Option<AhoCorasick>,
     /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
     /// Atomic flag for coordinating consumer shutdown.
@@ -1575,9 +1654,11 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
-    SP: PartitionStateProvider<C::Payload>,
+    SP: PartitionStateProvider,
+    <SP::Manager as PartitionStateManager>::Session:
+        StateSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
-    C::Payload: Clone + EventType,
+    C::Payload: Clone + EventType + EventIdentity,
 {
     // Create the consumer context with the message handler and shared state
     let context = Context::new(
@@ -1589,9 +1670,9 @@ where
         },
         params.watermark_version.clone(),
         params.managers.clone(),
-        params.allowed_events,
         params.telemetry,
-    );
+        params.version,
+    )?;
 
     // Use mock cluster for testing or real bootstrap servers
     let bootstrap = if params.config.mock {
@@ -1746,6 +1827,10 @@ pub enum ConsumerError {
 /// consumer.
 #[derive(Debug, Error)]
 pub enum KeyedStateInitError {
+    /// The keyed-state configuration could not be built from the environment.
+    #[error("invalid keyed-state configuration: {0:#}")]
+    Configuration(#[from] KeyedStateConfigurationBuilderError),
+
     /// A descriptor registration was invalid or conflicted.
     #[error(transparent)]
     Register(#[from] RegisterStateError),

@@ -9,6 +9,7 @@
 
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::tracing::init_test_logging;
 use prosody::{
@@ -219,6 +220,7 @@ impl TestEnvironment {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
+            KeyedStateConfiguration::default(),
             handler_provider,
             Telemetry::new(),
         )

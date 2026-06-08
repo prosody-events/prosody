@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::Uncommitted;
 use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
@@ -220,6 +221,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(handler.clone()),
         Telemetry::new(),
     )

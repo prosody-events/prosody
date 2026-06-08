@@ -21,15 +21,13 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonMiddlewareConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
-    PipelineMiddlewareConfiguration, ProsodyConsumer,
+    CommonMiddlewareConfiguration, ConsumerConfiguration, DemandType, KafkaMessageDescriptor,
+    KafkaStateError, KeyedStateConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
+    kafka_message_state,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::state::descriptor::{
-    KafkaMessageDescriptor, KafkaStateError, ValueDescriptor, ValueStateError, kafka_message_state,
-    value_state,
-};
+use prosody::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
 use prosody::state::registry::CollectionDef;
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::CompactDateTime;

@@ -11,6 +11,7 @@
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
+use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{StateDescriptor, StructuralIdentity};
@@ -199,12 +200,12 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// The per-event keyed-state session descriptor binds operate over.
     ///
     /// Leaf contexts carry the session the partition loop minted for the
-    /// event ([`UnavailableState`](crate::state::session::UnavailableState)
-    /// where keyed state is not wired);
-    /// wrapper contexts forward their inner context's session type
-    /// (`type State = C::State`). The `Payload` equality keeps
-    /// Kafka-message handles fully typed inside generic handlers.
-    type State: StateSession<Payload = Self::Payload>;
+    /// event; wrapper contexts forward their inner context's session type
+    /// (`type State = C::State`). State itself is Kafka-agnostic, so the
+    /// payload tie lives here: the session's loader yields `Self::Payload`,
+    /// which keeps Kafka-message handles fully typed inside generic
+    /// handlers without `StateSession` ever naming a payload.
+    type State: StateSession<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a keyed-state descriptor to this context's session, returning
     /// its typed handle.
@@ -227,8 +228,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// registered with the consumer, or
     /// [`StateAccessError::IdentityMismatch`] when the registered identity
     /// differs from the descriptor's.
-    ///
-    /// [`UnavailableState`]: crate::state::session::UnavailableState
     fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
         DESC: StateDescriptor;
@@ -507,10 +506,10 @@ where
 impl<T, S> EventContext for PartitionEventContext<T, S>
 where
     T: TriggerStore,
-    S: StateSession,
+    S: StateSession<Loader: MessageLoader>,
 {
     type Error = TimerManagerError<T::Error>;
-    type Payload = S::Payload;
+    type Payload = <S::Loader as MessageLoader>::Payload;
     type State = S;
 
     fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<S>, StateAccessError>

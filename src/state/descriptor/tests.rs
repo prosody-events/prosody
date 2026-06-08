@@ -11,6 +11,7 @@
 use super::*;
 use crate::codec::JsonCodecError;
 use crate::consumer::event_context::EventContext;
+use crate::consumer::kafka_state::kafka_message_state;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
@@ -57,7 +58,8 @@ pub(crate) type TestSession<S> =
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
 /// kind runs through (the N4 proof is that both the JSON tests here and
-/// the Kafka tests in [`super::kafka::tests`] call exactly this).
+/// the Kafka-message tests in
+/// [`crate::consumer::kafka_state::tests`] call exactly this).
 pub(crate) fn bind_registered<DESC, S>(
     descriptor: DESC,
     dirty: S,

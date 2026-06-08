@@ -9,7 +9,7 @@ use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::state::descriptor::{ValueDescriptor, value_state};
-use crate::state::manager::{NoState, StateManagerProvider};
+use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::value_suite::{FixedOracle, bytes};
@@ -51,14 +51,42 @@ trait HasProcessedOffsets {
     fn notify(&self) -> &Arc<Notify>;
 }
 
+/// Partition-agnostic memory keyed-state provider used by the partition
+/// tests: state is always wired, so even tests that never touch state mint a
+/// real (empty-registry) provider over the in-memory backend.
+type MemoryStateProvider = StateManagerProvider<
+    SharedStateBackend<
+        MemoryDurableValueStore,
+        FixedOracle,
+        MemoryDirtyValueStoreProvider,
+        MemoryDurableValueStore,
+    >,
+    MemoryLoader<serde_json::Value>,
+>;
+
+/// Builds a [`MemoryStateProvider`] with the given collection registry.
+fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider {
+    let durable = MemoryDurableValueStore::for_tests();
+    StateManagerProvider::new(
+        SharedStateBackend::new(
+            durable.clone(),
+            FixedOracle::committed(),
+            MemoryDirtyValueStoreProvider,
+            durable,
+        ),
+        MemoryLoader::new(),
+        Arc::new(registry),
+        Arc::from("test-group"),
+        CompactDuration::new(30),
+    )
+}
+
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration<
-    InMemoryTriggerStoreProvider,
-    NoState<serde_json::Value>,
-    serde_json::Value,
-> {
+fn default_config()
+-> PartitionConfiguration<InMemoryTriggerStoreProvider, MemoryStateProvider, serde_json::Value> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
+        version: Arc::from("1"),
         buffer_size: 10,
         max_uncommitted: 10,
         allowed_events: None,
@@ -66,7 +94,7 @@ fn default_config() -> PartitionConfiguration<
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_provider: InMemoryTriggerStoreProvider::new(),
-        state_provider: NoState::new(),
+        state_provider: memory_state_provider(CollectionDefRegistry::new(None)),
         timer_slab_size: CompactDuration::new(30),
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),
@@ -676,7 +704,9 @@ async fn recovery_timer_manager(
 /// Acquires a real keyed-state manager over the memory backend with `CART`
 /// registered, returning the durable store alongside.
 async fn recovery_state_manager() -> color_eyre::Result<(
-    impl PartitionStateManager<Payload = serde_json::Value>,
+    impl PartitionStateManager<
+        Session: StateSession<Loader: MessageLoader<Payload = serde_json::Value>>,
+    >,
     MemoryDurableValueStore,
 )> {
     const CART: ValueDescriptor = value_state("cart");
@@ -688,12 +718,11 @@ async fn recovery_state_manager() -> color_eyre::Result<(
             durable.clone(),
             FixedOracle::committed(),
             MemoryDirtyValueStoreProvider,
+            durable.clone(),
         ),
-        durable.clone(),
         MemoryLoader::<serde_json::Value>::new(),
         Arc::new(registry),
         Arc::from("test-group"),
-        Arc::from("1"),
         CompactDuration::new(30),
     );
     let manager = provider
@@ -764,6 +793,12 @@ async fn state_recovery_trigger_is_intercepted_by_the_loop() -> color_eyre::Resu
         &shutdown_rx,
         &timer_manager,
         &state_manager,
+        DedupIdentity {
+            version: "1",
+            group_id: "test-group",
+            topic: "t",
+            partition: 0,
+        },
         SpanRelation::default(),
     )
     .await;

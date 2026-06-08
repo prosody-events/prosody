@@ -8,6 +8,7 @@
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::middleware::CloneProvider;
@@ -294,6 +295,7 @@ async fn test_producer_deduplication() -> Result<()> {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &cfg,
             &common::create_cassandra_trigger_store_config(),
+            KeyedStateConfiguration::default(),
             CloneProvider::new(TestHandler { tx }),
             Telemetry::new(),
         )

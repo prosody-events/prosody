@@ -14,7 +14,10 @@ use prosody::{
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, DemandType, EventHandler, ProsodyConsumer, Uncommitted},
+    consumer::{
+        ConsumerConfiguration, DemandType, EventHandler, KeyedStateConfiguration, ProsodyConsumer,
+        Uncommitted,
+    },
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
     timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
@@ -133,6 +136,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(handler),
         Telemetry::new(),
     )

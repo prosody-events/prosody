@@ -12,7 +12,7 @@
 //! The main entry point is the [`poll`] function, which orchestrates all these
 //! operations within a continuous loop until shutdown is signaled.
 
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, TopicPartitionList};
@@ -27,17 +27,14 @@ use crate::Codec;
 use crate::EventType;
 use crate::Topic;
 use crate::consumer::decode::decode_message;
-use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{EventHandler, HandlerProvider, Managers, WatermarkVersion};
+use crate::consumer::{Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
 use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 use crate::related_span;
-use crate::state::manager::PartitionStateProvider;
 
-use crate::timers::store::TriggerStoreProvider;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Configuration for the Kafka message polling process.
@@ -48,16 +45,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///
 /// # Type Parameters
 ///
-/// * `T` - A type implementing [`HandlerProvider`] that creates message
-///   handlers for assigned partitions.
-/// * `P` - A type implementing [`TriggerStoreProvider`] for timer storage.
+/// * `Ctx` - The Kafka [`ConsumerContext`] the [`BaseConsumer`] runs under.
+///   The poller only calls `Consumer`-trait methods on it, so it stays
+///   agnostic to the provider generics baked into the context.
 /// * `C` - A type implementing [`Codec`] for deserializing message payloads.
-pub struct PollConfig<'a, T, P, SP, C>
+pub struct PollConfig<'a, Ctx, C>
 where
-    T: HandlerProvider,
-    T::Handler: EventHandler<Payload = C::Payload>,
-    P: TriggerStoreProvider,
-    SP: PartitionStateProvider<C::Payload>,
+    Ctx: ConsumerContext,
     C: Codec,
     C::Payload: Clone + EventType,
 {
@@ -68,7 +62,7 @@ where
     pub max_message_count: usize,
 
     /// The configured Kafka consumer with context
-    pub consumer: BaseConsumer<Context<T, P, SP, C::Payload>>,
+    pub consumer: BaseConsumer<Ctx>,
 
     /// Codec for deserializing message payloads
     pub codec: C,
@@ -105,12 +99,9 @@ where
 /// # Arguments
 ///
 /// * `config` - The configuration for the polling process
-pub fn poll<T, P, SP, C>(config: PollConfig<T, P, SP, C>)
+pub fn poll<Ctx, C>(config: PollConfig<Ctx, C>)
 where
-    T: HandlerProvider,
-    T::Handler: EventHandler<Payload = C::Payload>,
-    P: TriggerStoreProvider,
-    SP: PartitionStateProvider<C::Payload>,
+    Ctx: ConsumerContext,
     C: Codec,
     C::Payload: Clone + EventType,
 {
@@ -251,16 +242,13 @@ fn dispatch_with_retry<P: Send + Sync + 'static>(
 /// * `watermark_version` - Counter tracking changes to committed offsets
 /// * `managers` - Collection of partition managers that track committed offsets
 /// * `last_version` - The last processed watermark version
-fn store_watermarks<T, P, SP, PL>(
-    consumer: &BaseConsumer<Context<T, P, SP, PL>>,
+fn store_watermarks<Ctx, PL>(
+    consumer: &BaseConsumer<Ctx>,
     watermark_version: &WatermarkVersion,
     managers: &Managers<PL>,
     last_version: &mut usize,
 ) where
-    T: HandlerProvider,
-    T::Handler: EventHandler<Payload = PL>,
-    P: TriggerStoreProvider,
-    SP: PartitionStateProvider<PL>,
+    Ctx: ConsumerContext,
     PL: Clone + Send + Sync + 'static + EventType,
 {
     // Skip if no watermark updates have occurred
@@ -336,17 +324,14 @@ fn store_watermarks<T, P, SP, PL>(
 /// # Errors
 ///
 /// Returns any error from the underlying Kafka pause/resume operations.
-fn pause_busy_partitions<T, P, SP, PL>(
+fn pause_busy_partitions<Ctx, PL>(
     is_paused: &mut bool,
     maybe_permit: Option<&OwnedSemaphorePermit>,
-    consumer: &BaseConsumer<Context<T, P, SP, PL>>,
+    consumer: &BaseConsumer<Ctx>,
     managers: &Managers<PL>,
 ) -> Result<(), KafkaError>
 where
-    T: HandlerProvider,
-    T::Handler: EventHandler<Payload = PL>,
-    P: TriggerStoreProvider,
-    SP: PartitionStateProvider<PL>,
+    Ctx: ConsumerContext,
     PL: Clone + Send + Sync + 'static + EventType,
 {
     let managers = managers.read();

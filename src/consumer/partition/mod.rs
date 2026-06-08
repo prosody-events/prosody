@@ -15,20 +15,23 @@
 
 use crate::consumer::event_context::{EventContext, PartitionEventContext};
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
+use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
+use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::otel::SpanRelation;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
-use crate::state::session::TerminationWatch;
+use crate::state::session::{StateSession, TerminationWatch};
+use crate::state::{EventRef, TimerEventRef};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStore, TriggerStoreProvider};
 use crate::timers::{
     PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores, TimerType, UncommittedTimer,
 };
-use crate::{EventType, Offset, Partition, ProcessScope, Topic};
+use crate::{EventIdentity, EventType, Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
@@ -144,13 +147,16 @@ pub struct PartitionConfiguration<S, SP, P> {
     /// Shared counter tracking watermark updates
     pub watermark_version: Arc<CachePadded<AtomicUsize>>,
 
+    /// Deduplication hash version. Threaded into the per-message
+    /// [`EventRef::Message`] dedup id so recovery resolves a message's
+    /// committed state by the exact id the deduplication writer produced.
+    pub version: Arc<str>,
+
     /// Trigger store provider — creates per-partition stores with independent
     /// caches.
     pub trigger_provider: S,
 
-    /// Keyed-state provider — acquires per-partition state managers
-    /// ([`NoState`](crate::state::manager::NoState) where keyed state is
-    /// not wired).
+    /// Keyed-state provider — acquires per-partition state managers.
     pub state_provider: SP,
 
     /// Timer slab size
@@ -235,8 +241,10 @@ impl<P: Send + 'static> PartitionManager<P> {
     where
         T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
-        SP: PartitionStateProvider<P>,
-        P: Sync + EventType,
+        SP: PartitionStateProvider,
+        <SP::Manager as PartitionStateManager>::Session:
+            StateSession<Loader: MessageLoader<Payload = P>>,
+        P: Sync + EventType + EventIdentity,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -468,14 +476,14 @@ where
 /// dispatches.
 ///
 /// Returns `None` if shutdown is signaled before acquisition succeeds.
-async fn init_state_manager<SP, P>(
+async fn init_state_manager<SP>(
     state_provider: &SP,
     topic: Topic,
     partition: Partition,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
 ) -> Option<SP::Manager>
 where
-    SP: PartitionStateProvider<P>,
+    SP: PartitionStateProvider,
 {
     loop {
         if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
@@ -496,6 +504,7 @@ where
 /// [`run_partition`].
 struct PartitionParams {
     group_id: Arc<str>,
+    version: Arc<str>,
     allowed_events: Option<AhoCorasick>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
@@ -516,11 +525,14 @@ async fn handle_messages<T, S, SP, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
-    SP: PartitionStateProvider<P>,
-    P: Send + Sync + 'static + EventType,
+    SP: PartitionStateProvider,
+    <SP::Manager as PartitionStateManager>::Session:
+        StateSession<Loader: MessageLoader<Payload = P>>,
+    P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionConfiguration {
         group_id,
+        version,
         allowed_events,
         trigger_provider,
         state_provider,
@@ -553,6 +565,7 @@ async fn handle_messages<T, S, SP, P>(
 
     let params = PartitionParams {
         group_id,
+        version,
         allowed_events,
         timer_semaphores,
         telemetry_sender,
@@ -583,11 +596,12 @@ async fn run_partition<T, S, M, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
-    M: PartitionStateManager<Payload = P>,
-    P: Send + Sync + 'static + EventType,
+    M: PartitionStateManager<Session: StateSession<Loader: MessageLoader<Payload = P>>>,
+    P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionParams {
         group_id,
+        version,
         allowed_events,
         timer_semaphores,
         telemetry_sender,
@@ -648,6 +662,12 @@ async fn run_partition<T, S, M, P>(
             &shutdown_rx,
             &timer_manager,
             &state_manager,
+            DedupIdentity {
+                version: version.as_ref(),
+                group_id: group_id.as_ref(),
+                topic: partition_info.topic.as_ref(),
+                partition: partition_info.partition,
+            },
             timer_spans,
         )
         .await;
@@ -677,18 +697,27 @@ async fn process_event<T, S, M, P>(
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
     timer_manager: &TimerManager<S>,
     state_manager: &M,
+    dedup_identity: DedupIdentity<'_>,
     timer_spans: SpanRelation,
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
-    M: PartitionStateManager<Payload = P>,
-    P: Send + Sync + 'static,
+    M: PartitionStateManager<Session: StateSession<Loader: MessageLoader<Payload = P>>>,
+    P: Send + Sync + 'static + EventIdentity,
 {
     match event {
         UncommittedEvent::Message(message) => {
             let (cancel_tx, cancel_rx) = watch::channel(false);
-            let session = state_manager.session_for_message(
-                message.message(),
+            // Derive the dedup id for every message — even when no
+            // descriptors are registered — because the EventRef must exist
+            // before we know whether the handler touches state. The
+            // derivation matches the deduplication writer's so recovery
+            // resolves a message by the exact id that writer produced.
+            let msg = message.message();
+            let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
+            let session = state_manager.session(
+                msg.key().clone(),
+                EventRef::Message { dedup_id },
                 TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
             );
             let context = PartitionEventContext::new(
@@ -711,12 +740,12 @@ async fn process_event<T, S, M, P>(
 
                 // `StateRecovery` is framework-internal: the sweep runs
                 // here, owned by the state manager, and user handlers
-                // structurally never see the trigger. Commit on success;
+                // structurally never see the trigger. State is always
+                // wired, so the sweep is always intercepted (it is inert
+                // when no collections are registered). Commit on success;
                 // abort on failure so the trigger redelivers and the
                 // sweep re-runs.
-                if state_manager.intercepts_recovery()
-                    && firing.timer_type() == TimerType::StateRecovery
-                {
+                if firing.timer_type() == TimerType::StateRecovery {
                     let _guard = firing.process_scope();
                     let (trigger, commit_guard) = firing.into_inner();
                     match state_manager
@@ -736,8 +765,15 @@ async fn process_event<T, S, M, P>(
                 }
 
                 let (cancel_tx, cancel_rx) = watch::channel(false);
-                let session = state_manager.session_for_timer(
-                    firing.trigger(),
+                let trigger = firing.trigger();
+                let event = EventRef::Timer(TimerEventRef::new(
+                    trigger.timer_type,
+                    trigger.time,
+                    trigger.tag,
+                ));
+                let session = state_manager.session(
+                    firing.key().clone(),
+                    event,
                     TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
                 );
                 let context = PartitionEventContext::new(

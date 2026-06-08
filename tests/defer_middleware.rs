@@ -27,6 +27,7 @@
 
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::defer::message::loader::KafkaLoader;
@@ -301,6 +302,7 @@ impl DeferTestEnvironment {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
+            KeyedStateConfiguration::default(),
             handler_provider,
             Telemetry::new(),
         )
@@ -393,6 +395,7 @@ impl DeferTestEnvironment {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
+            KeyedStateConfiguration::default(),
             handler_provider,
             Telemetry::new(),
         )

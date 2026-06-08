@@ -153,6 +153,7 @@ where
     type Durable = ProductionValueDurable<ProductionOracle<DP, TP>>;
     type Error = FjallFactoryError;
     type Oracle = ProductionOracle<DP, TP>;
+    type Scanner = CassandraValueStore;
 
     fn for_partition(
         &self,
@@ -174,6 +175,10 @@ where
             topic,
             partition,
         );
+        // The scanner is the un-wrapped backing store: recovery streams its
+        // pending-index rows, while the recovery-wrapped `durable` bundle
+        // does the point reads and resolutions.
+        let scanner = self.backing.clone();
         let durable = compose_value_durable(
             cache,
             self.backing.clone(),
@@ -184,6 +189,7 @@ where
             durable,
             oracle,
             dirty: FjallDirtyValueStoreProvider::new(workspace),
+            scanner,
         })
     }
 }
@@ -241,6 +247,7 @@ where
     >;
     type Error = Infallible;
     type Oracle = ProductionOracle<DP, TP>;
+    type Scanner = MemoryDurableValueStore;
 
     fn for_partition(
         &self,
@@ -255,6 +262,9 @@ where
             topic,
             partition,
         );
+        // The scanner is the un-wrapped shared store; `durable` wraps the
+        // same store in the recovery layer.
+        let scanner = self.durable.clone();
         let durable = RecoveringValueStore::new(
             self.durable.clone(),
             oracle.clone(),
@@ -264,6 +274,7 @@ where
             durable,
             oracle,
             dirty: MemoryDirtyValueStoreProvider,
+            scanner,
         })
     }
 }

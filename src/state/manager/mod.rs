@@ -15,15 +15,13 @@
 //! failed acquisitions until shutdown, the same pattern as timer-manager
 //! initialization.
 //!
-//! [`NoState`] is the provider/manager for consumers without keyed state
-//! (the plain consumer): sessions are [`UnavailableState`], recovery is a
-//! no-op, and `StateRecovery` triggers are not intercepted.
+//! State is **always wired** — there is no no-state mode. The manager is
+//! Kafka-agnostic: it mints a session for an already-resolved [`EventRef`],
+//! never from a transport message. The partition loop builds the
+//! [`EventRef`] (deriving a message's dedup id with the deduplication
+//! writer's canonical derivation) and hands it in.
 
-use crate::consumer::Keyed;
 use crate::consumer::event_context::BoxEventContextError;
-use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::deduplication::dedup_uuid_for_message;
-use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor_identity::{
@@ -34,24 +32,21 @@ use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
     DirtyValueBundle, DurableValueBundle, SessionParts, StateSession, TerminationWatch,
-    UnavailableState, ValueStateSession,
+    ValueStateSession,
 };
 use crate::state::value::{DurableWalStore, ValueKind};
 use crate::state::{
     CollectionId, CollectionKindId, CollectionRef, CommitDecision, DirtyStoreProvider,
     DurableState, EventRef, StateBackend, StateBackendFactory, StateKey, StoreOutcome,
-    TimerEventRef,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{SegmentId, TriggerStore};
-use crate::timers::{TimerManager, TimerType, Trigger};
-use crate::{EventIdentity, Key, Partition, Topic};
+use crate::timers::{TimerManager, TimerType};
+use crate::{Key, Partition, Topic};
 use futures::StreamExt;
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
@@ -63,31 +58,19 @@ type DirtyStoreOf<B> =
 /// Per-partition keyed-state manager minted by a
 /// [`PartitionStateProvider`].
 ///
-/// Mints one session per event and runs the `StateRecovery` sweep. The
-/// payload type is the loader's; the [`EventIdentity`] bound the dedup-id
-/// derivation needs discharges on this trait's impls, never on the
-/// partition loop.
+/// Mints one session per event from an already-resolved [`EventRef`] and
+/// runs the `StateRecovery` sweep. The manager is Kafka-agnostic: building
+/// the `EventRef` (including a message's dedup id) is the partition loop's
+/// job.
 pub trait PartitionStateManager: Clone + Send + Sync + 'static {
-    /// The consumer's message payload type.
-    type Payload: Send + Sync + 'static;
-
     /// Session type minted per event.
-    type Session: StateSession<Payload = Self::Payload>;
+    type Session: StateSession;
 
     /// Error raised by the recovery sweep.
     type RecoveryError: Error + Send + Sync + 'static;
 
-    /// Mints the session for a message event, deriving its
-    /// [`EventRef::Message`] dedup id with the canonical writer derivation.
-    fn session_for_message(
-        &self,
-        message: &ConsumerMessage<Self::Payload>,
-        termination: TerminationWatch,
-    ) -> Self::Session;
-
-    /// Mints the session for a timer event under its
-    /// [`EventRef::Timer`] reference.
-    fn session_for_timer(&self, trigger: &Trigger, termination: TerminationWatch) -> Self::Session;
+    /// Mints the session for `event` on `key`.
+    fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session;
 
     /// Runs the `StateRecovery` sweep for `key` and clears the
     /// `StateRecovery` timer once the pending partition is drained.
@@ -103,18 +86,14 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::RecoveryError>> + Send
     where
         T: TriggerStore;
-
-    /// Whether the partition loop must intercept `StateRecovery` triggers
-    /// and route them to [`Self::recover`]. `false` only for [`NoState`].
-    fn intercepts_recovery(&self) -> bool;
 }
 
 /// Process-wide factory for per-partition [`PartitionStateManager`]s,
 /// the keyed-state analog of
 /// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider).
-pub trait PartitionStateProvider<P>: Clone + Send + Sync + 'static {
+pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
     /// Manager minted per partition assignment.
-    type Manager: PartitionStateManager<Payload = P>;
+    type Manager: PartitionStateManager;
 
     /// Error raised when a partition's manager cannot be acquired.
     type AcquireError: ClassifyError + Error + Send + Sync + 'static;
@@ -134,89 +113,6 @@ pub trait PartitionStateProvider<P>: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send;
 }
 
-/// Stateless provider/manager for consumers without keyed state.
-///
-/// Sessions are [`UnavailableState`], recovery is a no-op, and the
-/// partition loop does not intercept `StateRecovery` triggers (none can
-/// exist — nothing schedules them).
-pub struct NoState<P>(PhantomData<fn() -> P>);
-
-impl<P> NoState<P> {
-    /// Creates the stateless provider.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<P> Default for NoState<P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<P> Clone for NoState<P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P> Copy for NoState<P> {}
-
-impl<P> fmt::Debug for NoState<P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("NoState")
-    }
-}
-
-impl<P> PartitionStateManager for NoState<P>
-where
-    P: Send + Sync + 'static,
-{
-    type Payload = P;
-    type RecoveryError = Infallible;
-    type Session = UnavailableState<P>;
-
-    fn session_for_message(
-        &self,
-        _message: &ConsumerMessage<P>,
-        _termination: TerminationWatch,
-    ) -> Self::Session {
-        UnavailableState::new()
-    }
-
-    fn session_for_timer(
-        &self,
-        _trigger: &Trigger,
-        _termination: TerminationWatch,
-    ) -> Self::Session {
-        UnavailableState::new()
-    }
-
-    async fn recover<T>(&self, _key: Key, _timers: &TimerManager<T>) -> Result<(), Infallible>
-    where
-        T: TriggerStore,
-    {
-        Ok(())
-    }
-
-    fn intercepts_recovery(&self) -> bool {
-        false
-    }
-}
-
-impl<P> PartitionStateProvider<P> for NoState<P>
-where
-    P: Send + Sync + 'static,
-{
-    type AcquireError = Infallible;
-    type Manager = Self;
-
-    async fn acquire(&self, _topic: Topic, _partition: Partition) -> Result<Self, Infallible> {
-        Ok(*self)
-    }
-}
-
 struct StateManagerInner<D, O, DP, Sc, L> {
     durable: D,
     oracle: O,
@@ -226,8 +122,6 @@ struct StateManagerInner<D, O, DP, Sc, L> {
     registry: Arc<CollectionDefRegistry>,
     segment_id: SegmentId,
     recovery_delay: CompactDuration,
-    version: Arc<str>,
-    consumer_group: Arc<str>,
 }
 
 /// The real per-partition state manager: owns the partition-lifetime
@@ -249,33 +143,7 @@ impl<D, O, DP, Sc, L> fmt::Debug for StateManager<D, O, DP, Sc, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateManager")
             .field("segment_id", &self.inner.segment_id)
-            .field("consumer_group", &self.inner.consumer_group)
             .finish_non_exhaustive()
-    }
-}
-
-impl<D, O, DP, Sc, L> StateManager<D, O, DP, Sc, L>
-where
-    D: Clone,
-    DP: DirtyStoreProvider<ValueKind>,
-    L: Clone,
-{
-    fn session(
-        &self,
-        key: Key,
-        event: EventRef,
-        termination: TerminationWatch,
-    ) -> ValueStateSession<D, DP, L> {
-        ValueStateSession::new(SessionParts {
-            durable: self.inner.durable.clone(),
-            dirty: self.inner.dirty.clone(),
-            loader: self.inner.loader.clone(),
-            registry: self.inner.registry.clone(),
-            state_key: StateKey::new(self.inner.segment_id, key),
-            event,
-            recovery_delay: self.inner.recovery_delay,
-            termination,
-        })
     }
 }
 
@@ -286,45 +154,23 @@ where
     DP: DirtyStoreProvider<ValueKind>,
     DP::Store: DirtyValueBundle + Send + Sync,
     Sc: PendingIndexScanner,
-    L: MessageLoader + 'static,
-    L::Payload: EventIdentity,
+    L: Clone + Send + Sync + 'static,
 {
-    type Payload = L::Payload;
     type RecoveryError =
         RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error>;
     type Session = ValueStateSession<D, DP, L>;
 
-    fn session_for_message(
-        &self,
-        message: &ConsumerMessage<L::Payload>,
-        termination: TerminationWatch,
-    ) -> Self::Session {
-        // The dedup id is derived for every message — even when no
-        // descriptors are registered — because the EventRef must exist
-        // before we know whether the handler touches state. One hash per
-        // message is a deliberate cost of the always-on layer.
-        let topic = message.topic();
-        let dedup_id = dedup_uuid_for_message(
-            self.inner.version.as_ref(),
-            self.inner.consumer_group.as_ref(),
-            &topic,
-            message.partition(),
-            message,
-        );
-        self.session(
-            message.key().clone(),
-            EventRef::Message { dedup_id },
+    fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
+        ValueStateSession::new(SessionParts {
+            durable: self.inner.durable.clone(),
+            dirty: self.inner.dirty.clone(),
+            loader: self.inner.loader.clone(),
+            registry: self.inner.registry.clone(),
+            state_key: StateKey::new(self.inner.segment_id, key),
+            event,
+            recovery_delay: self.inner.recovery_delay,
             termination,
-        )
-    }
-
-    fn session_for_timer(&self, trigger: &Trigger, termination: TerminationWatch) -> Self::Session {
-        let event = EventRef::Timer(TimerEventRef::new(
-            trigger.timer_type,
-            trigger.time,
-            trigger.tag,
-        ));
-        self.session(trigger.key.clone(), event, termination)
+        })
     }
 
     async fn recover<T>(
@@ -350,74 +196,60 @@ where
             .map_err(|e| RecoveryError::Timer(Box::new(e)))?;
         Ok(())
     }
-
-    fn intercepts_recovery(&self) -> bool {
-        true
-    }
 }
 
 /// Process-wide [`PartitionStateProvider`] over a
 /// [`StateBackendFactory`]: acquisition mints the partition's backend and
 /// eagerly validates descriptor identities.
-pub struct StateManagerProvider<B, Sc, L> {
+pub struct StateManagerProvider<B, L> {
     backend: B,
-    scanner: Sc,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
-    version: Arc<str>,
     recovery_delay: CompactDuration,
 }
 
-impl<B, Sc, L> StateManagerProvider<B, Sc, L> {
+impl<B, L> StateManagerProvider<B, L> {
     /// Creates the provider.
     ///
-    /// `version` **must** equal the deduplication middleware's hash
-    /// version: recovery looks a message's committed state up by the dedup
-    /// id the deduplication writer produced, and the version is one of the
-    /// hashed inputs.
+    /// `consumer_group` derives the partition's segment id; it must match
+    /// the formula the trigger store and timer manager use, so recovery
+    /// reads the exact rows the partition writes.
     #[must_use]
     pub fn new(
         backend: B,
-        scanner: Sc,
         loader: L,
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
-        version: Arc<str>,
         recovery_delay: CompactDuration,
     ) -> Self {
         Self {
             backend,
-            scanner,
             loader,
             registry,
             consumer_group,
-            version,
             recovery_delay,
         }
     }
 }
 
-impl<B, Sc, L> Clone for StateManagerProvider<B, Sc, L>
+impl<B, L> Clone for StateManagerProvider<B, L>
 where
     B: Clone,
-    Sc: Clone,
     L: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             backend: self.backend.clone(),
-            scanner: self.scanner.clone(),
             loader: self.loader.clone(),
             registry: self.registry.clone(),
             consumer_group: self.consumer_group.clone(),
-            version: self.version.clone(),
             recovery_delay: self.recovery_delay,
         }
     }
 }
 
-impl<B, Sc, L> fmt::Debug for StateManagerProvider<B, Sc, L> {
+impl<B, L> fmt::Debug for StateManagerProvider<B, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateManagerProvider")
             .field("consumer_group", &self.consumer_group)
@@ -426,20 +258,18 @@ impl<B, Sc, L> fmt::Debug for StateManagerProvider<B, Sc, L> {
     }
 }
 
-impl<B, Sc, L, P> PartitionStateProvider<P> for StateManagerProvider<B, Sc, L>
+impl<B, L> PartitionStateProvider for StateManagerProvider<B, L>
 where
     B: StateBackendFactory,
     B::Durable: DurableValueBundle
         + PendingIndexStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>
         + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
     DirtyStoreOf<B>: DirtyValueBundle + Send + Sync,
-    Sc: PendingIndexScanner,
-    L: MessageLoader<Payload = P> + 'static,
-    P: EventIdentity + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     type AcquireError =
         StateAcquireError<B::Error, <B::Durable as DurableWalStore<ValueKind>>::Error>;
-    type Manager = StateManager<B::Durable, B::Oracle, B::DirtyProvider, Sc, L>;
+    type Manager = StateManager<B::Durable, B::Oracle, B::DirtyProvider, B::Scanner, L>;
 
     async fn acquire(
         &self,
@@ -451,6 +281,7 @@ where
             durable,
             oracle,
             dirty,
+            scanner,
         } = self
             .backend
             .for_partition(topic, partition)
@@ -466,13 +297,11 @@ where
                 durable,
                 oracle,
                 dirty,
-                scanner: self.scanner.clone(),
+                scanner,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
                 segment_id,
                 recovery_delay: self.recovery_delay,
-                version: self.version.clone(),
-                consumer_group: self.consumer_group.clone(),
             }),
         })
     }

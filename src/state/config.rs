@@ -4,8 +4,13 @@ use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
 use crate::timers::duration::CompactDuration;
 use crate::util::from_env_with_fallback;
-use std::path::PathBuf;
+use derive_builder::Builder;
+use std::path::{Path, PathBuf};
 use std::{env, process};
+use validator::{Validate, ValidationError};
+
+/// Environment variable for the local fjall workspace directory.
+const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
 
 /// Default delay between sealing and the `StateRecovery` sweep.
 const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
@@ -25,7 +30,7 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 ///
 /// let keyed_state = KeyedStateConfiguration::default().state(&CART, CollectionDef::new(None));
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
     /// Root directory for the local fjall workspace (committed-value cache
     /// + dirty overlays).
@@ -37,30 +42,29 @@ pub struct KeyedStateConfiguration {
     /// work out of the box.
     ///
     /// Environment variable: `PROSODY_FJALL_CACHE_DIR`
+    #[builder(default = "from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())?")]
+    #[validate(custom(function = "validate_cache_dir"))]
     pub cache_dir: PathBuf,
 
     /// Middleware-wide default TTL for collections whose
     /// [`CollectionDef`] does not override it. `None` means indefinite
     /// retention.
+    #[builder(default)]
     pub default_ttl: Option<CompactDuration>,
 
     /// Delay between sealing a WAL and the `StateRecovery` backstop sweep.
+    #[builder(default = "CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)")]
     pub recovery_delay: CompactDuration,
 
+    #[builder(setter(skip), default)]
     registrations: Vec<(&'static str, StructuralIdentity, CollectionDef)>,
 }
 
 impl Default for KeyedStateConfiguration {
     fn default() -> Self {
-        let fallback = env::temp_dir().join(format!("prosody-keyed-state-{}", process::id()));
-        let cache_dir = match from_env_with_fallback("PROSODY_FJALL_CACHE_DIR", fallback.clone()) {
-            Ok(dir) => dir,
-            // `PathBuf` parsing is infallible; keep the fallback as the
-            // sensible default if that ever changes.
-            Err(_) => fallback,
-        };
         Self {
-            cache_dir,
+            cache_dir: from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())
+                .unwrap_or_else(|_| default_cache_dir()),
             default_ttl: None,
             recovery_delay: CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS),
             registrations: Vec::new(),
@@ -69,6 +73,12 @@ impl Default for KeyedStateConfiguration {
 }
 
 impl KeyedStateConfiguration {
+    /// Creates a new builder.
+    #[must_use]
+    pub fn builder() -> KeyedStateConfigurationBuilder {
+        KeyedStateConfigurationBuilder::default()
+    }
+
     /// Registers `descriptor`'s collection with operational settings `def`.
     ///
     /// Name validation and identity-conflict rejection run at consumer
@@ -103,4 +113,17 @@ impl KeyedStateConfiguration {
         }
         Ok(registry)
     }
+}
+
+/// Per-process fallback fjall workspace, used when [`FJALL_CACHE_DIR_ENV`] is
+/// unset. Wiped on restart, so it needs no persistence.
+fn default_cache_dir() -> PathBuf {
+    env::temp_dir().join(format!("prosody-keyed-state-{}", process::id()))
+}
+
+fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
+    if cache_dir.as_os_str().is_empty() {
+        return Err(ValidationError::new("cache_dir_empty"));
+    }
+    Ok(())
 }

@@ -26,6 +26,7 @@ use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::cassandra::config::CassandraConfiguration;
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
 use prosody::consumer::middleware::{CloneProvider, FallibleHandler};
@@ -258,6 +259,7 @@ pub fn spawn_consumers(
             let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
                 &consumer_config,
                 &create_cassandra_trigger_store_config(),
+                KeyedStateConfiguration::default(),
                 handler_provider,
                 Telemetry::new(),
             )

@@ -209,31 +209,44 @@ pub fn dedup_uuid(
     uuid::Builder::from_custom_bytes(hash.to_le_bytes()).into_uuid()
 }
 
+/// The fixed coordinates a consumer deduplicates a partition's messages
+/// under: the hash version, consumer group, topic, and partition. These four
+/// never vary across a partition's message stream — only the per-message key,
+/// event id, and offset do. Bundled so the deduplication writer and the
+/// keyed-state recovery reader derive a message's id from the same identity,
+/// and passed by value (it borrows; the fields are cheap to reference).
+#[derive(Clone, Copy)]
+pub struct DedupIdentity<'a> {
+    /// Deduplication hash version.
+    pub version: &'a str,
+    /// Consumer group.
+    pub group_id: &'a str,
+    /// Kafka topic.
+    pub topic: &'a str,
+    /// Kafka partition.
+    pub partition: Partition,
+}
+
 /// Computes the dedup UUID for a message, assembling the per-message hash
-/// arguments (key, `event_id`, offset) from `message` in one place.
+/// arguments (key, `event_id`, offset) from `message` and the fixed
+/// coordinates from `identity` in one place.
 ///
 /// This is the single source of truth for the message → dedup-id mapping.
 /// The deduplication middleware writes a row under this id; any reader that
 /// must look the row up — notably the keyed-state recovery oracle — calls
-/// this same function with the same `(version, group_id, topic, partition)`
-/// so the two derivations cannot drift apart on the `event_id`/offset branch
-/// selection inside [`dedup_uuid`].
+/// this same function with the same [`DedupIdentity`] so the two derivations
+/// cannot drift apart on the `event_id`/offset branch selection inside
+/// [`dedup_uuid`].
 #[must_use]
-pub fn dedup_uuid_for_message<P>(
-    version: &str,
-    group_id: &str,
-    topic: &str,
-    partition: i32,
-    message: &ConsumerMessage<P>,
-) -> Uuid
+pub fn dedup_uuid_for_message<P>(identity: DedupIdentity<'_>, message: &ConsumerMessage<P>) -> Uuid
 where
     P: EventIdentity,
 {
     dedup_uuid(
-        version,
-        group_id,
-        topic,
-        partition,
+        identity.version,
+        identity.group_id,
+        identity.topic,
+        identity.partition,
         message.key().as_bytes(),
         message.payload().event_id().map(str::as_bytes),
         message.offset(),
@@ -248,10 +261,12 @@ where
 {
     fn dedup_uuid_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
         dedup_uuid_for_message(
-            &self.version,
-            &self.group_id,
-            &self.topic,
-            self.partition,
+            DedupIdentity {
+                version: &self.version,
+                group_id: &self.group_id,
+                topic: &self.topic,
+                partition: self.partition,
+            },
             message,
         )
     }

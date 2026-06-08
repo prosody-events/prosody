@@ -28,6 +28,7 @@
 
 use crate::error::ClassifyError;
 use crate::state::oracle::CommitOracle;
+use crate::state::pending::PendingIndexScanner;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
@@ -68,14 +69,22 @@ pub use value::{ValueApplied, ValueKind, ValueOp};
 pub use wal::{EmptyOperationsError, NonEmptyOps, SealedWal, WalBlob, WalEnvelope};
 
 /// The per-partition keyed-state backend: the durable Value bundle, the
-/// commit oracle it recovers through, and the dirty-workspace provider.
+/// commit oracle it recovers through, the dirty-workspace provider, and the
+/// pending-index scanner the recovery sweep streams.
 ///
 /// Minted as one unit by [`StateBackendFactory::for_partition`] so the
 /// oracle baked into the durable bundle's recovery wrapper and the oracle
 /// the middleware's sweep consults are the *same* instance, and the
 /// fjall workspace backing the dirty provider and the durable cache is
 /// opened once.
-pub struct StateBackend<D, O, P> {
+///
+/// `scanner` and `durable` play distinct recovery roles: the scanner
+/// streams the pending-index rows (`scan_pending`), while the durable
+/// bundle does the point reads and resolutions (`read_partition`,
+/// `apply_sealed`, …). They are the *un-wrapped* inner store and the
+/// recovery-wrapped bundle respectively — distinct types even when both
+/// front the same backing store.
+pub struct StateBackend<D, O, P, Sc> {
     /// Durable Value bundle for this partition.
     pub durable: D,
 
@@ -84,13 +93,17 @@ pub struct StateBackend<D, O, P> {
 
     /// Per-event dirty-workspace provider for this partition.
     pub dirty: P,
+
+    /// Pending-index scanner for this partition's recovery sweep.
+    pub scanner: Sc,
 }
 
-/// The backend triple a [`StateBackendFactory`] mints for one partition.
+/// The backend bundle a [`StateBackendFactory`] mints for one partition.
 pub type BackendOf<B> = StateBackend<
     <B as StateBackendFactory>::Durable,
     <B as StateBackendFactory>::Oracle,
     <B as StateBackendFactory>::DirtyProvider,
+    <B as StateBackendFactory>::Scanner,
 >;
 
 /// Process-wide factory minting the per-partition keyed-state backend.
@@ -109,6 +122,9 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
 
     /// Per-event dirty-workspace provider minted per partition.
     type DirtyProvider: DirtyStoreProvider<ValueKind>;
+
+    /// Pending-index scanner minted per partition for the recovery sweep.
+    type Scanner: PendingIndexScanner;
 
     /// Error returned when a partition's backend cannot be materialized.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -133,45 +149,50 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
 /// tests and bespoke wiring; production uses the partition-scoped factories
 /// in [`production`].
 #[derive(Clone, Debug)]
-pub struct SharedStateBackend<D, O, P> {
+pub struct SharedStateBackend<D, O, P, Sc> {
     durable: D,
     oracle: O,
     dirty: P,
+    scanner: Sc,
 }
 
-impl<D, O, P> SharedStateBackend<D, O, P> {
+impl<D, O, P, Sc> SharedStateBackend<D, O, P, Sc> {
     /// Creates a backend factory that hands out clones of the supplied
     /// parts.
     #[must_use]
-    pub fn new(durable: D, oracle: O, dirty: P) -> Self {
+    pub fn new(durable: D, oracle: O, dirty: P, scanner: Sc) -> Self {
         Self {
             durable,
             oracle,
             dirty,
+            scanner,
         }
     }
 }
 
-impl<D, O, P> StateBackendFactory for SharedStateBackend<D, O, P>
+impl<D, O, P, Sc> StateBackendFactory for SharedStateBackend<D, O, P, Sc>
 where
     D: Clone + Send + Sync + 'static,
     O: CommitOracle,
     P: DirtyStoreProvider<ValueKind>,
+    Sc: PendingIndexScanner,
 {
     type DirtyProvider = P;
     type Durable = D;
     type Error = Infallible;
     type Oracle = O;
+    type Scanner = Sc;
 
     fn for_partition(
         &self,
         _topic: Topic,
         _partition: Partition,
-    ) -> Result<StateBackend<D, O, P>, Self::Error> {
+    ) -> Result<BackendOf<Self>, Self::Error> {
         Ok(StateBackend {
             durable: self.durable.clone(),
             oracle: self.oracle.clone(),
             dirty: self.dirty.clone(),
+            scanner: self.scanner.clone(),
         })
     }
 }

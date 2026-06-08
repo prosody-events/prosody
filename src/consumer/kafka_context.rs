@@ -12,7 +12,7 @@
 //! The core component is the `Context` struct which implements Kafka's
 //! rebalance callbacks to manage partition lifecycle events.
 
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rdkafka::ClientContext;
@@ -26,16 +26,18 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
+use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
     ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
 };
-use crate::state::manager::PartitionStateProvider;
+use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
+use crate::state::session::StateSession;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStoreProvider;
-use crate::{EventType, Topic};
+use crate::{EventIdentity, EventType, Topic};
 
 /// The per-partition factories the context threads into each
 /// [`PartitionConfiguration`]: trigger stores for the timer system and
@@ -99,17 +101,32 @@ where
     /// * `providers` - Per-partition trigger-store and keyed-state factories
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
-    /// * `allowed_events` - Optional filter automaton; payloads supply their
-    ///   event type via [`EventType`]
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BuildError`] if the configured `allowed_events` prefixes
+    /// cannot be compiled into a filter automaton.
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         providers: PartitionProviders<P, SP>,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers<PL>>,
-        allowed_events: Option<AhoCorasick>,
         telemetry: TelemetrySender,
-    ) -> Self {
+        version: Arc<str>,
+    ) -> Result<Self, BuildError> {
+        // Compile the event-type filter automaton from the configured
+        // prefixes; payloads supply their event type via [`EventType`].
+        let allowed_events = config
+            .allowed_events
+            .as_ref()
+            .map(|prefixes| {
+                AhoCorasick::builder()
+                    .start_kind(StartKind::Anchored)
+                    .build(prefixes)
+            })
+            .transpose()?;
+
         let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
             error!("invalid timer slab size: {error:#}; using default");
             CompactDuration::new(10 * 60)
@@ -127,6 +144,7 @@ where
             shutdown_timeout: config.shutdown_timeout,
             stall_threshold: config.stall_threshold,
             watermark_version,
+            version,
             trigger_provider: providers.triggers,
             state_provider: providers.state,
             timer_slab_size,
@@ -136,12 +154,12 @@ where
             _payload: PhantomData,
         };
 
-        Self {
+        Ok(Self {
             config,
             handler_provider,
             managers,
             telemetry,
-        }
+        })
     }
 }
 
@@ -149,7 +167,7 @@ impl<T, P, SP, PL> ClientContext for Context<T, P, SP, PL>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
-    SP: PartitionStateProvider<PL>,
+    SP: PartitionStateProvider,
     PL: Clone + Send + Sync + 'static,
 {
 }
@@ -159,8 +177,10 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
-    SP: PartitionStateProvider<PL>,
-    PL: Clone + Send + Sync + 'static + EventType,
+    SP: PartitionStateProvider,
+    <SP::Manager as PartitionStateManager>::Session:
+        StateSession<Loader: MessageLoader<Payload = PL>>,
+    PL: Clone + Send + Sync + 'static + EventType + EventIdentity,
 {
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.

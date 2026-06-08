@@ -18,7 +18,9 @@
 
 use super::*;
 use crate::codec::{Codec, JsonCodec};
+use crate::consumer::Keyed;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
@@ -39,8 +41,8 @@ use crate::state::session::{TerminationWatch, ValueStateSession};
 use crate::state::tests::value_suite::{FixedOracle, finish_trace};
 use crate::state::value::DurableWalStore;
 use crate::state::{
-    CollectionId, CollectionRef, CommitMode, DurableState, SharedStateBackend, StateKey, StateName,
-    StateType, ValueKind,
+    CollectionId, CollectionRef, CommitMode, DurableState, EventRef, SharedStateBackend, StateKey,
+    StateName, StateType, TimerEventRef, ValueKind,
 };
 use crate::telemetry::Telemetry;
 use crate::timers::Trigger;
@@ -88,12 +90,11 @@ async fn state_manager(durable: MemoryDurableValueStore, mode: CommitMode) -> Re
             durable.clone(),
             FixedOracle::committed(),
             MemoryDirtyValueStoreProvider,
+            durable,
         ),
-        durable,
         MemoryLoader::new(),
         registry_with_mode(mode)?,
         Arc::from("test-group"),
-        Arc::from("1"),
         CompactDuration::new(30),
     );
     provider
@@ -116,14 +117,34 @@ fn test_message(offset: Offset) -> Result<ConsumerMessage<Value>> {
 /// Mints a session for `message` and wraps it in a tracking mock context —
 /// exactly what the partition loop does per event.
 fn message_context(manager: &TestManager, message: &ConsumerMessage<Value>) -> TestContext {
-    let session = manager.session_for_message(message, termination());
+    // Mirror the partition loop: derive the dedup id through the canonical
+    // function and hand the manager the resolved event ref.
+    let dedup_id = dedup_uuid_for_message(
+        DedupIdentity {
+            version: "1",
+            group_id: "test-group",
+            topic: message.topic().as_ref(),
+            partition: message.partition(),
+        },
+        message,
+    );
+    let session = manager.session(
+        message.key().clone(),
+        EventRef::Message { dedup_id },
+        termination(),
+    );
     MockEventContext::new()
         .with_timer_tracking()
         .with_session(session)
 }
 
 fn timer_context(manager: &TestManager, trigger: &Trigger) -> TestContext {
-    let session = manager.session_for_timer(trigger, termination());
+    let event = EventRef::Timer(TimerEventRef::new(
+        trigger.timer_type,
+        trigger.time,
+        trigger.tag,
+    ));
+    let session = manager.session(trigger.key.clone(), event, termination());
     MockEventContext::new()
         .with_timer_tracking()
         .with_session(session)

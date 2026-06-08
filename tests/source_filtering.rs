@@ -15,7 +15,7 @@ use prosody::{
     JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, ProsodyConsumer},
+    consumer::{ConsumerConfiguration, KeyedStateConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
 };
@@ -103,6 +103,7 @@ async fn run_scenario(
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(TestHandler { messages_tx: tx }),
         Telemetry::new(),
     )

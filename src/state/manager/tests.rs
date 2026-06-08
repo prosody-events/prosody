@@ -1,17 +1,19 @@
-//! Directed tests for [`StateManager`], [`StateManagerProvider`], and
-//! [`NoState`].
+//! Directed tests for [`StateManager`] and [`StateManagerProvider`].
 //!
-//! These exercise eager identity acquisition, session minting (event-ref
-//! derivation parity with the deduplication writer), the recovery sweep
-//! against a real in-memory `TimerManager`, and the stateless `NoState`
-//! arm. All tests are broker-free.
+//! These exercise eager identity acquisition, per-event session minting from
+//! an already-resolved [`EventRef`], and the recovery sweep against a real
+//! in-memory `TimerManager`. State is always wired — there is no stateless
+//! arm. The manager is Kafka-agnostic: it mints a session from a key and an
+//! [`EventRef`], never from a message, so these tests hand it one directly —
+//! the message→dedup-id derivation is the partition loop's concern and is
+//! covered there. All tests are broker-free.
 
 use super::*;
-use crate::consumer::event_context::StateAccessError;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::state::SharedStateBackend;
+use crate::state::TimerEventRef;
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
 use crate::state::registry::CollectionDef;
@@ -20,6 +22,7 @@ use crate::state::tests::value_suite::{FixedOracle, FixedOracleError, bytes};
 use crate::state::value::ValueOp;
 use crate::state::{CommitDecision, DurableState, StateName, StateType};
 use crate::telemetry::Telemetry;
+use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
@@ -69,9 +72,13 @@ impl CommitOracle for CountingOracle {
     }
 }
 
-type TestBackend<O> = SharedStateBackend<MemoryDurableValueStore, O, MemoryDirtyValueStoreProvider>;
-type TestProvider<O> =
-    StateManagerProvider<TestBackend<O>, MemoryDurableValueStore, MemoryLoader<serde_json::Value>>;
+type TestBackend<O> = SharedStateBackend<
+    MemoryDurableValueStore,
+    O,
+    MemoryDirtyValueStoreProvider,
+    MemoryDurableValueStore,
+>;
+type TestProvider<O> = StateManagerProvider<TestBackend<O>, MemoryLoader<serde_json::Value>>;
 type TestTimerManager = TimerManager<TableAdapter<InMemoryTriggerStore>>;
 
 fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {
@@ -89,14 +96,46 @@ where
     O: CommitOracle,
 {
     StateManagerProvider::new(
-        SharedStateBackend::new(durable.clone(), oracle, MemoryDirtyValueStoreProvider),
-        durable,
+        SharedStateBackend::new(
+            durable.clone(),
+            oracle,
+            MemoryDirtyValueStoreProvider,
+            durable,
+        ),
         MemoryLoader::new(),
         registry,
         Arc::from("test-group"),
-        Arc::from("1"),
         CompactDuration::new(30),
     )
+}
+
+/// Mints a message session the way the partition loop does: from a key and an
+/// already-resolved dedup id. The manager consumes the [`EventRef`] directly;
+/// the message→id derivation lives in the partition loop, not here.
+fn message_session<M>(
+    manager: &M,
+    key: Key,
+    dedup_id: Uuid,
+    termination: TerminationWatch,
+) -> M::Session
+where
+    M: PartitionStateManager,
+{
+    manager.session(key, EventRef::Message { dedup_id }, termination)
+}
+
+/// Mints a timer session the way the partition loop does: from the trigger's
+/// durable timer coordinates.
+fn session_for_timer<M>(manager: &M, trigger: &Trigger, termination: TerminationWatch) -> M::Session
+where
+    M: PartitionStateManager,
+{
+    let event = EventRef::Timer(TimerEventRef::new(
+        trigger.timer_type,
+        trigger.time,
+        trigger.tag,
+    ));
+    manager.session(trigger.key.clone(), event, termination)
 }
 
 fn termination() -> TerminationWatch {
@@ -105,17 +144,6 @@ fn termination() -> TerminationWatch {
     // Dropped senders are fine: watch receivers keep reporting the last
     // value, which stays "live" for these tests.
     TerminationWatch::new(shutdown_rx, cancel_rx)
-}
-
-fn test_message(offset: crate::Offset) -> Result<ConsumerMessage<serde_json::Value>> {
-    ConsumerMessage::for_testing(
-        Topic::from("t"),
-        0,
-        offset,
-        Arc::from("k"),
-        serde_json::Value::Null,
-    )
-    .map_err(|e| eyre!("for_testing: {e}"))
 }
 
 /// Builds a real in-memory `TimerManager`; the pending stream is returned
@@ -203,13 +231,12 @@ async fn acquire_validates_identities_eagerly() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = registry_with_cart()?;
     let p = provider(durable.clone(), FixedOracle::committed(), registry);
-    let manager = acquire(&p).await?;
+    acquire(&p).await?;
 
     // The rows were written during acquisition.
     let segment_id = compute_segment_id(Topic::from("t"), 0, "test-group");
     let rows = durable.read_descriptor_identities(segment_id).await?;
     assert_eq!(rows.len(), 1, "first acquisition writes the identity row");
-    assert!(manager.intercepts_recovery());
 
     // Re-acquiring with the same registry is idempotent.
     acquire(&p).await?;
@@ -228,13 +255,10 @@ async fn acquire_validates_identities_eagerly() -> Result<()> {
     Ok(())
 }
 
-/// T1 (reader side): the manager derives a message's dedup id through the
-/// canonical [`dedup_uuid_for_message`] the deduplication *writer* uses,
-/// threading its configured `version` and `consumer_group`. Covered for
-/// payloads with and without an `event_id` so both hash branches are
-/// exercised.
+/// A minted message session carries the [`EventRef::Message`] it was handed —
+/// the manager echoes the oracle reference back unaltered.
 #[tokio::test]
-async fn session_for_message_derives_canonical_dedup_id() -> Result<()> {
+async fn session_carries_event_ref() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let manager = acquire(&provider(
         durable,
@@ -243,17 +267,9 @@ async fn session_for_message_derives_canonical_dedup_id() -> Result<()> {
     ))
     .await?;
 
-    for payload in [serde_json::json!({ "id": "evt-1" }), serde_json::json!({})] {
-        let msg = ConsumerMessage::for_testing(Topic::from("t"), 0, 7, Arc::from("k"), payload)
-            .map_err(|e| eyre!("for_testing: {e}"))?;
-        let session = manager.session_for_message(&msg, termination());
-        let expected = dedup_uuid_for_message("1", "test-group", "t", 0, &msg);
-        assert_eq!(
-            session.event(),
-            EventRef::Message { dedup_id: expected },
-            "session event must match the canonical writer derivation"
-        );
-    }
+    let dedup_id = Uuid::from_u128(7);
+    let session = message_session(&manager, Arc::from("k"), dedup_id, termination());
+    assert_eq!(session.event(), EventRef::Message { dedup_id });
     Ok(())
 }
 
@@ -273,7 +289,7 @@ async fn session_for_timer_uses_timer_event_ref() -> Result<()> {
         CompactDateTime::from(99_u32),
         TimerType::Application,
     );
-    let session = manager.session_for_timer(&trigger, termination());
+    let session = session_for_timer(&manager, &trigger, termination());
     assert_eq!(
         session.event(),
         EventRef::Timer(TimerEventRef::new(
@@ -302,8 +318,7 @@ async fn recover_applies_sealed_and_clears_timer() -> Result<()> {
     let key: Key = Arc::from("k");
 
     // A session seals but its apply hook never runs (crash window).
-    let msg = test_message(0)?;
-    let session = manager.session_for_message(&msg, termination());
+    let session = message_session(&manager, key.clone(), Uuid::from_u128(0), termination());
     session
         .set_state_cell(&StateName::try_new("cart")?, bytes(7))
         .await?;
@@ -352,8 +367,7 @@ async fn recover_rolls_back_when_not_committed() -> Result<()> {
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     let key: Key = Arc::from("k");
 
-    let msg = test_message(1)?;
-    let session = manager.session_for_message(&msg, termination());
+    let session = message_session(&manager, key.clone(), Uuid::from_u128(1), termination());
     session
         .set_state_cell(&StateName::try_new("cart")?, bytes(99))
         .await?;
@@ -404,29 +418,6 @@ async fn recover_deletes_stale_pending_without_consulting_oracle() -> Result<()>
         0,
         "oracle must not be consulted for a stale pending row"
     );
-    Ok(())
-}
-
-/// `NoState` yields unavailable sessions, no-op recovery, and no
-/// `StateRecovery` interception.
-#[tokio::test]
-async fn no_state_provider_yields_unavailable_sessions() -> Result<()> {
-    let provider: NoState<serde_json::Value> = NoState::new();
-    let manager = provider
-        .acquire(Topic::from("t"), 0)
-        .await
-        .map_err(|e| eyre!("{e}"))?;
-    assert!(!manager.intercepts_recovery());
-
-    let msg = test_message(0)?;
-    let session = manager.session_for_message(&msg, termination());
-    assert!(matches!(
-        session.state_cell(&StateName::try_new("anything")?).await,
-        Err(StateAccessError::Unavailable)
-    ));
-
-    let (_stream, timers, _shutdown_tx) = timer_manager().await?;
-    manager.recover(Arc::from("k"), &timers).await?;
     Ok(())
 }
 
@@ -529,7 +520,7 @@ async fn run_deferred_message_crash(
     // The loop mints the session from the firing trigger (canonical tag);
     // the reloaded message's handler writes state, which seals under the
     // timer event ref on finalize.
-    let session = manager.session_for_timer(firing.trigger(), termination());
+    let session = session_for_timer(&manager, firing.trigger(), termination());
     session
         .set_state_cell(&StateName::try_new("cart")?, bytes(7))
         .await?;

@@ -7,82 +7,42 @@
 //! typed, owned handle:
 //!
 //! ```
-//! use prosody::codec::JsonCodecError;
-//! use prosody::consumer::DemandType;
-//! use prosody::consumer::event_context::EventContext;
-//! use prosody::consumer::message::ConsumerMessage;
-//! use prosody::consumer::middleware::FallibleHandler;
-//! use prosody::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
-//! use prosody::timers::Trigger;
-//! use serde_json::Value;
+//! use prosody::state::descriptor::{ValueDescriptor, value_state};
 //!
+//! // Declared once — usually as a `const` — then registered with the
+//! // consumer. Binding it to an `EventContext` yields a typed, owned handle
+//! // whose `get`/`set` read and write the cell committed by the previous
+//! // event on the key. See the consumer middleware docs (`FallibleHandler`)
+//! // for the full read-modify-write handler.
 //! const CART: ValueDescriptor = value_state("cart");
-//!
-//! #[derive(Clone)]
-//! struct MyHandler;
-//!
-//! impl FallibleHandler for MyHandler {
-//!     type Error = ValueStateError<JsonCodecError>;
-//!     type Output = ();
-//!     type Payload = Value;
-//!
-//!     async fn on_message<C>(
-//!         &self,
-//!         ctx: C,
-//!         message: ConsumerMessage<Value>,
-//!         _demand: DemandType,
-//!     ) -> Result<(), Self::Error>
-//!     where
-//!         C: EventContext<Payload = Value>,
-//!     {
-//!         // Read-modify-write: each message appends to the cell
-//!         // committed by the previous event on this key.
-//!         let cart = ctx.state(CART)?;
-//!         let mut items = match cart.get().await? {
-//!             Some(Value::Array(items)) => items,
-//!             _ => Vec::new(),
-//!         };
-//!         items.push(message.payload().clone());
-//!         cart.set(Value::Array(items)).await?;
-//!         Ok(())
-//!     }
-//!
-//!     async fn on_timer<C>(
-//!         &self,
-//!         ctx: C,
-//!         _trigger: Trigger,
-//!         _demand: DemandType,
-//!     ) -> Result<(), Self::Error>
-//!     where
-//!         C: EventContext<Payload = Value>,
-//!     {
-//!         // Timer handlers bind the same way; state persists across
-//!         // event kinds for the key.
-//!         let _cart = ctx.state(CART)?.get().await?;
-//!         Ok(())
-//!     }
-//!
-//!     async fn shutdown(self) {}
-//! }
+//! # let _ = &CART;
 //! ```
 //!
-//! Two descriptor kinds ship today:
+//! # Codec and resolver
 //!
-//! * [`ValueDescriptor`] — a codec-backed single value. The codec **is** the
-//!   typing: the cell type is `C::Payload`, and the default codec is
-//!   [`JsonCodec`] (cells are [`serde_json::Value`]s, exactly like the default
-//!   message payload). A typed cell means writing a `CartCodec: Codec<Payload =
-//!   Cart>` — one codec, one layer of encoding.
-//! * [`KafkaMessageDescriptor`] — codec-free; cells hold a [`KafkaMessageRef`]
-//!   and `get()` resolves the full consumer message (decoded by the consumer's
-//!   own codec) through the message loader.
+//! A [`ValueDescriptor`] is generic over two orthogonal strategies:
+//!
+//! * a [`Codec`] (`bytes ↔ Stored`, synchronous) — the codec **is** the
+//!   typing of the stored cell. The default is [`JsonCodec`] (cells are
+//!   [`serde_json::Value`]s, exactly like the default message payload). A
+//!   typed cell means writing a `CartCodec: Codec<Payload = Cart>` — one
+//!   codec, one layer of encoding.
+//! * a [`CellResolver`] (`Stored → value`, asynchronous) — maps the decoded
+//!   cell into what `get()` returns and what `set()` takes. The default is
+//!   [`Passthrough`]: the resolved value *is* the stored value.
+//!
+//! Both are Kafka-agnostic. The consumer layer composes a non-trivial codec +
+//! resolver pair to model a *reference* cell — bytes that decode to a durable
+//! pointer which the resolver then loads into a full value — but `src/state`
+//! never names that machinery; it only sees the two generic strategies.
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
-//! `(kind, cell kind, codec id, schema label)` tuple. The identity is
-//! checked at registration (same name ⇒ same identity), at bind, and
-//! against the durable per-segment identity table on first use, so a
-//! process carrying an incompatible descriptor fails loudly instead of
-//! silently misreading cells.
+//! `(kind, cell kind, codec id, schema label)` tuple. Identity is derived
+//! from the codec, never the resolver: the resolver is operational, not part
+//! of the durable contract. The identity is checked at registration (same
+//! name ⇒ same identity), at bind, and against the durable per-segment
+//! identity table on first use, so a process carrying an incompatible
+//! descriptor fails loudly instead of silently misreading cells.
 
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::event_context::StateAccessError;
@@ -93,16 +53,10 @@ use crate::state::{StateName, StoreOutcome};
 use bytes::Bytes;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use thiserror::Error;
-
-pub mod kafka;
-
-pub use kafka::{
-    KafkaMessageDescriptor, KafkaMessageHandle, KafkaMessageRef, KafkaStateError,
-    kafka_message_state,
-};
 
 /// Cell-format discriminator persisted in a collection's structural
 /// identity.
@@ -114,9 +68,6 @@ pub use kafka::{
 pub enum CellKind {
     /// Raw bytes produced by a user-facing [`Codec`].
     Codec = 1,
-
-    /// A `MsgPack`-encoded [`KafkaMessageRef`].
-    KafkaMessageRef = 2,
 }
 
 impl From<CellKind> for i16 {
@@ -247,28 +198,90 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 }
 
-/// Descriptor for a codec-backed single value collection.
+/// Strategy that maps a decoded cell value into the value a handle exposes,
+/// and back.
 ///
-/// The codec carries the typing: the cell type **is** `C::Payload`. The
-/// default [`JsonCodec`] stores [`serde_json::Value`] cells — the same
-/// default as the consumer's message payload. Declare as a `const` via
-/// [`value_state`]; for a typed cell, declare a codec
-/// (`CartCodec: Codec<Payload = Cart>`) and write
-/// `const CART: ValueDescriptor<CartCodec> = value_state("cart");`.
-pub struct ValueDescriptor<C = JsonCodec> {
-    meta: DescriptorMeta,
-    _marker: PhantomData<fn() -> C>,
+/// The resolver is a zero-sized *strategy*, never an instance: every method
+/// is static (no `&self`). Any runtime dependency it needs (for example a
+/// message loader) is read from the [`StateSession`] handed to
+/// [`Self::resolve`] — see the consumer layer's reference resolver. This is
+/// what keeps [`ValueDescriptor`]'s identity resolver-agnostic: a descriptor
+/// carries no resolver state.
+pub trait CellResolver<S: StateSession> {
+    /// The decoded cell type — pinned to the codec's payload by the handle.
+    type Stored;
+
+    /// What [`StateHandle::get`] returns.
+    type Resolved;
+
+    /// What [`StateHandle::set`] takes. A GAT so a borrowing resolver (e.g.
+    /// "store a reference to the message in hand") can take `&'a T` while a
+    /// passthrough takes an owned value.
+    type Write<'a>;
+
+    /// Resolves a decoded cell into the exposed value, optionally using the
+    /// session (for example its loader).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError`] when resolution fails (for example a
+    /// loader miss).
+    fn resolve(
+        session: &S,
+        stored: Self::Stored,
+    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send;
+
+    /// Lowers a written value into the cell value the codec serializes.
+    fn stored_from(write: Self::Write<'_>) -> Self::Stored;
 }
 
-impl<C> Clone for ValueDescriptor<C> {
+/// Identity [`CellResolver`]: the resolved value *is* the stored value.
+///
+/// A zero-sized strategy; [`value_state`] pairs it with the codec so a plain
+/// value collection round-trips `C::Payload` with no extra layer.
+pub struct Passthrough<T>(PhantomData<fn() -> T>);
+
+impl<S, T> CellResolver<S> for Passthrough<T>
+where
+    S: StateSession,
+    T: Send + 'static,
+{
+    type Stored = T;
+    type Resolved = T;
+    type Write<'a> = T;
+
+    async fn resolve(_session: &S, stored: T) -> Result<T, StateAccessError> {
+        Ok(stored)
+    }
+
+    fn stored_from(write: T) -> T {
+        write
+    }
+}
+
+/// Descriptor for a codec-backed single value collection.
+///
+/// Generic over a [`Codec`] (the cell typing) and a [`CellResolver`] (how a
+/// decoded cell becomes the exposed value). The default [`JsonCodec`] stores
+/// [`serde_json::Value`] cells — the same default as the consumer's message
+/// payload — and the default [`Passthrough`] resolver exposes the stored
+/// value directly. Declare as a `const` via [`value_state`]; for a typed
+/// cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and write
+/// `const CART: ValueDescriptor<CartCodec> = value_state("cart");`.
+pub struct ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> {
+    meta: DescriptorMeta,
+    _marker: PhantomData<fn() -> (C, R)>,
+}
+
+impl<C, R> Clone for ValueDescriptor<C, R> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<C> Copy for ValueDescriptor<C> {}
+impl<C, R> Copy for ValueDescriptor<C, R> {}
 
-impl<C> fmt::Debug for ValueDescriptor<C> {
+impl<C, R> fmt::Debug for ValueDescriptor<C, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValueDescriptor")
             .field("meta", &self.meta)
@@ -280,17 +293,40 @@ impl<C> fmt::Debug for ValueDescriptor<C> {
 /// default — annotate the `const` with `ValueDescriptor<MyCodec>` to pick
 /// another codec).
 ///
+/// The resolver defaults to [`Passthrough`]: the value is stored and
+/// returned verbatim.
+///
 /// `name` is not validated here (const contexts cannot fail); an empty
 /// name fails loudly at registration, the fallible boundary.
 #[must_use]
-pub const fn value_state<C>(name: &'static str) -> ValueDescriptor<C> {
-    ValueDescriptor {
-        meta: DescriptorMeta::new(name),
-        _marker: PhantomData,
-    }
+pub const fn value_state<C>(name: &'static str) -> ValueDescriptor<C, Passthrough<C::Payload>>
+where
+    C: Codec,
+{
+    ValueDescriptor::new(name)
 }
 
-impl<C> ValueDescriptor<C> {
+impl<C, R> ValueDescriptor<C, R> {
+    /// Declares a value collection named `name` over an explicit codec and
+    /// resolver pair.
+    ///
+    /// Bound-free by design: construction needs no `Codec`/`CellResolver`
+    /// bounds (those surface only on [`StateHandle::get`]/`set`), so a
+    /// consumer-layer alias can build a non-[`Passthrough`] descriptor — e.g.
+    /// a reference cell whose resolver loads through a message loader — as a
+    /// `const`. [`value_state`] is the convenience constructor for the common
+    /// [`Passthrough`] case.
+    ///
+    /// `name` is not validated here (const contexts cannot fail); an empty
+    /// name fails loudly at registration, the fallible boundary.
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            meta: DescriptorMeta::new(name),
+            _marker: PhantomData,
+        }
+    }
+
     /// Attaches an opt-in schema version label to the frozen identity.
     #[must_use]
     pub const fn with_schema_label(mut self, label: &'static str) -> Self {
@@ -299,7 +335,7 @@ impl<C> ValueDescriptor<C> {
     }
 }
 
-impl<C> DescriptorIdentity for ValueDescriptor<C>
+impl<C, R> DescriptorIdentity for ValueDescriptor<C, R>
 where
     C: Codec,
 {
@@ -317,20 +353,20 @@ where
     }
 }
 
-impl<C> StateDescriptor for ValueDescriptor<C>
+impl<C, R> StateDescriptor for ValueDescriptor<C, R>
 where
     C: Codec,
 {
-    type Handle<S: StateSession> = TypedValueHandle<S, C>;
+    type Handle<S: StateSession> = StateHandle<S, C, R>;
 
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+        // Bind is resolver-agnostic: identity is codec-derived, and the
+        // handle carries the resolver only as a marker. The
+        // `R: CellResolver<S>` requirement surfaces on `get`/`set`, not here,
+        // so this compiles through the shared `StateDescriptor` trait.
         let name =
             session.verify_state_registration(self.meta.name(), &self.structural_identity())?;
-        Ok(TypedValueHandle {
-            session: session.clone(),
-            name,
-            _marker: PhantomData,
-        })
+        Ok(StateHandle::new(session.clone(), name))
     }
 }
 
@@ -338,17 +374,31 @@ where
 ///
 /// Owns a clone of the binding session (`Clone + Send + Sync + 'static` —
 /// an FFI requirement); the codec runs only at the edges (`get` decodes,
-/// `set` encodes) over the session's byte cells. Every operation first
-/// guards on session termination ([`StateAccessError::Terminated`]); stale
+/// `set` encodes) over the session's byte cells, and the resolver maps the
+/// decoded cell to/from the exposed value. Every operation first guards on
+/// session termination ([`StateAccessError::Terminated`]); stale
 /// post-dispatch use additionally fails through the per-event transaction
 /// state machine.
-pub struct TypedValueHandle<S, C> {
+pub struct StateHandle<S, C, R> {
     session: S,
     name: StateName,
-    _marker: PhantomData<fn() -> C>,
+    _marker: PhantomData<fn() -> (C, R)>,
 }
 
-impl<S: Clone, C> Clone for TypedValueHandle<S, C> {
+impl<S, C, R> StateHandle<S, C, R> {
+    /// Wraps a verified session + canonical name. Resolver-agnostic so
+    /// [`StateDescriptor::bind`] can mint it without a [`CellResolver`]
+    /// bound.
+    fn new(session: S, name: StateName) -> Self {
+        Self {
+            session,
+            name,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S: Clone, C, R> Clone for StateHandle<S, C, R> {
     fn clone(&self) -> Self {
         Self {
             session: self.session.clone(),
@@ -358,18 +408,20 @@ impl<S: Clone, C> Clone for TypedValueHandle<S, C> {
     }
 }
 
-impl<S, C> TypedValueHandle<S, C>
+impl<S, C, R> StateHandle<S, C, R>
 where
     S: StateSession,
     C: Codec,
+    R: CellResolver<S, Stored = C::Payload>,
 {
-    /// Reads and decodes the current visible value.
+    /// Reads, decodes, and resolves the current visible value.
     ///
     /// # Errors
     ///
-    /// Returns an access error from the session, or a codec error
-    /// (Permanent) when the cell bytes do not decode as `C::Payload`.
-    pub async fn get(&self) -> Result<Option<C::Payload>, ValueStateError<C::Error>> {
+    /// Returns an access error from the session, a codec error (Permanent)
+    /// when the cell bytes do not decode as `C::Payload`, or a resolution
+    /// error from the resolver.
+    pub async fn get(&self) -> Result<Option<R::Resolved>, ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
         let Some(cell) = self.session.state_cell(&self.name).await? else {
             return Ok(None);
@@ -377,24 +429,22 @@ where
         // `Codec::deserialize` parses in place (destructive); cells live in
         // shared `Bytes`, so copy first.
         let mut buf = cell.to_vec();
-        let payload = C::with_cached_local(|codec| codec.deserialize(&mut buf))
+        let stored = C::with_cached_local(|codec| codec.deserialize(&mut buf))
             .map_err(ValueStateError::Codec)?;
-        Ok(Some(payload))
+        Ok(Some(R::resolve(&self.session, stored).await?))
     }
 
-    /// Encodes `value` and buffers a set operation.
-    ///
-    /// Takes the value by value — [`Codec::serialize`] consumes its
-    /// payload.
+    /// Lowers `value` through the resolver, encodes it, and buffers a set.
     ///
     /// # Errors
     ///
-    /// Returns a codec error (Permanent) when `value` fails to encode, or
+    /// Returns a codec error (Permanent) when the cell fails to encode, or
     /// an access error from the session.
-    pub async fn set(&self, value: C::Payload) -> Result<(), ValueStateError<C::Error>> {
+    pub async fn set(&self, value: R::Write<'_>) -> Result<(), ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
+        let stored = R::stored_from(value);
         let mut buf = Vec::new();
-        C::with_cached_local(|codec| codec.serialize(value, &mut buf))
+        C::with_cached_local(|codec| codec.serialize(stored, &mut buf))
             .map_err(ValueStateError::Codec)?;
         Ok(self
             .session
@@ -426,9 +476,8 @@ where
 
 /// Guards every handle operation: a session whose partition is shutting
 /// down or whose event is cancelled refuses state access with
-/// [`StateAccessError::Terminated`]. Shared by the value and Kafka-message
-/// handles.
-pub(crate) fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
+/// [`StateAccessError::Terminated`].
+fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
 where
     S: StateSession,
 {
@@ -438,7 +487,7 @@ where
     Ok(())
 }
 
-/// Error returned by [`TypedValueHandle`] operations.
+/// Error returned by [`StateHandle`] operations.
 #[derive(Debug, Error)]
 pub enum ValueStateError<E>
 where
@@ -469,4 +518,4 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

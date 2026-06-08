@@ -14,7 +14,7 @@ use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, Sche
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{
-    ConsumerConfigurationBuilder, ConsumerError, KeyedStateConfiguration,
+    ConsumerConfigurationBuilder, ConsumerError, KeyedStateConfiguration, KeyedStateInitError,
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use crate::high_level::config::{
@@ -279,8 +279,10 @@ where
                         dedup: dedup.clone(),
                         // The high-level (FFI-facing) API does not expose
                         // keyed-state registrations yet; the always-on layer
-                        // stays inert with no registered collections.
-                        keyed_state: KeyedStateConfiguration::default(),
+                        // stays inert with an environment-loaded config.
+                        keyed_state: KeyedStateConfiguration::builder().build().map_err(
+                            |error| ConsumerError::from(KeyedStateInitError::Configuration(error)),
+                        )?,
                     },
                     common,
                     self.telemetry.clone(),

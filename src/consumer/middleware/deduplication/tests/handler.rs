@@ -6,7 +6,7 @@ use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
-    DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
+    DedupIdentity, DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
     MemoryDeduplicationStore, MemoryDeduplicationStoreProvider, dedup_uuid, dedup_uuid_for_message,
 };
 use crate::consumer::middleware::tests::test_support::MockEventContext;
@@ -630,7 +630,15 @@ fn dedup_id_writer_matches_canonical_reader_derivation() {
         };
 
         let writer_id = handler.dedup_uuid_for_message(&msg);
-        let reader_id = dedup_uuid_for_message(VERSION, GROUP, TOPIC, PARTITION, &msg);
+        let reader_id = dedup_uuid_for_message(
+            DedupIdentity {
+                version: VERSION,
+                group_id: GROUP,
+                topic: TOPIC,
+                partition: PARTITION,
+            },
+            &msg,
+        );
         assert_eq!(
             writer_id, reader_id,
             "writer and canonical reader derivations must agree (event_id = {event_id:?})"
