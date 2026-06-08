@@ -11,8 +11,7 @@ use crate::cassandra::{
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
 use crate::consumer::middleware::deduplication::{
-    DeduplicationConfiguration, DeduplicationConfigurationBuilder,
-    DeduplicationConfigurationBuilderError,
+    DeduplicationConfigurationBuilder, DeduplicationConfigurationBuilderError,
 };
 use crate::consumer::middleware::defer::{
     DeferConfigError, DeferConfiguration, DeferConfigurationBuilder,
@@ -87,9 +86,7 @@ pub enum ModeConfiguration {
         monopolization: MonopolizationConfiguration,
         /// Defer middleware configuration.
         defer: DeferConfiguration,
-        /// Deduplication middleware configuration.
-        dedup: DeduplicationConfiguration,
-        /// Common middleware configuration (scheduler, timeout).
+        /// Common middleware configuration (scheduler, timeout, dedup).
         common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
@@ -141,9 +138,16 @@ impl ModeConfiguration {
         let retry = params.retry_builder.build()?;
         let scheduler = params.scheduler_builder.build()?;
         let timeout = params.timeout_builder.build()?;
+        // Deduplication is the commit oracle for every mode, so it lives in the
+        // common configuration rather than pipeline-only.
+        let dedup = params.dedup_builder.build()?;
 
         // Build common middleware configuration
-        let common = CommonMiddlewareConfiguration { scheduler, timeout };
+        let common = CommonMiddlewareConfiguration {
+            scheduler,
+            timeout,
+            dedup,
+        };
 
         // Create trigger store configuration based on mock mode
         let trigger_store = if consumer.mock {
@@ -157,13 +161,11 @@ impl ModeConfiguration {
             Mode::Pipeline => {
                 let monopolization = params.monopolization_builder.build()?;
                 let defer = params.defer_builder.clone().build()?;
-                let dedup = params.dedup_builder.build()?;
                 Self::Pipeline {
                     consumer,
                     retry,
                     monopolization,
                     defer,
-                    dedup,
                     common,
                     trigger_store,
                 }

@@ -80,13 +80,13 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         retry: RetryConfigurationBuilder::default().build()?,
         monopolization: MonopolizationConfigurationBuilder::default().build()?,
         defer: DeferConfigurationBuilder::default().build()?,
-        dedup: DeduplicationConfigurationBuilder::default().build()?,
         keyed_state: KeyedStateConfiguration::default(),
     };
 
     let common_config = CommonMiddlewareConfiguration {
         scheduler: SchedulerConfigurationBuilder::default().build()?,
         timeout: TimeoutConfigurationBuilder::default().build()?,
+        dedup: DeduplicationConfigurationBuilder::default().build()?,
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(

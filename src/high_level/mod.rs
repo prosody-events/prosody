@@ -265,7 +265,6 @@ where
                 retry,
                 monopolization,
                 defer,
-                dedup,
                 common,
                 trigger_store,
             } => {
@@ -276,7 +275,6 @@ where
                         retry: retry.clone(),
                         monopolization: monopolization.clone(),
                         defer: defer.clone(),
-                        dedup: dedup.clone(),
                         // The high-level (FFI-facing) API does not expose
                         // keyed-state registrations yet; the always-on layer
                         // stays inert with an environment-loaded config.

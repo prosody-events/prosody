@@ -684,6 +684,12 @@ pub struct CommonMiddlewareConfiguration {
     pub scheduler: SchedulerConfiguration,
     /// Timeout configuration for handler execution limits.
     pub timeout: TimeoutConfiguration,
+    /// Deduplication configuration.
+    ///
+    /// Deduplication runs in **every** consumer mode: it is the commit oracle
+    /// the keyed-state recovery path reads (a message's dedup row existing
+    /// means it committed), so it cannot be pipeline-specific.
+    pub dedup: DeduplicationConfiguration,
 }
 
 /// Configuration for middleware specific to pipeline consumers.
@@ -698,8 +704,6 @@ pub struct PipelineMiddlewareConfiguration {
     pub monopolization: MonopolizationConfiguration,
     /// Defer middleware configuration.
     pub defer: DeferConfiguration,
-    /// Deduplication middleware configuration.
-    pub dedup: DeduplicationConfiguration,
     /// Keyed-state configuration (always-on; inert when no collections are
     /// registered).
     pub keyed_state: KeyedStateConfiguration,
@@ -941,11 +945,12 @@ async fn prepare_pipeline_stack<P: Send + Sync + 'static>(
     // Create both stores atomically - ensures trigger and defer stores match.
     // A `cache_capacity` of zero disables deduplication; `StorePair::new`
     // skips dedup wiring entirely in that case.
+    let dedup_config = common_config.dedup.clone();
     let stores = StorePair::new(
         trigger_store_config,
         consumer_config.mock,
-        pipeline_config.dedup.ttl,
-        pipeline_config.dedup.cache_capacity,
+        dedup_config.ttl,
+        dedup_config.cache_capacity,
         pipeline_config.keyed_state.default_ttl,
         consumer_config.timer_spans,
     )
@@ -954,7 +959,6 @@ async fn prepare_pipeline_stack<P: Send + Sync + 'static>(
         retry: retry_config,
         monopolization: monopolization_config,
         defer: defer_config,
-        dedup: dedup_config,
         keyed_state: keyed_state_config,
     } = pipeline_config;
     keyed_state_config.validate()?;

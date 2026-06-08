@@ -284,7 +284,6 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
         retry: RetryConfigurationBuilder::default().build()?,
         monopolization: MonopolizationConfigurationBuilder::default().build()?,
         defer: DeferConfigurationBuilder::default().build()?,
-        dedup: DeduplicationConfigurationBuilder::default().build()?,
         keyed_state: KeyedStateConfiguration::default()
             .state(&CART, CollectionDef::new(None))
             .state(&LAST_SEEN, CollectionDef::new(None)),
@@ -293,6 +292,7 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
     let common_config = CommonMiddlewareConfiguration {
         scheduler: SchedulerConfigurationBuilder::default().build()?,
         timeout: TimeoutConfigurationBuilder::default().build()?,
+        dedup: DeduplicationConfigurationBuilder::default().build()?,
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
