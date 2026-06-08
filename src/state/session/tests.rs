@@ -8,8 +8,8 @@
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::*;
 use crate::codec::JsonCodec;
-use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::partition::ShutdownPhase;
+use crate::loader::MemoryLoader;
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};

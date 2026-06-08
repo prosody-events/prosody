@@ -23,7 +23,6 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
-use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
@@ -31,6 +30,7 @@ use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::tests::test_support::{MockEventContext, TimerOperation};
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::consumer::partition::ShutdownPhase;
+use crate::loader::MemoryLoader;
 use crate::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
 use crate::state::manager::{
     PartitionStateManager, PartitionStateProvider, StateManager, StateManagerProvider,

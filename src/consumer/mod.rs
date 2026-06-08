@@ -127,7 +127,7 @@
 
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
-use crate::consumer::kafka_context::{Context, PartitionProviders};
+use crate::consumer::kafka_context::{PartitionProviders, new_context};
 pub use crate::consumer::kafka_state::{
     KafkaMessageDescriptor, KafkaMessageRef, KafkaRefCodec, KafkaRefCodecError, KafkaResolver,
     KafkaStateError, kafka_message_state,
@@ -138,11 +138,8 @@ pub use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::HandlerMiddleware;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
-    DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, DeduplicationMiddleware,
-    DeduplicationStoreProvider,
-};
-use crate::consumer::middleware::defer::message::loader::{
-    KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader,
+    CassandraDeduplicationStoreProvider, DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration,
+    DeduplicationMiddleware, DeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
@@ -171,8 +168,10 @@ use crate::consumer::probes::ProbeServer;
 use crate::consumer::storage::StorePair;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::loader::{KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader};
 pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
+use crate::state::cassandra::CassandraValueStore;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
@@ -186,7 +185,8 @@ use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::TriggerStoreProvider;
-use crate::timers::store::cassandra::CassandraTriggerStoreError;
+use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -831,30 +831,28 @@ impl KeyedStateInputs {
 ///
 /// Groups the middleware and configuration that are common to both memory
 /// and Cassandra storage backends, reducing parameter counts.
-struct PipelineMiddlewareStack<CM> {
+struct PipelineMiddlewareStack {
     consumer_config: ConsumerConfiguration,
     defer_config: DeferConfiguration,
-    dedup_config: DeduplicationConfiguration,
+    common_config: CommonMiddlewareConfiguration,
     failure_tracker: FailureTracker,
-    common_middleware: CM,
     monopolization_middleware: Option<MonopolizationMiddleware>,
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
 }
 
-impl<CM> PipelineMiddlewareStack<CM> {
+impl PipelineMiddlewareStack {
     fn build<T, MP, TP, DP, PP, SP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
-        dedup_provider: Option<DP>,
+        dedup_provider: DP,
         trigger_provider: PP,
         state_provider: SP,
         handler: T,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
-        CM: HandlerMiddleware<C::Payload>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
@@ -875,41 +873,33 @@ impl<CM> PipelineMiddlewareStack<CM> {
             &self.telemetry,
         );
 
-        let version: Arc<str> = Arc::from(self.dedup_config.version.as_str());
-        let dedup_middleware = match dedup_provider {
-            Some(provider) => DeduplicationMiddleware::new(
-                self.dedup_config,
-                self.consumer_config.group_id.as_str(),
-                provider,
-            )?,
-            None => None,
-        };
+        let version: Arc<str> = Arc::from(self.common_config.dedup.version.as_str());
 
-        // `.layer(x)` makes `x` the OUTERMOST layer, so the stack runs
-        // outer→inner as:
+        // `build_common_middleware` constructs the whole common block —
+        // including dedup + state_lifecycle — so the pipeline only layers its
+        // mode-specific middleware OUTSIDE it. `.layer(x)` makes `x` the
+        // OUTERMOST layer, so the stack runs outer→inner as:
         //
-        //   retry → state_lifecycle → dedup → message_defer → timer_defer
-        //     → monopolization → common(cancellation → scheduler → timeout
-        //     → telemetry) → handler
+        //   retry → message_defer → timer_defer → monopolization
+        //     → state_lifecycle → dedup → common(cancellation → scheduler
+        //     → timeout → telemetry) → handler
         //
-        // Two ordering consequences are load-bearing:
-        //
-        // * retry OUTSIDE state_lifecycle ⇒ every retry attempt is a fresh dispatch
-        //   through the lifecycle layer, and the retry loop resets the event's session
-        //   between attempts, so a failed attempt's dirty ops never leak into the next.
-        // * state_lifecycle OUTSIDE dedup and the defer middlewares ⇒ duplicates
-        //   short-circuit before anything seals (empty session → no seal), and a
-        //   deferred-message reload reaches the handler as `on_message` while its seals
-        //   record under the *timer* EventRef of the reloading `DeferredMessage`
-        //   trigger — which the commit oracle resolves through the timer-tag
-        //   three-state logic, timer-type-agnostic by design.
-        let provider = self
-            .common_middleware
+        // retry stays OUTSIDE everything so each attempt is a fresh dispatch
+        // that resets the event's session; the defer middlewares sit OUTSIDE
+        // the keyed-state pair so a deferred message's `after_commit` routes
+        // through `state_lifecycle`'s `after_abort` directly.
+        let common_middleware = build_common_middleware::<DP, C::Payload>(
+            &self.common_config,
+            self.consumer_config.stall_threshold,
+            self.telemetry.clone(),
+            Arc::from(self.consumer_config.group_id.as_str()),
+            dedup_provider,
+            self.consumer_config.group_id.as_str(),
+        )?;
+        let provider = common_middleware
             .layer(self.monopolization_middleware)
             .layer(timer_defer_middleware)
             .layer(message_defer_middleware)
-            .layer(dedup_middleware)
-            .layer(StateLifecycleMiddleware)
             .layer(self.retry_middleware)
             .into_provider(handler);
 
@@ -928,23 +918,14 @@ impl<CM> PipelineMiddlewareStack<CM> {
 /// Builds the storage pair, keyed-state inputs, and shared middleware stack
 /// for [`ProsodyConsumer::pipeline_consumer`], enforcing the keyed-state
 /// deduplication gate.
-async fn prepare_pipeline_stack<P: Send + Sync + 'static>(
+async fn prepare_pipeline_stack(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
     pipeline_config: PipelineMiddlewareConfiguration,
     common_config: &CommonMiddlewareConfiguration,
     telemetry: Telemetry,
-) -> Result<
-    (
-        StorePair,
-        KeyedStateInputs,
-        PipelineMiddlewareStack<impl HandlerMiddleware<P>>,
-    ),
-    ConsumerError,
-> {
-    // Create both stores atomically - ensures trigger and defer stores match.
-    // A `cache_capacity` of zero disables deduplication; `StorePair::new`
-    // skips dedup wiring entirely in that case.
+) -> Result<(StorePair, KeyedStateInputs, PipelineMiddlewareStack), ConsumerError> {
+    // Create both stores atomically — ensures trigger and defer stores match.
     let dedup_config = common_config.dedup.clone();
     let stores = StorePair::new(
         trigger_store_config,
@@ -979,28 +960,11 @@ async fn prepare_pipeline_stack<P: Send + Sync + 'static>(
     let keyed_state =
         KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
 
-    // WAL-mode recovery reads message commit state from the deduplication
-    // store; registered state without deduplication would silently roll
-    // back every committed message during recovery.
-    let dedup_enabled = match &stores {
-        StorePair::Memory { dedup_provider, .. } => dedup_provider.is_some(),
-        StorePair::Cassandra { dedup_provider, .. } => dedup_provider.is_some(),
-    };
-    if keyed_state.config.has_registrations() && !dedup_enabled {
-        return Err(KeyedStateInitError::DeduplicationRequired.into());
-    }
-
     let stack = PipelineMiddlewareStack {
         consumer_config: consumer_config.clone(),
         defer_config,
-        dedup_config,
+        common_config: common_config.clone(),
         failure_tracker,
-        common_middleware: build_common_middleware::<P>(
-            common_config,
-            consumer_config.stall_threshold,
-            telemetry.clone(),
-            Arc::from(consumer_config.group_id.as_str()),
-        )?,
         monopolization_middleware,
         retry_middleware: RetryMiddleware::new(retry_config)?,
         heartbeats,
@@ -1010,21 +974,147 @@ async fn prepare_pipeline_stack<P: Send + Sync + 'static>(
     Ok((stores, keyed_state, stack))
 }
 
-fn build_common_middleware<P: Send + Sync + 'static>(
+/// Builds the storage pair, keyed-state inputs, and heartbeat registry for the
+/// convenience constructors ([`ProsodyConsumer::low_latency_consumer`] and
+/// [`ProsodyConsumer::best_effort_consumer`]). These paths expose no keyed-state
+/// registrations and load their state config from the environment, so the
+/// always-on state layer stays inert.
+async fn prepare_convenience_stores(
+    consumer_config: &ConsumerConfiguration,
+    trigger_store_config: &TriggerStoreConfiguration,
+    common_config: &CommonMiddlewareConfiguration,
+) -> Result<(StorePair, KeyedStateInputs, HeartbeatRegistry), ConsumerError> {
+    consumer_config.validate()?;
+    let keyed_state_config = KeyedStateConfiguration::builder()
+        .build()
+        .map_err(KeyedStateInitError::Configuration)?;
+    keyed_state_config.validate()?;
+    let dedup_config = common_config.dedup.clone();
+    let heartbeats = HeartbeatRegistry::new(
+        consumer_config.group_id.clone(),
+        consumer_config.stall_threshold,
+    );
+    let stores = StorePair::new(
+        trigger_store_config,
+        consumer_config.mock,
+        dedup_config.ttl,
+        dedup_config.cache_capacity,
+        keyed_state_config.default_ttl,
+        consumer_config.timer_spans,
+    )
+    .await?;
+    let keyed_state =
+        KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
+    Ok((stores, keyed_state, heartbeats))
+}
+
+/// Builds the common middleware shared by every mode — the single place any
+/// common-middleware component is constructed.
+///
+/// This is the whole cross-mode set: telemetry, timeout, scheduler,
+/// cancellation, and the keyed-state pair **deduplication + `state_lifecycle`**
+/// (the mandatory commit oracle). It runs outer→inner as
+/// `state_lifecycle → dedup → cancellation → scheduler → timeout → telemetry →
+/// handler`. Each mode layers only its *mode-specific* middleware (retry,
+/// monopolization, defer, failure-topic, log) OUTSIDE the returned block.
+///
+/// Because the deduplication middleware needs the per-partition dedup store,
+/// this is called INSIDE the storage `match` arm where the concrete
+/// `dedup_provider` is in hand.
+fn build_common_middleware<DP, P>(
     config: &CommonMiddlewareConfiguration,
     stall_threshold: Duration,
     telemetry: Telemetry,
     source: Arc<str>,
-) -> Result<impl HandlerMiddleware<P>, ConsumerError> {
+    dedup_provider: DP,
+    group_id: &str,
+) -> Result<impl HandlerMiddleware<P>, ConsumerError>
+where
+    DP: DeduplicationStoreProvider,
+    P: Send + Sync + 'static + EventIdentity,
+{
     let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, &telemetry)?;
     let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
     let telemetry_middleware = TelemetryMiddleware::new(telemetry, source);
+    let dedup_middleware =
+        DeduplicationMiddleware::new(config.dedup.clone(), group_id, dedup_provider)?;
 
-    // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
     Ok(telemetry_middleware
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
-        .layer(CancellationMiddleware::new()))
+        .layer(CancellationMiddleware::new())
+        .layer(dedup_middleware)
+        .layer(StateLifecycleMiddleware))
+}
+
+/// Builds the keyed-state provider for a [`StorePair::Memory`] arm: the
+/// in-memory durable store, backend factory, and in-memory message loader,
+/// wrapped in the partition state provider. Shared by every constructor's
+/// memory arm.
+fn memory_state_provider<C: Codec>(
+    keyed_state: &KeyedStateInputs,
+    dedup_provider: MemoryDeduplicationStoreProvider,
+    trigger_provider: &InMemoryTriggerStoreProvider,
+) -> impl PartitionStateProvider<
+    Manager: PartitionStateManager<
+        Session: StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+    >,
+>
+where
+    C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
+{
+    let backend = MemoryStateBackendFactory::new(
+        MemoryDurableValueStore::new(keyed_state.config.default_ttl),
+        dedup_provider,
+        trigger_provider.clone(),
+        keyed_state.group.clone(),
+        keyed_state.timer_slab_size,
+        keyed_state.registry.clone(),
+    );
+    keyed_state.provider(backend, MemoryLoader::<C::Payload>::new())
+}
+
+/// Builds the keyed-state provider for a [`StorePair::Cassandra`] arm: opens
+/// the per-consumer Kafka loader and fjall workspace, mints the backend
+/// factory, and wraps it in the partition state provider. Shared by every
+/// constructor's Cassandra arm.
+fn cassandra_state_provider<C: Codec>(
+    keyed_state: &KeyedStateInputs,
+    consumer_config: &ConsumerConfiguration,
+    heartbeats: &HeartbeatRegistry,
+    dedup_provider: CassandraDeduplicationStoreProvider,
+    trigger_provider: &CassandraTriggerStoreProvider,
+    value_store: CassandraValueStore,
+) -> Result<
+    impl PartitionStateProvider<
+        Manager: PartitionStateManager<
+            Session: StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+        >,
+    >,
+    ConsumerError,
+>
+where
+    C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
+{
+    let loader = KafkaLoader::<C>::for_consumer(consumer_config, heartbeats)
+        .map_err(DeferInitError::from)?;
+    // The fjall workspace root is wiped on restart (Cassandra is
+    // authoritative), so creating the default directory here is safe.
+    fs::create_dir_all(&keyed_state.config.cache_dir)?;
+    let fjall_client = FjallClient::open(&FjallConfiguration {
+        cache_dir: keyed_state.config.cache_dir.clone(),
+    })
+    .map_err(KeyedStateInitError::from)?;
+    let backend = CassandraStateBackendFactory::new(
+        fjall_client,
+        value_store,
+        dedup_provider,
+        trigger_provider.clone(),
+        keyed_state.group.clone(),
+        keyed_state.timer_slab_size,
+        keyed_state.registry.clone(),
+    );
+    Ok(keyed_state.provider(backend, loader))
 }
 
 /// Helper function to initialize a consumer with a trigger store provider.
@@ -1083,42 +1173,26 @@ impl<C: Codec> ProsodyConsumer<C>
 where
     C::Payload: EventType + Clone,
 {
-    /// Creates a new `ProsodyConsumer` with the given configuration and handler
-    /// provider.
+    /// Creates a low-level `ProsodyConsumer` that runs an [`EventHandler`]
+    /// directly, with **no middleware**.
     ///
-    /// This is the standard constructor which is usually wrapped by
-    /// higher-level functions like `pipeline_consumer` or
-    /// `low_latency_consumer`.
+    /// This is the lower of the two consumer layers. It wires the partition
+    /// machinery and an empty keyed-state backend, then dispatches each
+    /// message and timer straight to the handler — no retry, deduplication,
+    /// monopolization, defer, or state-lifecycle middleware runs. The handler
+    /// owns its own commit decisions through the `Uncommitted` types.
     ///
-    /// Keyed state is **always wired**, mode-matched to the storage backend:
-    /// mock/in-memory runs over a memory state store with an in-memory
-    /// loader; Cassandra runs over the fjall+Cassandra state store with a
-    /// `KafkaLoader`. Pass `KeyedStateConfiguration::builder().build()?` for an
-    /// always-on but inert layer (no registered collections), or register
-    /// collections on the builder result before passing it.
-    ///
-    /// # Arguments
-    ///
-    /// * `consumer_config` - The consumer configuration.
-    /// * `trigger_store_config` - The trigger store configuration.
-    /// * `keyed_state_config` - The keyed-state configuration (collections,
-    ///   TTLs, cache dir, recovery delay).
-    /// * `handler_provider` - The message handler provider.
-    ///
-    /// # Returns
-    ///
-    /// A Result containing the new `ProsodyConsumer` instance or a
-    /// `ConsumerError`.
+    /// Because no state-lifecycle middleware runs here, keyed-state
+    /// collections can be neither sealed nor recovered: registering any is
+    /// rejected with [`KeyedStateInitError::StateUnsupported`]. Use a
+    /// high-level constructor ([`Self::pipeline_consumer`],
+    /// [`Self::low_latency_consumer`]) for keyed state and the full middleware
+    /// stack — those take a [`FallibleHandler`].
     ///
     /// # Errors
     ///
-    /// Returns a `ConsumerError` if:
-    /// - The configuration is invalid
-    /// - Keyed-state collections are registered on this dedup-less path (they
-    ///   need the deduplication store for message-event recovery)
-    /// - The hostname cannot be retrieved
-    /// - The Kafka consumer cannot be created
-    /// - The consumer fails to subscribe to the specified topics
+    /// Returns a `ConsumerError` if the configuration is invalid, keyed-state
+    /// collections are registered, or store/consumer creation fails.
     pub async fn new<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
@@ -1131,26 +1205,31 @@ where
         T::Handler: EventHandler<Payload = C::Payload>,
         C::Payload: EventIdentity + Send + Sync + 'static,
     {
-        // Validate the configuration
         consumer_config.validate()?;
         keyed_state_config.validate()?;
+
+        // No state-lifecycle middleware runs on this path, so a registered
+        // collection could never be sealed or recovered. Reject it rather than
+        // silently accept a non-functional registration.
+        if keyed_state_config.has_registrations() {
+            return Err(KeyedStateInitError::StateUnsupported.into());
+        }
 
         let heartbeats = HeartbeatRegistry::new(
             consumer_config.group_id.clone(),
             consumer_config.stall_threshold,
         );
 
-        // Always-on keyed state, mode-matched to the trigger store. This raw
-        // path wires no deduplication middleware, so dedup is disabled
-        // (`cache_capacity = 0`); the gate below rejects registered
-        // collections, which would need the dedup store for message-event
-        // recovery. An empty registry is sound: nothing seals, so the oracle
-        // is never consulted.
+        // Build the empty keyed-state backend the partition machinery requires.
+        // Deduplication is structurally mandatory in the store layer, but with
+        // no dedup/state middleware on this path the dedup store stays inert and
+        // its oracle is never consulted — an empty registry seals nothing — so a
+        // minimal cache capacity is sufficient.
         let stores = StorePair::new(
             trigger_store_config,
             consumer_config.mock,
             Duration::default(),
-            0,
+            1,
             keyed_state_config.default_ttl,
             consumer_config.timer_spans,
         )
@@ -1160,9 +1239,6 @@ where
             consumer_config,
             DEFAULT_IDEMPOTENCE_VERSION,
         )?;
-        if keyed_state.config.has_registrations() {
-            return Err(KeyedStateInitError::DeduplicationRequired.into());
-        }
 
         match stores {
             StorePair::Memory {
@@ -1170,17 +1246,16 @@ where
                 dedup_provider,
                 ..
             } => {
-                let loader = MemoryLoader::<C::Payload>::new();
-                let durable = MemoryDurableValueStore::new(keyed_state.config.default_ttl);
                 let backend = MemoryStateBackendFactory::new(
-                    durable,
+                    MemoryDurableValueStore::new(keyed_state.config.default_ttl),
                     dedup_provider,
                     trigger_provider.clone(),
                     keyed_state.group.clone(),
                     keyed_state.timer_slab_size,
                     keyed_state.registry.clone(),
                 );
-                let state_provider = keyed_state.provider(backend, loader);
+                let state_provider =
+                    keyed_state.provider(backend, MemoryLoader::<C::Payload>::new());
                 initialize_consumer_with_provider::<_, _, _, C>(
                     consumer_config,
                     keyed_state.version.clone(),
@@ -1266,7 +1341,7 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone,
     {
-        let (stores, keyed_state, stack) = prepare_pipeline_stack::<C::Payload>(
+        let (stores, keyed_state, stack) = prepare_pipeline_stack(
             consumer_config,
             trigger_store_config,
             pipeline_config,
@@ -1409,39 +1484,93 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        // This convenience path exposes no keyed-state registrations; the
-        // always-on layer stays inert with an environment-loaded config.
-        let keyed_state_config = KeyedStateConfiguration::builder()
-            .build()
-            .map_err(KeyedStateInitError::Configuration)?;
+        let (stores, keyed_state, heartbeats) =
+            prepare_convenience_stores(consumer_config, trigger_store_config, common_config)
+                .await?;
+        let version = keyed_state.version.clone();
+
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
             failure_topic: topic_config,
         } = low_latency_config;
-        let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
-        let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
-        let common_middleware = build_common_middleware::<C::Payload>(
-            common_config,
-            consumer_config.stall_threshold,
-            telemetry.clone(),
-            Arc::from(consumer_config.group_id.as_str()),
-        )?;
+        let topic_middleware =
+            FailureTopicMiddleware::new(topic_config, consumer_config.group_id.clone(), producer)?;
 
-        let provider = common_middleware
-            .layer(retry_middleware.clone()) // retry the task a fixed number of times
-            .layer(topic_middleware) // write to failure topic
-            .layer(retry_middleware) // retry writing to the failure topic indefinitely
-            .into_provider(handler);
-
-        Self::new(
-            consumer_config,
-            trigger_store_config,
-            keyed_state_config,
-            provider,
-            telemetry,
-        )
-        .await
+        // dedup + state_lifecycle live inside the common block; the
+        // failure-topic/retry chain layers OUTSIDE it, so a routed failure
+        // (which the topic middleware swallows) is never recorded as a commit.
+        // Built per storage arm because the dedup store lives there.
+        match stores {
+            StorePair::Memory {
+                trigger_provider,
+                dedup_provider,
+                ..
+            } => {
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
+                    &trigger_provider,
+                );
+                let provider = build_common_middleware::<_, C::Payload>(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    telemetry.clone(),
+                    Arc::from(consumer_config.group_id.as_str()),
+                    dedup_provider,
+                    consumer_config.group_id.as_str(),
+                )?
+                .layer(retry_middleware.clone()) // retry the task a fixed number of times
+                .layer(topic_middleware) // write to failure topic
+                .layer(retry_middleware) // retry writing to the failure topic indefinitely
+                .into_provider(handler);
+                initialize_consumer_with_provider::<_, _, _, C>(
+                    consumer_config,
+                    version,
+                    provider,
+                    trigger_provider,
+                    state_provider,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+            StorePair::Cassandra {
+                trigger_provider,
+                dedup_provider,
+                value_store,
+                ..
+            } => {
+                let state_provider = cassandra_state_provider::<C>(
+                    &keyed_state,
+                    consumer_config,
+                    &heartbeats,
+                    dedup_provider.clone(),
+                    &trigger_provider,
+                    value_store,
+                )?;
+                let provider = build_common_middleware::<_, C::Payload>(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    telemetry.clone(),
+                    Arc::from(consumer_config.group_id.as_str()),
+                    dedup_provider,
+                    consumer_config.group_id.as_str(),
+                )?
+                .layer(retry_middleware.clone())
+                .layer(topic_middleware)
+                .layer(retry_middleware)
+                .into_provider(handler);
+                initialize_consumer_with_provider::<_, _, _, C>(
+                    consumer_config,
+                    version,
+                    provider,
+                    trigger_provider,
+                    state_provider,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+        }
     }
 
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
@@ -1477,31 +1606,80 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        // This convenience path exposes no keyed-state registrations; the
-        // always-on layer stays inert with an environment-loaded config.
-        let keyed_state_config = KeyedStateConfiguration::builder()
-            .build()
-            .map_err(KeyedStateInitError::Configuration)?;
-        let common_middleware = build_common_middleware::<C::Payload>(
-            common_config,
-            consumer_config.stall_threshold,
-            telemetry.clone(),
-            Arc::from(consumer_config.group_id.as_str()),
-        )?;
+        let (stores, keyed_state, heartbeats) =
+            prepare_convenience_stores(consumer_config, trigger_store_config, common_config)
+                .await?;
+        let version = keyed_state.version.clone();
 
-        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
-        let provider = common_middleware
-            .layer(LogMiddleware::new())
-            .into_provider(handler);
-
-        Self::new(
-            consumer_config,
-            trigger_store_config,
-            keyed_state_config,
-            provider,
-            telemetry,
-        )
-        .await
+        // dedup + state_lifecycle live inside the common block; `log` (which
+        // swallows failures) layers OUTSIDE it. Built per storage arm because
+        // the dedup store lives there.
+        match stores {
+            StorePair::Memory {
+                trigger_provider,
+                dedup_provider,
+                ..
+            } => {
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
+                    &trigger_provider,
+                );
+                let provider = build_common_middleware::<_, C::Payload>(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    telemetry.clone(),
+                    Arc::from(consumer_config.group_id.as_str()),
+                    dedup_provider,
+                    consumer_config.group_id.as_str(),
+                )?
+                .layer(LogMiddleware::new())
+                .into_provider(handler);
+                initialize_consumer_with_provider::<_, _, _, C>(
+                    consumer_config,
+                    version,
+                    provider,
+                    trigger_provider,
+                    state_provider,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+            StorePair::Cassandra {
+                trigger_provider,
+                dedup_provider,
+                value_store,
+                ..
+            } => {
+                let state_provider = cassandra_state_provider::<C>(
+                    &keyed_state,
+                    consumer_config,
+                    &heartbeats,
+                    dedup_provider.clone(),
+                    &trigger_provider,
+                    value_store,
+                )?;
+                let provider = build_common_middleware::<_, C::Payload>(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    telemetry.clone(),
+                    Arc::from(consumer_config.group_id.as_str()),
+                    dedup_provider,
+                    consumer_config.group_id.as_str(),
+                )?
+                .layer(LogMiddleware::new())
+                .into_provider(handler);
+                initialize_consumer_with_provider::<_, _, _, C>(
+                    consumer_config,
+                    version,
+                    provider,
+                    trigger_provider,
+                    state_provider,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+        }
     }
 }
 
@@ -1660,7 +1838,7 @@ where
     C::Payload: Clone + EventType + EventIdentity,
 {
     // Create the consumer context with the message handler and shared state
-    let context = Context::new(
+    let context = new_context(
         &params.config,
         params.handler_provider,
         PartitionProviders {
@@ -1838,15 +2016,15 @@ pub enum KeyedStateInitError {
     #[error("failed to open the keyed-state cache: {0:#}")]
     Cache(#[from] FjallClientError),
 
-    /// Keyed-state collections are registered but deduplication is
-    /// disabled. WAL recovery reads message commit state from the
-    /// deduplication store; without it every committed message would be
-    /// rolled back. Enable deduplication (non-zero `cache_capacity`).
+    /// Keyed-state collections were registered on the low-level
+    /// [`ProsodyConsumer::new`] constructor, which runs no state middleware to
+    /// seal or recover them. Build a high-level consumer (e.g.
+    /// [`ProsodyConsumer::pipeline_consumer`]) to use keyed state.
     #[error(
-        "keyed-state collections are registered but deduplication is disabled; set a non-zero \
-         deduplication cache_capacity"
+        "keyed-state collections require a high-level consumer; the low-level \
+         `new` constructor runs no state middleware"
     )]
-    DeduplicationRequired,
+    StateUnsupported,
 }
 
 impl From<CassandraTriggerStoreError> for ConsumerError {

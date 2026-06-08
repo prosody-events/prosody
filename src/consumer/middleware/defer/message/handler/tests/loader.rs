@@ -4,10 +4,8 @@
 //! based on trace specifications.
 
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::message::loader::{
-    MemoryLoader, MemoryLoaderError, MessageLoader,
-};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::loader::{MemoryLoader, MemoryLoaderError, MessageLoader};
 use crate::{Key, Offset, Partition, Topic};
 use parking_lot::Mutex;
 use serde_json::Value;

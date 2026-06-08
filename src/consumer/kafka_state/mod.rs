@@ -17,7 +17,7 @@
 use crate::codec::Codec;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::message::MessageLoader;
+use crate::loader::MessageLoader;
 use crate::state::descriptor::{CellResolver, ValueDescriptor, ValueStateError};
 use crate::state::session::StateSession;
 use crate::{Offset, Partition, Topic};

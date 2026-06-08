@@ -106,7 +106,7 @@ pub type ProductionOracle<DP, TP> = CommitManager<
 pub struct CassandraStateBackendFactory<DP, TP> {
     client: Arc<FjallClient>,
     backing: CassandraValueStore,
-    dedup: Option<DP>,
+    dedup: DP,
     triggers: TP,
     consumer_group: ConsumerGroup,
     timer_slab_size: CompactDuration,
@@ -116,17 +116,15 @@ pub struct CassandraStateBackendFactory<DP, TP> {
 impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
     /// Creates the factory.
     ///
-    /// `dedup` may be `None` only when no keyed-state collections are
-    /// registered (the consumer wiring enforces this) — message-event
-    /// recovery reads commit state from the deduplication store.
-    /// `registry` must be the same [`Arc<CollectionDefRegistry>`] handed to
-    /// the keyed-state middleware so every recovery path binds identical
-    /// per-collection TTLs.
+    /// Deduplication is mandatory — it is the commit oracle for message-event
+    /// recovery. `registry` must be the same [`Arc<CollectionDefRegistry>`]
+    /// handed to the keyed-state middleware so every recovery path binds
+    /// identical per-collection TTLs.
     #[must_use]
     pub fn new(
         client: Arc<FjallClient>,
         backing: CassandraValueStore,
-        dedup: Option<DP>,
+        dedup: DP,
         triggers: TP,
         consumer_group: ConsumerGroup,
         timer_slab_size: CompactDuration,
@@ -168,7 +166,7 @@ where
         );
         let cache = FjallValueStore::new(workspace.cache_handle().clone());
         let oracle = mint_oracle(
-            self.dedup.as_ref(),
+            &self.dedup,
             &self.triggers,
             &self.consumer_group,
             self.timer_slab_size,
@@ -203,7 +201,7 @@ where
 #[derive(Clone)]
 pub struct MemoryStateBackendFactory<DP, TP> {
     durable: MemoryDurableValueStore,
-    dedup: Option<DP>,
+    dedup: DP,
     triggers: TP,
     consumer_group: ConsumerGroup,
     timer_slab_size: CompactDuration,
@@ -217,7 +215,7 @@ impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
     #[must_use]
     pub fn new(
         durable: MemoryDurableValueStore,
-        dedup: Option<DP>,
+        dedup: DP,
         triggers: TP,
         consumer_group: ConsumerGroup,
         timer_slab_size: CompactDuration,
@@ -255,7 +253,7 @@ where
         partition: Partition,
     ) -> Result<BackendOf<Self>, Self::Error> {
         let oracle = mint_oracle(
-            self.dedup.as_ref(),
+            &self.dedup,
             &self.triggers,
             &self.consumer_group,
             self.timer_slab_size,
@@ -285,7 +283,7 @@ where
 /// formula the partition loop uses — so the oracle reads the exact timer
 /// rows the partition writes.
 fn mint_oracle<DP, TP>(
-    dedup: Option<&DP>,
+    dedup: &DP,
     triggers: &TP,
     consumer_group: &ConsumerGroup,
     timer_slab_size: CompactDuration,
@@ -296,12 +294,12 @@ where
     DP: DeduplicationStoreProvider,
     TP: TriggerStoreProvider,
 {
-    let dedup = dedup.map(|provider| provider.create_store(topic, partition, consumer_group));
+    let dedup = dedup.create_store(topic, partition, consumer_group);
     let triggers = StoreTagSource(triggers.create_store(Segment::for_partition(
         consumer_group,
         topic,
         partition,
         timer_slab_size,
     )));
-    CommitManager::with_optional_dedup(dedup, triggers)
+    CommitManager::new(dedup, triggers)
 }

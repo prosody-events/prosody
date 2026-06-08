@@ -376,22 +376,6 @@ fn dedup_uuid_differs_by_dimension() -> color_eyre::Result<()> {
 }
 
 #[test]
-fn cache_capacity_zero_returns_none() {
-    let config = DeduplicationConfiguration {
-        version: "1".to_owned(),
-        cache_capacity: 0,
-        ttl: Duration::from_hours(1),
-    };
-    let result = DeduplicationMiddleware::<_, serde_json::Value>::new(
-        config,
-        "group",
-        MemoryDeduplicationStoreProvider::new(),
-    );
-    assert!(result.is_ok());
-    assert!(result.as_ref().is_ok_and(Option::is_none));
-}
-
-#[test]
 fn ttl_exceeding_max_rejected() {
     let config = DeduplicationConfiguration {
         version: "1".to_owned(),

@@ -78,7 +78,10 @@ pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
 }
 
 impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
-    /// Creates a new middleware, or `None` if `cache_capacity == 0`.
+    /// Creates a new middleware.
+    ///
+    /// Deduplication is mandatory: it is the commit oracle for keyed state, so
+    /// there is no disabled variant.
     ///
     /// # Errors
     ///
@@ -87,21 +90,17 @@ impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
         config: DeduplicationConfiguration,
         group_id: &str,
         store_provider: S,
-    ) -> Result<Option<Self>, validator::ValidationErrors> {
+    ) -> Result<Self, validator::ValidationErrors> {
         config.validate()?;
 
-        if config.cache_capacity == 0 {
-            return Ok(None);
-        }
-
-        Ok(Some(Self {
+        Ok(Self {
             shared: Arc::new(DeduplicationShared {
                 config,
                 group_id: Arc::from(group_id),
                 store_provider,
             }),
             _payload: PhantomData,
-        }))
+        })
     }
 }
 

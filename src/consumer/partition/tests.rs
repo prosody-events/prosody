@@ -4,10 +4,10 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
-use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::MemoryLoader;
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};

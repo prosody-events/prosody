@@ -110,19 +110,15 @@ where
 
 /// Read-only oracle for commit state of message and timer events.
 ///
-/// The deduplication slot is `Option` so consumers that disable
-/// deduplication can still construct the oracle for an *empty* keyed-state
-/// registry (it is never consulted there — the consumer build rejects
-/// registered state without deduplication). Resolving a message event with
-/// the slot empty fails loudly with
-/// [`CommitManagerError::DeduplicationDisabled`].
+/// Deduplication is mandatory — it is the commit oracle for message events, so
+/// the store is always present.
 #[derive(Clone)]
 pub struct CommitManager<D, TS>
 where
     D: DeduplicationStore,
     TS: TimerTagSource,
 {
-    dedup: Option<D>,
+    dedup: D,
     timers: TS,
 }
 
@@ -132,9 +128,7 @@ where
     TS: TimerTagSource,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CommitManager")
-            .field("dedup_enabled", &self.dedup.is_some())
-            .finish_non_exhaustive()
+        f.debug_struct("CommitManager").finish_non_exhaustive()
     }
 }
 
@@ -145,18 +139,6 @@ where
 {
     /// Creates a new commit manager.
     pub fn new(dedup: D, timers: TS) -> Self {
-        Self {
-            dedup: Some(dedup),
-            timers,
-        }
-    }
-
-    /// Creates a commit manager whose deduplication slot may be empty.
-    ///
-    /// Pass `None` only when no keyed-state collections are registered —
-    /// message-event resolution fails Permanent without a deduplication
-    /// store.
-    pub fn with_optional_dedup(dedup: Option<D>, timers: TS) -> Self {
         Self { dedup, timers }
     }
 
@@ -165,17 +147,12 @@ where
     ///
     /// # Errors
     ///
-    /// Returns `CommitManagerError::Dedup` if the store read fails, or
-    /// `CommitManagerError::DeduplicationDisabled` when the deduplication
-    /// slot is empty.
+    /// Returns `CommitManagerError::Dedup` if the store read fails.
     pub async fn is_message_committed(
         &self,
         dedup_id: Uuid,
     ) -> Result<bool, CommitManagerError<D::Error, TS::Error>> {
-        let Some(dedup) = &self.dedup else {
-            return Err(CommitManagerError::DeduplicationDisabled);
-        };
-        dedup
+        self.dedup
             .exists(dedup_id)
             .await
             .map_err(CommitManagerError::Dedup)
@@ -255,11 +232,6 @@ where
     /// Timer tag read failed.
     #[error("timer store error")]
     Timer(#[source] TE),
-    /// A message event was resolved without a deduplication store. Only
-    /// reachable when WAL-mode keyed state runs with deduplication
-    /// disabled — a configuration the consumer build rejects.
-    #[error("message commit state requires the deduplication middleware")]
-    DeduplicationDisabled,
 }
 
 impl<DE, TE> ClassifyError for CommitManagerError<DE, TE>
@@ -271,8 +243,6 @@ where
         match self {
             // Both halves are storage reads — transient.
             Self::Dedup(_) | Self::Timer(_) => ErrorCategory::Transient,
-            // Configuration error; retrying cannot help.
-            Self::DeduplicationDisabled => ErrorCategory::Permanent,
         }
     }
 }

@@ -26,9 +26,9 @@
 //!    the transaction map, and the sealed set so the next attempt starts clean.
 
 use crate::consumer::event_context::StateAccessError;
-#[cfg(test)]
-use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::partition::ShutdownPhase;
+#[cfg(test)]
+use crate::loader::MemoryLoader;
 use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::value::{
@@ -736,7 +736,7 @@ where
 /// [`MemoryLoader`] purely so the session satisfies the consumer's loader
 /// context bound; no op ever reaches it.
 ///
-/// [`MemoryLoader`]: crate::consumer::middleware::defer::message::loader::MemoryLoader
+/// [`MemoryLoader`]: crate::loader::MemoryLoader
 #[cfg(test)]
 #[derive(Clone)]
 pub struct UnavailableState<P> {

@@ -34,8 +34,8 @@ pub struct DeduplicationConfiguration {
                          DEFAULT_IDEMPOTENCE_VERSION.to_owned())?")]
     pub version: String,
 
-    /// Global shared cache capacity across all partitions. Set to 0 to disable
-    /// the deduplication middleware entirely.
+    /// Global shared cache capacity across all partitions. Deduplication is
+    /// mandatory (the keyed-state commit oracle), so this must be at least 1.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
     /// Default: 8192
@@ -43,6 +43,7 @@ pub struct DeduplicationConfiguration {
         default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", \
                    DEFAULT_IDEMPOTENCE_CACHE_SIZE)?"
     )]
+    #[validate(range(min = 1_usize))]
     pub cache_capacity: usize,
 
     /// Cassandra TTL for deduplication records. Must be at least 1 minute

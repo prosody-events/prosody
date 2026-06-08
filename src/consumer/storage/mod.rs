@@ -179,9 +179,8 @@ pub enum StorePair {
         message_provider: MemoryMessageDeferStoreProvider,
         /// Timer defer store provider (Memory).
         timer_provider: MemoryTimerDeferStoreProvider,
-        /// Deduplication store provider (Memory). `None` when deduplication
-        /// is disabled (cache capacity of zero).
-        dedup_provider: Option<MemoryDeduplicationStoreProvider>,
+        /// Deduplication store provider (Memory) — the mandatory commit oracle.
+        dedup_provider: MemoryDeduplicationStoreProvider,
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
@@ -192,10 +191,9 @@ pub enum StorePair {
         message_provider: CassandraMessageDeferStoreProvider,
         /// Timer defer store provider (Cassandra with resources).
         timer_provider: CassandraTimerDeferStoreProvider,
-        /// Deduplication store provider (Cassandra). `None` when
-        /// deduplication is disabled (cache capacity of zero); in that case
-        /// no `DeduplicationQueries` are prepared against the session.
-        dedup_provider: Option<CassandraDeduplicationStoreProvider>,
+        /// Deduplication store provider (Cassandra) — the mandatory commit
+        /// oracle; `DeduplicationQueries` are always prepared.
+        dedup_provider: CassandraDeduplicationStoreProvider,
         /// Keyed-state Value store sharing the same session.
         value_store: CassandraValueStore,
     },
@@ -253,11 +251,10 @@ impl StorePair {
     ///
     /// * `config` - Trigger store configuration (`InMemory` or `Cassandra`)
     /// * `mock` - If true, uses in-memory storage regardless of config
-    /// * `dedup_ttl` - TTL for deduplication records (only consulted when
-    ///   deduplication is enabled)
-    /// * `dedup_cache_capacity` - Capacity of the deduplication cache. A value
-    ///   of `0` disables deduplication entirely; no `DeduplicationQueries` are
-    ///   prepared and `dedup_provider` is set to `None` on both variants.
+    /// * `dedup_ttl` - TTL for deduplication records
+    /// * `dedup_cache_capacity` - Capacity of the deduplication cache. The
+    ///   config validates `>= 1`; deduplication is always wired (it is the
+    ///   keyed-state commit oracle).
     /// * `timer_spans` - How timer spans relate to their producer span
     ///
     /// # Errors
@@ -292,9 +289,10 @@ impl StorePair {
         keyed_state_ttl: Option<CompactDuration>,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
-        // `NonZeroUsize::new` doubles as the "enabled?" gate: `None` skips all
-        // dedup wiring; `Some(capacity)` carries the validated capacity forward.
-        let dedup_cache_capacity = NonZeroUsize::new(dedup_cache_capacity);
+        // Deduplication is mandatory (the keyed-state commit oracle); the
+        // config validates `cache_capacity >= 1`, so the floor is never hit.
+        let dedup_cache_capacity =
+            NonZeroUsize::new(dedup_cache_capacity).unwrap_or(NonZeroUsize::MIN);
 
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
@@ -302,8 +300,7 @@ impl StorePair {
                 trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
                 timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
-                dedup_provider: dedup_cache_capacity
-                    .map(|_| MemoryDeduplicationStoreProvider::new()),
+                dedup_provider: MemoryDeduplicationStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
@@ -336,29 +333,22 @@ impl StorePair {
                     timer_spans,
                 );
 
-                let dedup_provider = if let Some(capacity) = dedup_cache_capacity {
-                    let dedup_ttl_secs: i32 = dedup_ttl
-                        .as_secs()
-                        .try_into()
-                        .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
-
-                    if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
-                        return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
-                    }
-                    debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
-
-                    let dedup_queries =
-                        Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
-
-                    Some(CassandraDeduplicationStoreProvider::new(
-                        store.clone(),
-                        dedup_queries,
-                        dedup_ttl_secs,
-                        capacity,
-                    ))
-                } else {
-                    None
-                };
+                let dedup_ttl_secs: i32 = dedup_ttl
+                    .as_secs()
+                    .try_into()
+                    .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
+                if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
+                    return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
+                }
+                debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
+                let dedup_queries =
+                    Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
+                let dedup_provider = CassandraDeduplicationStoreProvider::new(
+                    store.clone(),
+                    dedup_queries,
+                    dedup_ttl_secs,
+                    dedup_cache_capacity,
+                );
 
                 validate_keyed_state_ttl(keyed_state_ttl)?;
                 let value_queries = Arc::new(ValueQueries::new(store.session(), keyspace).await?);

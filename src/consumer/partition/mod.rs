@@ -16,11 +16,11 @@
 use crate::consumer::event_context::{EventContext, PartitionEventContext};
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
-use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::{StateSession, TerminationWatch};

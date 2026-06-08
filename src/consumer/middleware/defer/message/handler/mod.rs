@@ -27,7 +27,6 @@
 //! * `NoInner` — inner did not run (queue-append, orphan-timer, loader failure,
 //!   key-mismatch); suppress both hooks.
 
-use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
 use crate::JsonCodec;
 use crate::consumer::event_context::EventContext;
@@ -40,6 +39,7 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
+use crate::loader::{KafkaLoader, MessageLoader};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::TimerEventType;
 use crate::telemetry::partition::TelemetryPartitionSender;
@@ -107,8 +107,8 @@ where
     /// [`KafkaLoader::for_consumer`]) or [`MemoryLoader`] for mock mode,
     /// where connecting to real Kafka is not permitted.
     ///
-    /// [`KafkaLoader::for_consumer`]: super::loader::KafkaLoader::for_consumer
-    /// [`MemoryLoader`]: super::loader::MemoryLoader
+    /// [`KafkaLoader::for_consumer`]: crate::loader::KafkaLoader::for_consumer
+    /// [`MemoryLoader`]: crate::loader::MemoryLoader
     ///
     /// # Errors
     ///

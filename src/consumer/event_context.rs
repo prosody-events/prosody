@@ -11,9 +11,9 @@
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
-use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::loader::MessageLoader;
 use crate::state::descriptor::{StateDescriptor, StructuralIdentity};
 use crate::state::session::StateSession;
 use crate::timers::datetime::CompactDateTime;

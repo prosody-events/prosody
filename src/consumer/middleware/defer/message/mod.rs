@@ -11,13 +11,10 @@
 //! # Modules
 //!
 //! - [`handler`]: Message defer handler and middleware implementation
-//! - [`loader`]: Message loaders for reloading messages from Kafka
 //! - [`store`]: Storage trait and implementations for deferred message offsets
 
 pub mod handler;
-pub mod loader;
 pub mod store;
 
 pub use handler::{MessageDeferHandler, MessageDeferMiddleware, MessageDeferProvider};
-pub use loader::{KafkaLoader, KafkaLoaderError, LoaderConfiguration, MessageLoader};
 pub use store::MessageDeferStore;

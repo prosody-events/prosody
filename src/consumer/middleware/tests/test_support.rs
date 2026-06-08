@@ -14,8 +14,8 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
-use crate::consumer::middleware::defer::message::MessageLoader;
 use crate::consumer::partition::ShutdownPhase;
+use crate::loader::MessageLoader;
 use crate::state::descriptor::StateDescriptor;
 use crate::state::session::{StateSession, UnavailableState};
 use crate::timers::TimerType;

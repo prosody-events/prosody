@@ -7,7 +7,7 @@ use super::*;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::error::DeferError;
-use crate::consumer::middleware::defer::message::loader::KafkaLoaderError;
+use crate::loader::KafkaLoaderError;
 use crate::tracing::init_test_logging;
 use scylla::errors::ExecutionError;
 

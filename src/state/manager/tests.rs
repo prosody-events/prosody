@@ -9,9 +9,9 @@
 //! covered there. All tests are broker-free.
 
 use super::*;
-use crate::consumer::middleware::defer::message::loader::MemoryLoader;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::MemoryLoader;
 use crate::state::SharedStateBackend;
 use crate::state::TimerEventRef;
 use crate::state::descriptor::{ValueDescriptor, value_state};
