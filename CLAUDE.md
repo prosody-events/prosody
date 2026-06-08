@@ -198,6 +198,29 @@ pub struct Configuration {
 - Partition-level parallelism with per-key ordering
 - Cross-key concurrency, capacity-based backpressure
 
+**Middleware composition — memorize this, it is easy to invert:**
+
+`some_mw.layer(x)` adds `x` as the new **OUTERMOST** layer (it builds
+`ComposedMiddleware(outer=x, inner=self)`; `with_provider` nests as
+`outer.with_provider(inner.with_provider(base))`). `into_provider(handler)`
+terminates the chain with the handler as the **INNERMOST** component.
+
+- **Handler is INNERMOST. Retry is OUTERMOST.** Request phase runs
+  OUTER→INNER (retry first, handler last); response phase unwinds INNER→OUTER.
+- The block built by `build_common_middleware`
+  (`telemetry.layer(timeout).layer(scheduler).layer(cancellation)`) is the
+  **innermost** block, directly outside the handler; within it OUTER→INNER is
+  `cancellation → scheduler → timeout → telemetry → handler`.
+- Pipeline stack OUTERMOST→INNERMOST:
+  `retry → state_lifecycle → dedup → message_defer → timer_defer →
+  monopolization → (cancellation → scheduler → timeout → telemetry) → handler`.
+- **Shared/common cross-mode concerns (dedup, state_lifecycle) belong in the
+  OUTER region** — just inside retry, **outside** the mode-specific
+  defer/topic/log middleware. The order is load-bearing: `state_lifecycle`
+  outside `dedup` outside the defer middlewares so a deferred-message reload
+  re-enters through a fresh session and seals under the right `EventRef`;
+  `retry` outside `state_lifecycle` so each attempt resets the session.
+
 **Timer System:** Slab-based time partitioning (TimerManager → Store + Scheduler + SlabLoader)
 
 - Persistent storage via `TriggerStore` trait (Cassandra/Memory)

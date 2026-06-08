@@ -45,15 +45,27 @@ impl DeduplicationStore for MemoryDeduplicationStore {
     }
 }
 
-/// Creates isolated in-memory deduplication stores per partition.
+/// Hands out clones of one shared in-memory deduplication store.
+///
+/// Every `create_store` call returns a clone of the **same** `Arc`-backed
+/// store, so the deduplication middleware (writer) and the keyed-state commit
+/// oracle (reader) observe the same rows for a partition — exactly as the
+/// Cassandra provider does by sharing its session and cache. A fresh store per
+/// call would split-brain the oracle: it would never see the middleware's
+/// inserts and message recovery would silently fail. The dedup UUID encodes
+/// topic/partition, so one shared set across partitions cannot collide.
 #[derive(Clone, Debug, Default)]
-pub struct MemoryDeduplicationStoreProvider;
+pub struct MemoryDeduplicationStoreProvider {
+    store: MemoryDeduplicationStore,
+}
 
 impl MemoryDeduplicationStoreProvider {
-    /// Creates a new provider.
+    /// Creates a new provider backed by one fresh shared store.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            store: MemoryDeduplicationStore::new(),
+        }
     }
 }
 
@@ -66,7 +78,7 @@ impl DeduplicationStoreProvider for MemoryDeduplicationStoreProvider {
         _partition: Partition,
         _consumer_group: &str,
     ) -> Self::Store {
-        MemoryDeduplicationStore::new()
+        self.store.clone()
     }
 }
 
