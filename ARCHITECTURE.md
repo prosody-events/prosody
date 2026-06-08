@@ -71,7 +71,7 @@ sequenceDiagram
 3. The `PartitionManager` enqueues the message in the correct key-based queue within `KeyManager`, according to the
    message key (e.g., User ID, Product ID).
 4. `KeyManager` dispatches messages for each key sequentially through the middleware stack, which applies retry,
-   deduplication, telemetry, timeout, cancellation, and other behaviors before invoking the user-provided `EventHandler`.
+   deduplication, telemetry, timeout, cancellation, and other behaviors before invoking the user-provided `FallibleHandler`.
 5. After processing, the key's offset is recorded in `OffsetTracker`.
 6. The `PartitionManager`'s `OffsetTracker` tracks the partition's high watermark committed offset.
 7. The `Poll Loop` reads watermarks from each `PartitionManager` and stores them with librdkafka, which commits them

@@ -302,9 +302,9 @@ to set the source system. To explicitly set the producer's source system identif
 export PROSODY_SOURCE_SYSTEM="my-service"
 ```
 
-### Idempotence Deduplication (Pipeline Mode)
+### Idempotence Deduplication (All Modes)
 
-The pipeline consumer includes a deduplication middleware that filters duplicate messages using a two-tier cache:
+Every consumer mode includes a deduplication middleware that filters duplicate messages using a two-tier cache:
 
 1. **Global cache**: A shared in-memory cache across all partitions for fast lookups. Survives partition reassignments within the same consumer instance.
 2. **Persistent store**: A Cassandra-backed store that survives restarts and rebalances.
@@ -319,7 +319,7 @@ both tiers.
 - **Cache-busting**: Changing `PROSODY_IDEMPOTENCE_VERSION` invalidates all previously recorded entries, causing
   messages to be reprocessed.
 - **TTL expiry**: Dedup records in Cassandra expire after `PROSODY_IDEMPOTENCE_TTL` (default: 7 days).
-- **Disabling**: Set `PROSODY_IDEMPOTENCE_CACHE_SIZE` to `0` to disable the middleware entirely.
+- **Always on**: Deduplication cannot be disabled; `PROSODY_IDEMPOTENCE_CACHE_SIZE` must be at least 1.
 
 The producer also maintains a separate local deduplication cache to avoid sending duplicate messages. It hashes the
 `(topic, key, id)` triple into a 128-bit key and stores it in a bounded in-memory set. Messages without an `id` field

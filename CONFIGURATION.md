@@ -63,11 +63,11 @@ When a handler fails, retry with exponential backoff:
 | `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
 | `PROSODY_DEFER_DISCARD_THRESHOLD` | Read optimization (rarely needs changing)         | 100     |
 
-## Deduplication (Pipeline Mode)
+## Deduplication (All Modes)
 
 | Environment Variable             | Description                                         | Default |
 |----------------------------------|-----------------------------------------------------|---------|
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Global shared cache capacity (0 to disable)         | 8192    |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Global shared cache capacity (must be at least 1)   | 8192    |
 | `PROSODY_IDEMPOTENCE_VERSION`    | Version string for cache-busting dedup hashes       | 1       |
 | `PROSODY_IDEMPOTENCE_TTL`        | TTL for dedup records in Cassandra                  | 7d      |
 
