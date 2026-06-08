@@ -47,7 +47,6 @@ use super::MessageLoader;
 use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
@@ -77,7 +76,10 @@ use tracing::{Span, debug, error, instrument, warn};
 use crate::Codec;
 use crate::otel::SpanRelation;
 use crate::related_span;
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
+use derive_builder::Builder;
 use tokio::select;
+use validator::Validate;
 use whoami::hostname;
 
 #[cfg(test)]
@@ -175,6 +177,116 @@ pub struct LoaderConfiguration {
 
     /// Span relation for loaded message spans.
     pub message_spans: SpanRelation,
+}
+
+impl LoaderConfiguration {
+    /// Assembles the internal loader configuration from the consumer-wide
+    /// settings.
+    ///
+    /// The connection and concurrency fields come from
+    /// [`ConsumerConfiguration`]; the loader-specific tuning
+    /// (`cache_size`, `seek_timeout`, `discard_threshold`) comes from its
+    /// [`KafkaLoaderConfiguration`]. A `{group_id}.defer-loader` group keeps the
+    /// loader out of the primary consumer's group coordination.
+    #[must_use]
+    fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
+        Self {
+            bootstrap_servers: consumer_config.bootstrap_servers.clone(),
+            group_id: format!("{}.defer-loader", consumer_config.group_id),
+            max_permits: consumer_config.max_uncommitted,
+            cache_size: consumer_config.loader.cache_size,
+            poll_interval: consumer_config.poll_interval,
+            seek_timeout: consumer_config.loader.seek_timeout,
+            discard_threshold: consumer_config.loader.discard_threshold,
+            message_spans: consumer_config.message_spans,
+        }
+    }
+}
+
+/// User-facing tuning for the Kafka message loader, carried on
+/// [`ConsumerConfiguration`].
+///
+/// Holds only the loader-specific knobs; connection and concurrency settings
+/// are shared with the primary consumer and read from
+/// [`ConsumerConfiguration`] directly when the loader is assembled. Built from
+/// the environment like every other configuration — no hand-written literal on
+/// any production path.
+#[derive(Builder, Clone, Debug, Validate)]
+#[builder(build_fn(private, name = "build_internal"))]
+pub struct KafkaLoaderConfiguration {
+    /// Maximum number of decoded messages to cache.
+    ///
+    /// The cache uses S3-FIFO eviction, which quickly evicts "one-hit wonders"
+    /// while keeping frequently accessed items.
+    ///
+    /// Environment variable: `PROSODY_LOADER_CACHE_SIZE`
+    /// Default: 1,024 entries
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_LOADER_CACHE_SIZE\", 1_024)?",
+        setter(into)
+    )]
+    #[validate(range(min = 1_usize))]
+    pub cache_size: usize,
+
+    /// Timeout for Kafka seek operations.
+    ///
+    /// Environment variable: `PROSODY_LOADER_SEEK_TIMEOUT`
+    /// Default: 30 seconds
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_LOADER_SEEK_TIMEOUT\", \
+                   Duration::from_secs(30))?",
+        setter(into)
+    )]
+    pub seek_timeout: Duration,
+
+    /// Number of messages to read sequentially before seeking.
+    ///
+    /// If the next requested offset is within this threshold, the loader
+    /// continues reading and discards intermediate messages rather than
+    /// performing an expensive seek.
+    ///
+    /// Environment variable: `PROSODY_LOADER_DISCARD_THRESHOLD`
+    /// Default: 100
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_LOADER_DISCARD_THRESHOLD\", 100)?",
+        setter(into)
+    )]
+    #[validate(range(min = 0_i64))]
+    pub discard_threshold: i64,
+}
+
+impl KafkaLoaderConfiguration {
+    /// Creates a new configuration builder.
+    #[must_use]
+    pub fn builder() -> KafkaLoaderConfigurationBuilder {
+        KafkaLoaderConfigurationBuilder::default()
+    }
+}
+
+impl KafkaLoaderConfigurationBuilder {
+    /// Builds the configuration and validates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a field is missing or a validation constraint is
+    /// violated.
+    pub fn build(&self) -> Result<KafkaLoaderConfiguration, KafkaLoaderConfigError> {
+        let config = self.build_internal()?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// Error building or validating a [`KafkaLoaderConfiguration`].
+#[derive(Debug, Error)]
+pub enum KafkaLoaderConfigError {
+    /// A required field was missing during building.
+    #[error("loader configuration build error: {0:#}")]
+    Build(#[from] KafkaLoaderConfigurationBuilderError),
+
+    /// A validation constraint was violated.
+    #[error("loader configuration validation error: {0:#}")]
+    Validation(#[from] validator::ValidationErrors),
 }
 
 /// Cache mapping `(topic, partition, offset)` to a decoded message — keyed
@@ -310,20 +422,12 @@ where
     /// Returns an error if the underlying `BaseConsumer` cannot be created.
     pub fn for_consumer(
         consumer_config: &ConsumerConfiguration,
-        defer_config: &DeferConfiguration,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, KafkaLoaderError> {
-        let loader_config = LoaderConfiguration {
-            bootstrap_servers: consumer_config.bootstrap_servers.clone(),
-            group_id: format!("{}.defer-loader", consumer_config.group_id),
-            max_permits: consumer_config.max_uncommitted,
-            cache_size: defer_config.cache_size,
-            poll_interval: consumer_config.poll_interval,
-            seek_timeout: defer_config.seek_timeout,
-            discard_threshold: defer_config.discard_threshold,
-            message_spans: consumer_config.message_spans,
-        };
-        Self::new(loader_config, heartbeats)
+        Self::new(
+            LoaderConfiguration::for_consumer(consumer_config),
+            heartbeats,
+        )
     }
 
     /// Loads a specific message from Kafka by offset.

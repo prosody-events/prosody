@@ -82,24 +82,8 @@ pub struct DeferConfiguration {
     )]
     pub failure_window: Duration,
 
-    /// Cache size for the Kafka message loader cache.
-    ///
-    /// Caches decoded Kafka messages to avoid redundant reads when retrying
-    /// deferred messages. Cassandra store caches are controlled separately via
-    /// `store_cache_size` / `PROSODY_DEFER_STORE_CACHE_SIZE`.
-    ///
-    /// Environment variable: `PROSODY_DEFER_CACHE_SIZE`
-    /// Default: 1,024 entries
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_DEFER_CACHE_SIZE\", 1_024)?",
-        setter(into)
-    )]
-    #[validate(range(min = 1_usize))]
-    pub cache_size: usize,
-
     /// Cache size for the per-partition Cassandra defer store cache.
     ///
-    /// Separate from `cache_size` (which tunes the Kafka message loader cache).
     /// Controls the `(key → Option<(next_offset, retry_count)>)` cache inside
     /// each `CassandraMessageDeferStore` / `CassandraTimerDeferStore`. Larger
     /// values reduce `read_next_static` round-trips for wide-fan-out workloads
@@ -113,32 +97,6 @@ pub struct DeferConfiguration {
     )]
     #[validate(range(min = 1_usize))]
     pub store_cache_size: usize,
-
-    /// Timeout for Kafka seek operations in the message loader.
-    ///
-    /// Environment variable: `PROSODY_DEFER_SEEK_TIMEOUT`
-    /// Default: 30 seconds
-    #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_DEFER_SEEK_TIMEOUT\", \
-                   Duration::from_secs(30))?",
-        setter(into)
-    )]
-    pub seek_timeout: Duration,
-
-    /// Number of messages to read sequentially before seeking.
-    ///
-    /// If the next requested offset is within this threshold, the loader
-    /// continues reading and discards intermediate messages rather than
-    /// performing an expensive seek operation.
-    ///
-    /// Environment variable: `PROSODY_DEFER_DISCARD_THRESHOLD`
-    /// Default: 100
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_DEFER_DISCARD_THRESHOLD\", 100)?",
-        setter(into)
-    )]
-    #[validate(range(min = 0_i64))]
-    pub discard_threshold: i64,
 }
 
 impl DeferConfiguration {
@@ -213,7 +171,7 @@ mod tests {
             .max_delay(Duration::from_hours(1))
             .failure_threshold(0.8_f64)
             .failure_window(Duration::from_mins(10))
-            .cache_size(5_000_usize)
+            .store_cache_size(5_000_usize)
             .build();
 
         assert!(config.is_ok());
@@ -248,8 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_size_zero_fails() {
-        let result = DeferConfiguration::builder().cache_size(0_usize).build();
+    fn test_store_cache_size_zero_fails() {
+        let result = DeferConfiguration::builder()
+            .store_cache_size(0_usize)
+            .build();
 
         assert!(result.is_err());
     }

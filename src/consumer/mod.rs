@@ -142,7 +142,7 @@ use crate::consumer::middleware::deduplication::{
     DeduplicationStoreProvider,
 };
 use crate::consumer::middleware::defer::message::loader::{
-    KafkaLoader, LoaderConfiguration, MemoryLoader, MessageLoader,
+    KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader,
 };
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
@@ -619,6 +619,16 @@ pub struct ConsumerConfiguration {
         default = "from_env_with_fallback(\"PROSODY_TIMER_SPANS\", SpanRelation::FollowsFrom)?"
     )]
     pub timer_spans: SpanRelation,
+
+    /// Tuning for the Kafka message loader (deferred-retry reload and
+    /// keyed-state message resolution).
+    ///
+    /// The loader is consumer-wide and shares this struct's connection and
+    /// concurrency settings; only its own knobs live here. Env-loaded like the
+    /// rest of the configuration (`PROSODY_LOADER_*`).
+    #[builder(default = "KafkaLoaderConfiguration::builder().build().map_err(|e| e.to_string())?")]
+    #[validate(nested)]
+    pub loader: KafkaLoaderConfiguration,
 }
 
 impl ConsumerConfiguration {
@@ -1183,25 +1193,8 @@ where
                 value_store,
                 ..
             } => {
-                // TEMP bridge (Phase 2 removes this): the loader's tuning still
-                // lives on `DeferConfiguration` until it is split into a
-                // top-level `KafkaLoaderConfiguration` on `ConsumerConfiguration`.
-                // Built inline here with the same defaults so the raw path does
-                // not need a `DeferConfiguration`.
-                let loader = KafkaLoader::<C>::new(
-                    LoaderConfiguration {
-                        bootstrap_servers: consumer_config.bootstrap_servers.clone(),
-                        group_id: format!("{}.defer-loader", consumer_config.group_id),
-                        max_permits: consumer_config.max_uncommitted,
-                        cache_size: 1_024,
-                        poll_interval: consumer_config.poll_interval,
-                        seek_timeout: Duration::from_secs(30),
-                        discard_threshold: 100,
-                        message_spans: consumer_config.message_spans,
-                    },
-                    &heartbeats,
-                )
-                .map_err(DeferInitError::from)?;
+                let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
+                    .map_err(DeferInitError::from)?;
                 // The fjall workspace root is wiped on restart (Cassandra is
                 // authoritative), so creating the default directory here is safe.
                 fs::create_dir_all(&keyed_state.config.cache_dir)?;
@@ -1323,12 +1316,14 @@ where
                 dedup_provider,
                 value_store,
             } => {
-                let loader = KafkaLoader::<C>::for_consumer(
-                    &stack.consumer_config,
-                    &stack.defer_config,
-                    &stack.heartbeats,
-                )
-                .map_err(DeferInitError::from)?;
+                // One Kafka loader per consumer: built once here and shared by
+                // cloning. A clone shares the channel, semaphore, cache, and the
+                // single background poll thread — so the message-defer middleware
+                // and the keyed-state provider resolve through the same loader,
+                // never two `BaseConsumer`s.
+                let loader =
+                    KafkaLoader::<C>::for_consumer(&stack.consumer_config, &stack.heartbeats)
+                        .map_err(DeferInitError::from)?;
                 // The fjall workspace root is wiped on restart (Cassandra is
                 // authoritative), so creating the default directory here is
                 // safe; mounted production paths already exist.

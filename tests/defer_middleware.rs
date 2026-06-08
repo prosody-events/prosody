@@ -284,8 +284,7 @@ impl DeferTestEnvironment {
             &telemetry,
             &heartbeats,
         );
-        let loader =
-            KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
+        let loader = KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &heartbeats)?;
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
@@ -377,8 +376,7 @@ impl DeferTestEnvironment {
             &telemetry,
             &heartbeats,
         );
-        let loader =
-            KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
+        let loader = KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &heartbeats)?;
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,

@@ -22,13 +22,18 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// [`Self::state`]:
 ///
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use prosody::consumer::KeyedStateConfiguration;
 /// use prosody::state::descriptor::{ValueDescriptor, value_state};
 /// use prosody::state::registry::CollectionDef;
 ///
 /// const CART: ValueDescriptor = value_state("cart");
 ///
-/// let keyed_state = KeyedStateConfiguration::default().state(&CART, CollectionDef::new(None));
+/// let keyed_state = KeyedStateConfiguration::builder()
+///     .build()?
+///     .state(&CART, CollectionDef::new(None));
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {

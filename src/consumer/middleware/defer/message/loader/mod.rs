@@ -31,7 +31,10 @@ use std::future::Future;
 mod kafka;
 mod memory;
 
-pub use kafka::{KafkaLoader, KafkaLoaderError, LoaderConfiguration};
+pub use kafka::{
+    KafkaLoader, KafkaLoaderConfigError, KafkaLoaderConfiguration, KafkaLoaderError,
+    LoaderConfiguration,
+};
 pub use memory::{MemoryLoader, MemoryLoaderError};
 
 /// Loads messages by their exact offset coordinates for retry.
