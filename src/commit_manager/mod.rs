@@ -223,7 +223,7 @@ where
 #[derive(Debug, Error)]
 pub enum CommitManagerError<DE, TE>
 where
-    DE: Error + Send + Sync + 'static,
+    DE: ClassifyError + Error + Send + Sync + 'static,
     TE: ClassifyError + Error + Send + Sync + 'static,
 {
     /// Deduplication store read failed.
@@ -236,13 +236,17 @@ where
 
 impl<DE, TE> ClassifyError for CommitManagerError<DE, TE>
 where
-    DE: Error + Send + Sync + 'static,
+    DE: ClassifyError + Error + Send + Sync + 'static,
     TE: ClassifyError + Error + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
+        // Delegate to the underlying store's own classification. Most oracle
+        // read failures are transient storage errors and retry, but a store
+        // that reports a `Permanent` error (e.g. an unparseable row) is taken
+        // at its word rather than masked as transient.
         match self {
-            // Both halves are storage reads — transient.
-            Self::Dedup(_) | Self::Timer(_) => ErrorCategory::Transient,
+            Self::Dedup(e) => e.classify_error(),
+            Self::Timer(e) => e.classify_error(),
         }
     }
 }

@@ -3,6 +3,7 @@
 //! Abstracts over storage backends for checking and recording processed message
 //! identifiers.
 
+use crate::error::ClassifyError;
 use crate::{Partition, Topic};
 use std::error::Error;
 use std::future::Future;
@@ -15,7 +16,13 @@ use uuid::Uuid;
 /// failures gracefully.
 pub trait DeduplicationStore: Clone + Send + Sync + 'static {
     /// Error type for store operations.
-    type Error: Error + Send + Sync + 'static;
+    ///
+    /// Bounded [`ClassifyError`] (mirroring [`TriggerStore::Error`]) so the
+    /// commit oracle can delegate its classification to the underlying store
+    /// rather than flattening every read failure to a single category.
+    ///
+    /// [`TriggerStore::Error`]: crate::timers::store::TriggerStore::Error
+    type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Checks whether a deduplication identifier has already been recorded.
     fn exists(&self, id: Uuid) -> impl Future<Output = Result<bool, Self::Error>> + Send;
