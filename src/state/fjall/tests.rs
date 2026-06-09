@@ -818,9 +818,9 @@ use crate::state::fjall::FjallConfiguration;
 use crate::timers::datetime::CompactDateTime;
 
 fn make_client(dir: &TempDir) -> Result<Arc<FjallClient>> {
-    let config = FjallConfiguration::builder()
-        .cache_dir(dir.path().to_path_buf())
-        .build()?;
+    let config = FjallConfiguration {
+        cache_dir: dir.path().to_path_buf(),
+    };
     Ok(FjallClient::open(&config)?)
 }
 

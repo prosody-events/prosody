@@ -132,3 +132,23 @@ fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::KeyedStateConfiguration;
+    use color_eyre::eyre::Result;
+    use std::path::PathBuf;
+    use validator::Validate;
+
+    #[test]
+    fn empty_cache_dir_is_rejected() -> Result<()> {
+        let config = KeyedStateConfiguration::builder()
+            .cache_dir(PathBuf::new())
+            .build()?;
+        assert!(
+            config.validate().is_err(),
+            "empty cache_dir must fail validation"
+        );
+        Ok(())
+    }
+}
