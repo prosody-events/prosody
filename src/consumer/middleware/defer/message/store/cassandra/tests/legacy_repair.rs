@@ -1,29 +1,4 @@
 use super::*;
-use crate::cassandra::{CassandraConfiguration, CassandraStore};
-use crate::{ConsumerGroup, Partition, Topic};
-
-async fn build_store() -> color_eyre::Result<CassandraMessageDeferStore> {
-    let config = CassandraConfiguration::builder()
-        .nodes(vec!["localhost:9042".to_owned()])
-        .keyspace("prosody_test".to_owned())
-        .build()
-        .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
-    let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-    let segment = LazySegment::new(
-        segment_store,
-        Topic::from("test-topic"),
-        Partition::from(0_i32),
-        Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
-    );
-    Ok(CassandraMessageDeferStore::new(
-        cassandra_store,
-        queries,
-        segment,
-        1_024,
-    ))
-}
 
 /// Build a fresh store and seed a unique key into the pre-migration
 /// (legacy) shape: `clustering` offsets with `next_offset = NULL` and the

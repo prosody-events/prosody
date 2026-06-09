@@ -1,23 +1,13 @@
 use super::*;
-use chrono::Utc;
 
 /// Density of the tombstone band — chosen to mimic the post-FIFO
 /// graveyard observed in production (~5k cells per partition).
 const TOMBSTONE_COUNT: u32 = 5_000;
 
-fn key() -> Key {
-    Arc::from(format!("tombstone-timer-{}", uuid::Uuid::new_v4()))
-}
-
-fn future_time(offset_secs: u32) -> CompactDateTime {
-    let now = u32::try_from(Utc::now().timestamp()).unwrap_or(u32::MAX);
-    CompactDateTime::from(now.saturating_add(offset_secs))
-}
-
 #[tokio::test]
 async fn test_get_next_skips_low_time_tombstones() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("tombstone-timer");
     let segment_id = store
         .segment_id()
         .await

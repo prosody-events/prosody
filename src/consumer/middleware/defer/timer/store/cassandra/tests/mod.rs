@@ -6,6 +6,20 @@ mod ttl_drift;
 use super::*;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::{ConsumerGroup, Partition, Topic};
+use chrono::Utc;
+
+/// A unique, prefix-tagged key. The prefix tags which test seeded a row in
+/// the shared `prosody_test` keyspace; the uuid suffix keeps runs isolated.
+fn key(prefix: &str) -> Key {
+    Arc::from(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+}
+
+/// A `CompactDateTime` `offset_secs` in the future, saturating on the
+/// `i64`→`u32` epoch conversion rather than wrapping.
+fn future_time(offset_secs: u32) -> CompactDateTime {
+    let now = u32::try_from(Utc::now().timestamp()).unwrap_or(u32::MAX);
+    CompactDateTime::from(now.saturating_add(offset_secs))
+}
 
 pub(super) async fn build_test_store() -> color_eyre::Result<CassandraTimerDeferStore> {
     let config = CassandraConfiguration::builder()

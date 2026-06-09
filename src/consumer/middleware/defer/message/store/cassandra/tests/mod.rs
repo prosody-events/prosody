@@ -11,13 +11,12 @@ use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::defer_store_tests;
 use crate::{ConsumerGroup, Partition, Topic};
 
-defer_store_tests!(async {
+pub(super) async fn build_store() -> color_eyre::Result<CassandraMessageDeferStore> {
     let config = CassandraConfiguration::builder()
         .nodes(vec!["localhost:9042".to_owned()])
         .keyspace("prosody_test".to_owned())
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
-
     let cassandra_store = CassandraStore::new(&config).await?;
     let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
     let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
@@ -27,6 +26,12 @@ defer_store_tests!(async {
         Partition::from(0_i32),
         Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
     );
-    let defer_store = CassandraMessageDeferStore::new(cassandra_store, queries, segment, 1_024);
-    Ok::<_, color_eyre::Report>(defer_store)
-});
+    Ok(CassandraMessageDeferStore::new(
+        cassandra_store,
+        queries,
+        segment,
+        1_024,
+    ))
+}
+
+defer_store_tests!(async { build_store().await });

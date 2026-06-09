@@ -1,6 +1,5 @@
 use super::*;
 use crate::cassandra::TABLE_DEFERRED_TIMERS;
-use chrono::Utc;
 
 /// Tolerance for the gap between our local clock reading of `target` and
 /// the wall-clock the cluster used when it bound the TTL: request latency
@@ -8,15 +7,6 @@ use chrono::Utc;
 /// purpose — every test below uses a multi-hour lead, so the assertion
 /// still rejects a `base_ttl()` regression with room to spare.
 const CLOCK_SKEW_SECS: i32 = 60;
-
-fn key(prefix: &str) -> Key {
-    Arc::from(format!("{prefix}-{}", uuid::Uuid::new_v4()))
-}
-
-fn future_time(offset_secs: u32) -> CompactDateTime {
-    let now = u32::try_from(Utc::now().timestamp()).unwrap_or(u32::MAX);
-    CompactDateTime::from(now.saturating_add(offset_secs))
-}
 
 fn trigger(key: &Key, time: CompactDateTime) -> Trigger {
     Trigger::new(

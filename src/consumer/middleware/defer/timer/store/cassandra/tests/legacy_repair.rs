@@ -1,14 +1,4 @@
 use super::*;
-use chrono::Utc;
-
-fn key() -> Key {
-    Arc::from(format!("legacy-timer-{}", uuid::Uuid::new_v4()))
-}
-
-fn future_time(offset_secs: u32) -> CompactDateTime {
-    let now = Utc::now().timestamp() as u32;
-    CompactDateTime::from(now.saturating_add(offset_secs))
-}
 
 /// Asserts the persisted static `next_timer` anchor for `k` has the
 /// expected time (or is absent). `None` covers the unrepaired/empty case.
@@ -25,7 +15,7 @@ async fn assert_next_timer(
 #[tokio::test]
 async fn test_legacy_get_next_repairs() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(60);
     store.seed_legacy_for_test(&k, &[t], Some(2)).await?;
 
@@ -41,7 +31,7 @@ async fn test_legacy_get_next_repairs() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_is_deferred_repairs() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(90);
     store.seed_legacy_for_test(&k, &[t], Some(1)).await?;
 
@@ -55,7 +45,7 @@ async fn test_legacy_is_deferred_repairs() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_defer_first_on_legacy_partition() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let low = future_time(30);
     let high = future_time(120);
     store.seed_legacy_for_test(&k, &[low], Some(3)).await?;
@@ -75,7 +65,7 @@ async fn test_legacy_defer_first_on_legacy_partition() -> color_eyre::Result<()>
 #[tokio::test]
 async fn test_legacy_append_on_legacy_partition() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let seeded = future_time(120);
     let earlier = future_time(10);
     store.seed_legacy_for_test(&k, &[seeded], Some(0)).await?;
@@ -95,7 +85,7 @@ async fn test_legacy_append_on_legacy_partition() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_complete_retry_at_min() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let low = future_time(30);
     let high = future_time(90);
     store
@@ -116,7 +106,7 @@ async fn test_legacy_complete_retry_at_min() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_complete_retry_above_min() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let low = future_time(30);
     let high = future_time(90);
     store
@@ -137,7 +127,7 @@ async fn test_legacy_complete_retry_above_min() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_orphan_retry_count_only() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     store.seed_legacy_for_test(&k, &[], Some(4)).await?;
 
     let got = store.get_next_deferred_timer(&k).await?;
@@ -150,7 +140,7 @@ async fn test_legacy_orphan_retry_count_only() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_timer_span_preserved_on_repair() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(45);
 
     // Seed a clustering row with a distinct span map via the normal
@@ -203,7 +193,7 @@ async fn test_legacy_timer_span_preserved_on_repair() -> color_eyre::Result<()> 
 #[tokio::test]
 async fn test_legacy_repair_idempotent() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(60);
     store.seed_legacy_for_test(&k, &[t], Some(5)).await?;
 
@@ -224,7 +214,7 @@ async fn test_legacy_repair_idempotent() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_remove_at_min() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let low = future_time(30);
     let high = future_time(90);
     store
@@ -240,7 +230,7 @@ async fn test_legacy_remove_at_min() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_remove_above_min() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let low = future_time(30);
     let high = future_time(90);
     store
@@ -258,7 +248,7 @@ async fn test_legacy_remove_above_min() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_delete_key_wipes_partition() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(45);
     store.seed_legacy_for_test(&k, &[t], Some(3)).await?;
 
@@ -275,7 +265,7 @@ async fn test_legacy_delete_key_wipes_partition() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_legacy_set_retry_count_triggers_repair() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(60);
     store.seed_legacy_for_test(&k, &[t], Some(2)).await?;
 
@@ -299,7 +289,7 @@ async fn test_legacy_set_retry_count_triggers_repair() -> color_eyre::Result<()>
 #[tokio::test]
 async fn test_legacy_none_none_returns_none_without_repair() -> color_eyre::Result<()> {
     let store = build_test_store().await?;
-    let k = key();
+    let k = key("legacy-timer");
     let t = future_time(60);
     // Seed clustering row but no static retry_count — produces the
     // (next_timer=NULL, retry_count=NULL) state the plan deliberately
