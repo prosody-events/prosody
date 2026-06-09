@@ -199,48 +199,6 @@ pub enum StorePair {
     },
 }
 
-/// Errors that can occur during store pair creation.
-#[derive(Debug, Error)]
-pub enum StoreCreationError {
-    /// Failed to create trigger store.
-    #[error("failed to create trigger store: {0:#}")]
-    TriggerStore(Box<CassandraTriggerStoreError>),
-
-    /// Failed to create defer store queries.
-    #[error("failed to create defer store queries: {0:#}")]
-    DeferStore(Box<CassandraStoreError>),
-
-    /// Failed to create segment store.
-    #[error("failed to create segment store: {0:#}")]
-    SegmentStore(Box<CassandraSegmentStoreError>),
-
-    /// Deduplication TTL exceeds Cassandra's maximum.
-    #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
-    DeduplicationTtl(u64),
-
-    /// Keyed-state default TTL exceeds Cassandra's maximum.
-    #[error("keyed-state default TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
-    KeyedStateTtl(u64),
-}
-
-impl From<CassandraTriggerStoreError> for StoreCreationError {
-    fn from(e: CassandraTriggerStoreError) -> Self {
-        Self::TriggerStore(Box::new(e))
-    }
-}
-
-impl From<CassandraStoreError> for StoreCreationError {
-    fn from(e: CassandraStoreError) -> Self {
-        Self::DeferStore(Box::new(e))
-    }
-}
-
-impl From<CassandraSegmentStoreError> for StoreCreationError {
-    fn from(e: CassandraSegmentStoreError) -> Self {
-        Self::SegmentStore(Box::new(e))
-    }
-}
-
 impl StorePair {
     /// Creates both trigger and defer store providers atomically.
     ///
@@ -381,6 +339,48 @@ fn validate_keyed_state_ttl(ttl: Option<CompactDuration>) -> Result<(), StoreCre
         }
     }
     Ok(())
+}
+
+/// Errors that can occur during store pair creation.
+#[derive(Debug, Error)]
+pub enum StoreCreationError {
+    /// Failed to create trigger store.
+    #[error("failed to create trigger store: {0:#}")]
+    TriggerStore(Box<CassandraTriggerStoreError>),
+
+    /// Failed to create defer store queries.
+    #[error("failed to create defer store queries: {0:#}")]
+    DeferStore(Box<CassandraStoreError>),
+
+    /// Failed to create segment store.
+    #[error("failed to create segment store: {0:#}")]
+    SegmentStore(Box<CassandraSegmentStoreError>),
+
+    /// Deduplication TTL exceeds Cassandra's maximum.
+    #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
+    DeduplicationTtl(u64),
+
+    /// Keyed-state default TTL exceeds Cassandra's maximum.
+    #[error("keyed-state default TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
+    KeyedStateTtl(u64),
+}
+
+impl From<CassandraTriggerStoreError> for StoreCreationError {
+    fn from(e: CassandraTriggerStoreError) -> Self {
+        Self::TriggerStore(Box::new(e))
+    }
+}
+
+impl From<CassandraStoreError> for StoreCreationError {
+    fn from(e: CassandraStoreError) -> Self {
+        Self::DeferStore(Box::new(e))
+    }
+}
+
+impl From<CassandraSegmentStoreError> for StoreCreationError {
+    fn from(e: CassandraSegmentStoreError) -> Self {
+        Self::SegmentStore(Box::new(e))
+    }
 }
 
 #[cfg(test)]
