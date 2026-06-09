@@ -86,12 +86,10 @@ impl Arbitrary for MigrationTestInput {
             // Generate random time using arbitrary
             let time = CompactDateTime::arbitrary(g);
 
-            // Generate random timer type
-            let timer_type = match u8::arbitrary(g) % 3 {
-                0 => TimerType::Application,
-                1 => TimerType::DeferredMessage,
-                _ => TimerType::DeferredTimer,
-            };
+            // Generate random timer type, drawing from every persisted variant
+            // (V2/V3 preserve it; V1 collapses to Application in the model).
+            let timer_type =
+                TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
 
             triggers.push(MigrationTriggerData {
                 key,

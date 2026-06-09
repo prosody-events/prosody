@@ -42,6 +42,7 @@ use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::result::Result as StdResult;
 use std::time::Duration as StdDuration;
+use strum::VariantArray;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::time::{Instant, advance};
 use tracing::Span;
@@ -201,11 +202,7 @@ impl TriggerSpec {
 }
 
 fn timer_type_from_idx(idx: u8) -> TimerType {
-    match idx % 3 {
-        0 => TimerType::Application,
-        1 => TimerType::DeferredMessage,
-        _ => TimerType::DeferredTimer,
-    }
+    TimerType::VARIANTS[usize::from(idx) % TimerType::VARIANTS.len()]
 }
 
 impl Arbitrary for TriggerSpec {
@@ -777,18 +774,14 @@ fn expected_watermark_after_cleanup_for_test(
 /// given `now_slab`. Used to drive an exhaustive per-triple check after
 /// every op without needing to iterate `ActiveTriggers`' internal map.
 fn build_universe(now_slab: SlabId) -> Vec<(Key, CompactDateTime, TimerType)> {
-    let mut out = Vec::with_capacity(usize::from(PROP_KEYS) * 11 * 3);
+    let mut out = Vec::with_capacity(usize::from(PROP_KEYS) * 11 * TimerType::VARIANTS.len());
     for key_idx in 0..PROP_KEYS {
         for offset in -PROP_PAST_SLABS..=PROP_FUTURE_SLABS {
             let signed = i64::from(now_slab) + i64::from(offset);
             let slab_id: SlabId = signed.max(0).try_into().unwrap_or(0);
             let time = CompactDateTime::from(slab_id.saturating_mul(SLAB_SIZE_SECS));
-            for ty_idx in 0_u8..3 {
-                out.push((
-                    Key::from(format!("k{key_idx}")),
-                    time,
-                    timer_type_from_idx(ty_idx),
-                ));
+            for &timer_type in TimerType::VARIANTS {
+                out.push((Key::from(format!("k{key_idx}")), time, timer_type));
             }
         }
     }

@@ -1,5 +1,6 @@
 pub(crate) mod dirty_value_suite;
 mod encoding;
+mod identity;
 pub(crate) mod value_suite;
 
 use self::dirty_value_suite::DirtyTrace;

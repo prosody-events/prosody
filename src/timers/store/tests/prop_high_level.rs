@@ -16,6 +16,7 @@ use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
+use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -146,13 +147,9 @@ fn random_key(g: &mut Gen) -> Key {
     format!("key-{}", u8::arbitrary(g) % 5).into()
 }
 
-/// Generates a random timer type.
+/// Generates a random timer type, drawing from every persisted variant.
 fn random_timer_type(g: &mut Gen) -> TimerType {
-    match u8::arbitrary(g) % 3 {
-        0 => TimerType::Application,
-        1 => TimerType::DeferredMessage,
-        _ => TimerType::DeferredTimer,
-    }
+    TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()]
 }
 
 fn model_tag_for_trigger(

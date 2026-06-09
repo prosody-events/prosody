@@ -2,8 +2,8 @@ use super::{
     collection_prefix, decode_cell, dirty_collection_key, encode_absent_cell, encode_present_cell,
 };
 use crate::Key;
-use crate::state::tests::value_suite::bytes;
 use crate::state::{CollectionId, EventScopeId, Read, StateKey, StateName, StateType, ValueKind};
+use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
@@ -28,12 +28,24 @@ fn absent_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// Any payload round-trips through `encode_present_cell` → `decode_cell` as
+/// `Read::Present` with identical bytes — the cache codec is lossless over the
+/// whole byte space, including the empty payload a `Set` of empty bytes
+/// produces, not just one fixed example.
 #[test]
-fn present_round_trip() -> Result<()> {
-    let payload = bytes(7);
-    let cell = encode_present_cell(&payload)?;
-    assert_eq!(decode_cell(Some(cell.as_ref()))?, Read::Present(payload));
-    Ok(())
+fn present_round_trip() {
+    fn prop(payload: Vec<u8>) -> TestResult {
+        let payload = Bytes::from(payload);
+        let Ok(cell) = encode_present_cell(&payload) else {
+            return TestResult::failed();
+        };
+        match decode_cell(Some(cell.as_ref())) {
+            Ok(Read::Present(decoded)) => TestResult::from_bool(decoded == payload),
+            _ => TestResult::failed(),
+        }
+    }
+
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
 #[test]

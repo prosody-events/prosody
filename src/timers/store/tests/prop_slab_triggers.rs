@@ -85,11 +85,8 @@ impl Arbitrary for SlabTriggerTestInput {
             let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
             let key = Key::from(key_pool[key_idx]);
 
-            let timer_type = match u8::arbitrary(g) % 3 {
-                0 => TimerType::Application,
-                1 => TimerType::DeferredMessage,
-                _ => TimerType::DeferredTimer,
-            };
+            let timer_type =
+                TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
 
             let time = CompactDateTime::arbitrary(g);
 
