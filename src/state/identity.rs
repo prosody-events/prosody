@@ -23,7 +23,7 @@ use thiserror::Error;
 /// The wire discriminator persisted beside durable identity is the `i8` the
 /// [`From`]/[`TryFrom`] pair round-trips through, so the on-wire encoding
 /// cannot drift from the type it encodes.
-#[repr(u8)]
+#[repr(i8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollectionKindId {
     /// A single optional byte payload.
@@ -38,7 +38,7 @@ pub enum CollectionKindId {
 
 impl From<CollectionKindId> for i8 {
     fn from(id: CollectionKindId) -> Self {
-        id as u8 as i8
+        id as i8
     }
 }
 

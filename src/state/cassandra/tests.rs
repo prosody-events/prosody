@@ -15,7 +15,7 @@ use crate::state::memory::MemoryDirtyValueStore;
 use crate::state::pending::PendingIndexStore;
 use crate::state::tests::value_suite::{self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref};
 use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
-use crate::state::{CollectionId, DurableState, EventRef, StateType, ValueKind};
+use crate::state::{CollectionId, DurableState, EventRef, ValueKind};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use crate::tracing::init_test_logging;
@@ -229,9 +229,7 @@ async fn corrupt_partition_returns_corrupt_wal() -> Result<()> {
     };
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
-    let state_type = match id.state_type() {
-        StateType::Application => 0_i8,
-    };
+    let state_type = id.state_type();
     let name = id.name().as_str();
     let cql = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} SET wal_event = ? WHERE segment_id = ? \
@@ -283,9 +281,7 @@ async fn corrupt_event_ref_udt_classifies_permanent() -> Result<()> {
     };
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
-    let state_type = match id.state_type() {
-        StateType::Application => 0_i8,
-    };
+    let state_type = id.state_type();
     let name = id.name().as_str();
     let cql = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} SET wal_event = ?, wal_ops = ?, \
@@ -340,9 +336,7 @@ async fn read_identity_version_raw(
 ) -> Result<Option<i32>> {
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
-    let state_type = match id.state_type() {
-        StateType::Application => 0_i8,
-    };
+    let state_type = id.state_type();
     let name = id.name().as_str();
     let cql = format!(
         "SELECT identity_version FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id \

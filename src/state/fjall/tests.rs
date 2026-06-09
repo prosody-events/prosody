@@ -37,6 +37,7 @@ use color_eyre::eyre::{self, Result};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::convert::Infallible;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -927,7 +928,7 @@ where
 struct AlwaysCommittedOracle;
 
 impl CommitOracle for AlwaysCommittedOracle {
-    type Error = AlwaysCommittedOracleError;
+    type Error = Infallible;
 
     async fn resolve<'a>(
         &'a self,
@@ -935,15 +936,6 @@ impl CommitOracle for AlwaysCommittedOracle {
         _event: EventRef,
     ) -> Result<CommitDecision, Self::Error> {
         Ok(CommitDecision::Committed)
-    }
-}
-
-#[derive(Debug, Error)]
-enum AlwaysCommittedOracleError {}
-
-impl ClassifyError for AlwaysCommittedOracleError {
-    fn classify_error(&self) -> ErrorCategory {
-        match *self {}
     }
 }
 
