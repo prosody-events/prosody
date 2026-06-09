@@ -160,20 +160,14 @@ impl Borrow<str> for StateName {
 
 /// Fully qualified typed collection identity.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct CollectionId<K>
-where
-    K: CollectionKind,
-{
+pub struct CollectionId<K> {
     state_key: StateKey,
     state_type: StateType,
     name: StateName,
     _kind: PhantomData<K>,
 }
 
-impl<K> CollectionId<K>
-where
-    K: CollectionKind,
-{
+impl<K> CollectionId<K> {
     /// Creates a collection identity for the type-level kind `K`.
     #[must_use]
     pub fn new(state_key: StateKey, state_type: StateType, name: StateName) -> Self {
@@ -205,7 +199,10 @@ where
 
     /// Returns the runtime collection kind discriminator.
     #[must_use]
-    pub fn kind(&self) -> CollectionKindId {
+    pub fn kind(&self) -> CollectionKindId
+    where
+        K: CollectionKind,
+    {
         K::ID
     }
 }
@@ -240,18 +237,12 @@ where
 /// `Hash`/`Eq` impls are hand-rolled (not derived) to keep a future change
 /// to the struct from silently folding `ttl` into equality.
 #[derive(Clone, Debug)]
-pub struct CollectionRef<K>
-where
-    K: CollectionKind,
-{
+pub struct CollectionRef<K> {
     id: CollectionId<K>,
     ttl: Option<CompactDuration>,
 }
 
-impl<K> CollectionRef<K>
-where
-    K: CollectionKind,
-{
+impl<K> CollectionRef<K> {
     /// Creates a typed collection reference. Pass `Some(ttl)` to bind a
     /// TTL on every write; pass `None` for indefinite retention or the
     /// Cassandra over-20-year overflow fallback. The TTL choice is
@@ -276,18 +267,18 @@ where
 
 impl<K> PartialEq for CollectionRef<K>
 where
-    K: CollectionKind + PartialEq,
+    K: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl<K> Eq for CollectionRef<K> where K: CollectionKind + Eq {}
+impl<K> Eq for CollectionRef<K> where K: Eq {}
 
 impl<K> Hash for CollectionRef<K>
 where
-    K: CollectionKind + Hash,
+    K: Hash,
 {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);

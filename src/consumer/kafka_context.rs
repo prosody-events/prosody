@@ -80,8 +80,8 @@ impl<PL, F> MakeManager<PL> for F where
 ///
 /// # Type Parameters
 ///
-/// * `F` - The partition-manager factory closure
-///   (`Fn(Topic, Partition) -> PartitionManager<PL>`)
+/// * `F` - The partition-manager factory closure (`Fn(Topic, Partition) ->
+///   PartitionManager<PL>`)
 /// * `PL` - The payload type carried by consumed messages
 pub struct Context<F, PL> {
     /// Builds a fresh partition manager for a newly assigned partition.

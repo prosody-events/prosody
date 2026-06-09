@@ -103,7 +103,8 @@ impl<T> DurableValueBundle for T where
 /// the lifecycle methods.
 pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
-    /// interprets it; a [`CellResolver`](crate::state::descriptor::CellResolver)
+    /// interprets it; a
+    /// [`CellResolver`](crate::state::descriptor::CellResolver)
     /// living *outside* `src/state` reads it from the session at resolve time
     /// (the consumer pins it to its message loader). Kept fully opaque here so
     /// nothing in `src/state` couples to how cells are resolved.

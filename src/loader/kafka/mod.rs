@@ -186,8 +186,8 @@ impl LoaderConfiguration {
     /// The connection and concurrency fields come from
     /// [`ConsumerConfiguration`]; the loader-specific tuning
     /// (`cache_size`, `seek_timeout`, `discard_threshold`) comes from its
-    /// [`KafkaLoaderConfiguration`]. A `{group_id}.defer-loader` group keeps the
-    /// loader out of the primary consumer's group coordination.
+    /// [`KafkaLoaderConfiguration`]. A `{group_id}.defer-loader` group keeps
+    /// the loader out of the primary consumer's group coordination.
     #[must_use]
     fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
         Self {

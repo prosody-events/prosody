@@ -17,10 +17,10 @@
 //!   through one composer keeps the layer from being silently dropped.
 //! * [`ProductionOracle`] names the commit oracle ([`CommitManager`]) that
 //!   answers "did this event commit?" while recovery replays sealed WALs.
-//! * [`CassandraStateBackendFactory`] and [`MemoryStateBackendFactory`] are
-//!   the per-partition [`StateBackendFactory`] implementations for the
-//!   Cassandra and in-memory backends; each mints the oracle and assembles the
-//!   durable bundle for one partition.
+//! * [`CassandraStateBackendFactory`] and [`MemoryStateBackendFactory`] are the
+//!   per-partition [`StateBackendFactory`] implementations for the Cassandra
+//!   and in-memory backends; each mints the oracle and assembles the durable
+//!   bundle for one partition.
 //!
 //! See the [design summary][summary] for the full canonical composition:
 //! `Layered<FjallValueStore, Recovering<CassandraValueStore,

@@ -22,11 +22,11 @@
 //!
 //! A [`ValueDescriptor`] is generic over two orthogonal strategies:
 //!
-//! * a [`Codec`] (`bytes ↔ Stored`, synchronous) — the codec **is** the
-//!   typing of the stored cell. The default is [`JsonCodec`] (cells are
-//!   [`serde_json::Value`]s, exactly like the default message payload). A
-//!   typed cell means writing a `CartCodec: Codec<Payload = Cart>` — one
-//!   codec, one layer of encoding.
+//! * a [`Codec`] (`bytes ↔ Stored`, synchronous) — the codec **is** the typing
+//!   of the stored cell. The default is [`JsonCodec`] (cells are
+//!   [`serde_json::Value`]s, exactly like the default message payload). A typed
+//!   cell means writing a `CartCodec: Codec<Payload = Cart>` — one codec, one
+//!   layer of encoding.
 //! * a [`CellResolver`] (`Stored → value`, asynchronous) — maps the decoded
 //!   cell into what `get()` returns and what `set()` takes. The default is
 //!   [`Passthrough`]: the resolved value *is* the stored value.
@@ -246,8 +246,8 @@ where
     S: StateSession,
     T: Send + 'static,
 {
-    type Stored = T;
     type Resolved = T;
+    type Stored = T;
     type Write<'a> = T;
 
     async fn resolve(_session: &S, stored: T) -> Result<T, StateAccessError> {

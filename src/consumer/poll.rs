@@ -45,9 +45,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///
 /// # Type Parameters
 ///
-/// * `Ctx` - The Kafka [`ConsumerContext`] the [`BaseConsumer`] runs under.
-///   The poller only calls `Consumer`-trait methods on it, so it stays
-///   agnostic to the provider generics baked into the context.
+/// * `Ctx` - The Kafka [`ConsumerContext`] the [`BaseConsumer`] runs under. The
+///   poller only calls `Consumer`-trait methods on it, so it stays agnostic to
+///   the provider generics baked into the context.
 /// * `C` - A type implementing [`Codec`] for deserializing message payloads.
 pub struct PollConfig<'a, Ctx, C>
 where

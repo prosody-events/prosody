@@ -35,7 +35,7 @@
 //! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::middleware::CloneProvider;
 //! use prosody::consumer::{
-//!     ConsumerConfiguration, DemandType, EventHandler, KeyedStateConfiguration, Keyed,
+//!     ConsumerConfiguration, DemandType, EventHandler, Keyed, KeyedStateConfiguration,
 //!     ProsodyConsumer, Uncommitted,
 //! };
 //! use prosody::high_level::config::TriggerStoreConfiguration;
@@ -897,9 +897,9 @@ impl PipelineMiddlewareStack {
 ///
 /// Validates `consumer_config` and `keyed_state_config` up front, before
 /// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The
-/// canonical `consumer_config.validate()` in [`initialize_consumer_with_provider`]
-/// remains the single invariant chokepoint; this early validation is the
-/// fail-fast guard.
+/// canonical `consumer_config.validate()` in
+/// [`initialize_consumer_with_provider`] remains the single invariant
+/// chokepoint; this early validation is the fail-fast guard.
 async fn build_shared_state(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
@@ -1940,8 +1940,8 @@ pub enum KeyedStateInitError {
     /// seal or recover them. Build a high-level consumer (e.g.
     /// [`ProsodyConsumer::pipeline_consumer`]) to use keyed state.
     #[error(
-        "keyed-state collections require a high-level consumer; the low-level \
-         `new` constructor runs no state middleware"
+        "keyed-state collections require a high-level consumer; the low-level `new` constructor \
+         runs no state middleware"
     )]
     StateUnsupported,
 }

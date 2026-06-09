@@ -9,7 +9,6 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::fmt;
 use std::future::Future;
 use thiserror::Error;
 
@@ -487,9 +486,8 @@ impl<D, S> ValueStore for TransactionValueStore<D, S>
 where
     D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
         + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug,
-    S: ValueStore + PendingOpSource<ValueKind, Error = <S as ValueStore>::Error> + fmt::Debug,
+        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>,
+    S: ValueStore + PendingOpSource<ValueKind, Error = <S as ValueStore>::Error>,
 {
     type Error = TxError<S, D>;
 
@@ -563,8 +561,8 @@ where
 #[derive(Debug, Error)]
 pub enum TransactionValueStoreError<DirtyError, DurableError>
 where
-    DirtyError: ClassifyError + Error + Send + Sync + 'static,
-    DurableError: ClassifyError + Error + Send + Sync + 'static,
+    DirtyError: Error + 'static,
+    DurableError: Error + 'static,
 {
     /// Dirty local store failed.
     #[error("dirty value store failed")]

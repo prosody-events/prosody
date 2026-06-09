@@ -113,11 +113,7 @@ where
 /// Deduplication is mandatory — it is the commit oracle for message events, so
 /// the store is always present.
 #[derive(Clone)]
-pub struct CommitManager<D, TS>
-where
-    D: DeduplicationStore,
-    TS: TimerTagSource,
-{
+pub struct CommitManager<D, TS> {
     dedup: D,
     timers: TS,
 }
@@ -223,8 +219,8 @@ where
 #[derive(Debug, Error)]
 pub enum CommitManagerError<DE, TE>
 where
-    DE: ClassifyError + Error + Send + Sync + 'static,
-    TE: ClassifyError + Error + Send + Sync + 'static,
+    DE: Error + 'static,
+    TE: Error + 'static,
 {
     /// Deduplication store read failed.
     #[error("deduplication store error")]

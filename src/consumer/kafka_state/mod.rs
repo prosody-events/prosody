@@ -94,8 +94,8 @@ impl<S> CellResolver<S> for KafkaResolver
 where
     S: StateSession<Loader: MessageLoader>,
 {
-    type Stored = KafkaMessageRef;
     type Resolved = ConsumerMessage<<S::Loader as MessageLoader>::Payload>;
+    type Stored = KafkaMessageRef;
     type Write<'a> = &'a ConsumerMessage<<S::Loader as MessageLoader>::Payload>;
 
     async fn resolve(
