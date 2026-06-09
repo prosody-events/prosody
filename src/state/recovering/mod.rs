@@ -123,7 +123,7 @@ impl CollectionTtl for Arc<CollectionDefRegistry> {
 /// A Value store whose [`ValueStore`] and [`DurableWalStore`] error types
 /// coincide — the single constraint shared verbatim by the wrapper's
 /// [`ValueStore`] and [`DurableWalStore`] impls. Mirrors
-/// [`DurableValueBundle`](super::middleware::DurableValueBundle) but omits
+/// [`DurableValueBundle`](super::session::DurableValueBundle) but omits
 /// the direct-apply / `Clone` / `Debug` requirements those two impls do not
 /// need, keeping the bound local to what recovery reads require. The
 /// [`DirectApplyStore`] impl adds [`DirectApplyStore`] on top.
@@ -344,17 +344,11 @@ where
     }
 }
 
-/// Pending-index pass-through.
+/// Descriptor-identity pass-through.
 ///
-/// The wrapper owns no pending index of its own; recovery resolves the
-/// inner store's sealed WALs, and the pending rows that index them live in
-/// `inner`. Delegating keeps `Self::Error` equal to the wrapper's
-/// [`DurableWalStore`] error so `Layered<Cache, Recovering<Backing>>`
-/// satisfies the middleware's
-/// `PendingIndexStore<Error = DurableWalStore::Error>` bound.
-/// Descriptor-identity pass-through: identity validation happens before
-/// any state op, so recovery never participates — delegate to `inner` and
-/// lift its error into the wrapper's error type.
+/// Identity validation happens before any state op, so recovery never
+/// participates: delegate to `inner` and lift its error into the wrapper's
+/// error type.
 impl<Inner, Oracle, R> DescriptorIdentityStore for RecoveringValueStore<Inner, Oracle, R>
 where
     Inner: RecoverableValueStore
@@ -387,6 +381,14 @@ where
     }
 }
 
+/// Pending-index pass-through.
+///
+/// The wrapper owns no pending index of its own; recovery resolves the
+/// inner store's sealed WALs, and the pending rows that index them live in
+/// `inner`. Delegating keeps `Self::Error` equal to the wrapper's
+/// [`DurableWalStore`] error so `Layered<Cache, Recovering<Backing>>`
+/// satisfies the middleware's
+/// `PendingIndexStore<Error = DurableWalStore::Error>` bound.
 impl<Inner, Oracle, R> PendingIndexStore for RecoveringValueStore<Inner, Oracle, R>
 where
     Inner: RecoverableValueStore

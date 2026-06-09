@@ -274,11 +274,12 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 }
 
 /// N5: re-registering the same name with a *different* structural identity
-/// is rejected, whichever field differs (cell kind, codec id, schema label).
+/// (codec id or schema label) is rejected.
 #[test]
 fn conflicting_registration_is_rejected() -> Result<()> {
-    // Different cell kind + codec id: a Kafka descriptor under a name
-    // registered as a JSON value.
+    // The two descriptors share the cell kind (there is only one) but carry
+    // different codec ids: a Kafka descriptor under a name already registered
+    // as a JSON value.
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&CART, CollectionDef::new(None))?;
     let conflict = registry.register(&kafka_message_state("cart"), CollectionDef::new(None));

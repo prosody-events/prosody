@@ -99,7 +99,7 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
-        /// Common middleware configuration (scheduler, timeout).
+        /// Common middleware configuration (scheduler, timeout, dedup).
         common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
@@ -108,7 +108,7 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
-        /// Common middleware configuration (scheduler, timeout).
+        /// Common middleware configuration (scheduler, timeout, dedup).
         common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,

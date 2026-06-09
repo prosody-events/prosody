@@ -5,9 +5,9 @@
 //! types in [`crate::state::cassandra`], [`crate::state::fjall`],
 //! [`crate::state::layered`], and [`crate::state::recovering`].
 //!
-//! Three exports, two of them a pair:
+//! It provides five items:
 //!
-//! * [`ProductionValueDurable`] names the canonical durable bundle shape,
+//! * [`ProductionValueDurable`] names the canonical durable-bundle shape,
 //!   `Layered<FjallValueStore, Recovering<CassandraValueStore, O>>`. The
 //!   `Recovering` layer is baked into the alias, so the production bundle
 //!   cannot even be *named* without it.
@@ -15,13 +15,19 @@
 //!   The `Recovering` layer is load-bearing for crash safety — omitting it
 //!   reopens the lost-commit data-loss window — so funneling construction
 //!   through one composer keeps the layer from being silently dropped.
+//! * [`ProductionOracle`] names the commit oracle ([`CommitManager`]) that
+//!   answers "did this event commit?" while recovery replays sealed WALs.
+//! * [`CassandraStateBackendFactory`] and [`MemoryStateBackendFactory`] are
+//!   the per-partition [`StateBackendFactory`] implementations for the
+//!   Cassandra and in-memory backends; each mints the oracle and assembles the
+//!   durable bundle for one partition.
 //!
 //! See the [design summary][summary] for the full canonical composition:
 //! `Layered<FjallValueStore, Recovering<CassandraValueStore,
 //! CommitManager>>` as the Value durable bundle,
 //! `CassandraValueStore` as the [`PendingIndexScanner`],
 //! `CommitManager` as the [`CommitOracle`], and
-//! `FjallDirtyValueStoreFactory` as the dirty-store factory.
+//! `FjallDirtyValueStoreProvider` as the dirty-store factory.
 //!
 //! [summary]: ../../docs/keyed-state/design-summary.md
 //! [`PendingIndexScanner`]: super::pending::PendingIndexScanner

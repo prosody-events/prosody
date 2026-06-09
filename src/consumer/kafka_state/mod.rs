@@ -77,8 +77,8 @@ impl Codec for KafkaRefCodec {
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        // The codec is a ZST with no reusable buffers, but the trait still
-        // routes through a thread-local so dispatch stays static.
+        // The codec is a zero-sized type with no reusable buffers, so there
+        // is nothing to cache: hand `f` a fresh instance.
         f(&mut Self)
     }
 }
