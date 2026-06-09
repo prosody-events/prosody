@@ -8,9 +8,11 @@
 //! The cache is shared across all partitions so it survives partition
 //! reassignments without cold-start penalties.
 //!
-//! The middleware sits just inside the retry layer on the pipeline consumer.
-//! It is optional — setting `cache_capacity = 0` disables it via the
-//! [`Option<M>`](crate::consumer::middleware::optional) pattern.
+//! The middleware lives in the common block (built by
+//! `build_common_middleware`), just outside `cancellation` and inside
+//! `state_lifecycle` — so `state_lifecycle` seals only after dedup has decided
+//! whether the inner ran. Deduplication is mandatory; there is no disabled
+//! variant.
 //!
 //! # Apply hooks
 //!

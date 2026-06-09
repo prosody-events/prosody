@@ -859,9 +859,14 @@ impl PipelineMiddlewareStack {
         //     → timeout → telemetry) → handler
         //
         // retry stays OUTSIDE everything so each attempt is a fresh dispatch
-        // that resets the event's session; the defer middlewares sit OUTSIDE
-        // the keyed-state pair so a deferred message's `after_commit` routes
-        // through `state_lifecycle`'s `after_abort` directly.
+        // that resets the event's session. The defer middlewares sit OUTSIDE
+        // the keyed-state pair: `state_lifecycle` seals only on an inner `Ok`,
+        // so a deferred (transient-error) dispatch seals nothing, and only an
+        // outer defer middleware can route that committed defer marker through
+        // `state_lifecycle`'s `after_abort` instead of `after_commit`.
+        // `monopolization` is state-agnostic, so its position is immaterial.
+        // See the Middleware-composition section of CLAUDE.md for the full
+        // correctness argument.
         let common_middleware = build_common_middleware::<DP, C::Payload>(
             &self.common_config,
             &self.consumer_config,

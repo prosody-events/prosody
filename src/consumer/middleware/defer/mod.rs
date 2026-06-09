@@ -92,10 +92,13 @@ pub fn calculate_backoff(config: &DeferConfiguration, retry_count: u32) -> Compa
 ///
 /// When a transient inner error is absorbed into an `Ok(Deferred…)`
 /// output, the durability marker for this dispatch commits — but the
-/// failed attempt's dirty state ops must not seal under it. Resetting the
-/// session here means the lifecycle middleware (outside the defer layers)
-/// finalizes an empty session and seals nothing; the deferred retry
-/// re-runs the handler from clean state.
+/// failed attempt's dirty state ops must not seal under it. The lifecycle
+/// middleware is INNER of the defer layers and seals only on an inner `Ok`,
+/// so it already sealed nothing on this error; resetting the session here
+/// also discards the failed attempt's in-memory dirty ops, so the deferred
+/// retry re-runs the handler from clean state. (The defer layer additionally
+/// routes the `Deferred` outcome to the inner `after_abort`, so anything that
+/// *had* sealed would roll back rather than apply.)
 pub(crate) fn reset_state_session<C>(context: &C)
 where
     C: EventContext,

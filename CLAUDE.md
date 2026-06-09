@@ -208,18 +208,35 @@ terminates the chain with the handler as the **INNERMOST** component.
 - **Handler is INNERMOST. Retry is OUTERMOST.** Request phase runs
   OUTER→INNER (retry first, handler last); response phase unwinds INNER→OUTER.
 - The block built by `build_common_middleware`
-  (`telemetry.layer(timeout).layer(scheduler).layer(cancellation)`) is the
-  **innermost** block, directly outside the handler; within it OUTER→INNER is
-  `cancellation → scheduler → timeout → telemetry → handler`.
+  (`telemetry.layer(timeout).layer(scheduler).layer(cancellation).layer(dedup).layer(state_lifecycle)`)
+  is the **innermost** block, directly outside the handler. It carries every
+  cross-mode concern — including the keyed-state pair `dedup` + `state_lifecycle`
+  — so modes layer only their mode-specific middleware OUTSIDE it. Within the
+  block OUTER→INNER is
+  `state_lifecycle → dedup → cancellation → scheduler → timeout → telemetry → handler`.
 - Pipeline stack OUTERMOST→INNERMOST:
-  `retry → state_lifecycle → dedup → message_defer → timer_defer →
-  monopolization → (cancellation → scheduler → timeout → telemetry) → handler`.
-- **Shared/common cross-mode concerns (dedup, state_lifecycle) belong in the
-  OUTER region** — just inside retry, **outside** the mode-specific
-  defer/topic/log middleware. The order is load-bearing: `state_lifecycle`
-  outside `dedup` outside the defer middlewares so a deferred-message reload
-  re-enters through a fresh session and seals under the right `EventRef`;
-  `retry` outside `state_lifecycle` so each attempt resets the session.
+  `retry → message_defer → timer_defer → monopolization → state_lifecycle →
+  dedup → (cancellation → scheduler → timeout → telemetry) → handler`.
+- **The keyed-state pair (`state_lifecycle` outside `dedup`) lives in the common
+  block, just outside `cancellation` and INSIDE the defer/monopolization
+  middlewares.** Three facts make this order correct for the deferred-message
+  reload path (and nothing else is order-sensitive — `monopolization` never
+  touches the session):
+  - `state_lifecycle` **seals only on an inner `Ok`**; a transient handler
+    error propagates through it unsealed.
+  - On a defer-swallow, the defer middleware both `reset()`s the session
+    (so `finalize` would seal nothing anyway) **and** routes the `Deferred`
+    outcome to the inner `after_abort` — so even a sealed session is rolled
+    back, not applied, when the defer marker commits. This belt-and-suspenders
+    is *why* the defer middlewares sit OUTSIDE the pair: only an outer
+    middleware can translate "defer marker committed, logical message aborted"
+    into `after_abort` for the state layer.
+  - `state_lifecycle` stays **outside `dedup`** so a duplicate short-circuits
+    with an empty session (nothing seals), and a deferred-message reload
+    re-dispatches `on_message` through `state_lifecycle` and seals under the
+    reloading `DeferredMessage` timer's `EventRef`.
+  `retry` stays OUTERMOST so each attempt is a fresh dispatch that resets the
+  session between attempts.
 
 **Timer System:** Slab-based time partitioning (TimerManager → Store + Scheduler + SlabLoader)
 
