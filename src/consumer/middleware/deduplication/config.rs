@@ -1,6 +1,7 @@
 //! Deduplication middleware configuration.
 
 use derive_builder::Builder;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use validator::{Validate, ValidationError};
 
@@ -20,6 +21,16 @@ pub const IDEMPOTENCE_VERSION_ENV: &str = "PROSODY_IDEMPOTENCE_VERSION";
 /// unset.
 pub const DEFAULT_IDEMPOTENCE_VERSION: &str = "1";
 
+/// Default dedup cache capacity as a non-zero value, derived from the shared
+/// [`DEFAULT_IDEMPOTENCE_CACHE_SIZE`]. Deduplication is mandatory (the
+/// keyed-state commit oracle), so — unlike the producer cache — it cannot be
+/// disabled by setting the capacity to zero.
+const DEFAULT_DEDUP_CACHE_CAPACITY: NonZeroUsize =
+    match NonZeroUsize::new(DEFAULT_IDEMPOTENCE_CACHE_SIZE) {
+        Some(capacity) => capacity,
+        None => NonZeroUsize::MIN,
+    };
+
 /// Configuration for the deduplication middleware.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct DeduplicationConfiguration {
@@ -35,16 +46,18 @@ pub struct DeduplicationConfiguration {
     pub version: String,
 
     /// Global shared cache capacity across all partitions. Deduplication is
-    /// mandatory (the keyed-state commit oracle), so this must be at least 1.
+    /// mandatory (the keyed-state commit oracle), so the capacity is
+    /// `NonZeroUsize`: a zero capacity is unrepresentable rather than
+    /// validated away. Setting `PROSODY_IDEMPOTENCE_CACHE_SIZE=0` is rejected
+    /// when the configuration is built.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
     /// Default: 8192
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", \
-                   DEFAULT_IDEMPOTENCE_CACHE_SIZE)?"
+                   DEFAULT_DEDUP_CACHE_CAPACITY)?"
     )]
-    #[validate(range(min = 1_usize))]
-    pub cache_capacity: usize,
+    pub cache_capacity: NonZeroUsize,
 
     /// Cassandra TTL for deduplication records. Must be at least 1 minute
     /// and must not exceed Cassandra's maximum TTL of 630,720,000 seconds.

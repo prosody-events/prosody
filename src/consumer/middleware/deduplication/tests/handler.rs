@@ -17,6 +17,7 @@ use crate::timers::datetime::CompactDateTime;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -379,7 +380,7 @@ fn dedup_uuid_differs_by_dimension() -> color_eyre::Result<()> {
 fn ttl_exceeding_max_rejected() {
     let config = DeduplicationConfiguration {
         version: "1".to_owned(),
-        cache_capacity: 100,
+        cache_capacity: NonZeroUsize::MIN,
         ttl: Duration::from_secs(700_000_000),
     };
     let result = DeduplicationMiddleware::<_, serde_json::Value>::new(
@@ -394,7 +395,7 @@ fn ttl_exceeding_max_rejected() {
 fn ttl_below_minimum_rejected() {
     let config = DeduplicationConfiguration {
         version: "1".to_owned(),
-        cache_capacity: 100,
+        cache_capacity: NonZeroUsize::MIN,
         ttl: Duration::from_secs(30),
     };
     let result = DeduplicationMiddleware::<_, serde_json::Value>::new(

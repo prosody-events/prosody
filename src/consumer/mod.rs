@@ -209,6 +209,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1223,7 +1224,7 @@ where
             trigger_store_config,
             consumer_config.mock,
             Duration::default(),
-            1,
+            NonZeroUsize::MIN,
             keyed_state_config.default_ttl,
             consumer_config.timer_spans,
         )

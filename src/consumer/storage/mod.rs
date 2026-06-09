@@ -133,6 +133,7 @@ impl StorageBackend {
 /// # use prosody::consumer::storage::{StorageBackend, StorePair};
 /// # use prosody::otel::SpanRelation;
 /// # use prosody::high_level::config::TriggerStoreConfiguration;
+/// # use std::num::NonZeroUsize;
 /// # use std::time::Duration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TriggerStoreConfiguration::InMemory;
@@ -140,7 +141,7 @@ impl StorageBackend {
 ///     &config,
 ///     false,
 ///     Duration::from_secs(7 * 24 * 3600),
-///     8192,
+///     NonZeroUsize::new(8192).ok_or("cache capacity must be nonzero")?,
 ///     None,
 ///     SpanRelation::FollowsFrom,
 /// )
@@ -210,9 +211,9 @@ impl StorePair {
     /// * `config` - Trigger store configuration (`InMemory` or `Cassandra`)
     /// * `mock` - If true, uses in-memory storage regardless of config
     /// * `dedup_ttl` - TTL for deduplication records
-    /// * `dedup_cache_capacity` - Capacity of the deduplication cache. The
-    ///   config validates `>= 1`; deduplication is always wired (it is the
-    ///   keyed-state commit oracle).
+    /// * `dedup_cache_capacity` - Capacity of the deduplication cache.
+    ///   `NonZeroUsize`, since deduplication is always wired (it is the
+    ///   keyed-state commit oracle) and a zero capacity is meaningless.
     /// * `timer_spans` - How timer spans relate to their producer span
     ///
     /// # Errors
@@ -225,13 +226,14 @@ impl StorePair {
     /// # use prosody::consumer::storage::StorePair;
     /// # use prosody::otel::SpanRelation;
     /// # use prosody::high_level::config::TriggerStoreConfiguration;
+    /// # use std::num::NonZeroUsize;
     /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let stores = StorePair::new(
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
-    ///     8192,
+    ///     NonZeroUsize::new(8192).ok_or("cache capacity must be nonzero")?,
     ///     None,
     ///     SpanRelation::FollowsFrom,
     /// )
@@ -243,15 +245,10 @@ impl StorePair {
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
-        dedup_cache_capacity: usize,
+        dedup_cache_capacity: NonZeroUsize,
         keyed_state_ttl: Option<CompactDuration>,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
-        // Deduplication is mandatory (the keyed-state commit oracle); the
-        // config validates `cache_capacity >= 1`, so the floor is never hit.
-        let dedup_cache_capacity =
-            NonZeroUsize::new(dedup_cache_capacity).unwrap_or(NonZeroUsize::MIN);
-
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
