@@ -38,7 +38,7 @@ const ZSTD_LEVEL: i32 = 0;
 /// encodings and are never reused — a stale cell carrying one fails
 /// loudly as [`EncodingError::UnknownPayloadEncoding`] (Permanent).
 #[repr(i16)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum PayloadEncoding {
     /// Raw codec bytes stored verbatim.
     RawV1 = 3,
@@ -69,7 +69,7 @@ impl TryFrom<i16> for PayloadEncoding {
 ///
 /// Mapped to and from `i16` symmetrically with [`PayloadEncoding`].
 #[repr(i16)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum WalFormat {
     /// Plain `MsgPack` header + op frames stream.
     MsgpackStreamV1 = 1,

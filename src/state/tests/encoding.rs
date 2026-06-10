@@ -326,6 +326,49 @@ fn encodable_op_is_implemented_for_value_op() {
     assert_encodable::<ValueOp>();
 }
 
+/// Golden bytes for the durable WAL stream. Round-trip properties prove
+/// `decode ∘ encode = id` *within one binary*, but they cannot catch a
+/// rename that shifts the persisted wire format: the encoder and decoder
+/// both move together, so the property still passes while every WAL written
+/// by an older build silently fails to decode. This freezes the exact
+/// uncompressed `MsgpackStreamV1` encoding of a deterministic envelope, so a
+/// change to any persisted token fails loudly here.
+///
+/// What it pins:
+/// - the `WalHeader.kind` field is the **`i8` discriminator `1`**, not the
+///   fixstr `"Value"` — guarding the `#[serde(into = "i8")]` freeze on
+///   [`CollectionKindId`] (F7);
+/// - `ValueOp`'s `#[serde(tag = "op")]` discriminator strings (`"set"` /
+///   `"clear"`) and the `payload` field name, which are equally rename-fragile.
+///
+/// Compression is intentionally excluded: zstd output is a function of the
+/// zstd version, not our format, so the stable golden is the plain stream.
+#[test]
+fn wal_golden_bytes_freeze_durable_format() -> Result<()> {
+    const GOLDEN: &[u8] = &[
+        0x83, 0xa7, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0xa4, 0x6b, 0x69, 0x6e, 0x64,
+        0x01, 0xa8, 0x6f, 0x70, 0x5f, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x02, 0x82, 0xa2, 0x6f, 0x70,
+        0xa3, 0x73, 0x65, 0x74, 0xa7, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0xc4, 0x04, 0x67,
+        0x6f, 0x6c, 0x64, 0x81, 0xa2, 0x6f, 0x70, 0xa5, 0x63, 0x6c, 0x65, 0x61, 0x72,
+    ];
+
+    let envelope = WalEnvelope::<ValueKind>::try_from_ops(vec![
+        ValueOp::Set {
+            payload: Bytes::from_static(b"gold"),
+        },
+        ValueOp::Clear,
+    ])?;
+    let blob = encode_wal::<ValueKind>(&envelope, WalFormat::MsgpackStreamV1)?;
+
+    assert_eq!(
+        blob.bytes().as_ref(),
+        GOLDEN,
+        "durable WAL encoding drifted; if this is an intentional format change, bump \
+         WAL_HEADER_VERSION and re-capture the golden bytes"
+    );
+    Ok(())
+}
+
 /// A WAL header declaring `op_count` ops over `tail` raw bytes. The
 /// `op_count` is drawn from a pool biased toward boundary values so the
 /// generator reliably hits `u64::MAX` — the value that reproduced the B2

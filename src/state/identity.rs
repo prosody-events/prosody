@@ -20,11 +20,16 @@ use thiserror::Error;
 
 /// Stable runtime discriminator for a collection kind.
 ///
-/// The wire discriminator persisted beside durable identity is the `i8` the
-/// [`From`]/[`TryFrom`] pair round-trips through, so the on-wire encoding
-/// cannot drift from the type it encodes.
+/// `#[serde(into = "i8", try_from = "i8")]` routes serde through the
+/// [`From`]/[`TryFrom`] pair, so the only durable wire surface is the `i8`
+/// discriminator — both the Cassandra discriminator column **and** the
+/// `MsgPack` WAL header encode the integer, never the variant name. A
+/// variant rename therefore cannot drift the on-wire encoding away from the
+/// type it encodes; an unknown discriminator decodes as
+/// [`UnknownCollectionKindId`], which classifies `Permanent`.
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "i8", try_from = "i8")]
 pub enum CollectionKindId {
     /// A single optional byte payload.
     Value = 1,
