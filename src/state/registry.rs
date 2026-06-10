@@ -1,5 +1,6 @@
 //! Per-collection definitions and the registry of middleware defaults.
 
+use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
 use crate::state::{CommitMode, StateName, StateNameError};
@@ -10,10 +11,12 @@ use thiserror::Error;
 /// Operational per-collection settings that override middleware defaults.
 ///
 /// Carries the collection's TTL and [`CommitMode`]. `ttl` is `None` for
-/// "do not bind a TTL" (explicit opt-out / Cassandra over-20-year
-/// overflow fallback). `commit_mode` decides whether handler-side dirty
-/// ops produce a sealed WAL on success ([`CommitMode::Wal`]) or apply
-/// straight to authoritative state ([`CommitMode::Direct`]).
+/// "do not bind a TTL" (explicit indefinite retention); a `Some(ttl)` over
+/// Cassandra's `USING TTL` ceiling is rejected at
+/// [`CollectionDefRegistry::register`] time, never silently collapsed.
+/// `commit_mode` decides whether handler-side dirty ops produce a sealed
+/// WAL on success ([`CommitMode::Wal`]) or apply straight to authoritative
+/// state ([`CommitMode::Direct`]).
 ///
 /// Operational settings are deliberately separate from the collection's
 /// frozen [`StructuralIdentity`]: the identity comes only from the
@@ -94,8 +97,9 @@ impl CollectionDefRegistry {
     /// # Errors
     ///
     /// Returns [`RegisterStateError::Name`] when the descriptor's name is
-    /// empty, or [`RegisterStateError::IdentityConflict`] when the name is
-    /// already registered with a different structural identity.
+    /// empty, [`RegisterStateError::Ttl`] when its TTL exceeds Cassandra's
+    /// `USING TTL` ceiling, or [`RegisterStateError::IdentityConflict`] when
+    /// the name is already registered with a different structural identity.
     pub fn register<D>(
         &mut self,
         descriptor: &D,
@@ -116,6 +120,14 @@ impl CollectionDefRegistry {
         def: CollectionDef,
     ) -> Result<(), RegisterStateError> {
         let name = StateName::try_new(name)?;
+        if let Some(ttl) = def.ttl
+            && i64::from(ttl.seconds()) > MAX_CASSANDRA_TTL_SECS
+        {
+            return Err(RegisterStateError::Ttl {
+                name,
+                seconds: ttl.seconds(),
+            });
+        }
         if let Some(existing) = self.defs.get(&name)
             && existing.identity != identity
         {
@@ -163,6 +175,24 @@ pub enum RegisterStateError {
     /// The descriptor's collection name was empty.
     #[error(transparent)]
     Name(#[from] StateNameError),
+
+    /// The collection's TTL exceeds Cassandra's `USING TTL` ceiling
+    /// (`630,720,000` seconds). Rejected at registration — the single choke
+    /// point behind every `ttl_for` read — so a misconfigured static TTL
+    /// fails fast at build time rather than failing every write for the
+    /// collection at the coordinator. Rejection (not a silent collapse to
+    /// "no TTL") avoids turning "expire in 25 years" into "persist forever".
+    #[error(
+        "state collection {name:?} TTL {seconds} seconds exceeds Cassandra maximum of 630,720,000 \
+         seconds"
+    )]
+    Ttl {
+        /// Collection name whose TTL is over the ceiling.
+        name: StateName,
+
+        /// The offending TTL, in seconds.
+        seconds: u32,
+    },
 
     /// The name is already registered with a different structural identity.
     #[error(

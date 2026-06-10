@@ -632,6 +632,13 @@ where
     (segment_id, key, state_type)
 }
 
+/// Converts a per-write TTL to the `i32` the driver binds to `USING TTL ?`.
+///
+/// The input is pre-validated against Cassandra's `630,720,000`-second
+/// ceiling at registration (`CollectionDefRegistry::register_identity`) and
+/// at store creation (`validate_keyed_state_ttl`), so the saturating
+/// conversion is only a defensive floor for the `u32 > i32::MAX` range that
+/// validation already excludes — it can never silently shorten a valid TTL.
 fn ttl_to_i32(ttl: CompactDuration) -> i32 {
     ttl.seconds().try_into().unwrap_or(i32::MAX)
 }

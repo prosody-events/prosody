@@ -86,8 +86,8 @@ impl KeyedStateConfiguration {
 
     /// Registers `descriptor`'s collection with operational settings `def`.
     ///
-    /// Name validation and identity-conflict rejection run at consumer
-    /// build, the fallible boundary.
+    /// Name validation, TTL-ceiling rejection, and identity-conflict
+    /// rejection all run at consumer build, the fallible boundary.
     #[must_use]
     pub fn state<DESC>(mut self, descriptor: &DESC, def: CollectionDef) -> Self
     where
@@ -109,8 +109,8 @@ impl KeyedStateConfiguration {
     ///
     /// # Errors
     ///
-    /// Returns [`RegisterStateError`] on an empty descriptor name or an
-    /// identity conflict.
+    /// Returns [`RegisterStateError`] on an empty descriptor name, a TTL
+    /// over Cassandra's `USING TTL` ceiling, or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::new(self.default_ttl);
         for (name, identity, def) in &self.registrations {
@@ -136,9 +136,19 @@ fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::KeyedStateConfiguration;
+    use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
+    use crate::state::descriptor::{ValueDescriptor, value_state};
+    use crate::state::registry::{CollectionDef, RegisterStateError};
+    use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::Result;
     use std::path::PathBuf;
     use validator::Validate;
+
+    const CART: ValueDescriptor = value_state("cart");
+
+    /// `MAX_CASSANDRA_TTL_SECS` fits a `u32`, so the ceiling and one second
+    /// past it are both representable as a `CompactDuration`.
+    const CEILING_SECS: u32 = MAX_CASSANDRA_TTL_SECS as u32;
 
     #[test]
     fn empty_cache_dir_is_rejected() -> Result<()> {
@@ -149,6 +159,40 @@ mod tests {
             config.validate().is_err(),
             "empty cache_dir must fail validation"
         );
+        Ok(())
+    }
+
+    /// Indefinite retention (`None`) is always allowed — the TTL ceiling
+    /// guards only oversized `Some` values, never the opt-out.
+    #[test]
+    fn collection_ttl_none_is_allowed() -> Result<()> {
+        let config = KeyedStateConfiguration::builder()
+            .build()?
+            .state(&CART, CollectionDef::new(None));
+        assert!(config.build_registry().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn collection_ttl_at_the_ceiling_is_allowed() -> Result<()> {
+        let ttl = CompactDuration::new(CEILING_SECS);
+        let config = KeyedStateConfiguration::builder()
+            .build()?
+            .state(&CART, CollectionDef::new(Some(ttl)));
+        assert!(config.build_registry().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn collection_ttl_over_the_ceiling_is_rejected() -> Result<()> {
+        let over = CEILING_SECS + 1;
+        let config = KeyedStateConfiguration::builder()
+            .build()?
+            .state(&CART, CollectionDef::new(Some(CompactDuration::new(over))));
+        assert!(matches!(
+            config.build_registry(),
+            Err(RegisterStateError::Ttl { seconds, .. }) if seconds == over
+        ));
         Ok(())
     }
 }

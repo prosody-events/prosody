@@ -217,22 +217,21 @@ impl<K> CollectionId<K> {
 ///
 /// The TTL is `Option<CompactDuration>`: `Some(d)` binds a TTL via
 /// `USING TTL ?` on every Cassandra write the store issues for this
-/// collection; `None` writes via the `*_no_ttl` query variants. `None`
-/// covers two first-class cases:
+/// collection; `None` writes via the `*_no_ttl` query variants and means the
+/// application opted into indefinite retention. An over-ceiling `Some(d)`
+/// (Cassandra rejects `USING TTL ?` values above `630_720_000` seconds) is
+/// rejected at `CollectionDefRegistry::register` time — never silently
+/// collapsed to `None`, which would turn a finite retention into permanent
+/// storage.
 ///
-/// 1. The application opted into indefinite retention.
-/// 2. The Cassandra over-20-year overflow fallback collapsed a computed TTL
-///    into `None` at the wiring layer (Cassandra rejects `USING TTL ?` values
-///    above `630_720_000` seconds).
-///
-/// Production callers either supply a per-write TTL explicitly or read it
-/// from a store's `default_ttl` field (set once at construction from
-/// `CassandraStore::base_ttl()`). The keyed-state stores never reach into
-/// a sibling type for TTL: each store owns its own `default_ttl` and
+/// Production callers either supply a per-collection TTL explicitly (from the
+/// registry) or read a store's `default_ttl` field (set once at construction
+/// from `CassandraStore::base_ttl()`). The keyed-state stores never reach
+/// into a sibling type for TTL: each store owns its own `default_ttl` and
 /// threads it through `ValueStore::set` / `clear` and through recovery
 /// writes. `None` is therefore a deliberate value, not a forgotten one.
 /// Reads do not see the TTL; recovery callers re-supply it from the
-/// store-owned default. Per-collection registry overrides are future work.
+/// store-owned default.
 ///
 /// # Identity invariant
 ///
@@ -249,9 +248,9 @@ pub struct CollectionRef<K> {
 
 impl<K> CollectionRef<K> {
     /// Creates a typed collection reference. Pass `Some(ttl)` to bind a
-    /// TTL on every write; pass `None` for indefinite retention or the
-    /// Cassandra over-20-year overflow fallback. The TTL choice is
-    /// always explicit at the callsite.
+    /// TTL on every write; pass `None` for indefinite retention. The TTL
+    /// choice is always explicit at the callsite, and an over-ceiling TTL
+    /// was already rejected at registration.
     #[must_use]
     pub fn new(id: CollectionId<K>, ttl: Option<CompactDuration>) -> Self {
         Self { id, ttl }
