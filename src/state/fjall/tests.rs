@@ -22,21 +22,17 @@ use crate::state::recovering::RecoveringValueStore;
 use crate::state::session::DurableValueBundle;
 use crate::state::tests::dirty_value_suite::{self, DirtyTrace};
 use crate::state::tests::value_suite::{
-    self, DirectTrace, TEST_TTL, Trace, bytes, collection_id, collection_ref, event, finish_trace,
+    self, ParityTrace, TEST_TTL, bytes, collection_id, collection_ref, event, finish_trace,
 };
-use crate::state::value::{
-    DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind, ValueStore,
-};
-use crate::state::{
-    CollectionId, CommitDecision, CommitMode, EventRef, EventScopeId, Read, StoreOutcome,
-};
+use crate::state::value::{DurableWalStore, PendingOpSource, ValueKind, ValueOp, ValueStore};
+use crate::state::{CollectionId, CommitDecision, EventRef, EventScopeId, Read};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use parking_lot::Mutex;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{QuickCheck, TestResult};
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -134,116 +130,13 @@ async fn cache_present_with_empty_bytes_round_trips() -> Result<()> {
     Ok(())
 }
 
-// ---- directed LayeredValueStore combinator tests ----------------------------
+// ---- directed LayeredValueStore combinator test -----------------------------
 //
-// All combinator tests use the memory durable store as the backing so they
-// run without a broker. The cache is observed directly via `cache_get` to
-// distinguish cache state from the layered store's read-through behavior.
-
-#[tokio::test]
-async fn cache_populated_on_miss() -> Result<()> {
-    let (_fixture, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::for_tests();
-    let id = collection_id("populated")?;
-    let payload = bytes(3);
-    backing.set(&id, payload.clone()).await?;
-
-    let layered = LayeredValueStore::new(cache.clone(), backing);
-    assert_eq!(cache.get(&id).await?, Read::Unknown);
-    assert_eq!(
-        layered.get(&id).await.map_err(into_eyre)?,
-        Read::Present(payload.clone())
-    );
-    assert_eq!(cache.get(&id).await?, Read::Present(payload));
-    Ok(())
-}
-
-#[tokio::test]
-async fn cache_patched_after_apply_sealed() -> Result<()> {
-    let (_fixture, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::for_tests();
-    let dirty = MemoryDirtyValueStore::new();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-    let layered = LayeredValueStore::new(cache.clone(), backing);
-    let mut tx = TransactionValueStore::new(layered, dirty, collection, event(1), CommitMode::Wal);
-
-    let payload = bytes(11);
-    tx.set(&collection_id, payload.clone())
-        .await
-        .map_err(into_eyre)?;
-    tx.seal().await.map_err(into_eyre)?;
-    let outcome = tx.apply_sealed().await.map_err(into_eyre)?;
-    assert_eq!(
-        outcome,
-        StoreOutcome::Applied,
-        "apply_sealed should report Applied"
-    );
-
-    assert_eq!(cache.get(&collection_id).await?, Read::Present(payload));
-    Ok(())
-}
-
-#[tokio::test]
-async fn cache_patched_after_direct_apply() -> Result<()> {
-    let (_fixture, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::for_tests();
-    let dirty = MemoryDirtyValueStore::new();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-    let layered = LayeredValueStore::new(cache.clone(), backing);
-    let mut tx =
-        TransactionValueStore::new(layered, dirty, collection, event(2), CommitMode::Direct);
-
-    let payload = bytes(22);
-    tx.set(&collection_id, payload.clone())
-        .await
-        .map_err(into_eyre)?;
-    let outcome = tx.direct_apply().await.map_err(into_eyre)?;
-    assert_eq!(outcome, StoreOutcome::Applied);
-
-    assert_eq!(cache.get(&collection_id).await?, Read::Present(payload));
-    Ok(())
-}
-
-#[tokio::test]
-async fn cache_untouched_after_seal() -> Result<()> {
-    let (_fixture, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::for_tests();
-    let dirty = MemoryDirtyValueStore::new();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-    let layered = LayeredValueStore::new(cache.clone(), backing);
-    let mut tx = TransactionValueStore::new(layered, dirty, collection, event(3), CommitMode::Wal);
-
-    let payload = bytes(33);
-    tx.set(&collection_id, payload).await.map_err(into_eyre)?;
-    tx.seal().await.map_err(into_eyre)?;
-
-    // Cache mirrors only applied state; seal does not change applied.
-    assert_eq!(cache.get(&collection_id).await?, Read::Unknown);
-    Ok(())
-}
-
-#[tokio::test]
-async fn cache_untouched_after_rollback_sealed() -> Result<()> {
-    let (_fixture, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::for_tests();
-    let dirty = MemoryDirtyValueStore::new();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-    let layered = LayeredValueStore::new(cache.clone(), backing);
-    let mut tx = TransactionValueStore::new(layered, dirty, collection, event(4), CommitMode::Wal);
-
-    let payload = bytes(44);
-    tx.set(&collection_id, payload).await.map_err(into_eyre)?;
-    tx.seal().await.map_err(into_eyre)?;
-    let outcome = tx.rollback_sealed().await.map_err(into_eyre)?;
-    assert_eq!(outcome, StoreOutcome::Applied);
-
-    assert_eq!(cache.get(&collection_id).await?, Read::Unknown);
-    Ok(())
-}
+// The full-op-set parity property (`prop_layered_fjall_*_full_parity`, below)
+// subsumes every healthy-cache patch rule. This one directed test needs the
+// fault-injection seam no healthy-backing parity run can reproduce: Layered
+// invariant 6 — a cache-write failure after a backing-side success must
+// invalidate and still return durable success.
 
 #[tokio::test]
 async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
@@ -278,6 +171,63 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn recover_before_seal_then_rollback_resyncs_cache() -> Result<()> {
+    // Regression for a cache-coherence hole the full-op parity property
+    // surfaced on `Layered<Fjall, Recovering<…>>`: `recover-before-seal` lives
+    // inside `Recovering` (below the cache), so it folds a prior crashed WAL
+    // into `applied` without the cache observing it. If the new event is then
+    // rolled back — which leaves `applied` at the recovered value — a stale
+    // cache survives and the next read returns the pre-recovery value.
+    let (_fixture, cache) = make_cache()?;
+    let inner = MemoryDurableValueStore::for_tests();
+    let backing = RecoveringValueStore::with_default_ttl(inner, AlwaysCommittedOracle, TEST_TTL);
+    let layered = LayeredValueStore::new(cache, backing);
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+
+    // Applied = A, cache populated.
+    layered.set(&id, bytes(1)).await.map_err(into_eyre)?;
+    assert_eq!(
+        layered.get(&id).await.map_err(into_eyre)?,
+        Read::Present(bytes(1))
+    );
+
+    // Seal event 1 over A, then seal event 2: the second seal recovers event 1
+    // (AlwaysCommitted → apply), folding `[Set 2]` into applied = B. The cache
+    // never sees this — it still holds A.
+    layered
+        .seal(
+            &collection,
+            event(1),
+            vec![ValueOp::Set { payload: bytes(2) }],
+        )
+        .await
+        .map_err(into_eyre)?;
+    layered
+        .seal(
+            &collection,
+            event(2),
+            vec![ValueOp::Set { payload: bytes(3) }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    // Roll back event 2: applied stays at the recovered B; rollback leaves the
+    // cache untouched (Layered invariant 4).
+    layered
+        .rollback_sealed(&collection, event(2))
+        .await
+        .map_err(into_eyre)?;
+
+    // The visible value must be the recovered B, not the stale cached A.
+    assert_eq!(
+        layered.get(&id).await.map_err(into_eyre)?,
+        Read::Present(bytes(2))
+    );
+    Ok(())
+}
+
 // ---- property runners: LayeredValueStore<FjallValueStore, Memory> -----------
 //
 // These use `TEST_RUNTIME.block_on` (not `futures::executor::block_on`)
@@ -304,154 +254,51 @@ fn run_layered_property<E: fmt::Debug>(
     finish_trace(run(cache), falsified, input_dbg)
 }
 
-fn prop_layered_memory_wal(trace: Trace) -> TestResult {
+fn layered_memory_full_parity(trace: ParityTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    run_layered_property("model mismatch", &input_dbg, |cache| {
-        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        TEST_RUNTIME.block_on(value_suite::run_trace(
-            layered,
-            MemoryDirtyValueStore::new,
+    run_layered_property("layered/backing divergence", &input_dbg, |cache| {
+        TEST_RUNTIME.block_on(value_suite::run_layered_parity(
+            cache,
+            MemoryDurableValueStore::for_tests(),
+            MemoryDurableValueStore::for_tests(),
             trace,
+            false,
         ))
     })
 }
 
-fn prop_layered_memory_idempotence(trace: Trace) -> TestResult {
+fn layered_recovering_memory_full_parity(trace: ParityTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    run_layered_property("model mismatch", &input_dbg, |cache| {
-        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        TEST_RUNTIME.block_on(value_suite::run_idempotence_trace(
-            layered,
-            MemoryDirtyValueStore::new,
+    run_layered_property("layered/backing divergence", &input_dbg, |cache| {
+        let backing_layered = RecoveringValueStore::with_default_ttl(
+            MemoryDurableValueStore::for_tests(),
+            AlwaysCommittedOracle,
+            TEST_TTL,
+        );
+        let backing_bare = RecoveringValueStore::with_default_ttl(
+            MemoryDurableValueStore::for_tests(),
+            AlwaysCommittedOracle,
+            TEST_TTL,
+        );
+        TEST_RUNTIME.block_on(value_suite::run_layered_parity(
+            cache,
+            backing_layered,
+            backing_bare,
             trace,
-        ))
-    })
-}
-
-fn prop_layered_memory_direct(trace: DirectTrace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
-    run_layered_property("model mismatch", &input_dbg, |cache| {
-        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        TEST_RUNTIME.block_on(value_suite::run_direct_trace(
-            layered,
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-    })
-}
-
-#[test]
-fn prop_layered_fjall_memory_trace() {
-    QuickCheck::new().quickcheck(prop_layered_memory_wal as fn(Trace) -> TestResult);
-}
-
-#[test]
-fn prop_layered_fjall_memory_idempotence_trace() {
-    QuickCheck::new().quickcheck(prop_layered_memory_idempotence as fn(Trace) -> TestResult);
-}
-
-#[test]
-fn prop_layered_fjall_memory_direct_trace() {
-    QuickCheck::new().quickcheck(prop_layered_memory_direct as fn(DirectTrace) -> TestResult);
-}
-
-// ---- property runners: Layered<Fjall, Recovering<Memory, AlwaysCommitted>> --
-
-fn prop_layered_fjall_recovering_memory(trace: Trace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
-    run_layered_property("model mismatch", &input_dbg, |cache| {
-        let inner = MemoryDurableValueStore::for_tests();
-        let recovering =
-            RecoveringValueStore::with_default_ttl(inner, AlwaysCommittedOracle, TEST_TTL);
-        let layered = LayeredValueStore::new(cache, recovering);
-        TEST_RUNTIME.block_on(value_suite::run_trace(
-            layered,
-            MemoryDirtyValueStore::new,
-            trace,
+            true,
         ))
     })
 }
 
 #[test]
-fn prop_layered_fjall_recovering_memory_trace() {
-    QuickCheck::new().quickcheck(prop_layered_fjall_recovering_memory as fn(Trace) -> TestResult);
-}
-
-// ---- F6: LayeredValueStore vs. backing-alone parity -------------------------
-
-/// One `ValueStore`-level operation in an [`F6Trace`].
-#[derive(Clone, Debug)]
-enum CacheOp {
-    Set(u8),
-    Clear,
-    Get,
-}
-
-#[derive(Clone, Debug)]
-struct F6Trace(Vec<CacheOp>);
-
-impl Arbitrary for CacheOp {
-    fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 3 {
-            0 => Self::Set(u8::arbitrary(g)),
-            1 => Self::Clear,
-            _ => Self::Get,
-        }
-    }
-}
-
-impl Arbitrary for F6Trace {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let len = usize::arbitrary(g) % 24;
-        Self((0..len).map(|_| CacheOp::arbitrary(g)).collect())
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        Box::new(self.0.shrink().map(F6Trace))
-    }
-}
-
-/// F6: a `LayeredValueStore<FjallValueStore, MemoryDurableValueStore>` must
-/// return the same visible value as the backing store alone for every read,
-/// across cache miss/populate (`Get` after a write went through), cache patch
-/// (`Set`/`Clear` write-through), and the absent path. Drives an identical op
-/// trace against the layered store and a bare backing reference and compares
-/// `get` after every step, so a stale cache serving a wrong value is caught
-/// directly rather than only against the analytical model.
-fn layered_parity_property(trace: F6Trace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
-    let F6Trace(ops) = trace;
-    run_layered_property("model mismatch", &input_dbg, |cache| -> Result<bool> {
-        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-        let reference = MemoryDurableValueStore::for_tests();
-        TEST_RUNTIME.block_on(async {
-            let id = collection_id("parity")?;
-            for op in &ops {
-                match op {
-                    CacheOp::Set(byte) => {
-                        layered.set(&id, bytes(*byte)).await?;
-                        reference.set(&id, bytes(*byte)).await?;
-                    }
-                    CacheOp::Clear => {
-                        layered.clear(&id).await?;
-                        reference.clear(&id).await?;
-                    }
-                    CacheOp::Get => {
-                        if layered.get(&id).await? != reference.get(&id).await? {
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-            // Final read parity regardless of the trailing op.
-            Ok(layered.get(&id).await? == reference.get(&id).await?)
-        })
-    })
+fn prop_layered_fjall_memory_full_parity() {
+    QuickCheck::new().quickcheck(layered_memory_full_parity as fn(ParityTrace) -> TestResult);
 }
 
 #[test]
-fn prop_layered_fjall_memory_parity() {
-    QuickCheck::new().quickcheck(layered_parity_property as fn(F6Trace) -> TestResult);
+fn prop_layered_fjall_recovering_memory_full_parity() {
+    QuickCheck::new()
+        .quickcheck(layered_recovering_memory_full_parity as fn(ParityTrace) -> TestResult);
 }
 
 // ---- property runners: LayeredValueStore<FjallValueStore, Cassandra> --------
@@ -525,27 +372,16 @@ fn run_cassandra_property<E: fmt::Debug>(
     finish_trace(result, falsified, input_dbg)
 }
 
-fn cassandra_wal_property(trace: Trace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
-    run_cassandra_property("model mismatch", &input_dbg, |span, cache, backing| {
-        let layered = LayeredValueStore::new(cache, backing);
-        TEST_RUNTIME.block_on(
-            async { value_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
-                .instrument(span),
-        )
-    })
-}
-
-fn cassandra_idempotence_property(trace: Trace) -> TestResult {
+fn cassandra_full_parity(trace: ParityTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_cassandra_property(
-        "idempotence violated",
+        "layered/backing divergence",
         &input_dbg,
         |span, cache, backing| {
-            let layered = LayeredValueStore::new(cache, backing);
             TEST_RUNTIME.block_on(
                 async {
-                    value_suite::run_idempotence_trace(layered, MemoryDirtyValueStore::new, trace)
+                    let backing_bare = setup_cassandra_value_store().await?;
+                    value_suite::run_layered_parity(cache, backing, backing_bare, trace, false)
                         .await
                 }
                 .instrument(span),
@@ -554,16 +390,32 @@ fn cassandra_idempotence_property(trace: Trace) -> TestResult {
     )
 }
 
-fn cassandra_direct_property(trace: DirectTrace) -> TestResult {
+fn recovering_cassandra_full_parity(trace: ParityTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
     run_cassandra_property(
-        "partition sealed under direct mode",
+        "layered/backing divergence",
         &input_dbg,
         |span, cache, backing| {
-            let layered = LayeredValueStore::new(cache, backing);
             TEST_RUNTIME.block_on(
                 async {
-                    value_suite::run_direct_trace(layered, MemoryDirtyValueStore::new, trace).await
+                    let backing_layered = RecoveringValueStore::with_default_ttl(
+                        backing,
+                        AlwaysCommittedOracle,
+                        TEST_TTL,
+                    );
+                    let backing_bare = RecoveringValueStore::with_default_ttl(
+                        setup_cassandra_value_store().await?,
+                        AlwaysCommittedOracle,
+                        TEST_TTL,
+                    );
+                    value_suite::run_layered_parity(
+                        cache,
+                        backing_layered,
+                        backing_bare,
+                        trace,
+                        true,
+                    )
+                    .await
                 }
                 .instrument(span),
             )
@@ -572,48 +424,19 @@ fn cassandra_direct_property(trace: DirectTrace) -> TestResult {
 }
 
 #[test]
-fn prop_layered_fjall_cassandra_trace() {
+fn prop_layered_fjall_cassandra_full_parity() {
     init_test_logging();
     QuickCheck::new()
         .tests(get_test_count())
-        .quickcheck(cassandra_wal_property as fn(Trace) -> TestResult);
+        .quickcheck(cassandra_full_parity as fn(ParityTrace) -> TestResult);
 }
 
 #[test]
-fn prop_layered_fjall_cassandra_idempotence_trace() {
+fn prop_layered_fjall_recovering_cassandra_full_parity() {
     init_test_logging();
     QuickCheck::new()
         .tests(get_test_count())
-        .quickcheck(cassandra_idempotence_property as fn(Trace) -> TestResult);
-}
-
-#[test]
-fn prop_layered_fjall_cassandra_direct_trace() {
-    init_test_logging();
-    QuickCheck::new()
-        .tests(get_test_count())
-        .quickcheck(cassandra_direct_property as fn(DirectTrace) -> TestResult);
-}
-
-fn cassandra_recovering_wal_property(trace: Trace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
-    run_cassandra_property("model mismatch", &input_dbg, |span, cache, backing| {
-        let recovering =
-            RecoveringValueStore::with_default_ttl(backing, AlwaysCommittedOracle, TEST_TTL);
-        let layered = LayeredValueStore::new(cache, recovering);
-        TEST_RUNTIME.block_on(
-            async { value_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
-                .instrument(span),
-        )
-    })
-}
-
-#[test]
-fn prop_layered_fjall_recovering_cassandra_trace() {
-    init_test_logging();
-    QuickCheck::new()
-        .tests(get_test_count())
-        .quickcheck(cassandra_recovering_wal_property as fn(Trace) -> TestResult);
+        .quickcheck(recovering_cassandra_full_parity as fn(ParityTrace) -> TestResult);
 }
 
 // ---- fault-injection cache --------------------------------------------------

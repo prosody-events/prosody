@@ -16,7 +16,7 @@ use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, Memor
 use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::value_suite::{
-    self, DirectTrace, OraclePolicy, TEST_TTL, Trace, bytes, collection_ref, finish_trace,
+    self, DirectTrace, OraclePolicy, TEST_TTL, Trace, bytes, collection_ref, event, finish_trace,
 };
 use crate::state::value::{DirectApplyStore, DurableWalStore, ValueOp, ValueStore};
 use crate::state::{
@@ -177,12 +177,6 @@ impl CommitOracle for ScriptedOracle {
 }
 
 // ---- helpers ---------------------------------------------------------------
-
-fn event(id: u128) -> EventRef {
-    EventRef::Message {
-        dedup_id: Uuid::from_u128(id),
-    }
-}
 
 /// A `RecoveringValueStore` over a fresh in-memory backing store with the
 /// shared one-hour TTL, driven by `oracle`. Shared by the property runners,
@@ -394,6 +388,11 @@ async fn oracle_error_propagates() -> Result<()> {
         .err()
         .ok_or_else(|| eyre::eyre!("expected oracle error to propagate"))?;
     assert!(matches!(err, RecoveringValueStoreError::Oracle(_)));
+    assert_eq!(
+        err.classify_error(),
+        ErrorCategory::Permanent,
+        "the oracle's Permanent classification must propagate through the wrapper"
+    );
     Ok(())
 }
 
@@ -663,6 +662,11 @@ async fn inner_error_during_apply_propagates() -> Result<()> {
         .err()
         .ok_or_else(|| eyre::eyre!("expected inner error to propagate"))?;
     assert!(matches!(err, RecoveringValueStoreError::Inner(_)));
+    assert_eq!(
+        err.classify_error(),
+        ErrorCategory::Permanent,
+        "the inner store's Permanent classification must propagate through the wrapper"
+    );
     Ok(())
 }
 
@@ -923,21 +927,6 @@ fn prop_recovering_memory_direct_trace() {
         finish_trace(result, "direct-mode invariant violated", &input_dbg)
     }
     QuickCheck::new().quickcheck(property as fn(DirectTrace) -> TestResult);
-}
-
-#[test]
-fn prop_recovering_memory_crash_committed() {
-    fn property(trace: Trace) -> TestResult {
-        let input_dbg = format!("{trace:#?}");
-        let result = executor::block_on(value_suite::run_trace_with_policy(
-            recovering_memory(MockOracle::always_committed()),
-            MemoryDirtyValueStore::new,
-            trace,
-            OraclePolicy::AlwaysCommitted,
-        ));
-        finish_trace(result, "model mismatch", &input_dbg)
-    }
-    QuickCheck::new().quickcheck(property as fn(Trace) -> TestResult);
 }
 
 #[test]

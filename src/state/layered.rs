@@ -20,8 +20,13 @@
 //!    Cache `Read::Unknown` *or* a cache `Err` triggers exactly one backing
 //!    `get`. The result is written back to the cache as a best-effort hint,
 //!    automatically repairing a corrupt cell.
-//! 2. **`seal` does not change applied state → cache untouched.** The cache
-//!    mirrors `applied`; the WAL columns are backing-only.
+//! 2. **`seal` re-syncs the cache from the backing's post-seal applied.** A
+//!    plain backing leaves `applied` unchanged across a seal, but a recovering
+//!    backing may resolve a prior crashed-but-sealed WAL during seal
+//!    (recover-before-seal), folding it into `applied` beneath the cache.
+//!    Reading the post-seal applied via `read_partition` — which never triggers
+//!    recovery, unlike `get` on the partition we just sealed — and patching
+//!    keeps the cache coherent in both cases.
 //! 3. **`apply_sealed` Applied → read backing's new applied and patch.** The
 //!    backing's authoritative answer wins; the cache is patched to match.
 //!    `NoOp` leaves the cache alone.
@@ -172,7 +177,8 @@ where
         DurableWalStore::read_partition(&self.backing, collection).await
     }
 
-    /// Invariant 2: applied state unchanged → cache untouched.
+    /// Invariant 2: re-sync the cache from the backing's post-seal applied — a
+    /// recovering backing may have changed it via recover-before-seal.
     async fn seal<'a, I>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
@@ -182,7 +188,17 @@ where
     where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
-        self.backing.seal(collection, event, ops).await
+        let sealed = self.backing.seal(collection, event, ops).await?;
+        // `read_partition` reports the applied state without resolving the WAL
+        // we just sealed; `get` would recover it. The applied it returns already
+        // reflects any recover-before-seal the backing performed.
+        let new_applied =
+            match DurableWalStore::read_partition(&self.backing, collection.id()).await? {
+                DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
+            };
+        self.patch_cache_or_invalidate(collection.id(), new_applied)
+            .await;
+        Ok(sealed)
     }
 
     /// Invariant 3: on Applied, read backing's new applied via `get` and

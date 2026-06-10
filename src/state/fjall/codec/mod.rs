@@ -10,9 +10,15 @@
 //!
 //! The hierarchy is `[16-byte collection hash][inner key bytes]`:
 //!
-//! - The collection hash is `xxh3_128(segment_id || 0x00 || key || 0x00 ||
-//!   state_type || 0x00 || name)`, serialized **big-endian** for stable
-//!   cross-platform ordering.
+//! - The collection hash is `xxh3_128` over an **injective** encoding of the
+//!   collection identity: the fixed-width fields first (`segment_id` then the
+//!   one-byte `state_type`), then each variable-length field length-prefixed
+//!   (`key_len` as 8 big-endian bytes, then `key`; `name_len`, then `name`).
+//!   The hash is serialized **big-endian** for stable cross-platform ordering.
+//!   Length-prefixing (rather than a delimiter byte) keeps the encoding
+//!   injective even when `key` or `name` contain the delimiter — Kafka keys are
+//!   arbitrary bytes — so distinct collections cannot share an input buffer and
+//!   the only residual collision risk is the hash's own ≈ 2⁻⁶⁴.
 //! - For **Value**, the inner key is empty.
 //! - For **Map** (future work), the inner key is the user's `EncodedMapKey`
 //!   (order-preserving by trait contract).
@@ -56,13 +62,17 @@ where
     let state_type_byte = u8::from_le_bytes(i8::from(id.state_type()).to_le_bytes());
     let name_bytes = id.name().as_str().as_bytes();
 
-    let mut buf = Vec::with_capacity(segment_bytes.len() + key_bytes.len() + name_bytes.len() + 4);
+    // Injective layout: fixed-width fields first, then each variable-length
+    // field length-prefixed. A delimiter byte would not be injective — a key
+    // or name containing it could shift the field boundary (Kafka keys are
+    // arbitrary bytes) — so two distinct collections could share a buffer.
+    let mut buf =
+        Vec::with_capacity(segment_bytes.len() + 1 + 8 + key_bytes.len() + 8 + name_bytes.len());
     buf.extend_from_slice(segment_bytes);
-    buf.push(0);
-    buf.extend_from_slice(key_bytes);
-    buf.push(0);
     buf.push(state_type_byte);
-    buf.push(0);
+    buf.extend_from_slice(&(key_bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(key_bytes);
+    buf.extend_from_slice(&(name_bytes.len() as u64).to_be_bytes());
     buf.extend_from_slice(name_bytes);
 
     xxh3_128(&buf).to_be_bytes()

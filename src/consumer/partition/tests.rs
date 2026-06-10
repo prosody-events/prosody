@@ -443,6 +443,15 @@ where
 }
 
 /// Waits for partition stall state to match `expected` or times out.
+///
+/// Unlike [`wait_for_processed_offsets`] — which awaits the handler's
+/// `Notify`, fired on each processed message — `is_stalled` has no readiness
+/// signal to await: it is a derived predicate over time-thresholded state
+/// (uncommitted-offset age and heartbeat freshness against the stall
+/// threshold). It flips purely with the passage of wall-clock time, with no
+/// edge event the production code could notify on, so deadline-bounded
+/// polling is the only way to observe the transition. The `sleep` here is a
+/// readiness poll, not a backpressure or timing simulation.
 async fn wait_for_partition_stalled<P>(
     partition_manager: &PartitionManager<P>,
     expected: bool,

@@ -120,59 +120,47 @@ trait ClassifyError {
 
 ## Testing
 
-**Organization:** Integration (`tests/`), Unit (`#[cfg(test)]`), Property (`src/timers/store/tests/`)
+The full testing guide — the property-test idiom catalog, invariant
+shapes, exemplar files, and how to run the suites — lives in
+[TESTING.md](TESTING.md). Read it before writing tests. The rules below
+are the non-negotiables.
 
-**Tests live in their own modules.** Default to a sibling `tests.rs` (or
-`foo/tests.rs` if `foo.rs` becomes a directory), declared as
-`#[cfg(test)] mod tests;`. Inline `#[cfg(test)] mod tests { ... }` blocks
-are acceptable only for a handful of tiny tests on a small file; promote
-to a sibling file as soon as the block has fixtures, helpers, or starts
-to dominate the read of the production code. Production code reads better
-without the scaffolding inline; tests get their own headers and structure.
+**Organization:** Integration (`tests/`), unit and property tests in
+sibling modules next to the code they check. Default to a sibling
+`tests.rs` (or `foo/tests.rs`), declared as `#[cfg(test)] mod tests;`.
+Inline `#[cfg(test)] mod tests { ... }` blocks are acceptable only for a
+handful of tiny tests on a small file.
 
-**Drive tests by invariants, not by paths.** For a piece of code, ask
-"what must remain true here?" and write that down. Then write the test
-that proves it across random inputs. Example tests catch obvious paths;
-property tests catch the corners — silent bugs (state that drifts,
-watermarks that leap, invariants that break only on specific interleavings)
-do not get caught any other way. If you can identify the invariant
-(round-trip, parity between two structures, monotonicity, idempotence,
-crash-recovery equivalence, oracle correctness), use a property test.
-Reach for an example test only when the invariant is too narrow to
-generalize, or as a fast smoke alongside the prop test.
+**Drive tests by invariants, not by paths — and prefer few broad property
+tests over many narrow example tests.** Name the invariant (round-trip,
+parity, monotonicity, idempotence, crash-recovery equivalence, oracle
+correctness) and write the property test that proves it over a realistic
+generator: random operation sequences, interleavings, and boundary values,
+not happy-path toys. One such property subsumes dozens of example tests
+and keeps finding bugs as the code evolves; a property over toy inputs is
+just a slow example test. About to write a third example test for the same
+function? Write the generalizing property instead, and fold existing
+example clusters into a property when you're already touching their
+module. Example tests are for invariants too narrow to generalize, or as
+fast smokes alongside the property. Copy the idioms cataloged in
+TESTING.md (trace + model oracle, backend-generic suite runners, crash
+simulation, explicit shrinking) rather than inventing new harnesses.
 
-**Property-test iteration count must come from `QUICKCHECK_TESTS`** (or the
-equivalent env var for your generator). Never hardcode a count in the test
-body — `QuickCheck::new().quickcheck(...)` reads `QUICKCHECK_TESTS`
-automatically, with a sensible default when unset. CI can crank this up; dev
-loops stay fast.
+**Iteration counts come from the environment — never hardcoded:**
+`QUICKCHECK_TESTS` for in-memory property tests (quickcheck reads it
+automatically), `INTEGRATION_TESTS` for property tests against live
+backends. CI cranks these up; dev loops stay fast.
 
-**Synchronization - never use `sleep` except for backpressure simulation:**
+**Never use `sleep` except for backpressure simulation.** Wait on
+channels, `Notify`, or `select!` with a deadline — the deadline is a
+hang-guard, never the assertion. Patterns in TESTING.md.
 
-```rust
-// Channel-based waiting (preferred)
-let timer_event = env.expect_timer(5).await?;
+**Use `assert` or `color_eyre::Result` with `?` in tests — never
+`expect`/`unwrap`, never swallow errors.**
 
-// Notification with timeout
-tokio::select! {
-    () = notify.notified() => {},
-    () = tokio::time::sleep_until(deadline) => return Err("Timeout".into()),
-}
-```
-
-**Use `assert` or `color_eyre::Result` in tests - never `expect`/`unwrap`**
-
-**Integration tests:** When running slow integration tests, write output to a temp file rather than piping to `grep`,
-`head`, or `tail`. Re-running tests is expensive; keep output files around for exploration:
-
-```bash
-# Good: preserve output for exploration
-cargo test 2>&1 | tee /tmp/test_output.log
-grep FAILED /tmp/test_output.log
-
-# Bad: loses output, forces expensive re-runs
-cargo test 2>&1 | grep FAILED
-```
+**Run tests with `cargo nextest run` and tee output to a file**
+(`cargo nextest run 2>&1 | tee /tmp/test_output.log`) — re-running slow
+suites is expensive; grep the file, not the pipe.
 
 ## API Design
 

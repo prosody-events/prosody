@@ -25,6 +25,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::Segment;
 use crate::timers::store::SegmentVersion;
+use crate::timers::store::TriggerStore;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::{
@@ -32,7 +33,7 @@ use crate::timers::{
     TimerType, Trigger,
 };
 
-use super::CommitManager;
+use super::{CommitManager, StoreTagSource};
 
 type TestManager = TimerManager<TableAdapter<InMemoryTriggerStore>>;
 type TestCommitManager = CommitManager<MemoryDeduplicationStore, TestManager>;
@@ -241,6 +242,65 @@ async fn timer_committed_when_tag_differs() -> Result<()> {
     Ok(())
 }
 
+/// B.4: production wires the timer half of the oracle with
+/// [`StoreTagSource`] (a bare `TriggerStore` read), not the scheduler-first
+/// [`TimerManager`] every other oracle test drives. Build a `CommitManager`
+/// over `StoreTagSource(store)` and assert `is_timer_committed`'s
+/// three-state contract resolves against the store tag directly:
+/// tag-matches → not committed; tag-differs → committed; row-absent →
+/// committed. The row is created through the manager (the known-good write
+/// path); only the tag *source* is the bare store, which is the production
+/// gap.
+#[tokio::test]
+async fn store_tag_source_resolves_three_states() -> Result<()> {
+    time::pause();
+    let (_stream, manager, _tx, store) = setup_with_store().await?;
+    let trigger = test_trigger("k", 5)?;
+    manager.schedule_trigger(trigger.clone()).await?;
+
+    let oracle = CommitManager::new(
+        MemoryDeduplicationStore::new(),
+        StoreTagSource(store.clone()),
+    );
+    let live_tag = store
+        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+        .await?
+        .ok_or_else(|| eyre!("scheduled timer must have a live store tag"))?;
+
+    // tag-matches → not committed.
+    assert!(
+        !oracle
+            .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, live_tag)
+            .await?,
+        "store tag matches the WAL tag → not committed"
+    );
+
+    // tag-differs → committed-and-rescheduled.
+    assert!(
+        oracle
+            .is_timer_committed(
+                &trigger.key,
+                trigger.timer_type,
+                trigger.time,
+                live_tag.wrapping_add(1)
+            )
+            .await?,
+        "store tag differs from the WAL tag → committed"
+    );
+
+    // row-absent → committed (fired-and-removed).
+    store
+        .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
+        .await?;
+    assert!(
+        oracle
+            .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, live_tag)
+            .await?,
+        "store row absent → committed"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn timer_same_coordinate_clear_not_committed_until_commit() -> Result<()> {
     time::pause();
@@ -332,6 +392,78 @@ async fn commit_manager_drives_recovering_value_store_get() -> Result<()> {
     assert_eq!(visible, Read::Present(payload));
 
     // Partition transitions to Idle after first-touch recovery.
+    match inner.read_partition(&id).await.map_err(|e| eyre!("{e}"))? {
+        DurableState::Idle { .. } => Ok(()),
+        DurableState::Sealed { .. } => Err(eyre!("expected Idle post-recovery")),
+    }
+}
+
+/// Sibling of [`commit_manager_drives_recovering_value_store_get`] for the
+/// timer arm: a Value WAL sealed under a *timer* `EventRef` recovers through
+/// `RecoveringValueStore::get`, exercising `is_timer_committed`. The timer is
+/// fired and committed so its store row is removed (→ committed), and the
+/// recovered collection is keyed by the same app key the oracle resolves the
+/// timer coordinate under.
+#[tokio::test]
+async fn commit_manager_drives_recovering_value_store_get_timer_arm() -> Result<()> {
+    use std::sync::Arc as StdArc;
+
+    use crate::state::memory::MemoryDurableValueStore;
+    use crate::state::recovering::RecoveringValueStore;
+    use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
+    use crate::state::{
+        CollectionId, CollectionRef, DurableState, EventRef, Read, StateKey, StateName, StateType,
+        TimerEventRef,
+    };
+    use bytes::Bytes;
+
+    time::pause();
+    let (stream, manager, _tx) = setup().await?;
+    pin_mut!(stream);
+    let app_key = "timer-recovery-key";
+    let trigger = test_trigger(app_key, 1)?;
+    manager.schedule_trigger(trigger.clone()).await?;
+
+    // Fire and commit: the timer row is removed, so the oracle answers
+    // `Committed` for this coordinate regardless of the WAL tag.
+    let firing = fire_next(stream.as_mut(), Duration::from_secs(2)).await?;
+    let wal_tag = firing.trigger().tag;
+    firing.commit().await;
+    let oracle = CommitManager::new(MemoryDeduplicationStore::new(), manager);
+
+    // Seal a Value WAL under the timer EventRef on a collection keyed by the
+    // SAME app key the oracle uses to resolve the timer coordinate.
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = CollectionRef::new(
+        CollectionId::new(
+            StateKey::new(Uuid::new_v4(), StdArc::from(app_key)),
+            StateType::Application,
+            StateName::try_new("timer-arm-smoke").map_err(|e| eyre!("{e}"))?,
+        ),
+        None,
+    );
+    let id = collection.id().clone();
+    let payload = Bytes::from_static(b"timer-recovered");
+    let event = EventRef::Timer(TimerEventRef::new(
+        trigger.timer_type,
+        trigger.time,
+        wal_tag,
+    ));
+    inner
+        .seal(
+            &collection,
+            event,
+            vec![ValueOp::Set {
+                payload: payload.clone(),
+            }],
+        )
+        .await
+        .map_err(|e| eyre!("{e}"))?;
+
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, None);
+    let visible = store.get(&id).await.map_err(|e| eyre!("{e}"))?;
+    assert_eq!(visible, Read::Present(payload));
+
     match inner.read_partition(&id).await.map_err(|e| eyre!("{e}"))? {
         DurableState::Idle { .. } => Ok(()),
         DurableState::Sealed { .. } => Err(eyre!("expected Idle post-recovery")),

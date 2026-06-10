@@ -6,7 +6,7 @@ use super::super::value::{ValueKind, ValueOp};
 use super::super::{CollectionKind, CollectionKindId, NonEmptyOps, WalBlob, WalEnvelope};
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
-use quickcheck::{Arbitrary, Gen, QuickCheck};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde::Serialize;
 use std::num::NonZeroU64;
 
@@ -88,37 +88,38 @@ impl Arbitrary for ArbValueEnvelope {
 
 #[test]
 fn prop_payload_roundtrip() {
-    fn property(payload: Vec<u8>, encoding: ArbPayloadEncoding) -> bool {
+    fn property(payload: Vec<u8>, encoding: ArbPayloadEncoding) -> TestResult {
         let payload = Bytes::from(payload);
-        let Ok(encoded) = encode_payload(&payload, encoding.0) else {
-            return false;
+        let encoded = match encode_payload(&payload, encoding.0) {
+            Ok(encoded) => encoded,
+            Err(e) => return TestResult::error(format!("encode_payload failed: {e}")),
         };
-        let Ok(decoded) = decode_payload(&encoded, encoding.0) else {
-            return false;
+        let decoded = match decode_payload(&encoded, encoding.0) {
+            Ok(decoded) => decoded,
+            Err(e) => return TestResult::error(format!("decode_payload failed: {e}")),
         };
-        decoded == payload
+        TestResult::from_bool(decoded == payload)
     }
 
-    QuickCheck::new().quickcheck(property as fn(Vec<u8>, ArbPayloadEncoding) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, ArbPayloadEncoding) -> TestResult);
 }
 
 #[test]
 fn prop_wal_roundtrip() {
-    fn property(envelope: ArbValueEnvelope, format: ArbWalFormat) -> bool {
+    fn property(envelope: ArbValueEnvelope, format: ArbWalFormat) -> TestResult {
         let ArbValueEnvelope(envelope) = envelope;
-        let Ok(blob) = encode_wal::<ValueKind>(&envelope, format.0) else {
-            return false;
+        let blob = match encode_wal::<ValueKind>(&envelope, format.0) {
+            Ok(blob) => blob,
+            Err(e) => return TestResult::error(format!("encode_wal failed: {e}")),
         };
-        if blob.format() != format.0 {
-            return false;
-        }
-        let Ok(decoded) = decode_wal::<ValueKind>(&blob) else {
-            return false;
+        let decoded = match decode_wal::<ValueKind>(&blob) {
+            Ok(decoded) => decoded,
+            Err(e) => return TestResult::error(format!("decode_wal failed: {e}")),
         };
-        decoded == envelope
+        TestResult::from_bool(blob.format() == format.0 && decoded == envelope)
     }
 
-    QuickCheck::new().quickcheck(property as fn(ArbValueEnvelope, ArbWalFormat) -> bool);
+    QuickCheck::new().quickcheck(property as fn(ArbValueEnvelope, ArbWalFormat) -> TestResult);
 }
 
 #[test]

@@ -21,7 +21,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterState
 use crate::state::session::{DirtyValueBundle, SessionParts, TerminationWatch, ValueStateSession};
 use crate::state::tests::value_suite::finish_trace;
 use crate::state::value::{PendingOpSource, ValueKind};
-use crate::state::{DirtyStoreProvider, EventRef, EventScopeId, StateKey};
+use crate::state::{CommitMode, DirtyStoreProvider, EventRef, EventScopeId, StateKey, StateName};
 use crate::test_util::{ArbJson, TEST_RUNTIME};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
@@ -275,6 +275,13 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 
 /// N5: re-registering the same name with a *different* structural identity
 /// (codec id or schema label) is rejected.
+///
+/// Kept as directed examples rather than a generated property: a
+/// `StructuralIdentity` has only two fields that can differ today
+/// (`codec_id`, `schema_label`) — `CellKind` has one variant and `kind` is
+/// always `Value` — so a property over identity mismatches would add
+/// generation machinery without covering a case these two examples miss.
+/// Revisit when a second `CellKind`/kind exists.
 #[test]
 fn conflicting_registration_is_rejected() -> Result<()> {
     // The two descriptors share the cell kind (there is only one) but carry
@@ -300,13 +307,35 @@ fn conflicting_registration_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// N5: identical re-registration is idempotent (operational settings may
-/// be updated; the identity is unchanged).
+/// N5: re-registering the same name with an *unchanged* identity is
+/// accepted and updates the operational settings — the second `CollectionDef`
+/// wins. Identity is frozen; TTL and commit mode are not.
 #[test]
-fn identical_reregistration_ok() -> Result<()> {
+fn reregistration_updates_operational_settings() -> Result<()> {
+    let name = StateName::try_new("cart")?;
+    let initial_ttl = CompactDuration::new(60);
+    let updated_ttl = CompactDuration::new(7_200);
+
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(None))?;
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&CART, CollectionDef::new(Some(initial_ttl)))?;
+    assert_eq!(registry.ttl_for(&name), Some(initial_ttl));
+    assert_eq!(registry.commit_mode_for(&name), CommitMode::Wal);
+
+    // Same name, same identity, different operational settings.
+    registry.register(
+        &CART,
+        CollectionDef::new(Some(updated_ttl)).with_commit_mode(CommitMode::Direct),
+    )?;
+    assert_eq!(
+        registry.ttl_for(&name),
+        Some(updated_ttl),
+        "the re-registration's TTL must win"
+    );
+    assert_eq!(
+        registry.commit_mode_for(&name),
+        CommitMode::Direct,
+        "the re-registration's commit mode must win"
+    );
     Ok(())
 }
 

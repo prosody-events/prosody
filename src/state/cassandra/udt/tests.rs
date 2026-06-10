@@ -3,31 +3,57 @@ use crate::state::TimerEventRef;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use color_eyre::eyre::{self, Result};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use uuid::Uuid;
 
-/// Invariant: `from_event` followed by `try_into_event` recovers the original.
-fn assert_round_trips(event: EventRef) -> Result<()> {
-    let decoded = RawEventRef::from_event(event)
-        .try_into_event()
-        .map_err(|e| eyre::eyre!("{e}"))?;
-    assert_eq!(decoded, event);
-    Ok(())
+/// An arbitrary [`EventRef`] of either variant, with random message dedup
+/// ids and random timer coordinates, for the round-trip property.
+#[derive(Clone, Copy, Debug)]
+struct ArbEventRef(EventRef);
+
+impl Arbitrary for ArbEventRef {
+    fn arbitrary(g: &mut Gen) -> Self {
+        const TIMER_TYPES: [TimerType; 3] = [
+            TimerType::Application,
+            TimerType::DeferredMessage,
+            TimerType::DeferredTimer,
+        ];
+        let event = if bool::arbitrary(g) {
+            EventRef::Message {
+                dedup_id: Uuid::from_u128(u128::arbitrary(g)),
+            }
+        } else {
+            let timer_type = g
+                .choose(&TIMER_TYPES)
+                .copied()
+                .unwrap_or(TimerType::Application);
+            EventRef::Timer(TimerEventRef::new(
+                timer_type,
+                CompactDateTime::from(u32::arbitrary(g)),
+                i32::arbitrary(g),
+            ))
+        };
+        Self(event)
+    }
 }
 
+/// `from_event` followed by `try_into_event` recovers any `EventRef` —
+/// generalizes the two per-variant round-trip examples over random message
+/// dedup ids and timer coordinates. Iteration count comes from
+/// `QUICKCHECK_TESTS`.
 #[test]
-fn round_trips_message_variant() -> Result<()> {
-    assert_round_trips(EventRef::Message {
-        dedup_id: Uuid::from_u128(0xdead_beef),
-    })
-}
-
-#[test]
-fn round_trips_timer_variant() -> Result<()> {
-    assert_round_trips(EventRef::Timer(TimerEventRef::new(
-        TimerType::Application,
-        CompactDateTime::from(123_456_u32),
-        42,
-    )))
+fn prop_event_ref_round_trips() {
+    fn prop(event: ArbEventRef) -> TestResult {
+        let ArbEventRef(event) = event;
+        match RawEventRef::from_event(event).try_into_event() {
+            Ok(decoded) if decoded == event => TestResult::passed(),
+            Ok(decoded) => {
+                TestResult::error(format!("round-trip changed {event:?} into {decoded:?}"))
+            }
+            Err(e) => TestResult::error(format!("round-trip of {event:?} failed: {e}")),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(ArbEventRef) -> TestResult);
 }
 
 #[test]

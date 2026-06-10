@@ -6,21 +6,24 @@
 //! different iterations and different test functions never collide.
 
 use super::{CassandraValueStore, CassandraValueStoreError, ValueQueries};
-use crate::cassandra::{CassandraConfiguration, CassandraStore, TABLE_KEYED_STATE_VALUE};
+use crate::cassandra::{
+    CassandraConfiguration, CassandraStore, TABLE_KEYED_STATE_PENDING, TABLE_KEYED_STATE_VALUE,
+};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::decode::CorruptReason;
 use crate::state::cassandra::error::CorruptUdtError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::memory::MemoryDirtyValueStore;
-use crate::state::pending::PendingIndexStore;
+use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::tests::value_suite::{self, DirectTrace, TEST_TTL, Trace, bytes, collection_ref};
 use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
-use crate::state::{CollectionId, DurableState, EventRef, ValueKind};
+use crate::state::{CollectionId, EventRef, ValueKind};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
+use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
 use std::env;
 use std::fmt::Debug;
@@ -175,25 +178,6 @@ async fn event_mismatch_returns_typed_error() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn stale_pending_row_after_partial_seal() -> Result<()> {
-    init_test_logging();
-    let store = setup_value_store().await?;
-    let collection = collection_ref()?;
-
-    // Mimic a crash between insert_pending and write_wal: the pending row
-    // is present but the value partition has no WAL columns.
-    PendingIndexStore::insert_pending::<ValueKind>(&store, collection.id()).await?;
-
-    let state = store.read_partition(collection.id()).await?;
-    match state {
-        DurableState::Idle { applied: None } => Ok(()),
-        other => Err(eyre::eyre!(
-            "value partition should be Idle empty, got {other:?}"
-        )),
-    }
-}
-
 /// F4 (Cassandra): the shared stale-pending sweep check against the real
 /// Cassandra Value store — the `Idle ⇒ delete_pending` recovery arm run
 /// against a real pending index, not one derived from WAL presence. Mirrors
@@ -203,6 +187,60 @@ async fn state_recovery_sweeps_stale_pending_row() -> Result<()> {
     init_test_logging();
     let store = setup_value_store().await?;
     value_suite::run_stale_pending_index(store).await
+}
+
+/// B.5: the streamed pending scanner drops rows whose discriminators this
+/// build does not recognise — a forward-compatible row a newer build wrote
+/// with a `kind`/`state_type` this build cannot map — rather than failing
+/// the whole partition scan. A valid pending row and a row carrying an
+/// unknown `kind` discriminator share one `(segment_id, key)` partition, so
+/// a single `scan_pending` sees both; the scan must yield exactly the
+/// recognised entry and the stream must not error.
+#[tokio::test]
+async fn scan_pending_skips_unknown_discriminator_rows() -> Result<()> {
+    init_test_logging();
+    let store = setup_value_store().await?;
+    let collection = collection_ref()?;
+    let id: &CollectionId<ValueKind> = collection.id();
+    let state_key = id.state_key();
+
+    // One valid pending row through the production write path.
+    PendingIndexStore::insert_pending::<ValueKind>(&store, id).await?;
+
+    // One forward-compatible row in the SAME partition carrying an unknown
+    // `kind` (99 maps to no `CollectionKindId` this build knows).
+    let cql = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_PENDING} (segment_id, key, state_type, \
+         kind, name) VALUES (?, ?, ?, ?, ?)",
+    );
+    let prepared = store.store.session().prepare(cql).await?;
+    store
+        .store
+        .session()
+        .execute_unpaged(
+            &prepared,
+            (
+                &state_key.segment_id,
+                state_key.key.as_ref(),
+                id.state_type(),
+                99_i8,
+                "from-the-future",
+            ),
+        )
+        .await?;
+
+    let stream = store.scan_pending(state_key);
+    futures::pin_mut!(stream);
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.next().await {
+        entries.push(entry?);
+    }
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the recognised pending row should survive the scan, got {entries:?}"
+    );
+    Ok(())
 }
 
 /// N7/N8 (Cassandra): the shared durable descriptor-identity acquisition
@@ -399,28 +437,78 @@ async fn value_row_stamps_identity_version_with_data() -> Result<()> {
     Ok(())
 }
 
+/// Reads the live `TTL(data)` for `id` directly from Cassandra, bypassing
+/// the store. `Ok(None)` means the column carries no TTL (NULL); `Ok(Some)`
+/// returns the remaining TTL in seconds.
+async fn read_data_ttl(
+    store: &CassandraValueStore,
+    id: &CollectionId<ValueKind>,
+) -> Result<Option<i32>> {
+    let segment_id = &id.state_key().segment_id;
+    let key = id.state_key().key.as_ref();
+    let state_type = id.state_type();
+    let name = id.name().as_str();
+    let cql = format!(
+        "SELECT TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id = ? AND \
+         key = ? AND state_type = ? AND name = ?",
+    );
+    let prepared = store.store.session().prepare(cql).await?;
+    let row = store
+        .store
+        .session()
+        .execute_unpaged(&prepared, (segment_id, key, state_type, name))
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<i32>,)>()?;
+    Ok(row.and_then(|(ttl,)| ttl))
+}
+
 /// Constructing `CassandraValueStore` with `default_ttl = Some(_)` must
-/// route `ValueStore::set` through the with-TTL query arm. The exact TTL
-/// cannot easily be asserted from a `SELECT`, so this test guards against
-/// compilation/dispatch regression of the with-TTL arm.
+/// route `ValueStore::set` through the with-TTL query arm: the written
+/// `data` cell carries a live TTL ≈ `TEST_TTL`. Asserting the TTL (not just
+/// `Ok(())`) pins the arm to the configured duration, so a regression that
+/// silently drops the TTL or routes through the no-TTL arm fails here.
 #[tokio::test]
 async fn set_with_default_ttl_some_writes_via_ttl_arm() -> Result<()> {
+    // No time elapses in the test, so the remaining TTL sits just under the
+    // configured value; allow a generous skew window below `expected`.
+    const SKEW_SECS: i32 = 120;
+
     init_test_logging();
     let store = setup_value_store_with_ttl(TEST_TTL).await?;
     let id = collection_ref()?.id().clone();
     store.set(&id, Bytes::from_static(b"x")).await?;
+
+    let expected: i32 = TEST_TTL
+        .ok_or_else(|| eyre::eyre!("TEST_TTL must be Some"))?
+        .seconds()
+        .try_into()?;
+    let ttl = read_data_ttl(&store, &id)
+        .await?
+        .ok_or_else(|| eyre::eyre!("expected a live TTL on data, got NULL"))?;
+    assert!(
+        ttl > expected - SKEW_SECS && ttl <= expected,
+        "TTL(data) should be ≈ {expected} (TEST_TTL), got {ttl}"
+    );
     Ok(())
 }
 
-/// Constructing `CassandraValueStore` with `default_ttl = None` must
-/// route `ValueStore::set` through the no-TTL query arm. This would have
-/// caught an earlier bug where production writes hardcoded `None`
-/// (and so always used the no-TTL arm even when a TTL was configured).
+/// Constructing `CassandraValueStore` with `default_ttl = None` must route
+/// `ValueStore::set` through the no-TTL query arm: the written `data` cell
+/// carries no TTL. This would have caught an earlier bug where production
+/// writes hardcoded `None` (and so always used the no-TTL arm even when a
+/// TTL was configured).
 #[tokio::test]
 async fn set_with_default_ttl_none_writes_via_no_ttl_arm() -> Result<()> {
     init_test_logging();
     let store = setup_value_store_with_ttl(None).await?;
     let id = collection_ref()?.id().clone();
     store.set(&id, Bytes::from_static(b"x")).await?;
+
+    assert_eq!(
+        read_data_ttl(&store, &id).await?,
+        None,
+        "the no-TTL arm must leave data without a TTL"
+    );
     Ok(())
 }

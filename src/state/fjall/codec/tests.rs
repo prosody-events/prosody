@@ -5,7 +5,7 @@ use crate::Key;
 use crate::state::{CollectionId, EventScopeId, Read, StateKey, StateName, StateType, ValueKind};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -36,12 +36,14 @@ fn absent_round_trip() -> Result<()> {
 fn present_round_trip() {
     fn prop(payload: Vec<u8>) -> TestResult {
         let payload = Bytes::from(payload);
-        let Ok(cell) = encode_present_cell(&payload) else {
-            return TestResult::failed();
+        let cell = match encode_present_cell(&payload) {
+            Ok(cell) => cell,
+            Err(e) => return TestResult::error(format!("encode_present_cell failed: {e}")),
         };
         match decode_cell(Some(cell.as_ref())) {
             Ok(Read::Present(decoded)) => TestResult::from_bool(decoded == payload),
-            _ => TestResult::failed(),
+            Ok(other) => TestResult::error(format!("round-trip produced {other:?}, not Present")),
+            Err(e) => TestResult::error(format!("decode_cell failed: {e}")),
         }
     }
 
@@ -90,11 +92,93 @@ fn collection_prefix_is_deterministic() -> Result<()> {
     Ok(())
 }
 
+/// A collection identity whose variable-length fields are drawn from a tiny
+/// null-prone alphabet, so the injectivity property reaches the corner a
+/// delimiter scheme would break: a `key`/`name` containing the delimiter
+/// byte. `name` is forced non-empty (`StateName` rejects empty).
+#[derive(Clone, Debug)]
+struct PrefixFields {
+    segment: u128,
+    key: String,
+    name: String,
+}
+
+impl Arbitrary for PrefixFields {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            segment: u128::arbitrary(g),
+            key: null_prone_string(g, false),
+            name: null_prone_string(g, true),
+        }
+    }
+}
+
+/// Builds a short string over `{a, b, \0}` so a field that contains the byte
+/// a null-delimiter scheme would use is reachable. `non_empty` guarantees at
+/// least one character for `StateName`.
+fn null_prone_string(g: &mut Gen, non_empty: bool) -> String {
+    const ALPHABET: [char; 3] = ['a', 'b', '\0'];
+    let len = usize::arbitrary(g) % 5 + usize::from(non_empty);
+    (0..len)
+        .map(|_| g.choose(&ALPHABET).copied().unwrap_or('a'))
+        .collect()
+}
+
+fn prefix_for(fields: PrefixFields) -> Result<[u8; 16]> {
+    let name = StateName::try_new(&fields.name)?;
+    let id = CollectionId::<ValueKind>::new(
+        StateKey::new(
+            Uuid::from_u128(fields.segment),
+            Arc::<str>::from(fields.key),
+        ),
+        StateType::Application,
+        name,
+    );
+    Ok(collection_prefix(&id))
+}
+
+/// Injectivity: any two collection identities that differ in at least one
+/// field produce distinct 16-byte prefixes. Generalizes the prior directed
+/// test (which varied only `name`) and, with the null-prone generator,
+/// covers the field-boundary corner. `state_type` has a single discriminant
+/// today, so the property varies the other three fields; it will cover the
+/// type field once a second `StateType` exists.
 #[test]
-fn distinct_collections_get_distinct_prefixes() -> Result<()> {
-    let a = collection("profile-a")?;
-    let b = collection("profile-b")?;
-    assert_ne!(collection_prefix(&a), collection_prefix(&b));
+fn prop_distinct_collections_get_distinct_prefixes() {
+    fn prop(a: PrefixFields, b: PrefixFields) -> TestResult {
+        if (a.segment, &a.key, &a.name) == (b.segment, &b.key, &b.name) {
+            return TestResult::discard();
+        }
+        let (pa, pb) = match (prefix_for(a), prefix_for(b)) {
+            (Ok(pa), Ok(pb)) => (pa, pb),
+            (a, b) => return TestResult::error(format!("prefix build failed: {a:?} / {b:?}")),
+        };
+        TestResult::from_bool(pa != pb)
+    }
+    QuickCheck::new().quickcheck(prop as fn(PrefixFields, PrefixFields) -> TestResult);
+}
+
+/// Regression: with the single `state_type` discriminant sitting at byte
+/// `0x00`, the prior null-delimited encoding made `(key="x", name="\0y")`
+/// and `(key="x\0", name="y")` hash the *same* buffer — a wrong-collection
+/// cache hit. The length-prefixed encoding keeps the field boundary fixed,
+/// so they stay distinct.
+#[test]
+fn null_in_key_or_name_does_not_shift_field_boundary() -> Result<()> {
+    let a = prefix_for(PrefixFields {
+        segment: 0xA1,
+        key: "x".to_owned(),
+        name: "\0y".to_owned(),
+    })?;
+    let b = prefix_for(PrefixFields {
+        segment: 0xA1,
+        key: "x\0".to_owned(),
+        name: "y".to_owned(),
+    })?;
+    assert_ne!(
+        a, b,
+        "a null in key/name must not collapse the key/name boundary"
+    );
     Ok(())
 }
 

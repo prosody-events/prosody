@@ -31,6 +31,7 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity,
     INITIAL_IDENTITY_VERSION, acquire_descriptor_identities,
 };
+use crate::state::layered::LayeredValueStore;
 use crate::state::manager::sweep_pending;
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
@@ -39,9 +40,10 @@ use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Report, Result, eyre};
 use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
+use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1156,4 +1158,411 @@ enum ModelPhase {
     Dirty,
     Sealed,
     Finished,
+}
+
+// ---- Layered ≡ backing full-op differential parity
+// ---------------------------
+//
+// `run_layered_parity` proves `Layered<Cache, B>` is observationally identical
+// to the bare backing `B` over the full Value op set across many collections.
+// Both sides share the backing type `B`, so every WAL/direct path
+// (`read_partition`, `seal`, `apply_sealed`, `rollback_sealed`,
+// `direct_apply`) delegates straight through the cache and is identical by
+// construction; `get` (cache-first) is the only surface where a divergent
+// cache can serve a wrong value. Combined with the retained "B ≡ model" runs,
+// this gives "Layered ≡ model" transitively.
+
+/// Number of distinct collections each parity store drives.
+const PARITY_POOL: usize = 3;
+
+/// Tiny event space for `Seal` so a later `Seal` on the same collection often
+/// reuses a live event (idempotent reseal) and often differs from it
+/// (recover-before-seal). `ApplySealed`/`RollbackSealed` do not draw from it —
+/// they take the live WAL's event from the shadow (see [`compare_op`]).
+const PARITY_EVENTS: u8 = 4;
+
+/// Differential parity runner: drives an identical [`ParityTrace`] against the
+/// layered store (`cache` over `backing_layered`) and the bare `backing_bare`,
+/// asserting they stay observationally identical.
+///
+/// The two stores draw from **disjoint** collection-ref pools (different
+/// segment UUIDs) so they never collide in a shared backing keyspace
+/// (Cassandra), while op `col` indexes both pools so identical
+/// events/payloads/call-shapes hit both — Value semantics are UUID-independent.
+///
+/// `backing_recovers` records whether `B` recovers a sealed WAL on `get`
+/// (`Recovering<…>`). When it does, a `get` during a collection's sealed window
+/// is **not** compared: the bare side recovers (mutating the store) while a
+/// cache hit shields the layered side, a legitimate, desyncing divergence. For
+/// plain backings every `get` is compared, including while sealed — that is
+/// what checks the cache stays coherent with `applied` across `seal` /
+/// `rollback_sealed` (which must not corrupt it).
+///
+/// A one-sided store error surfaces as a runtime `Err`, not a parity
+/// falsification: [`LayeredValueStore`] delegates backing errors verbatim and
+/// swallows cache errors, so an error divergence is necessarily a backend
+/// fault, never a cache bug.
+///
+/// # Errors
+///
+/// Propagates store/runtime errors; a parity violation returns `Ok(false)`.
+pub(crate) async fn run_layered_parity<Cache, B>(
+    cache: Cache,
+    backing_layered: B,
+    backing_bare: B,
+    trace: ParityTrace,
+    backing_recovers: bool,
+) -> Result<bool>
+where
+    Cache: ValueStore + Clone,
+    B: DurableBundle,
+{
+    let layered = LayeredValueStore::new(cache, backing_layered);
+    let layered_pool = parity_pool()?;
+    let bare_pool = parity_pool()?;
+    let mut shadow = Shadow::new();
+
+    for op in trace.0 {
+        let col = op.col();
+        let lref = &layered_pool[col];
+        let bref = &bare_pool[col];
+
+        // A direct write (Set/Clear/DirectApply) onto a collection that holds a
+        // live WAL is unreachable in production — a collection's durable ops are
+        // mode-consistent (WAL-mode events seal then resolve; direct-mode events
+        // direct-apply; the two never mix on one collection). The Cassandra row
+        // encoding even rejects the resulting WAL-present/encoding-absent shape
+        // as corrupt. Skip those ops so the differential exercises only states
+        // production can produce; the stores stay in lockstep since neither
+        // sees the op.
+        let skip_op = shadow.is_sealed(col) && op.is_direct_write();
+
+        // The apply/rollback `expected_event` must match the live WAL — a
+        // mismatch is a store error, not a `NoOp` — so derive it from the
+        // shadow before the op mutates it.
+        if !skip_op
+            && !compare_op(
+                &layered,
+                &backing_bare,
+                lref,
+                bref,
+                &op,
+                shadow.sealed_event(col),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        shadow.observe(&op);
+
+        // `read_partition` is cache-free and recovery-free, so it is the
+        // reliable sealed-window probe — compared on every op.
+        if !partitions_agree(&layered, &backing_bare, lref.id(), bref.id()).await? {
+            return Ok(false);
+        }
+
+        // A `get` during a recovering backing's sealed window would recover
+        // the bare store while a cache hit shields the layered side; skip it.
+        let skip_get = backing_recovers && shadow.is_sealed(col);
+        if !skip_get && !gets_agree(&layered, &backing_bare, lref.id(), bref.id()).await? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+/// Builds one parity pool of [`PARITY_POOL`] collections.
+///
+/// Every entry shares one fresh `segment_id` and the `Application` state type
+/// (the fixed-width prefix of the fjall cache key) and differs only in the
+/// `(key, name)` split of a common byte sequence: `("a", "bc")`, `("ab", "c")`
+/// — both spell `"abc"` once concatenated — and `("abc", "d")`. The shared
+/// fixed prefix forces the cache key's injectivity to rest entirely on the
+/// **length-prefixed** variable-length encoding, so dropping that length
+/// prefix collapses the first two entries onto one cache slot. That makes the
+/// differential a live regression test for the `collection_prefix` injectivity
+/// bug: the bare backing keys these as distinct rows regardless, so a colliding
+/// cache surfaces as a `get` divergence. A fresh per-pool segment keeps the
+/// layered and bare pools disjoint in a shared backing keyspace.
+fn parity_pool() -> Result<Vec<CollectionRef<ValueKind>>> {
+    let segment_id = Uuid::new_v4();
+    [("a", "bc"), ("ab", "c"), ("abc", "d")]
+        .into_iter()
+        .map(|(key, name)| {
+            let id = CollectionId::new(
+                StateKey::new(segment_id, Arc::from(key)),
+                StateType::Application,
+                StateName::try_new(name)?,
+            );
+            Ok(CollectionRef::new(id, TEST_TTL))
+        })
+        .collect()
+}
+
+/// Runner-local sealed-window tracker, one slot per pool collection. Derives
+/// valid `expected_event` args and the get-skip decision without reading either
+/// store: `Seal` opens a window, a matching `ApplySealed`/`RollbackSealed`
+/// closes it. It cannot under-estimate sealed-ness — `get` is only called when
+/// the window is closed, which is exactly when the WAL has cleared.
+struct Shadow {
+    sealed_event: Vec<Option<EventRef>>,
+}
+
+impl Shadow {
+    fn new() -> Self {
+        Self {
+            sealed_event: vec![None; PARITY_POOL],
+        }
+    }
+
+    fn observe(&mut self, op: &ParityOp) {
+        match *op {
+            ParityOp::Seal { col, event, .. } => self.sealed_event[col] = Some(parity_event(event)),
+            // Apply/rollback always pass the live WAL's event (see the runner),
+            // so they resolve it whenever one exists: the window closes either
+            // way.
+            ParityOp::ApplySealed { col } | ParityOp::RollbackSealed { col } => {
+                self.sealed_event[col] = None;
+            }
+            ParityOp::Get { .. }
+            | ParityOp::Set { .. }
+            | ParityOp::Clear { .. }
+            | ParityOp::DirectApply { .. } => {}
+        }
+    }
+
+    fn sealed_event(&self, col: usize) -> Option<EventRef> {
+        self.sealed_event[col]
+    }
+
+    fn is_sealed(&self, col: usize) -> bool {
+        self.sealed_event[col].is_some()
+    }
+}
+
+/// Runs the op against both stores and compares its return value.
+///
+/// `Get` is a no-op here — its return is the read compared by the per-op
+/// `gets_agree` probe, which is the single get-comparison point (gated by the
+/// sealed-window skip). `Seal` compares the sealed event only: a
+/// [`SealedCollection`](super::SealedCollection) embeds the per-pool
+/// `CollectionRef`, whose UUID differs across pools. `ApplySealed`/
+/// `RollbackSealed` pass `sealed_event` (the live WAL's event, from the shadow)
+/// so they resolve the WAL when one exists and otherwise hit the no-WAL `NoOp`
+/// path — never the `EventMismatch` error a stale event would raise.
+async fn compare_op<Cache, B>(
+    layered: &LayeredValueStore<Cache, B>,
+    bare: &B,
+    lref: &CollectionRef<ValueKind>,
+    bref: &CollectionRef<ValueKind>,
+    op: &ParityOp,
+    sealed_event: Option<EventRef>,
+) -> Result<bool>
+where
+    Cache: ValueStore + Clone,
+    B: DurableBundle,
+{
+    let (lid, bid) = (lref.id(), bref.id());
+    match op {
+        ParityOp::Get { .. } => Ok(true),
+        ParityOp::Set { byte, .. } => {
+            let l = layered.set(lid, bytes(*byte)).await;
+            let b = bare.set(bid, bytes(*byte)).await;
+            results_agree(l, b)
+        }
+        ParityOp::Clear { .. } => {
+            let l = layered.clear(lid).await;
+            let b = bare.clear(bid).await;
+            results_agree(l, b)
+        }
+        ParityOp::Seal { event, ops, .. } => {
+            let event = parity_event(*event);
+            let l = layered
+                .seal(lref, event, ops.clone())
+                .await
+                .map(|s| s.event());
+            let b = bare.seal(bref, event, ops.clone()).await.map(|s| s.event());
+            results_agree(l, b)
+        }
+        ParityOp::ApplySealed { .. } => {
+            let event = sealed_event.unwrap_or_else(|| parity_event(0));
+            let l = layered.apply_sealed(lref, event).await;
+            let b = bare.apply_sealed(bref, event).await;
+            results_agree(l, b)
+        }
+        ParityOp::RollbackSealed { .. } => {
+            let event = sealed_event.unwrap_or_else(|| parity_event(0));
+            let l = layered.rollback_sealed(lref, event).await;
+            let b = bare.rollback_sealed(bref, event).await;
+            results_agree(l, b)
+        }
+        ParityOp::DirectApply { ops, .. } => {
+            let l = layered.direct_apply(lref, ops.clone()).await;
+            let b = bare.direct_apply(bref, ops.clone()).await;
+            results_agree(l, b)
+        }
+    }
+}
+
+/// Compares the cache-free, recovery-free [`DurableState`] on both stores.
+async fn partitions_agree<Cache, B>(
+    layered: &LayeredValueStore<Cache, B>,
+    bare: &B,
+    lid: &CollectionId<ValueKind>,
+    bid: &CollectionId<ValueKind>,
+) -> Result<bool>
+where
+    Cache: ValueStore + Clone,
+    B: DurableBundle,
+{
+    let l = DurableWalStore::read_partition(layered, lid).await;
+    let b = DurableWalStore::read_partition(bare, bid).await;
+    results_agree(l, b)
+}
+
+/// Compares the visible [`Read`] on both stores — the only surface a divergent
+/// cache can corrupt.
+async fn gets_agree<Cache, B>(
+    layered: &LayeredValueStore<Cache, B>,
+    bare: &B,
+    lid: &CollectionId<ValueKind>,
+    bid: &CollectionId<ValueKind>,
+) -> Result<bool>
+where
+    Cache: ValueStore + Clone,
+    B: DurableBundle,
+{
+    let l = ValueStore::get(layered, lid).await;
+    let b = ValueStore::get(bare, bid).await;
+    results_agree(l, b)
+}
+
+/// Two successes compare by value; a one-sided error is a parity violation
+/// (`Ok(false)`); a two-sided error is a backend fault propagated as a runtime
+/// `Err`.
+fn results_agree<T, E>(layered: Result<T, E>, bare: Result<T, E>) -> Result<bool>
+where
+    T: PartialEq,
+    E: StdError + Send + Sync + 'static,
+{
+    match (layered, bare) {
+        (Ok(l), Ok(b)) => Ok(l == b),
+        (Err(e), Err(_)) => Err(Report::new(e)),
+        _ => Ok(false),
+    }
+}
+
+/// Message [`EventRef`] for the tiny [`PARITY_EVENTS`] event space.
+fn parity_event(byte: u8) -> EventRef {
+    event(u128::from(byte))
+}
+
+/// A non-empty ordered op list for `Seal`/`DirectApply` (the store rejects an
+/// empty seal).
+fn parity_ops(g: &mut Gen) -> Vec<ValueOp> {
+    let mut ops = vec![value_op(g)];
+    for _ in 0..(u8::arbitrary(g) % 3) {
+        ops.push(value_op(g));
+    }
+    ops
+}
+
+fn value_op(g: &mut Gen) -> ValueOp {
+    if bool::arbitrary(g) {
+        ValueOp::Set {
+            payload: bytes(u8::arbitrary(g)),
+        }
+    } else {
+        ValueOp::Clear
+    }
+}
+
+/// One full-op-set operation in a [`ParityTrace`], targeting pool collection
+/// `col` (taken modulo [`PARITY_POOL`] at generation time).
+#[derive(Clone, Debug)]
+pub(crate) enum ParityOp {
+    Get {
+        col: usize,
+    },
+    Set {
+        col: usize,
+        byte: u8,
+    },
+    Clear {
+        col: usize,
+    },
+    Seal {
+        col: usize,
+        event: u8,
+        ops: Vec<ValueOp>,
+    },
+    ApplySealed {
+        col: usize,
+    },
+    RollbackSealed {
+        col: usize,
+    },
+    DirectApply {
+        col: usize,
+        ops: Vec<ValueOp>,
+    },
+}
+
+impl ParityOp {
+    fn col(&self) -> usize {
+        match *self {
+            Self::Get { col }
+            | Self::Set { col, .. }
+            | Self::Clear { col }
+            | Self::Seal { col, .. }
+            | Self::ApplySealed { col }
+            | Self::RollbackSealed { col }
+            | Self::DirectApply { col, .. } => col,
+        }
+    }
+
+    /// Writes that go straight to the applied columns, bypassing the WAL.
+    /// Issuing one over a live WAL is unreachable in production (see the
+    /// runner).
+    fn is_direct_write(&self) -> bool {
+        matches!(
+            self,
+            Self::Set { .. } | Self::Clear { .. } | Self::DirectApply { .. }
+        )
+    }
+}
+
+impl Arbitrary for ParityOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let col = usize::from(u8::arbitrary(g)) % PARITY_POOL;
+        match u8::arbitrary(g) % 7 {
+            0 => Self::Get { col },
+            1 => Self::Set {
+                col,
+                byte: u8::arbitrary(g),
+            },
+            2 => Self::Clear { col },
+            3 => Self::Seal {
+                col,
+                event: u8::arbitrary(g) % PARITY_EVENTS,
+                ops: parity_ops(g),
+            },
+            4 => Self::ApplySealed { col },
+            5 => Self::RollbackSealed { col },
+            _ => Self::DirectApply {
+                col,
+                ops: parity_ops(g),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ParityTrace(Vec<ParityOp>);
+
+impl Arbitrary for ParityTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self(capped_vec(g, MAX_TRACE_OPS))
+    }
 }
