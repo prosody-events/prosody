@@ -96,19 +96,21 @@ fn decodes_sealed_with_data_and_wal() -> Result<()> {
             assert_eq!(wal.event(), message_event());
             assert_eq!(wal.wal().bytes(), &Bytes::from(wal_bytes));
             assert_eq!(wal.wal().format(), WalFormat::MsgpackStreamZstdV1);
-            assert_eq!(wal.payload_encoding(), PayloadEncoding::RawZstdV1);
             Ok(())
         }
         other => Err(eyre::eyre!("expected Sealed, got {other:?}")),
     }
 }
 
+/// A sealed row with no prior `data` carries no applied cells at all: the
+/// applied triple (`data` + `payload_encoding` + `identity_version`) is
+/// absent and only the WAL columns are set.
 #[test]
 fn decodes_sealed_no_data() -> Result<()> {
     let wal_bytes = vec![1_u8, 2, 3];
     let state = try_decode_row((
         None,
-        Some(i16::from(PayloadEncoding::RawZstdV1)),
+        None,
         None,
         Some(message_event_raw()),
         Some(wal_bytes.clone()),
@@ -188,18 +190,40 @@ fn rejects_partial_wal_columns_ops_and_format_only() -> Result<()> {
     )
 }
 
+/// The `data` ⇔ `payload_encoding` pairing holds in the sealed shape too:
+/// an applied `data` cell with no encoding is corrupt regardless of the WAL
+/// columns (the applied triple is validated independently of the WAL).
 #[test]
-fn rejects_sealed_without_payload_encoding() -> Result<()> {
+fn rejects_sealed_data_without_payload_encoding() -> Result<()> {
+    let data = encoded_payload(4)?;
+    assert_corrupt_wal(
+        try_decode_row((
+            Some(data),
+            None,
+            Some(INITIAL_IDENTITY_VERSION),
+            Some(message_event_raw()),
+            Some(vec![1_u8]),
+            Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
+        )),
+        CorruptReason::MissingPayloadEncodingWithData,
+    )
+}
+
+/// The inverse pairing in the sealed shape: a `payload_encoding` cell with no
+/// `data` is the orphan shape — exactly what a TTL desync between the applied
+/// triple and the WAL columns could otherwise produce (F4).
+#[test]
+fn rejects_sealed_payload_encoding_without_data() -> Result<()> {
     assert_corrupt_wal(
         try_decode_row((
             None,
-            None,
+            Some(i16::from(PayloadEncoding::RawZstdV1)),
             None,
             Some(message_event_raw()),
             Some(vec![1_u8]),
             Some(i16::from(WalFormat::MsgpackStreamZstdV1)),
         )),
-        CorruptReason::WalWithoutPayloadEncoding,
+        CorruptReason::PayloadEncodingWithoutData,
     )
 }
 

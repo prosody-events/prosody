@@ -24,7 +24,7 @@ use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use futures::StreamExt;
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::env;
 use std::fmt::Debug;
 use std::future::Future;
@@ -437,20 +437,24 @@ async fn value_row_stamps_identity_version_with_data() -> Result<()> {
     Ok(())
 }
 
-/// Reads the live `TTL(data)` for `id` directly from Cassandra, bypassing
-/// the store. `Ok(None)` means the column carries no TTL (NULL); `Ok(Some)`
-/// returns the remaining TTL in seconds.
-async fn read_data_ttl(
+/// Reads the live `TTL(data)`, `TTL(payload_encoding)`, and
+/// `TTL(identity_version)` for `id` in one row read, bypassing the store.
+/// Each element is `None` when the column carries no TTL (NULL) and
+/// `Some(secs)` otherwise. All three are read against the same coordinator
+/// timestamp, so two cells written by the same statement read back exactly
+/// equal.
+async fn read_applied_triple_ttls(
     store: &CassandraValueStore,
     id: &CollectionId<ValueKind>,
-) -> Result<Option<i32>> {
+) -> Result<(Option<i32>, Option<i32>, Option<i32>)> {
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
     let state_type = id.state_type();
     let name = id.name().as_str();
     let cql = format!(
-        "SELECT TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id = ? AND \
-         key = ? AND state_type = ? AND name = ?",
+        "SELECT TTL(data), TTL(payload_encoding), TTL(identity_version) FROM \
+         {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id = ? AND key = ? AND \
+         state_type = ? AND name = ?",
     );
     let prepared = store.store.session().prepare(cql).await?;
     let row = store
@@ -459,8 +463,17 @@ async fn read_data_ttl(
         .execute_unpaged(&prepared, (segment_id, key, state_type, name))
         .await?
         .into_rows_result()?
-        .maybe_first_row::<(Option<i32>,)>()?;
-    Ok(row.and_then(|(ttl,)| ttl))
+        .maybe_first_row::<(Option<i32>, Option<i32>, Option<i32>)>()?;
+    Ok(row.unwrap_or((None, None, None)))
+}
+
+/// Reads the live `TTL(data)` for `id`. `Ok(None)` means the column carries
+/// no TTL (NULL); `Ok(Some)` returns the remaining TTL in seconds.
+async fn read_data_ttl(
+    store: &CassandraValueStore,
+    id: &CollectionId<ValueKind>,
+) -> Result<Option<i32>> {
+    Ok(read_applied_triple_ttls(store, id).await?.0)
 }
 
 /// Constructing `CassandraValueStore` with `default_ttl = Some(_)` must
@@ -509,6 +522,161 @@ async fn set_with_default_ttl_none_writes_via_no_ttl_arm() -> Result<()> {
         read_data_ttl(&store, &id).await?,
         None,
         "the no-TTL arm must leave data without a TTL"
+    );
+    Ok(())
+}
+
+/// Returns whether the applied triple's TTLs are *lockstep*: either every
+/// cell is absent (no TTL), or every cell carries the same remaining TTL.
+/// Because the three cells are only ever written by one statement with one
+/// `USING TTL ?`, and read here in a single row read, any other shape means
+/// the triple desynced — the F4 hazard.
+fn applied_triple_ttls_lockstep(ttls: (Option<i32>, Option<i32>, Option<i32>)) -> bool {
+    match ttls {
+        (None, None, None) => true,
+        (Some(d), Some(p), Some(i)) => d == p && p == i,
+        _ => false,
+    }
+}
+
+/// A single step against the Value store, exercising every column-writing
+/// path so a random sequence can drive the applied triple into any reachable
+/// state. `Seal*` writes only the WAL columns; the apply/direct paths write
+/// the whole triple atomically.
+#[derive(Clone, Copy, Debug)]
+enum TtlStep {
+    DirectSet(u8),
+    DirectClear,
+    SealSet(u8),
+    SealClear,
+    ApplySealed,
+    RollbackSealed,
+}
+
+impl Arbitrary for TtlStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let choices = [
+            Self::DirectSet(u8::arbitrary(g)),
+            Self::DirectClear,
+            Self::SealSet(u8::arbitrary(g)),
+            Self::SealClear,
+            Self::ApplySealed,
+            Self::RollbackSealed,
+        ];
+        *g.choose(&choices).unwrap_or(&Self::DirectClear)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TtlTrace(Vec<TtlStep>);
+
+impl Arbitrary for TtlTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self(Vec::<TtlStep>::arbitrary(g))
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.0.shrink().map(Self))
+    }
+}
+
+/// Drives `trace` against a real store and asserts the applied triple's TTLs
+/// stay lockstep after every step. A fresh `segment_id` per run keeps
+/// iterations isolated. `last_seal` tracks the most recent unresolved seal so
+/// `ApplySealed`/`RollbackSealed` target the matching event (and no-op when
+/// nothing is sealed).
+async fn ttl_lockstep_run(store: CassandraValueStore, trace: TtlTrace) -> Result<bool> {
+    use crate::state::value::DirectApplyStore;
+
+    let collection = collection_ref()?;
+    let mut last_seal: Option<EventRef> = None;
+    let mut nonce: u128 = 0;
+
+    for step in trace.0 {
+        match step {
+            TtlStep::DirectSet(b) => {
+                store
+                    .direct_apply(&collection, vec![ValueOp::Set { payload: bytes(b) }])
+                    .await?;
+            }
+            TtlStep::DirectClear => {
+                store
+                    .direct_apply(&collection, vec![ValueOp::Clear])
+                    .await?;
+            }
+            TtlStep::SealSet(_) | TtlStep::SealClear => {
+                let op = match step {
+                    TtlStep::SealSet(b) => ValueOp::Set { payload: bytes(b) },
+                    _ => ValueOp::Clear,
+                };
+                let event = EventRef::Message {
+                    dedup_id: Uuid::from_u128(nonce),
+                };
+                nonce += 1;
+                store.seal(&collection, event, vec![op]).await?;
+                last_seal = Some(event);
+            }
+            TtlStep::ApplySealed => {
+                if let Some(event) = last_seal.take() {
+                    store.apply_sealed(&collection, event).await?;
+                }
+            }
+            TtlStep::RollbackSealed => {
+                if let Some(event) = last_seal.take() {
+                    store.rollback_sealed(&collection, event).await?;
+                }
+            }
+        }
+
+        if !applied_triple_ttls_lockstep(read_applied_triple_ttls(&store, collection.id()).await?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// F4: the applied triple (`data` + `payload_encoding` + `identity_version`)
+/// must keep its TTLs lockstep across every `{direct_apply, seal,
+/// apply_sealed, rollback_sealed}` sequence — the columns are written and
+/// cleared only by the apply/direct-apply statements, never by seal or
+/// rollback. Fails at the pre-fix HEAD the moment a `seal` runs over an empty
+/// row: seal there wrote `payload_encoding` while `data`/`identity_version`
+/// stayed NULL, producing the `(None, Some, None)` orphan shape with no
+/// expiry wait. `default_ttl` is `TEST_TTL` (`Some`) via `setup_value_store`.
+#[test]
+fn prop_applied_triple_ttls_stay_lockstep_against_cassandra() {
+    init_test_logging();
+    QuickCheck::new()
+        .tests(get_test_count())
+        .quickcheck(ttl_lockstep_property as fn(TtlTrace) -> TestResult);
+}
+
+fn ttl_lockstep_property(trace: TtlTrace) -> TestResult {
+    run_cassandra_property(trace, "applied triple TTLs desynced.", ttl_lockstep_run)
+}
+
+/// Deterministic F4 regression: a single `seal` over a fresh (empty) row must
+/// leave the applied triple entirely absent — no `payload_encoding` cell
+/// orphaned without `data`. At the pre-fix HEAD this read back
+/// `(None, Some, None)` and bricked the key's reads until the orphan expired.
+#[tokio::test]
+async fn seal_over_empty_row_leaves_applied_triple_absent() -> Result<()> {
+    init_test_logging();
+    let store = setup_value_store_with_ttl(TEST_TTL).await?;
+    let collection = collection_ref()?;
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(0xF4),
+    };
+
+    store
+        .seal(&collection, event, vec![ValueOp::Set { payload: bytes(1) }])
+        .await?;
+
+    let ttls = read_applied_triple_ttls(&store, collection.id()).await?;
+    assert_eq!(
+        ttls,
+        (None, None, None),
+        "seal must not write any applied-triple cell; got TTLs {ttls:?}"
     );
     Ok(())
 }

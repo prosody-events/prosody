@@ -174,7 +174,6 @@ impl CassandraValueStore {
         ops_bytes: &[u8],
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let payload_encoding = VALUE_PAYLOAD_ENCODING;
         let wal_format = VALUE_WAL_FORMAT;
         self.store
             .execute_with_optional_ttl(
@@ -183,27 +182,12 @@ impl CassandraValueStore {
                 &self.queries.write_wal_no_ttl,
                 |ttl| {
                     (
-                        ttl,
-                        event,
-                        ops_bytes,
-                        wal_format,
-                        payload_encoding,
-                        segment_id,
-                        key,
-                        state_type,
-                        name,
+                        ttl, event, ops_bytes, wal_format, segment_id, key, state_type, name,
                     )
                 },
                 || {
                     (
-                        event,
-                        ops_bytes,
-                        wal_format,
-                        payload_encoding,
-                        segment_id,
-                        key,
-                        state_type,
-                        name,
+                        event, ops_bytes, wal_format, segment_id, key, state_type, name,
                     )
                 },
             )
@@ -211,22 +195,17 @@ impl CassandraValueStore {
         Ok(())
     }
 
-    /// Clears the WAL columns; selects the variant that also wipes
-    /// `payload_encoding` when no authoritative `data` is present, so the
-    /// row never lands in the `PayloadEncodingWithoutData` shape after a
-    /// rollback over a previously-empty row.
+    /// Clears the WAL columns without touching the applied triple. Safe in
+    /// every rollback case: `seal` never writes `payload_encoding`/
+    /// `identity_version`, so the row can never carry an applied cell that
+    /// would orphan when the WAL clears (see the applied-triple invariant on
+    /// the impl block).
     async fn clear_wal_columns(
         &self,
         id: &CollectionId<ValueKind>,
-        keep_payload_encoding: bool,
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(id);
-        let statement = if keep_payload_encoding {
-            &self.queries.clear_wal
-        } else {
-            &self.queries.clear_wal_and_encoding
-        };
-        self.execute_unpaged(statement, (segment_id, key, state_type, name))
+        self.execute_unpaged(&self.queries.clear_wal, (segment_id, key, state_type, name))
             .await
     }
 
@@ -399,6 +378,19 @@ impl ValueStore for CassandraValueStore {
     }
 }
 
+/// # Applied-triple invariant
+///
+/// `data`, `payload_encoding`, and `identity_version` form one *applied
+/// triple*. The triple is written and cleared **only** by the apply and
+/// direct-apply statements (`batch_apply_wal*`, `write_data_only*`), so its
+/// three cells always share one write timestamp and one TTL. `seal` writes
+/// only the WAL columns (`wal_event`/`wal_ops`/`wal_format`) and
+/// `rollback_sealed` clears only the WAL columns — neither touches the
+/// triple. This keeps the triple from desyncing: were `seal` to refresh
+/// `payload_encoding`'s TTL, a later rollback over prior data would let
+/// `data` expire before `payload_encoding`, leaving the
+/// `PayloadEncodingWithoutData` orphan shape the decoder rejects Permanent —
+/// bricking the key's reads *and* writes for up to a TTL window.
 impl DurableWalStore<ValueKind> for CassandraValueStore {
     type Error = CassandraValueStoreError;
 
@@ -458,21 +450,22 @@ impl DurableWalStore<ValueKind> for CassandraValueStore {
 
     /// Rolls back a sealed WAL when it matches `expected_event`. Clears
     /// the WAL columns first, then deletes the pending row. The applied
-    /// cell's TTL is not refreshed; `data` is untouched. Returns `NoOp`
-    /// when no WAL is present.
+    /// triple (`data` + `payload_encoding` + `identity_version`) is
+    /// untouched — its TTL is never refreshed by seal or rollback. Returns
+    /// `NoOp` when no WAL is present.
     async fn rollback_sealed<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
-        let Some((applied, _)) = self
+        if self
             .read_sealed_matching(collection.id(), expected_event)
             .await?
-        else {
+            .is_none()
+        {
             return Ok(StoreOutcome::NoOp);
-        };
-        self.clear_wal_columns(collection.id(), applied.is_some())
-            .await?;
+        }
+        self.clear_wal_columns(collection.id()).await?;
         self.delete_pending::<ValueKind>(collection.id()).await?;
         Ok(StoreOutcome::Applied)
     }

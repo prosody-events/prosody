@@ -10,17 +10,24 @@
 //! | Absent row (no row returned)                         | `Idle { applied: None }`|
 //! | All columns NULL                                     | `Idle { applied: None }`|
 //! | `data + payload_encoding`, no WAL columns            | `Idle { applied: Some }` |
-//! | `data + payload_encoding + wal_event + wal_ops + wal_format` (any data presence) | `Sealed { applied, wal }` |
+//! | WAL columns, no `data`/`payload_encoding`            | `Sealed { applied: None, wal }` |
+//! | `data + payload_encoding` + WAL columns              | `Sealed { applied: Some, wal }` |
 //! | Semantically-corrupt `event_ref` UDT (e.g. `kind == 7`) | `CorruptUdt { .. }` |
-//! | `identity_version` not paired with `data`            | `CorruptWal { reason }` |
+//! | `payload_encoding`/`identity_version` not paired with `data` | `CorruptWal { reason }` |
 //! | `identity_version` ≠ [`INITIAL_IDENTITY_VERSION`]    | `IdentityVersionMismatch` |
 //! | Anything else                                        | `CorruptWal { reason }` |
 //!
-//! `identity_version` pairs with `data` (both present or both NULL): the
-//! stamp records which descriptor identity version the authoritative bytes
-//! were written under. `seal` never stamps — WAL columns carry no version.
-//! A stamp other than [`INITIAL_IDENTITY_VERSION`] is unreachable until
-//! identity migration ships and is rejected Permanent defensively.
+//! `payload_encoding` and `identity_version` both pair with `data` (each
+//! present iff `data` is present), independent of the WAL shape: they are
+//! members of the *applied triple* (`data` + `payload_encoding` +
+//! `identity_version`), written and cleared only by apply/direct-apply
+//! statements. `seal` writes only the WAL columns and rollback clears only
+//! the WAL columns, so the triple always shares one write timestamp and TTL
+//! and a sealed row simply reuses the applied cells (if any) for its
+//! pre-WAL state. `identity_version` records which descriptor identity
+//! version the authoritative bytes were written under; a stamp other than
+//! [`INITIAL_IDENTITY_VERSION`] is unreachable until identity migration
+//! ships and is rejected Permanent defensively.
 //!
 //! The intermediate `Option<...>` tuple [`RawValueRow`] is private to this
 //! module; callers see only the three valid outcomes plus the typed
@@ -105,18 +112,20 @@ fn validate_identity_version(
     }
 }
 
-fn decode_idle(
+/// Decodes the applied cells, enforcing the `data` ⇔ `payload_encoding`
+/// pairing symmetrically with [`validate_identity_version`]. Both members
+/// of the applied triple are present together or absent together, regardless
+/// of the WAL shape — a sealed row with no prior `data` simply has no
+/// applied cells.
+fn decode_applied(
     data: Option<Vec<u8>>,
     payload_encoding: Option<i16>,
-) -> Result<DurableState<ValueKind>, CassandraValueStoreError> {
+) -> Result<Option<bytes::Bytes>, CassandraValueStoreError> {
     match (data, payload_encoding) {
-        (None, None) => Ok(DurableState::Idle { applied: None }),
+        (None, None) => Ok(None),
         (Some(bytes), Some(encoding)) => {
             let encoding = PayloadEncoding::try_from(encoding)?;
-            let payload = decode_payload(&bytes, encoding)?;
-            Ok(DurableState::Idle {
-                applied: Some(payload),
-            })
+            Ok(Some(decode_payload(&bytes, encoding)?))
         }
         (Some(_), None) => Err(CassandraValueStoreError::CorruptWal {
             reason: CorruptReason::MissingPayloadEncodingWithData,
@@ -125,6 +134,15 @@ fn decode_idle(
             reason: CorruptReason::PayloadEncodingWithoutData,
         }),
     }
+}
+
+fn decode_idle(
+    data: Option<Vec<u8>>,
+    payload_encoding: Option<i16>,
+) -> Result<DurableState<ValueKind>, CassandraValueStoreError> {
+    Ok(DurableState::Idle {
+        applied: decode_applied(data, payload_encoding)?,
+    })
 }
 
 fn decode_sealed(
@@ -138,24 +156,11 @@ fn decode_sealed(
     // shape surfaces as `CorruptUdt` (Permanent → skip), not as a laundered
     // scylla `DeserializationError` (Terminal → shut down).
     let event = raw_event.try_into_event()?;
-    let Some(encoding_raw) = payload_encoding else {
-        return Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::WalWithoutPayloadEncoding,
-        });
-    };
     let format = WalFormat::try_from(format_raw)?;
-    let encoding = PayloadEncoding::try_from(encoding_raw)?;
+    let applied = decode_applied(data, payload_encoding)?;
 
-    let applied = match data {
-        Some(bytes) => Some(decode_payload(&bytes, encoding)?),
-        None => None,
-    };
-
-    let wal = SealedWal::<ValueKind>::new(
-        event,
-        WalBlob::new(bytes::Bytes::from(ops_bytes), format),
-        encoding,
-    );
+    let wal =
+        SealedWal::<ValueKind>::new(event, WalBlob::new(bytes::Bytes::from(ops_bytes), format));
     Ok(DurableState::Sealed { applied, wal })
 }
 
@@ -221,10 +226,6 @@ pub enum CorruptReason {
         /// Which of the WAL columns were present.
         mask: WalColumnMask,
     },
-
-    /// All WAL columns are populated but `payload_encoding` is NULL.
-    #[error("sealed WAL row is missing payload_encoding")]
-    WalWithoutPayloadEncoding,
 }
 
 #[cfg(test)]

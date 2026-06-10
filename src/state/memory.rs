@@ -11,8 +11,8 @@ use super::value::{
 };
 use super::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, DirtyStoreProvider,
-    DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read, SealedCollection,
-    SealedWal, StateKey, StateName, StateType, StoreOutcome, WalFormat,
+    DurableState, EventRef, EventScopeId, PendingOps, Read, SealedCollection, SealedWal, StateKey,
+    StateName, StateType, StoreOutcome, WalFormat,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
@@ -291,13 +291,8 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
         let collected: Vec<ValueOp> = ops.into_iter().collect();
-        let wal = SealedWal::try_new(
-            event,
-            collected,
-            WalFormat::MsgpackStreamV1,
-            PayloadEncoding::RawV1,
-        )
-        .map_err(MemoryStateError::Encoding)?;
+        let wal = SealedWal::try_new(event, collected, WalFormat::MsgpackStreamV1)
+            .map_err(MemoryStateError::Encoding)?;
 
         // Mirror Cassandra's ordering: record the pending row first, then
         // write the WAL. Mutate `pending` before borrowing `entries` so the

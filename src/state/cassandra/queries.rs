@@ -36,18 +36,21 @@ cassandra_queries! {
             TABLE_KEYED_STATE_VALUE
         ),
 
-        /// Writes the WAL columns with TTL.
+        /// Writes the WAL columns with TTL. Touches only the WAL columns —
+        /// never `payload_encoding`, which belongs to the applied triple and
+        /// must share that triple's write timestamp and TTL.
         write_wal: (
             "UPDATE $keyspace.{} USING TTL ? \
-             SET wal_event = ?, wal_ops = ?, wal_format = ?, payload_encoding = ? \
+             SET wal_event = ?, wal_ops = ?, wal_format = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
 
-        /// Writes the WAL columns without TTL.
+        /// Writes the WAL columns without TTL. Touches only the WAL columns
+        /// (see `write_wal`).
         write_wal_no_ttl: (
             "UPDATE $keyspace.{} \
-             SET wal_event = ?, wal_ops = ?, wal_format = ?, payload_encoding = ? \
+             SET wal_event = ?, wal_ops = ?, wal_format = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -82,28 +85,17 @@ cassandra_queries! {
             TABLE_KEYED_STATE_VALUE, TABLE_KEYED_STATE_VALUE
         ),
 
-        /// Clears the WAL columns without refreshing the applied cells.
+        /// Clears the WAL columns without touching the applied triple.
         ///
-        /// Used by `rollback_sealed` when authoritative `data` is present:
-        /// the row keeps `data` and `payload_encoding` (which describes
-        /// `data`), and the WAL columns become NULL.
+        /// Used by `rollback_sealed` in every case. Because `seal` never
+        /// writes `payload_encoding`/`identity_version` (the applied triple
+        /// is written and cleared only by apply/direct-apply statements),
+        /// the row never lands in the `PayloadEncodingWithoutData` shape
+        /// after a rollback — clearing the WAL columns alone restores it to
+        /// `Idle` whether or not authoritative `data` is present.
         clear_wal: (
             "UPDATE $keyspace.{} \
              SET wal_event = null, wal_ops = null, wal_format = null \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
-        ),
-
-        /// Clears the WAL columns *and* `payload_encoding` +
-        /// `identity_version`.
-        ///
-        /// Used by `rollback_sealed` when authoritative `data` is also
-        /// NULL: leaving `payload_encoding` or `identity_version` set with
-        /// no `data` would be a corruption shape per the decoder.
-        clear_wal_and_encoding: (
-            "UPDATE $keyspace.{} \
-             SET wal_event = null, wal_ops = null, wal_format = null, \
-                 payload_encoding = null, identity_version = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),

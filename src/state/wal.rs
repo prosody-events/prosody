@@ -2,11 +2,11 @@
 //!
 //! A [`WalEnvelope`] is the materialized typed op stream; [`WalBlob`] is
 //! its encoded bytes tagged with a [`WalFormat`]; [`SealedWal`] is the
-//! durable sealed state (blob + owning [`EventRef`] +
-//! payload encoding). All three rest on [`NonEmptyOps`], which makes the
-//! "a WAL never holds zero operations" invariant a type-level fact.
+//! durable sealed state (blob + owning [`EventRef`]). All three rest on
+//! [`NonEmptyOps`], which makes the "a WAL never holds zero operations"
+//! invariant a type-level fact.
 
-use super::encoding::{self, EncodingError, PayloadEncoding, WalFormat};
+use super::encoding::{self, EncodingError, WalFormat};
 use super::event_ref::EventRef;
 use super::identity::CollectionKind;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -171,7 +171,6 @@ where
 {
     event: EventRef,
     wal: WalBlob<K>,
-    payload_encoding: PayloadEncoding,
 }
 
 impl<K> SealedWal<K>
@@ -180,12 +179,8 @@ where
 {
     /// Creates durable sealed state from an encoded WAL blob.
     #[must_use]
-    pub fn new(event: EventRef, wal: WalBlob<K>, payload_encoding: PayloadEncoding) -> Self {
-        Self {
-            event,
-            wal,
-            payload_encoding,
-        }
+    pub fn new(event: EventRef, wal: WalBlob<K>) -> Self {
+        Self { event, wal }
     }
 
     /// Returns the event that owns the sealed operations.
@@ -198,12 +193,6 @@ where
     #[must_use]
     pub fn wal(&self) -> &WalBlob<K> {
         &self.wal
-    }
-
-    /// Returns the payload encoding for stored payload cells in this partition.
-    #[must_use]
-    pub fn payload_encoding(&self) -> PayloadEncoding {
-        self.payload_encoding
     }
 }
 
@@ -222,11 +211,10 @@ where
         event: EventRef,
         ops: Vec<K::Op>,
         format: WalFormat,
-        payload_encoding: PayloadEncoding,
     ) -> Result<Self, EncodingError> {
         let envelope = WalEnvelope::<K>::try_from_ops(ops)?;
         let wal = encoding::encode_wal::<K>(&envelope, format)?;
-        Ok(Self::new(event, wal, payload_encoding))
+        Ok(Self::new(event, wal))
     }
 }
 
