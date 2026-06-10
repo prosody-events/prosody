@@ -328,7 +328,7 @@ async fn recover_applies_sealed_and_clears_timer() -> Result<()> {
         .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Sealed);
 
-    // The backstop timer the lifecycle middleware would have armed.
+    // The backstop timer the durability boundary would have armed.
     let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
     timers
         .schedule(TimerRequest::new(

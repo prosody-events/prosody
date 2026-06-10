@@ -1174,10 +1174,11 @@ where
     /// This is the lower of the two consumer layers. It wires the partition
     /// machinery and an empty keyed-state backend, then dispatches each
     /// message and timer straight to the handler — no retry, deduplication,
-    /// monopolization, defer, or state-lifecycle middleware runs. The handler
-    /// owns its own commit decisions through the `Uncommitted` types.
+    /// monopolization, or defer middleware runs, and the `settle` durability
+    /// boundary never executes. The handler owns its own commit decisions
+    /// through the `Uncommitted` types.
     ///
-    /// Because no state-lifecycle middleware runs here, keyed-state
+    /// Because the durability boundary never runs here, keyed-state
     /// collections can be neither sealed nor recovered: registering any is
     /// rejected with [`KeyedStateInitError::StateUnsupported`]. Use a
     /// high-level constructor ([`Self::pipeline_consumer`],
@@ -1203,9 +1204,9 @@ where
         consumer_config.validate()?;
         keyed_state_config.validate()?;
 
-        // No state-lifecycle middleware runs on this path, so a registered
-        // collection could never be sealed or recovered. Reject it rather than
-        // silently accept a non-functional registration.
+        // The `settle` durability boundary never runs on this path, so a
+        // registered collection could never be sealed or recovered. Reject it
+        // rather than silently accept a non-functional registration.
         if keyed_state_config.has_registrations() {
             return Err(KeyedStateInitError::StateUnsupported.into());
         }

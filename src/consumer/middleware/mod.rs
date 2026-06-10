@@ -537,8 +537,9 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// invocation maps 1:1 to a single dispatch, and resolving the marker
 /// coincides with the work outcome (commit ⇒ final invocation, abort ⇒
 /// re-dispatch on the next poll, which produces a new invocation with
-/// its own apply hook). [`retry`], defer, and topic middlewares take on
-/// this responsibility for richer compositions.
+/// its own apply hook). [`retry`] owns the only other `EventHandler`
+/// boundary; both route their final outcome through the shared `settle`
+/// durability sequence (see [`FallibleEventHandler`]).
 ///
 /// [`EventHandler`]: crate::consumer::EventHandler
 /// [`Uncommitted::commit`]: crate::consumer::Uncommitted::commit

@@ -110,12 +110,14 @@ impl CommitOracle for RecordingOracle {
 }
 
 /// Durable Value bundle that delegates to [`MemoryDurableValueStore`] but
-/// fails the first `fail_seals` `seal` calls with a *permanent* error, so the
-/// boundary's `retry_step` skips the marker flush without sleeping.
+/// fails the first `fail_seals` `seal` calls with an injected error of the
+/// configured classification: `Permanent` drives the boundary's skip arm,
+/// `Transient` drives `retry_step`'s retry-in-place loop.
 #[derive(Clone, Debug)]
 struct FailingSealDurable {
     inner: MemoryDurableValueStore,
     fail_seals: Arc<AtomicUsize>,
+    category: ErrorCategory,
 }
 
 impl FailingSealDurable {
@@ -123,24 +125,28 @@ impl FailingSealDurable {
         Self {
             inner: MemoryDurableValueStore::for_tests(),
             fail_seals: Arc::new(AtomicUsize::new(0)),
+            category: ErrorCategory::Permanent,
         }
     }
 
-    fn failing_seals(count: usize) -> Self {
+    fn failing_seals(count: usize, category: ErrorCategory) -> Self {
         Self {
             inner: MemoryDurableValueStore::for_tests(),
             fail_seals: Arc::new(AtomicUsize::new(count)),
+            category,
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("injected permanent seal failure")]
-struct InjectedSealError;
+#[error("injected seal failure ({category:?})")]
+struct InjectedSealError {
+    category: ErrorCategory,
+}
 
 impl ClassifyError for InjectedSealError {
     fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
+        self.category
     }
 }
 
@@ -220,7 +226,10 @@ mod failing_seal_impls {
         {
             if self.fail_seals.load(Ordering::SeqCst) > 0 {
                 self.fail_seals.fetch_sub(1, Ordering::SeqCst);
-                return Err(InjectedSealError.into());
+                return Err(InjectedSealError {
+                    category: self.category,
+                }
+                .into());
             }
             Ok(self.inner.seal(collection, event, ops).await?)
         }
@@ -518,7 +527,7 @@ async fn commit_seals_flushes_applies_and_point_clears() -> Result<()> {
 /// seal) the row would be present here.
 #[tokio::test]
 async fn seal_failure_writes_no_marker() -> Result<()> {
-    let durable = FailingSealDurable::failing_seals(1);
+    let durable = FailingSealDurable::failing_seals(1, ErrorCategory::Permanent);
     let store = MemoryDeduplicationStore::new();
     let key: Key = Arc::from("k");
     let marker = Uuid::from_u128(0xBEEF);
@@ -549,6 +558,51 @@ async fn seal_failure_writes_no_marker() -> Result<()> {
         0,
         "nothing resolved, so nothing is point-cleared"
     );
+    Ok(())
+}
+
+/// The literal finding-1 interleaving, transient variant: handler `Ok`, then
+/// the seal fails transiently. Pre-rework, the dedup row was already written
+/// before the seal, so the retry re-dispatch dedup-short-circuited and the
+/// handler's writes were silently lost. Now `retry_step` retries the seal in
+/// place — the handler runs exactly once, the marker flushes only after the
+/// seal eventually succeeds, and the value lands durably. Paused tokio time
+/// auto-advances the boundary's retry sleeps.
+#[tokio::test(start_paused = true)]
+async fn transient_seal_failure_retries_in_place_without_rerunning_handler() -> Result<()> {
+    let durable = FailingSealDurable::failing_seals(2, ErrorCategory::Transient);
+    let store = MemoryDeduplicationStore::new();
+    let key: Key = Arc::from("k");
+    let marker = Uuid::from_u128(0xF1);
+
+    let context = MockEventContext::new()
+        .with_timer_tracking()
+        .with_session(session(durable.clone(), store.clone(), &key)?);
+    let handler = BoundaryHandler::set_ok(5, marker);
+
+    dispatch_message(&handler, context.clone(), 0, &key).await?;
+
+    assert_eq!(
+        handler.observed.lock().len(),
+        1,
+        "transient seal retries never re-run the handler"
+    );
+    assert!(
+        store.exists(marker).await?,
+        "the marker flushes once the seal eventually succeeds"
+    );
+    let id = cart_id(&key)?;
+    assert_eq!(
+        read_applied(&durable, &id).await?,
+        Some(Value::from(5_i32)),
+        "the handler's writes survive the transient seal failures"
+    );
+    assert_eq!(
+        schedules(&context),
+        1,
+        "the eventual seal arms one backstop"
+    );
+    assert_eq!(unschedules(&context), 1, "resolution point-clears it");
     Ok(())
 }
 

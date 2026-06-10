@@ -448,7 +448,9 @@ impl<T> RetryHandler<T> {
 
                     // Attempt boundary: reset the event's keyed-state
                     // session so the failed attempt's dirty ops never leak
-                    // into the next attempt's transaction.
+                    // into the next attempt's transaction — and so its
+                    // registered dedup marker is discarded rather than
+                    // flushed by `settle` after a later attempt succeeds.
                     if let Ok(lifecycle) = context.state(LifecycleAccess) {
                         lifecycle.reset();
                     }
