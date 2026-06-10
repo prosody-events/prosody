@@ -138,8 +138,9 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    abandon, settle,
 };
-use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
 use crate::state::session::LifecycleAccess;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
@@ -710,17 +711,19 @@ where
 // ============================================================================
 //
 // As the outermost durability layer, transient errors retry forever (no
-// fallback exists below). This impl IS the durability boundary that ties the
-// commit/abort of the offset (or timer) marker to the inner handler's apply
-// hook for the FINAL attempt: the `Resolution` returned by `run` is mapped
-// to commit + after_commit or abort + after_abort. Intermediate (non-final)
-// attempts have already been resolved on the inner by `run`'s loop, which
-// fires `inner.after_abort(Err(error))` between attempts to satisfy the
-// per-invocation apply-hook invariant on the inner.
+// fallback exists below). This impl owns the commit-vs-abort *decision* — a
+// shutdown abort must redeliver, not commit, which only the `Resolution` from
+// `run` distinguishes — but it delegates the durability *sequence* (seal →
+// marker flush → commit → resolve) to the shared `settle` / `abandon`
+// functions, the single owner of that sequence (see the `FallibleEventHandler`
+// docs). Intermediate (non-final) attempts have already been resolved on the
+// inner by `run`'s loop, which fires `inner.after_abort(Err(error))` between
+// attempts to satisfy the per-invocation apply-hook invariant on the inner.
 
 impl<T> EventHandler for RetryHandler<T>
 where
     T: FallibleHandler,
+    T::Error: ClassifyError,
 {
     type Payload = T::Payload;
 
@@ -762,13 +765,9 @@ where
             .await;
 
         match resolution {
-            Resolution::Commit(result) => {
-                uncommitted_offset.commit();
-                self.handler.after_commit(context, result).await;
-            }
+            Resolution::Commit(result) => settle(self, context, uncommitted_offset, result).await,
             Resolution::Abort(error) => {
-                uncommitted_offset.abort();
-                self.handler.after_abort(context, Err(error)).await;
+                abandon(self, context, uncommitted_offset, Err(error)).await;
             }
         }
     }
@@ -792,13 +791,9 @@ where
             .await;
 
         match resolution {
-            Resolution::Commit(result) => {
-                uncommitted.commit().await;
-                self.handler.after_commit(context, result).await;
-            }
+            Resolution::Commit(result) => settle(self, context, uncommitted, result).await,
             Resolution::Abort(error) => {
-                uncommitted.abort().await;
-                self.handler.after_abort(context, Err(error)).await;
+                abandon(self, context, uncommitted, Err(error)).await;
             }
         }
     }

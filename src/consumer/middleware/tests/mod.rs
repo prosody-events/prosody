@@ -1,3 +1,4 @@
+mod durability_boundary;
 pub mod test_support;
 
 // Tests for the `after_commit` / `after_abort` apply hooks plumbed

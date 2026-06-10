@@ -14,22 +14,32 @@
 //!
 //! # Lifecycle
 //!
-//! The framework's per-event sequence over a session:
+//! The framework's per-event sequence over a session, driven by the
+//! durability boundary (`crate::consumer::middleware`'s blanket
+//! `EventHandler` impl) in straight-line code:
 //!
-//! 1. Handler ops buffer into the dirty scope through the byte-cell methods.
-//! 2. On handler success, `finalize` seals every dirty `Wal` collection
-//!    (recording the sealed set inside the session) and direct-applies `Direct`
-//!    collections.
-//! 3. After the durability marker resolves, `commit_apply` / `rollback_aborted`
-//!    resolve the recorded sealed set against the durable store.
+//! 1. Handler ops buffer into the dirty scope through the byte-cell methods;
+//!    the deduplication middleware buffers the message's commit marker into the
+//!    session via `register_marker` during unwind.
+//! 2. On the final handler success, `finalize` seals every dirty `Wal`
+//!    collection (recording the sealed set inside the session) and
+//!    direct-applies `Direct` collections.
+//! 3. Strictly after the seal, `flush_marker` writes the registered dedup
+//!    marker through the commit oracle — so a present marker always certifies a
+//!    durable seal. Then `commit_apply` / `rollback_aborted` resolve the
+//!    recorded sealed set against the durable store.
 //! 4. At attempt boundaries (retry, defer), `reset` discards the dirty scope,
-//!    the transaction map, and the sealed set so the next attempt starts clean.
+//!    the transaction map, the sealed set, and the registered marker so the
+//!    next attempt starts clean. A defer-swallow therefore flushes no marker,
+//!    so the deferred reload is not deduped — with no flag and no outcome
+//!    inspection.
 
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::partition::ShutdownPhase;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
+use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind,
@@ -50,6 +60,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use tracing::warn;
+use uuid::Uuid;
 
 /// Bundle bound for the per-event dirty Value store a session composes
 /// with.
@@ -189,7 +200,7 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
 /// [`StateSession`] in bounds but can neither implement it nor reach the
 /// lifecycle: sealing, applying, and resetting are framework-only moves.
 pub(crate) mod sealed {
-    use super::{Future, StateAccessError};
+    use super::{Future, StateAccessError, Uuid};
     use crate::timers::duration::CompactDuration;
 
     /// Whether `finalize` produced sealed collections.
@@ -209,6 +220,14 @@ pub(crate) mod sealed {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ApplyOutcome {
         /// No sealed set was recorded for this event — nothing to resolve.
+        ///
+        /// Load-bearing: `NothingSealed` is **not** `Resolved`. The
+        /// durability boundary only point-clears a `StateRecovery` backstop
+        /// for an event that both armed (sealed) **and** resolved. An event
+        /// that armed defensively after a permanent seal failure leaves an
+        /// empty sealed set, so its `commit_apply` returns `NothingSealed` —
+        /// the boundary must then leave the backstop armed for the sweep to
+        /// roll the partial seal back, never treat it as resolved.
         NothingSealed,
 
         /// Every recorded sealed collection resolved; the caller may clear
@@ -243,13 +262,34 @@ pub(crate) mod sealed {
         /// Best-effort, symmetric with `commit_apply`.
         fn rollback_aborted(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
-        /// Discards the per-event dirty scope, transaction map, and
-        /// recorded sealed set so the next attempt starts clean. Called at
-        /// attempt boundaries (retry, defer-swallow).
+        /// Buffers the message commit marker (`dedup_id`) for this event.
+        ///
+        /// Infallible and last-wins: the deduplication middleware calls it
+        /// during unwind on a handler `Ok` or permanent error. The marker
+        /// rides the session — not derived from the session's `EventRef` —
+        /// because on a deferred-message reload the marker is the reloaded
+        /// *message's* dedup id while the session seals under the *timer's*
+        /// `EventRef`. The boundary flushes it strictly after the seal;
+        /// [`Self::reset`] discards it at attempt boundaries.
+        fn register_marker(&self, dedup_id: Uuid);
+
+        /// Writes the registered marker through the commit oracle, clearing
+        /// the slot only on success so the boundary can retry a transient
+        /// failure. A no-op when no marker is registered (returns `Ok`).
+        ///
+        /// # Errors
+        ///
+        /// Returns a type-erased store error (carrying its classification)
+        /// when the oracle write fails.
+        fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
+        /// Discards the per-event dirty scope, transaction map, recorded
+        /// sealed set, and registered marker so the next attempt starts
+        /// clean. Called at attempt boundaries (retry, defer-swallow).
         fn reset(&self);
 
         /// Delay between sealing and the `StateRecovery` sweep, used by
-        /// the lifecycle middleware to arm the backstop timer.
+        /// the durability boundary to arm the backstop timer.
         fn recovery_fire_delay(&self) -> CompactDuration;
     }
 }
@@ -302,12 +342,16 @@ enum Resolution {
 
 /// Construction parameters for [`ValueStateSession`], bundled so the
 /// constructor stays readable.
-pub struct SessionParts<D, P, L>
+pub struct SessionParts<D, O, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
     /// Partition-lifetime durable Value bundle.
     pub durable: D,
+
+    /// Partition-lifetime commit oracle; the marker flush writes the
+    /// message commit row through it.
+    pub oracle: O,
 
     /// Partition-lifetime dirty-workspace provider; `reset` mints fresh
     /// scopes from it.
@@ -335,11 +379,12 @@ where
     pub termination: TerminationWatch,
 }
 
-struct SessionInner<D, P, L>
+struct SessionInner<D, O, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
     durable: D,
+    oracle: O,
     dirty_provider: P,
     /// Current per-event dirty workspace; swapped for a fresh scope on
     /// `reset`.
@@ -352,22 +397,27 @@ where
     termination: TerminationWatch,
     transactions: SyncMutex<HashMap<StateName, ValueTx<D, P::Store>>>,
     sealed: SyncMutex<Option<SealedSet>>,
+    /// The registered message commit marker, flushed strictly after the
+    /// seal and cleared by `reset`. `None` until the deduplication
+    /// middleware registers it (or always, on the timer arm).
+    marker: SyncMutex<Option<Uuid>>,
 }
 
 /// The real per-event session over a partition's Value stores.
 ///
 /// One session is minted per event by the partition's state manager;
-/// clones share the per-event transaction map, dirty scope, and recorded
-/// sealed set. `D` is the durable Value bundle, `P` the per-partition
-/// dirty-workspace provider, `L` the message loader.
-pub struct ValueStateSession<D, P, L>
+/// clones share the per-event transaction map, dirty scope, recorded
+/// sealed set, and registered marker. `D` is the durable Value bundle, `O`
+/// the commit oracle, `P` the per-partition dirty-workspace provider, `L`
+/// the message loader.
+pub struct ValueStateSession<D, O, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
-    inner: Arc<SessionInner<D, P, L>>,
+    inner: Arc<SessionInner<D, O, P, L>>,
 }
 
-impl<D, P, L> Clone for ValueStateSession<D, P, L>
+impl<D, O, P, L> Clone for ValueStateSession<D, O, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
@@ -378,7 +428,7 @@ where
     }
 }
 
-impl<D, P, L> fmt::Debug for ValueStateSession<D, P, L>
+impl<D, O, P, L> fmt::Debug for ValueStateSession<D, O, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
@@ -390,15 +440,16 @@ where
     }
 }
 
-impl<D, P, L> ValueStateSession<D, P, L>
+impl<D, O, P, L> ValueStateSession<D, O, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
     /// Creates a session for one event, opening a fresh dirty scope.
     #[must_use]
-    pub fn new(parts: SessionParts<D, P, L>) -> Self {
+    pub fn new(parts: SessionParts<D, O, P, L>) -> Self {
         let SessionParts {
             durable,
+            oracle,
             dirty,
             loader,
             registry,
@@ -411,6 +462,7 @@ where
         Self {
             inner: Arc::new(SessionInner {
                 durable,
+                oracle,
                 dirty_provider: dirty,
                 dirty: SyncMutex::new(scope),
                 loader,
@@ -421,6 +473,7 @@ where
                 termination,
                 transactions: SyncMutex::new(HashMap::new()),
                 sealed: SyncMutex::new(None),
+                marker: SyncMutex::new(None),
             }),
         }
     }
@@ -429,6 +482,12 @@ where
     #[cfg(test)]
     pub(crate) fn event(&self) -> EventRef {
         self.inner.event
+    }
+
+    /// The currently registered marker (test observability).
+    #[cfg(test)]
+    pub(crate) fn registered_marker(&self) -> Option<Uuid> {
+        *self.inner.marker.lock()
     }
 
     fn collection_id_for(&self, name: &StateName) -> CollectionId<ValueKind> {
@@ -447,7 +506,7 @@ where
     }
 }
 
-impl<D, P, L> ValueStateSession<D, P, L>
+impl<D, O, P, L> ValueStateSession<D, O, P, L>
 where
     D: Clone,
     P: DirtyStoreProvider<ValueKind>,
@@ -474,9 +533,10 @@ where
     }
 }
 
-impl<D, P, L> StateSession for ValueStateSession<D, P, L>
+impl<D, O, P, L> StateSession for ValueStateSession<D, O, P, L>
 where
     D: DurableValueBundle,
+    O: CommitOracle,
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + Send + Sync,
     L: Clone + Send + Sync + 'static,
@@ -546,7 +606,7 @@ where
     }
 }
 
-impl<D, P, L> ValueStateSession<D, P, L>
+impl<D, O, P, L> ValueStateSession<D, O, P, L>
 where
     D: DurableValueBundle,
     P: DirtyStoreProvider<ValueKind>,
@@ -584,13 +644,21 @@ where
     }
 }
 
-impl<D, P, L> StateLifecycle for ValueStateSession<D, P, L>
+impl<D, O, P, L> StateLifecycle for ValueStateSession<D, O, P, L>
 where
     D: DurableValueBundle,
+    O: CommitOracle,
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + Send + Sync,
     L: Send + Sync + 'static,
 {
+    /// Seals dirty `Wal` collections and direct-applies `Direct` ones,
+    /// recording the sealed set. **Idempotent under retry**: the durability
+    /// boundary retries a transient seal failure in place, so a partial seal
+    /// (collection A sealed, B failed) must not poison the re-run. An
+    /// already-`Sealed` `Wal` collection re-collects into the sealed set
+    /// rather than erroring `AlreadySealed`, and a `Finished` `Direct`
+    /// collection (applied on a prior attempt) is tolerated.
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
         use crate::state::value::TransactionValueStoreError;
 
@@ -611,10 +679,20 @@ where
                         // Touched the collection (e.g. via `get`) but
                         // never mutated it — nothing to seal.
                     }
+                    // A prior attempt of this same finalize already sealed
+                    // this collection; re-collect it so the retry records the
+                    // complete sealed set instead of failing forever.
+                    Err(TransactionValueStoreError::AlreadySealed) => {
+                        sealed.push(self.collection_ref_for(&name));
+                    }
                     Err(err) => return Err(StateAccessError::store(&err)),
                 },
                 CommitMode::Direct => match guard.direct_apply().await {
-                    Ok(_) | Err(TransactionValueStoreError::NoPendingOps) => {}
+                    Ok(_)
+                    | Err(
+                        TransactionValueStoreError::NoPendingOps
+                        | TransactionValueStoreError::Finished,
+                    ) => {}
                     Err(err) => return Err(StateAccessError::store(&err)),
                 },
             }
@@ -637,12 +715,33 @@ where
         self.resolve_sealed(Resolution::Rollback).await
     }
 
+    fn register_marker(&self, dedup_id: Uuid) {
+        *self.inner.marker.lock() = Some(dedup_id);
+    }
+
+    async fn flush_marker(&self) -> Result<(), StateAccessError> {
+        // Read without taking: the slot clears only after the oracle write
+        // succeeds, so a transient failure leaves the marker for the
+        // boundary to retry.
+        let Some(dedup_id) = *self.inner.marker.lock() else {
+            return Ok(());
+        };
+        self.inner
+            .oracle
+            .record_message(dedup_id)
+            .await
+            .map_err(|e| StateAccessError::store(&e))?;
+        *self.inner.marker.lock() = None;
+        Ok(())
+    }
+
     fn reset(&self) {
         // Swap in a fresh dirty scope first so no cleared transaction can
         // observe the old workspace through a racing re-open.
         *self.inner.dirty.lock() = self.inner.dirty_provider.for_scope(EventScopeId::fresh());
         self.inner.transactions.lock().clear();
         *self.inner.sealed.lock() = None;
+        *self.inner.marker.lock() = None;
     }
 
     fn recovery_fire_delay(&self) -> CompactDuration {
@@ -717,6 +816,20 @@ where
         self.session.rollback_aborted().await
     }
 
+    /// See [`StateLifecycle::register_marker`].
+    pub(crate) fn register_marker(&self, dedup_id: Uuid) {
+        self.session.register_marker(dedup_id);
+    }
+
+    /// See [`StateLifecycle::flush_marker`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a type-erased store error when the oracle write fails.
+    pub(crate) async fn flush_marker(&self) -> Result<(), StateAccessError> {
+        self.session.flush_marker().await
+    }
+
     /// See [`StateLifecycle::reset`].
     pub(crate) fn reset(&self) {
         self.session.reset();
@@ -742,6 +855,10 @@ where
 #[derive(Clone)]
 pub struct UnavailableState<P> {
     loader: MemoryLoader<P>,
+    /// Records every `register_marker` call so tests can prove the boundary
+    /// routes the marker through the session even on a stateless stub. The
+    /// stub's `flush_marker` stays inert (no oracle), returning `Ok`.
+    markers: Arc<SyncMutex<Vec<Uuid>>>,
 }
 
 #[cfg(test)]
@@ -754,7 +871,13 @@ where
     pub fn new() -> Self {
         Self {
             loader: MemoryLoader::new(),
+            markers: Arc::new(SyncMutex::new(Vec::new())),
         }
+    }
+
+    /// The markers registered against this stub (test observability).
+    pub(crate) fn registered_markers(&self) -> Vec<Uuid> {
+        self.markers.lock().clone()
     }
 }
 
@@ -836,7 +959,17 @@ where
         ApplyOutcome::NothingSealed
     }
 
-    fn reset(&self) {}
+    fn register_marker(&self, dedup_id: Uuid) {
+        self.markers.lock().push(dedup_id);
+    }
+
+    async fn flush_marker(&self) -> Result<(), StateAccessError> {
+        Ok(())
+    }
+
+    fn reset(&self) {
+        self.markers.lock().clear();
+    }
 
     fn recovery_fire_delay(&self) -> CompactDuration {
         CompactDuration::MIN

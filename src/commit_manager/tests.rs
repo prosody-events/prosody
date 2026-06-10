@@ -398,6 +398,65 @@ async fn commit_manager_drives_recovering_value_store_get() -> Result<()> {
     }
 }
 
+/// The message-arm crash window between seal and marker flush: a Value WAL is
+/// sealed under a message event but its dedup row was never written (the
+/// durability boundary crashed after the seal, before
+/// [`CommitOracle::record_message`]). The oracle answers `NotCommitted`, so
+/// `RecoveringValueStore::get` rolls the orphan seal back — the message
+/// redelivers and re-runs from clean state. Pairs with
+/// [`commit_manager_drives_recovering_value_store_get`] (row present ⇒ apply).
+#[tokio::test]
+async fn commit_manager_rolls_back_unflushed_message_seal() -> Result<()> {
+    use std::sync::Arc as StdArc;
+
+    use crate::state::memory::MemoryDurableValueStore;
+    use crate::state::recovering::RecoveringValueStore;
+    use crate::state::value::{DurableWalStore, ValueOp, ValueStore};
+    use crate::state::{
+        CollectionId, CollectionRef, DurableState, EventRef, Read, StateKey, StateName, StateType,
+    };
+    use bytes::Bytes;
+
+    time::pause();
+    let (_stream, manager, _tx) = setup().await?;
+    // Empty dedup store: the marker was never flushed.
+    let oracle = CommitManager::new(MemoryDeduplicationStore::new(), manager);
+
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = CollectionRef::new(
+        CollectionId::new(
+            StateKey::new(Uuid::new_v4(), StdArc::from("unflushed-message-key")),
+            StateType::Application,
+            StateName::try_new("unflushed-smoke").map_err(|e| eyre!("{e}"))?,
+        ),
+        None,
+    );
+    let id = collection.id().clone();
+    inner
+        .seal(
+            &collection,
+            EventRef::Message {
+                dedup_id: Uuid::new_v4(),
+            },
+            vec![ValueOp::Set {
+                payload: Bytes::from_static(b"orphan"),
+            }],
+        )
+        .await
+        .map_err(|e| eyre!("{e}"))?;
+
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, None);
+    // No marker ⇒ NotCommitted ⇒ the orphan seal rolls back to Absent.
+    assert_eq!(
+        store.get(&id).await.map_err(|e| eyre!("{e}"))?,
+        Read::Absent
+    );
+    match inner.read_partition(&id).await.map_err(|e| eyre!("{e}"))? {
+        DurableState::Idle { applied: None } => Ok(()),
+        other => Err(eyre!("expected Idle/Absent post-rollback, got {other:?}")),
+    }
+}
+
 /// Sibling of [`commit_manager_drives_recovering_value_store_get`] for the
 /// timer arm: a Value WAL sealed under a *timer* `EventRef` recovers through
 /// `RecoveringValueStore::get`, exercising `is_timer_committed`. The timer is

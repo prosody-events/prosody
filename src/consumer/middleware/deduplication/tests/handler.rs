@@ -7,10 +7,12 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
     DedupIdentity, DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
-    MemoryDeduplicationStore, MemoryDeduplicationStoreProvider, dedup_uuid, dedup_uuid_for_message,
+    DeduplicationStore, MemoryDeduplicationStore, MemoryDeduplicationStoreProvider, dedup_uuid,
+    dedup_uuid_for_message,
 };
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
+use crate::state::session::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -175,32 +177,29 @@ fn create_test_message(
     ))
 }
 
+/// A row already present in the store (written by a prior committed
+/// dispatch's marker flush) filters the message before the handler runs.
+/// Pre-seeded because the middleware no longer writes the store itself —
+/// the marker is flushed later, at the `settle` boundary.
 #[tokio::test]
-async fn local_cache_hit_skips_handler() {
+async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
     let context = MockEventContext::new();
 
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        return;
+    let Some(msg) = create_test_message("key1", Some("evt1")) else {
+        color_eyre::eyre::bail!("could not create test message");
     };
-    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
+    let id = handler.dedup_uuid_for_message(&msg);
+    handler.store.insert(id).await?;
 
-    // First call processes
-    let result =
-        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
-    assert!(result.is_ok());
-    assert_eq!(handler.inner.call_count(), 1);
-
-    // Second call deduplicates
-    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
-    assert!(result.is_ok());
-    assert_eq!(handler.inner.call_count(), 1);
+    let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
+    assert!(matches!(result, Ok(None)), "a seeded id is filtered");
+    assert_eq!(handler.inner.call_count(), 0, "filtered before the handler");
+    Ok(())
 }
 
 #[tokio::test]
-async fn cache_miss_processes_and_populates() {
+async fn cache_miss_runs_handler() {
     let handler = create_handler(MockHandler::success());
     let context = MockEventContext::new();
 
@@ -209,8 +208,59 @@ async fn cache_miss_processes_and_populates() {
     };
 
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
-    assert!(result.is_ok());
+    assert!(matches!(result, Ok(Some(()))));
     assert_eq!(handler.inner.call_count(), 1);
+}
+
+/// The middleware registers the message's commit marker in the session on a
+/// final outcome (`Ok` or `Permanent`) and not on a non-final one
+/// (`Transient`/`Terminal`); either way it never writes the store itself —
+/// the flush happens later at the `settle` boundary. Subsumes the old
+/// per-error-class insert tests.
+#[tokio::test]
+async fn marker_registered_for_final_outcomes_only() -> color_eyre::Result<()> {
+    let cases: [(fn() -> MockHandler, bool); 4] = [
+        (MockHandler::success, true),
+        (MockHandler::failing_permanent, true),
+        (MockHandler::failing_transient, false),
+        (MockHandler::failing_terminal, false),
+    ];
+    for (make, expect_registered) in cases {
+        let handler = create_handler(make());
+        let session = UnavailableState::<serde_json::Value>::new();
+        let context = MockEventContext::new().with_session(session.clone());
+
+        let Some(msg) = create_test_message("key1", Some("evt1")) else {
+            color_eyre::eyre::bail!("could not create test message");
+        };
+        let id = handler.dedup_uuid_for_message(&msg);
+
+        let _ = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
+        assert_eq!(
+            handler.inner.call_count(),
+            1,
+            "handler runs on a cache miss"
+        );
+
+        let registered = session.registered_markers();
+        assert_eq!(
+            !registered.is_empty(),
+            expect_registered,
+            "marker registered iff the outcome is final (Ok | Permanent)"
+        );
+        if expect_registered {
+            assert_eq!(
+                registered,
+                vec![id],
+                "the registered marker is the message id"
+            );
+        }
+        assert!(
+            !handler.store.exists(id).await?,
+            "the middleware never writes the dedup store — settle flushes the marker"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -243,76 +293,6 @@ async fn timer_passthrough() {
     let result = FallibleHandler::on_timer(&handler, context, trigger, DemandType::Normal).await;
     assert!(result.is_ok());
     assert_eq!(handler.inner.call_count(), 1);
-}
-
-#[tokio::test]
-async fn permanent_error_is_deduplicated() {
-    let handler = create_handler(MockHandler::failing_permanent());
-    let context = MockEventContext::new();
-
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-
-    // First call: permanent failure, should still write to dedup store
-    let result =
-        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
-    assert!(result.is_err());
-    assert_eq!(handler.inner.call_count(), 1);
-
-    // Second call with same message: deduplicated — handler not called again
-    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
-    assert!(result.is_ok());
-    assert_eq!(handler.inner.call_count(), 1);
-}
-
-#[tokio::test]
-async fn transient_error_does_not_deduplicate() {
-    let handler = create_handler(MockHandler::failing_transient());
-    let context = MockEventContext::new();
-
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-
-    // First call: transient failure, must NOT write to dedup store
-    let result =
-        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
-    assert!(result.is_err());
-
-    // Second call: not deduplicated — retry reaches handler again
-    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
-    assert!(result.is_err());
-    assert_eq!(handler.inner.call_count(), 2);
-}
-
-#[tokio::test]
-async fn terminal_error_does_not_deduplicate() {
-    let handler = create_handler(MockHandler::failing_terminal());
-    let context = MockEventContext::new();
-
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-
-    // First call: terminal failure, must NOT write to dedup store
-    let result =
-        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
-    assert!(result.is_err());
-
-    // Second call: not deduplicated — handler reached again
-    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
-    assert!(result.is_err());
-    assert_eq!(handler.inner.call_count(), 2);
 }
 
 #[test]
@@ -488,7 +468,7 @@ impl FallibleHandler for ApplyProbe {
 }
 
 #[tokio::test]
-async fn dedup_skip_does_not_invoke_inner_after_commit() {
+async fn dedup_skip_does_not_invoke_inner_after_commit() -> color_eyre::Result<()> {
     // First message goes through, second is deduplicated → inner.after_commit
     // must fire on the first dispatch but NOT on the second.
     let inner = ApplyProbe::default();
@@ -497,10 +477,10 @@ async fn dedup_skip_does_not_invoke_inner_after_commit() {
     let context = MockEventContext::new();
 
     let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        return;
+        color_eyre::eyre::bail!("could not create test message");
     };
     let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        return;
+        color_eyre::eyre::bail!("could not create test message");
     };
 
     // First dispatch: inner runs, on_message returns Ok(Some(())).
@@ -509,6 +489,13 @@ async fn dedup_skip_does_not_invoke_inner_after_commit() {
     assert!(matches!(result1, Ok(Some(()))));
     // The dedup middleware's after_commit must forward the inner half.
     FallibleHandler::after_commit(&handler, context.clone(), result1).await;
+
+    // Simulate the `settle` boundary flushing the registered marker after the
+    // first commit (the middleware no longer writes the store itself).
+    handler
+        .store
+        .insert(handler.dedup_uuid_for_message(&msg2))
+        .await?;
 
     // Second dispatch: deduplicated, on_message returns Ok(None).
     let result2 =
@@ -521,6 +508,7 @@ async fn dedup_skip_does_not_invoke_inner_after_commit() {
         vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
         "second dispatch must NOT invoke inner.after_commit (handler never ran)",
     );
+    Ok(())
 }
 
 #[tokio::test]

@@ -12,7 +12,9 @@ use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::middleware::CloneProvider;
-use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::{
+    ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::timers::UncommittedTimer;
@@ -45,7 +47,7 @@ impl EventHandler for TestHandler {
         let key = inner.key().to_string();
         let payload = inner.payload().clone();
         let _ = self.tx.send((key, payload)).await;
-        uncommitted.commit();
+        uncommitted.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)

@@ -17,7 +17,9 @@ use prosody::{
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
+    consumer::{
+        ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+    },
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
     timers::TimerType,
@@ -83,7 +85,7 @@ impl EventHandler for TimerTestHandler {
             .await
         {
             error!("Failed to send message event: {e}");
-            uncommitted.commit();
+            uncommitted.commit().await;
             return;
         }
 
@@ -141,7 +143,7 @@ impl EventHandler for TimerTestHandler {
             }
         }
 
-        uncommitted.commit();
+        uncommitted.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)

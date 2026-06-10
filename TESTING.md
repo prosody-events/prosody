@@ -78,8 +78,9 @@ so failures reduce to minimal reproductions. Without shrinking, a failing
 inside generators — deterministic ranges keep failures reproducible.
 
 Exemplars: `src/state/tests/value_suite.rs` (`Trace`),
-`src/state/tests/encoding.rs` (`Arb*` wrappers around enums),
-`DispatchTrace` in `src/consumer/middleware/state_lifecycle/tests.rs`.
+`src/state/tests/encoding.rs` (`Arb*` wrappers around enums), and the
+durability-sequence properties in
+`src/consumer/middleware/tests/durability_boundary.rs`.
 
 ### Backend-generic suite runners
 

@@ -102,6 +102,10 @@ impl MockOracle {
 impl CommitOracle for MockOracle {
     type Error = MockOracleError;
 
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn resolve<'a>(
         &'a self,
         _collection: &'a CollectionId<ValueKind>,
@@ -157,6 +161,10 @@ impl ScriptedOracle {
 
 impl CommitOracle for ScriptedOracle {
     type Error = MockOracleError;
+
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     async fn resolve<'a>(
         &'a self,

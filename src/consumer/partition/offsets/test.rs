@@ -19,6 +19,7 @@ use tokio::task;
 use tokio::time::{Instant, advance};
 
 use crate::Offset;
+use crate::consumer::Uncommitted;
 use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation, UncommittedOffset};
 use crate::test_util::TEST_RUNTIME;
 
@@ -82,7 +83,7 @@ async fn tracks_commit_watermark_impl(Actions(actions): Actions) -> TestResult {
             Operation::Commit => {
                 // Commit an offset if it was previously taken
                 if let Some(commit) = commits.remove(&action.offset) {
-                    commit.commit();
+                    commit.commit().await;
                     test_offsets.insert(action.offset, action.operation);
                 }
             }
@@ -190,7 +191,7 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
                 }
                 StallAction::Commit(offset) => {
                     if let Some((uncommitted_offset, _)) = uncommitted_offsets.remove(&offset) {
-                        uncommitted_offset.commit();
+                        uncommitted_offset.commit().await;
                         committed_offsets.insert(offset);
                     }
                 }

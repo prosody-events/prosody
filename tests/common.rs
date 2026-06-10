@@ -30,7 +30,9 @@ use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
 use prosody::consumer::middleware::{CloneProvider, FallibleHandler};
-use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::{
+    ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
@@ -463,7 +465,7 @@ impl EventHandler for TestHandler {
             error!("failed to send message: {error:#}");
         }
 
-        uncommitted.commit(); // Commit message to mark as processed
+        uncommitted.commit().await; // Commit message to mark as processed
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
@@ -509,7 +511,7 @@ impl EventHandler for SlowTestHandler {
         if let Err(e) = self.messages_tx.send((key.clone(), payload)).await {
             error!("failed to send message for key {}: {e:#}", key);
         }
-        uncommitted.commit(); // Commit message to mark as processed
+        uncommitted.commit().await; // Commit message to mark as processed
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)

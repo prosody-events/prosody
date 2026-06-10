@@ -155,7 +155,6 @@ use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::scheduler::{
     SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
 };
-use crate::consumer::middleware::state_lifecycle::StateLifecycleMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
@@ -851,23 +850,24 @@ impl PipelineMiddlewareStack {
         let version: Arc<str> = Arc::from(self.common_config.dedup.version.as_str());
 
         // `build_common_middleware` constructs the whole common block —
-        // including dedup + state_lifecycle — so the pipeline only layers its
-        // mode-specific middleware OUTSIDE it. `.layer(x)` makes `x` the
-        // OUTERMOST layer, so the stack runs outer→inner as:
+        // including dedup — so the pipeline only layers its mode-specific
+        // middleware OUTSIDE it. `.layer(x)` makes `x` the OUTERMOST layer, so
+        // the stack runs outer→inner as:
         //
         //   retry → message_defer → timer_defer → monopolization
-        //     → state_lifecycle → dedup → common(cancellation → scheduler
-        //     → timeout → telemetry) → handler
+        //     → dedup → common(cancellation → scheduler → timeout
+        //     → telemetry) → handler
         //
-        // retry stays OUTSIDE everything so each attempt is a fresh dispatch
-        // that resets the event's session. The defer middlewares sit OUTSIDE
-        // the keyed-state pair: `state_lifecycle` seals only on an inner `Ok`,
-        // so a deferred (transient-error) dispatch seals nothing, and only an
-        // outer defer middleware can route that committed defer marker through
-        // `state_lifecycle`'s `after_abort` instead of `after_commit`.
-        // `monopolization` is state-agnostic, so its position is immaterial.
-        // See the Middleware-composition section of CLAUDE.md for the full
-        // correctness argument.
+        // The keyed-state durability sequence is NOT in this stack — it runs
+        // once after the stack returns, owned by the `settle` boundary (see
+        // `consumer::middleware`'s `FallibleEventHandler` docs). Three residual
+        // order facts remain: retry stays OUTERMOST so each attempt is a fresh
+        // dispatch that resets the event's session (and the registered marker);
+        // the defer middlewares sit OUTSIDE the common block so a defer-swallow
+        // resets the session before swallowing into `Ok(Deferred)`, leaving no
+        // marker to flush (the reload is therefore not deduped); and `dedup`
+        // stays in-stack as a duplicate filter so the deferred-message reload
+        // still filters producer duplicates. `monopolization` is state-agnostic.
         let common_middleware = build_common_middleware::<DP, C::Payload>(
             &self.common_config,
             &self.consumer_config,
@@ -1003,11 +1003,12 @@ async fn prepare_pipeline_stack(
 /// common-middleware component is constructed.
 ///
 /// This is the whole cross-mode set: telemetry, timeout, scheduler,
-/// cancellation, and the keyed-state pair **deduplication + `state_lifecycle`**
-/// (the mandatory commit oracle). It runs outer→inner as
-/// `state_lifecycle → dedup → cancellation → scheduler → timeout → telemetry →
-/// handler`. Each mode layers only its *mode-specific* middleware (retry,
-/// monopolization, defer, failure-topic, log) OUTSIDE the returned block.
+/// cancellation, and **deduplication** (the mandatory commit oracle, here a
+/// duplicate filter + marker register — the marker is flushed later by the
+/// `settle` boundary, not in this stack). It runs outer→inner as
+/// `dedup → cancellation → scheduler → timeout → telemetry → handler`. Each
+/// mode layers only its *mode-specific* middleware (retry, monopolization,
+/// defer, failure-topic, log) OUTSIDE the returned block.
 ///
 /// Because the deduplication middleware needs the per-partition dedup store,
 /// this is called INSIDE the storage `match` arm where the concrete
@@ -1037,8 +1038,7 @@ where
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
         .layer(CancellationMiddleware::new())
-        .layer(dedup_middleware)
-        .layer(StateLifecycleMiddleware))
+        .layer(dedup_middleware))
 }
 
 /// Builds the keyed-state provider for a [`StorePair::Memory`] arm: the
@@ -1441,9 +1441,10 @@ where
         let topic_middleware =
             FailureTopicMiddleware::new(topic_config, consumer_config.group_id.clone(), producer)?;
 
-        // dedup + state_lifecycle live inside the common block; the
-        // failure-topic/retry chain layers OUTSIDE it, so a routed failure
-        // (which the topic middleware swallows) is never recorded as a commit.
+        // dedup lives inside the common block; the failure-topic/retry chain
+        // layers OUTSIDE it, so a routed failure (which the topic middleware
+        // swallows) is never recorded as a commit. The keyed-state durability
+        // sequence runs after the stack returns, in the `settle` boundary.
         // Built per storage arm because the dedup store lives there.
         match stores {
             StorePair::Memory {
@@ -1535,9 +1536,10 @@ where
             build_inert_shared_state(consumer_config, trigger_store_config, common_config).await?;
         let version = keyed_state.version.clone();
 
-        // dedup + state_lifecycle live inside the common block; `log` (which
-        // swallows failures) layers OUTSIDE it. Built per storage arm because
-        // the dedup store lives there.
+        // dedup lives inside the common block; `log` (which swallows failures)
+        // layers OUTSIDE it. The keyed-state durability sequence runs after the
+        // stack returns, in the `settle` boundary. Built per storage arm
+        // because the dedup store lives there.
         match stores {
             StorePair::Memory {
                 trigger_provider,

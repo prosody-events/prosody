@@ -16,18 +16,51 @@ use crate::state::memory::{
     MemoryDirtyValueStoreProvider, MemoryDurableValueStore, MemoryStateError,
 };
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::tests::value_suite::bytes;
+use crate::state::tests::value_suite::{FixedOracle, FixedOracleError, bytes};
 use crate::state::value::ValueOp;
-use crate::state::{DurableState, SealedCollection, StateType};
+use crate::state::{CommitDecision, DurableState, SealedCollection, StateType};
 use color_eyre::eyre::{Result, eyre};
 use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use uuid::Uuid;
 
 type TestSession = ValueStateSession<
     MemoryDurableValueStore,
+    FixedOracle,
+    MemoryDirtyValueStoreProvider,
+    MemoryLoader<serde_json::Value>,
+>;
+
+/// Commit oracle that records every `record_message` so the marker-flush
+/// tests can assert what the session wrote through the oracle.
+#[derive(Clone, Default)]
+struct RecordingOracle {
+    recorded: Arc<SyncMutex<Vec<Uuid>>>,
+}
+
+impl CommitOracle for RecordingOracle {
+    type Error = FixedOracleError;
+
+    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
+        self.recorded.lock().push(dedup_id);
+        Ok(())
+    }
+
+    async fn resolve<'a>(
+        &'a self,
+        _collection: &'a CollectionId<ValueKind>,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        Ok(CommitDecision::Committed)
+    }
+}
+
+type RecordingSession = ValueStateSession<
+    MemoryDurableValueStore,
+    RecordingOracle,
     MemoryDirtyValueStoreProvider,
     MemoryLoader<serde_json::Value>,
 >;
@@ -99,6 +132,7 @@ fn build_session(
     // value, which stays "live" for these tests.
     ValueStateSession::new(SessionParts {
         durable,
+        oracle: FixedOracle::committed(),
         dirty: MemoryDirtyValueStoreProvider,
         loader: MemoryLoader::new(),
         registry: Arc::new(registry),
@@ -107,6 +141,30 @@ fn build_session(
         recovery_delay: CompactDuration::new(30),
         termination,
     })
+}
+
+/// Builds a session over a [`RecordingOracle`] so the marker-flush tests can
+/// inspect what the session wrote through the oracle.
+fn build_recording_session(
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    event: EventRef,
+) -> (RecordingSession, Arc<SyncMutex<Vec<Uuid>>>) {
+    let (_shutdown_tx, _cancel_tx, termination) = live_termination();
+    let oracle = RecordingOracle::default();
+    let recorded = oracle.recorded.clone();
+    let session = ValueStateSession::new(SessionParts {
+        durable: MemoryDurableValueStore::for_tests(),
+        oracle,
+        dirty: MemoryDirtyValueStoreProvider,
+        loader: MemoryLoader::new(),
+        registry: Arc::new(registry),
+        state_key,
+        event,
+        recovery_delay: CompactDuration::new(30),
+        termination,
+    });
+    (session, recorded)
 }
 
 /// Read a partition expected to be `Idle`, returning its applied payload.
@@ -389,6 +447,7 @@ async fn commit_apply_continues_past_a_failed_collection() -> Result<()> {
     let (_shutdown_tx, _cancel_tx, termination) = live_termination();
     let session = ValueStateSession::new(SessionParts {
         durable: durable.clone(),
+        oracle: FixedOracle::committed(),
         dirty: MemoryDirtyValueStoreProvider,
         loader: MemoryLoader::<serde_json::Value>::new(),
         registry: Arc::new(registry_with_modes(&modes)?),
@@ -464,6 +523,7 @@ async fn termination_watch_trips_on_either_signal() -> Result<()> {
     };
     let session = ValueStateSession::new(SessionParts {
         durable,
+        oracle: FixedOracle::committed(),
         dirty: MemoryDirtyValueStoreProvider,
         loader: MemoryLoader::<serde_json::Value>::new(),
         registry: Arc::new(registry()),
@@ -513,8 +573,92 @@ async fn unavailable_state_refuses_everything() -> Result<()> {
         session.rollback_aborted().await,
         ApplyOutcome::NothingSealed
     );
+
+    // The marker still routes through the stub (so the boundary's flush is
+    // uniform across stateful and stateless sessions), but flush is inert
+    // and reset discards the recording.
+    let id = Uuid::from_u128(1);
+    session.register_marker(id);
+    assert_eq!(session.registered_markers(), vec![id]);
+    session.flush_marker().await?;
     session.reset();
+    assert!(session.registered_markers().is_empty());
     Ok(())
+}
+
+/// Marker slot is last-wins, flushes through the oracle exactly once, and
+/// clears on flush success and on `reset`. Property: replaying a sequence of
+/// `Register`/`Flush`/`Reset` ops against the session matches a 3-line model
+/// of the slot, and every flushed id reaches the oracle.
+#[test]
+fn prop_marker_slot_matches_model() {
+    /// One op against the marker slot.
+    #[derive(Clone, Debug)]
+    enum MarkerOp {
+        Register(u8),
+        Flush,
+        Reset,
+    }
+
+    impl Arbitrary for MarkerOp {
+        fn arbitrary(g: &mut Gen) -> Self {
+            match u8::arbitrary(g) % 3 {
+                0 => Self::Register(u8::arbitrary(g)),
+                1 => Self::Flush,
+                _ => Self::Reset,
+            }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            match self {
+                Self::Register(b) => Box::new(b.shrink().map(Self::Register)),
+                Self::Flush | Self::Reset => Box::new(iter::empty()),
+            }
+        }
+    }
+
+    fn property(ops: Vec<MarkerOp>) -> TestResult {
+        let result: Result<bool> = executor::block_on(async {
+            let (session, recorded) =
+                build_recording_session(registry(), make_state_key(), msg_event(1));
+
+            // Model: the slot is `Option<Uuid>`; flush writes it through and
+            // clears it; reset clears it.
+            let mut slot: Option<Uuid> = None;
+            let mut expected_flushed: Vec<Uuid> = Vec::new();
+
+            for op in ops {
+                match op {
+                    MarkerOp::Register(b) => {
+                        let id = Uuid::from_u128(u128::from(b));
+                        session.register_marker(id);
+                        slot = Some(id);
+                    }
+                    MarkerOp::Flush => {
+                        session.flush_marker().await?;
+                        if let Some(id) = slot.take() {
+                            expected_flushed.push(id);
+                        }
+                    }
+                    MarkerOp::Reset => {
+                        session.reset();
+                        slot = None;
+                    }
+                }
+                if session.registered_marker() != slot {
+                    return Ok(false);
+                }
+            }
+            Ok(*recorded.lock() == expected_flushed)
+        });
+        match result {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(e) => TestResult::error(format!("{e}")),
+        }
+    }
+
+    QuickCheck::new().quickcheck(property as fn(Vec<MarkerOp>) -> TestResult);
 }
 
 // ---- CountingFailDurable: fails the Nth apply_sealed -----------------------

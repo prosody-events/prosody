@@ -9,10 +9,14 @@
 //! reassignments without cold-start penalties.
 //!
 //! The middleware lives in the common block (built by
-//! `build_common_middleware`), just outside `cancellation` and inside
-//! `state_lifecycle` — so `state_lifecycle` seals only after dedup has decided
-//! whether the inner ran. Deduplication is mandatory; there is no disabled
-//! variant.
+//! `build_common_middleware`), just outside `cancellation`. It is a
+//! duplicate **filter** plus a marker **register**: a dedup hit
+//! short-circuits before the inner runs; otherwise, on a handler `Ok` or a
+//! permanent error, it registers the message's dedup id in the event's
+//! keyed-state session. The actual marker write happens later, at the
+//! `settle` durability boundary, strictly after the WAL seal — so the
+//! commit marker can never precede the durable state it certifies.
+//! Deduplication is mandatory; there is no disabled variant.
 //!
 //! # Apply hooks
 //!
@@ -46,6 +50,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
+use crate::state::session::LifecycleAccess;
 use crate::timers::Trigger;
 use crate::{EventIdentity, Partition, Topic};
 
@@ -316,21 +321,23 @@ where
         // Process message.
         let result = self
             .inner
-            .on_message(context, message, demand_type)
+            .on_message(context.clone(), message, demand_type)
             .await
             .map_err(DeduplicationError::Inner);
 
-        // Record on success or permanent error.
-        let should_dedup = match &result {
+        // Register the marker on success or permanent error — both are final
+        // from the consumer's POV, so the message must dedup on redelivery.
+        // The marker is written (flushed) later by the `settle` boundary,
+        // strictly after the WAL seal; registering it here, not writing it,
+        // is what makes "marker before seal" unwritable. A defer-swallow or a
+        // retry attempt-boundary resets the session, discarding the marker, so
+        // a deferred reload is correctly not deduped.
+        let register = match &result {
             Ok(_) => true,
             Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
         };
-
-        if should_dedup {
-            self.store
-                .insert(id)
-                .await
-                .map_err(|e| DeduplicationError::Store(Box::new(e)))?;
+        if register && let Ok(lifecycle) = context.state(LifecycleAccess) {
+            lifecycle.register_marker(id);
         }
 
         result.map(Some)
@@ -356,14 +363,13 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // The `Err(Store(_))` arm covers two cases:
-        //   1. Inner did not run (store read failed before dispatch).
-        //   2. Inner ran, then the post-inner store write failed.
-        // Both deliberately suppress the inner's apply hook. `Store(_)` is
-        // classified as Transient (see `ClassifyError` impl below), so the
-        // outer retry layer will redrive the whole stack and the inner sees
-        // a fresh invocation. Apply hooks are best-effort by design — see
-        // `FallibleHandler::after_commit` docs.
+        // `Store(_)` now arises only from the `exists` read before dispatch —
+        // the inner never ran — so suppressing the inner's apply hook is
+        // correct. `Store(_)` is classified Transient (see `ClassifyError`
+        // below), so the outer retry layer redrives the whole stack and the
+        // inner sees a fresh invocation. (The marker is no longer written
+        // here; the `settle` boundary flushes it after the seal.) Apply hooks
+        // are best-effort by design — see `FallibleHandler::after_commit`.
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
             Ok(None) | Err(DeduplicationError::Store(_)) => {}
@@ -377,9 +383,8 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // See `after_commit`: `Err(Store(_))` covers both pre-inner read
-        // failure and post-inner write failure. Both suppress the inner hook;
-        // retry redrives.
+        // See `after_commit`: `Err(Store(_))` is the pre-inner read failure;
+        // the inner never ran, so suppress its hook and let retry redrive.
         match result {
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
             Ok(None) | Err(DeduplicationError::Store(_)) => {}

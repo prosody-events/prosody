@@ -24,6 +24,7 @@ use tokio::time::{Instant, sleep_until};
 use tokio::{select, spawn};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::consumer::Uncommitted;
 use crate::{Offset, Partition, Topic};
 
 #[cfg(test)]
@@ -179,9 +180,9 @@ pub struct UncommittedOffset {
     permit: Option<OwnedPermit<Action>>,
 }
 
-impl UncommittedOffset {
+impl Uncommitted for UncommittedOffset {
     /// Commits this offset.
-    pub fn commit(mut self) {
+    async fn commit(mut self) {
         let Some(permit) = self.permit.take() else {
             error!("offset {} already committed", self.offset);
             return;
@@ -190,7 +191,7 @@ impl UncommittedOffset {
     }
 
     /// Aborts committing this offset.
-    pub fn abort(mut self) {
+    async fn abort(mut self) {
         let Some(_) = self.permit.take() else {
             error!("offset {} already committed", self.offset);
             return;

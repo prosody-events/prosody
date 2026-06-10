@@ -174,7 +174,7 @@ impl<P: Send + Sync + 'static> Uncommitted for UncommittedMessage<P> {
             offset = self.offset(),
             "committing message"
         );
-        self.uncommitted_offset.commit();
+        self.uncommitted_offset.commit().await;
     }
 
     /// Abort the message processing and log the action.
@@ -186,7 +186,7 @@ impl<P: Send + Sync + 'static> Uncommitted for UncommittedMessage<P> {
             offset = self.offset(),
             "aborting message"
         );
-        self.uncommitted_offset.abort();
+        self.uncommitted_offset.abort().await;
     }
 }
 

@@ -155,13 +155,25 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::io::Error as IoError;
 use std::marker::PhantomData;
+use std::time::Duration;
+
+use tokio::time::sleep;
+use tracing::{error, warn};
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{DemandType, EventHandler, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::timers::{Trigger, UncommittedTimer};
+use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome};
+use crate::state::session::{LifecycleAccess, LifecycleView};
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
+
+/// Delay between retries of a durability step (seal / arm / marker flush)
+/// that failed transiently. Mirrors the timer commit retry cadence
+/// ([`crate::timers::uncommitted`]) and the state-manager init loop.
+const DURABILITY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub mod cancellation;
 /// Message retry mechanism that loads failed messages from specific Kafka
@@ -174,7 +186,6 @@ pub mod optional;
 pub mod providers;
 pub mod retry;
 pub mod scheduler;
-pub mod state_lifecycle;
 pub mod telemetry;
 pub mod timeout;
 pub mod topic;
@@ -748,37 +759,46 @@ pub trait FallibleHandler: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 
-/// Provides default `EventHandler` implementation for types that implement
-/// `FallibleHandler`.
+/// Marks a [`FallibleHandler`] as the **durability boundary**, getting the
+/// blanket [`EventHandler`] impl below.
 ///
-/// This is the **default durability boundary**: with no rescue / defer /
-/// retry middleware below it, each `EventHandler::on_message` /
-/// `EventHandler::on_timer` call performs **exactly one** invocation of
-/// the inner `FallibleHandler` and pairs it with **exactly one** apply
-/// hook firing — satisfying the strictly-per-invocation invariant
-/// required by the [`FallibleHandler`] apply-hook contract:
+/// # The durability sequence has one owner: `settle`
 ///
-/// 1. Extract inner message/timer and the uncommitted offset/timer.
-/// 2. Invoke the `FallibleHandler` method **once**.
-/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this invocation
-///    is final from the consumer's POV — and call `after_commit` with the typed
-///    result.
-/// 4. On `Terminal`: abort the marker — the message/timer will be redelivered
-///    on the next poll, producing a **new** invocation that will get its own
-///    apply hook — and call `after_abort` with the typed error.
+/// The blanket impl invokes the inner `FallibleHandler` method **exactly
+/// once**, then hands the single result to `settle` — the one place that
+/// runs the keyed-state durability sequence in straight-line code:
 ///
-/// Because there is exactly one inner invocation per call into this impl,
-/// the per-invocation invariant is satisfied trivially: one invocation
-/// pairs with one apply-hook firing.
+/// ```text
+/// final Ok  → seal WAL / direct-apply   (retry transient failures in place)
+///           → arm StateRecovery backstop (if anything sealed; fire time kept local)
+///           → flush registered dedup marker   (STRICTLY after the seal)
+///           → commit the offset / trigger marker
+///           → resolve the sealed set; point-clear the backstop iff resolved
+///           → after_commit(Ok)
+/// final Err Transient/Permanent → flush registered marker → commit → after_commit(Err)
+/// final Err Terminal            → abort → roll back → after_abort
+/// ```
 ///
-/// Types can override the default implementations to add custom behavior
-/// like logging. Implementations that change the work-outcome shape (e.g.
-/// rescue an inner error and schedule a retry while still committing the
-/// marker), or any wrapping `FallibleHandler` middleware that re-invokes
-/// the inner more than once per outer call, MUST NOT use this default;
-/// they must drive the apply hooks according to the per-invocation rule
-/// in the [`FallibleHandler`] docs — one hook per inner invocation, never
-/// coalesced.
+/// Because the marker flush is textually *after* the seal in one function,
+/// the finding-1 bug class — marker written before the WAL is durable — is
+/// **unwritable**, not merely avoided. The timer marker (trigger tag) was
+/// already written outside the stack by the marker commit; moving the
+/// message marker here restores message/timer symmetry.
+///
+/// [`RetryHandler`](retry::RetryHandler) is a second durability boundary
+/// (it owns its own `EventHandler` impl so it can map shutdown to abort
+/// rather than commit); it routes its final outcome through the **same**
+/// `settle` / `abandon` functions, so the sequence still has a single
+/// owner. No other middleware should implement `EventHandler` directly.
+///
+/// **Stack contract:** `settle` keys the seal to the *final* `Ok` the
+/// stack returns, not the inner handler's `Ok`. This is correct because no
+/// middleware maps an inner `Ok` to an outer `Err` — verified across every
+/// middleware in this module. A new middleware that did so would seal state
+/// the consumer then reports as failed; don't write one.
+///
+/// Per-invocation apply-hook correctness is preserved: one inner invocation
+/// pairs with exactly one `after_commit` / `after_abort` firing.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
     ///
@@ -833,49 +853,16 @@ where
     ) where
         C: EventContext<Payload = T::Payload>,
     {
+        // Invoke the inner FallibleHandler EXACTLY ONCE, then hand its single
+        // result to the shared durability sequence. `settle` fires EXACTLY
+        // ONE apply hook, so the per-invocation invariant holds.
         let (inner_message, uncommitted_offset) = message.into_inner();
-
-        // Per-invocation correctness: this method invokes the inner
-        // `FallibleHandler::on_message` EXACTLY ONCE below, and every
-        // control-flow path through the rest of this function fires
-        // EXACTLY ONE apply hook (`after_commit` or `after_abort`)
-        // carrying that single invocation's `Result`. One inner
-        // invocation, one apply-hook firing — the strictly-per-invocation
-        // invariant is satisfied trivially here.
         let result =
             FallibleHandler::on_message(self, context.clone(), inner_message, demand_type).await;
-
-        // Pick the apply hook by the per-invocation work outcome. At this
-        // default boundary (no rescue middleware below us) committing the
-        // offset coincides with "this invocation is final" and aborting
-        // it coincides with "this invocation is not final — the broker
-        // will redeliver and produce a fresh invocation that gets its
-        // own apply hook".
         if let Err(error) = &result {
             self.on_message_error(error);
-            match error.classify_error() {
-                ErrorCategory::Transient | ErrorCategory::Permanent => {
-                    // Final from this consumer's POV: nothing below us is
-                    // going to redeliver this message into the handler,
-                    // so this invocation pairs with `after_commit`.
-                    uncommitted_offset.commit();
-                    self.after_commit(context, result).await;
-                }
-                ErrorCategory::Terminal => {
-                    // Not final: aborting the offset means the broker will
-                    // redeliver this message to this handler on the next
-                    // poll, producing a new invocation. This invocation
-                    // pairs with `after_abort`; the future invocation
-                    // will get its own apply hook.
-                    uncommitted_offset.abort();
-                    self.after_abort(context, result).await;
-                }
-            }
-        } else {
-            // Success: final invocation, pair with `after_commit`.
-            uncommitted_offset.commit();
-            self.after_commit(context, result).await;
         }
+        settle(self, context, uncommitted_offset, result).await;
     }
 
     async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
@@ -884,46 +871,275 @@ where
         U: UncommittedTimer,
     {
         let (trigger, uncommitted_timer) = timer.into_inner();
-
-        // Per-invocation correctness: as with the message arm, the inner
-        // `FallibleHandler::on_timer` is invoked EXACTLY ONCE below, and
-        // every control-flow path through the rest of this function fires
-        // EXACTLY ONE apply hook carrying that single invocation's
-        // `Result`. One inner invocation, one apply-hook firing.
         let result = FallibleHandler::on_timer(self, context.clone(), trigger, demand_type).await;
-
-        // Same per-invocation work-outcome rule as the message arm: at
-        // this default boundary, committing the timer marker coincides
-        // with "this invocation is final" and aborting coincides with
-        // "this invocation is not final — the timer will fire again,
-        // producing a fresh invocation that gets its own apply hook".
         if let Err(error) = &result {
             self.on_timer_error(error);
-            match error.classify_error() {
-                ErrorCategory::Transient | ErrorCategory::Permanent => {
-                    // Final invocation: no further invocation of the
-                    // handler is coming for this trigger.
-                    uncommitted_timer.commit().await;
-                    self.after_commit(context, result).await;
-                }
-                ErrorCategory::Terminal => {
-                    // Not final: aborting leaves the timer in place to
-                    // fire again, so `after_abort` is the matching hook
-                    // for this invocation. The next firing will produce
-                    // a new invocation paired with its own apply hook.
-                    uncommitted_timer.abort().await;
-                    self.after_abort(context, result).await;
-                }
-            }
-        } else {
-            // Success: final invocation, pair with `after_commit`.
-            uncommitted_timer.commit().await;
-            self.after_commit(context, result).await;
         }
+        settle(self, context, uncommitted_timer, result).await;
     }
 
     async fn shutdown(self) {
         FallibleHandler::shutdown(self).await;
+    }
+}
+
+/// Outcome of one durability step driven by [`retry_step`].
+enum StepOutcome<R> {
+    /// The step succeeded, carrying its result.
+    Done(R),
+
+    /// The step failed permanently. The sequence continues defensively
+    /// (the `StateRecovery` sweep cleans up any partial effect); it never
+    /// flushes a marker over an uncertain seal.
+    Skip,
+
+    /// Shutdown, or a terminal failure: abandon the event — abort the
+    /// marker, roll back, and let redelivery re-run from clean state.
+    Abandon,
+}
+
+/// The durability sequence: the single owner of seal → arm → marker-flush →
+/// commit → resolve, run once per event after the stack returns its final
+/// `result`. Both the blanket [`EventHandler`] impl and
+/// [`RetryHandler`](retry::RetryHandler) route their final outcome here, so
+/// the wrong ordering (marker before seal) is structurally unwritable.
+///
+/// Fires exactly one apply hook (`after_commit` / `after_abort`) carrying
+/// `result`, preserving the per-invocation apply-hook invariant.
+pub(crate) async fn settle<T, C, G>(
+    handler: &T,
+    context: C,
+    guard: G,
+    result: Result<T::Output, T::Error>,
+) where
+    T: FallibleHandler,
+    T::Error: ClassifyError,
+    C: EventContext<Payload = T::Payload>,
+    G: Uncommitted + Send,
+{
+    // The inner work is done; clear any stale message-level cancel flag so
+    // the durability steps' cancel-guarded timer ops aren't short-circuited
+    // (mirrors the timeout middleware uncancelling after the inner returns).
+    context.uncancel();
+
+    // Reach the event's sealed lifecycle. Every live context carries one —
+    // `LifecycleAccess` binds unconditionally — so `None` means only an
+    // invalidated context, which cannot seal anyway.
+    let lifecycle = context.state(LifecycleAccess).ok();
+
+    match result.as_ref().err().map(ClassifyError::classify_error) {
+        // Terminal: the marker aborts; the event redelivers and re-runs.
+        Some(ErrorCategory::Terminal) => {
+            abandon(handler, context, guard, result).await;
+        }
+        // Final error (Transient/Permanent): nothing sealed (finalize runs
+        // only on Ok). On a Permanent error the dedup middleware registered
+        // the marker; flush it so the failed-but-final message deduplicates.
+        // Then commit the marker and fire the hook.
+        Some(_) => {
+            if let Some(lifecycle) = &lifecycle {
+                flush_marker_best_effort(&context, lifecycle).await;
+            }
+            guard.commit().await;
+            handler.after_commit(context, result).await;
+        }
+        // Success: run the full durability sequence.
+        None => settle_committed(handler, context, guard, result, lifecycle).await,
+    }
+}
+
+/// The success arm of [`settle`]: seal, arm the backstop, flush the marker
+/// strictly after the seal, commit, then resolve the sealed set.
+async fn settle_committed<T, C, G>(
+    handler: &T,
+    context: C,
+    guard: G,
+    result: Result<T::Output, T::Error>,
+    lifecycle: Option<LifecycleView<C::State>>,
+) where
+    T: FallibleHandler,
+    C: EventContext<Payload = T::Payload>,
+    G: Uncommitted + Send,
+{
+    let Some(lifecycle) = lifecycle else {
+        // Invalidated / stateless context: just commit and fire the hook.
+        guard.commit().await;
+        handler.after_commit(context, result).await;
+        return;
+    };
+
+    // 1. Seal WAL collections / direct-apply, retrying transient failures.
+    let sealed = match retry_step(&context, "keyed-state finalize", || lifecycle.finalize()).await {
+        StepOutcome::Done(FinalizeOutcome::Sealed) => true,
+        StepOutcome::Done(FinalizeOutcome::Clean) => false,
+        StepOutcome::Skip => {
+            // Permanent seal failure: a partial seal may be durable. Arm the
+            // backstop defensively so the sweep rolls it back, skip the marker
+            // flush (invariant: marker present ⇒ seal durable), and commit.
+            let _ = arm_backstop(&context, &lifecycle).await;
+            guard.commit().await;
+            handler.after_commit(context, result).await;
+            return;
+        }
+        StepOutcome::Abandon => {
+            abandon(handler, context, guard, result).await;
+            return;
+        }
+    };
+
+    // 2. Arm the StateRecovery backstop iff something sealed, keeping the
+    // fire time so the post-resolve clear targets exactly this timer.
+    let armed_fire = if sealed {
+        match arm_backstop(&context, &lifecycle).await {
+            StepOutcome::Done(fire) => Some(fire),
+            // Permanent arm failure: the seal is still recoverable by
+            // first-touch on the next access to the collection.
+            StepOutcome::Skip => None,
+            StepOutcome::Abandon => {
+                abandon(handler, context, guard, result).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // 3. Flush the registered dedup marker — STRICTLY after the seal, so a
+    // present marker always certifies a durable seal.
+    match retry_step(&context, "keyed-state marker flush", || {
+        lifecycle.flush_marker()
+    })
+    .await
+    {
+        StepOutcome::Done(()) => {}
+        StepOutcome::Skip => {
+            // Permanent flush failure: the committed seal won't be certified,
+            // so recovery rolls it back. Leave the backstop armed and commit.
+            guard.commit().await;
+            handler.after_commit(context, result).await;
+            return;
+        }
+        StepOutcome::Abandon => {
+            abandon(handler, context, guard, result).await;
+            return;
+        }
+    }
+
+    // 4. Commit the durability marker (offset / trigger).
+    guard.commit().await;
+
+    // 5. Resolve the sealed set; point-clear the backstop only when this
+    // event both armed and fully resolved (`NothingSealed` ≠ `Resolved`, so
+    // a defensive arm over a permanent seal failure never clears here).
+    let applied = lifecycle.commit_apply().await;
+    if applied == ApplyOutcome::Resolved
+        && let Some(fire) = armed_fire
+        && let Err(error) = context.unschedule(fire, TimerType::StateRecovery).await
+    {
+        warn!(error = %error, "failed to point-clear StateRecovery backstop");
+    }
+
+    // 6. After-commit hook (telemetry, dedup forwarding, ...).
+    handler.after_commit(context, result).await;
+}
+
+/// Abandons the event: abort the marker (offset → redelivery, timer →
+/// reloadable), roll back any seal recorded before this point, and fire
+/// `after_abort`. Reached on a terminal error or a shutdown mid-sequence.
+pub(crate) async fn abandon<T, C, G>(
+    handler: &T,
+    context: C,
+    guard: G,
+    result: Result<T::Output, T::Error>,
+) where
+    T: FallibleHandler,
+    C: EventContext<Payload = T::Payload>,
+    G: Uncommitted + Send,
+{
+    guard.abort().await;
+    if let Ok(lifecycle) = context.state(LifecycleAccess) {
+        // Best-effort: first-touch / the sweep recover anything left behind.
+        // Resolves the shared session's recorded sealed set (empty unless a
+        // seal was recorded before the abandon point), so a fresh view is
+        // equivalent to one threaded down.
+        lifecycle.rollback_aborted().await;
+    }
+    handler.after_abort(context, result).await;
+}
+
+/// Arms the one-shot `StateRecovery` backstop, returning its fire time so
+/// the caller can point-clear exactly this timer after resolution.
+async fn arm_backstop<C>(
+    context: &C,
+    lifecycle: &LifecycleView<C::State>,
+) -> StepOutcome<CompactDateTime>
+where
+    C: EventContext,
+{
+    let delay = lifecycle.recovery_fire_delay();
+    let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
+        Ok(fire) => fire,
+        Err(error) => {
+            error!(error = %error, "failed to compute StateRecovery fire time; skipping backstop");
+            return StepOutcome::Skip;
+        }
+    };
+    match retry_step(context, "arm StateRecovery backstop", || {
+        context.schedule(fire, TimerType::StateRecovery)
+    })
+    .await
+    {
+        StepOutcome::Done(()) => StepOutcome::Done(fire),
+        StepOutcome::Skip => StepOutcome::Skip,
+        StepOutcome::Abandon => StepOutcome::Abandon,
+    }
+}
+
+/// Flushes the registered marker, retrying transient failures; a permanent
+/// failure or shutdown is tolerated (the failed-but-final message simply
+/// isn't deduplicated and re-runs, re-failing the same way).
+async fn flush_marker_best_effort<C>(context: &C, lifecycle: &LifecycleView<C::State>)
+where
+    C: EventContext,
+{
+    let _ = retry_step(context, "keyed-state marker flush", || {
+        lifecycle.flush_marker()
+    })
+    .await;
+}
+
+/// Retries one durability step until it succeeds, is abandoned on shutdown,
+/// or fails terminally; a permanent failure is skipped so the straight-line
+/// sequence continues defensively. Mirrors the retry-until-shutdown idiom of
+/// the timer commit loop and state-manager initialization.
+async fn retry_step<C, R, E, F, Fut>(context: &C, label: &str, mut step: F) -> StepOutcome<R>
+where
+    C: EventContext,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<R, E>>,
+    E: ClassifyError + StdError,
+{
+    loop {
+        if context.is_shutdown() {
+            return StepOutcome::Abandon;
+        }
+        match step().await {
+            Ok(value) => return StepOutcome::Done(value),
+            Err(error) => match error.classify_error() {
+                ErrorCategory::Transient => {
+                    error!(label, error = %error, "durability step failed; retrying");
+                    sleep(DURABILITY_RETRY_DELAY).await;
+                }
+                ErrorCategory::Permanent => {
+                    error!(label, error = %error, "durability step failed permanently; skipping");
+                    return StepOutcome::Skip;
+                }
+                ErrorCategory::Terminal => {
+                    error!(label, error = %error, "durability step terminal failure; abandoning");
+                    return StepOutcome::Abandon;
+                }
+            },
+        }
     }
 }
 

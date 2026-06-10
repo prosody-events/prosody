@@ -16,7 +16,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{
         ConsumerConfiguration, DemandType, EventHandler, Keyed, KeyedStateConfiguration,
-        ProsodyConsumer,
+        ProsodyConsumer, Uncommitted,
     },
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
@@ -77,7 +77,7 @@ impl EventHandler for SlowTimerHandler {
             }
         }
 
-        uncommitted.commit();
+        uncommitted.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)

@@ -753,6 +753,10 @@ struct AlwaysCommittedOracle;
 impl CommitOracle for AlwaysCommittedOracle {
     type Error = Infallible;
 
+    async fn record_message(&self, _dedup_id: uuid::Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn resolve<'a>(
         &'a self,
         _collection: &'a CollectionId<ValueKind>,

@@ -1,13 +1,19 @@
 //! Commit oracle for keyed-state recovery.
 //!
 //! [`CommitManager`] answers "did this event commit?" for both message and
-//! timer events. It is the read-only interface consumed by the state
-//! middleware during WAL-based recovery; no write operations are exposed.
+//! timer events, and writes the one marker it owns end-to-end: the message
+//! dedup row. It implements [`CommitOracle`] — the recovery reader's
+//! resolve half plus the durability boundary's [`CommitOracle::record_message`]
+//! write half.
 //!
 //! # Message side
 //!
-//! `is_message_committed(dedup_id)` delegates to a [`DeduplicationStore`]:
-//! row present ⇔ committed.
+//! `is_message_committed(dedup_id)` delegates a read to a
+//! [`DeduplicationStore`]: row present ⇔ committed.
+//! [`CommitOracle::record_message`] writes that row via
+//! [`DeduplicationStore::insert`] — the boundary's marker-flush step,
+//! strictly after the WAL seal, so a present row always certifies a durable
+//! seal.
 //!
 //! # Timer side
 //!
@@ -17,9 +23,13 @@
 //! - `Some(cur) == wal_tag` → not committed
 //! - `Some(cur) != wal_tag` → committed-and-rescheduled (returns `true`)
 //!
-//! **Encapsulation note**: no accessor returns the inner store or manager;
-//! the state middleware physically cannot reach write operations through this
-//! type.
+//! The timer side is read-only here: a trigger's tag row is written by the
+//! timer manager's own commit machinery, never through this type. See
+//! [`StoreTagSource`] for the production timer-tag source.
+//!
+//! **Encapsulation note**: the only write exposed is the message marker via
+//! the [`CommitOracle`] trait; no accessor returns the inner store or
+//! manager.
 
 use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
@@ -190,6 +200,13 @@ where
     TS: TimerTagSource,
 {
     type Error = CommitManagerError<D::Error, TS::Error>;
+
+    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
+        self.dedup
+            .insert(dedup_id)
+            .await
+            .map_err(CommitManagerError::Dedup)
+    }
 
     async fn resolve<'a>(
         &'a self,

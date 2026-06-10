@@ -334,6 +334,10 @@ impl ClassifyError for FixedOracleError {
 impl CommitOracle for FixedOracle {
     type Error = FixedOracleError;
 
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn resolve<'a>(
         &'a self,
         _collection: &'a CollectionId<ValueKind>,
@@ -363,6 +367,10 @@ impl ClassifyError for NeverConsultedOracleError {
 
 impl CommitOracle for NeverConsultedOracle {
     type Error = NeverConsultedOracleError;
+
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     async fn resolve<'a>(
         &'a self,

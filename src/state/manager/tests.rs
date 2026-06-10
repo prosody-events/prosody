@@ -62,6 +62,10 @@ impl CountingOracle {
 impl CommitOracle for CountingOracle {
     type Error = FixedOracleError;
 
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn resolve<'a>(
         &'a self,
         _collection: &'a CollectionId<ValueKind>,

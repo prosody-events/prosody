@@ -158,11 +158,12 @@ where
 {
     type RecoveryError =
         RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error>;
-    type Session = ValueStateSession<D, DP, L>;
+    type Session = ValueStateSession<D, O, DP, L>;
 
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
         ValueStateSession::new(SessionParts {
             durable: self.inner.durable.clone(),
+            oracle: self.inner.oracle.clone(),
             dirty: self.inner.dirty.clone(),
             loader: self.inner.loader.clone(),
             registry: self.inner.registry.clone(),

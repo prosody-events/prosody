@@ -19,7 +19,7 @@ use crate::state::fjall::FjallDirtyValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{DirtyValueBundle, SessionParts, TerminationWatch, ValueStateSession};
-use crate::state::tests::value_suite::finish_trace;
+use crate::state::tests::value_suite::{FixedOracle, finish_trace};
 use crate::state::value::{PendingOpSource, ValueKind};
 use crate::state::{CommitMode, DirtyStoreProvider, EventRef, EventScopeId, StateKey, StateName};
 use crate::test_util::{ArbJson, TEST_RUNTIME};
@@ -52,8 +52,12 @@ where
     }
 }
 
-pub(crate) type TestSession<S> =
-    ValueStateSession<MemoryDurableValueStore, FixedDirtyProvider<S>, MemoryLoader<Value>>;
+pub(crate) type TestSession<S> = ValueStateSession<
+    MemoryDurableValueStore,
+    FixedOracle,
+    FixedDirtyProvider<S>,
+    MemoryLoader<Value>,
+>;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
@@ -89,6 +93,7 @@ where
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     ValueStateSession::new(SessionParts {
         durable: MemoryDurableValueStore::for_tests(),
+        oracle: FixedOracle::committed(),
         dirty: FixedDirtyProvider(dirty),
         loader,
         registry: Arc::new(registry),
