@@ -333,11 +333,21 @@ where
 
     /// Applies dirty operations directly and leaves the transaction clean.
     ///
+    /// Direct-mode only, like [`Self::direct_apply`]. A `Wal` collection's
+    /// buffered ops must reach authoritative state only through the
+    /// seal→commit→apply sequence; flushing them mid-handler would make the
+    /// write durable before the event's commit marker, so a failed handler
+    /// plus retry re-applies it — exactly the at-least-once double-apply the
+    /// WAL mode exists to prevent.
+    ///
     /// # Errors
     ///
-    /// Returns a transaction error if the transaction is sealed, finished, or a
-    /// backing store fails.
+    /// Returns [`TransactionValueStoreError::WrongCommitMode`] for a
+    /// [`CommitMode::Wal`] collection, or a transaction error if the
+    /// transaction is sealed, finished, or a backing store fails.
     pub async fn flush(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
+        self.ensure_mode(CommitMode::Direct)?;
+
         match self.local_tx() {
             LocalTx::Clean(_) => Ok(StoreOutcome::NoOp),
             LocalTx::Dirty => {

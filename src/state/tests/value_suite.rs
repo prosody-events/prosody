@@ -776,7 +776,6 @@ where
         TraceOp::Seal => apply_trace_seal(tx, model).await,
         TraceOp::Commit => apply_trace_commit(tx, model).await,
         TraceOp::Abort => apply_trace_abort(tx, model).await,
-        TraceOp::Flush => apply_trace_flush(tx, model).await,
         // Crash is handled by the driver, not dispatched here.
         TraceOp::Crash => Ok(true),
     }
@@ -957,33 +956,6 @@ where
     }
 }
 
-async fn apply_trace_flush<D, S>(
-    tx: &mut TransactionValueStore<D, S>,
-    model: &mut Model,
-) -> Result<bool>
-where
-    D: DurableBundle,
-    S: DirtyBundle,
-{
-    match model.phase {
-        ModelPhase::Clean => Ok(tx.flush().await? == StoreOutcome::NoOp),
-        ModelPhase::Dirty => {
-            if tx.flush().await? != StoreOutcome::Applied {
-                return Ok(false);
-            }
-            model.applied = fold_value_ops(model.applied.clone(), &model.dirty_ops);
-            model.clear_dirty();
-            model.phase = ModelPhase::Clean;
-            Ok(true)
-        }
-        ModelPhase::Sealed => Ok(matches!(
-            tx.flush().await,
-            Err(TransactionValueStoreError::AlreadySealed)
-        )),
-        ModelPhase::Finished => Ok(false),
-    }
-}
-
 async fn apply_direct_op<D, S>(
     tx: &mut TransactionValueStore<D, S>,
     collection: &CollectionId<ValueKind>,
@@ -1025,13 +997,17 @@ impl Arbitrary for Trace {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Wal-mode trace operations. `Flush` is deliberately absent: it is
+/// Direct-mode only ([`DirectTraceOp::Flush`]) — on a `Wal` collection it
+/// rejects with `WrongCommitMode` (pinned by an example test in
+/// `state::tests`), since flushing mid-handler would make writes durable
+/// before the event's commit marker.
 pub(crate) enum TraceOp {
     Set(u8),
     Clear,
     Seal,
     Commit,
     Abort,
-    Flush,
     /// Simulates a process crash: drops the transaction without driving
     /// abort/apply/rollback. In the [`ModelPhase::Sealed`] phase this
     /// leaves a sealed WAL on the durable store; the runner resolves it
@@ -1041,13 +1017,12 @@ pub(crate) enum TraceOp {
 
 impl Arbitrary for TraceOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 7 {
+        match u8::arbitrary(g) % 6 {
             0 => Self::Set(u8::arbitrary(g)),
             1 => Self::Clear,
             2 => Self::Seal,
             3 => Self::Commit,
             4 => Self::Abort,
-            5 => Self::Flush,
             _ => Self::Crash,
         }
     }
