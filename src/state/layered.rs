@@ -192,10 +192,29 @@ where
         // `read_partition` reports the applied state without resolving the WAL
         // we just sealed; `get` would recover it. The applied it returns already
         // reflects any recover-before-seal the backing performed.
-        let new_applied =
-            match DurableWalStore::read_partition(&self.backing, collection.id()).await? {
-                DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
-            };
+        let new_applied = match DurableWalStore::read_partition(&self.backing, collection.id())
+            .await
+        {
+            Ok(DurableState::Idle { applied } | DurableState::Sealed { applied, .. }) => applied,
+            Err(error) => {
+                // The seal committed, but we cannot read the post-seal
+                // applied to re-sync the cache. Leaving the pre-seal entry
+                // would be silently stale — and a Permanent classification
+                // of this error strands it past recovery (the sweep rolls
+                // back the WAL but never repatches the cache). Best-effort
+                // invalidate so the next `get` re-reads the backing: seal's
+                // contract is "cache re-synced or invalidated, never
+                // silently stale" (mirrors `patch_cache_or_invalidate`).
+                warn!(error = %error, "post-seal cache re-sync read failed; invalidating cache entry");
+                if let Err(clear_error) = self.cache.clear(collection.id()).await {
+                    warn!(
+                        error = %clear_error,
+                        "cache invalidation after failed re-sync also failed; entry may be stale until next miss"
+                    );
+                }
+                return Err(error);
+            }
+        };
         self.patch_cache_or_invalidate(collection.id(), new_applied)
             .await;
         Ok(sealed)
@@ -326,5 +345,213 @@ where
         K: CollectionKind,
     {
         self.backing.delete_pending(id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LayeredValueStore;
+    use crate::Key;
+    use crate::error::{ClassifyError, ErrorCategory};
+    use crate::state::memory::{MemoryDurableValueStore, MemoryStateError};
+    use crate::state::value::{DurableWalStore, ValueKind, ValueOp, ValueStore};
+    use crate::state::{
+        CollectionId, CollectionRef, DurableState, EventRef, Read, SealedCollection, StateKey,
+        StateName, StateType, StoreOutcome,
+    };
+    use bytes::Bytes;
+    use color_eyre::eyre::Result;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use thiserror::Error;
+    use uuid::Uuid;
+
+    /// Backing that delegates to [`MemoryDurableValueStore`] but fails the
+    /// `fail_at`-th `read_partition` (1-based). Used to simulate the post-seal
+    /// re-sync read failing exactly once.
+    #[derive(Clone)]
+    struct FailNthReadPartition {
+        inner: MemoryDurableValueStore,
+        fail_at: usize,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl FailNthReadPartition {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                inner: MemoryDurableValueStore::for_tests(),
+                fail_at,
+                reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ValueStore for FailNthReadPartition {
+        type Error = FailReadError;
+
+        async fn get<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+        ) -> Result<Read<Bytes>, Self::Error> {
+            self.inner.get(collection).await.map_err(Into::into)
+        }
+
+        async fn set<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+            payload: Bytes,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .set(collection, payload)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn clear<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+        ) -> Result<(), Self::Error> {
+            self.inner.clear(collection).await.map_err(Into::into)
+        }
+    }
+
+    impl DurableWalStore<ValueKind> for FailNthReadPartition {
+        type Error = FailReadError;
+
+        async fn read_partition<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+        ) -> Result<DurableState<ValueKind>, Self::Error> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+                return Err(FailReadError::Injected);
+            }
+            DurableWalStore::read_partition(&self.inner, collection)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn seal<'a, I>(
+            &'a self,
+            collection: &'a CollectionRef<ValueKind>,
+            event: EventRef,
+            ops: I,
+        ) -> Result<SealedCollection<ValueKind>, Self::Error>
+        where
+            I: IntoIterator<Item = ValueOp> + Send + 'a,
+        {
+            self.inner
+                .seal(collection, event, ops)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn apply_sealed<'a>(
+            &'a self,
+            collection: &'a CollectionRef<ValueKind>,
+            expected_event: EventRef,
+        ) -> Result<StoreOutcome, Self::Error> {
+            self.inner
+                .apply_sealed(collection, expected_event)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn rollback_sealed<'a>(
+            &'a self,
+            collection: &'a CollectionRef<ValueKind>,
+            expected_event: EventRef,
+        ) -> Result<StoreOutcome, Self::Error> {
+            self.inner
+                .rollback_sealed(collection, expected_event)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    #[derive(Debug, Error)]
+    enum FailReadError {
+        #[error("injected read_partition failure")]
+        Injected,
+        #[error(transparent)]
+        Memory(#[from] MemoryStateError),
+    }
+
+    impl ClassifyError for FailReadError {
+        fn classify_error(&self) -> ErrorCategory {
+            ErrorCategory::Permanent
+        }
+    }
+
+    fn collection_id(key: &Key) -> Result<CollectionId<ValueKind>> {
+        Ok(CollectionId::new(
+            StateKey::new(Uuid::from_u128(0x5E6), key.clone()),
+            StateType::Application,
+            StateName::try_new("cart")?,
+        ))
+    }
+
+    /// Invariant 2 failure path: when the post-seal re-sync `read_partition`
+    /// fails, `seal` must invalidate the cache before propagating the error —
+    /// never leave the cache entry silently diverged from the backing.
+    /// Otherwise a `Permanent` classification strands the stale entry past
+    /// recovery, since the sweep rolls back the WAL but never repatches the
+    /// cache.
+    ///
+    /// The cache is preloaded with a value the backing does not agree with
+    /// (the recover-before-seal shape: a pre-recovery cache hint over a
+    /// backing whose authoritative state has since moved). With the re-sync
+    /// read failing once, `seal` returns the error, but the cache must be
+    /// invalidated — so the next `get` falls through and *agrees with the
+    /// backing* rather than serving the stale hit. Pre-fix, `?` propagated
+    /// before any patch and the stale cache entry survived, so `get` would
+    /// return `Present("old")` while the backing reads `Absent`.
+    #[tokio::test]
+    async fn failed_post_seal_resync_invalidates_cache_rather_than_leaving_it_stale() -> Result<()>
+    {
+        let key: Key = Arc::from("k");
+        let id = collection_id(&key)?;
+        let stale = Bytes::from_static(b"old");
+
+        let cache = MemoryDurableValueStore::for_tests();
+        // Fail the very first read_partition — the post-seal re-sync read.
+        let backing = FailNthReadPartition::new(1);
+        let layered = LayeredValueStore::new(cache.clone(), backing.clone());
+
+        // The cache holds a value the backing does not agree with.
+        cache.set(&id, stale.clone()).await?;
+
+        let collection = CollectionRef::new(id.clone(), None);
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(0xE0E0),
+        };
+        let result = layered
+            .seal(
+                &collection,
+                event,
+                [ValueOp::Set {
+                    payload: stale.clone(),
+                }],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the failed re-sync read still surfaces as the seal's error"
+        );
+
+        // The backing disagrees with the stale cache entry; after the failed
+        // re-sync the cache must be invalidated, so `get` agrees with the
+        // backing instead of serving the stale hit.
+        let backing_view = ValueStore::get(&backing, &id).await?;
+        assert_ne!(
+            backing_view,
+            Read::Present(stale),
+            "precondition: the backing does not hold the stale value"
+        );
+        assert_eq!(
+            layered.get(&id).await?,
+            backing_view,
+            "post-seal get must reflect the backing, not the stale cache entry"
+        );
+        Ok(())
     }
 }
