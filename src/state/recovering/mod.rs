@@ -2,13 +2,15 @@
 //!
 //! `RecoveringValueStore<Inner, Oracle>` wraps any durable Value store that
 //! implements [`ValueStore`] + [`DurableWalStore<ValueKind>`] +
-//! [`DirectApplyStore<ValueKind>`] together with a [`CommitOracle`]. Two
+//! [`DirectApplyStore<ValueKind>`] together with a [`CommitOracle`]. Three
 //! methods recover a crashed-but-sealed WAL before proceeding —
-//! [`ValueStore::get`] (read-before-use) and [`DurableWalStore::seal`]
-//! (recover-before-overwrite); every other method passes through unchanged.
-//! Together they cover every durable-touching path: `get` is the only read
-//! that reaches durable, and `seal` is the only write that overwrites the
-//! WAL columns.
+//! [`ValueStore::get`] (read-before-use), [`DurableWalStore::seal`]
+//! (recover-before-overwrite), and [`DirectApplyStore::direct_apply`]
+//! (recover-before-overwrite for the mid-handler flush path); every other
+//! method passes through unchanged. Together they cover every
+//! durable-touching production path: `get` is the only read that reaches
+//! durable, and `seal` / `direct_apply` are the only writes the transaction
+//! layer issues.
 //!
 //! # Recovery flow ([`ValueStore::get`])
 //!
@@ -58,7 +60,7 @@
 //! | `DurableWalStore::seal`            | **Yes** — recover-before-overwrite |
 //! | `DurableWalStore::apply_sealed`    | No (pass) — the resolution itself |
 //! | `DurableWalStore::rollback_sealed` | No (pass) — the resolution itself |
-//! | `DirectApplyStore::direct_apply`   | No (pass) — direct mode never produces a sealed state |
+//! | `DirectApplyStore::direct_apply`   | **Yes** — recover-before-overwrite (a flush can encounter a foreign seal) |
 //! | `PendingIndexStore::insert_pending` | No (pass) — the index rows live in `inner` |
 //! | `PendingIndexStore::delete_pending` | No (pass) — the index rows live in `inner` |
 
@@ -329,6 +331,23 @@ where
     type Error =
         RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;
 
+    /// Recovers a crashed-but-sealed WAL before applying — the
+    /// recover-before-overwrite guard, mirrored from `seal`.
+    ///
+    /// Direct mode never *produces* a sealed state, but a direct apply can
+    /// *encounter* one: a `Wal`-mode event seals, commits its marker, and
+    /// crashes before resolution; a later handler then flushes (the
+    /// documented mid-handler write-through works in either mode). Without
+    /// recovery the flush writes the applied triple while the committed WAL
+    /// still waits, and the eventual sweep folds the *old* WAL over the
+    /// *newer* flushed write — a lost update. Resolving first makes the
+    /// flush land on post-recovery state.
+    ///
+    /// No same-event guard is needed (unlike `seal`): a handler can only be
+    /// running — and therefore flushing — when its own prior attempt's
+    /// marker is absent (a present message marker dedup-filters the
+    /// redelivery; a committed trigger never refires), so any encountered
+    /// seal resolves correctly through the oracle.
     async fn direct_apply<'a, I>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
@@ -337,6 +356,15 @@ where
     where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
+        if let DurableState::Sealed { wal, .. } =
+            DurableWalStore::read_partition(&self.inner, collection.id())
+                .await
+                .map_err(RecoveringValueStoreError::Inner)?
+        {
+            let recovery_ref =
+                CollectionRef::new(collection.id().clone(), self.ttl.ttl_for(collection.id()));
+            resolve_sealed(&self.inner, &self.oracle, &recovery_ref, wal.event()).await?;
+        }
         self.inner
             .direct_apply(collection, ops)
             .await

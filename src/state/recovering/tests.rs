@@ -813,6 +813,117 @@ async fn seal_same_event_redelivery_skips_oracle() -> Result<()> {
     Ok(())
 }
 
+// ---- recover-before-direct-apply directed tests -----------------------------
+//
+// `direct_apply` is the mid-handler flush path (valid in either commit
+// mode). Without recover-before-overwrite, flushing over a committed
+// crashed seal leaves that WAL in place, and the eventual sweep folds the
+// *old* WAL over the *newer* flushed write — a lost update on state the
+// handler observed succeeding.
+
+/// Committed prior. E1 sealed and crashed before resolution; the oracle says
+/// committed. A later flush (`direct_apply`) must apply E1 first, then fold
+/// its own ops over the recovered state — leaving the partition `Idle` so no
+/// stale WAL survives to clobber the flushed write later. Pre-fix the
+/// partition stayed `Sealed{E1}` and a later resolution overwrote the flush.
+#[tokio::test]
+async fn direct_apply_recovers_committed_prior_before_overwrite() -> Result<()> {
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+    let e1 = event(1);
+    let flushed = bytes(22);
+
+    // Crash post-seal / pre-resolve on E1.
+    inner
+        .seal(&collection, e1, vec![ValueOp::Set { payload: bytes(11) }])
+        .await
+        .map_err(into_eyre)?;
+
+    let (oracle, log) = MockOracle::recording();
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
+    store
+        .direct_apply(
+            &collection,
+            vec![ValueOp::Set {
+                payload: flushed.clone(),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    assert_eq!(
+        *log.lock(),
+        vec![e1],
+        "the prior event E1 must be resolved exactly once before the flush applies"
+    );
+    match DurableWalStore::read_partition(&inner, &id)
+        .await
+        .map_err(into_eyre)?
+    {
+        DurableState::Idle { applied } => assert_eq!(
+            applied,
+            Some(flushed),
+            "the flush must land last, folded over E1's recovered state"
+        ),
+        DurableState::Sealed { .. } => {
+            return Err(eyre::eyre!(
+                "no WAL may survive the flush — a leftover seal would clobber it later"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Not-committed prior. The oracle says the crashed E1 did not commit; the
+/// flush must roll E1 back, then apply its own ops. The recording oracle
+/// pins that the resolve path ran (E1 consulted exactly once).
+#[tokio::test]
+async fn direct_apply_rolls_back_not_committed_prior_before_overwrite() -> Result<()> {
+    let inner = MemoryDurableValueStore::for_tests();
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+    let e1 = event(1);
+    let flushed = bytes(44);
+
+    inner
+        .seal(&collection, e1, vec![ValueOp::Set { payload: bytes(99) }])
+        .await
+        .map_err(into_eyre)?;
+
+    let (oracle, log) = MockOracle::recording_not_committed();
+    let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, TEST_TTL_DURATION);
+    store
+        .direct_apply(
+            &collection,
+            vec![ValueOp::Set {
+                payload: flushed.clone(),
+            }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    assert_eq!(
+        *log.lock(),
+        vec![e1],
+        "the prior event E1 must be resolved exactly once before the flush applies"
+    );
+    match DurableWalStore::read_partition(&inner, &id)
+        .await
+        .map_err(into_eyre)?
+    {
+        DurableState::Idle { applied } => assert_eq!(
+            applied,
+            Some(flushed),
+            "rolled-back E1 must not contribute; the flush lands on clean state"
+        ),
+        DurableState::Sealed { .. } => {
+            return Err(eyre::eyre!("no WAL may survive the flush"));
+        }
+    }
+    Ok(())
+}
+
 /// Crash-recovery equivalence for the seal-chain. Sealing a sequence of
 /// events `E0..En` through the wrapper resolves each prior event before
 /// overwriting its WAL (recover-before-seal), and the final `get` resolves
