@@ -220,22 +220,15 @@ pub(crate) mod sealed {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ApplyOutcome {
         /// No sealed set was recorded for this event — nothing to resolve.
-        ///
-        /// Load-bearing: `NothingSealed` is **not** `Resolved`. The
-        /// durability boundary only point-clears a `StateRecovery` backstop
-        /// for an event that both armed (sealed) **and** resolved. An event
-        /// that armed defensively after a permanent seal failure leaves an
-        /// empty sealed set, so its `commit_apply` returns `NothingSealed` —
-        /// the boundary must then leave the backstop armed for the sweep to
-        /// roll the partial seal back, never treat it as resolved.
         NothingSealed,
 
-        /// Every recorded sealed collection resolved; the caller may clear
-        /// the `StateRecovery` backstop timer.
+        /// Every recorded sealed collection resolved (applied to
+        /// authoritative state and its WAL cleared).
         Resolved,
 
-        /// At least one resolution failed; the caller must leave the
-        /// `StateRecovery` timer armed so the sweep retries.
+        /// At least one resolution failed; the per-key `StateRecovery`
+        /// backstop (always left armed by the durability boundary) lets the
+        /// sweep retry. The boundary logs this outcome.
         Incomplete,
     }
 

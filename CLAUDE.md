@@ -211,10 +211,14 @@ after the stack returns, owned by the `settle` boundary (the blanket
 `FallibleEventHandler → EventHandler` impl in `consumer::middleware`; `retry`
 routes its final outcome through the same `settle`/`abandon`). `settle` does,
 in straight-line code: seal WAL / direct-apply (retrying transient failures in
-place) → arm `StateRecovery` if anything sealed → **flush the registered dedup
-marker, strictly after the seal** → commit the offset/trigger → resolve the
-sealed set, point-clearing the backstop only when this event armed and resolved
-→ `after_commit`. Because the marker flush is textually after the seal in one
+place) → arm `StateRecovery` if anything sealed (a per-key singleton via
+`clear_and_schedule`) → **flush the registered dedup marker, strictly after the
+seal** → commit the offset/trigger → resolve the sealed set → `after_commit`.
+The boundary **never** unschedules the backstop: the per-key `StateRecovery`
+timer is debounced outward by each stateful commit and removed only by the
+sweep's `unschedule_all` once the key goes quiet, so one event can no longer
+point-clear another event's still-needed backstop (finding F2). Because the
+marker flush is textually after the seal in one
 function, "marker before durable state" is **unwritable**. The dedup middleware
 in the stack only *filters* duplicates and *registers* the marker (on `Ok` /
 `Permanent`); it never writes the dedup store. Three residual order facts remain:

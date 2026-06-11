@@ -771,10 +771,11 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 ///
 /// ```text
 /// final Ok  → seal WAL / direct-apply   (retry transient failures in place)
-///           → arm StateRecovery backstop (if anything sealed; fire time kept local)
+///           → arm StateRecovery backstop (clear_and_schedule; per-key singleton)
 ///           → flush registered dedup marker   (STRICTLY after the seal)
 ///           → commit the offset / trigger marker
-///           → resolve the sealed set; point-clear the backstop iff resolved
+///           → resolve the sealed set (the backstop stays armed; the sweep
+///             self-clears once the key goes quiet)
 ///           → after_commit(Ok)
 /// final Err Transient/Permanent → flush registered marker → commit → after_commit(Err)
 /// final Err Terminal            → abort → roll back → after_abort
@@ -988,22 +989,16 @@ async fn settle_committed<T, C, G>(
         }
     };
 
-    // 2. Arm the StateRecovery backstop iff something sealed, keeping the
-    // fire time so the post-resolve clear targets exactly this timer.
-    let armed_fire = if sealed {
-        match arm_backstop(&context, &lifecycle).await {
-            StepOutcome::Done(fire) => Some(fire),
-            // Permanent arm failure: the seal is still recoverable by
-            // first-touch on the next access to the collection.
-            StepOutcome::Skip => None,
-            StepOutcome::Abandon => {
-                abandon(handler, context, guard, result).await;
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    // 2. Arm the StateRecovery backstop iff something sealed. The backstop is
+    // a debounced per-key singleton (`clear_and_schedule`); the boundary never
+    // clears it, so this event cannot disturb another's backstop (F2). A
+    // permanent arm failure (`Skip`) is benign — first-touch on the next
+    // access to the collection still recovers the seal — so only `Abandon`
+    // (shutdown / terminal) diverts the sequence.
+    if sealed && let StepOutcome::Abandon = arm_backstop(&context, &lifecycle).await {
+        abandon(handler, context, guard, result).await;
+        return;
+    }
 
     // 3. Flush the registered dedup marker — STRICTLY after the seal, so a
     // present marker always certifies a durable seal.
@@ -1029,15 +1024,13 @@ async fn settle_committed<T, C, G>(
     // 4. Commit the durability marker (offset / trigger).
     guard.commit().await;
 
-    // 5. Resolve the sealed set; point-clear the backstop only when this
-    // event both armed and fully resolved (`NothingSealed` ≠ `Resolved`, so
-    // a defensive arm over a permanent seal failure never clears here).
-    let applied = lifecycle.commit_apply().await;
-    if applied == ApplyOutcome::Resolved
-        && let Some(fire) = armed_fire
-        && let Err(error) = context.unschedule(fire, TimerType::StateRecovery).await
-    {
-        warn!(error = %error, "failed to point-clear StateRecovery backstop");
+    // 5. Resolve the recorded sealed set (apply each sealed WAL to
+    // authoritative state and clear it). The backstop stays armed regardless:
+    // a `Resolved` key's sweep finds nothing pending and clears itself when
+    // the key goes quiet, while an `Incomplete` resolution leaves real work
+    // for that same sweep to retry. No point-clear means no cross-event race.
+    if lifecycle.commit_apply().await == ApplyOutcome::Incomplete {
+        warn!("keyed-state apply incomplete; the StateRecovery sweep will retry");
     }
 
     // 6. After-commit hook (telemetry, dedup forwarding, ...).
@@ -1068,12 +1061,20 @@ pub(crate) async fn abandon<T, C, G>(
     handler.after_abort(context, result).await;
 }
 
-/// Arms the one-shot `StateRecovery` backstop, returning its fire time so
-/// the caller can point-clear exactly this timer after resolution.
-async fn arm_backstop<C>(
-    context: &C,
-    lifecycle: &LifecycleView<C::State>,
-) -> StepOutcome<CompactDateTime>
+/// Arms the per-key `StateRecovery` backstop as a debounced singleton.
+///
+/// `clear_and_schedule` overwrites any prior `StateRecovery` timer for the
+/// key with one at `fire`, atomically and tombstone-free (verified at
+/// `timers/manager/mod.rs:520`). It is type-scoped — only the key's
+/// `StateRecovery` timers are replaced; user timers of other types are
+/// untouched. The result is a single backstop per key whose fire time is the
+/// key's *last* stateful commit plus `delay`: rapid commits debounce it
+/// outward rather than racing to clear each other.
+///
+/// The only remover is the sweep's `clear_scheduled`/`unschedule_all`; the
+/// durability boundary never unschedules, which is why one event can no
+/// longer clear another's still-needed backstop (finding F2).
+async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> StepOutcome<()>
 where
     C: EventContext,
 {
@@ -1085,15 +1086,10 @@ where
             return StepOutcome::Skip;
         }
     };
-    match retry_step(context, "arm StateRecovery backstop", || {
-        context.schedule(fire, TimerType::StateRecovery)
+    retry_step(context, "arm StateRecovery backstop", || {
+        context.clear_and_schedule(fire, TimerType::StateRecovery)
     })
     .await
-    {
-        StepOutcome::Done(()) => StepOutcome::Done(fire),
-        StepOutcome::Skip => StepOutcome::Skip,
-        StepOutcome::Abandon => StepOutcome::Abandon,
-    }
 }
 
 /// Flushes the registered marker, retrying transient failures; a permanent

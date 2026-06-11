@@ -22,6 +22,7 @@
 //! `state::session::tests`; here the focus is the boundary sequence and its
 //! ordering.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,6 +61,7 @@ use crate::state::{
 };
 use crate::timers::TimerType;
 use crate::timers::Trigger;
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::{Key, Offset, Topic};
 
@@ -67,6 +69,7 @@ use crate::test_util::TEST_RUNTIME;
 use color_eyre::eyre::{Result, eyre};
 
 const CART: ValueDescriptor = value_state("cart");
+const WISHLIST: ValueDescriptor = value_state("wishlist");
 const SEGMENT: Uuid = Uuid::from_u128(0x5E6);
 
 type Session = ValueStateSession<
@@ -112,11 +115,15 @@ impl CommitOracle for RecordingOracle {
 /// Durable Value bundle that delegates to [`MemoryDurableValueStore`] but
 /// fails the first `fail_seals` `seal` calls with an injected error of the
 /// configured classification: `Permanent` drives the boundary's skip arm,
-/// `Transient` drives `retry_step`'s retry-in-place loop.
+/// `Transient` drives `retry_step`'s retry-in-place loop. Independently, it
+/// fails the first `fail_applies` post-commit `apply_sealed` calls, driving
+/// `commit_apply` to [`ApplyOutcome::Incomplete`] so the backstop must stay
+/// armed for the sweep.
 #[derive(Clone, Debug)]
 struct FailingSealDurable {
     inner: MemoryDurableValueStore,
     fail_seals: Arc<AtomicUsize>,
+    fail_applies: Arc<AtomicUsize>,
     category: ErrorCategory,
 }
 
@@ -125,6 +132,7 @@ impl FailingSealDurable {
         Self {
             inner: MemoryDurableValueStore::for_tests(),
             fail_seals: Arc::new(AtomicUsize::new(0)),
+            fail_applies: Arc::new(AtomicUsize::new(0)),
             category: ErrorCategory::Permanent,
         }
     }
@@ -133,8 +141,28 @@ impl FailingSealDurable {
         Self {
             inner: MemoryDurableValueStore::for_tests(),
             fail_seals: Arc::new(AtomicUsize::new(count)),
+            fail_applies: Arc::new(AtomicUsize::new(0)),
             category,
         }
+    }
+
+    /// Seals succeed, but the first `count` post-commit `apply_sealed` calls
+    /// fail permanently — the seal commits but never resolves, so
+    /// `commit_apply` returns [`ApplyOutcome::Incomplete`].
+    fn failing_applies(count: usize) -> Self {
+        Self {
+            inner: MemoryDurableValueStore::for_tests(),
+            fail_seals: Arc::new(AtomicUsize::new(0)),
+            fail_applies: Arc::new(AtomicUsize::new(count)),
+            category: ErrorCategory::Permanent,
+        }
+    }
+
+    /// Sets whether the *next* `apply_sealed` fails — per-event control over a
+    /// shared store, safe because per-key serialization runs one event's
+    /// settle to completion before the next dispatches.
+    fn arm_apply_failure(&self, fail: bool) {
+        self.fail_applies.store(usize::from(fail), Ordering::SeqCst);
     }
 }
 
@@ -239,6 +267,13 @@ mod failing_seal_impls {
             collection: &'a CollectionRef<ValueKind>,
             event: EventRef,
         ) -> Result<StoreOutcome, Self::Error> {
+            if self.fail_applies.load(Ordering::SeqCst) > 0 {
+                self.fail_applies.fetch_sub(1, Ordering::SeqCst);
+                return Err(InjectedSealError {
+                    category: ErrorCategory::Permanent,
+                }
+                .into());
+            }
             Ok(self.inner.apply_sealed(collection, event).await?)
         }
 
@@ -267,12 +302,14 @@ mod failing_seal_impls {
     }
 }
 
-/// Leaf handler driven through the blanket `EventHandler` impl. Writes
-/// `CART` per the scripted op, then registers the message commit marker on a
-/// final outcome (`Ok` / `Permanent`) — mirroring the deduplication
-/// middleware — and returns the scripted result.
+/// Leaf handler driven through the blanket `EventHandler` impl. Writes its
+/// target collection (`CART` by default; override with [`Self::on_collection`])
+/// per the scripted op, then registers the message commit marker on a final
+/// outcome (`Ok` / `Permanent`) — mirroring the deduplication middleware — and
+/// returns the scripted result.
 #[derive(Clone)]
 struct BoundaryHandler {
+    descriptor: ValueDescriptor,
     set_byte: u8,
     marker: Uuid,
     result: Result<(), ErrorCategory>,
@@ -282,6 +319,7 @@ struct BoundaryHandler {
 impl BoundaryHandler {
     fn set_ok(byte: u8, marker: Uuid) -> Self {
         Self {
+            descriptor: CART,
             set_byte: byte,
             marker,
             result: Ok(()),
@@ -291,6 +329,7 @@ impl BoundaryHandler {
 
     fn set_err(byte: u8, marker: Uuid, category: ErrorCategory) -> Self {
         Self {
+            descriptor: CART,
             set_byte: byte,
             marker,
             result: Err(category),
@@ -298,11 +337,17 @@ impl BoundaryHandler {
         }
     }
 
+    /// Targets a specific registered collection instead of the default `CART`.
+    fn on_collection(mut self, descriptor: ValueDescriptor) -> Self {
+        self.descriptor = descriptor;
+        self
+    }
+
     async fn run<C>(&self, ctx: &C) -> Result<(), BoundaryError>
     where
         C: EventContext<Payload = Value>,
     {
-        let cart = ctx.state(CART).map_err(ValueStateError::from)?;
+        let cart = ctx.state(self.descriptor).map_err(ValueStateError::from)?;
         let before = cart.get().await?;
         self.observed.lock().push(before);
         cart.set(Value::from(self.set_byte)).await?;
@@ -379,7 +424,8 @@ fn registry() -> Result<Arc<CollectionDefRegistry>> {
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
     let def =
         CollectionDef::new(Some(CompactDuration::new(3_600))).with_commit_mode(CommitMode::Wal);
-    registry.register(&CART, def)?;
+    registry.register(&CART, def.clone())?;
+    registry.register(&WISHLIST, def)?;
     Ok(Arc::new(registry))
 }
 
@@ -410,10 +456,14 @@ fn session(
 }
 
 fn cart_id(key: &Key) -> Result<CollectionId<ValueKind>> {
+    collection_id(key, "cart")
+}
+
+fn collection_id(key: &Key, name: &str) -> Result<CollectionId<ValueKind>> {
     Ok(CollectionId::new(
         StateKey::new(SEGMENT, key.clone()),
         StateType::Application,
-        StateName::try_new("cart")?,
+        StateName::try_new(name)?,
     ))
 }
 
@@ -453,11 +503,26 @@ async fn dispatch_message(
     Ok(())
 }
 
-fn schedules(context: &TestContext) -> usize {
+fn schedules<S>(context: &MockEventContext<Value, S>) -> usize {
     context.count_scheduled(TimerType::StateRecovery)
 }
 
-fn unschedules(context: &TestContext) -> usize {
+/// The backstop is armed via `clear_and_schedule` (a per-key singleton
+/// overwrite), never a bare `schedule`.
+fn clear_and_schedules<S>(context: &MockEventContext<Value, S>) -> usize {
+    context
+        .timer_operations()
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                TimerOperation::ClearAndSchedule(_, TimerType::StateRecovery)
+            )
+        })
+        .count()
+}
+
+fn unschedules<S>(context: &MockEventContext<Value, S>) -> usize {
     context
         .timer_operations()
         .iter()
@@ -465,21 +530,15 @@ fn unschedules(context: &TestContext) -> usize {
         .count()
 }
 
-fn clear_scheduleds(context: &TestContext) -> usize {
-    context
-        .timer_operations()
-        .iter()
-        .filter(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery)))
-        .count()
-}
-
-/// On a successful dispatch the boundary seals, flushes the marker, applies
-/// the sealed set, and point-clears its own backstop: the durable cell holds
-/// the value, the WAL is resolved (`Idle`), the marker row is present, and
-/// exactly one `Schedule` + one `Unschedule` of `StateRecovery` were recorded
-/// (never a key-wide `ClearScheduled`).
+/// On a successful dispatch the boundary seals, flushes the marker, and
+/// applies the sealed set: the durable cell holds the value, the WAL is
+/// resolved (`Idle`), and the marker row is present. The backstop is armed as
+/// a per-key singleton (`clear_and_schedule`) and is **never** point-cleared
+/// — the sweep self-clears once the key goes quiet. So exactly one
+/// `ClearAndSchedule` and *zero* `Unschedule`s of `StateRecovery` are
+/// recorded (finding F2: the boundary cannot disturb a backstop).
 #[tokio::test]
-async fn commit_seals_flushes_applies_and_point_clears() -> Result<()> {
+async fn commit_seals_flushes_applies_and_arms_singleton_backstop() -> Result<()> {
     let durable = FailingSealDurable::never_fails();
     let store = MemoryDeduplicationStore::new();
     let key: Key = Arc::from("k");
@@ -503,19 +562,14 @@ async fn commit_seals_flushes_applies_and_point_clears() -> Result<()> {
         "the marker row is present after commit"
     );
     assert_eq!(
-        schedules(&context),
+        clear_and_schedules(&context),
         1,
-        "the seal armed exactly one backstop"
+        "the seal armed exactly one singleton backstop via clear_and_schedule"
     );
     assert_eq!(
         unschedules(&context),
-        1,
-        "resolution point-cleared that backstop"
-    );
-    assert_eq!(
-        clear_scheduleds(&context),
         0,
-        "never a key-wide ClearScheduled"
+        "the boundary never point-clears a backstop"
     );
     Ok(())
 }
@@ -549,14 +603,14 @@ async fn seal_failure_writes_no_marker() -> Result<()> {
         "the handler runs exactly once per dispatch — seal retries don't re-run it"
     );
     assert_eq!(
-        schedules(&context),
+        clear_and_schedules(&context),
         1,
-        "a permanent seal failure still arms the backstop defensively"
+        "a permanent seal failure still arms the singleton backstop defensively"
     );
     assert_eq!(
         unschedules(&context),
         0,
-        "nothing resolved, so nothing is point-cleared"
+        "the boundary never point-clears a backstop"
     );
     Ok(())
 }
@@ -598,11 +652,15 @@ async fn transient_seal_failure_retries_in_place_without_rerunning_handler() -> 
         "the handler's writes survive the transient seal failures"
     );
     assert_eq!(
-        schedules(&context),
+        clear_and_schedules(&context),
         1,
-        "the eventual seal arms one backstop"
+        "the eventual seal arms one singleton backstop"
     );
-    assert_eq!(unschedules(&context), 1, "resolution point-clears it");
+    assert_eq!(
+        unschedules(&context),
+        0,
+        "the boundary never point-clears a backstop"
+    );
     Ok(())
 }
 
@@ -635,6 +693,153 @@ async fn permanent_error_flushes_marker_without_sealing() -> Result<()> {
         "the failed dispatch's write never reaches durable state"
     );
     Ok(())
+}
+
+/// F2 cross-event regression — the interleaving the single-event harness
+/// could not see. Two events on the **same key** share one timer state:
+///
+/// * Event A writes `CART`; its post-commit apply fails, so `CART` stays
+///   `Sealed` (pending) with a `StateRecovery` backstop armed.
+/// * Event B writes a *different* collection (`WISHLIST`) and resolves cleanly
+///   in the same fire-time second.
+///
+/// Pre-fix, B's `Resolved` point-clear `unschedule`d the shared backstop slot,
+/// stripping the only backstop covering A's still-pending seal. The singleton
+/// `clear_and_schedule` design never unschedules, so after B settles the key
+/// **still has** a `StateRecovery` timer. The `unschedules == 0` assertion is
+/// the deterministic teeth (it fails pre-fix the moment B resolves, regardless
+/// of the wall-clock second); the non-empty net-schedule assertion states the
+/// consequence the plan calls for.
+#[tokio::test]
+async fn cross_event_resolved_commit_keeps_a_pending_backstop() -> Result<()> {
+    let durable = FailingSealDurable::failing_applies(1);
+    let store = MemoryDeduplicationStore::new();
+    let key: Key = Arc::from("k");
+    // One shared timer-op log across both events: cloning the base context
+    // shares the underlying `Arc`, so A's and B's ops accumulate together.
+    let base = MockEventContext::<Value>::new().with_timer_tracking();
+
+    // Event A on CART: apply fails (the one armed failure), CART stays Sealed.
+    let ctx_a = base
+        .clone()
+        .with_session(session(durable.clone(), store.clone(), &key)?);
+    let handler_a = BoundaryHandler::set_ok(1, Uuid::from_u128(0xA)).on_collection(CART);
+    dispatch_message(&handler_a, ctx_a, 0, &key).await?;
+
+    // Event B on WISHLIST: resolves cleanly (the failure budget is spent).
+    let ctx_b = base
+        .clone()
+        .with_session(session(durable.clone(), store.clone(), &key)?);
+    let handler_b = BoundaryHandler::set_ok(2, Uuid::from_u128(0xB)).on_collection(WISHLIST);
+    dispatch_message(&handler_b, ctx_b, 1, &key).await?;
+
+    assert!(
+        matches!(
+            DurableWalStore::read_partition(&durable, &collection_id(&key, "cart")?).await?,
+            DurableState::Sealed { .. }
+        ),
+        "A's apply failed, so CART is still a pending seal after B settles"
+    );
+    assert_eq!(
+        unschedules(&base),
+        0,
+        "the boundary never point-clears, so B cannot strip A's backstop"
+    );
+    assert!(
+        !net_scheduled(&base, TimerType::StateRecovery).is_empty(),
+        "a StateRecovery backstop still covers CART's pending seal after B"
+    );
+    Ok(())
+}
+
+/// Property (multi-event-per-key, shared timer state): for any sequence of
+/// committing events on one key — each targeting `CART` or `WISHLIST` and
+/// either resolving cleanly or failing its apply — the boundary issues **zero**
+/// `Unschedule`s, and whenever the key has any pending (unresolved) seal a
+/// `StateRecovery` timer is scheduled. This is the plan's invariant "a key with
+/// any pending entry has a scheduled `StateRecovery` timer", exercised over
+/// real interleavings the old point-clear could corrupt.
+#[test]
+fn prop_pending_key_always_has_a_backstop() {
+    fn property(steps: Vec<(bool, bool)>) -> TestResult {
+        if steps.is_empty() {
+            return TestResult::discard();
+        }
+        let input = format!("{steps:?}");
+        match TEST_RUNTIME.block_on(run_backstop_sequence(steps)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::error(format!("backstop invariant violated for {input}")),
+            Err(e) => TestResult::error(format!("{input}: {e}")),
+        }
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<(bool, bool)>) -> TestResult);
+}
+
+/// Drives `steps` (`(use_wishlist, fail_apply)` per event) on one key against a
+/// shared durable and a shared timer-op log, checking the F2 invariant after
+/// every settle. Returns `Ok(false)` on the first violation.
+async fn run_backstop_sequence(steps: Vec<(bool, bool)>) -> Result<bool> {
+    let durable = FailingSealDurable::never_fails();
+    let store = MemoryDeduplicationStore::new();
+    let key: Key = Arc::from("k");
+    let base = MockEventContext::<Value>::new().with_timer_tracking();
+
+    for (idx, (use_wishlist, fail_apply)) in steps.into_iter().enumerate() {
+        durable.arm_apply_failure(fail_apply);
+        let descriptor = if use_wishlist { WISHLIST } else { CART };
+        let marker = Uuid::from_u128(idx as u128 + 1);
+        let handler = BoundaryHandler::set_ok(idx as u8, marker).on_collection(descriptor);
+        let context = base
+            .clone()
+            .with_session(session(durable.clone(), store.clone(), &key)?);
+
+        dispatch_message(&handler, context, idx as Offset, &key).await?;
+
+        // Invariant 1: the boundary never point-clears a backstop.
+        if unschedules(&base) != 0 {
+            return Ok(false);
+        }
+        // Invariant 2: any pending (Sealed) collection ⇒ a backstop is armed.
+        let pending = is_sealed(&durable, &key, "cart").await?
+            || is_sealed(&durable, &key, "wishlist").await?;
+        if pending && net_scheduled(&base, TimerType::StateRecovery).is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Replays the recorded timer ops (all for one key, since each test uses a
+/// single key) into the net set of scheduled times for `timer_type`.
+fn net_scheduled<S>(
+    context: &MockEventContext<Value, S>,
+    timer_type: TimerType,
+) -> BTreeSet<CompactDateTime> {
+    let mut set = BTreeSet::new();
+    for op in context.timer_operations() {
+        match op {
+            TimerOperation::Schedule(time, t) if t == timer_type => {
+                set.insert(time);
+            }
+            TimerOperation::ClearAndSchedule(time, t) if t == timer_type => {
+                set.clear();
+                set.insert(time);
+            }
+            TimerOperation::Unschedule(time, t) if t == timer_type => {
+                set.remove(&time);
+            }
+            TimerOperation::ClearScheduled(t) if t == timer_type => set.clear(),
+            _ => {}
+        }
+    }
+    set
+}
+
+async fn is_sealed(durable: &FailingSealDurable, key: &Key, name: &str) -> Result<bool> {
+    Ok(matches!(
+        DurableWalStore::read_partition(durable, &collection_id(key, name)?).await?,
+        DurableState::Sealed { .. }
+    ))
 }
 
 /// Property: a sequence of committing messages on one key reads its own
