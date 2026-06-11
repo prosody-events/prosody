@@ -463,23 +463,21 @@ where
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
-    /// transaction to `Clean`. **[`CommitMode::Direct`] collections only.**
+    /// transaction to `Clean` — a mid-handler write-through, valid in
+    /// **either** commit mode.
     ///
-    /// A `Wal` collection's writes become durable only through the
-    /// seal→commit→apply sequence, atomically with the event's commit
-    /// marker. Flushing mid-handler would persist the write *before* the
-    /// marker, so a failed handler plus retry would re-apply it — flush on
-    /// a `Wal` collection therefore rejects (`Permanent`) rather than
-    /// silently downgrading the guarantee. Reads already see buffered
-    /// writes without flushing.
+    /// The contract is **at-least-once**: a flushed write is durable
+    /// immediately, *not* atomically with the event's commit marker. A
+    /// handler that fails after flushing re-runs against the
+    /// already-applied state on retry or redelivery, so flushed writes
+    /// must be idempotent (or the handler must tolerate re-execution).
+    /// Ops buffered *after* the flush still ride the collection's normal
+    /// commit path. Reads already see buffered writes without flushing —
+    /// flush is for making them durable early, not for read-your-writes.
     ///
     /// # Errors
     ///
-    /// Returns a `WrongCommitMode` store error for a
-    /// [`CommitMode::Wal`](crate::state::CommitMode::Wal) collection, or an
-    /// access error from the session.
-    ///
-    /// [`CommitMode::Direct`]: crate::state::CommitMode::Direct
+    /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
         Ok(self.session.flush_state_cell(&self.name).await?)

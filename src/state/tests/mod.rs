@@ -223,45 +223,6 @@ async fn unsealed_apply_or_rollback_clears_dirty_like_abort() -> Result<()> {
     Ok(())
 }
 
-/// `flush` is Direct-mode only: on a `Wal` collection it must reject with
-/// `WrongCommitMode` instead of applying buffered ops to authoritative state
-/// mid-handler — that write would be durable *before* the event's commit
-/// marker, so a failed handler plus retry would apply it twice.
-#[tokio::test]
-async fn flush_rejects_wal_mode_without_applying() -> Result<()> {
-    let durable = MemoryDurableValueStore::for_tests();
-    let dirty = MemoryDirtyValueStore::new();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-
-    let mut tx = TransactionValueStore::new(
-        durable.clone(),
-        dirty,
-        collection,
-        event(1),
-        CommitMode::Wal,
-    );
-    tx.set(&collection_id, bytes(1)).await?;
-
-    assert!(matches!(
-        tx.flush().await,
-        Err(TransactionValueStoreError::WrongCommitMode {
-            expected: CommitMode::Direct,
-            actual: CommitMode::Wal,
-        })
-    ));
-    let applied = match durable.read_partition(&collection_id).await? {
-        super::DurableState::Idle { applied } | super::DurableState::Sealed { applied, .. } => {
-            applied
-        }
-    };
-    assert_eq!(applied, None, "the rejected flush must not write durably");
-    // The transaction is still usable: the buffered op survives for the
-    // boundary's seal.
-    assert_eq!(tx.get(&collection_id).await?, Read::Present(bytes(1)));
-    Ok(())
-}
-
 #[tokio::test]
 async fn finished_transaction_rejects_further_transitions() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
