@@ -11,13 +11,33 @@ use super::wal::SealedWal;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 
-/// Persistence mode for local state changes.
+/// Persistence mode for a collection's state changes, chosen per collection
+/// at registration
+/// ([`CollectionDef::with_commit_mode`](crate::state::registry::CollectionDef::with_commit_mode);
+/// the default is [`Self::Wal`]).
+///
+/// The trade-off:
+///
+/// * **`Wal` — atomic with the event, crash-recoverable.** On handler success
+///   the buffered writes seal into a write-ahead log *before* the event's
+///   commit marker; crash recovery then applies or rolls the WAL back according
+///   to whether the event committed. A handler that fails or redelivers never
+///   half-applies its writes. Costs one extra durable write (the seal) plus the
+///   deferred apply per event.
+/// * **`Direct` — cheaper, at-least-once.** Buffered writes apply straight to
+///   authoritative state when the handler succeeds, with no WAL. A crash
+///   between the apply and the event's commit re-runs the handler against
+///   already-applied state, so writes must be idempotent (last-writer-wins
+///   `set`s usually are). Choose it for state where re-application is harmless
+///   and the extra write per event matters.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitMode {
-    /// Seal dirty operations before the event commit oracle resolves them.
+    /// Seal dirty operations into a write-ahead log before the event commit
+    /// oracle resolves them — atomic with the event's commit marker.
     Wal,
 
-    /// Apply dirty operations directly with no sealed write-ahead state.
+    /// Apply dirty operations directly with no sealed write-ahead state —
+    /// cheaper, with at-least-once application semantics.
     Direct,
 }
 

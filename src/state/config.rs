@@ -51,9 +51,14 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_cache_dir"))]
     pub cache_dir: PathBuf,
 
-    /// Middleware-wide default TTL for collections whose
-    /// [`CollectionDef`] does not override it. `None` means indefinite
-    /// retention.
+    /// Fallback TTL for state rows whose collection is **not** in the
+    /// registry — recovery-sweep leftovers whose descriptor was since
+    /// removed from the application. `None` means indefinite retention for
+    /// such rows.
+    ///
+    /// Registered collections never inherit this value: their TTL is
+    /// exactly the `Option` passed to [`CollectionDef::new`], where `None`
+    /// is an explicit choice of indefinite retention.
     #[builder(default)]
     pub default_ttl: Option<CompactDuration>,
 

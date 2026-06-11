@@ -134,6 +134,7 @@ use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::defer::reset_state_session;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
@@ -362,10 +363,14 @@ where
             .timestamp()
             .to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        // Attempt to process the message with the wrapped handler
+        // Attempt to process the message with the wrapped handler. Keep a
+        // clone of the context: the routed arm below swallows the inner
+        // error into `Ok(Routed)` and must reset the keyed-state session
+        // first, like every other Err→Ok swallow point.
+        let inner_context = context.clone();
         let error = match self
             .handler
-            .on_message(context, message.clone(), demand_type)
+            .on_message(inner_context, message.clone(), demand_type)
             .await
         {
             Ok(output) => return Ok(FailureTopicOutput::Inner(output)),
@@ -413,7 +418,14 @@ where
             .send(headers, self.topic, key, message.payload().clone())
             .await
         {
-            Ok(()) => Ok(FailureTopicOutput::Routed(error)),
+            Ok(()) => {
+                // The inner attempt failed but the dispatch resolves `Ok`:
+                // reset the session so the failed attempt's dirty ops never
+                // seal and its registered marker never flushes (the same
+                // attempt-boundary reset both defer swallow points perform).
+                reset_state_session(&context);
+                Ok(FailureTopicOutput::Routed(error))
+            }
             Err(producer) => Err(FailureTopicError::DlqSendFailed {
                 inner: error,
                 producer,

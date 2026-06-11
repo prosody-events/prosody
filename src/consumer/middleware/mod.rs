@@ -794,10 +794,13 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// owner. No other middleware should implement `EventHandler` directly.
 ///
 /// **Stack contract:** `settle` keys the seal to the *final* `Ok` the
-/// stack returns, not the inner handler's `Ok`. This is correct because no
-/// middleware maps an inner `Ok` to an outer `Err` — verified across every
-/// middleware in this module. A new middleware that did so would seal state
-/// the consumer then reports as failed; don't write one.
+/// stack returns, not the inner handler's `Ok`. In the shipped stacks no
+/// reachable path maps an inner `Ok` to an outer `Err`; the defer
+/// middlewares *can* (a rescue failure after inner success), which is safe
+/// because retry's between-attempt reset discards the session and `settle`
+/// flushes a registered marker only on a `Permanent` final. A new
+/// middleware that converts inner `Ok` to outer `Err` must reset the
+/// session (`reset_state_session`) or rely on those same guards.
 ///
 /// Per-invocation apply-hook correctness is preserved: one inner invocation
 /// pairs with exactly one `after_commit` / `after_abort` firing.
@@ -937,9 +940,15 @@ pub(crate) async fn settle<T, C, G>(
         // Final error (Transient/Permanent): nothing sealed (finalize runs
         // only on Ok). On a Permanent error the dedup middleware registered
         // the marker; flush it so the failed-but-final message deduplicates.
-        // Then commit the marker and fire the hook.
-        Some(_) => {
-            if let Some(lifecycle) = &lifecycle {
+        // The flush is gated to Permanent: in the shipped stacks a Transient
+        // final has no registered marker anyway, but a custom stack whose
+        // middleware swallows a post-success failure into a Transient error
+        // (without resetting the session) must not have that attempt's
+        // marker certify never-sealed state. Then commit and fire the hook.
+        Some(category) => {
+            if category == ErrorCategory::Permanent
+                && let Some(lifecycle) = &lifecycle
+            {
                 flush_marker_best_effort(&context, lifecycle).await;
             }
             guard.commit().await;
@@ -978,6 +987,9 @@ async fn settle_committed<T, C, G>(
             // Permanent seal failure: a partial seal may be durable. Arm the
             // backstop defensively so the sweep rolls it back, skip the marker
             // flush (invariant: marker present ⇒ seal durable), and commit.
+            // A shutdown `Abandon` from the arm is deliberately ignored:
+            // committing a permanently-unsealable event beats livelocking,
+            // and first-touch covers the unarmed seal.
             let _ = arm_backstop(&context, &lifecycle).await;
             guard.commit().await;
             handler.after_commit(context, result).await;
@@ -1064,9 +1076,9 @@ pub(crate) async fn abandon<T, C, G>(
 /// Arms the per-key `StateRecovery` backstop as a debounced singleton.
 ///
 /// `clear_and_schedule` overwrites any prior `StateRecovery` timer for the
-/// key with one at `fire`, atomically and tombstone-free (verified at
-/// `timers/manager/mod.rs:520`). It is type-scoped — only the key's
-/// `StateRecovery` timers are replaced; user timers of other types are
+/// key with one at `fire`, atomically and tombstone-free
+/// (`TimerManager::clear_and_schedule_trigger`). It is type-scoped — only the
+/// key's `StateRecovery` timers are replaced; user timers of other types are
 /// untouched. The result is a single backstop per key whose fire time is the
 /// key's *last* stateful commit plus `delay`: rapid commits debounce it
 /// outward rather than racing to clear each other.
