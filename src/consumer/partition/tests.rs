@@ -256,7 +256,7 @@ async fn test_partition_manager_max_uncommitted() {
 }
 
 #[tokio::test]
-async fn test_partition_manager_is_stalled() {
+async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     // Handler that introduces a delay to simulate a stall
     #[derive(Clone)]
     struct StallTestHandler {
@@ -335,19 +335,14 @@ async fn test_partition_manager_is_stalled() {
         "Message send should succeed"
     );
 
-    wait_for_partition_stalled(&partition_manager, true, Duration::from_secs(2))
-        .await
-        .expect("PartitionManager should report as stalled");
+    wait_for_partition_stalled(&partition_manager, true, Duration::from_secs(2)).await?;
 
-    wait_for_processed_offsets(&handler, 1, Duration::from_secs(3))
-        .await
-        .expect("Message should be processed");
+    wait_for_processed_offsets(&handler, 1, Duration::from_secs(3)).await?;
 
-    wait_for_partition_stalled(&partition_manager, false, Duration::from_secs(2))
-        .await
-        .expect("PartitionManager should no longer report as stalled");
+    wait_for_partition_stalled(&partition_manager, false, Duration::from_secs(2)).await?;
 
     partition_manager.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -419,7 +414,7 @@ async fn wait_for_processed_offsets<H>(
     handler: &H,
     expected_count: usize,
     timeout: Duration,
-) -> Result<(), String>
+) -> color_eyre::Result<()>
 where
     H: HasProcessedOffsets + ?Sized,
 {
@@ -432,13 +427,13 @@ where
             }
         }
         if Instant::now() >= deadline {
-            return Err(format!("Timeout waiting for {expected_count} messages"));
+            return Err(eyre!("Timeout waiting for {expected_count} messages"));
         }
         let notified = handler.notify().notified();
         tokio::select! {
             () = notified => {},
             () = sleep_until(deadline) => {
-                return Err(format!("Timeout waiting for {expected_count} messages"));
+                return Err(eyre!("Timeout waiting for {expected_count} messages"));
             }
         }
     }
@@ -458,7 +453,7 @@ async fn wait_for_partition_stalled<P>(
     partition_manager: &PartitionManager<P>,
     expected: bool,
     timeout: Duration,
-) -> Result<(), String>
+) -> color_eyre::Result<()>
 where
     P: Send + 'static,
 {
@@ -469,14 +464,14 @@ where
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(eyre!(
                 "Timeout waiting for partition stalled state {expected}; last state was {actual}"
             ));
         }
         tokio::select! {
             () = sleep(Duration::from_millis(10)) => {},
             () = sleep_until(deadline) => {
-                return Err(format!(
+                return Err(eyre!(
                     "Timeout waiting for partition stalled state {expected}; last state was {actual}"
                 ));
             }
