@@ -97,9 +97,11 @@ impl CollectionDefRegistry {
     /// # Errors
     ///
     /// Returns [`RegisterStateError::Name`] when the descriptor's name is
-    /// empty, [`RegisterStateError::Ttl`] when its TTL exceeds Cassandra's
-    /// `USING TTL` ceiling, or [`RegisterStateError::IdentityConflict`] when
-    /// the name is already registered with a different structural identity.
+    /// empty, [`RegisterStateError::SchemaLabel`] when its identity carries an
+    /// empty schema label, [`RegisterStateError::Ttl`] when its TTL exceeds
+    /// Cassandra's `USING TTL` ceiling, or
+    /// [`RegisterStateError::IdentityConflict`] when the name is already
+    /// registered with a different structural identity.
     pub fn register<D>(
         &mut self,
         descriptor: &D,
@@ -120,6 +122,11 @@ impl CollectionDefRegistry {
         def: CollectionDef,
     ) -> Result<(), RegisterStateError> {
         let name = StateName::try_new(name)?;
+        if let Some(label) = &identity.schema_label
+            && label.as_str().trim().is_empty()
+        {
+            return Err(RegisterStateError::SchemaLabel { name });
+        }
         if let Some(ttl) = def.ttl
             && i64::from(ttl.seconds()) > MAX_CASSANDRA_TTL_SECS
         {
@@ -175,6 +182,18 @@ pub enum RegisterStateError {
     /// The descriptor's collection name was empty.
     #[error(transparent)]
     Name(#[from] StateNameError),
+
+    /// The descriptor's identity carried an empty (or whitespace-only) schema
+    /// label. A label is part of the frozen [`StructuralIdentity`], so an
+    /// empty one would durably persist `Some("")` — indistinguishable at the
+    /// wire from a deliberate blank version. Rejected here, the single
+    /// registration choke point, so the empty label never reaches durable
+    /// state; opting out of labels is `None`, not `Some("")`.
+    #[error("state collection {name:?} declared an empty schema label")]
+    SchemaLabel {
+        /// Collection name whose schema label was empty.
+        name: StateName,
+    },
 
     /// The collection's TTL exceeds Cassandra's `USING TTL` ceiling
     /// (`630,720,000` seconds). Rejected at registration — the single choke

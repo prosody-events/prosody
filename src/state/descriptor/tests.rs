@@ -312,6 +312,24 @@ fn conflicting_registration_is_rejected() -> Result<()> {
     Ok(())
 }
 
+/// N5: a descriptor whose schema label is empty (or whitespace-only) is
+/// rejected at registration, so `Some("")` never freezes into durable
+/// identity. Opting out of a label is `None`; a present label must carry
+/// content.
+#[test]
+fn empty_schema_label_is_rejected() {
+    const BLANK: ValueDescriptor = value_state("cart").with_schema_label("");
+    const WHITESPACE: ValueDescriptor = value_state("cart").with_schema_label("  ");
+
+    for desc in [BLANK, WHITESPACE] {
+        let mut registry = CollectionDefRegistry::new(None);
+        assert!(matches!(
+            registry.register(&desc, CollectionDef::new(None)),
+            Err(RegisterStateError::SchemaLabel { .. })
+        ));
+    }
+}
+
 /// N5: re-registering the same name with an *unchanged* identity is
 /// accepted and updates the operational settings — the second `CollectionDef`
 /// wins. Identity is frozen; TTL and commit mode are not.
