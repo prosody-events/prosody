@@ -185,6 +185,44 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
     Ok(())
 }
 
+/// Symmetry pin for `LocalTx::Dirty`: resolving a transaction's *sealed* event
+/// (`apply_sealed` / `rollback_sealed`) while it is still `Dirty` — staged
+/// writes that were never sealed — must discard those pending ops, exactly as
+/// [`TransactionValueStore::abort`] does. Pre-fix, only `abort` cleared the
+/// dirty workspace, so the unsealed ops leaked.
+#[tokio::test]
+async fn unsealed_apply_or_rollback_clears_dirty_like_abort() -> Result<()> {
+    for resolve_via_rollback in [false, true] {
+        let durable = MemoryDurableValueStore::for_tests();
+        let dirty = MemoryDirtyValueStore::new();
+        let collection = collection_ref()?;
+        let collection_id = collection.id().clone();
+
+        let mut tx = TransactionValueStore::new(
+            durable,
+            dirty.clone(),
+            collection,
+            event(1),
+            CommitMode::Wal,
+        );
+        tx.set(&collection_id, bytes(1)).await?;
+
+        // Resolve via the sealed-event path on a still-`Dirty` transaction.
+        if resolve_via_rollback {
+            tx.rollback_sealed().await?;
+        } else {
+            tx.apply_sealed().await?;
+        }
+
+        assert_eq!(
+            dirty.get(&collection_id).await?,
+            Read::Unknown,
+            "resolving a sealed event must discard the unsealed dirty ops"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn finished_transaction_rejects_further_transitions() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();

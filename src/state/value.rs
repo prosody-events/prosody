@@ -301,6 +301,7 @@ where
     /// storage rejects the sealed event.
     pub async fn apply_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         self.ensure_not_finished()?;
+        self.discard_dirty_pending_ops()?;
 
         let outcome = self
             .durable
@@ -319,6 +320,7 @@ where
     /// storage rejects the sealed event.
     pub async fn rollback_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         self.ensure_not_finished()?;
+        self.discard_dirty_pending_ops()?;
 
         let outcome = self
             .durable
@@ -422,6 +424,22 @@ where
             return Ok(None);
         };
         Ok(Some(pending.ops.collect()))
+    }
+
+    /// Discards uncommitted dirty ops before resolving a *sealed* event.
+    ///
+    /// Symmetric with [`Self::abort`]'s `Dirty` arm: a transaction that staged
+    /// writes but is then resolved through its sealed state (apply / rollback)
+    /// must not leave those unsealed ops orphaning the dirty workspace. A no-op
+    /// in every other local state, so the normal `Sealed`-then-apply path is
+    /// untouched.
+    fn discard_dirty_pending_ops(&self) -> Result<(), TxError<S, D>> {
+        if matches!(self.local_tx(), LocalTx::Dirty) {
+            self.dirty
+                .clear_pending_ops(self.collection.id())
+                .map_err(TransactionValueStoreError::Dirty)?;
+        }
+        Ok(())
     }
 
     /// Returns an error when the transaction's pinned commit mode is not
