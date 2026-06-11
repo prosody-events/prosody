@@ -28,7 +28,7 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
 use crate::state::oracle::CommitOracle;
-use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
+use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
     DirtyValueBundle, DurableValueBundle, SessionParts, StateSession, TerminationWatch,
@@ -49,7 +49,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// The per-event dirty store behind a backend factory's provider.
 type DirtyStoreOf<B> =
@@ -81,7 +81,9 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`Self::RecoveryError`] when the sweep or the timer clear
-    /// fails; the caller aborts the firing trigger so the sweep re-runs.
+    /// fails. The caller classifies: Transient/Terminal aborts the firing
+    /// trigger so the sweep re-runs; Permanent commits it to stop the
+    /// refire loop (first-touch and the key's next commit still recover).
     fn recover<T>(
         &self,
         key: Key,
@@ -323,6 +325,15 @@ where
 /// at WARN and skipped; future kinds plug in by extending the dispatch
 /// match. Clearing the `StateRecovery` timer is the caller's last step —
 /// the sweep itself is timer-agnostic.
+///
+/// Per-entry failures are classified: a **Permanent** failure (e.g. a
+/// corrupt durable row) is logged loudly and *skipped*, so one poisoned
+/// entry cannot starve the key's healthy siblings of resolution — were it
+/// to propagate, every sweep for the key would die at the same entry and
+/// a committed-but-unapplied sibling seal would wait on first-touch or its
+/// WAL TTL. Anything else propagates so the caller aborts the trigger and
+/// the sweep refires. Scanner errors always propagate: without the entry
+/// there is nothing to skip.
 pub(crate) async fn sweep_pending<D, Sc, O>(
     durable: &D,
     scanner: &Sc,
@@ -333,8 +344,10 @@ pub(crate) async fn sweep_pending<D, Sc, O>(
 where
     D: DurableWalStore<ValueKind>
         + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    <D as DurableWalStore<ValueKind>>::Error: ClassifyError,
     Sc: PendingIndexScanner,
     O: CommitOracle,
+    O::Error: ClassifyError,
 {
     let stream = scanner.scan_pending(&state_key);
     futures::pin_mut!(stream);
@@ -348,27 +361,56 @@ where
             );
             continue;
         }
-        let id =
-            CollectionId::<ValueKind>::new(state_key.clone(), entry.state_type, entry.name.clone());
-        let ttl = registry.ttl_for(&entry.name);
-        let collection_ref = CollectionRef::new(id.clone(), ttl);
-        match DurableWalStore::read_partition(durable, &id)
-            .await
-            .map_err(RecoveryError::Durable)?
-        {
-            DurableState::Idle { .. } => {
-                PendingIndexStore::delete_pending::<ValueKind>(durable, &id)
-                    .await
-                    .map_err(RecoveryError::Durable)?;
+        if let Err(error) = sweep_entry(durable, oracle, registry, &state_key, &entry).await {
+            if error.classify_error() == ErrorCategory::Permanent {
+                error!(
+                    name = entry.name.as_str(),
+                    key = %state_key.key,
+                    "skipping permanently-failing pending entry; first-touch or \
+                     the WAL TTL must resolve it: {error:#}"
+                );
+                continue;
             }
-            DurableState::Sealed { wal, .. } => {
-                resolve_sealed(durable, oracle, &collection_ref, wal.event())
-                    .await
-                    .map_err(|e| match e {
-                        ResolveSealedError::Durable(e) => RecoveryError::Durable(e),
-                        ResolveSealedError::Oracle(e) => RecoveryError::Oracle(e),
-                    })?;
-            }
+            return Err(match error {
+                ResolveSealedError::Durable(e) => RecoveryError::Durable(e),
+                ResolveSealedError::Oracle(e) => RecoveryError::Oracle(e),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolves one pending entry: deletes a stale row over an `Idle`
+/// partition, or resolves a `Sealed` WAL through the oracle. Entry-level
+/// operations only touch the durable store and the oracle, so the error is
+/// the shared [`ResolveSealedError`] pair.
+async fn sweep_entry<D, O>(
+    durable: &D,
+    oracle: &O,
+    registry: &CollectionDefRegistry,
+    state_key: &StateKey,
+    entry: &PendingEntry,
+) -> Result<(), ResolveSealedError<<D as DurableWalStore<ValueKind>>::Error, O::Error>>
+where
+    D: DurableWalStore<ValueKind>
+        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    O: CommitOracle,
+{
+    let id =
+        CollectionId::<ValueKind>::new(state_key.clone(), entry.state_type, entry.name.clone());
+    let ttl = registry.ttl_for(&entry.name);
+    let collection_ref = CollectionRef::new(id.clone(), ttl);
+    match DurableWalStore::read_partition(durable, &id)
+        .await
+        .map_err(ResolveSealedError::Durable)?
+    {
+        DurableState::Idle { .. } => {
+            PendingIndexStore::delete_pending::<ValueKind>(durable, &id)
+                .await
+                .map_err(ResolveSealedError::Durable)?;
+        }
+        DurableState::Sealed { wal, .. } => {
+            resolve_sealed(durable, oracle, &collection_ref, wal.event()).await?;
         }
     }
     Ok(())
@@ -516,6 +558,21 @@ where
     /// The commit oracle failed.
     #[error("keyed-state commit oracle failed")]
     Oracle(#[source] OracleErr),
+}
+
+/// Delegates to the inner error, so the sweep can skip a permanently
+/// poisoned entry without starving its siblings.
+impl<DurableErr, OracleErr> ClassifyError for ResolveSealedError<DurableErr, OracleErr>
+where
+    DurableErr: ClassifyError + Error + 'static,
+    OracleErr: ClassifyError + Error + 'static,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Durable(e) => e.classify_error(),
+            Self::Oracle(e) => e.classify_error(),
+        }
+    }
 }
 
 #[cfg(test)]

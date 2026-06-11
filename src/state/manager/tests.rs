@@ -585,3 +585,170 @@ async fn sweep_pending_resolves_out_of_band_seal() -> Result<()> {
     assert_eq!(read_idle_applied(&durable, &id).await?, Some(bytes(11)));
     Ok(())
 }
+
+/// Durable wrapper that fails `read_partition` permanently for one poisoned
+/// collection name, delegating everything else to the inner memory store.
+#[derive(Clone)]
+struct PoisonedRead {
+    inner: MemoryDurableValueStore,
+    poisoned: &'static str,
+}
+
+mod poisoned_read_impls {
+    use super::{DurableWalStore, PoisonedRead, ValueKind, ValueOp};
+    use crate::error::{ClassifyError, ErrorCategory};
+    use crate::state::memory::MemoryStateError;
+    use crate::state::pending::PendingIndexStore;
+    use crate::state::{
+        CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, SealedCollection,
+        StoreOutcome,
+    };
+    use thiserror::Error;
+
+    #[derive(Debug, Error)]
+    pub(super) enum PoisonedError {
+        #[error("injected permanent read failure")]
+        Injected,
+        #[error(transparent)]
+        Memory(#[from] MemoryStateError),
+    }
+
+    impl ClassifyError for PoisonedError {
+        fn classify_error(&self) -> ErrorCategory {
+            match self {
+                Self::Injected => ErrorCategory::Permanent,
+                Self::Memory(e) => e.classify_error(),
+            }
+        }
+    }
+
+    impl DurableWalStore<ValueKind> for PoisonedRead {
+        type Error = PoisonedError;
+
+        async fn read_partition<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+        ) -> Result<DurableState<ValueKind>, Self::Error> {
+            if collection.name().as_str() == self.poisoned {
+                return Err(PoisonedError::Injected);
+            }
+            DurableWalStore::read_partition(&self.inner, collection)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn seal<'a, I>(
+            &'a self,
+            collection: &'a CollectionRef<ValueKind>,
+            event: EventRef,
+            ops: I,
+        ) -> Result<SealedCollection<ValueKind>, Self::Error>
+        where
+            I: IntoIterator<Item = ValueOp> + Send + 'a,
+        {
+            self.inner
+                .seal(collection, event, ops)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn apply_sealed<'a>(
+            &'a self,
+            collection: &'a CollectionRef<ValueKind>,
+            expected_event: EventRef,
+        ) -> Result<StoreOutcome, Self::Error> {
+            self.inner
+                .apply_sealed(collection, expected_event)
+                .await
+                .map_err(Into::into)
+        }
+
+        async fn rollback_sealed<'a>(
+            &'a self,
+            collection: &'a CollectionRef<ValueKind>,
+            expected_event: EventRef,
+        ) -> Result<StoreOutcome, Self::Error> {
+            self.inner
+                .rollback_sealed(collection, expected_event)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    impl PendingIndexStore for PoisonedRead {
+        type Error = PoisonedError;
+
+        async fn insert_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+        where
+            K: CollectionKind,
+        {
+            self.inner.insert_pending(id).await.map_err(Into::into)
+        }
+
+        async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+        where
+            K: CollectionKind,
+        {
+            self.inner.delete_pending(id).await.map_err(Into::into)
+        }
+    }
+}
+
+/// One permanently-poisoned pending entry must not starve the key's healthy
+/// siblings: the sweep skips it (logging loudly) and still resolves the
+/// committed sibling seal, returning `Ok` so the trigger commits. Pre-fix
+/// the sweep was fail-fast — the poisoned entry erred the whole sweep, every
+/// retry died at the same entry, and the sibling's committed seal could wait
+/// for its WAL TTL.
+#[tokio::test]
+async fn sweep_skips_poisoned_entry_and_resolves_siblings() -> Result<()> {
+    let inner = MemoryDurableValueStore::for_tests();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("k"));
+    let poison_id = CollectionId::<ValueKind>::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("poison")?,
+    );
+    let cart_id = CollectionId::<ValueKind>::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("cart")?,
+    );
+    for (id, event_id, byte) in [(&poison_id, 1_u128, 9_u8), (&cart_id, 2, 7)] {
+        inner
+            .seal(
+                &CollectionRef::new((*id).clone(), None),
+                EventRef::Message {
+                    dedup_id: Uuid::from_u128(event_id),
+                },
+                vec![ValueOp::Set {
+                    payload: bytes(byte),
+                }],
+            )
+            .await?;
+    }
+
+    let durable = PoisonedRead {
+        inner: inner.clone(),
+        poisoned: "poison",
+    };
+    let registry = CollectionDefRegistry::new(None);
+    sweep_pending(
+        &durable,
+        &inner,
+        &FixedOracle::committed(),
+        &registry,
+        state_key.clone(),
+    )
+    .await
+    .map_err(|e| eyre!("a poisoned entry must not fail the sweep: {e}"))?;
+
+    // The healthy sibling resolved; the poisoned entry's seal and pending
+    // row survive for first-touch / TTL.
+    assert_eq!(read_idle_applied(&inner, &cart_id).await?, Some(bytes(7)));
+    assert!(matches!(
+        DurableWalStore::read_partition(&inner, &poison_id).await?,
+        DurableState::Sealed { .. }
+    ));
+    Ok(())
+}

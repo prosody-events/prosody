@@ -746,10 +746,11 @@ async fn process_event<T, S, M, P>(
                 // when no collections are registered). Commit on success.
                 // On failure, classify: a transient/terminal failure aborts
                 // so the trigger redelivers and the sweep re-runs; a
-                // permanent failure (e.g. a corrupt pending row that can
-                // never resolve) commits the trigger to stop refiring it
-                // forever — the seal stays recoverable by first-touch on the
-                // next access and by the backstop the key's next commit arms.
+                // permanent failure (e.g. a permanently failing scan — the
+                // sweep already skips per-entry Permanent failures inside)
+                // commits the trigger to stop refiring it forever — the
+                // seal stays recoverable by first-touch on the next access
+                // and by the backstop the key's next commit arms.
                 if firing.timer_type() == TimerType::StateRecovery {
                     let _guard = firing.process_scope();
                     let (trigger, commit_guard) = firing.into_inner();
