@@ -1074,6 +1074,15 @@ pub(crate) async fn abandon<T, C, G>(
 /// The only remover is the sweep's `clear_scheduled`/`unschedule_all`; the
 /// durability boundary never unschedules, which is why one event can no
 /// longer clear another's still-needed backstop (finding F2).
+///
+/// Cost and healing: a hot key issues *fewer* timer-store ops than the old
+/// point-clear design (one `clear_and_schedule` per stateful commit versus a
+/// schedule + unschedule pair), and the sweep only fires once the key goes
+/// quiet. Any read of a pending collection heals it immediately via
+/// first-touch (`RecoveringValueStore::get`). Accepted residual: an
+/// `Incomplete` leftover on a hot key whose collection is never read again
+/// waits for quiescence before the sweep resolves it — bounded by
+/// first-touch on any access and by the WAL row's TTL.
 async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> StepOutcome<()>
 where
     C: EventContext,

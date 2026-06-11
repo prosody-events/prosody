@@ -40,6 +40,14 @@ A property over toy inputs is just a slow example test. Generators must
 cover what production actually sends: empty/min/max sizes, duplicate keys,
 out-of-order delivery, interleaved operations, error outcomes.
 
+One class of invariant a round-trip property structurally **cannot** prove:
+wire-format freezing. `decode(encode(x)) == x` survives a variant rename
+because encoder and decoder move together inside one binary. **Policy: any
+encoding persisted beyond process lifetime gets a frozen-bytes test** — an
+example test asserting the exact encoded bytes of a deterministic value
+(exemplar: `wal_golden_bytes_freeze_durable_format` in
+`src/state/tests/encoding.rs`).
+
 ## Idiom catalog
 
 ### Trace + model in lockstep
