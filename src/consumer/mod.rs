@@ -1255,19 +1255,21 @@ where
                 )
             }
             StorePair::Cassandra {
-                trigger_provider,
-                dedup_provider,
-                value_store,
-                ..
+                trigger_provider, ..
             } => {
-                let state_provider = cassandra_state_provider::<C>(
+                // Stateless consumer: the `settle` boundary never runs and the
+                // registry is provably empty (rejected above otherwise), so no
+                // session can ever seal. Back keyed state with the inert memory
+                // provider rather than `cassandra_state_provider`, which would
+                // otherwise spawn a loader `BaseConsumer` + poll thread and
+                // create the fjall cache dir for a backend that seals nothing.
+                // The real Cassandra `trigger_provider` still drives the timer
+                // system.
+                let state_provider = memory_state_provider::<C>(
                     &keyed_state,
-                    consumer_config,
-                    &heartbeats,
-                    dedup_provider,
-                    &trigger_provider,
-                    value_store,
-                )?;
+                    MemoryDeduplicationStoreProvider::new(),
+                    &InMemoryTriggerStoreProvider::new(),
+                );
                 initialize_consumer_with_provider::<_, _, _, C>(
                     consumer_config,
                     keyed_state.version.clone(),
