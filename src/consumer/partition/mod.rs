@@ -19,6 +19,7 @@ use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_m
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
@@ -742,9 +743,13 @@ async fn process_event<T, S, M, P>(
                 // here, owned by the state manager, and user handlers
                 // structurally never see the trigger. State is always
                 // wired, so the sweep is always intercepted (it is inert
-                // when no collections are registered). Commit on success;
-                // abort on failure so the trigger redelivers and the
-                // sweep re-runs.
+                // when no collections are registered). Commit on success.
+                // On failure, classify: a transient/terminal failure aborts
+                // so the trigger redelivers and the sweep re-runs; a
+                // permanent failure (e.g. a corrupt pending row that can
+                // never resolve) commits the trigger to stop refiring it
+                // forever — the seal stays recoverable by first-touch on the
+                // next access and by the backstop the key's next commit arms.
                 if firing.timer_type() == TimerType::StateRecovery {
                     let _guard = firing.process_scope();
                     let (trigger, commit_guard) = firing.into_inner();
@@ -753,10 +758,18 @@ async fn process_event<T, S, M, P>(
                         .await
                     {
                         Ok(()) => commit_guard.commit().await,
+                        Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+                            error!(
+                                key = ?trigger.key,
+                                "keyed-state recovery sweep failed permanently: {error:#}; \
+                                 committing trigger to stop refiring (first-touch still recovers)"
+                            );
+                            commit_guard.commit().await;
+                        }
                         Err(error) => {
                             error!(
                                 key = ?trigger.key,
-                                "keyed-state recovery sweep failed: {error:#}; aborting trigger"
+                                "keyed-state recovery sweep failed: {error:#}; aborting trigger to retry"
                             );
                             commit_guard.abort().await;
                         }

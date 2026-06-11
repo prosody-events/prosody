@@ -66,8 +66,11 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
     type Session: StateSession;
 
-    /// Error raised by the recovery sweep.
-    type RecoveryError: Error + Send + Sync + 'static;
+    /// Error raised by the recovery sweep. Classified so the partition loop
+    /// can drop a permanently-failing trigger (committing it) rather than
+    /// refiring it forever — first-touch / the next sweep still recover the
+    /// seal.
+    type RecoveryError: ClassifyError + Error + Send + Sync + 'static;
 
     /// Mints the session for `event` on `key`.
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session;
@@ -150,10 +153,13 @@ impl<D, O, DP, Sc, L> fmt::Debug for StateManager<D, O, DP, Sc, L> {
 impl<D, O, DP, Sc, L> PartitionStateManager for StateManager<D, O, DP, Sc, L>
 where
     D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
+    <D as DurableWalStore<ValueKind>>::Error: ClassifyError,
     O: CommitOracle,
+    O::Error: ClassifyError,
     DP: DirtyStoreProvider<ValueKind>,
     DP::Store: DirtyValueBundle + Send + Sync,
     Sc: PendingIndexScanner,
+    Sc::Error: ClassifyError,
     L: Clone + Send + Sync + 'static,
 {
     type RecoveryError =
@@ -466,6 +472,29 @@ where
     /// Clearing the recovery timer failed (type-erased timer error).
     #[error("keyed-state recovery timer failed: {0:#}")]
     Timer(BoxEventContextError),
+}
+
+/// Each variant delegates to its inner error's classification, so the
+/// partition loop can decide whether a failed sweep is worth refiring
+/// (transient) or should be dropped and left to first-touch / the next sweep
+/// (permanent). The boxed `Timer` error classifies through its
+/// [`EventContextError`](crate::consumer::event_context::EventContextError)
+/// supertrait.
+impl<DurableErr, ScannerErr, OracleErr> ClassifyError
+    for RecoveryError<DurableErr, ScannerErr, OracleErr>
+where
+    DurableErr: ClassifyError + Error + 'static,
+    ScannerErr: ClassifyError + Error + 'static,
+    OracleErr: ClassifyError + Error + 'static,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Durable(e) => e.classify_error(),
+            Self::Scanner(e) => e.classify_error(),
+            Self::Oracle(e) => e.classify_error(),
+            Self::Timer(e) => e.classify_error(),
+        }
+    }
 }
 
 /// Error raised by [`resolve_sealed`].

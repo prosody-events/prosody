@@ -11,6 +11,7 @@ use crate::loader::MemoryLoader;
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
+use crate::state::pending::{PendingEntry, PendingIndexScanner};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::value_suite::{FixedOracle, bytes};
 use crate::state::value::{DurableWalStore, ValueOp};
@@ -30,6 +31,7 @@ use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use color_eyre::eyre::eyre;
 use crossbeam_utils::CachePadded;
+use futures::stream;
 use serde_json::json;
 use std::array::from_fn;
 use std::future::Future;
@@ -833,6 +835,180 @@ async fn state_recovery_trigger_is_intercepted_by_the_loop() -> color_eyre::Resu
     assert!(
         remaining.is_empty(),
         "the recovery trigger must commit without redelivery"
+    );
+    Ok(())
+}
+
+/// Pending-index scanner that fails every scan with a chosen classification,
+/// driving the real `recover` sweep to `RecoveryError::Scanner` so the
+/// partition loop's classification branch runs end-to-end (not a stubbed
+/// `recover`). The durable store is untouched, so a seal set up beforehand
+/// survives the failed sweep — the "first-touch still recovers" guarantee.
+#[derive(Clone)]
+struct FailingScanner(ErrorCategory);
+
+impl PendingIndexScanner for FailingScanner {
+    type Error = FailingScanError;
+
+    fn scan_pending(
+        &self,
+        _state_key: &StateKey,
+    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send {
+        let category = self.0;
+        stream::once(async move { Err(FailingScanError(category)) })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("injected scan failure ({0:?})")]
+struct FailingScanError(ErrorCategory);
+
+impl ClassifyError for FailingScanError {
+    fn classify_error(&self) -> ErrorCategory {
+        self.0
+    }
+}
+
+/// Builds a real keyed-state manager whose sweep *scanner* fails with
+/// `category`, over an otherwise-real memory durable (returned so a seal can
+/// be staged and its survival asserted).
+async fn recovery_manager_with_failing_scanner(
+    category: ErrorCategory,
+) -> color_eyre::Result<(
+    impl PartitionStateManager<
+        Session: StateSession<Loader: MessageLoader<Payload = serde_json::Value>>,
+    >,
+    MemoryDurableValueStore,
+)> {
+    const CART: ValueDescriptor = value_state("cart");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&CART, CollectionDef::new(None))?;
+    let durable = MemoryDurableValueStore::for_tests();
+    let provider = StateManagerProvider::new(
+        SharedStateBackend::new(
+            durable.clone(),
+            FixedOracle::committed(),
+            MemoryDirtyValueStoreProvider,
+            FailingScanner(category),
+        ),
+        MemoryLoader::<serde_json::Value>::new(),
+        Arc::new(registry),
+        Arc::from("test-group"),
+        CompactDuration::new(30),
+    );
+    let manager = provider
+        .acquire(Topic::from("t"), 0)
+        .await
+        .map_err(|e| eyre!("acquire failed: {e}"))?;
+    Ok((manager, durable))
+}
+
+/// Stages a crashed seal, fires its `StateRecovery` trigger through the real
+/// partition loop against a manager whose sweep fails with `category`, and
+/// returns `(trigger_redelivers, seal_survives)`.
+async fn run_sweep_failure(category: ErrorCategory) -> color_eyre::Result<(bool, bool)> {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (stream, timer_manager) = recovery_timer_manager(shutdown_rx.clone()).await?;
+    futures::pin_mut!(stream);
+    let (state_manager, durable) = recovery_manager_with_failing_scanner(category).await?;
+
+    // A crashed seal waits on the pending partition.
+    let key: Key = Arc::from("k");
+    let id = CollectionId::new(
+        StateKey::new(
+            compute_segment_id(Topic::from("t"), 0, "test-group"),
+            key.clone(),
+        ),
+        StateType::Application,
+        StateName::try_new("cart")?,
+    );
+    let collection_ref = CollectionRef::new(id.clone(), None);
+    durable
+        .seal(
+            &collection_ref,
+            EventRef::Message {
+                dedup_id: Uuid::from_u128(1),
+            },
+            vec![ValueOp::Set { payload: bytes(7) }],
+        )
+        .await?;
+
+    // The armed StateRecovery backstop fires.
+    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
+    timer_manager
+        .schedule(TimerRequest::new(
+            key.clone(),
+            fire,
+            TimerType::StateRecovery,
+            Span::current(),
+        ))
+        .await?;
+    advance(Duration::from_secs(30)).await;
+    yield_now().await;
+    let pending = stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("no pending timer fired"))?;
+
+    let handler = RecordingEventHandler::default();
+    process_event(
+        UncommittedEvent::Timer(pending),
+        &handler,
+        &shutdown_rx,
+        &timer_manager,
+        &state_manager,
+        DedupIdentity {
+            version: "1",
+            group_id: "test-group",
+            topic: "t",
+            partition: 0,
+        },
+        SpanRelation::default(),
+    )
+    .await;
+
+    let redelivers = !timer_manager
+        .scheduled_times(&key, TimerType::StateRecovery)
+        .await?
+        .is_empty();
+    // The failed sweep never resolved the seal, so it survives for first-touch.
+    let seal_survives = matches!(
+        DurableWalStore::read_partition(&durable, &id).await?,
+        DurableState::Sealed { .. }
+    );
+    Ok((redelivers, seal_survives))
+}
+
+/// A permanently-failing sweep commits the trigger (stops the refire loop)
+/// while leaving the seal for first-touch; a transiently-failing sweep aborts
+/// it so it redelivers and retries. Pre-fix, every failure aborted, so a
+/// permanent failure (e.g. a corrupt pending row) refired forever.
+#[tokio::test]
+async fn recovery_sweep_commits_on_permanent_and_redelivers_on_transient() -> color_eyre::Result<()>
+{
+    init_test_logging();
+    time::pause();
+
+    let (permanent_redelivers, permanent_survives) =
+        run_sweep_failure(ErrorCategory::Permanent).await?;
+    assert!(
+        !permanent_redelivers,
+        "a permanent sweep failure must commit the trigger, not refire it"
+    );
+    assert!(
+        permanent_survives,
+        "the seal must survive the dropped trigger for first-touch to recover"
+    );
+
+    let (transient_redelivers, transient_survives) =
+        run_sweep_failure(ErrorCategory::Transient).await?;
+    assert!(
+        transient_redelivers,
+        "a transient sweep failure must abort the trigger so it redelivers"
+    );
+    assert!(
+        transient_survives,
+        "the unresolved seal survives either way"
     );
     Ok(())
 }
