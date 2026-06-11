@@ -13,7 +13,7 @@ use super::{AssignmentEpoch, FjallClient, FjallDirtyValueStore, FjallValueStore}
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraValueStore, ValueQueries};
-use crate::state::layered::LayeredValueStore;
+use crate::state::layered::{LayeredValueStore, ValueCache};
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::PendingIndexStore;
@@ -155,8 +155,8 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
         .await
         .map_err(into_eyre)?;
 
-    // The cache had set called (and failed), then clear was attempted as
-    // a best-effort invalidation. We do not assert the cache reads
+    // The cache had set called (and failed), then a best-effort
+    // invalidation was attempted. We do not assert the cache reads
     // anything specific — we assert the operation succeeded despite the
     // cache failure and that the backing applied the write.
     assert_eq!(backing.get(&collection_id).await?, Read::Present(bytes(5)));
@@ -165,8 +165,8 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
         "cache.set should have been attempted"
     );
     assert!(
-        cache.clear_was_attempted(),
-        "cache.clear should have been attempted for invalidation"
+        cache.invalidate_was_attempted(),
+        "cache.invalidate should have been attempted after the failed patch"
     );
     Ok(())
 }
@@ -450,8 +450,9 @@ struct FaultyCache {
 
 #[derive(Debug, Default)]
 struct FaultyInner {
-    set_calls: Mutex<u32>,
-    clear_calls: Mutex<u32>,
+    sets: Mutex<u32>,
+    clears: Mutex<u32>,
+    invalidates: Mutex<u32>,
 }
 
 impl FaultyCache {
@@ -462,11 +463,11 @@ impl FaultyCache {
     }
 
     fn set_was_attempted(&self) -> bool {
-        *self.inner.set_calls.lock() > 0
+        *self.inner.sets.lock() > 0
     }
 
-    fn clear_was_attempted(&self) -> bool {
-        *self.inner.clear_calls.lock() > 0
+    fn invalidate_was_attempted(&self) -> bool {
+        *self.inner.invalidates.lock() > 0
     }
 }
 
@@ -485,7 +486,7 @@ impl ValueStore for FaultyCache {
         _collection: &'a CollectionId<ValueKind>,
         _payload: Bytes,
     ) -> Result<(), Self::Error> {
-        *self.inner.set_calls.lock() += 1;
+        *self.inner.sets.lock() += 1;
         Err(FaultyError::Injected)
     }
 
@@ -493,7 +494,14 @@ impl ValueStore for FaultyCache {
         &'a self,
         _collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        *self.inner.clear_calls.lock() += 1;
+        *self.inner.clears.lock() += 1;
+        Err(FaultyError::Injected)
+    }
+}
+
+impl ValueCache for FaultyCache {
+    async fn invalidate(&self, _collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {
+        *self.inner.invalidates.lock() += 1;
         Err(FaultyError::Injected)
     }
 }

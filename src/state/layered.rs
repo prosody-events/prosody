@@ -51,6 +51,30 @@ use crate::timers::store::SegmentId;
 use bytes::Bytes;
 use tracing::warn;
 
+/// The cache role over Value cells: a [`ValueStore`] plus true entry
+/// invalidation.
+///
+/// `invalidate` *removes* the entry, so the next [`ValueStore::get`]
+/// returns [`Read::Unknown`] and the layered read falls through to the
+/// backing. This is deliberately distinct from [`ValueStore::clear`], which
+/// writes an authoritative **known-Absent** cell — using `clear` to
+/// "invalidate" would assert "the value is absent" over a backing that may
+/// hold one, serving wrong reads until the next successful patch. Keeping
+/// the two operations as separate methods makes that confusion
+/// unrepresentable at the call site.
+pub trait ValueCache: ValueStore {
+    /// Removes the cached entry for `id`, if any, so the next read misses.
+    ///
+    /// # Errors
+    ///
+    /// Returns the cache's store error when removal fails; callers treat
+    /// invalidation as best-effort and log.
+    fn invalidate(
+        &self,
+        id: &CollectionId<ValueKind>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
 /// A two-layer Value store: cache + backing.
 ///
 /// See module documentation for the patch rules each method enforces.
@@ -70,16 +94,15 @@ impl<Cache, Backing> LayeredValueStore<Cache, Backing> {
 
 impl<Cache, Backing> LayeredValueStore<Cache, Backing>
 where
-    Cache: ValueStore,
+    Cache: ValueCache,
     Backing: ValueStore,
 {
     /// Patches the cache best-effort: writes `Present`/`Absent`,
-    /// invalidates on write failure.
+    /// invalidates (removes the entry) on write failure.
     ///
     /// Invariant 6: a cache failure after a backing-side success never
-    /// surfaces as `Err`. If the patch fails we attempt a clear; if even
-    /// that fails the cache may serve a stale value on the next read,
-    /// which the next miss-then-populate cycle corrects.
+    /// surfaces as `Err`. If the patch fails we invalidate so the next read
+    /// misses and re-populates from the backing.
     async fn patch_cache_or_invalidate(
         &self,
         id: &CollectionId<ValueKind>,
@@ -95,14 +118,15 @@ where
         }
     }
 
-    /// Best-effort cache invalidation: clears `id`, logging — never
-    /// propagating — a failure, after which the entry may serve stale until
-    /// the next miss repopulates it.
+    /// Best-effort cache invalidation: removes the entry so the next read
+    /// misses and falls through to the backing. A removal failure is logged
+    /// — never propagated — after which the entry may serve stale until the
+    /// next successful patch.
     async fn invalidate_cache_entry(&self, id: &CollectionId<ValueKind>) {
-        if let Err(error) = self.cache.clear(id).await {
+        if let Err(error) = self.cache.invalidate(id).await {
             warn!(
                 error = %error,
-                "cache invalidation failed; entry may be stale until next miss"
+                "cache invalidation failed; entry may be stale until the next successful patch"
             );
         }
     }
@@ -110,7 +134,7 @@ where
 
 impl<Cache, Backing> ValueStore for LayeredValueStore<Cache, Backing>
 where
-    Cache: ValueStore,
+    Cache: ValueCache,
     Backing: ValueStore,
 {
     type Error = Backing::Error;
@@ -170,7 +194,7 @@ where
 
 impl<Cache, Backing> DurableWalStore<ValueKind> for LayeredValueStore<Cache, Backing>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueCache + Clone,
     Backing: DurableWalStore<ValueKind>
         + ValueStore<Error = <Backing as DurableWalStore<ValueKind>>::Error>,
 {
@@ -234,9 +258,20 @@ where
             .apply_sealed(collection, expected_event)
             .await?;
         if outcome == StoreOutcome::Applied {
-            let new_applied = match ValueStore::get(&self.backing, collection.id()).await? {
-                Read::Present(payload) => Some(payload),
-                Read::Absent | Read::Unknown => None,
+            // The apply changed authoritative state beneath the cache. If
+            // the re-read fails we cannot patch — invalidate before
+            // propagating, or the cache serves the pre-apply value
+            // indefinitely (a retried apply resolves `NoOp` and never
+            // reaches this patch again). Same contract as `seal`:
+            // re-synced or invalidated, never silently stale.
+            let new_applied = match ValueStore::get(&self.backing, collection.id()).await {
+                Ok(Read::Present(payload)) => Some(payload),
+                Ok(Read::Absent | Read::Unknown) => None,
+                Err(error) => {
+                    warn!(error = %error, "post-apply cache re-sync read failed; invalidating cache entry");
+                    self.invalidate_cache_entry(collection.id()).await;
+                    return Err(error);
+                }
             };
             self.patch_cache_or_invalidate(collection.id(), new_applied)
                 .await;
@@ -258,7 +293,7 @@ where
 
 impl<Cache, Backing> DirectApplyStore<ValueKind> for LayeredValueStore<Cache, Backing>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueCache + Clone,
     Backing: DirectApplyStore<ValueKind>
         + ValueStore<Error = <Backing as DirectApplyStore<ValueKind>>::Error>,
 {
@@ -352,7 +387,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::LayeredValueStore;
+    use super::{LayeredValueStore, ValueCache};
     use crate::Key;
     use crate::error::{ClassifyError, ErrorCategory};
     use crate::state::memory::{MemoryDurableValueStore, MemoryStateError};
@@ -363,19 +398,98 @@ mod tests {
     };
     use bytes::Bytes;
     use color_eyre::eyre::Result;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use thiserror::Error;
     use uuid::Uuid;
 
+    /// Purpose-built cache fixture with real miss semantics: a missing
+    /// entry reads [`Read::Unknown`] (unlike the durable memory store,
+    /// whose `get` answers `Absent`), `invalidate` *removes* the entry, and
+    /// `set` can be scripted to fail — the seam the invalidation paths
+    /// need.
+    #[derive(Clone, Debug, Default)]
+    struct TestCache {
+        cells: Arc<Mutex<HashMap<CollectionId<ValueKind>, Option<Bytes>>>>,
+        fail_sets: Arc<AtomicUsize>,
+    }
+
+    impl TestCache {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// Fails the first `count` `set` calls.
+        fn failing_sets(count: usize) -> Self {
+            Self {
+                cells: Arc::default(),
+                fail_sets: Arc::new(AtomicUsize::new(count)),
+            }
+        }
+
+        fn preload(&self, id: &CollectionId<ValueKind>, payload: Bytes) {
+            self.cells.lock().insert(id.clone(), Some(payload));
+        }
+    }
+
+    impl ValueStore for TestCache {
+        type Error = FailReadError;
+
+        async fn get<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+        ) -> Result<Read<Bytes>, Self::Error> {
+            Ok(match self.cells.lock().get(collection) {
+                None => Read::Unknown,
+                Some(None) => Read::Absent,
+                Some(Some(payload)) => Read::Present(payload.clone()),
+            })
+        }
+
+        async fn set<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+            payload: Bytes,
+        ) -> Result<(), Self::Error> {
+            if self.fail_sets.load(Ordering::SeqCst) > 0 {
+                self.fail_sets.fetch_sub(1, Ordering::SeqCst);
+                return Err(FailReadError::Injected);
+            }
+            self.cells.lock().insert(collection.clone(), Some(payload));
+            Ok(())
+        }
+
+        async fn clear<'a>(
+            &'a self,
+            collection: &'a CollectionId<ValueKind>,
+        ) -> Result<(), Self::Error> {
+            self.cells.lock().insert(collection.clone(), None);
+            Ok(())
+        }
+    }
+
+    impl ValueCache for TestCache {
+        async fn invalidate(
+            &self,
+            collection: &CollectionId<ValueKind>,
+        ) -> Result<(), Self::Error> {
+            self.cells.lock().remove(collection);
+            Ok(())
+        }
+    }
+
     /// Backing that delegates to [`MemoryDurableValueStore`] but fails the
-    /// `fail_at`-th `read_partition` (1-based). Used to simulate the post-seal
-    /// re-sync read failing exactly once.
+    /// `fail_at`-th `read_partition` (1-based) and the first `fail_gets`
+    /// `get` calls. Used to simulate the post-seal / post-apply re-sync
+    /// reads failing exactly once.
     #[derive(Clone)]
     struct FailNthReadPartition {
         inner: MemoryDurableValueStore,
         fail_at: usize,
         reads: Arc<AtomicUsize>,
+        fail_gets: Arc<AtomicUsize>,
     }
 
     impl FailNthReadPartition {
@@ -384,6 +498,17 @@ mod tests {
                 inner: MemoryDurableValueStore::for_tests(),
                 fail_at,
                 reads: Arc::new(AtomicUsize::new(0)),
+                fail_gets: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Never fails `read_partition`; fails the first `count` `get`s.
+        fn failing_gets(count: usize) -> Self {
+            Self {
+                inner: MemoryDurableValueStore::for_tests(),
+                fail_at: 0,
+                reads: Arc::new(AtomicUsize::new(0)),
+                fail_gets: Arc::new(AtomicUsize::new(count)),
             }
         }
     }
@@ -395,6 +520,10 @@ mod tests {
             &'a self,
             collection: &'a CollectionId<ValueKind>,
         ) -> Result<Read<Bytes>, Self::Error> {
+            if self.fail_gets.load(Ordering::SeqCst) > 0 {
+                self.fail_gets.fetch_sub(1, Ordering::SeqCst);
+                return Err(FailReadError::Injected);
+            }
             self.inner.get(collection).await.map_err(Into::into)
         }
 
@@ -493,66 +622,129 @@ mod tests {
     }
 
     /// Invariant 2 failure path: when the post-seal re-sync `read_partition`
-    /// fails, `seal` must invalidate the cache before propagating the error —
-    /// never leave the cache entry silently diverged from the backing.
-    /// Otherwise a `Permanent` classification strands the stale entry past
-    /// recovery, since the sweep rolls back the WAL but never repatches the
-    /// cache.
+    /// fails, `seal` must invalidate the cache (remove the entry) before
+    /// propagating the error — never leave the cache entry silently
+    /// diverged from the backing. Otherwise a `Permanent` classification
+    /// strands the stale entry past recovery, since the sweep rolls back
+    /// the WAL but never repatches the cache.
     ///
-    /// The cache is preloaded with a value the backing does not agree with
-    /// (the recover-before-seal shape: a pre-recovery cache hint over a
-    /// backing whose authoritative state has since moved). With the re-sync
-    /// read failing once, `seal` returns the error, but the cache must be
-    /// invalidated — so the next `get` falls through and *agrees with the
-    /// backing* rather than serving the stale hit. Pre-fix, `?` propagated
-    /// before any patch and the stale cache entry survived, so `get` would
-    /// return `Present("old")` while the backing reads `Absent`.
+    /// The cache is preloaded with a stale value while the backing's
+    /// authoritative applied has moved (the recover-before-seal shape).
+    /// After the failed re-sync the next `get` must *miss* and return the
+    /// backing's value — pre-fix the stale `Present` hit survived
+    /// indefinitely.
     #[tokio::test]
     async fn failed_post_seal_resync_invalidates_cache_rather_than_leaving_it_stale() -> Result<()>
     {
         let key: Key = Arc::from("k");
         let id = collection_id(&key)?;
         let stale = Bytes::from_static(b"old");
+        let recovered = Bytes::from_static(b"recovered");
 
-        let cache = MemoryDurableValueStore::for_tests();
+        let cache = TestCache::new();
         // Fail the very first read_partition — the post-seal re-sync read.
         let backing = FailNthReadPartition::new(1);
         let layered = LayeredValueStore::new(cache.clone(), backing.clone());
 
-        // The cache holds a value the backing does not agree with.
-        cache.set(&id, stale.clone()).await?;
+        // The backing's applied state moved beneath a stale cache hint.
+        backing.inner.set(&id, recovered.clone()).await?;
+        cache.preload(&id, stale.clone());
 
         let collection = CollectionRef::new(id.clone(), None);
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(0xE0E0),
         };
         let result = layered
-            .seal(
-                &collection,
-                event,
-                [ValueOp::Set {
-                    payload: stale.clone(),
-                }],
-            )
+            .seal(&collection, event, [ValueOp::Set { payload: stale }])
             .await;
         assert!(
             result.is_err(),
             "the failed re-sync read still surfaces as the seal's error"
         );
 
-        // The backing disagrees with the stale cache entry; after the failed
-        // re-sync the cache must be invalidated, so `get` agrees with the
-        // backing instead of serving the stale hit.
-        let backing_view = ValueStore::get(&backing, &id).await?;
-        assert_ne!(
-            backing_view,
-            Read::Present(stale),
-            "precondition: the backing does not hold the stale value"
-        );
         assert_eq!(
             layered.get(&id).await?,
-            backing_view,
-            "post-seal get must reflect the backing, not the stale cache entry"
+            Read::Present(recovered),
+            "post-seal get must miss the invalidated cache and serve the backing"
+        );
+        Ok(())
+    }
+
+    /// B1 pin: invalidation must *remove* the entry, never write a
+    /// known-`Absent` cell. A durable `set` succeeds, the cache patch fails
+    /// once, and the fallback invalidates — the next `get` must fall
+    /// through and return the freshly written `Present` value. With
+    /// clear-as-invalidate (the pre-fix behavior) the cache asserted
+    /// `Absent` over the backing's `Present`, serving wrong reads until the
+    /// next successful patch.
+    #[tokio::test]
+    async fn failed_patch_invalidation_never_asserts_absent() -> Result<()> {
+        let key: Key = Arc::from("k");
+        let id = collection_id(&key)?;
+        let value = Bytes::from_static(b"v");
+
+        let cache = TestCache::failing_sets(1);
+        let backing = FailNthReadPartition::new(0);
+        let layered = LayeredValueStore::new(cache, backing);
+
+        // Backing write succeeds; the cache patch fails and falls back to
+        // invalidation.
+        layered.set(&id, value.clone()).await?;
+
+        assert_eq!(
+            layered.get(&id).await?,
+            Read::Present(value),
+            "after a failed patch the cache must miss, not assert Absent"
+        );
+        Ok(())
+    }
+
+    /// Invariant 3 failure path (the `apply_sealed` sibling of the seal
+    /// test): the apply changed authoritative state beneath the cache; if
+    /// the post-apply re-read fails, the cache must be invalidated before
+    /// the error propagates. Pre-fix the `?` skipped the patch entirely and
+    /// the stale entry survived — unhealable, because the sweep's retried
+    /// apply resolves `NoOp` and never patches.
+    #[tokio::test]
+    async fn failed_post_apply_resync_invalidates_cache_rather_than_leaving_it_stale() -> Result<()>
+    {
+        let key: Key = Arc::from("k");
+        let id = collection_id(&key)?;
+        let stale = Bytes::from_static(b"old");
+        let new = Bytes::from_static(b"new");
+
+        let cache = TestCache::new();
+        // Fail the first backing `get` — the post-apply re-sync read.
+        let backing = FailNthReadPartition::failing_gets(1);
+        let layered = LayeredValueStore::new(cache.clone(), backing.clone());
+
+        // A sealed WAL waits while the cache holds the pre-apply value.
+        let collection = CollectionRef::new(id.clone(), None);
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(0xE0E1),
+        };
+        backing
+            .inner
+            .seal(
+                &collection,
+                event,
+                vec![ValueOp::Set {
+                    payload: new.clone(),
+                }],
+            )
+            .await?;
+        cache.preload(&id, stale);
+
+        let result = layered.apply_sealed(&collection, event).await;
+        assert!(
+            result.is_err(),
+            "the failed re-sync read still surfaces as the apply's error"
+        );
+
+        assert_eq!(
+            layered.get(&id).await?,
+            Read::Present(new),
+            "post-apply get must miss the invalidated cache and serve the applied value"
         );
         Ok(())
     }

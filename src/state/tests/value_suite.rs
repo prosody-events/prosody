@@ -31,7 +31,7 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity,
     INITIAL_IDENTITY_VERSION, acquire_descriptor_identities,
 };
-use crate::state::layered::LayeredValueStore;
+use crate::state::layered::{LayeredValueStore, ValueCache};
 use crate::state::manager::sweep_pending;
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
@@ -1226,7 +1226,7 @@ pub(crate) async fn run_layered_parity<Cache, B>(
     backing_recovers: bool,
 ) -> Result<bool>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueCache + Clone,
     B: DurableBundle,
 {
     let layered = LayeredValueStore::new(cache, backing_layered);
@@ -1372,7 +1372,7 @@ async fn compare_op<Cache, B>(
     sealed_event: Option<EventRef>,
 ) -> Result<bool>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueCache + Clone,
     B: DurableBundle,
 {
     let (lid, bid) = (lref.id(), bref.id());
@@ -1425,7 +1425,7 @@ async fn partitions_agree<Cache, B>(
     bid: &CollectionId<ValueKind>,
 ) -> Result<bool>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueCache + Clone,
     B: DurableBundle,
 {
     let l = DurableWalStore::read_partition(layered, lid).await;
@@ -1442,7 +1442,7 @@ async fn gets_agree<Cache, B>(
     bid: &CollectionId<ValueKind>,
 ) -> Result<bool>
 where
-    Cache: ValueStore + Clone,
+    Cache: ValueCache + Clone,
     B: DurableBundle,
 {
     let l = ValueStore::get(layered, lid).await;

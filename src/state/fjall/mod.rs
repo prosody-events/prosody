@@ -40,6 +40,7 @@ pub use dirty::{FjallDirtyValueStore, FjallDirtyValueStoreProvider, FjallFactory
 pub use error::FjallValueStoreError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
+use crate::state::layered::ValueCache;
 use crate::state::value::{ValueKind, ValueStore};
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
@@ -111,5 +112,14 @@ impl ValueStore for FjallValueStore {
             codec::encode_absent_cell(),
         )
         .await
+    }
+}
+
+/// True invalidation: removes the cell, so the next read decodes
+/// [`Read::Unknown`] and the layered store falls through to the backing —
+/// unlike [`ValueStore::clear`], which writes an authoritative `Absent` cell.
+impl ValueCache for FjallValueStore {
+    async fn invalidate(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {
+        cell_io::remove_cell(&self.inner.partition, codec::collection_prefix(collection)).await
     }
 }
