@@ -33,14 +33,17 @@
 use super::config::FjallConfiguration;
 use super::error::FjallValueStoreError;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::{Partition, Topic};
 use educe::Educe;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::warn;
 use xxhash_rust::xxh3::xxh3_128;
+
+/// Source of process-monotonic [`AssignmentEpoch`] values.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 const PARTITION_NAME_PREFIX: &str = "value_";
 const CACHE_ROLE: &str = "cache";
@@ -48,34 +51,29 @@ const DIRTY_OVERLAY_ROLE: &str = "dirty_overlay";
 
 /// Per-Kafka-partition workspace creation epoch.
 ///
-/// Tagging a workspace with the moment it was created prevents a fast
-/// `assign → revoke → assign` cycle from colliding on the same Kafka
-/// `(topic, partition)` even when the prior `delete_partition` has not
-/// yet landed on disk.
+/// A process-monotonic counter, minted by [`Self::mint`] from a global
+/// [`AtomicU64`]. Tagging each workspace with a strictly increasing value
+/// guarantees that a fast `assign → revoke → assign` cycle on the same Kafka
+/// `(topic, partition)` produces *distinct* fjall partition names even when
+/// the prior `delete_partition` has not yet landed on disk — so the new
+/// workspace never aliases the live handle of the one being torn down.
+///
+/// Wall-clock granularity (the previous, one-second design) could not make
+/// that guarantee: two assignments in the same second collided. A counter is
+/// also deterministic, so the collision-avoidance invariant is testable.
+///
+/// Cross-restart collisions are irrelevant: the counter resets to `0` each
+/// process, but [`FjallClient::open`] sweeps *every* `value_*` partition at
+/// startup, so no stale partition from a prior process survives to alias a
+/// fresh epoch.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct AssignmentEpoch(CompactDateTime);
+pub struct AssignmentEpoch(u64);
 
 impl AssignmentEpoch {
-    /// Creates an assignment epoch from a [`CompactDateTime`].
+    /// Mints the next process-monotonic assignment epoch.
     #[must_use]
-    pub fn new(time: CompactDateTime) -> Self {
-        Self(time)
-    }
-
-    /// Returns the current wall-clock time as an [`AssignmentEpoch`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactDateTimeError`] when the system clock is before
-    /// [`CompactDateTime`]'s representable range.
-    pub fn now() -> Result<Self, CompactDateTimeError> {
-        Ok(Self(CompactDateTime::now()?))
-    }
-
-    /// Returns the raw epoch-seconds discriminator.
-    #[must_use]
-    pub fn epoch_seconds(self) -> u32 {
-        self.0.epoch_seconds()
+    pub fn mint() -> Self {
+        Self(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -247,7 +245,7 @@ fn partition_name(
     epoch: AssignmentEpoch,
 ) -> String {
     let mut buf = Vec::with_capacity(
-        role.len() + topic.as_ref().len() + 2 * size_of::<i32>() + size_of::<u32>(),
+        role.len() + topic.as_ref().len() + 2 * size_of::<i32>() + size_of::<u64>(),
     );
     buf.extend_from_slice(role.as_bytes());
     buf.push(0);
@@ -255,7 +253,7 @@ fn partition_name(
     buf.push(0);
     buf.extend_from_slice(&partition.to_be_bytes());
     buf.push(0);
-    buf.extend_from_slice(&epoch.epoch_seconds().to_be_bytes());
+    buf.extend_from_slice(&epoch.0.to_be_bytes());
 
     let hash = xxh3_128(&buf);
     format!("{PARTITION_NAME_PREFIX}{role}_{hash:032x}")

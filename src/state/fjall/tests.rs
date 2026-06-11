@@ -639,7 +639,6 @@ fn prop_fjall_dirty_matches_memory_dirty() {
 use crate::Partition;
 use crate::Topic;
 use crate::state::fjall::FjallConfiguration;
-use crate::timers::datetime::CompactDateTime;
 
 fn make_client(dir: &TempDir) -> Result<Arc<FjallClient>> {
     let config = FjallConfiguration {
@@ -654,7 +653,7 @@ async fn fjall_workspace_drop_deletes_both_partitions() -> Result<()> {
     let client = make_client(&dir)?;
     let topic: Topic = "test-topic".into();
     let partition: Partition = 7;
-    let epoch = AssignmentEpoch::now()?;
+    let epoch = AssignmentEpoch::mint();
 
     let before = client.keyspace().partition_count();
     let ws = client.workspace(topic, partition, epoch)?;
@@ -714,17 +713,26 @@ async fn fjall_client_open_sweeps_orphaned_partitions() -> Result<()> {
     Ok(())
 }
 
+/// A fast `assign → revoke → assign` cycle for the *same* `(topic,
+/// partition)` must produce distinct fjall partitions, so the second
+/// workspace never aliases the first's live handles while the first is
+/// being torn down.
+///
+/// The process-monotonic [`AssignmentEpoch`] makes this constructive: two
+/// back-to-back `mint()` calls are guaranteed distinct, so the test no
+/// longer needs synthetic wall-clock values that real same-second
+/// assignments could never differ by. Dropping the first workspace deletes
+/// only its own partitions; the second's handles keep accepting writes.
 #[tokio::test]
 async fn fjall_workspace_distinct_epochs_dont_collide() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let client = make_client(&dir)?;
     let topic: Topic = "tt".into();
     let partition: Partition = 0;
-    let epoch_a = AssignmentEpoch::new(CompactDateTime::from(100_u32));
-    let epoch_b = AssignmentEpoch::new(CompactDateTime::from(200_u32));
 
-    let _ws_a = client.workspace(topic, partition, epoch_a)?;
-    let _ws_b = client.workspace(topic, partition, epoch_b)?;
+    let ws_a = client.workspace(topic, partition, AssignmentEpoch::mint())?;
+    let ws_b = client.workspace(topic, partition, AssignmentEpoch::mint())?;
+
     // Each workspace minted two distinct partitions: 4 total.
     let value_count = client
         .keyspace()
@@ -732,7 +740,18 @@ async fn fjall_workspace_distinct_epochs_dont_collide() -> Result<()> {
         .into_iter()
         .filter(|name| name.starts_with("value_"))
         .count();
-    assert_eq!(value_count, 4);
+    assert_eq!(value_count, 4, "back-to-back epochs must not collide");
+
+    // Tearing down the first workspace must not disturb the second: its
+    // cache handle still accepts and reads back writes.
+    drop(ws_a);
+    ws_b.cache_handle().insert(b"k", b"v")?;
+    let read = ws_b.cache_handle().get(b"k")?;
+    assert_eq!(
+        read.as_deref(),
+        Some(b"v".as_slice()),
+        "surviving workspace handle must remain live after the sibling drops"
+    );
     Ok(())
 }
 

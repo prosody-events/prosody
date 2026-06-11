@@ -164,7 +164,7 @@ where
         topic: Topic,
         partition: Partition,
     ) -> Result<BackendOf<Self>, Self::Error> {
-        let epoch = AssignmentEpoch::now().map_err(FjallFactoryError::Epoch)?;
+        let epoch = AssignmentEpoch::mint();
         let workspace = Arc::new(
             self.client
                 .workspace(topic, partition, epoch)

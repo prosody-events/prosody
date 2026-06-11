@@ -44,7 +44,6 @@ use super::workspace::FjallWorkspace;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::value::{PendingOpSource, ValueKind, ValueOp, ValueStore};
 use crate::state::{CollectionId, DirtyStoreProvider, EventScopeId, PendingOps, Read};
-use crate::timers::datetime::CompactDateTimeError;
 use bytes::Bytes;
 use educe::Educe;
 use fjall::PartitionHandle;
@@ -164,10 +163,6 @@ impl DirtyStoreProvider<ValueKind> for FjallDirtyValueStoreProvider {
 /// factory in [`crate::state::production`]).
 #[derive(Debug, Error)]
 pub enum FjallFactoryError {
-    /// The wall-clock read for the assignment epoch failed.
-    #[error("assignment epoch lookup failed")]
-    Epoch(#[source] CompactDateTimeError),
-
     /// Opening the workspace partitions failed.
     #[error("fjall workspace open failed")]
     Workspace(#[source] FjallValueStoreError),
@@ -176,7 +171,6 @@ pub enum FjallFactoryError {
 impl ClassifyError for FjallFactoryError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Epoch(e) => e.classify_error(),
             Self::Workspace(e) => e.classify_error(),
         }
     }
