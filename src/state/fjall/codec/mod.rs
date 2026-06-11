@@ -59,7 +59,7 @@ where
 {
     let segment_bytes = id.state_key().segment_id.as_bytes();
     let key_bytes = id.state_key().key.as_bytes();
-    let state_type_byte = u8::from_le_bytes(i8::from(id.state_type()).to_le_bytes());
+    let state_type_byte = i8::from(id.state_type()).cast_unsigned();
     let name_bytes = id.name().as_str().as_bytes();
 
     // Injective layout: fixed-width fields first, then each variable-length

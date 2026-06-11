@@ -30,9 +30,9 @@ crossbeam-utils = "0.8"
 derive_builder = "0.20"
 dyn-clone = "1.0"
 educe = "0.6"
-# fjall 2.x: stable `Keyspace` / `PartitionHandle` API with synchronous
-# `insert`/`get`/`remove`. Slice 6 wraps each call in `spawn_blocking`.
 fixedstr = { version = "0.5", features = ["flex-str"] }
+# fjall 2.x: stable `Keyspace` / `PartitionHandle` API with synchronous
+# `insert`/`get`/`remove`, wrapped in `spawn_blocking` at each call site.
 fjall = "2.11"
 futures = "0.3"
 humantime = "2.3"

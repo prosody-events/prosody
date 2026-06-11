@@ -3,6 +3,7 @@ CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }
 # Debug builds inflate async poll frames heavily; the composed middleware
 # chain's poll descent (handler -> context chain -> TimerManager -> scylla)
 # overflows tokio's default 2 MiB worker stacks in integration tests.
-# Release builds are far below the limit; this only affects cargo-launched
-# test binaries on dev machines and CI.
+# This `[env]` applies to every cargo-launched process (`run`, `test`, ...),
+# not just test binaries; binaries invoked directly (e.g. a release deploy)
+# are unaffected and sit far below the limit regardless.
 RUST_MIN_STACK = "8388608"
