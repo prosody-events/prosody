@@ -91,12 +91,19 @@ where
         };
         if let Err(error) = write_result {
             warn!(error = %error, "cache patch failed; attempting invalidation");
-            if let Err(clear_error) = self.cache.clear(id).await {
-                warn!(
-                    error = %clear_error,
-                    "cache invalidation also failed; entry may be stale until next miss"
-                );
-            }
+            self.invalidate_cache_entry(id).await;
+        }
+    }
+
+    /// Best-effort cache invalidation: clears `id`, logging — never
+    /// propagating — a failure, after which the entry may serve stale until
+    /// the next miss repopulates it.
+    async fn invalidate_cache_entry(&self, id: &CollectionId<ValueKind>) {
+        if let Err(error) = self.cache.clear(id).await {
+            warn!(
+                error = %error,
+                "cache invalidation failed; entry may be stale until next miss"
+            );
         }
     }
 }
@@ -204,14 +211,9 @@ where
                 // back the WAL but never repatches the cache). Best-effort
                 // invalidate so the next `get` re-reads the backing: seal's
                 // contract is "cache re-synced or invalidated, never
-                // silently stale" (mirrors `patch_cache_or_invalidate`).
+                // silently stale".
                 warn!(error = %error, "post-seal cache re-sync read failed; invalidating cache entry");
-                if let Err(clear_error) = self.cache.clear(collection.id()).await {
-                    warn!(
-                        error = %clear_error,
-                        "cache invalidation after failed re-sync also failed; entry may be stale until next miss"
-                    );
-                }
+                self.invalidate_cache_entry(collection.id()).await;
                 return Err(error);
             }
         };
