@@ -765,7 +765,6 @@ impl DescriptorIdentity for LifecycleAccess {
             kind: CollectionKindId::Value,
             cell_kind: CellKind::Codec,
             codec_id: None,
-            schema_label: None,
         }
     }
 }

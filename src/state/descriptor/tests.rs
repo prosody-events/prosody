@@ -267,12 +267,12 @@ async fn state_with_unregistered_descriptor_errors() -> Result<()> {
 /// fails with [`StateAccessError::IdentityMismatch`].
 #[tokio::test]
 async fn bind_with_mismatched_identity_errors() -> Result<()> {
-    let relabeled: ValueDescriptor = value_state("cart").with_schema_label("v2");
+    let recoded: ValueDescriptor<CartCodec> = value_state("cart");
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(None))?;
     let session = test_session(MemoryDirtyValueStore::new(), MemoryLoader::new(), registry);
 
-    let Err(error) = relabeled.bind(&session) else {
+    let Err(error) = recoded.bind(&session) else {
         return Err(eyre!("mismatched bind must fail"));
     };
     assert!(matches!(error, StateAccessError::IdentityMismatch { .. }));
@@ -281,14 +281,14 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 }
 
 /// N5: re-registering the same name with a *different* structural identity
-/// (codec id or schema label) is rejected.
+/// is rejected.
 ///
-/// Kept as directed examples rather than a generated property: a
-/// `StructuralIdentity` has only two fields that can differ today
-/// (`codec_id`, `schema_label`) — `CellKind` has one variant and `kind` is
-/// always `Value` — so a property over identity mismatches would add
-/// generation machinery without covering a case these two examples miss.
-/// Revisit when a second `CellKind`/kind exists.
+/// Kept as a directed example rather than a generated property: a
+/// `StructuralIdentity` has only one field that can differ today
+/// (`codec_id`) — `CellKind` has one variant and `kind` is always `Value` —
+/// so a property over identity mismatches would add generation machinery
+/// without covering a case this example misses. Revisit when a second
+/// `CellKind`/kind exists.
 #[test]
 fn conflicting_registration_is_rejected() -> Result<()> {
     // The two descriptors share the cell kind (there is only one) but carry
@@ -301,35 +301,7 @@ fn conflicting_registration_is_rejected() -> Result<()> {
         conflict,
         Err(RegisterStateError::IdentityConflict { .. })
     ));
-
-    // Different schema label only.
-    let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&cart(), CollectionDef::new(None))?;
-    let relabeled: ValueDescriptor = value_state("cart").with_schema_label("v2");
-    let conflict = registry.register(&relabeled, CollectionDef::new(None));
-    assert!(matches!(
-        conflict,
-        Err(RegisterStateError::IdentityConflict { .. })
-    ));
     Ok(())
-}
-
-/// N5: a descriptor whose schema label is empty (or whitespace-only) is
-/// rejected at registration, so `Some("")` never freezes into durable
-/// identity. Opting out of a label is `None`; a present label must carry
-/// content.
-#[test]
-fn empty_schema_label_is_rejected() {
-    let blank: ValueDescriptor = value_state("cart").with_schema_label("");
-    let whitespace: ValueDescriptor = value_state("cart").with_schema_label("  ");
-
-    for desc in [blank, whitespace] {
-        let mut registry = CollectionDefRegistry::new(None);
-        assert!(matches!(
-            registry.register(&desc, CollectionDef::new(None)),
-            Err(RegisterStateError::SchemaLabel { .. })
-        ));
-    }
 }
 
 /// N5: re-registering the same name with an *unchanged* identity is
@@ -374,7 +346,7 @@ fn empty_name_rejected_at_registration() {
     assert!(matches!(result, Err(RegisterStateError::Name(_))));
 }
 
-/// Descriptors are plain values: for any runtime name/label strings, two
+/// Descriptors are plain values: for any runtime name string, two
 /// descriptors built independently from equal strings are interchangeable —
 /// same (interned) name, same frozen identity — so registering the second
 /// is the idempotent re-registration path, never an `IdentityConflict`.
@@ -382,14 +354,14 @@ fn empty_name_rejected_at_registration() {
 /// they need them instead of sharing one declaration.
 #[test]
 fn prop_descriptors_from_equal_strings_are_interchangeable() {
-    fn prop(name: String, label: String) -> TestResult {
-        if name.trim().is_empty() || label.trim().is_empty() {
+    fn prop(name: String) -> TestResult {
+        if name.trim().is_empty() {
             return TestResult::discard();
         }
-        let input_dbg = format!("name={name:?}, label={label:?}");
+        let input_dbg = format!("name={name:?}");
         let result = (move || -> Result<bool> {
-            let a: ValueDescriptor = value_state(&name).with_schema_label(&label);
-            let b: ValueDescriptor = value_state(&name).with_schema_label(&label);
+            let a: ValueDescriptor = value_state(&name);
+            let b: ValueDescriptor = value_state(&name);
             let mut registry = CollectionDefRegistry::new(None);
             registry.register(&a, CollectionDef::new(None))?;
             registry.register(&b, CollectionDef::new(None))?;
@@ -401,5 +373,5 @@ fn prop_descriptors_from_equal_strings_are_interchangeable() {
             &input_dbg,
         )
     }
-    QuickCheck::new().quickcheck(prop as fn(String, String) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(String) -> TestResult);
 }

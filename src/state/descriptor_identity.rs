@@ -60,9 +60,6 @@ pub struct DurableDescriptorIdentity {
     /// Codec token ([`Codec::CODEC_ID`](crate::codec::Codec::CODEC_ID);
     /// `None` for framework-defined cells).
     pub codec_id: Option<String>,
-
-    /// Optional schema version label.
-    pub schema_label: Option<String>,
 }
 
 impl DurableDescriptorIdentity {
@@ -74,10 +71,6 @@ impl DurableDescriptorIdentity {
             kind: identity.kind.into(),
             cell_kind: identity.cell_kind.into(),
             codec_id: identity.codec_id.map(str::to_owned),
-            schema_label: identity
-                .schema_label
-                .as_ref()
-                .map(|label| label.as_str().to_owned()),
         }
     }
 }

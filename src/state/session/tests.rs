@@ -7,7 +7,7 @@
 
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::*;
-use crate::codec::JsonCodec;
+use crate::codec::JsonBinaryCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
@@ -495,9 +495,7 @@ async fn verify_state_registration_checks_identity() -> Result<()> {
         Err(StateAccessError::Unregistered { name: "missing" })
     ));
 
-    let mismatched = value_state::<JsonCodec>("cart")
-        .with_schema_label("v2")
-        .structural_identity();
+    let mismatched = value_state::<JsonBinaryCodec>("cart").structural_identity();
     assert!(matches!(
         session.verify_state_registration("cart", &mismatched),
         Err(StateAccessError::IdentityMismatch { .. })

@@ -540,7 +540,6 @@ impl DescriptorIdentityStore for CassandraValueStore {
                 row.kind,
                 row.cell_kind,
                 row.codec_id,
-                row.schema_label,
             ));
         }
         self.session()

@@ -36,9 +36,9 @@
 //! never names that machinery; it only sees the two generic strategies.
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
-//! `(kind, cell kind, codec id, schema label)` tuple. Identity is derived
-//! from the codec, never the resolver: the resolver is operational, not part
-//! of the durable contract. The identity is checked at registration (same
+//! `(kind, cell kind, codec id)` tuple. Identity is derived from the codec,
+//! never the resolver: the resolver is operational, not part of the durable
+//! contract. The identity is checked at registration (same
 //! name ⇒ same identity), at bind, and against the durable per-segment
 //! identity table on first use, so a process carrying an incompatible
 //! descriptor fails loudly instead of silently misreading cells.
@@ -55,7 +55,6 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use thiserror::Error;
 
 /// Cell-format discriminator persisted in a collection's structural
@@ -76,64 +75,8 @@ impl From<CellKind> for i16 {
     }
 }
 
-/// Opt-in user-supplied schema version label, part of the frozen identity.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct SchemaLabel(Arc<str>);
-
-impl SchemaLabel {
-    /// Returns the label text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for SchemaLabel {
-    fn from(label: &str) -> Self {
-        Self(Arc::from(label))
-    }
-}
-
-/// The context-independent fields every descriptor carries: the collection
-/// name and the opt-in schema label.
-///
-/// Embedded in each descriptor so the shared `name()`/`with_schema_label`
-/// plumbing and the identity-label conversion live in one place rather than
-/// being copy-pasted per descriptor kind.
-#[derive(Clone, Copy, Debug)]
-struct DescriptorMeta {
-    name: &'static str,
-    schema_label: Option<&'static str>,
-}
-
-impl DescriptorMeta {
-    /// Metadata for a collection named `name` with no schema label.
-    fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            schema_label: None,
-        }
-    }
-
-    /// Attaches an opt-in schema version label.
-    fn with_schema_label(mut self, label: &'static str) -> Self {
-        self.schema_label = Some(label);
-        self
-    }
-
-    /// The collection name.
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    /// The schema label resolved into its frozen-identity form.
-    fn schema_label(&self) -> Option<SchemaLabel> {
-        self.schema_label.map(SchemaLabel::from)
-    }
-}
-
 /// The frozen structural identity a descriptor asserts for its collection:
-/// collection kind, cell format, codec token, and optional schema label.
+/// collection kind, cell format, and codec token.
 ///
 /// Operational settings (TTL, commit mode) are deliberately *not* part of
 /// the identity — they may change between deploys; the identity may not.
@@ -148,9 +91,6 @@ pub struct StructuralIdentity {
     /// Codec token ([`Codec::CODEC_ID`]; `None` for framework-defined
     /// cells).
     pub codec_id: Option<&'static str>,
-
-    /// Optional user-supplied schema version label.
-    pub schema_label: Option<SchemaLabel>,
 }
 
 /// Context-independent descriptor metadata: the name and frozen identity
@@ -270,7 +210,7 @@ where
 /// typed cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and
 /// annotate the binding `ValueDescriptor<CartCodec>`.
 pub struct ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> {
-    meta: DescriptorMeta,
+    name: &'static str,
     _marker: PhantomData<fn() -> (C, R)>,
 }
 
@@ -285,7 +225,7 @@ impl<C, R> Copy for ValueDescriptor<C, R> {}
 impl<C, R> fmt::Debug for ValueDescriptor<C, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValueDescriptor")
-            .field("meta", &self.meta)
+            .field("name", &self.name)
             .finish()
     }
 }
@@ -326,18 +266,9 @@ impl<C, R> ValueDescriptor<C, R> {
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
-            meta: DescriptorMeta::new(intern_descriptor_str(name)),
+            name: intern_descriptor_str(name),
             _marker: PhantomData,
         }
-    }
-
-    /// Attaches an opt-in schema version label to the frozen identity. Like
-    /// the collection name, the label may be any runtime string and is
-    /// interned.
-    #[must_use]
-    pub fn with_schema_label(mut self, label: &str) -> Self {
-        self.meta = self.meta.with_schema_label(intern_descriptor_str(label));
-        self
     }
 }
 
@@ -346,7 +277,7 @@ where
     C: Codec,
 {
     fn name(&self) -> &'static str {
-        self.meta.name()
+        self.name
     }
 
     fn structural_identity(&self) -> StructuralIdentity {
@@ -354,7 +285,6 @@ where
             kind: CollectionKindId::Value,
             cell_kind: CellKind::Codec,
             codec_id: Some(C::CODEC_ID),
-            schema_label: self.meta.schema_label(),
         }
     }
 }
@@ -370,8 +300,7 @@ where
         // handle carries the resolver only as a marker. The
         // `R: CellResolver<S>` requirement surfaces on `get`/`set`, not here,
         // so this compiles through the shared `StateDescriptor` trait.
-        let name =
-            session.verify_state_registration(self.meta.name(), &self.structural_identity())?;
+        let name = session.verify_state_registration(self.name, &self.structural_identity())?;
         Ok(StateHandle::new(session.clone(), name))
     }
 }
@@ -492,9 +421,9 @@ where
 
 /// Interns a descriptor string, returning the pool's canonical
 /// `&'static str` (the [`Topic`](crate::Topic) idiom). Descriptor names
-/// and labels are a bounded set fixed at consumer build, so pool entries
-/// living for the process is the intended retention; interning is what
-/// keeps descriptor metadata `Copy`.
+/// are a bounded set fixed at consumer build, so pool entries living for
+/// the process is the intended retention; interning is what keeps
+/// descriptors `Copy`.
 fn intern_descriptor_str(s: &str) -> &'static str {
     Intern::<str>::from(s).as_ref()
 }

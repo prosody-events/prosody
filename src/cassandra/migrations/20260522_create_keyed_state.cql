@@ -59,7 +59,6 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_DESCRIPTOR}} (
     kind          tinyint,
     cell_kind     smallint,
     codec_id      text,
-    schema_label  text,
 
     PRIMARY KEY ((segment_id), name, version)
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }

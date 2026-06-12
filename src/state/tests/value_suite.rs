@@ -25,6 +25,7 @@ use super::super::{
     CollectionId, CollectionRef, CommitDecision, CommitMode, DurableState, EventRef, LocalTx, Read,
     StateKey, StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp,
 };
+use crate::codec::JsonBinaryCodec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::descriptor_identity::{
@@ -456,7 +457,7 @@ where
 /// Invariants:
 ///
 /// 1. **Write-on-absent** — acquiring a segment with no identity row writes the
-///    descriptor's frozen `(kind, cell kind, codec id, schema label)`.
+///    descriptor's frozen `(kind, cell kind, codec id)`.
 /// 2. **Mismatch ⇒ Permanent, row untouched** — acquiring against a
 ///    pre-existing row with any differing field fails Permanent and does not
 ///    overwrite the row.
@@ -472,7 +473,7 @@ where
     D: DescriptorIdentityStore + Clone,
 {
     let profile: ValueDescriptor = value_state("acquisition-profile");
-    let relabeled: ValueDescriptor = value_state("acquisition-profile").with_schema_label("v2");
+    let recoded: ValueDescriptor<JsonBinaryCodec> = value_state("acquisition-profile");
 
     // Fresh segment per run so rows never collide with other iterations or
     // test functions (the Cassandra keyspace is shared).
@@ -519,10 +520,10 @@ where
         "re-acquisition writes nothing"
     );
 
-    // Invariant 2: mismatch (schema label differs) ⇒ Permanent; row untouched.
+    // Invariant 2: mismatch (codec id differs) ⇒ Permanent; row untouched.
     let mut mismatched = CollectionDefRegistry::new(None);
     mismatched
-        .register(&relabeled, CollectionDef::new(None))
+        .register(&recoded, CollectionDef::new(None))
         .map_err(|e| eyre!("register failed: {e}"))?;
     match acquire_descriptor_identities(&durable, &mismatched, segment_id).await {
         Err(error @ DescriptorIdentityError::Mismatch { .. }) => {

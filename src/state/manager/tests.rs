@@ -9,6 +9,7 @@
 //! covered there. All tests are broker-free.
 
 use super::*;
+use crate::codec::JsonBinaryCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
@@ -247,9 +248,13 @@ async fn acquire_validates_identities_eagerly() -> Result<()> {
     // Re-acquiring with the same registry is idempotent.
     acquire(&p).await?;
 
-    // A conflicting identity for the same name fails Permanent.
+    // A conflicting identity (different codec) for the same name fails
+    // Permanent.
     let mut conflicting = CollectionDefRegistry::new(None);
-    conflicting.register(&cart().with_schema_label("v2"), CollectionDef::new(None))?;
+    conflicting.register(
+        &value_state::<JsonBinaryCodec>("cart"),
+        CollectionDef::new(None),
+    )?;
     let conflicted = provider(durable, FixedOracle::committed(), Arc::new(conflicting));
     let err = conflicted
         .acquire(Topic::from("t"), 0)

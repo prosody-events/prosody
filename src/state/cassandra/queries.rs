@@ -133,7 +133,7 @@ cassandra_queries! {
         /// Reads every frozen descriptor-identity row for one segment
         /// (single-partition query).
         read_descriptor_identities: (
-            "SELECT name, version, kind, cell_kind, codec_id, schema_label \
+            "SELECT name, version, kind, cell_kind, codec_id \
              FROM $keyspace.{} WHERE segment_id = ?",
             TABLE_KEYED_STATE_DESCRIPTOR
         ),
@@ -144,8 +144,8 @@ cassandra_queries! {
         /// BATCH` at the call site.
         insert_descriptor_identity: (
             "INSERT INTO $keyspace.{} \
-             (segment_id, name, version, kind, cell_kind, codec_id, schema_label) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (segment_id, name, version, kind, cell_kind, codec_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
             TABLE_KEYED_STATE_DESCRIPTOR
         ),
 
