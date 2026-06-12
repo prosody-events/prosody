@@ -117,7 +117,9 @@ fn fjall_dirty() -> Result<(TempDir, FjallDirtyValueStore)> {
     ))
 }
 
-const CART: ValueDescriptor = value_state("cart");
+fn cart() -> ValueDescriptor {
+    value_state("cart")
+}
 
 /// N2 invariant: for every JSON-representable value, `set(v)` then `get()`
 /// returns `Some(v)` — the value survives the full
@@ -127,7 +129,7 @@ async fn roundtrip<S>(dirty: S, value: Value) -> Result<bool>
 where
     S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    let handle = bind_registered(CART, dirty, MemoryLoader::new())?;
+    let handle = bind_registered(cart(), dirty, MemoryLoader::new())?;
     handle.set(value.clone()).await?;
     Ok(handle.get().await? == Some(value))
 }
@@ -158,7 +160,7 @@ fn prop_descriptor_set_get_roundtrip_fjall() {
 /// A never-written collection reads as `None`.
 #[tokio::test]
 async fn descriptor_get_absent_returns_none() -> Result<()> {
-    let handle = bind_registered(CART, MemoryDirtyValueStore::new(), MemoryLoader::new())?;
+    let handle = bind_registered(cart(), MemoryDirtyValueStore::new(), MemoryLoader::new())?;
     assert_eq!(handle.get().await?, None);
     Ok(())
 }
@@ -166,7 +168,7 @@ async fn descriptor_get_absent_returns_none() -> Result<()> {
 /// `set` then `clear` reads as `None`.
 #[tokio::test]
 async fn descriptor_clear_then_get_none() -> Result<()> {
-    let handle = bind_registered(CART, MemoryDirtyValueStore::new(), MemoryLoader::new())?;
+    let handle = bind_registered(cart(), MemoryDirtyValueStore::new(), MemoryLoader::new())?;
     handle.set(json!({"items": [1_i32, 2_i32]})).await?;
     handle.clear().await?;
     assert_eq!(handle.get().await?, None);
@@ -209,11 +211,11 @@ impl Codec for CartCodec {
 /// type and records the codec's token in the structural identity.
 #[tokio::test]
 async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
-    const TYPED_CART: ValueDescriptor<CartCodec> = value_state("typed_cart");
-    assert_eq!(TYPED_CART.structural_identity().codec_id, Some("test-cart"));
+    let typed_cart: ValueDescriptor<CartCodec> = value_state("typed_cart");
+    assert_eq!(typed_cart.structural_identity().codec_id, Some("test-cart"));
 
     let handle = bind_registered(
-        TYPED_CART,
+        typed_cart,
         MemoryDirtyValueStore::new(),
         MemoryLoader::new(),
     )?;
@@ -232,7 +234,7 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
 #[test]
 fn state_unavailable_without_keyed_state() -> Result<()> {
     let ctx: MockEventContext = MockEventContext::new();
-    let Err(error) = ctx.state(CART) else {
+    let Err(error) = ctx.state(cart()) else {
         return Err(eyre!("bind on a state-less context must fail"));
     };
     assert!(matches!(error, StateAccessError::Unavailable));
@@ -250,7 +252,7 @@ async fn state_with_unregistered_descriptor_errors() -> Result<()> {
         MemoryLoader::new(),
         CollectionDefRegistry::new(None),
     );
-    let Err(error) = CART.bind(&session) else {
+    let Err(error) = cart().bind(&session) else {
         return Err(eyre!("unregistered bind must fail"));
     };
     assert!(matches!(
@@ -265,12 +267,12 @@ async fn state_with_unregistered_descriptor_errors() -> Result<()> {
 /// fails with [`StateAccessError::IdentityMismatch`].
 #[tokio::test]
 async fn bind_with_mismatched_identity_errors() -> Result<()> {
-    const RELABELED: ValueDescriptor = value_state("cart").with_schema_label("v2");
+    let relabeled: ValueDescriptor = value_state("cart").with_schema_label("v2");
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&cart(), CollectionDef::new(None))?;
     let session = test_session(MemoryDirtyValueStore::new(), MemoryLoader::new(), registry);
 
-    let Err(error) = RELABELED.bind(&session) else {
+    let Err(error) = relabeled.bind(&session) else {
         return Err(eyre!("mismatched bind must fail"));
     };
     assert!(matches!(error, StateAccessError::IdentityMismatch { .. }));
@@ -293,7 +295,7 @@ fn conflicting_registration_is_rejected() -> Result<()> {
     // different codec ids: a Kafka descriptor under a name already registered
     // as a JSON value.
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&cart(), CollectionDef::new(None))?;
     let conflict = registry.register(&kafka_message_state("cart"), CollectionDef::new(None));
     assert!(matches!(
         conflict,
@@ -302,7 +304,7 @@ fn conflicting_registration_is_rejected() -> Result<()> {
 
     // Different schema label only.
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&cart(), CollectionDef::new(None))?;
     let relabeled: ValueDescriptor = value_state("cart").with_schema_label("v2");
     let conflict = registry.register(&relabeled, CollectionDef::new(None));
     assert!(matches!(
@@ -318,10 +320,10 @@ fn conflicting_registration_is_rejected() -> Result<()> {
 /// content.
 #[test]
 fn empty_schema_label_is_rejected() {
-    const BLANK: ValueDescriptor = value_state("cart").with_schema_label("");
-    const WHITESPACE: ValueDescriptor = value_state("cart").with_schema_label("  ");
+    let blank: ValueDescriptor = value_state("cart").with_schema_label("");
+    let whitespace: ValueDescriptor = value_state("cart").with_schema_label("  ");
 
-    for desc in [BLANK, WHITESPACE] {
+    for desc in [blank, whitespace] {
         let mut registry = CollectionDefRegistry::new(None);
         assert!(matches!(
             registry.register(&desc, CollectionDef::new(None)),
@@ -340,13 +342,13 @@ fn reregistration_updates_operational_settings() -> Result<()> {
     let updated_ttl = CompactDuration::new(7_200);
 
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(Some(initial_ttl)))?;
+    registry.register(&cart(), CollectionDef::new(Some(initial_ttl)))?;
     assert_eq!(registry.ttl_for(&name), Some(initial_ttl));
     assert_eq!(registry.commit_mode_for(&name), CommitMode::Wal);
 
     // Same name, same identity, different operational settings.
     registry.register(
-        &CART,
+        &cart(),
         CollectionDef::new(Some(updated_ttl)).with_commit_mode(CommitMode::Direct),
     )?;
     assert_eq!(
@@ -370,4 +372,34 @@ fn empty_name_rejected_at_registration() {
     let empty: ValueDescriptor = value_state("");
     let result = registry.register(&empty, CollectionDef::new(None));
     assert!(matches!(result, Err(RegisterStateError::Name(_))));
+}
+
+/// Descriptors are plain values: for any runtime name/label strings, two
+/// descriptors built independently from equal strings are interchangeable —
+/// same (interned) name, same frozen identity — so registering the second
+/// is the idempotent re-registration path, never an `IdentityConflict`.
+/// This is the invariant that lets call sites build descriptors wherever
+/// they need them instead of sharing one declaration.
+#[test]
+fn prop_descriptors_from_equal_strings_are_interchangeable() {
+    fn prop(name: String, label: String) -> TestResult {
+        if name.trim().is_empty() || label.trim().is_empty() {
+            return TestResult::discard();
+        }
+        let input_dbg = format!("name={name:?}, label={label:?}");
+        let result = (move || -> Result<bool> {
+            let a: ValueDescriptor = value_state(&name).with_schema_label(&label);
+            let b: ValueDescriptor = value_state(&name).with_schema_label(&label);
+            let mut registry = CollectionDefRegistry::new(None);
+            registry.register(&a, CollectionDef::new(None))?;
+            registry.register(&b, CollectionDef::new(None))?;
+            Ok(a.name() == b.name() && a.structural_identity() == b.structural_identity())
+        })();
+        finish_trace(
+            result,
+            "equal strings must build interchangeable descriptors",
+            &input_dbg,
+        )
+    }
+    QuickCheck::new().quickcheck(prop as fn(String, String) -> TestResult);
 }

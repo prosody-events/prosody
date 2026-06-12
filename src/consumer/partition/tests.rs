@@ -715,9 +715,9 @@ async fn recovery_state_manager() -> color_eyre::Result<(
     >,
     MemoryDurableValueStore,
 )> {
-    const CART: ValueDescriptor = value_state("cart");
+    let cart: ValueDescriptor = value_state("cart");
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&cart, CollectionDef::new(None))?;
     let durable = MemoryDurableValueStore::for_tests();
     let provider = StateManagerProvider::new(
         SharedStateBackend::new(
@@ -875,9 +875,9 @@ async fn recovery_manager_with_failing_scanner(
     >,
     MemoryDurableValueStore,
 )> {
-    const CART: ValueDescriptor = value_state("cart");
+    let cart: ValueDescriptor = value_state("cart");
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&cart, CollectionDef::new(None))?;
     let durable = MemoryDurableValueStore::for_tests();
     let provider = StateManagerProvider::new(
         SharedStateBackend::new(

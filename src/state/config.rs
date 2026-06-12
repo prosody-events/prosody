@@ -27,11 +27,11 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// use prosody::state::descriptor::{ValueDescriptor, value_state};
 /// use prosody::state::registry::CollectionDef;
 ///
-/// const CART: ValueDescriptor = value_state("cart");
+/// let cart: ValueDescriptor = value_state("cart");
 ///
 /// let keyed_state = KeyedStateConfiguration::builder()
 ///     .build()?
-///     .state(&CART, CollectionDef::new(None));
+///     .state(&cart, CollectionDef::new(None));
 /// # Ok(())
 /// # }
 /// ```
@@ -149,7 +149,9 @@ mod tests {
     use std::path::PathBuf;
     use validator::Validate;
 
-    const CART: ValueDescriptor = value_state("cart");
+    fn cart() -> ValueDescriptor {
+        value_state("cart")
+    }
 
     /// `MAX_CASSANDRA_TTL_SECS` fits a `u32`, so the ceiling and one second
     /// past it are both representable as a `CompactDuration`.
@@ -173,7 +175,7 @@ mod tests {
     fn collection_ttl_none_is_allowed() -> Result<()> {
         let config = KeyedStateConfiguration::builder()
             .build()?
-            .state(&CART, CollectionDef::new(None));
+            .state(&cart(), CollectionDef::new(None));
         assert!(config.build_registry().is_ok());
         Ok(())
     }
@@ -183,7 +185,7 @@ mod tests {
         let ttl = CompactDuration::new(CEILING_SECS);
         let config = KeyedStateConfiguration::builder()
             .build()?
-            .state(&CART, CollectionDef::new(Some(ttl)));
+            .state(&cart(), CollectionDef::new(Some(ttl)));
         assert!(config.build_registry().is_ok());
         Ok(())
     }
@@ -191,9 +193,10 @@ mod tests {
     #[test]
     fn collection_ttl_over_the_ceiling_is_rejected() -> Result<()> {
         let over = CEILING_SECS + 1;
-        let config = KeyedStateConfiguration::builder()
-            .build()?
-            .state(&CART, CollectionDef::new(Some(CompactDuration::new(over))));
+        let config = KeyedStateConfiguration::builder().build()?.state(
+            &cart(),
+            CollectionDef::new(Some(CompactDuration::new(over))),
+        );
         assert!(matches!(
             config.build_registry(),
             Err(RegisterStateError::Ttl { seconds, .. }) if seconds == over

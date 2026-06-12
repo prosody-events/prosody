@@ -68,8 +68,13 @@ use crate::{Key, Offset, Topic};
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::eyre::{Result, eyre};
 
-const CART: ValueDescriptor = value_state("cart");
-const WISHLIST: ValueDescriptor = value_state("wishlist");
+fn cart() -> ValueDescriptor {
+    value_state("cart")
+}
+
+fn wishlist() -> ValueDescriptor {
+    value_state("wishlist")
+}
 const SEGMENT: Uuid = Uuid::from_u128(0x5E6);
 
 type Session = ValueStateSession<
@@ -303,7 +308,7 @@ mod failing_seal_impls {
 }
 
 /// Leaf handler driven through the blanket `EventHandler` impl. Writes its
-/// target collection (`CART` by default; override with [`Self::on_collection`])
+/// target collection (`cart` by default; override with [`Self::on_collection`])
 /// per the scripted op, then registers the message commit marker on a final
 /// outcome (`Ok` / `Permanent`) — mirroring the deduplication middleware — and
 /// returns the scripted result.
@@ -319,7 +324,7 @@ struct BoundaryHandler {
 impl BoundaryHandler {
     fn set_ok(byte: u8, marker: Uuid) -> Self {
         Self {
-            descriptor: CART,
+            descriptor: cart(),
             set_byte: byte,
             marker,
             result: Ok(()),
@@ -329,7 +334,7 @@ impl BoundaryHandler {
 
     fn set_err(byte: u8, marker: Uuid, category: ErrorCategory) -> Self {
         Self {
-            descriptor: CART,
+            descriptor: cart(),
             set_byte: byte,
             marker,
             result: Err(category),
@@ -337,7 +342,7 @@ impl BoundaryHandler {
         }
     }
 
-    /// Targets a specific registered collection instead of the default `CART`.
+    /// Targets a specific registered collection instead of the default `cart`.
     fn on_collection(mut self, descriptor: ValueDescriptor) -> Self {
         self.descriptor = descriptor;
         self
@@ -424,8 +429,8 @@ fn registry() -> Result<Arc<CollectionDefRegistry>> {
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
     let def =
         CollectionDef::new(Some(CompactDuration::new(3_600))).with_commit_mode(CommitMode::Wal);
-    registry.register(&CART, def.clone())?;
-    registry.register(&WISHLIST, def)?;
+    registry.register(&cart(), def.clone())?;
+    registry.register(&wishlist(), def)?;
     Ok(Arc::new(registry))
 }
 
@@ -698,9 +703,9 @@ async fn permanent_error_flushes_marker_without_sealing() -> Result<()> {
 /// F2 cross-event regression — the interleaving the single-event harness
 /// could not see. Two events on the **same key** share one timer state:
 ///
-/// * Event A writes `CART`; its post-commit apply fails, so `CART` stays
+/// * Event A writes `cart`; its post-commit apply fails, so `cart` stays
 ///   `Sealed` (pending) with a `StateRecovery` backstop armed.
-/// * Event B writes a *different* collection (`WISHLIST`) and resolves cleanly
+/// * Event B writes a *different* collection (`wishlist`) and resolves cleanly
 ///   in the same fire-time second.
 ///
 /// Pre-fix, B's `Resolved` point-clear `unschedule`d the shared backstop slot,
@@ -719,18 +724,18 @@ async fn cross_event_resolved_commit_keeps_a_pending_backstop() -> Result<()> {
     // shares the underlying `Arc`, so A's and B's ops accumulate together.
     let base = MockEventContext::<Value>::new().with_timer_tracking();
 
-    // Event A on CART: apply fails (the one armed failure), CART stays Sealed.
+    // Event A on `cart`: apply fails (the one armed failure), `cart` stays Sealed.
     let ctx_a = base
         .clone()
         .with_session(session(durable.clone(), store.clone(), &key)?);
-    let handler_a = BoundaryHandler::set_ok(1, Uuid::from_u128(0xA)).on_collection(CART);
+    let handler_a = BoundaryHandler::set_ok(1, Uuid::from_u128(0xA)).on_collection(cart());
     dispatch_message(&handler_a, ctx_a, 0, &key).await?;
 
-    // Event B on WISHLIST: resolves cleanly (the failure budget is spent).
+    // Event B on `wishlist`: resolves cleanly (the failure budget is spent).
     let ctx_b = base
         .clone()
         .with_session(session(durable.clone(), store.clone(), &key)?);
-    let handler_b = BoundaryHandler::set_ok(2, Uuid::from_u128(0xB)).on_collection(WISHLIST);
+    let handler_b = BoundaryHandler::set_ok(2, Uuid::from_u128(0xB)).on_collection(wishlist());
     dispatch_message(&handler_b, ctx_b, 1, &key).await?;
 
     assert!(
@@ -738,7 +743,7 @@ async fn cross_event_resolved_commit_keeps_a_pending_backstop() -> Result<()> {
             DurableWalStore::read_partition(&durable, &collection_id(&key, "cart")?).await?,
             DurableState::Sealed { .. }
         ),
-        "A's apply failed, so CART is still a pending seal after B settles"
+        "A's apply failed, so cart is still a pending seal after B settles"
     );
     assert_eq!(
         unschedules(&base),
@@ -747,13 +752,13 @@ async fn cross_event_resolved_commit_keeps_a_pending_backstop() -> Result<()> {
     );
     assert!(
         !net_scheduled(&base, TimerType::StateRecovery).is_empty(),
-        "a StateRecovery backstop still covers CART's pending seal after B"
+        "a StateRecovery backstop still covers cart's pending seal after B"
     );
     Ok(())
 }
 
 /// Property (multi-event-per-key, shared timer state): for any sequence of
-/// committing events on one key — each targeting `CART` or `WISHLIST` and
+/// committing events on one key — each targeting `cart` or `wishlist` and
 /// either resolving cleanly or failing its apply — the boundary issues **zero**
 /// `Unschedule`s, and whenever the key has any pending (unresolved) seal a
 /// `StateRecovery` timer is scheduled. This is the plan's invariant "a key with
@@ -786,7 +791,7 @@ async fn run_backstop_sequence(steps: Vec<(bool, bool)>) -> Result<bool> {
 
     for (idx, (use_wishlist, fail_apply)) in steps.into_iter().enumerate() {
         durable.arm_apply_failure(fail_apply);
-        let descriptor = if use_wishlist { WISHLIST } else { CART };
+        let descriptor = if use_wishlist { wishlist() } else { cart() };
         let marker = Uuid::from_u128(idx as u128 + 1);
         let handler = BoundaryHandler::set_ok(idx as u8, marker).on_collection(descriptor);
         let context = base

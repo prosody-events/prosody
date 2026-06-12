@@ -481,17 +481,17 @@ async fn commit_apply_continues_past_a_failed_collection() -> Result<()> {
 /// are `Unregistered`, identity mismatches are rejected.
 #[tokio::test]
 async fn verify_state_registration_checks_identity() -> Result<()> {
-    const CART: ValueDescriptor = value_state("cart");
+    let cart: ValueDescriptor = value_state("cart");
     let mut reg = registry();
-    reg.register(&CART, CollectionDef::new(None))?;
+    reg.register(&cart, CollectionDef::new(None))?;
     let durable = MemoryDurableValueStore::for_tests();
     let session = build_session(durable, reg, make_state_key(), msg_event(12));
 
-    let name = session.verify_state_registration("cart", &CART.structural_identity())?;
+    let name = session.verify_state_registration("cart", &cart.structural_identity())?;
     assert_eq!(name.as_str(), "cart");
 
     assert!(matches!(
-        session.verify_state_registration("missing", &CART.structural_identity()),
+        session.verify_state_registration("missing", &cart.structural_identity()),
         Err(StateAccessError::Unregistered { name: "missing" })
     ));
 

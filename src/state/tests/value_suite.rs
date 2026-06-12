@@ -471,7 +471,7 @@ pub(crate) async fn run_descriptor_identity_acquisition<D>(durable: D) -> Result
 where
     D: DescriptorIdentityStore + Clone,
 {
-    const PROFILE: ValueDescriptor = value_state("acquisition-profile");
+    let profile: ValueDescriptor = value_state("acquisition-profile");
     let relabeled: ValueDescriptor = value_state("acquisition-profile").with_schema_label("v2");
 
     // Fresh segment per run so rows never collide with other iterations or
@@ -481,7 +481,7 @@ where
     // Invariant 1: write-on-absent.
     let mut registry = CollectionDefRegistry::new(None);
     registry
-        .register(&PROFILE, CollectionDef::new(None))
+        .register(&profile, CollectionDef::new(None))
         .map_err(|e| eyre!("register failed: {e}"))?;
     let registry = Arc::new(registry);
     acquire_descriptor_identities(&durable, &registry, segment_id)
@@ -492,8 +492,8 @@ where
         .await
         .map_err(|e| eyre!("read identities failed: {e}"))?;
     let expected = DurableDescriptorIdentity::from_identity(
-        &StateName::try_new(PROFILE.name())?,
-        &PROFILE.structural_identity(),
+        &StateName::try_new(profile.name())?,
+        &profile.structural_identity(),
     );
     assert_eq!(
         rows,

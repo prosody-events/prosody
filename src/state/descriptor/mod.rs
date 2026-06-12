@@ -1,21 +1,20 @@
 //! Typed descriptors for keyed-state collections.
 //!
-//! Stores speak raw [`Bytes`]; this layer owns the typing. A
-//! handler declares a descriptor once — usually as a `const` — registers it
-//! with the consumer, and binds it to *any*
+//! Stores speak raw [`Bytes`]; this layer owns the typing. A descriptor is
+//! a plain `Copy` value — build it wherever it's needed (names are
+//! interned, so equal names produce interchangeable descriptors). Register
+//! it with the consumer, then bind it to *any*
 //! [`EventContext`](crate::consumer::event_context::EventContext) to obtain a
 //! typed, owned handle:
 //!
 //! ```
 //! use prosody::state::descriptor::{ValueDescriptor, value_state};
 //!
-//! // Declared once — usually as a `const` — then registered with the
-//! // consumer. Binding it to an `EventContext` yields a typed, owned handle
-//! // whose `get`/`set` read and write the cell committed by the previous
-//! // event on the key. See the consumer middleware docs (`FallibleHandler`)
-//! // for the full read-modify-write handler.
-//! const CART: ValueDescriptor = value_state("cart");
-//! # let _ = &CART;
+//! // Binding it to an `EventContext` yields a typed, owned handle whose
+//! // `get`/`set` read and write the cell committed by the previous event
+//! // on the key. See the consumer middleware docs (`FallibleHandler`) for
+//! // the full read-modify-write handler.
+//! let cart: ValueDescriptor = value_state("cart");
 //! ```
 //!
 //! # Codec and resolver
@@ -51,6 +50,7 @@ use crate::state::CollectionKindId;
 use crate::state::session::StateSession;
 use crate::state::{StateName, StoreOutcome};
 use bytes::Bytes;
+use internment::Intern;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -108,7 +108,7 @@ struct DescriptorMeta {
 
 impl DescriptorMeta {
     /// Metadata for a collection named `name` with no schema label.
-    const fn new(name: &'static str) -> Self {
+    fn new(name: &'static str) -> Self {
         Self {
             name,
             schema_label: None,
@@ -116,13 +116,13 @@ impl DescriptorMeta {
     }
 
     /// Attaches an opt-in schema version label.
-    const fn with_schema_label(mut self, label: &'static str) -> Self {
+    fn with_schema_label(mut self, label: &'static str) -> Self {
         self.schema_label = Some(label);
         self
     }
 
     /// The collection name.
-    const fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         self.name
     }
 
@@ -265,9 +265,10 @@ where
 /// decoded cell becomes the exposed value). The default [`JsonCodec`] stores
 /// [`serde_json::Value`] cells — the same default as the consumer's message
 /// payload — and the default [`Passthrough`] resolver exposes the stored
-/// value directly. Declare as a `const` via [`value_state`]; for a typed
-/// cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and write
-/// `const CART: ValueDescriptor<CartCodec> = value_state("cart");`.
+/// value directly. Declare via [`value_state`] — the name may be any
+/// runtime string (it is interned, so descriptors stay `Copy`); for a
+/// typed cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and
+/// annotate the binding `ValueDescriptor<CartCodec>`.
 pub struct ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> {
     meta: DescriptorMeta,
     _marker: PhantomData<fn() -> (C, R)>,
@@ -290,16 +291,18 @@ impl<C, R> fmt::Debug for ValueDescriptor<C, R> {
 }
 
 /// Declares a codec-backed value collection named `name` (JSON by
-/// default — annotate the `const` with `ValueDescriptor<MyCodec>` to pick
+/// default — annotate the binding with `ValueDescriptor<MyCodec>` to pick
 /// another codec).
 ///
 /// The resolver defaults to [`Passthrough`]: the value is stored and
 /// returned verbatim.
 ///
-/// `name` is not validated here (const contexts cannot fail); an empty
-/// name fails loudly at registration, the fallible boundary.
+/// `name` may be any runtime string — FFI clients register collections at
+/// client startup from host-language names — and is interned, so the
+/// descriptor stays `Copy`. It is not validated here; an empty name fails
+/// loudly at registration, the fallible boundary.
 #[must_use]
-pub const fn value_state<C>(name: &'static str) -> ValueDescriptor<C, Passthrough<C::Payload>>
+pub fn value_state<C>(name: &str) -> ValueDescriptor<C, Passthrough<C::Payload>>
 where
     C: Codec,
 {
@@ -313,24 +316,27 @@ impl<C, R> ValueDescriptor<C, R> {
     /// Bound-free by design: construction needs no `Codec`/`CellResolver`
     /// bounds (those surface only on [`StateHandle::get`]/`set`), so a
     /// consumer-layer alias can build a non-[`Passthrough`] descriptor — e.g.
-    /// a reference cell whose resolver loads through a message loader — as a
-    /// `const`. [`value_state`] is the convenience constructor for the common
+    /// a reference cell whose resolver loads through a message loader.
+    /// [`value_state`] is the convenience constructor for the common
     /// [`Passthrough`] case.
     ///
-    /// `name` is not validated here (const contexts cannot fail); an empty
-    /// name fails loudly at registration, the fallible boundary.
+    /// `name` may be any runtime string and is interned (see
+    /// [`value_state`]); it is not validated here — an empty name fails
+    /// loudly at registration, the fallible boundary.
     #[must_use]
-    pub const fn new(name: &'static str) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
-            meta: DescriptorMeta::new(name),
+            meta: DescriptorMeta::new(intern_descriptor_str(name)),
             _marker: PhantomData,
         }
     }
 
-    /// Attaches an opt-in schema version label to the frozen identity.
+    /// Attaches an opt-in schema version label to the frozen identity. Like
+    /// the collection name, the label may be any runtime string and is
+    /// interned.
     #[must_use]
-    pub const fn with_schema_label(mut self, label: &'static str) -> Self {
-        self.meta = self.meta.with_schema_label(label);
+    pub fn with_schema_label(mut self, label: &str) -> Self {
+        self.meta = self.meta.with_schema_label(intern_descriptor_str(label));
         self
     }
 }
@@ -482,6 +488,15 @@ where
         ensure_live(&self.session)?;
         Ok(self.session.flush_state_cell(&self.name).await?)
     }
+}
+
+/// Interns a descriptor string, returning the pool's canonical
+/// `&'static str` (the [`Topic`](crate::Topic) idiom). Descriptor names
+/// and labels are a bounded set fixed at consumer build, so pool entries
+/// living for the process is the intended retention; interning is what
+/// keeps descriptor metadata `Copy`.
+fn intern_descriptor_str(s: &str) -> &'static str {
+    Intern::<str>::from(s).as_ref()
 }
 
 /// Guards every handle operation: a session whose partition is shutting

@@ -52,8 +52,13 @@ mod common;
 /// read-back timer once the cart holds this many items.
 const MESSAGE_COUNT: usize = 2;
 
-const CART: ValueDescriptor = value_state("cart");
-const LAST_SEEN: KafkaMessageDescriptor = kafka_message_state("last_seen");
+fn cart() -> ValueDescriptor {
+    value_state("cart")
+}
+
+fn last_seen() -> KafkaMessageDescriptor {
+    kafka_message_state("last_seen")
+}
 
 /// What the handler saw, streamed to the test for content assertions.
 #[derive(Debug)]
@@ -70,8 +75,8 @@ enum Observation {
 }
 
 /// A generic handler — no concrete context type named anywhere — that
-/// accumulates message `"item"` fields into the `CART` cell, records the
-/// message in `LAST_SEEN`, and schedules an `Application` timer once the
+/// accumulates message `"item"` fields into the `cart` cell, records the
+/// message in `last_seen`, and schedules an `Application` timer once the
 /// cart is full. The timer reads both cells back.
 #[derive(Clone)]
 struct CartHandler {
@@ -89,7 +94,7 @@ impl CartHandler {
     {
         // Read-modify-write on the value cell: each message appends its
         // item to the array committed by the previous event.
-        let cart = ctx.state(CART)?;
+        let cart = ctx.state(cart())?;
         let mut items = match cart.get().await? {
             Some(Value::Array(items)) => items,
             Some(other) => return Err(CartHandlerError::UnexpectedCell(other)),
@@ -106,7 +111,7 @@ impl CartHandler {
         let updated = Value::Array(items);
         cart.set(updated.clone()).await?;
 
-        ctx.state(LAST_SEEN)?.set(&message).await?;
+        ctx.state(last_seen())?.set(&message).await?;
 
         // The final message completes the cart; schedule the timer that
         // reads the accumulated state back. Per-key serialization
@@ -131,11 +136,11 @@ impl CartHandler {
     where
         C: EventContext<Payload = Value>,
     {
-        let cart = ctx.state(CART)?.get().await?;
+        let cart = ctx.state(cart())?.get().await?;
         // Re-fetches the original message body from Kafka through the
         // consumer's loader, decoded by the consumer's own codec.
         let last_seen = ctx
-            .state(LAST_SEEN)?
+            .state(last_seen())?
             .get()
             .await?
             .map(|message| (message.offset(), message.payload().clone()));
@@ -285,8 +290,8 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
         monopolization: MonopolizationConfigurationBuilder::default().build()?,
         defer: DeferConfigurationBuilder::default().build()?,
         keyed_state: KeyedStateConfiguration::default()
-            .state(&CART, CollectionDef::new(None))
-            .state(&LAST_SEEN, CollectionDef::new(None)),
+            .state(&cart(), CollectionDef::new(None))
+            .state(&last_seen(), CollectionDef::new(None)),
     };
 
     let common_config = CommonMiddlewareConfiguration {

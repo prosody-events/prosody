@@ -36,7 +36,9 @@ use tokio::sync::{Semaphore, watch};
 use tracing::Span;
 use uuid::Uuid;
 
-const CART: ValueDescriptor = value_state("cart");
+fn cart() -> ValueDescriptor {
+    value_state("cart")
+}
 
 /// Oracle that counts `resolve` calls so a test can assert it was never
 /// consulted (the stale-pending sweep arm must not touch the oracle).
@@ -87,7 +89,7 @@ type TestTimerManager = TimerManager<TableAdapter<InMemoryTriggerStore>>;
 
 fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
-    registry.register(&CART, CollectionDef::new(None))?;
+    registry.register(&cart(), CollectionDef::new(None))?;
     Ok(Arc::new(registry))
 }
 
@@ -247,7 +249,7 @@ async fn acquire_validates_identities_eagerly() -> Result<()> {
 
     // A conflicting identity for the same name fails Permanent.
     let mut conflicting = CollectionDefRegistry::new(None);
-    conflicting.register(&CART.with_schema_label("v2"), CollectionDef::new(None))?;
+    conflicting.register(&cart().with_schema_label("v2"), CollectionDef::new(None))?;
     let conflicted = provider(durable, FixedOracle::committed(), Arc::new(conflicting));
     let err = conflicted
         .acquire(Topic::from("t"), 0)

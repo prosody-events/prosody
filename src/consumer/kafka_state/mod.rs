@@ -10,8 +10,8 @@
 //! * [`KafkaResolver`] — the resolution strategy: `KafkaMessageRef → message`,
 //!   loading through the session's loader.
 //!
-//! Handlers declare a collection as a `const` via [`kafka_message_state`] and
-//! bind it like any other descriptor; the handle's `get` returns the full
+//! Handlers declare a collection via [`kafka_message_state`] and bind it
+//! like any other descriptor; the handle's `get` returns the full
 //! [`ConsumerMessage`], and `set` takes the message in hand.
 
 use crate::codec::Codec;
@@ -116,8 +116,8 @@ where
 
 /// Descriptor for a collection whose cells reference Kafka message bodies.
 ///
-/// A [`ValueDescriptor`] over [`KafkaRefCodec`] + [`KafkaResolver`]; declare as
-/// a `const` via [`kafka_message_state`].
+/// A [`ValueDescriptor`] over [`KafkaRefCodec`] + [`KafkaResolver`]; declare
+/// via [`kafka_message_state`].
 pub type KafkaMessageDescriptor = ValueDescriptor<KafkaRefCodec, KafkaResolver>;
 
 /// Error returned by Kafka-message handle operations.
@@ -125,10 +125,12 @@ pub type KafkaStateError = ValueStateError<KafkaRefCodecError>;
 
 /// Declares a Kafka-message collection named `name`.
 ///
-/// `name` is not validated here (const contexts cannot fail); an empty name
-/// fails loudly at registration, the fallible boundary.
+/// `name` may be any runtime string and is interned (see
+/// [`value_state`](crate::state::descriptor::value_state)); it is not
+/// validated here — an empty name fails loudly at registration, the
+/// fallible boundary.
 #[must_use]
-pub const fn kafka_message_state(name: &'static str) -> KafkaMessageDescriptor {
+pub fn kafka_message_state(name: &str) -> KafkaMessageDescriptor {
     ValueDescriptor::new(name)
 }
 
