@@ -238,9 +238,12 @@ pub struct StateManagerProvider<B, L> {
 impl<B, L> StateManagerProvider<B, L> {
     /// Creates the provider.
     ///
-    /// `consumer_group` derives the partition's segment id; it must match
-    /// the formula the trigger store and timer manager use, so recovery
-    /// reads the exact rows the partition writes.
+    /// `consumer_group` derives the partition's segment id for **state-cell
+    /// identity** (via [`compute_segment_id`]). This is independent of the
+    /// timer subsystem's own segment (`Segment::for_partition`) — the two use
+    /// different derivations and never need to match, because the commit
+    /// oracle resolves a timer `EventRef` by `(key, timer_type, time)` against
+    /// the per-partition trigger store, never by the state segment id.
     #[must_use]
     pub fn new(
         backend: B,
