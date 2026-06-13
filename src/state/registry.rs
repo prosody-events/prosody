@@ -14,9 +14,10 @@ use thiserror::Error;
 /// "do not bind a TTL" (explicit indefinite retention); a `Some(ttl)` over
 /// Cassandra's `USING TTL` ceiling is rejected at
 /// [`CollectionDefRegistry::register`] time, never silently collapsed.
-/// `commit_mode` decides whether handler-side dirty ops produce a sealed
-/// WAL on success ([`CommitMode::Wal`]) or apply straight to authoritative
-/// state ([`CommitMode::Direct`]).
+/// `commit_mode` decides whether handler-side dirty ops stage a provisional
+/// cell that promotes to committed after the event commit
+/// ([`CommitMode::ReadCommitted`]) or apply straight to the committed value
+/// on handler success ([`CommitMode::ReadUncommitted`]).
 ///
 /// Operational settings are deliberately separate from the collection's
 /// frozen [`StructuralIdentity`]: the identity comes only from the
@@ -37,12 +38,12 @@ pub struct CollectionDef {
 
 impl CollectionDef {
     /// Creates a collection definition with the supplied TTL; commit
-    /// mode defaults to [`CommitMode::Wal`].
+    /// mode defaults to [`CommitMode::ReadCommitted`].
     #[must_use]
     pub fn new(ttl: Option<CompactDuration>) -> Self {
         Self {
             ttl,
-            commit_mode: CommitMode::Wal,
+            commit_mode: CommitMode::ReadCommitted,
         }
     }
 
@@ -161,12 +162,12 @@ impl CollectionDefRegistry {
     }
 
     /// Returns the commit mode bound to `name`, falling back to
-    /// [`CommitMode::Wal`] for names not in the registry.
+    /// [`CommitMode::ReadCommitted`] for names not in the registry.
     #[must_use]
     pub fn commit_mode_for(&self, name: &StateName) -> CommitMode {
         self.defs
             .get(name)
-            .map_or(CommitMode::Wal, |c| c.def.commit_mode)
+            .map_or(CommitMode::ReadCommitted, |c| c.def.commit_mode)
     }
 }
 
@@ -193,6 +194,28 @@ pub enum RegisterStateError {
 
         /// The offending TTL, in seconds.
         seconds: u32,
+    },
+
+    /// The collection's TTL does not strictly exceed the keyed-state
+    /// `recovery_delay`. A provisional cell carries this TTL; if the cell
+    /// could expire before the `StateRecovery` sweep (scheduled
+    /// `recovery_delay` after the last commit) resolves it, a committed
+    /// write would be lost. Rejected at consumer build so the
+    /// misconfiguration fails fast rather than silently losing state under
+    /// crash recovery. Indefinite retention (`None`) always passes.
+    #[error(
+        "state collection {name:?} TTL {ttl_seconds} seconds must exceed the keyed-state recovery \
+         delay of {recovery_seconds} seconds, or a provisional cell could expire before recovery"
+    )]
+    TtlBelowRecoveryDelay {
+        /// Collection name whose TTL is at or below the recovery delay.
+        name: StateName,
+
+        /// The offending TTL, in seconds.
+        ttl_seconds: u32,
+
+        /// The configured recovery delay, in seconds.
+        recovery_seconds: u32,
     },
 
     /// The name is already registered with a different structural identity.

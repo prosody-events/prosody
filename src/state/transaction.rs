@@ -1,44 +1,41 @@
 //! Transaction-side state shapes.
 //!
-//! [`DurableState`] is what a backend reads back for a partition (idle or
-//! sealed); [`LocalTx`] is the in-handler transaction state machine; the
-//! remaining types are the proofs and payloads those two thread between
-//! the dirty workspace and the durable store.
+//! [`CommitMode`] is the per-collection read guarantee; [`Read`] is the
+//! three-valued overlay read; [`PendingOps`] carries a collection's compacted
+//! dirty operations from the workspace to the durability step.
 
-use super::event_ref::EventRef;
-use super::identity::{CollectionKind, CollectionRef};
-use super::wal::SealedWal;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 
 /// Persistence mode for a collection's state changes, chosen per collection
 /// at registration
 /// ([`CollectionDef::with_commit_mode`](crate::state::registry::CollectionDef::with_commit_mode);
-/// the default is [`Self::Wal`]).
+/// the default is [`Self::ReadCommitted`]).
 ///
-/// The trade-off:
+/// The modes are named by the **read guarantee** they give, not the mechanism:
 ///
-/// * **`Wal` — atomic with the event, crash-recoverable.** On handler success
-///   the buffered writes seal into a write-ahead log *before* the event's
-///   commit marker; crash recovery then applies or rolls the WAL back according
-///   to whether the event committed. A handler that fails or redelivers never
-///   half-applies its writes. Costs one extra durable write (the seal) plus the
-///   deferred apply per event.
-/// * **`Direct` — cheaper, at-least-once.** Buffered writes apply straight to
-///   authoritative state when the handler succeeds, with no WAL. A crash
-///   between the apply and the event's commit re-runs the handler against
-///   already-applied state, so writes must be idempotent (last-writer-wins
-///   `set`s usually are). Choose it for state where re-application is harmless
-///   and the extra write per event matters.
+/// * **`ReadCommitted` — atomic with the event, crash-recoverable.** On handler
+///   success the buffered write stages as a provisional cell (new value beside
+///   the prior committed value) *before* the event's commit marker, then
+///   promotes to committed after the marker is durable; crash recovery resolves
+///   the cell through the commit oracle. A handler that fails or redelivers
+///   never exposes its writes — internal and external readers only ever observe
+///   committed values.
+/// * **`ReadUncommitted` — cheaper, at-least-once.** The buffered write applies
+///   straight to the committed value when the handler succeeds, visible even if
+///   the event later fails. A crash between the apply and the event's commit
+///   re-runs the handler against already-applied state, so writes must be
+///   idempotent (last-writer-wins `set`s usually are). Choose it for state
+///   where re-application is harmless and the extra promote per event matters.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitMode {
-    /// Seal dirty operations into a write-ahead log before the event commit
-    /// oracle resolves them — atomic with the event's commit marker.
-    Wal,
+    /// Stage the write provisionally before the event commit marker and
+    /// promote it after — readers observe committed values only.
+    ReadCommitted,
 
-    /// Apply dirty operations directly with no sealed write-ahead state —
-    /// cheaper, with at-least-once application semantics.
-    Direct,
+    /// Apply the write to committed state immediately — cheaper, with
+    /// at-least-once, read-uncommitted semantics.
+    ReadUncommitted,
 }
 
 /// Three-valued read used by overlays.
@@ -54,80 +51,6 @@ pub enum Read<T> {
     Unknown,
 }
 
-/// Durable collection state is either idle or sealed for one event.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DurableState<K>
-where
-    K: CollectionKind,
-{
-    /// No sealed operations are pending; `applied` is authoritative.
-    Idle {
-        /// Authoritative applied state.
-        applied: K::Applied,
-    },
-
-    /// A non-empty WAL is sealed for recovery.
-    Sealed {
-        /// Authoritative applied state observed before the WAL was sealed.
-        applied: K::Applied,
-
-        /// Durable sealed WAL.
-        wal: SealedWal<K>,
-    },
-}
-
-/// Local transaction state for one collection and event.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalTx<K>
-where
-    K: CollectionKind,
-{
-    /// No dirty operations are pending.
-    Clean(CollectionRef<K>),
-
-    /// Dirty operations are buffered in the local pending store.
-    Dirty,
-
-    /// Dirty operations have been sealed durably.
-    Sealed(SealedCollection<K>),
-
-    /// The transaction was resolved and must not transition again.
-    Finished,
-}
-
-/// Local proof that dirty operations were sealed for an event.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct SealedCollection<K>
-where
-    K: CollectionKind,
-{
-    collection: CollectionRef<K>,
-    event: EventRef,
-}
-
-impl<K> SealedCollection<K>
-where
-    K: CollectionKind,
-{
-    /// Creates a sealed local transition marker.
-    #[must_use]
-    pub fn new(collection: CollectionRef<K>, event: EventRef) -> Self {
-        Self { collection, event }
-    }
-
-    /// Returns the collection reference.
-    #[must_use]
-    pub fn collection(&self) -> &CollectionRef<K> {
-        &self.collection
-    }
-
-    /// Returns the event that owns the sealed operations.
-    #[must_use]
-    pub fn event(&self) -> EventRef {
-        self.event
-    }
-}
-
 /// Pending operations for one collection, with a typed non-empty proof.
 ///
 /// Returned by
@@ -135,9 +58,9 @@ where
 /// wrapped in [`Option`]: `None` means no dirty work is buffered for the
 /// collection, `Some(PendingOps { count, ops })` means at least one
 /// operation exists and `count` matches the iterator. The [`NonZeroU64`]
-/// count lets callers size the seal without materializing `ops` first; the
-/// iterator yields the operations themselves in order when the seal or
-/// direct-apply path needs them.
+/// count lets callers size the work without materializing `ops` first; the
+/// iterator yields the operations themselves in order when `finalize` folds
+/// them into the staged or resolved cell write.
 pub struct PendingOps<I>
 where
     I: Iterator + Send,

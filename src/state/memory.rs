@@ -1,30 +1,22 @@
 //! In-memory keyed-state stores.
 
-use super::descriptor_identity::{
-    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
-};
-use super::encoding::{EncodingError, decode_wal};
-use super::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
-use super::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, ValueKind, ValueOp, ValueStore,
-    fold_value_ops,
-};
+use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
+use super::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use super::partition_store::CommittedCache;
+use super::store::CellStore;
+use super::value::{PendingOpSource, ValueKind, ValueOp, ValueStore};
 use super::{
-    CollectionId, CollectionKind, CollectionKindId, CollectionRef, DirtyStoreProvider,
-    DurableState, EventRef, EventScopeId, PendingOps, Read, SealedCollection, SealedWal, StateKey,
-    StateName, StateType, StoreOutcome, WalFormat,
+    CollectionId, CollectionRef, DirtyStoreProvider, EventRef, EventScopeId, PendingOps, Read,
 };
-use crate::error::{ClassifyError, ErrorCategory};
-use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
 use ahash::RandomState;
 use bytes::Bytes;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
-use thiserror::Error;
 
 /// In-memory dirty Value store.
 ///
@@ -52,7 +44,7 @@ impl Default for MemoryDirtyValueStore {
 }
 
 impl ValueStore for MemoryDirtyValueStore {
-    type Error = MemoryStateError;
+    type Error = Infallible;
 
     async fn get<'a>(
         &'a self,
@@ -112,7 +104,7 @@ impl DirtyStoreProvider<ValueKind> for MemoryDirtyValueStoreProvider {
 }
 
 impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
-    type Error = MemoryStateError;
+    type Error = Infallible;
     type Ops<'a> = OptionIntoIter<ValueOp>;
 
     fn pending_ops<'a>(
@@ -129,233 +121,103 @@ impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
     }
 }
 
-/// In-memory durable Value store.
+/// In-memory [`CellStore`] for the Value kind.
 ///
-/// Each collection has authoritative applied state and at most one sealed WAL
-/// record. Sealing never mutates applied state; applying or rolling back a
-/// matching sealed event resolves the WAL record.
-///
-/// The store ignores TTL at the write layer (memory has no expiry), but it
-/// still threads its constructor-supplied `default_ttl` through every
-/// [`CollectionRef`] it builds for [`ValueStore::set`] / [`ValueStore::clear`].
-/// This keeps the production pattern symmetric with [`super::cassandra`] so a
-/// careless copy-paste cannot regress to hardcoded `None`.
-#[derive(Clone, Debug)]
-pub struct MemoryDurableValueStore {
-    inner: Arc<Mutex<DurableInner>>,
-    default_ttl: Option<CompactDuration>,
+/// The provisional-cell durable backend: one cell per collection (Value's
+/// `CellAddr` is `()`), each either resolved or provisional, plus the
+/// per-segment descriptor-identity rows. One instance is shared
+/// process-wide across partition reassignments (`Clone` shares the `Arc`),
+/// so committed state and identities survive a rebalance within the process.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryCellStore {
+    inner: Arc<Mutex<CellInner>>,
 }
 
-impl MemoryDurableValueStore {
-    /// Creates an empty durable Value store with a constructor-supplied
-    /// default TTL. The TTL is propagated through every
-    /// [`CollectionRef`] built by [`ValueStore::set`] / [`ValueStore::clear`].
-    /// Pass `None` for indefinite retention (or the Cassandra >20-year
-    /// overflow fallback at the wiring layer).
+impl MemoryCellStore {
+    /// Creates an empty cell store.
     #[must_use]
-    pub fn new(default_ttl: Option<CompactDuration>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(DurableInner::default())),
-            default_ttl,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
+}
 
-    /// Test-only convenience: one-hour default TTL.
-    #[cfg(test)]
-    #[must_use]
-    pub fn for_tests() -> Self {
-        Self::new(Some(CompactDuration::new(3_600)))
-    }
+impl CellStore<ValueKind> for MemoryCellStore {
+    type Error = Infallible;
 
-    /// Test-only read of the `identity_version` stamp mirroring
-    /// Cassandra's per-row column, so suites can prove the
-    /// `applied` ⇔ stamp pairing on the memory backend.
-    #[cfg(test)]
-    pub(crate) fn identity_version_for_tests(
-        &self,
-        collection: &CollectionId<ValueKind>,
-    ) -> Option<i32> {
-        self.inner
+    async fn read_cell<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+    ) -> Result<Cell, Self::Error> {
+        Ok(self
+            .inner
             .lock()
-            .entries
+            .cells
             .get(collection)
-            .and_then(|entry| entry.identity_version)
+            .map_or_else(|| Cell::Resolved(Committed::new(None)), StoredCell::to_cell))
     }
 
-    /// Applies a single op via [`DirectApplyStore`], threading the
-    /// constructor-supplied `default_ttl` through the built [`CollectionRef`].
-    /// Backs the [`ValueStore::set`] / [`ValueStore::clear`] impls.
-    async fn apply_one(
-        &self,
-        collection: &CollectionId<ValueKind>,
-        op: ValueOp,
-    ) -> Result<(), MemoryStateError> {
-        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
-        self.direct_apply(&collection_ref, vec![op]).await?;
+    fn provisional_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+    ) -> impl Stream<Item = Result<((), ProvisionalCell), Self::Error>> + Send + 'a {
+        let provisional = match self.inner.lock().cells.get(collection) {
+            Some(StoredCell::Provisional { data, prev, event }) => {
+                Some(ProvisionalCell::new(data.clone(), prev.clone(), *event))
+            }
+            _ => None,
+        };
+        stream::iter(provisional.map(|cell| Ok(((), cell))))
+    }
+
+    async fn write_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef<ValueKind>,
+        (): &'a (),
+        write: &'a ProvisionalWrite,
+    ) -> Result<(), Self::Error> {
+        self.inner.lock().cells.insert(
+            collection.id().clone(),
+            StoredCell::Provisional {
+                data: write.data().cloned(),
+                prev: write.prev().cloned(),
+                event: write.event(),
+            },
+        );
         Ok(())
     }
 
-    /// Resolves a sealed event, running `resolve` over the matched WAL before
-    /// clearing it. Shared by `apply_sealed` (folds the decoded ops into
-    /// `applied`) and `rollback_sealed` (a no-op resolution). The whole body is
-    /// synchronous, so the `parking_lot` guard is never held across an await.
-    ///
-    /// `resolve` runs *before* the WAL is cleared, so a failing resolution
-    /// (e.g. a WAL decode error) leaves both `applied` and `wal` intact.
-    fn resolve_sealed(
-        &self,
-        collection: &CollectionRef<ValueKind>,
-        expected_event: EventRef,
-        resolve: impl FnOnce(
-            &mut DurableValueEntry,
-            &SealedWal<ValueKind>,
-        ) -> Result<(), MemoryStateError>,
-    ) -> Result<StoreOutcome, MemoryStateError> {
-        let pending_key = PendingKey::from_id(collection.id());
-        let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.id().clone()).or_default();
-        let Some(sealed) = entry.wal.clone() else {
-            return Ok(StoreOutcome::NoOp);
-        };
-        if sealed.event() != expected_event {
-            return Err(MemoryStateError::EventMismatch {
-                expected: expected_event,
-                actual: sealed.event(),
-            });
-        }
-
-        resolve(entry, &sealed)?;
-        entry.wal = None;
-        // WAL cleared; drop the pending row last (Cassandra ordering). The
-        // `entry` borrow has ended, so re-borrowing `inner` is sound.
-        inner.pending.remove(&pending_key);
-        Ok(StoreOutcome::Applied)
-    }
-}
-
-impl ValueStore for MemoryDurableValueStore {
-    type Error = MemoryStateError;
-
-    async fn get<'a>(
+    async fn write_resolved<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<Bytes>, Self::Error> {
-        let state = self.read_partition(collection).await?;
-        Ok(match state {
-            DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => {
-                applied.map_or(Read::Absent, Read::Present)
-            }
-        })
-    }
-
-    async fn set<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        collection: &'a CollectionRef<ValueKind>,
+        (): &'a (),
+        data: Option<&'a Bytes>,
     ) -> Result<(), Self::Error> {
-        self.apply_one(collection, ValueOp::Set { payload }).await
+        self.inner
+            .lock()
+            .cells
+            .insert(collection.id().clone(), StoredCell::Resolved(data.cloned()));
+        Ok(())
     }
 
-    async fn clear<'a>(
+    async fn mark_resolved<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
+        collection: &'a CollectionRef<ValueKind>,
+        (): &'a (),
     ) -> Result<(), Self::Error> {
-        self.apply_one(collection, ValueOp::Clear).await
-    }
-}
-
-impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
-    type Error = MemoryStateError;
-
-    async fn read_partition<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<DurableState<ValueKind>, Self::Error> {
-        let inner = self.inner.lock();
-        let entry = inner.entries.get(collection);
-        let applied = entry.and_then(|entry| entry.applied.clone());
-        if let Some(wal) = entry.and_then(|entry| entry.wal.clone()) {
-            return Ok(DurableState::Sealed { applied, wal });
-        }
-
-        Ok(DurableState::Idle { applied })
-    }
-
-    async fn seal<'a, I>(
-        &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        event: EventRef,
-        ops: I,
-    ) -> Result<SealedCollection<ValueKind>, Self::Error>
-    where
-        I: IntoIterator<Item = ValueOp> + Send + 'a,
-    {
-        let collected: Vec<ValueOp> = ops.into_iter().collect();
-        let wal = SealedWal::try_new(event, collected, WalFormat::MsgpackStreamV1)
-            .map_err(MemoryStateError::Encoding)?;
-
-        // Mirror Cassandra's ordering: record the pending row first, then
-        // write the WAL. Mutate `pending` before borrowing `entries` so the
-        // two `&mut inner` reaches do not overlap (the trait methods are not
-        // called here — the mutex is non-reentrant). See [`PendingKey`].
-        let pending_key = PendingKey::from_id(collection.id());
         let mut inner = self.inner.lock();
-        inner.pending.insert(pending_key);
-        let entry = inner.entries.entry(collection.id().clone()).or_default();
-        entry.wal = Some(wal);
-        Ok(SealedCollection::new(collection.clone(), event))
-    }
-
-    async fn apply_sealed<'a>(
-        &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        expected_event: EventRef,
-    ) -> Result<StoreOutcome, Self::Error> {
-        // Sync resolution: nothing awaits under the lock, and `decode_wal`
-        // running before the WAL is cleared keeps a decode failure
-        // non-destructive (state survives intact on `Err`).
-        self.resolve_sealed(collection, expected_event, |entry, sealed| {
-            let envelope =
-                decode_wal::<ValueKind>(sealed.wal()).map_err(MemoryStateError::Encoding)?;
-            entry.fold_applied(&envelope.into_ops());
-            Ok(())
-        })
-    }
-
-    async fn rollback_sealed<'a>(
-        &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        expected_event: EventRef,
-    ) -> Result<StoreOutcome, Self::Error> {
-        self.resolve_sealed(collection, expected_event, |_, _| Ok(()))
-    }
-}
-
-impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
-    type Error = MemoryStateError;
-
-    async fn direct_apply<'a, I>(
-        &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        ops: I,
-    ) -> Result<StoreOutcome, Self::Error>
-    where
-        I: IntoIterator<Item = ValueOp> + Send + 'a,
-    {
-        let ops = ops.into_iter().collect::<Vec<_>>();
-        if ops.is_empty() {
-            return Ok(StoreOutcome::NoOp);
+        if let Some(StoredCell::Provisional { data, .. }) = inner.cells.get(collection.id()) {
+            let data = data.clone();
+            inner
+                .cells
+                .insert(collection.id().clone(), StoredCell::Resolved(data));
         }
-
-        let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.id().clone()).or_default();
-        entry.fold_applied(&ops);
-        Ok(StoreOutcome::Applied)
+        Ok(())
     }
 }
 
-impl DescriptorIdentityStore for MemoryDurableValueStore {
-    type Error = MemoryStateError;
+impl DescriptorIdentityStore for MemoryCellStore {
+    type Error = Infallible;
 
     async fn read_descriptor_identities(
         &self,
@@ -391,57 +253,51 @@ impl DescriptorIdentityStore for MemoryDurableValueStore {
     }
 }
 
-impl PendingIndexStore for MemoryDurableValueStore {
-    type Error = MemoryStateError;
+/// In-memory [`CommittedCache`] for the Value kind.
+///
+/// A plain map of committed cell values, used by memory-backed tests and the
+/// memory production wiring. Infallible — its error is [`Infallible`].
+#[derive(Clone, Debug, Default)]
+pub struct MemoryCommittedCache {
+    inner: Arc<Mutex<HashMap<CollectionId<ValueKind>, Committed, RandomState>>>,
+}
 
-    async fn insert_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
-    where
-        K: CollectionKind,
-    {
-        self.inner.lock().pending.insert(PendingKey::from_id(id));
-        Ok(())
-    }
-
-    async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
-    where
-        K: CollectionKind,
-    {
-        self.inner.lock().pending.remove(&PendingKey::from_id(id));
-        Ok(())
+impl MemoryCommittedCache {
+    /// Creates an empty committed-value cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
-impl PendingIndexScanner for MemoryDurableValueStore {
-    type Error = MemoryStateError;
+impl CommittedCache<ValueKind> for MemoryCommittedCache {
+    type Error = Infallible;
 
-    /// Streams the pending Value entries on `(segment, key)` from the
-    /// dedicated pending index, yielding one entry per recorded
-    /// `PendingKey` whose segment-qualified key matches `state_key`.
-    ///
-    /// Reading from the real index (rather than deriving from
-    /// `entry.wal.is_some()`) lets the memory backend represent the
-    /// crash state *pending-written / WAL-not-written* — the
-    /// `Idle ⇒ delete_pending` recovery sweep arm that derived presence
-    /// could never reproduce. The snapshot is taken under the inner lock;
-    /// the stream itself is materialized at call time (the memory backend
-    /// has no I/O to incrementalize), which honors the "Collection scans
-    /// are streaming" contract by shape even though the underlying data is
-    /// fully resident.
-    fn scan_pending(
-        &self,
-        state_key: &StateKey,
-    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send {
-        let snapshot: Vec<PendingEntry> = {
-            let inner = self.inner.lock();
-            inner
-                .pending
-                .iter()
-                .filter(|key| &key.state_key == state_key)
-                .map(|key| PendingEntry::new(key.state_type, key.kind, key.name.clone()))
-                .collect()
-        };
+    async fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+    ) -> Result<Option<Committed>, Self::Error> {
+        Ok(self.inner.lock().get(collection).cloned())
+    }
 
-        stream::iter(snapshot.into_iter().map(Ok))
+    async fn put<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+        value: &'a Committed,
+    ) -> Result<(), Self::Error> {
+        self.inner.lock().insert(collection.clone(), value.clone());
+        Ok(())
+    }
+
+    async fn invalidate<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+    ) -> Result<(), Self::Error> {
+        self.inner.lock().remove(collection);
+        Ok(())
     }
 }
 
@@ -451,92 +307,29 @@ struct DirtyInner {
 }
 
 #[derive(Debug, Default)]
-struct DurableInner {
-    entries: HashMap<CollectionId<ValueKind>, DurableValueEntry, RandomState>,
-    pending: HashSet<PendingKey, RandomState>,
+struct CellInner {
+    cells: HashMap<CollectionId<ValueKind>, StoredCell, RandomState>,
     identities: HashMap<SegmentId, Vec<DurableDescriptorIdentity>, RandomState>,
 }
 
-/// Untyped key into the in-memory pending-WAL index.
-///
-/// [`PendingIndexStore::insert_pending`] / `delete_pending` are generic over
-/// the collection kind `K`, so the key erases the type-level kind into the
-/// runtime [`CollectionKindId`] discriminator. Storing `kind` lets the
-/// kind-agnostic [`PendingIndexScanner::scan_pending`] mirror Cassandra's
-/// cross-kind scan and keeps the middleware's WARN-and-skip path for
-/// non-Value kinds reachable from memory-backed tests.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PendingKey {
-    state_key: StateKey,
-    state_type: StateType,
-    kind: CollectionKindId,
-    name: StateName,
-}
-
-impl PendingKey {
-    fn from_id<K>(id: &CollectionId<K>) -> Self
-    where
-        K: CollectionKind,
-    {
-        Self {
-            state_key: id.state_key().clone(),
-            state_type: id.state_type(),
-            kind: id.kind(),
-            name: id.name().clone(),
-        }
-    }
-}
-
-/// Authoritative state for one durable Value collection.
-///
-/// Invariant: `applied` always reflects the pre-seal authoritative state.
-/// `seal` writes only `wal`; `applied` is mutated solely by `apply_sealed`
-/// and `direct_apply` (through [`Self::fold_applied`]). This is what lets
-/// `rollback_sealed` resolve a sealed event with `entry.wal = None` and no
-/// `applied` restoration.
-///
-/// Invariant: `identity_version` pairs with `applied` (both present or
-/// both absent) — the memory mirror of Cassandra's `data` ⇔
-/// `identity_version` column pairing. `seal` never stamps.
-#[derive(Debug, Default)]
-struct DurableValueEntry {
-    applied: Option<Bytes>,
-    identity_version: Option<i32>,
-    wal: Option<SealedWal<ValueKind>>,
-}
-
-impl DurableValueEntry {
-    /// Folds `ops` into the applied state, stamping `identity_version` in
-    /// lockstep — the single mutation path for `applied`.
-    fn fold_applied<'a, I>(&mut self, ops: I)
-    where
-        I: IntoIterator<Item = &'a ValueOp>,
-    {
-        self.applied = fold_value_ops(self.applied.clone(), ops);
-        self.identity_version = self.applied.is_some().then_some(INITIAL_IDENTITY_VERSION);
-    }
-}
-
-/// Error returned by memory keyed-state stores.
-#[derive(Debug, Error)]
-pub enum MemoryStateError {
-    /// WAL encoding or decoding failed.
-    #[error(transparent)]
-    Encoding(#[from] EncodingError),
-
-    /// The sealed event did not match the event being resolved.
-    #[error("sealed event mismatch: expected {expected:?}, actual {actual:?}")]
-    EventMismatch {
-        /// Event requested by the caller.
-        expected: EventRef,
-
-        /// Event stored in durable sealed state.
-        actual: EventRef,
+/// One stored cell in [`MemoryCellStore`].
+#[derive(Clone, Debug)]
+enum StoredCell {
+    Resolved(Option<Bytes>),
+    Provisional {
+        data: Option<Bytes>,
+        prev: Option<Bytes>,
+        event: EventRef,
     },
 }
 
-impl ClassifyError for MemoryStateError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
+impl StoredCell {
+    fn to_cell(&self) -> Cell {
+        match self {
+            Self::Resolved(data) => Cell::Resolved(Committed::new(data.clone())),
+            Self::Provisional { data, prev, event } => {
+                Cell::Provisional(ProvisionalCell::new(data.clone(), prev.clone(), *event))
+            }
+        }
     }
 }

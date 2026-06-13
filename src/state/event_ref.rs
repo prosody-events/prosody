@@ -1,7 +1,7 @@
 //! Event identity and store/oracle verdicts.
 //!
 //! [`EventRef`] is the durable reference to the upstream event that owns a
-//! sealed WAL; [`EventScopeId`] distinguishes concurrent handler
+//! provisional cell; [`EventScopeId`] distinguishes concurrent handler
 //! invocations. [`CommitDecision`] and [`StoreOutcome`] are the two
 //! distinct verdicts threaded through recovery: the oracle decides, the
 //! store acts and reports.
@@ -42,7 +42,7 @@ impl EventScopeId {
     }
 }
 
-/// Durable reference to the upstream event that owns a sealed WAL.
+/// Durable reference to the upstream event that owns a provisional cell.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum EventRef {
     /// Kafka message event identified by its deduplication marker.
@@ -64,7 +64,7 @@ impl EventRef {
     pub(crate) const TIMER_KIND: i8 = 1;
 }
 
-/// Durable timer identity stored in a sealed WAL.
+/// Durable timer identity stored in a provisional cell.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct TimerEventRef {
     /// Timer namespace.
@@ -73,7 +73,7 @@ pub struct TimerEventRef {
     /// Scheduled fire time.
     pub time: CompactDateTime,
 
-    /// Timer row tag observed when the WAL was sealed.
+    /// Timer row tag observed when the cell was staged.
     pub tag: i32,
 }
 
@@ -89,40 +89,34 @@ impl TimerEventRef {
     }
 }
 
-/// Oracle verdict on a sealed WAL for one event.
+/// Oracle verdict on a provisional cell's event.
 ///
-/// Returned by the commit oracle when it resolves a
-/// [`SealedWal`](super::SealedWal)'s [`EventRef`] against the upstream
-/// commit source (deduplication store for messages, timer-row tag for
-/// timers per `docs/keyed-state/design-summary.md` §"Recovery"). Distinct
-/// from [`StoreOutcome`], which is the durable store's "did this call
-/// mutate state" signal: the oracle decides, the store acts on the
-/// decision.
+/// Returned by the commit oracle when it resolves a provisional cell's
+/// [`EventRef`] against the upstream commit source (deduplication store for
+/// messages, timer-row tag for timers per
+/// `docs/keyed-state/design-summary.md` §"Recovery"). Distinct from
+/// [`StoreOutcome`], which is the durable store's "did this call mutate
+/// state" signal: the oracle decides, the store acts on the decision.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
-    /// The sealed operations were committed.
+    /// The event's provisional write committed: promote it to the committed
+    /// value.
     Committed,
 
-    /// No sealed operations were committed.
+    /// The event did not commit: roll the cell back to its committed base.
     NotCommitted,
 }
 
 /// Did this store call mutate authoritative state.
 ///
-/// Returned by store-side methods that may or may not have work to do:
-/// [`apply_sealed`](super::value::DurableWalStore::apply_sealed) (WAL
-/// present → folded),
-/// [`rollback_sealed`](super::value::DurableWalStore::rollback_sealed)
-/// (WAL present → cleared),
-/// [`direct_apply`](super::value::DirectApplyStore::direct_apply) (ops
-/// non-empty → folded), and the
-/// [`TransactionValueStore`](super::value::TransactionValueStore) wrappers
-/// around them.
+/// Returned by the mid-handler write-through path
+/// ([`flush_state_cell`](super::session::StateSession::flush_state_cell)):
+/// [`StoreOutcome::Applied`] when buffered ops were written to the committed
+/// value, [`StoreOutcome::NoOp`] when nothing was buffered.
 ///
-/// Distinct from [`CommitDecision`]: the oracle decides whether a sealed
-/// WAL should be committed, the store reports whether it actually
-/// changed durable state when called. A second call with the same
-/// arguments observes [`StoreOutcome::NoOp`].
+/// Distinct from [`CommitDecision`]: the oracle decides whether a provisional
+/// cell should commit, the store reports whether it actually changed durable
+/// state when called.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum StoreOutcome {
     /// The call mutated authoritative state.

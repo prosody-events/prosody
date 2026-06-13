@@ -1,19 +1,18 @@
+pub(crate) mod cell_suite;
 pub(crate) mod dirty_value_suite;
-mod encoding;
 mod identity;
 pub(crate) mod value_suite;
 
+use self::cell_suite::{
+    OverwriteTrace, ProjTrace, Trace, run_crash_equivalence_trace, run_overwrite_trace,
+    run_projection_trace,
+};
 use self::dirty_value_suite::DirtyTrace;
-use self::value_suite::{DirectTrace, Trace, bytes, collection_id, collection_ref, event};
-use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
-use super::value::{
-    DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueStore, fold_value_ops,
-};
-use super::{
-    CollectionKindId, CollectionRef, CommitMode, Read, StoreOutcome, ValueKind, ValueOp,
-    WalEnvelope,
-};
-use color_eyre::eyre::{self, Result};
+use self::value_suite::{bytes, collection_id};
+use super::memory::{MemoryCellStore, MemoryDirtyValueStore};
+use super::value::{ValueOp, fold_value_ops};
+use super::{CollectionKindId, CollectionRef, ValueKind};
+use color_eyre::eyre::Result;
 use futures::executor;
 use quickcheck::QuickCheck;
 
@@ -34,73 +33,10 @@ fn value_folding_uses_last_ordered_op() {
     );
 }
 
-/// F4 (memory): the shared stale-pending sweep check against the memory
-/// durable store. Runs always (no broker). The Cassandra counterpart lives
-/// in `state::cassandra::tests` and drives the identical helper.
-#[tokio::test]
-async fn memory_sweep_deletes_stale_pending_index() -> Result<()> {
-    value_suite::run_stale_pending_index(MemoryDurableValueStore::for_tests()).await
-}
-
-/// N7/N8 (memory): the shared durable descriptor-identity acquisition
-/// check. The Cassandra counterpart lives in `state::cassandra::tests` and
-/// drives the identical helper.
-#[tokio::test]
-async fn memory_descriptor_identity_acquisition() -> Result<()> {
-    value_suite::run_descriptor_identity_acquisition(MemoryDurableValueStore::for_tests()).await
-}
-
-/// Memory mirror of Cassandra's `data` ⇔ `identity_version` column
-/// pairing: `seal` never stamps, applying the WAL stamps the folded data,
-/// and folding to a cleared cell drops the stamp with the data. The
-/// Cassandra counterpart (`value_row_stamps_identity_version_with_data`)
-/// reads the raw column; this reads the mirrored entry field.
-#[tokio::test]
-async fn memory_identity_version_stamp_pairs_with_applied() -> Result<()> {
-    use super::descriptor_identity::INITIAL_IDENTITY_VERSION;
-    use super::value::DirectApplyStore;
-
-    let durable = MemoryDurableValueStore::for_tests();
-    let collection = collection_ref()?;
-
-    durable
-        .seal(
-            &collection,
-            event(1),
-            vec![ValueOp::Set { payload: bytes(4) }],
-        )
-        .await?;
-    assert_eq!(
-        durable.identity_version_for_tests(collection.id()),
-        None,
-        "seal must not stamp identity_version"
-    );
-
-    durable.apply_sealed(&collection, event(1)).await?;
-    assert_eq!(
-        durable.identity_version_for_tests(collection.id()),
-        Some(INITIAL_IDENTITY_VERSION),
-        "apply must stamp the authoritative data"
-    );
-
-    durable
-        .direct_apply(&collection, vec![ValueOp::Clear])
-        .await?;
-    assert_eq!(
-        durable.identity_version_for_tests(collection.id()),
-        None,
-        "a cleared cell carries no stamp"
-    );
-    Ok(())
-}
-
 #[test]
 fn collection_identity_carries_value_kind() -> Result<()> {
     let collection = collection_id("profile")?;
     assert_eq!(collection.kind(), CollectionKindId::Value);
-
-    let envelope = WalEnvelope::<ValueKind>::try_from_ops(vec![ValueOp::Clear])?;
-    assert_eq!(envelope.operation_count().get(), 1);
     Ok(())
 }
 
@@ -133,158 +69,6 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()> {
-    let durable = MemoryDurableValueStore::for_tests();
-    let collection = collection_ref()?;
-    let _sealed = durable
-        .seal(&collection, event(1), vec![ValueOp::Clear])
-        .await?;
-
-    let error = durable
-        .apply_sealed(&collection, event(2))
-        .await
-        .err()
-        .ok_or_else(|| eyre::eyre!("expected mismatched event error"))?;
-    match error {
-        MemoryStateError::EventMismatch { expected, actual } => {
-            assert_eq!(expected, event(2));
-            assert_eq!(actual, event(1));
-        }
-        other @ MemoryStateError::Encoding(_) => {
-            return Err(eyre::eyre!("expected EventMismatch, got {other:?}"));
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
-    let durable = MemoryDurableValueStore::for_tests();
-    let dirty = MemoryDirtyValueStore::new();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-
-    let mut tx = TransactionValueStore::new(
-        durable.clone(),
-        dirty.clone(),
-        collection,
-        event(1),
-        CommitMode::Wal,
-    );
-    tx.set(&collection_id, bytes(1)).await?;
-    assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
-
-    let applied = match durable.read_partition(&collection_id).await? {
-        super::DurableState::Idle { applied } | super::DurableState::Sealed { applied, .. } => {
-            applied
-        }
-    };
-    assert_eq!(applied, None);
-    assert_eq!(dirty.get(&collection_id).await?, Read::Unknown);
-    Ok(())
-}
-
-/// Symmetry pin for `LocalTx::Dirty`: resolving a transaction's *sealed* event
-/// (`apply_sealed` / `rollback_sealed`) while it is still `Dirty` — staged
-/// writes that were never sealed — must discard those pending ops, exactly as
-/// [`TransactionValueStore::abort`] does. Pre-fix, only `abort` cleared the
-/// dirty workspace, so the unsealed ops leaked.
-#[tokio::test]
-async fn unsealed_apply_or_rollback_clears_dirty_like_abort() -> Result<()> {
-    for resolve_via_rollback in [false, true] {
-        let durable = MemoryDurableValueStore::for_tests();
-        let dirty = MemoryDirtyValueStore::new();
-        let collection = collection_ref()?;
-        let collection_id = collection.id().clone();
-
-        let mut tx = TransactionValueStore::new(
-            durable,
-            dirty.clone(),
-            collection,
-            event(1),
-            CommitMode::Wal,
-        );
-        tx.set(&collection_id, bytes(1)).await?;
-
-        // Resolve via the sealed-event path on a still-`Dirty` transaction.
-        if resolve_via_rollback {
-            tx.rollback_sealed().await?;
-        } else {
-            tx.apply_sealed().await?;
-        }
-
-        assert_eq!(
-            dirty.get(&collection_id).await?,
-            Read::Unknown,
-            "resolving a sealed event must discard the unsealed dirty ops"
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn finished_transaction_rejects_further_transitions() -> Result<()> {
-    let durable = MemoryDurableValueStore::for_tests();
-    let collection = collection_ref()?;
-    let collection_id = collection.id().clone();
-    let mut tx = TransactionValueStore::new(
-        durable,
-        MemoryDirtyValueStore::new(),
-        collection,
-        event(1),
-        CommitMode::Wal,
-    );
-
-    assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
-    let error = tx
-        .set(&collection_id, bytes(1))
-        .await
-        .err()
-        .ok_or_else(|| eyre::eyre!("expected finished transaction error"))?;
-    assert!(matches!(error, TransactionValueStoreError::Finished));
-    Ok(())
-}
-
-#[test]
-fn prop_value_transaction_trace_matches_model() {
-    fn property(trace: Trace) -> Result<bool> {
-        executor::block_on(value_suite::run_trace(
-            MemoryDurableValueStore::for_tests(),
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-    }
-
-    QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
-}
-
-#[test]
-fn prop_durable_resolution_is_idempotent() {
-    fn property(trace: Trace) -> Result<bool> {
-        executor::block_on(value_suite::run_idempotence_trace(
-            MemoryDurableValueStore::for_tests(),
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-    }
-
-    QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
-}
-
-#[test]
-fn prop_direct_mode_never_creates_wal() {
-    fn property(trace: DirectTrace) -> Result<bool> {
-        executor::block_on(value_suite::run_direct_trace(
-            MemoryDurableValueStore::for_tests(),
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-    }
-
-    QuickCheck::new().quickcheck(property as fn(DirectTrace) -> Result<bool>);
-}
-
 #[test]
 fn prop_memory_dirty_satisfies_invariants() {
     fn property(trace: DirtyTrace) -> Result<bool> {
@@ -295,4 +79,41 @@ fn prop_memory_dirty_satisfies_invariants() {
     }
 
     QuickCheck::new().quickcheck(property as fn(DirtyTrace) -> Result<bool>);
+}
+
+/// Crash-recovery equivalence over the memory cell store: every resolution
+/// path (clean promote, inline rollback, crash → sweep / first-touch recovery)
+/// converges each cell's committed projection to the model.
+#[test]
+fn prop_memory_cell_crash_equivalence() {
+    fn property(trace: Trace) -> Result<bool> {
+        executor::block_on(run_crash_equivalence_trace(MemoryCellStore::new(), trace))
+    }
+
+    QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
+}
+
+/// Reader-projection soundness over the memory cell store: a provisional cell
+/// always projects its committed `prev` (stale by the in-flight event), a
+/// resolved cell projects the committed value, and prev-is-committed holds.
+#[test]
+fn prop_memory_cell_projection_is_sound() {
+    fn property(trace: ProjTrace) -> Result<bool> {
+        executor::block_on(run_projection_trace(MemoryCellStore::new(), trace))
+    }
+
+    QuickCheck::new().quickcheck(property as fn(ProjTrace) -> Result<bool>);
+}
+
+/// Implicit-overwrite soundness over the memory cell store: a sequence of
+/// events that never promote or roll back explicitly converges every cell to
+/// the model, each overwrite resolving its predecessor's provisional cell
+/// through the oracle (both arms) on read.
+#[test]
+fn prop_memory_cell_implicit_overwrite() {
+    fn property(trace: OverwriteTrace) -> Result<bool> {
+        executor::block_on(run_overwrite_trace(MemoryCellStore::new(), trace))
+    }
+
+    QuickCheck::new().quickcheck(property as fn(OverwriteTrace) -> Result<bool>);
 }

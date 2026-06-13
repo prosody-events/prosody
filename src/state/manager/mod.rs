@@ -4,10 +4,12 @@
 //! a [`PartitionStateProvider`] (mirroring
 //! [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider)),
 //! then mints one [`StateSession`] per event from it. The manager owns the
-//! partition-lifetime pieces — the durable bundle (including the layered
-//! fjall cache), the commit oracle, the dirty-workspace provider, the
-//! pending-index scanner, and the message loader — while each session gets
-//! `Arc`-clones plus a fresh per-event dirty scope.
+//! partition-lifetime pieces — the [`PartitionStateStore`] (cell store +
+//! oracle + committed-value cache + status map), the dirty-workspace
+//! provider, and the message loader — while each session gets `Arc`-clones
+//! plus a fresh per-event dirty scope. The recovery sweep shares the *same*
+//! [`PartitionStateStore`], so the status marks sessions set are visible to
+//! it.
 //!
 //! Acquisition is **eager**: descriptor identities are validated against
 //! the segment's durable rows before the manager exists, so no session can
@@ -21,39 +23,37 @@
 //! [`EventRef`] (deriving a message's dedup id with the deduplication
 //! writer's canonical derivation) and hands it in.
 
+#[cfg(test)]
+mod tests;
+
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor_identity::{
-    DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
-};
+use crate::state::descriptor_identity::{DescriptorIdentityError, acquire_descriptor_identities};
 use crate::state::oracle::CommitOracle;
-use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
+use crate::state::partition_store::{CommittedCache, PartitionStateStore, PartitionStoreError};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
-    DirtyValueBundle, DurableValueBundle, SessionParts, StateSession, TerminationWatch,
-    ValueStateSession,
+    ArmedKeys, DirtyValueBundle, SessionParts, StateSession, TerminationWatch, ValueStateSession,
 };
-use crate::state::value::{DurableWalStore, ValueKind};
+use crate::state::store::CellStore;
+use crate::state::value::ValueKind;
 use crate::state::{
-    CollectionId, CollectionKindId, CollectionRef, CommitDecision, DirtyStoreProvider,
-    DurableState, EventRef, StateBackend, StateBackendFactory, StateKey, StoreOutcome,
+    CollectionId, CollectionRef, DirtyStoreProvider, EventRef, StateBackend, StateBackendFactory,
+    StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{SegmentId, TriggerStore};
 use crate::timers::{TimerManager, TimerType};
 use crate::{Key, Partition, Topic};
-use futures::StreamExt;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{error, warn};
 
-/// The per-event dirty store behind a backend factory's provider.
-type DirtyStoreOf<B> =
-    <<B as StateBackendFactory>::DirtyProvider as DirtyStoreProvider<ValueKind>>::Store;
+/// The cell-store error of a backend factory's cell store.
+type CellErr<B> = <<B as StateBackendFactory>::Cell as CellStore<ValueKind>>::Error;
 
 /// Per-partition keyed-state manager minted by a
 /// [`PartitionStateProvider`].
@@ -69,14 +69,14 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Error raised by the recovery sweep. Classified so the partition loop
     /// can drop a permanently-failing trigger (committing it) rather than
     /// refiring it forever — first-touch / the next sweep still recover the
-    /// seal.
+    /// staged cell.
     type RecoveryError: ClassifyError + Error + Send + Sync + 'static;
 
     /// Mints the session for `event` on `key`.
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session;
 
     /// Runs the `StateRecovery` sweep for `key` and clears the
-    /// `StateRecovery` timer once the pending partition is drained.
+    /// `StateRecovery` timer once every provisional cell on the key resolves.
     ///
     /// # Errors
     ///
@@ -118,25 +118,33 @@ pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send;
 }
 
-struct StateManagerInner<D, O, DP, Sc, L> {
-    durable: D,
+struct StateManagerInner<S, O, C, DP, L> {
+    store: PartitionStateStore<ValueKind, S, O, C>,
     oracle: O,
     dirty: DP,
-    scanner: Sc,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
+    /// Every collection name durable on the segment at acquisition time —
+    /// the union of the registered descriptors and any stored identity row
+    /// whose descriptor was since removed. The recovery sweep enumerates
+    /// this set so deregistered crash residue is still swept (invariant 5),
+    /// rather than the live registry alone.
+    names: Arc<[StateName]>,
     segment_id: SegmentId,
     recovery_delay: CompactDuration,
+    /// Keys with a standing `StateRecovery` backstop. Sessions read/set it to
+    /// amortize re-arming; `recover` removes the key when the sweep fires.
+    armed: ArmedKeys,
 }
 
 /// The real per-partition state manager: owns the partition-lifetime
-/// durable bundle (incl. the layered cache), oracle, dirty provider,
-/// scanner, and loader; mints per-event [`ValueStateSession`]s.
-pub struct StateManager<D, O, DP, Sc, L> {
-    inner: Arc<StateManagerInner<D, O, DP, Sc, L>>,
+/// [`PartitionStateStore`], oracle, dirty provider, and loader; mints
+/// per-event [`ValueStateSession`]s sharing that store.
+pub struct StateManager<S, O, C, DP, L> {
+    inner: Arc<StateManagerInner<S, O, C, DP, L>>,
 }
 
-impl<D, O, DP, Sc, L> Clone for StateManager<D, O, DP, Sc, L> {
+impl<S, O, C, DP, L> Clone for StateManager<S, O, C, DP, L> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -144,7 +152,7 @@ impl<D, O, DP, Sc, L> Clone for StateManager<D, O, DP, Sc, L> {
     }
 }
 
-impl<D, O, DP, Sc, L> fmt::Debug for StateManager<D, O, DP, Sc, L> {
+impl<S, O, C, DP, L> fmt::Debug for StateManager<S, O, C, DP, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateManager")
             .field("segment_id", &self.inner.segment_id)
@@ -152,25 +160,21 @@ impl<D, O, DP, Sc, L> fmt::Debug for StateManager<D, O, DP, Sc, L> {
     }
 }
 
-impl<D, O, DP, Sc, L> PartitionStateManager for StateManager<D, O, DP, Sc, L>
+impl<S, O, C, DP, L> PartitionStateManager for StateManager<S, O, C, DP, L>
 where
-    D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
-    <D as DurableWalStore<ValueKind>>::Error: ClassifyError,
+    S: CellStore<ValueKind>,
     O: CommitOracle,
-    O::Error: ClassifyError,
+    C: CommittedCache<ValueKind>,
     DP: DirtyStoreProvider<ValueKind>,
     DP::Store: DirtyValueBundle + Send + Sync,
-    Sc: PendingIndexScanner,
-    Sc::Error: ClassifyError,
     L: Clone + Send + Sync + 'static,
 {
-    type RecoveryError =
-        RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error>;
-    type Session = ValueStateSession<D, O, DP, L>;
+    type RecoveryError = RecoveryError<S::Error, O::Error>;
+    type Session = ValueStateSession<S, O, C, DP, L>;
 
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
         ValueStateSession::new(SessionParts {
-            durable: self.inner.durable.clone(),
+            store: self.inner.store.clone(),
             oracle: self.inner.oracle.clone(),
             dirty: self.inner.dirty.clone(),
             loader: self.inner.loader.clone(),
@@ -178,6 +182,7 @@ where
             state_key: StateKey::new(self.inner.segment_id, key),
             event,
             recovery_delay: self.inner.recovery_delay,
+            armed: self.inner.armed.clone(),
             termination,
         })
     }
@@ -191,25 +196,37 @@ where
         T: TriggerStore,
     {
         let state_key = StateKey::new(self.inner.segment_id, key.clone());
-        sweep_pending(
-            &self.inner.durable,
-            &self.inner.scanner,
-            &self.inner.oracle,
+        // The backstop fired, so it no longer stands: clear the armed flag so
+        // the key's next stateful commit re-arms. Per-key serialization means
+        // no commit on this key runs while the sweep does, so this cannot race
+        // a `mark_backstop_armed`. If the sweep then aborts and the trigger
+        // refires, the next commit's re-arm (`clear_and_schedule`, a singleton
+        // overwrite) simply replaces the refiring timer — still one backstop.
+        self.inner.armed.remove_async(&key).await;
+        let all_resolved = sweep_partition(
+            &self.inner.store,
+            &self.inner.names,
             &self.inner.registry,
-            state_key,
+            &state_key,
         )
         .await?;
-        timers
-            .unschedule_all(&key, TimerType::StateRecovery)
-            .await
-            .map_err(|e| RecoveryError::Timer(Box::new(e)))?;
+        // Only clear the backstop when every cell ended resolved (the
+        // no-strand invariant): a skipped Permanent cell leaves the timer
+        // armed for first-touch / a later sweep.
+        if all_resolved {
+            timers
+                .unschedule_all(&key, TimerType::StateRecovery)
+                .await
+                .map_err(|e| RecoveryError::Timer(Box::new(e)))?;
+        }
         Ok(())
     }
 }
 
 /// Process-wide [`PartitionStateProvider`] over a
-/// [`StateBackendFactory`]: acquisition mints the partition's backend and
-/// eagerly validates descriptor identities.
+/// [`StateBackendFactory`]: acquisition mints the partition's backend,
+/// eagerly validates descriptor identities, and composes the
+/// [`PartitionStateStore`].
 pub struct StateManagerProvider<B, L> {
     backend: B,
     loader: L,
@@ -270,15 +287,11 @@ impl<B, L> fmt::Debug for StateManagerProvider<B, L> {
 impl<B, L> PartitionStateProvider for StateManagerProvider<B, L>
 where
     B: StateBackendFactory,
-    B::Durable: DurableValueBundle
-        + PendingIndexStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>
-        + DescriptorIdentityStore<Error = <B::Durable as DurableWalStore<ValueKind>>::Error>,
     DirtyStoreOf<B>: DirtyValueBundle + Send + Sync,
     L: Clone + Send + Sync + 'static,
 {
-    type AcquireError =
-        StateAcquireError<B::Error, <B::Durable as DurableWalStore<ValueKind>>::Error>;
-    type Manager = StateManager<B::Durable, B::Oracle, B::DirtyProvider, B::Scanner, L>;
+    type AcquireError = StateAcquireError<B::Error, CellErr<B>>;
+    type Manager = StateManager<B::Cell, B::Oracle, B::Cache, B::DirtyProvider, L>;
 
     async fn acquire(
         &self,
@@ -287,10 +300,10 @@ where
     ) -> Result<Self::Manager, Self::AcquireError> {
         let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
         let StateBackend {
-            durable,
+            cell,
             oracle,
+            cache,
             dirty,
-            scanner,
         } = self
             .backend
             .for_partition(topic, partition)
@@ -298,159 +311,75 @@ where
         // Invariant: no state op executes under an unvalidated identity —
         // the manager does not exist until the segment's durable identity
         // rows match the registered descriptors.
-        acquire_descriptor_identities(&durable, &self.registry, segment_id)
+        let names = acquire_descriptor_identities(&cell, &self.registry, segment_id)
             .await
             .map_err(StateAcquireError::Identity)?;
+        let store = PartitionStateStore::new(cell, oracle.clone(), cache, self.registry.clone());
         Ok(StateManager {
             inner: Arc::new(StateManagerInner {
-                durable,
+                store,
                 oracle,
                 dirty,
-                scanner,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
+                names: names.into(),
                 segment_id,
                 recovery_delay: self.recovery_delay,
+                armed: Arc::default(),
             }),
         })
     }
 }
 
-/// Sweeps the `(segment, key)` pending partition.
-///
-/// For each Value entry it reads the durable partition and either cleans a
-/// stale pending row over an idle partition
-/// ([`PendingIndexStore::delete_pending`]) or resolves a sealed WAL
-/// against the oracle via [`resolve_sealed`]. Non-Value kinds are logged
-/// at WARN and skipped; future kinds plug in by extending the dispatch
-/// match. Clearing the `StateRecovery` timer is the caller's last step —
-/// the sweep itself is timer-agnostic.
-///
-/// Per-entry failures are classified: a **Permanent** failure (e.g. a
-/// corrupt durable row) is logged loudly and *skipped*, so one poisoned
-/// entry cannot starve the key's healthy siblings of resolution — were it
-/// to propagate, every sweep for the key would die at the same entry and
-/// a committed-but-unapplied sibling seal would wait on first-touch or its
-/// WAL TTL. Anything else propagates so the caller aborts the trigger and
-/// the sweep refires. Scanner errors always propagate: without the entry
-/// there is nothing to skip.
-pub(crate) async fn sweep_pending<D, Sc, O>(
-    durable: &D,
-    scanner: &Sc,
-    oracle: &O,
-    registry: &CollectionDefRegistry,
-    state_key: StateKey,
-) -> Result<(), RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error>>
-where
-    D: DurableWalStore<ValueKind>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
-    <D as DurableWalStore<ValueKind>>::Error: ClassifyError,
-    Sc: PendingIndexScanner,
-    O: CommitOracle,
-    O::Error: ClassifyError,
-{
-    let stream = scanner.scan_pending(&state_key);
-    futures::pin_mut!(stream);
-    while let Some(entry) = stream.next().await {
-        let entry = entry.map_err(RecoveryError::Scanner)?;
-        if entry.kind != CollectionKindId::Value {
-            warn!(
-                kind = ?entry.kind,
-                name = entry.name.as_str(),
-                "skipping unsupported pending kind in state recovery"
-            );
-            continue;
-        }
-        if let Err(error) = sweep_entry(durable, oracle, registry, &state_key, &entry).await {
-            if error.classify_error() == ErrorCategory::Permanent {
-                error!(
-                    name = entry.name.as_str(),
-                    key = %state_key.key,
-                    "skipping permanently-failing pending entry; first-touch or \
-                     the WAL TTL must resolve it: {error:#}"
-                );
-                continue;
-            }
-            return Err(match error {
-                ResolveSealedError::Durable(e) => RecoveryError::Durable(e),
-                ResolveSealedError::Oracle(e) => RecoveryError::Oracle(e),
-            });
-        }
-    }
-    Ok(())
-}
+/// The per-event dirty store behind a backend factory's provider.
+type DirtyStoreOf<B> =
+    <<B as StateBackendFactory>::DirtyProvider as DirtyStoreProvider<ValueKind>>::Store;
 
-/// Resolves one pending entry: deletes a stale row over an `Idle`
-/// partition, or resolves a `Sealed` WAL through the oracle. Entry-level
-/// operations only touch the durable store and the oracle, so the error is
-/// the shared [`ResolveSealedError`] pair.
-async fn sweep_entry<D, O>(
-    durable: &D,
-    oracle: &O,
-    registry: &CollectionDefRegistry,
-    state_key: &StateKey,
-    entry: &PendingEntry,
-) -> Result<(), ResolveSealedError<<D as DurableWalStore<ValueKind>>::Error, O::Error>>
-where
-    D: DurableWalStore<ValueKind>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
-    O: CommitOracle,
-{
-    let id =
-        CollectionId::<ValueKind>::new(state_key.clone(), entry.state_type, entry.name.clone());
-    let ttl = registry.ttl_for(&entry.name);
-    let collection_ref = CollectionRef::new(id.clone(), ttl);
-    match DurableWalStore::read_partition(durable, &id)
-        .await
-        .map_err(ResolveSealedError::Durable)?
-    {
-        DurableState::Idle { .. } => {
-            PendingIndexStore::delete_pending::<ValueKind>(durable, &id)
-                .await
-                .map_err(ResolveSealedError::Durable)?;
-        }
-        DurableState::Sealed { wal, .. } => {
-            resolve_sealed(durable, oracle, &collection_ref, wal.event()).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Resolves a single sealed WAL: consult `oracle` for `event`, then apply or
-/// roll back the sealed ops on `durable`.
+/// Sweeps every durable collection on `(segment, key)`, resolving any
+/// provisional cell through the oracle.
 ///
-/// This is the shared inner decision of every recovery path —
-/// [`RecoveringValueStore`](crate::state::recovering::RecoveringValueStore)'s
-/// first-touch (`get`) and recover-before-overwrite (`seal`) recovery, and
-/// the [`sweep_pending`] timer sweep. Each caller maps
-/// [`ResolveSealedError`] into its own error enum and keeps its surrounding
-/// logic (the sweep's `Idle` stale-row `delete_pending`, the get-side
-/// post-resolution re-read) at the callsite.
+/// `names` is the segment's durable name set retained from acquisition (the
+/// union of registered descriptors and stored identity rows), so a
+/// deregistered collection's crash residue is still swept rather than
+/// stranded until its TTL (invariant 5, sweep-covers-everything). TTLs come
+/// from `registry`, which falls back to the middleware-wide default for a
+/// name no longer registered.
+///
+/// Returns `true` iff every collection ended fully resolved — the caller
+/// unschedules the backstop only then (the no-strand invariant). The status
+/// map inside the store lets a collection the eager promote already resolved
+/// skip its read; a never-touched name streams no provisional cell and
+/// resolves trivially. A per-cell Permanent failure is logged and skipped
+/// inside [`PartitionStateStore::sweep_collection`], leaving that collection
+/// unresolved (`false`) for first-touch or a later sweep; a transient/terminal
+/// failure propagates so the trigger aborts and the sweep refires.
 ///
 /// # Errors
 ///
-/// Returns [`ResolveSealedError::Oracle`] if the oracle read fails, or
-/// [`ResolveSealedError::Durable`] if `apply_sealed` / `rollback_sealed`
-/// fails.
-pub(crate) async fn resolve_sealed<D, O>(
-    durable: &D,
-    oracle: &O,
-    collection: &CollectionRef<ValueKind>,
-    event: EventRef,
-) -> Result<StoreOutcome, ResolveSealedError<<D as DurableWalStore<ValueKind>>::Error, O::Error>>
+/// Returns [`RecoveryError`] on a transient/terminal backend or oracle
+/// failure.
+pub(crate) async fn sweep_partition<S, O, C>(
+    store: &PartitionStateStore<ValueKind, S, O, C>,
+    names: &[StateName],
+    registry: &CollectionDefRegistry,
+    state_key: &StateKey,
+) -> Result<bool, RecoveryError<S::Error, O::Error>>
 where
-    D: DurableWalStore<ValueKind>,
+    S: CellStore<ValueKind>,
     O: CommitOracle,
+    C: CommittedCache<ValueKind>,
 {
-    let decision = oracle
-        .resolve(collection.id(), event)
-        .await
-        .map_err(ResolveSealedError::Oracle)?;
-    match decision {
-        CommitDecision::Committed => durable.apply_sealed(collection, event).await,
-        CommitDecision::NotCommitted => durable.rollback_sealed(collection, event).await,
+    let mut all_resolved = true;
+    for name in names {
+        let ttl = registry.ttl_for(name);
+        let id =
+            CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name.clone());
+        let collection_ref = CollectionRef::new(id, ttl);
+        if !store.sweep_collection(&collection_ref).await? {
+            all_resolved = false;
+        }
     }
-    .map_err(ResolveSealedError::Durable)
+    Ok(all_resolved)
 }
 
 /// Error raised when a [`StateManagerProvider`] cannot acquire a
@@ -488,24 +417,19 @@ where
 
 /// Errors raised by the state-recovery sweep.
 ///
-/// The sweep only ever fails while scanning the pending index, reading or
-/// mutating durable state, consulting the oracle, or clearing the recovery
-/// timer. It never runs a handler, drives a transaction, or computes a
-/// fire time, so those variants are absent.
+/// The sweep only ever fails while resolving provisional cells (the durable
+/// cell store or the commit oracle) or clearing the recovery timer. It never
+/// runs a handler, drives a transaction, or computes a fire time, so those
+/// variants are absent.
 #[derive(Debug, Error)]
-pub enum RecoveryError<DurableErr, ScannerErr, OracleErr>
+pub enum RecoveryError<StoreErr, OracleErr>
 where
-    DurableErr: Error + 'static,
-    ScannerErr: Error + 'static,
+    StoreErr: Error + 'static,
     OracleErr: Error + 'static,
 {
-    /// A durable Value store operation failed.
-    #[error("keyed-state durable store failed")]
-    Durable(#[source] DurableErr),
-
-    /// A scanner pull failed.
-    #[error("keyed-state pending scanner failed")]
-    Scanner(#[source] ScannerErr),
+    /// A durable cell store operation failed.
+    #[error("keyed-state cell store failed")]
+    Store(#[source] StoreErr),
 
     /// The commit oracle failed.
     #[error("keyed-state commit oracle failed")]
@@ -522,58 +446,30 @@ where
 /// (permanent). The boxed `Timer` error classifies through its
 /// [`EventContextError`](crate::consumer::event_context::EventContextError)
 /// supertrait.
-impl<DurableErr, ScannerErr, OracleErr> ClassifyError
-    for RecoveryError<DurableErr, ScannerErr, OracleErr>
+impl<StoreErr, OracleErr> ClassifyError for RecoveryError<StoreErr, OracleErr>
 where
-    DurableErr: ClassifyError + Error + 'static,
-    ScannerErr: ClassifyError + Error + 'static,
+    StoreErr: ClassifyError + Error + 'static,
     OracleErr: ClassifyError + Error + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Durable(e) => e.classify_error(),
-            Self::Scanner(e) => e.classify_error(),
+            Self::Store(e) => e.classify_error(),
             Self::Oracle(e) => e.classify_error(),
             Self::Timer(e) => e.classify_error(),
         }
     }
 }
 
-/// Error raised by [`resolve_sealed`].
-///
-/// Kept distinct from [`RecoveryError`] and
-/// [`RecoveringValueStoreError`](crate::state::recovering::RecoveringValueStoreError)
-/// so the shared helper carries no caller-specific variants; each callsite
-/// maps it into its own enum.
-#[derive(Debug, Error)]
-pub(crate) enum ResolveSealedError<DurableErr, OracleErr>
+impl<StoreErr, OracleErr> From<PartitionStoreError<StoreErr, OracleErr>>
+    for RecoveryError<StoreErr, OracleErr>
 where
-    DurableErr: Error + 'static,
-    OracleErr: Error + 'static,
+    StoreErr: ClassifyError + Error + Send + Sync + 'static,
+    OracleErr: ClassifyError + Error + Send + Sync + 'static,
 {
-    /// The durable apply / rollback failed.
-    #[error("keyed-state durable store failed")]
-    Durable(#[source] DurableErr),
-
-    /// The commit oracle failed.
-    #[error("keyed-state commit oracle failed")]
-    Oracle(#[source] OracleErr),
-}
-
-/// Delegates to the inner error, so the sweep can skip a permanently
-/// poisoned entry without starving its siblings.
-impl<DurableErr, OracleErr> ClassifyError for ResolveSealedError<DurableErr, OracleErr>
-where
-    DurableErr: ClassifyError + Error + 'static,
-    OracleErr: ClassifyError + Error + 'static,
-{
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Durable(e) => e.classify_error(),
-            Self::Oracle(e) => e.classify_error(),
+    fn from(error: PartitionStoreError<StoreErr, OracleErr>) -> Self {
+        match error {
+            PartitionStoreError::Store(e) => Self::Store(e),
+            PartitionStoreError::Oracle(e) => Self::Oracle(e),
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

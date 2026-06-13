@@ -1,12 +1,11 @@
 //! Descriptor binding, registration, and typed round-trip tests.
 //!
 //! N2 — the typed `set(T) → cell bytes → store → get() → T` round-trip over
-//! the real [`TransactionValueStore`](crate::state::value::TransactionValueStore)
-//! machinery, run against both the memory and fjall dirty backends. N4 —
-//! the two-instance interface proof: the JSON and Kafka descriptors bind
-//! through the *same* session machinery ([`bind_registered`]). N5 —
-//! registration and bind error surfaces, including the state-unavailable
-//! stub on contexts without keyed state.
+//! the real per-event session machinery, run against both the memory and
+//! fjall dirty backends. N4 — the two-instance interface proof: the JSON and
+//! Kafka descriptors bind through the *same* session machinery
+//! ([`bind_registered`]). N5 — registration and bind error surfaces,
+//! including the state-unavailable stub on contexts without keyed state.
 
 use super::*;
 use crate::codec::JsonCodecError;
@@ -16,12 +15,17 @@ use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::fjall::FjallDirtyValueStore;
-use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStore};
+use crate::state::oracle::CommitOracle;
+use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
-use crate::state::session::{DirtyValueBundle, SessionParts, TerminationWatch, ValueStateSession};
-use crate::state::tests::value_suite::{FixedOracle, finish_trace};
+use crate::state::session::{
+    ArmedKeys, DirtyValueBundle, SessionParts, TerminationWatch, ValueStateSession,
+};
 use crate::state::value::{PendingOpSource, ValueKind};
-use crate::state::{CommitMode, DirtyStoreProvider, EventRef, EventScopeId, StateKey, StateName};
+use crate::state::{
+    CommitDecision, CommitMode, DirtyStoreProvider, EventRef, EventScopeId, StateKey, StateName,
+};
 use crate::test_util::{ArbJson, TEST_RUNTIME};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
@@ -31,10 +35,48 @@ use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::watch;
 use uuid::Uuid;
+
+/// Oracle returning a fixed decision; the session's marker flush and the
+/// store's resolution both route through it.
+#[derive(Clone)]
+pub(crate) struct FixedOracle(CommitDecision);
+
+impl FixedOracle {
+    fn committed() -> Self {
+        Self(CommitDecision::Committed)
+    }
+}
+
+impl CommitOracle for FixedOracle {
+    type Error = Infallible;
+
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn resolve<'a>(
+        &'a self,
+        _state_key: &'a StateKey,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        Ok(self.0)
+    }
+}
+
+/// Converts a property body's `Result<bool>` into a `TestResult`, surfacing
+/// the offending input on failure.
+fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult {
+    match result {
+        Ok(true) => TestResult::passed(),
+        Ok(false) => TestResult::error(format!("{message}: {input}")),
+        Err(error) => TestResult::error(format!("{message}: {input}: {error:#}")),
+    }
+}
 
 /// Test-only dirty provider handing out clones of one pre-built store, so
 /// the round-trip properties can inject either dirty backend.
@@ -53,8 +95,9 @@ where
 }
 
 pub(crate) type TestSession<S> = ValueStateSession<
-    MemoryDurableValueStore,
+    MemoryCellStore,
     FixedOracle,
+    MemoryCommittedCache,
     FixedDirtyProvider<S>,
     MemoryLoader<Value>,
 >;
@@ -89,21 +132,69 @@ pub(crate) fn test_session<S>(
 where
     S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
 {
+    test_session_parts(
+        dirty,
+        loader,
+        registry,
+        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+    )
+    .0
+}
+
+/// Like [`test_session`] but pins the session's [`StateKey`] and also returns
+/// the underlying [`MemoryCellStore`] (a clone sharing the durable `Arc`), so a
+/// caller can inspect the durable cell directly after driving the session
+/// through its lifecycle.
+pub(crate) fn test_session_parts<S>(
+    dirty: S,
+    loader: MemoryLoader<Value>,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+) -> (TestSession<S>, MemoryCellStore)
+where
+    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
+{
+    test_session_with_armed(dirty, loader, registry, state_key, Arc::default())
+}
+
+/// Like [`test_session_parts`] but shares an explicit `armed` set across
+/// sessions, so a test can drive several events on the same key through one
+/// per-partition backstop-amortization state.
+pub(crate) fn test_session_with_armed<S>(
+    dirty: S,
+    loader: MemoryLoader<Value>,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    armed: ArmedKeys,
+) -> (TestSession<S>, MemoryCellStore)
+where
+    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
+{
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    ValueStateSession::new(SessionParts {
-        durable: MemoryDurableValueStore::for_tests(),
+    let registry = Arc::new(registry);
+    let cell_store = MemoryCellStore::new();
+    let store = PartitionStateStore::new(
+        cell_store.clone(),
+        FixedOracle::committed(),
+        MemoryCommittedCache::new(),
+        registry.clone(),
+    );
+    let session = ValueStateSession::new(SessionParts {
+        store,
         oracle: FixedOracle::committed(),
         dirty: FixedDirtyProvider(dirty),
         loader,
-        registry: Arc::new(registry),
-        state_key: StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+        registry,
+        state_key,
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
         recovery_delay: CompactDuration::new(30),
+        armed,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    })
+    });
+    (session, cell_store)
 }
 
 fn fjall_dirty() -> Result<(TempDir, FjallDirtyValueStore)> {
@@ -124,7 +215,7 @@ fn cart() -> ValueDescriptor {
 /// N2 invariant: for every JSON-representable value, `set(v)` then `get()`
 /// returns `Some(v)` — the value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
-/// the real transaction substrate.
+/// the real session substrate.
 async fn roundtrip<S>(dirty: S, value: Value) -> Result<bool>
 where
     S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
@@ -316,12 +407,12 @@ fn reregistration_updates_operational_settings() -> Result<()> {
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(Some(initial_ttl)))?;
     assert_eq!(registry.ttl_for(&name), Some(initial_ttl));
-    assert_eq!(registry.commit_mode_for(&name), CommitMode::Wal);
+    assert_eq!(registry.commit_mode_for(&name), CommitMode::ReadCommitted);
 
     // Same name, same identity, different operational settings.
     registry.register(
         &cart(),
-        CollectionDef::new(Some(updated_ttl)).with_commit_mode(CommitMode::Direct),
+        CollectionDef::new(Some(updated_ttl)).with_commit_mode(CommitMode::ReadUncommitted),
     )?;
     assert_eq!(
         registry.ttl_for(&name),
@@ -330,7 +421,7 @@ fn reregistration_updates_operational_settings() -> Result<()> {
     );
     assert_eq!(
         registry.commit_mode_for(&name),
-        CommitMode::Direct,
+        CommitMode::ReadUncommitted,
         "the re-registration's commit mode must win"
     );
     Ok(())

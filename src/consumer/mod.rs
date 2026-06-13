@@ -170,11 +170,11 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader};
 pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
-use crate::state::cassandra::CassandraValueStore;
+use crate::state::cassandra::CassandraCellStore;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
-use crate::state::memory::MemoryDurableValueStore;
+use crate::state::memory::MemoryCellStore;
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::state::session::StateSession;
@@ -229,6 +229,9 @@ pub(crate) mod partition;
 mod poll;
 mod probes;
 pub mod storage;
+
+#[cfg(test)]
+mod tests;
 
 /// Atomic counter for tracking changes in partition watermarks.
 ///
@@ -893,6 +896,43 @@ impl PipelineMiddlewareStack {
     }
 }
 
+/// Multiplier on `recovery_delay` for the minimum deduplication TTL
+/// (invariant 10): the dedup marker is the commit oracle, so it must outlive
+/// the recovery window by a wide margin to survive rebalances and retries.
+const RECOVERY_TTL_DELAY_MULTIPLIER: u64 = 48;
+
+/// Absolute floor for the deduplication TTL when state is registered, in
+/// seconds (1 hour) — the larger of this and `48 × recovery_delay` applies.
+const MIN_RECOVERY_EVIDENCE_TTL_SECONDS: u64 = 3_600;
+
+/// Validates that the deduplication TTL clears the keyed-state recovery
+/// window (invariant 10, resolution-before-evidence-expiry): `dedup.ttl ≥
+/// max(48 × recovery_delay, 1h)`. The dedup marker is the commit oracle a
+/// provisional cell is resolved against, so if the marker expires first the
+/// cell can no longer be resolved correctly and a committed write is lost.
+///
+/// # Errors
+///
+/// Returns [`RecoveryTtlMarginError`] when the dedup TTL is below the margin.
+fn validate_recovery_ttl_margin(
+    dedup_ttl: Duration,
+    recovery_delay: CompactDuration,
+) -> Result<(), RecoveryTtlMarginError> {
+    let recovery_delay_seconds = u64::from(recovery_delay.seconds());
+    let required_seconds = recovery_delay_seconds
+        .saturating_mul(RECOVERY_TTL_DELAY_MULTIPLIER)
+        .max(MIN_RECOVERY_EVIDENCE_TTL_SECONDS);
+    let dedup_ttl_seconds = dedup_ttl.as_secs();
+    if dedup_ttl_seconds < required_seconds {
+        return Err(RecoveryTtlMarginError {
+            dedup_ttl: dedup_ttl_seconds,
+            recovery_delay: recovery_delay_seconds,
+            required: required_seconds,
+        });
+    }
+    Ok(())
+}
+
 /// Builds the storage core shared by every constructor: the deduplication
 /// store pair, keyed-state inputs, and heartbeat registry.
 ///
@@ -910,6 +950,15 @@ async fn build_shared_state(
     consumer_config.validate()?;
     keyed_state_config.validate()?;
     let dedup_config = common_config.dedup.clone();
+    // The commit oracle is the dedup marker; a provisional cell must resolve
+    // while its marker still lives, so the dedup TTL must clear the recovery
+    // window with margin (invariant 10). Only gate this when state is actually
+    // registered — an inert state layer arms no backstop, so a short dedup TTL
+    // on a stateless consumer is harmless.
+    if keyed_state_config.has_registrations() {
+        validate_recovery_ttl_margin(dedup_config.ttl, keyed_state_config.recovery_delay)
+            .map_err(KeyedStateInitError::from)?;
+    }
     let heartbeats = HeartbeatRegistry::new(
         consumer_config.group_id.clone(),
         consumer_config.stall_threshold,
@@ -1058,12 +1107,11 @@ where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
     let backend = MemoryStateBackendFactory::new(
-        MemoryDurableValueStore::new(keyed_state.config.default_ttl),
+        MemoryCellStore::new(),
         dedup_provider,
         trigger_provider.clone(),
         keyed_state.group.clone(),
         keyed_state.timer_slab_size,
-        keyed_state.registry.clone(),
     );
     keyed_state.provider(backend, MemoryLoader::<C::Payload>::new())
 }
@@ -1079,7 +1127,7 @@ fn cassandra_state_provider<C: Codec>(
     heartbeats: &HeartbeatRegistry,
     dedup_provider: CassandraDeduplicationStoreProvider,
     trigger_provider: &CassandraTriggerStoreProvider,
-    value_store: CassandraValueStore,
+    cell_store: CassandraCellStore,
 ) -> Result<
     impl PartitionStateProvider<
         Manager: PartitionStateManager<
@@ -1102,12 +1150,11 @@ where
     .map_err(KeyedStateInitError::from)?;
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
-        value_store,
+        cell_store,
         dedup_provider,
         trigger_provider.clone(),
         keyed_state.group.clone(),
         keyed_state.timer_slab_size,
-        keyed_state.registry.clone(),
     );
     Ok(keyed_state.provider(backend, loader))
 }
@@ -1326,14 +1373,12 @@ where
                 // touch Kafka — pair it with an in-memory loader, shared by
                 // message defer and the keyed-state Kafka-message handles.
                 let loader = MemoryLoader::<C::Payload>::new();
-                let durable = MemoryDurableValueStore::new(keyed_state.config.default_ttl);
                 let backend = MemoryStateBackendFactory::new(
-                    durable.clone(),
+                    MemoryCellStore::new(),
                     dedup_provider.clone(),
                     trigger_provider.clone(),
                     keyed_state.group.clone(),
                     keyed_state.timer_slab_size,
-                    keyed_state.registry.clone(),
                 );
                 let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
@@ -1358,7 +1403,7 @@ where
                 message_provider,
                 timer_provider,
                 dedup_provider,
-                value_store,
+                cell_store,
             } => {
                 // One Kafka loader per consumer: built once here and shared by
                 // cloning. A clone shares the channel, semaphore, cache, and the
@@ -1378,12 +1423,11 @@ where
                 .map_err(KeyedStateInitError::from)?;
                 let backend = CassandraStateBackendFactory::new(
                     fjall_client,
-                    value_store.clone(),
+                    cell_store,
                     dedup_provider.clone(),
                     trigger_provider.clone(),
                     keyed_state.group.clone(),
                     keyed_state.timer_slab_size,
-                    keyed_state.registry.clone(),
                 );
                 let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
@@ -1483,7 +1527,7 @@ where
             StorePair::Cassandra {
                 trigger_provider,
                 dedup_provider,
-                value_store,
+                cell_store,
                 ..
             } => {
                 let state_provider = cassandra_state_provider::<C>(
@@ -1492,7 +1536,7 @@ where
                     &heartbeats,
                     dedup_provider.clone(),
                     &trigger_provider,
-                    value_store,
+                    cell_store,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1575,7 +1619,7 @@ where
             StorePair::Cassandra {
                 trigger_provider,
                 dedup_provider,
-                value_store,
+                cell_store,
                 ..
             } => {
                 let state_provider = cassandra_state_provider::<C>(
@@ -1584,7 +1628,7 @@ where
                     &heartbeats,
                     dedup_provider.clone(),
                     &trigger_provider,
-                    value_store,
+                    cell_store,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1937,6 +1981,11 @@ pub enum KeyedStateInitError {
     #[error(transparent)]
     Register(#[from] RegisterStateError),
 
+    /// The deduplication TTL is too short to outlive the keyed-state
+    /// recovery window.
+    #[error(transparent)]
+    RecoveryTtlMargin(#[from] RecoveryTtlMarginError),
+
     /// The local fjall cache could not be opened.
     #[error("failed to open the keyed-state cache: {0:#}")]
     Cache(#[from] FjallClientError),
@@ -1950,6 +1999,30 @@ pub enum KeyedStateInitError {
          runs no state middleware"
     )]
     StateUnsupported,
+}
+
+/// The deduplication TTL is below the keyed-state recovery margin
+/// (invariant 10): a provisional cell could outlive its commit-oracle marker
+/// and be lost under crash recovery. Returned at consumer build when state
+/// collections are registered. Raise `PROSODY_IDEMPOTENCE_TTL` or lower
+/// `recovery_delay` so `dedup.ttl ≥ max(48 × recovery_delay, 1h)` holds.
+///
+/// All fields are in seconds.
+#[derive(Debug, Error)]
+#[error(
+    "deduplication TTL {dedup_ttl} seconds is below the keyed-state recovery margin of {required} \
+     seconds (the larger of 48 × recovery_delay {recovery_delay}s and 3600s); a provisional cell \
+     could outlive its commit-oracle marker and be lost"
+)]
+pub struct RecoveryTtlMarginError {
+    /// The configured deduplication TTL.
+    dedup_ttl: u64,
+
+    /// The configured keyed-state recovery delay.
+    recovery_delay: u64,
+
+    /// The minimum deduplication TTL the configuration must meet.
+    required: u64,
 }
 
 impl From<CassandraTriggerStoreError> for ConsumerError {

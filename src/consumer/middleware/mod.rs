@@ -770,22 +770,24 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// runs the keyed-state durability sequence in straight-line code:
 ///
 /// ```text
-/// final Ok  → seal WAL / direct-apply   (retry transient failures in place)
+/// final Ok  → stage provisional cells / write resolved (retry transient failures in place)
 ///           → arm StateRecovery backstop (clear_and_schedule; per-key singleton)
-///           → flush registered dedup marker   (STRICTLY after the seal)
+///           → flush registered dedup marker   (STRICTLY after the stage)
 ///           → commit the offset / trigger marker
-///           → resolve the sealed set (the backstop stays armed; the sweep
+///           → promote the staged cells (the backstop stays armed; the sweep
 ///             self-clears once the key goes quiet)
 ///           → after_commit(Ok)
 /// final Err Transient/Permanent → flush registered marker → commit → after_commit(Err)
 /// final Err Terminal            → abort → roll back → after_abort
 /// ```
 ///
-/// Because the marker flush is textually *after* the seal in one function,
-/// the finding-1 bug class — marker written before the WAL is durable — is
-/// **unwritable**, not merely avoided. The timer marker (trigger tag) was
-/// already written outside the stack by the marker commit; moving the
-/// message marker here restores message/timer symmetry.
+/// Because the marker flush is textually *after* the stage in one function,
+/// the finding-1 bug class — marker written before the staged cell is durable
+/// — is **unwritable**, not merely avoided. Promotion runs strictly *after*
+/// the commit (invariant 3): promoting a timer write before its trigger commit
+/// would resurrect it on a crash-refire. The timer marker (trigger tag) is
+/// written outside the stack by the marker commit; the message marker here
+/// restores message/timer symmetry.
 ///
 /// [`RetryHandler`](retry::RetryHandler) is a second durability boundary
 /// (it owns its own `EventHandler` impl so it can map shutdown to abort
@@ -934,8 +936,16 @@ pub(crate) async fn settle<T, C, G>(
 
     match result.as_ref().err().map(ClassifyError::classify_error) {
         // Terminal: the marker aborts; the event redelivers and re-runs.
+        // Nothing staged (finalize runs only on Ok), so rollback is a no-op.
         Some(ErrorCategory::Terminal) => {
-            abandon(handler, context, guard, result).await;
+            abandon(
+                handler,
+                context,
+                guard,
+                result,
+                RollbackSafety::BeforeMarkerFlush,
+            )
+            .await;
         }
         // Final error (Transient/Permanent): nothing sealed (finalize runs
         // only on Ok). On a Permanent error the dedup middleware registered
@@ -979,41 +989,73 @@ async fn settle_committed<T, C, G>(
         return;
     };
 
-    // 1. Seal WAL collections / direct-apply, retrying transient failures.
-    let sealed = match retry_step(&context, "keyed-state finalize", || lifecycle.finalize()).await {
-        StepOutcome::Done(FinalizeOutcome::Sealed) => true,
+    // 1. Stage provisional cells / write resolved, retrying transient
+    // failures.
+    let staged = match retry_step(&context, "keyed-state finalize", || lifecycle.finalize()).await {
+        StepOutcome::Done(FinalizeOutcome::Staged) => true,
         StepOutcome::Done(FinalizeOutcome::Clean) => false,
         StepOutcome::Skip => {
-            // Permanent seal failure: a partial seal may be durable. Arm the
-            // backstop defensively so the sweep rolls it back, skip the marker
-            // flush (invariant: marker present ⇒ seal durable), and commit.
+            // Permanent stage failure: a partial stage may be durable. Arm the
+            // backstop defensively so the sweep resolves it, skip the marker
+            // flush (invariant: marker present ⇒ stage durable), and commit.
             // A shutdown `Abandon` from the arm is deliberately ignored:
-            // committing a permanently-unsealable event beats livelocking,
-            // and first-touch covers the unarmed seal.
+            // committing a permanently-unstageable event beats livelocking,
+            // and first-touch covers the unarmed cell. No marker was flushed
+            // before this commit, so rollback-safety does not arise.
             let _ = arm_backstop(&context, &lifecycle).await;
             guard.commit().await;
             handler.after_commit(context, result).await;
             return;
         }
         StepOutcome::Abandon => {
-            abandon(handler, context, guard, result).await;
+            // Before the marker flush: the recorded staged set (if any) rolls
+            // back to its committed base.
+            abandon(
+                handler,
+                context,
+                guard,
+                result,
+                RollbackSafety::BeforeMarkerFlush,
+            )
+            .await;
             return;
         }
     };
 
-    // 2. Arm the StateRecovery backstop iff something sealed. The backstop is
-    // a debounced per-key singleton (`clear_and_schedule`); the boundary never
-    // clears it, so this event cannot disturb another's backstop (F2). A
-    // permanent arm failure (`Skip`) is benign — first-touch on the next
-    // access to the collection still recovers the seal — so only `Abandon`
-    // (shutdown / terminal) diverts the sequence.
-    if sealed && let StepOutcome::Abandon = arm_backstop(&context, &lifecycle).await {
-        abandon(handler, context, guard, result).await;
-        return;
+    // 2. Arm the StateRecovery backstop iff something staged. The backstop is
+    // an amortized per-key singleton: the first commit of a generation arms it,
+    // later commits skip while it stands, and the boundary never clears it
+    // (the sweep does, on fire), so this event cannot disturb another's
+    // backstop (F2).
+    //
+    // Arm-gates-marker (invariant 8): a backstop is the only guarantee that a
+    // staged provisional cell resolves before its TTL, so if arming does not
+    // succeed we must NOT certify the stage. Both a permanent failure (`Skip`)
+    // and a shutdown (`Abandon`) therefore skip the marker flush and abandon
+    // *before* it — the staged set rolls back to its committed base (no
+    // lingering provisional, nothing to TTL out) and the offset aborts so the
+    // event redelivers and re-runs. A *persistent* permanent arm failure
+    // redelivers until the timer store recovers; that is preferred over
+    // committing a marker-certified write that could later TTL out unresolved.
+    if staged {
+        match arm_backstop(&context, &lifecycle).await {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Skip | StepOutcome::Abandon => {
+                abandon(
+                    handler,
+                    context,
+                    guard,
+                    result,
+                    RollbackSafety::BeforeMarkerFlush,
+                )
+                .await;
+                return;
+            }
+        }
     }
 
-    // 3. Flush the registered dedup marker — STRICTLY after the seal, so a
-    // present marker always certifies a durable seal.
+    // 3. Flush the registered dedup marker — STRICTLY after the stage, so a
+    // present marker always certifies a durable stage.
     match retry_step(&context, "keyed-state marker flush", || {
         lifecycle.flush_marker()
     })
@@ -1021,14 +1063,26 @@ async fn settle_committed<T, C, G>(
     {
         StepOutcome::Done(()) => {}
         StepOutcome::Skip => {
-            // Permanent flush failure: the committed seal won't be certified,
+            // Permanent flush failure: the committed stage won't be certified,
             // so recovery rolls it back. Leave the backstop armed and commit.
             guard.commit().await;
             handler.after_commit(context, result).await;
             return;
         }
         StepOutcome::Abandon => {
-            abandon(handler, context, guard, result).await;
+            // A marker-flush attempt was made before shutdown: its durability
+            // is ambiguous, so the staged cells must NOT roll back. They stay
+            // provisional and the armed sweep resolves them through the oracle
+            // (invariant 7). Rolling back here could erase a committed write
+            // that redelivery then dedup-filters.
+            abandon(
+                handler,
+                context,
+                guard,
+                result,
+                RollbackSafety::AfterMarkerFlush,
+            )
+            .await;
             return;
         }
     }
@@ -1036,69 +1090,108 @@ async fn settle_committed<T, C, G>(
     // 4. Commit the durability marker (offset / trigger).
     guard.commit().await;
 
-    // 5. Resolve the recorded sealed set (apply each sealed WAL to
-    // authoritative state and clear it). The backstop stays armed regardless:
-    // a `Resolved` key's sweep finds nothing pending and clears itself when
-    // the key goes quiet, while an `Incomplete` resolution leaves real work
-    // for that same sweep to retry. No point-clear means no cross-event race.
+    // 5. Promote the staged cells (null `event`/`prev`, O(1) per cell). This
+    // is invariant-3 correct only here, strictly after the commit: promoting a
+    // timer write before its trigger commit would resurrect it on a
+    // crash-refire. The backstop stays armed regardless: a `Resolved` key's
+    // sweep finds nothing provisional and clears itself when the key goes
+    // quiet, while an `Incomplete` promote leaves real work for that same
+    // sweep to retry. No point-clear means no cross-event race.
     if lifecycle.commit_apply().await == ApplyOutcome::Incomplete {
-        warn!("keyed-state apply incomplete; the StateRecovery sweep will retry");
+        warn!("keyed-state promote incomplete; the StateRecovery sweep will retry");
     }
 
     // 6. After-commit hook (telemetry, dedup forwarding, ...).
     handler.after_commit(context, result).await;
 }
 
+/// Whether inline abandon may roll a staged set back to its committed base.
+///
+/// The marker flush is the boundary (invariant 7): before any flush attempt a
+/// rollback is sound; after one it is not, because the flush's durability is
+/// ambiguous on a write-timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RollbackSafety {
+    /// No marker flush has been attempted; rolling the staged set back to its
+    /// committed base is safe.
+    BeforeMarkerFlush,
+
+    /// A marker flush has been attempted (durability ambiguous); leave staged
+    /// cells provisional for the sweep to resolve through the oracle.
+    AfterMarkerFlush,
+}
+
 /// Abandons the event: abort the marker (offset → redelivery, timer →
-/// reloadable), roll back any seal recorded before this point, and fire
+/// reloadable), conditionally roll back any staged set, and fire
 /// `after_abort`. Reached on a terminal error or a shutdown mid-sequence.
+///
+/// `safety` gates the rollback (invariant 7, rollback-only-before-flush):
+/// inline rollback to the committed base is sound only
+/// [`RollbackSafety::BeforeMarkerFlush`]. Once a marker flush has been
+/// *attempted* ([`RollbackSafety::AfterMarkerFlush`]) a write-timeout is
+/// ambiguous — the marker may be durable — so rolling back could erase a
+/// committed write that redelivery then dedup-filters away. In that window the
+/// staged cells stay provisional and the (already-armed) `StateRecovery` sweep
+/// resolves them through the oracle, which reads whether the marker landed.
 pub(crate) async fn abandon<T, C, G>(
     handler: &T,
     context: C,
     guard: G,
     result: Result<T::Output, T::Error>,
+    safety: RollbackSafety,
 ) where
     T: FallibleHandler,
     C: EventContext<Payload = T::Payload>,
     G: Uncommitted + Send,
 {
     guard.abort().await;
-    if let Ok(lifecycle) = context.state(LifecycleAccess) {
+    if let (RollbackSafety::BeforeMarkerFlush, Ok(lifecycle)) =
+        (safety, context.state(LifecycleAccess))
+    {
         // Best-effort: first-touch / the sweep recover anything left behind.
-        // Resolves the shared session's recorded sealed set (empty unless a
-        // seal was recorded before the abandon point), so a fresh view is
+        // Resolves the shared session's recorded staged set (empty unless a
+        // stage was recorded before the abandon point), so a fresh view is
         // equivalent to one threaded down.
         lifecycle.rollback_aborted().await;
     }
     handler.after_abort(context, result).await;
 }
 
-/// Arms the per-key `StateRecovery` backstop as a debounced singleton.
+/// Arms the per-key `StateRecovery` backstop as an amortized singleton.
 ///
-/// `clear_and_schedule` overwrites any prior `StateRecovery` timer for the
-/// key with one at `fire`, atomically and tombstone-free
-/// (`TimerManager::clear_and_schedule_trigger`). It is type-scoped — only the
-/// key's `StateRecovery` timers are replaced; user timers of other types are
-/// untouched. The result is a single backstop per key whose fire time is the
-/// key's *last* stateful commit plus `delay`: rapid commits debounce it
-/// outward rather than racing to clear each other.
+/// The first stateful commit on a quiet key issues one `clear_and_schedule`
+/// (a type-scoped singleton overwrite — only the key's `StateRecovery` timers
+/// move; user timers of other types are untouched) and marks the key armed.
+/// While that backstop stands, later commits skip re-arming entirely: the
+/// standing timer at first-commit-plus-`delay` already covers their staged
+/// cells. So a burst of commits on one key issues a *single* timer-store write
+/// rather than one per commit — the amortization the redesign's
+/// tombstone-accounting depends on.
 ///
-/// The only remover is the sweep's `clear_scheduled`/`unschedule_all`; the
-/// durability boundary never unschedules, which is why one event can no
-/// longer clear another's still-needed backstop (finding F2).
+/// The armed flag is cleared only when the sweep fires (the manager's
+/// `recover`), so the durability boundary never unschedules and one event can
+/// never clear another's still-needed backstop (finding F2). Per-key
+/// serialization makes the flag race-free: the sweep that consumes a backstop
+/// cannot run while a commit on the same key decides whether to re-arm.
 ///
-/// Cost and healing: a hot key issues *fewer* timer-store ops than the old
-/// point-clear design (one `clear_and_schedule` per stateful commit versus a
-/// schedule + unschedule pair), and the sweep only fires once the key goes
-/// quiet. Any read of a pending collection heals it immediately via
-/// first-touch (`RecoveringValueStore::get`). Accepted residual: an
+/// Cost and healing: at most one `clear_and_schedule` per backstop generation,
+/// and the sweep fires `delay` after the first commit of a generation (on a
+/// sustained hot key, periodically; the status map keeps each such sweep
+/// cheap). Any read of a provisional collection heals it immediately via
+/// first-touch (`PartitionStateStore::committed`). Accepted residual: an
 /// `Incomplete` leftover on a hot key whose collection is never read again
-/// waits for quiescence before the sweep resolves it — bounded by
-/// first-touch on any access and by the WAL row's TTL.
+/// waits for the next sweep to resolve it — bounded by first-touch on any
+/// access and by the cell's TTL.
 async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> StepOutcome<()>
 where
     C: EventContext,
 {
+    // Amortize: a standing backstop already covers this commit's staged cells,
+    // so skip re-arming. Per-key serialization makes the standing flag reliable
+    // — the sweep that consumes it cannot run while this commit decides.
+    if lifecycle.backstop_armed().await {
+        return StepOutcome::Done(());
+    }
     let delay = lifecycle.recovery_fire_delay();
     let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
         Ok(fire) => fire,
@@ -1107,10 +1200,16 @@ where
             return StepOutcome::Skip;
         }
     };
-    retry_step(context, "arm StateRecovery backstop", || {
+    let outcome = retry_step(context, "arm StateRecovery backstop", || {
         context.clear_and_schedule(fire, TimerType::StateRecovery)
     })
-    .await
+    .await;
+    // Record the standing backstop only after a successful arm, so a failed
+    // arm leaves the flag clear and the next commit retries.
+    if matches!(outcome, StepOutcome::Done(())) {
+        lifecycle.mark_backstop_armed().await;
+    }
+    outcome
 }
 
 /// Flushes the registered marker, retrying transient failures; a permanent

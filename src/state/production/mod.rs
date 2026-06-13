@@ -1,49 +1,27 @@
 //! Production composition helpers for the keyed-state stack.
 //!
-//! This module provides small wiring utilities that the typical
-//! production composition needs. It stays a thin layer over the concrete
-//! types in [`crate::state::cassandra`], [`crate::state::fjall`],
-//! [`crate::state::layered`], and [`crate::state::recovering`].
+//! This module provides the per-partition [`StateBackendFactory`]
+//! implementations the typical production composition needs:
 //!
-//! It provides five items:
-//!
-//! * [`ProductionValueDurable`] names the canonical durable-bundle shape,
-//!   `Layered<FjallValueStore, Recovering<CassandraValueStore, O>>`. The
-//!   `Recovering` layer is baked into the alias, so the production bundle
-//!   cannot even be *named* without it.
-//! * [`compose_value_durable`] is the only sanctioned way to build that bundle.
-//!   The `Recovering` layer is load-bearing for crash safety — omitting it
-//!   reopens the lost-commit data-loss window — so funneling construction
-//!   through one composer keeps the layer from being silently dropped.
+//! * [`CassandraStateBackendFactory`] mints, per partition, the
+//!   [`CassandraCellStore`] (shared), a per-partition fjall committed-value
+//!   cache and dirty workspace, and the segment-scoped commit oracle.
+//! * [`MemoryStateBackendFactory`] mints the in-memory equivalents over a
+//!   process-wide shared [`MemoryCellStore`].
 //! * [`ProductionOracle`] names the commit oracle ([`CommitManager`]) that
-//!   answers "did this event commit?" while recovery replays sealed WALs.
-//! * [`CassandraStateBackendFactory`] and [`MemoryStateBackendFactory`] are the
-//!   per-partition [`StateBackendFactory`] implementations for the Cassandra
-//!   and in-memory backends; each mints the oracle and assembles the durable
-//!   bundle for one partition.
+//!   answers "did this event commit?" while the recovery sweep resolves
+//!   provisional cells.
 //!
-//! See the [design summary][summary] for the full canonical composition:
-//! `Layered<FjallValueStore, Recovering<CassandraValueStore,
-//! CommitManager>>` as the Value durable bundle,
-//! `CassandraValueStore` as the [`PendingIndexScanner`],
-//! `CommitManager` as the [`CommitOracle`], and
-//! `FjallDirtyValueStoreProvider` as the dirty-store factory.
-//!
-//! [summary]: ../../docs/keyed-state/design-summary.md
-//! [`PendingIndexScanner`]: super::pending::PendingIndexScanner
 //! [`CommitOracle`]: super::oracle::CommitOracle
 
 use crate::ConsumerGroup;
 use crate::commit_manager::{CommitManager, StoreTagSource};
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
-use crate::state::cassandra::CassandraValueStore;
+use crate::state::cassandra::CassandraCellStore;
 use crate::state::fjall::{
     AssignmentEpoch, FjallClient, FjallDirtyValueStoreProvider, FjallFactoryError, FjallValueStore,
 };
-use crate::state::layered::LayeredValueStore;
-use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
-use crate::state::recovering::RecoveringValueStore;
-use crate::state::registry::CollectionDefRegistry;
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStoreProvider};
 use crate::state::{BackendOf, StateBackend, StateBackendFactory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStoreProvider};
@@ -51,51 +29,14 @@ use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::sync::Arc;
 
-/// The canonical production Value durable bundle:
-/// `Layered<FjallValueStore, Recovering<CassandraValueStore, O>>`, with the
-/// shared [`Arc<CollectionDefRegistry>`] as the recovery-write TTL resolver.
-///
-/// `O` is the [`CommitOracle`](crate::state::oracle::CommitOracle) — in
-/// production [`CommitManager`].
-pub type ProductionValueDurable<O> = LayeredValueStore<
-    FjallValueStore,
-    RecoveringValueStore<CassandraValueStore, O, Arc<CollectionDefRegistry>>,
->;
-
-/// Composes the canonical production Value durable bundle.
-///
-/// Wraps the authoritative [`CassandraValueStore`] in
-/// [`RecoveringValueStore`] — so both the read-before-use (`get`) and
-/// recover-before-overwrite (`seal`) recovery paths are always present — and
-/// fronts it with the [`FjallValueStore`] cache. This is the one sanctioned
-/// constructor for the bundle, and its return type — [`ProductionValueDurable`]
-/// — bakes `Recovering` into the type, so the production bundle cannot be named
-/// without it. Routing every wiring through here keeps the `Recovering` layer
-/// from being silently dropped, which would reopen the lost-commit data-loss
-/// window.
-///
-/// `registry` must be the **same** [`Arc<CollectionDefRegistry>`] the
-/// state manager's provider holds, so first-touch recovery (driven by the
-/// wrapper's resolver) and the timer-sweep recovery (driven by the
-/// manager's registry) bind identical per-collection TTLs.
-#[must_use]
-pub fn compose_value_durable<O>(
-    cache: FjallValueStore,
-    backing: CassandraValueStore,
-    oracle: O,
-    registry: Arc<CollectionDefRegistry>,
-) -> ProductionValueDurable<O> {
-    LayeredValueStore::new(cache, RecoveringValueStore::new(backing, oracle, registry))
-}
-
 /// The oracle both production backend factories mint: a [`CommitManager`]
 /// whose timer half reads tags straight from the partition's segment-scoped
 /// trigger store.
 ///
 /// The store-backed tag source is sound here because the oracle is only
-/// consulted for *sealed* WALs during recovery, and per-key serialization
-/// guarantees the sealing event fully completed — durability markers
-/// included — before any later event on the key dispatches.
+/// consulted for *provisional* cells during recovery, and per-key
+/// serialization guarantees the staging event fully completed — durability
+/// markers included — before any later event on the key dispatches.
 pub type ProductionOracle<DP, TP> = CommitManager<
     <DP as DeduplicationStoreProvider>::Store,
     StoreTagSource<<TP as TriggerStoreProvider>::Store>,
@@ -104,46 +45,44 @@ pub type ProductionOracle<DP, TP> = CommitManager<
 /// [`StateBackendFactory`] for the Cassandra storage backend.
 ///
 /// Per partition it opens one fjall workspace (committed cache + dirty
-/// overlay), mints the segment-scoped commit oracle, and composes the
-/// canonical durable bundle via [`compose_value_durable`] — so first-touch
-/// recovery and the middleware sweep share one oracle, and the cache and
-/// dirty workspaces share one fjall instance.
+/// overlay), mints the segment-scoped commit oracle, and hands out a clone of
+/// the shared [`CassandraCellStore`] — so the sessions stage and the recovery
+/// sweep resolve through one oracle, and the cache and dirty workspaces share
+/// one fjall instance.
 #[derive(Clone)]
 pub struct CassandraStateBackendFactory<DP, TP> {
     client: Arc<FjallClient>,
-    backing: CassandraValueStore,
+    cell: CassandraCellStore,
     dedup: DP,
     triggers: TP,
     consumer_group: ConsumerGroup,
     timer_slab_size: CompactDuration,
-    registry: Arc<CollectionDefRegistry>,
 }
 
 impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
     /// Creates the factory.
     ///
     /// Deduplication is mandatory — it is the commit oracle for message-event
-    /// recovery. `registry` must be the same [`Arc<CollectionDefRegistry>`]
-    /// handed to the keyed-state middleware so every recovery path binds
-    /// identical per-collection TTLs.
+    /// recovery. The per-collection TTL registry is held by the
+    /// [`StateManagerProvider`](crate::state::manager::StateManagerProvider),
+    /// not the factory, so every recovery path binds identical TTLs through
+    /// the one [`PartitionStateStore`](crate::state::partition_store::PartitionStateStore).
     #[must_use]
     pub fn new(
         client: Arc<FjallClient>,
-        backing: CassandraValueStore,
+        cell: CassandraCellStore,
         dedup: DP,
         triggers: TP,
         consumer_group: ConsumerGroup,
         timer_slab_size: CompactDuration,
-        registry: Arc<CollectionDefRegistry>,
     ) -> Self {
         Self {
             client,
-            backing,
+            cell,
             dedup,
             triggers,
             consumer_group,
             timer_slab_size,
-            registry,
         }
     }
 }
@@ -153,11 +92,11 @@ where
     DP: DeduplicationStoreProvider,
     TP: TriggerStoreProvider,
 {
+    type Cache = FjallValueStore;
+    type Cell = CassandraCellStore;
     type DirtyProvider = FjallDirtyValueStoreProvider;
-    type Durable = ProductionValueDurable<ProductionOracle<DP, TP>>;
     type Error = FjallFactoryError;
     type Oracle = ProductionOracle<DP, TP>;
-    type Scanner = CassandraValueStore;
 
     fn for_partition(
         &self,
@@ -179,21 +118,11 @@ where
             topic,
             partition,
         );
-        // The scanner is the un-wrapped backing store: recovery streams its
-        // pending-index rows, while the recovery-wrapped `durable` bundle
-        // does the point reads and resolutions.
-        let scanner = self.backing.clone();
-        let durable = compose_value_durable(
-            cache,
-            self.backing.clone(),
-            oracle.clone(),
-            Arc::clone(&self.registry),
-        );
         Ok(StateBackend {
-            durable,
+            cell: self.cell.clone(),
             oracle,
+            cache,
             dirty: FjallDirtyValueStoreProvider::new(workspace),
-            scanner,
         })
     }
 }
@@ -201,39 +130,35 @@ where
 /// [`StateBackendFactory`] for the in-memory storage backend (and mock
 /// mode).
 ///
-/// One process-wide [`MemoryDurableValueStore`] is shared across partitions
-/// (state survives reassignment within the process); the recovery wrapper
-/// and oracle are minted per partition, mirroring the Cassandra factory.
+/// One process-wide [`MemoryCellStore`] is shared across partitions (state
+/// survives reassignment within the process); the committed-value cache and
+/// oracle are minted per partition, mirroring the Cassandra factory.
 #[derive(Clone)]
 pub struct MemoryStateBackendFactory<DP, TP> {
-    durable: MemoryDurableValueStore,
+    cell: MemoryCellStore,
     dedup: DP,
     triggers: TP,
     consumer_group: ConsumerGroup,
     timer_slab_size: CompactDuration,
-    registry: Arc<CollectionDefRegistry>,
 }
 
 impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
-    /// Creates the factory over a shared memory durable store. See
-    /// [`CassandraStateBackendFactory::new`] for the `dedup` and `registry`
-    /// contracts.
+    /// Creates the factory over a shared memory cell store. See
+    /// [`CassandraStateBackendFactory::new`] for the `dedup` contract.
     #[must_use]
     pub fn new(
-        durable: MemoryDurableValueStore,
+        cell: MemoryCellStore,
         dedup: DP,
         triggers: TP,
         consumer_group: ConsumerGroup,
         timer_slab_size: CompactDuration,
-        registry: Arc<CollectionDefRegistry>,
     ) -> Self {
         Self {
-            durable,
+            cell,
             dedup,
             triggers,
             consumer_group,
             timer_slab_size,
-            registry,
         }
     }
 }
@@ -243,15 +168,11 @@ where
     DP: DeduplicationStoreProvider,
     TP: TriggerStoreProvider,
 {
+    type Cache = MemoryCommittedCache;
+    type Cell = MemoryCellStore;
     type DirtyProvider = MemoryDirtyValueStoreProvider;
-    type Durable = RecoveringValueStore<
-        MemoryDurableValueStore,
-        ProductionOracle<DP, TP>,
-        Arc<CollectionDefRegistry>,
-    >;
     type Error = Infallible;
     type Oracle = ProductionOracle<DP, TP>;
-    type Scanner = MemoryDurableValueStore;
 
     fn for_partition(
         &self,
@@ -266,19 +187,11 @@ where
             topic,
             partition,
         );
-        // The scanner is the un-wrapped shared store; `durable` wraps the
-        // same store in the recovery layer.
-        let scanner = self.durable.clone();
-        let durable = RecoveringValueStore::new(
-            self.durable.clone(),
-            oracle.clone(),
-            Arc::clone(&self.registry),
-        );
         Ok(StateBackend {
-            durable,
+            cell: self.cell.clone(),
             oracle,
+            cache: MemoryCommittedCache::new(),
             dirty: MemoryDirtyValueStoreProvider,
-            scanner,
         })
     }
 }

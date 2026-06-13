@@ -4,48 +4,31 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
-use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
-use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
-use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::manager::StateManagerProvider;
-use crate::state::memory::{MemoryDirtyValueStoreProvider, MemoryDurableValueStore};
-use crate::state::pending::{PendingEntry, PendingIndexScanner};
-use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::tests::value_suite::{FixedOracle, bytes};
-use crate::state::value::{DurableWalStore, ValueOp};
-use crate::state::{
-    CollectionId, CollectionRef, DurableState, EventRef, SharedStateBackend, StateKey, StateName,
-    StateType,
-};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStoreProvider};
+use crate::state::oracle::CommitOracle;
+use crate::state::registry::CollectionDefRegistry;
+use crate::state::{CommitDecision, EventRef, SharedStateBackend, StateKey};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
-use crate::timers::datetime::CompactDateTime;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
-use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
-use crate::timers::store::{Segment, SegmentVersion};
-use crate::timers::{TimerManagerConfig, TimerRequest};
 use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use color_eyre::eyre::eyre;
 use crossbeam_utils::CachePadded;
-use futures::stream;
 use serde_json::json;
 use std::array::from_fn;
+use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
-use tokio::task::yield_now;
-use tokio::time::{self, advance};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::Span;
-use uuid::Uuid;
 
 /// Helper trait for waiting on processed offsets.
 trait HasProcessedOffsets {
@@ -53,28 +36,54 @@ trait HasProcessedOffsets {
     fn notify(&self) -> &Arc<Notify>;
 }
 
+/// Oracle returning a fixed decision; the partition tests never exercise
+/// recovery, so a committed-everything oracle suffices.
+#[derive(Clone)]
+struct FixedOracle(CommitDecision);
+
+impl FixedOracle {
+    fn committed() -> Self {
+        Self(CommitDecision::Committed)
+    }
+}
+
+impl CommitOracle for FixedOracle {
+    type Error = Infallible;
+
+    async fn record_message(&self, _dedup_id: uuid::Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn resolve<'a>(
+        &'a self,
+        _state_key: &'a StateKey,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        Ok(self.0)
+    }
+}
+
 /// Partition-agnostic memory keyed-state provider used by the partition
 /// tests: state is always wired, so even tests that never touch state mint a
 /// real (empty-registry) provider over the in-memory backend.
 type MemoryStateProvider = StateManagerProvider<
     SharedStateBackend<
-        MemoryDurableValueStore,
+        MemoryCellStore,
         FixedOracle,
+        MemoryCommittedCache,
         MemoryDirtyValueStoreProvider,
-        MemoryDurableValueStore,
     >,
     MemoryLoader<serde_json::Value>,
 >;
 
 /// Builds a [`MemoryStateProvider`] with the given collection registry.
 fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider {
-    let durable = MemoryDurableValueStore::for_tests();
     StateManagerProvider::new(
         SharedStateBackend::new(
-            durable.clone(),
+            MemoryCellStore::new(),
             FixedOracle::committed(),
+            MemoryCommittedCache::new(),
             MemoryDirtyValueStoreProvider,
-            durable,
         ),
         MemoryLoader::new(),
         Arc::new(registry),
@@ -637,373 +646,4 @@ async fn test_partition_manager_timer_heartbeat_integration() {
         watermark.is_some() || watermark.is_none(),
         "Shutdown should complete"
     );
-}
-
-/// Handler that records every dispatch it sees; the interception test
-/// asserts it sees none.
-#[derive(Clone, Default)]
-struct RecordingEventHandler {
-    timer_calls: Arc<AtomicUsize>,
-    message_calls: Arc<AtomicUsize>,
-}
-
-impl EventHandler for RecordingEventHandler {
-    type Payload = serde_json::Value;
-
-    async fn on_message<C>(
-        &self,
-        _context: C,
-        message: UncommittedMessage<serde_json::Value>,
-        _demand_type: DemandType,
-    ) where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.message_calls.fetch_add(1, Ordering::SeqCst);
-        message.commit().await;
-    }
-
-    async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
-    where
-        C: EventContext<Payload = Self::Payload>,
-        U: UncommittedTimer,
-    {
-        self.timer_calls.fetch_add(1, Ordering::SeqCst);
-        let (_trigger, guard) = timer.into_inner();
-        guard.commit().await;
-    }
-
-    async fn shutdown(self) {}
-}
-
-/// Builds a real in-memory `TimerManager` for the interception test.
-async fn recovery_timer_manager(
-    shutdown_rx: watch::Receiver<ShutdownPhase>,
-) -> color_eyre::Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
-)> {
-    let segment = Segment {
-        id: Uuid::new_v4(),
-        name: "test".to_owned(),
-        slab_size: CompactDuration::new(300),
-        version: SegmentVersion::V3,
-    };
-    let store = memory_store(segment);
-    let telemetry = Telemetry::new();
-    let timer_config = TimerManagerConfig {
-        name: "test".to_owned(),
-        store,
-        telemetry: telemetry.partition_sender(Topic::from("t"), 0),
-        source: Arc::from(""),
-    };
-    let semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| Arc::new(Semaphore::new(10))));
-    TimerManager::new(
-        timer_config,
-        HeartbeatRegistry::test(),
-        shutdown_rx,
-        semaphores,
-    )
-    .await
-    .map_err(|e| eyre!("{e}"))
-}
-
-/// Acquires a real keyed-state manager over the memory backend with `CART`
-/// registered, returning the durable store alongside.
-async fn recovery_state_manager() -> color_eyre::Result<(
-    impl PartitionStateManager<
-        Session: StateSession<Loader: MessageLoader<Payload = serde_json::Value>>,
-    >,
-    MemoryDurableValueStore,
-)> {
-    let cart: ValueDescriptor = value_state("cart");
-    let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&cart, CollectionDef::new(None))?;
-    let durable = MemoryDurableValueStore::for_tests();
-    let provider = StateManagerProvider::new(
-        SharedStateBackend::new(
-            durable.clone(),
-            FixedOracle::committed(),
-            MemoryDirtyValueStoreProvider,
-            durable.clone(),
-        ),
-        MemoryLoader::<serde_json::Value>::new(),
-        Arc::new(registry),
-        Arc::from("test-group"),
-        CompactDuration::new(30),
-    );
-    let manager = provider
-        .acquire(Topic::from("t"), 0)
-        .await
-        .map_err(|e| eyre!("acquire failed: {e}"))?;
-    Ok((manager, durable))
-}
-
-/// `StateRecovery` triggers are framework-internal: the partition loop
-/// intercepts them before dispatch, runs the state manager's sweep, and
-/// commits the trigger — the user handler is structurally never invoked.
-/// Also verifies the sweep's `unschedule_all(StateRecovery)` does not
-/// fight the firing trigger's own commit (the trigger row is already in
-/// its firing state when the clear runs).
-#[tokio::test]
-async fn state_recovery_trigger_is_intercepted_by_the_loop() -> color_eyre::Result<()> {
-    init_test_logging();
-    time::pause();
-
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (stream, timer_manager) = recovery_timer_manager(shutdown_rx.clone()).await?;
-    futures::pin_mut!(stream);
-    let (state_manager, durable) = recovery_state_manager().await?;
-
-    // A crashed seal waits on the pending partition.
-    let key: Key = Arc::from("k");
-    let id = CollectionId::new(
-        StateKey::new(
-            compute_segment_id(Topic::from("t"), 0, "test-group"),
-            key.clone(),
-        ),
-        StateType::Application,
-        StateName::try_new("cart")?,
-    );
-    let collection_ref = CollectionRef::new(id.clone(), None);
-    durable
-        .seal(
-            &collection_ref,
-            EventRef::Message {
-                dedup_id: Uuid::from_u128(1),
-            },
-            vec![ValueOp::Set { payload: bytes(7) }],
-        )
-        .await?;
-
-    // The armed StateRecovery backstop fires.
-    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
-    timer_manager
-        .schedule(TimerRequest::new(
-            key.clone(),
-            fire,
-            TimerType::StateRecovery,
-            Span::current(),
-        ))
-        .await?;
-    advance(Duration::from_secs(30)).await;
-    yield_now().await;
-    let pending = stream
-        .next()
-        .await
-        .ok_or_else(|| eyre!("no pending timer fired"))?;
-
-    let handler = RecordingEventHandler::default();
-    process_event(
-        UncommittedEvent::Timer(pending),
-        &handler,
-        &shutdown_rx,
-        &timer_manager,
-        &state_manager,
-        DedupIdentity {
-            version: "1",
-            group_id: "test-group",
-            topic: "t",
-            partition: 0,
-        },
-        SpanRelation::default(),
-    )
-    .await;
-
-    assert_eq!(
-        handler.timer_calls.load(Ordering::SeqCst),
-        0,
-        "the user handler must never see a StateRecovery trigger"
-    );
-    assert_eq!(handler.message_calls.load(Ordering::SeqCst), 0);
-
-    // The sweep resolved the crashed seal and the trigger committed
-    // cleanly: nothing is scheduled and nothing redelivers.
-    match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => assert_eq!(applied, Some(bytes(7))),
-        other @ DurableState::Sealed { .. } => {
-            return Err(eyre!("sweep must resolve the seal, got {other:?}"));
-        }
-    }
-    let remaining = timer_manager
-        .scheduled_times(&key, TimerType::StateRecovery)
-        .await?;
-    assert!(
-        remaining.is_empty(),
-        "the recovery trigger must commit without redelivery"
-    );
-    Ok(())
-}
-
-/// Pending-index scanner that fails every scan with a chosen classification,
-/// driving the real `recover` sweep to `RecoveryError::Scanner` so the
-/// partition loop's classification branch runs end-to-end (not a stubbed
-/// `recover`). The durable store is untouched, so a seal set up beforehand
-/// survives the failed sweep — the "first-touch still recovers" guarantee.
-#[derive(Clone)]
-struct FailingScanner(ErrorCategory);
-
-impl PendingIndexScanner for FailingScanner {
-    type Error = FailingScanError;
-
-    fn scan_pending(
-        &self,
-        _state_key: &StateKey,
-    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send {
-        let category = self.0;
-        stream::once(async move { Err(FailingScanError(category)) })
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("injected scan failure ({0:?})")]
-struct FailingScanError(ErrorCategory);
-
-impl ClassifyError for FailingScanError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.0
-    }
-}
-
-/// Builds a real keyed-state manager whose sweep *scanner* fails with
-/// `category`, over an otherwise-real memory durable (returned so a seal can
-/// be staged and its survival asserted).
-async fn recovery_manager_with_failing_scanner(
-    category: ErrorCategory,
-) -> color_eyre::Result<(
-    impl PartitionStateManager<
-        Session: StateSession<Loader: MessageLoader<Payload = serde_json::Value>>,
-    >,
-    MemoryDurableValueStore,
-)> {
-    let cart: ValueDescriptor = value_state("cart");
-    let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&cart, CollectionDef::new(None))?;
-    let durable = MemoryDurableValueStore::for_tests();
-    let provider = StateManagerProvider::new(
-        SharedStateBackend::new(
-            durable.clone(),
-            FixedOracle::committed(),
-            MemoryDirtyValueStoreProvider,
-            FailingScanner(category),
-        ),
-        MemoryLoader::<serde_json::Value>::new(),
-        Arc::new(registry),
-        Arc::from("test-group"),
-        CompactDuration::new(30),
-    );
-    let manager = provider
-        .acquire(Topic::from("t"), 0)
-        .await
-        .map_err(|e| eyre!("acquire failed: {e}"))?;
-    Ok((manager, durable))
-}
-
-/// Stages a crashed seal, fires its `StateRecovery` trigger through the real
-/// partition loop against a manager whose sweep fails with `category`, and
-/// returns `(trigger_redelivers, seal_survives)`.
-async fn run_sweep_failure(category: ErrorCategory) -> color_eyre::Result<(bool, bool)> {
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (stream, timer_manager) = recovery_timer_manager(shutdown_rx.clone()).await?;
-    futures::pin_mut!(stream);
-    let (state_manager, durable) = recovery_manager_with_failing_scanner(category).await?;
-
-    // A crashed seal waits on the pending partition.
-    let key: Key = Arc::from("k");
-    let id = CollectionId::new(
-        StateKey::new(
-            compute_segment_id(Topic::from("t"), 0, "test-group"),
-            key.clone(),
-        ),
-        StateType::Application,
-        StateName::try_new("cart")?,
-    );
-    let collection_ref = CollectionRef::new(id.clone(), None);
-    durable
-        .seal(
-            &collection_ref,
-            EventRef::Message {
-                dedup_id: Uuid::from_u128(1),
-            },
-            vec![ValueOp::Set { payload: bytes(7) }],
-        )
-        .await?;
-
-    // The armed StateRecovery backstop fires.
-    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
-    timer_manager
-        .schedule(TimerRequest::new(
-            key.clone(),
-            fire,
-            TimerType::StateRecovery,
-            Span::current(),
-        ))
-        .await?;
-    advance(Duration::from_secs(30)).await;
-    yield_now().await;
-    let pending = stream
-        .next()
-        .await
-        .ok_or_else(|| eyre!("no pending timer fired"))?;
-
-    let handler = RecordingEventHandler::default();
-    process_event(
-        UncommittedEvent::Timer(pending),
-        &handler,
-        &shutdown_rx,
-        &timer_manager,
-        &state_manager,
-        DedupIdentity {
-            version: "1",
-            group_id: "test-group",
-            topic: "t",
-            partition: 0,
-        },
-        SpanRelation::default(),
-    )
-    .await;
-
-    let redelivers = !timer_manager
-        .scheduled_times(&key, TimerType::StateRecovery)
-        .await?
-        .is_empty();
-    // The failed sweep never resolved the seal, so it survives for first-touch.
-    let seal_survives = matches!(
-        DurableWalStore::read_partition(&durable, &id).await?,
-        DurableState::Sealed { .. }
-    );
-    Ok((redelivers, seal_survives))
-}
-
-/// A permanently-failing sweep commits the trigger (stops the refire loop)
-/// while leaving the seal for first-touch; a transiently-failing sweep aborts
-/// it so it redelivers and retries. Pre-fix, every failure aborted, so a
-/// permanent failure (e.g. a corrupt pending row) refired forever.
-#[tokio::test]
-async fn recovery_sweep_commits_on_permanent_and_redelivers_on_transient() -> color_eyre::Result<()>
-{
-    init_test_logging();
-    time::pause();
-
-    let (permanent_redelivers, permanent_survives) =
-        run_sweep_failure(ErrorCategory::Permanent).await?;
-    assert!(
-        !permanent_redelivers,
-        "a permanent sweep failure must commit the trigger, not refire it"
-    );
-    assert!(
-        permanent_survives,
-        "the seal must survive the dropped trigger for first-touch to recover"
-    );
-
-    let (transient_redelivers, transient_survives) =
-        run_sweep_failure(ErrorCategory::Transient).await?;
-    assert!(
-        transient_redelivers,
-        "a transient sweep failure must abort the trigger so it redelivers"
-    );
-    assert!(
-        transient_survives,
-        "the unresolved seal survives either way"
-    );
-    Ok(())
 }

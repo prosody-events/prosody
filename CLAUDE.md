@@ -209,16 +209,20 @@ terminates the chain with the handler as the **INNERMOST** component.
 **The keyed-state durability sequence is NOT in the stack.** It runs once
 after the stack returns, owned by the `settle` boundary (the blanket
 `FallibleEventHandler → EventHandler` impl in `consumer::middleware`; `retry`
-routes its final outcome through the same `settle`/`abandon`). `settle` does,
-in straight-line code: seal WAL / direct-apply (retrying transient failures in
-place) → arm `StateRecovery` if anything sealed (a per-key singleton via
-`clear_and_schedule`) → **flush the registered dedup marker, strictly after the
-seal** → commit the offset/trigger → resolve the sealed set → `after_commit`.
+routes its final outcome through the same `settle`/`abandon`). State is one
+**provisional cell** per value (`data | prev_data | event`); there is no WAL.
+`settle` does, in straight-line code: stage provisional cells / write resolved
+(`finalize`, retrying transient failures in place) → arm `StateRecovery` if
+anything staged (an amortized per-key singleton via `clear_and_schedule`,
+skipped while a backstop already stands; a permanent arm failure gates the
+marker, invariant 8) → **flush the registered dedup marker, strictly after the
+stage** → commit the offset/trigger → promote the staged cells (best-effort,
+O(1) per cell) → `after_commit`.
 The boundary **never** unschedules the backstop: the per-key `StateRecovery`
 timer is debounced outward by each stateful commit and removed only by the
 sweep's `unschedule_all` once the key goes quiet, so one event can no longer
 point-clear another event's still-needed backstop (finding F2). Because the
-marker flush is textually after the seal in one
+marker flush is textually after the stage in one
 function, "marker before durable state" is **unwritable**. The dedup middleware
 in the stack only *filters* duplicates and *registers* the marker (on `Ok` /
 `Permanent`); it never writes the dedup store. Three residual order facts remain:
@@ -228,7 +232,7 @@ in the stack only *filters* duplicates and *registers* the marker (on `Ok` /
     `reset()`s the session *before* swallowing a transient error into
     `Ok(Deferred)` — discarding the registered marker, so `settle` flushes no
     marker and the deferred reload is **not** deduped (no flag, no outcome
-    inspection). The reload re-dispatches `on_message` and `settle` seals under
+    inspection). The reload re-dispatches `on_message` and `settle` stages under
     the reloading timer's `EventRef`.
   - `dedup` stays in the stack as a duplicate **filter** so the deferred-message
     reload dispatch still filters producer duplicates. (`monopolization` is
@@ -259,7 +263,7 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 
 **Batching:** When multiple statements target the **same partition (same row key)**, group them into an `UNLOGGED BATCH` whenever possible. Same-partition unlogged batches are atomic on the replica and execute as a single mutation, eliminating extra coordinator round-trips. Never use `LOGGED BATCH` for performance reasons, and never batch across partitions to "reduce round-trips" — that's an anti-pattern that overloads the coordinator.
 
-**Bind persisted types directly via their scylla serdes.** Pass persisted types to the driver through their `SerializeValue`/`DeserializeValue` impls; never hand-convert to a driver primitive (`i8`/`i16`/etc.) at the call site. When you persist a type, give it idiomatic `From<Self> for iN` / `TryFrom<iN> for Self` discriminator conversions (a dedicated error for the fallible direction) and let the scylla serde delegate through them — e.g. `i8::from(*self).serialize(...)`; see `TimerType`, `SegmentVersion`, `StateType`, `CollectionKindId`, `PayloadEncoding`, `WalFormat`, `CellKind`. Do not add bespoke `as_iN`/`from_iN` inherent methods; the trait impls are the single conversion surface. Reads may keep deserializing the raw primitive and validating it through `TryFrom` in a fallible post-step **only** when a bad value must classify `Permanent` (or be skipped for forward-compat) rather than become scylla's `Terminal` `DeserializationError` — as the `EventRef` UDT and the discriminators above do. In that case the serde is serialize-only by design (a `SerializeValue` impl with no `DeserializeValue`, since the latter cannot express "skip this row"); document the read-side validator it pairs with.
+**Bind persisted types directly via their scylla serdes.** Pass persisted types to the driver through their `SerializeValue`/`DeserializeValue` impls; never hand-convert to a driver primitive (`i8`/`i16`/etc.) at the call site. When you persist a type, give it idiomatic `From<Self> for iN` / `TryFrom<iN> for Self` discriminator conversions (a dedicated error for the fallible direction) and let the scylla serde delegate through them — e.g. `i8::from(*self).serialize(...)`; see `TimerType`, `SegmentVersion`, `StateType`, `CollectionKindId`, `PayloadEncoding`, `CellKind`. Do not add bespoke `as_iN`/`from_iN` inherent methods; the trait impls are the single conversion surface. Reads may keep deserializing the raw primitive and validating it through `TryFrom` in a fallible post-step **only** when a bad value must classify `Permanent` (or be skipped for forward-compat) rather than become scylla's `Terminal` `DeserializationError` — as the `EventRef` UDT and the discriminators above do. In that case the serde is serialize-only by design (a `SerializeValue` impl with no `DeserializeValue`, since the latter cannot express "skip this row"); document the read-side validator it pairs with.
 
 **Handling NULLs from static columns:**
 
@@ -300,6 +304,11 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 ## Common Patterns
 
 - Use `parking_lot` over `std::sync`
+- For concurrent hash sets/maps, use `scc` (`scc::HashSet` / `scc::HashMap`),
+  never a `Mutex<HashSet>` / `Mutex<HashMap>` — `scc` is lock-free and sharded,
+  so a single mutex would serialize unrelated keys. In async code prefer its
+  async interface (`insert_async` / `contains_async` / `remove_async`); pair it
+  with `ahash::RandomState` as the hasher.
 - Use `tokio::sync` primitives (`Notify`, channels, `select!`) for async
 - Mark builders with `#[must_use]`
 - Use `LazyLock` for expensive static initialization

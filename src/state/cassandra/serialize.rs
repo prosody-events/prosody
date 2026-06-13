@@ -9,15 +9,14 @@
 //!
 //! These impls are **serialize-only by design**, the same rationale as the
 //! [`EventRef`](crate::state::EventRef) UDT bridge in
-//! [`super::udt`]. Reads do *not* go through a matching
-//! `DeserializeValue`: the row decoder ([`super::decode`]) and the pending
-//! scanner ([`super::scanner`]) deserialize the raw integer and validate it in
-//! a fallible post-step. A bad discriminator then classifies `Permanent`
-//! (skip the row) or is skipped for forward-compatibility, rather than
-//! becoming scylla's opaque `Terminal` `DeserializationError`, which would
-//! tear the partition down over one bad row.
+//! [`super::udt`]. Reads do *not* go through a matching `DeserializeValue`:
+//! the cell decoder ([`super::cell::decode`]) deserializes the raw integer and
+//! validates it in a fallible post-step. A bad discriminator then classifies
+//! `Permanent` rather than becoming scylla's opaque `Terminal`
+//! `DeserializationError`, which would tear the partition down over one bad
+//! row.
 
-use crate::state::encoding::{PayloadEncoding, WalFormat};
+use crate::state::encoding::PayloadEncoding;
 use crate::state::{CollectionKindId, StateType};
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
@@ -44,16 +43,6 @@ impl SerializeValue for CollectionKindId {
 }
 
 impl SerializeValue for PayloadEncoding {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i16::from(*self).serialize(typ, writer)
-    }
-}
-
-impl SerializeValue for WalFormat {
     fn serialize<'b>(
         &self,
         typ: &ColumnType,

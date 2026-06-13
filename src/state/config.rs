@@ -1,6 +1,7 @@
 //! User-facing configuration for the always-on keyed-state layer.
 
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
+use crate::state::StateName;
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
 use crate::timers::duration::CompactDuration;
 use crate::util::from_env_with_fallback;
@@ -12,13 +13,13 @@ use validator::{Validate, ValidationError};
 /// Environment variable for the local fjall workspace directory.
 const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
 
-/// Default delay between sealing and the `StateRecovery` sweep.
+/// Default delay between staging a cell and the `StateRecovery` sweep.
 const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 
 /// Configuration for the pipeline consumer's keyed-state layer.
 ///
 /// The layer is always present; with no registered descriptors it is inert
-/// (no durable identity I/O, no seals). Register collections with
+/// (no durable identity I/O, no cell writes). Register collections with
 /// [`Self::state`]:
 ///
 /// ```
@@ -62,7 +63,11 @@ pub struct KeyedStateConfiguration {
     #[builder(default)]
     pub default_ttl: Option<CompactDuration>,
 
-    /// Delay between sealing a WAL and the `StateRecovery` backstop sweep.
+    /// Delay between staging a provisional cell and the `StateRecovery`
+    /// backstop sweep that resolves any cell the eager post-commit promote
+    /// did not. Every registered collection's TTL must strictly exceed this
+    /// (checked at consumer build) so a provisional cell cannot expire before
+    /// the sweep reaches it.
     #[builder(default = "CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)")]
     pub recovery_delay: CompactDuration,
 
@@ -112,13 +117,30 @@ impl KeyedStateConfiguration {
     /// Builds the collection registry from the registrations and
     /// `default_ttl`.
     ///
+    /// Each registration's TTL is checked against `recovery_delay` here, the
+    /// one boundary that knows both: a provisional cell carries the
+    /// collection's TTL, so it must outlive the `StateRecovery` sweep or a
+    /// committed write could expire before recovery resolves it (invariant
+    /// 10). The intrinsic per-collection checks (name, Cassandra TTL ceiling,
+    /// identity conflict) stay in [`CollectionDefRegistry::register_identity`].
+    ///
     /// # Errors
     ///
-    /// Returns [`RegisterStateError`] on an empty descriptor name, a TTL
-    /// over Cassandra's `USING TTL` ceiling, or an identity conflict.
+    /// Returns [`RegisterStateError`] on an empty descriptor name, a TTL over
+    /// Cassandra's `USING TTL` ceiling, a TTL at or below `recovery_delay`,
+    /// or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::new(self.default_ttl);
         for (name, identity, def) in &self.registrations {
+            if let Some(ttl) = def.ttl
+                && ttl.seconds() <= self.recovery_delay.seconds()
+            {
+                return Err(RegisterStateError::TtlBelowRecoveryDelay {
+                    name: StateName::try_new(name)?,
+                    ttl_seconds: ttl.seconds(),
+                    recovery_seconds: self.recovery_delay.seconds(),
+                });
+            }
             registry.register_identity(name, identity.clone(), def.clone())?;
         }
         Ok(registry)
@@ -201,6 +223,51 @@ mod tests {
             config.build_registry(),
             Err(RegisterStateError::Ttl { seconds, .. }) if seconds == over
         ));
+        Ok(())
+    }
+
+    /// A TTL equal to the recovery delay is rejected: the cell must *outlive*
+    /// the sweep, so the floor is strict (`>`), not `>=`.
+    #[test]
+    fn collection_ttl_at_the_recovery_delay_is_rejected() -> Result<()> {
+        let delay = CompactDuration::new(60);
+        let config = KeyedStateConfiguration::builder()
+            .recovery_delay(delay)
+            .build()?
+            .state(&cart(), CollectionDef::new(Some(delay)));
+        assert!(matches!(
+            config.build_registry(),
+            Err(RegisterStateError::TtlBelowRecoveryDelay {
+                ttl_seconds,
+                recovery_seconds,
+                ..
+            }) if ttl_seconds == 60 && recovery_seconds == 60
+        ));
+        Ok(())
+    }
+
+    /// A TTL one second below the recovery delay is rejected.
+    #[test]
+    fn collection_ttl_below_the_recovery_delay_is_rejected() -> Result<()> {
+        let config = KeyedStateConfiguration::builder()
+            .recovery_delay(CompactDuration::new(60))
+            .build()?
+            .state(&cart(), CollectionDef::new(Some(CompactDuration::new(59))));
+        assert!(matches!(
+            config.build_registry(),
+            Err(RegisterStateError::TtlBelowRecoveryDelay { .. })
+        ));
+        Ok(())
+    }
+
+    /// A TTL one second above the recovery delay clears the floor.
+    #[test]
+    fn collection_ttl_above_the_recovery_delay_is_allowed() -> Result<()> {
+        let config = KeyedStateConfiguration::builder()
+            .recovery_delay(CompactDuration::new(60))
+            .build()?
+            .state(&cart(), CollectionDef::new(Some(CompactDuration::new(61))));
+        assert!(config.build_registry().is_ok());
         Ok(())
     }
 }

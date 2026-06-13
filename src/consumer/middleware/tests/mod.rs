@@ -1,4 +1,3 @@
-mod durability_boundary;
 pub mod test_support;
 
 // Tests for the `after_commit` / `after_abort` apply hooks plumbed
@@ -513,4 +512,310 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
         "pass-through middleware forwards after_abort on terminal",
     );
     Ok(())
+}
+
+/// Invariant 7 (rollback-only-before-flush): inline `abandon` rolls a staged
+/// set back to its committed base ONLY before a marker flush is attempted.
+/// After an attempt the flush's durability is ambiguous, so the staged cells
+/// must stay provisional for the armed sweep to resolve through the oracle —
+/// rolling back here could erase a committed write that redelivery then
+/// dedup-filters away.
+mod rollback_safety {
+    use super::*;
+    use crate::consumer::Uncommitted;
+    use crate::loader::MemoryLoader;
+    use crate::state::cell::Cell;
+    use crate::state::descriptor::tests::{TestSession, test_session_parts};
+    use crate::state::descriptor::{ValueDescriptor, value_state};
+    use crate::state::memory::{MemoryCellStore, MemoryDirtyValueStore};
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::LifecycleAccess;
+    use crate::state::session::sealed::FinalizeOutcome;
+    use crate::state::store::CellStore;
+    use crate::state::value::ValueKind;
+    use crate::state::{CollectionId, StateKey, StateName, StateType};
+    use color_eyre::eyre::{Result, eyre};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    /// A commit guard that records nothing — `abandon` only `abort`s it.
+    struct NoopGuard;
+
+    impl Uncommitted for NoopGuard {
+        async fn commit(self) {}
+
+        async fn abort(self) {}
+    }
+
+    /// A commit guard that records whether it was committed or aborted, so a
+    /// test can assert which terminal the durability sequence chose.
+    struct RecordingGuard {
+        committed: Arc<AtomicUsize>,
+        aborted: Arc<AtomicUsize>,
+    }
+
+    impl Uncommitted for RecordingGuard {
+        async fn commit(self) {
+            self.committed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn abort(self) {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type Ctx = MockEventContext<serde_json::Value, TestSession<MemoryDirtyValueStore>>;
+
+    /// The `cart` descriptor with the default JSON codec.
+    fn cart() -> ValueDescriptor {
+        value_state("cart")
+    }
+
+    /// Stages one provisional cell on `cart` through a real session and returns
+    /// the context (ready to abandon / settle), the durable store, and the cell
+    /// id. When `arm_failure` is set the context fails every timer schedule
+    /// permanently, so the backstop arm resolves to `Skip`.
+    async fn staged(arm_failure: bool) -> Result<(Ctx, MemoryCellStore, CollectionId<ValueKind>)> {
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&cart(), CollectionDef::new(None))?;
+        let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
+        let (session, cell_store) = test_session_parts(
+            MemoryDirtyValueStore::new(),
+            MemoryLoader::new(),
+            registry,
+            state_key.clone(),
+        );
+        let base = MockEventContext::new().with_session(session);
+        let context: Ctx = if arm_failure {
+            base.with_arm_failure()
+        } else {
+            base
+        };
+
+        // Write a value and finalize → one provisional cell staged durably.
+        let handle = context.state(cart()).map_err(|e| eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
+        let lifecycle = context
+            .state(LifecycleAccess)
+            .map_err(|e| eyre!("lifecycle: {e}"))?;
+        let outcome = lifecycle
+            .finalize()
+            .await
+            .map_err(|e| eyre!("finalize: {e}"))?;
+        assert_eq!(outcome, FinalizeOutcome::Staged);
+
+        let cart_id = CollectionId::new(
+            state_key,
+            StateType::Application,
+            StateName::try_new("cart")?,
+        );
+        assert!(
+            matches!(
+                cell_store.read_cell(&cart_id, &()).await?,
+                Cell::Provisional(_)
+            ),
+            "the cell must be provisional after staging"
+        );
+        Ok((context, cell_store, cart_id))
+    }
+
+    /// After a marker-flush attempt, abandon must NOT roll back: the cell stays
+    /// provisional for the sweep to resolve through the oracle.
+    #[tokio::test]
+    async fn after_marker_flush_keeps_the_cell_provisional() -> Result<()> {
+        let (context, cell_store, cart_id) = staged(false).await?;
+        let handler = ProbeHandler::ok(0);
+
+        abandon(
+            &handler,
+            context,
+            NoopGuard,
+            Err(TestError(ErrorCategory::Terminal, "shutdown mid-flush")),
+            RollbackSafety::AfterMarkerFlush,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                cell_store.read_cell(&cart_id, &()).await?,
+                Cell::Provisional(_)
+            ),
+            "AfterMarkerFlush must leave the staged cell provisional",
+        );
+        Ok(())
+    }
+
+    /// Before any marker flush, abandon rolls the staged cell back to its
+    /// committed base — here the empty base, so the cell resolves to absent.
+    #[tokio::test]
+    async fn before_marker_flush_rolls_the_cell_back() -> Result<()> {
+        let (context, cell_store, cart_id) = staged(false).await?;
+        let handler = ProbeHandler::ok(0);
+
+        abandon(
+            &handler,
+            context,
+            NoopGuard,
+            Err(TestError(ErrorCategory::Terminal, "terminal handler error")),
+            RollbackSafety::BeforeMarkerFlush,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                cell_store.read_cell(&cart_id, &()).await?,
+                Cell::Resolved(_)
+            ),
+            "BeforeMarkerFlush must roll the staged cell back to resolved",
+        );
+        Ok(())
+    }
+
+    /// Arm-gates-marker (invariant 8), end to end through `settle`'s success
+    /// path: when the backstop arm fails permanently, `settle` must NOT flush
+    /// the marker and must abandon *before* it — so the staged cell rolls back
+    /// to its committed base and the offset aborts (the event redelivers). A
+    /// committed-and-promoted cell here would be a marker-uncertified write
+    /// that could TTL out unresolved.
+    #[tokio::test]
+    async fn permanent_arm_failure_skips_marker_and_aborts() -> Result<()> {
+        let (context, cell_store, cart_id) = staged(true).await?;
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        // Success result drives the full durability sequence; the arm fails.
+        settle(&handler, context, guard, Ok(0)).await;
+
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            0,
+            "marker must not commit"
+        );
+        assert_eq!(aborted.load(Ordering::SeqCst), 1, "offset must abort");
+        assert!(
+            matches!(
+                cell_store.read_cell(&cart_id, &()).await?,
+                Cell::Resolved(_)
+            ),
+            "a skipped arm must roll the staged cell back (no marker-uncertified provisional left \
+             to TTL out)",
+        );
+        Ok(())
+    }
+}
+
+/// `ArmState` amortization: while a `StateRecovery` backstop stands for a key,
+/// later stateful commits on that key skip re-arming, so a burst issues at most
+/// one timer-store write per backstop generation.
+mod backstop_amortization {
+    use super::*;
+    use crate::loader::MemoryLoader;
+    use crate::state::StateKey;
+    use crate::state::descriptor::tests::test_session_with_armed;
+    use crate::state::descriptor::{ValueDescriptor, value_state};
+    use crate::state::memory::MemoryDirtyValueStore;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::{ArmedKeys, LifecycleAccess};
+    use color_eyre::eyre::{Result, eyre};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn cart() -> ValueDescriptor {
+        value_state("cart")
+    }
+
+    /// Five commits on one key, all sharing the partition's `armed` set, arm
+    /// the backstop exactly once: the first commit schedules, the rest skip
+    /// while it stands.
+    #[tokio::test]
+    async fn commits_while_armed_schedule_at_most_once() -> Result<()> {
+        const COMMITS: usize = 5;
+        let armed: ArmedKeys = Arc::default();
+        let state_key = StateKey::new(Uuid::from_u128(0x9), Arc::from("hot-key"));
+        let mut total_scheduled = 0;
+
+        for i in 0..COMMITS {
+            let mut registry = CollectionDefRegistry::default();
+            registry.register(&cart(), CollectionDef::new(None))?;
+            // A fresh session per event, all sharing the one `armed` set and key
+            // — exactly how the manager mints sessions for a partition.
+            let (session, _store) = test_session_with_armed(
+                MemoryDirtyValueStore::new(),
+                MemoryLoader::new(),
+                registry,
+                state_key.clone(),
+                armed.clone(),
+            );
+            let context = MockEventContext::new()
+                .with_session(session)
+                .with_timer_tracking();
+
+            // Stage a cell so arming is warranted.
+            let handle = context.state(cart()).map_err(|e| eyre!("bind: {e}"))?;
+            handle.set(json!({ "i": i as i32 })).await?;
+            let lifecycle = context
+                .state(LifecycleAccess)
+                .map_err(|e| eyre!("lifecycle: {e}"))?;
+            lifecycle
+                .finalize()
+                .await
+                .map_err(|e| eyre!("finalize: {e}"))?;
+
+            let outcome = arm_backstop(&context, &lifecycle).await;
+            assert!(
+                matches!(outcome, StepOutcome::Done(())),
+                "arm must succeed every commit"
+            );
+            total_scheduled += context.count_scheduled(TimerType::StateRecovery);
+        }
+
+        assert_eq!(
+            total_scheduled, 1,
+            "only the first commit of the armed generation schedules a backstop"
+        );
+        Ok(())
+    }
+
+    /// The amortization is per key: a commit on a different key arms its own
+    /// backstop even while the first key's stands.
+    #[tokio::test]
+    async fn a_different_key_arms_independently() -> Result<()> {
+        let armed: ArmedKeys = Arc::default();
+        let mut scheduled = 0;
+
+        for raw_key in ["key-a", "key-b"] {
+            let state_key = StateKey::new(Uuid::from_u128(0xA), Arc::from(raw_key));
+            let mut registry = CollectionDefRegistry::default();
+            registry.register(&cart(), CollectionDef::new(None))?;
+            let (session, _store) = test_session_with_armed(
+                MemoryDirtyValueStore::new(),
+                MemoryLoader::new(),
+                registry,
+                state_key,
+                armed.clone(),
+            );
+            let context = MockEventContext::new()
+                .with_session(session)
+                .with_timer_tracking();
+            let handle = context.state(cart()).map_err(|e| eyre!("bind: {e}"))?;
+            handle.set(json!({ "x": 1_i32 })).await?;
+            let lifecycle = context
+                .state(LifecycleAccess)
+                .map_err(|e| eyre!("lifecycle: {e}"))?;
+            lifecycle
+                .finalize()
+                .await
+                .map_err(|e| eyre!("finalize: {e}"))?;
+            arm_backstop(&context, &lifecycle).await;
+            scheduled += context.count_scheduled(TimerType::StateRecovery);
+        }
+
+        assert_eq!(scheduled, 2, "each distinct key arms its own backstop");
+        Ok(())
+    }
 }

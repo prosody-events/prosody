@@ -14,11 +14,11 @@
 //! partition.
 
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::StateName;
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDefRegistry;
+use crate::state::{StateName, StateNameError};
 use crate::timers::store::SegmentId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
 use thiserror::Error;
@@ -77,10 +77,9 @@ impl DurableDescriptorIdentity {
 
 /// Durable storage for per-segment descriptor identity rows.
 ///
-/// Implemented by every durable Value bundle (memory, Cassandra, and the
-/// layered/recovering combinators by delegation), so the middleware needs
-/// no extra wiring parameter — the handler validates through the same `D`
-/// it stores state in.
+/// Implemented by every durable cell store (memory and Cassandra), so the
+/// framework needs no extra wiring parameter — the handler validates through
+/// the same backend it stores state in.
 pub trait DescriptorIdentityStore: Send + Sync + 'static {
     /// Error type for identity reads and writes.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -102,19 +101,30 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
 }
 
 /// Validates every registered descriptor against the segment's durable
-/// identity rows, writing rows for first-seen names. An empty registry
-/// skips the I/O entirely.
+/// identity rows, writing rows for first-seen names, and returns **every
+/// name durable on the segment** — the union of the stored rows and the
+/// registered descriptors. An empty registry skips the I/O entirely and
+/// returns no names.
+///
+/// The returned set is what the recovery sweep enumerates (invariant 5,
+/// sweep-covers-everything): it includes names whose descriptor was since
+/// removed from the application, so crash residue on a deregistered
+/// collection is still swept rather than stranded until its TTL. Because no
+/// state op runs before its identity row is written, a provisional cell
+/// always implies a durable identity row, so this set covers every cell that
+/// could exist on the segment.
 ///
 /// # Errors
 ///
 /// Returns [`DescriptorIdentityError::Mismatch`] (Permanent; the row is
 /// **not** overwritten) when a durable row disagrees with the registered
-/// identity, or [`DescriptorIdentityError::Store`] when the store fails.
+/// identity, [`DescriptorIdentityError::Store`] when the store fails, or
+/// [`DescriptorIdentityError::Name`] when a stored row carries an empty name.
 pub(crate) async fn acquire_descriptor_identities<St>(
     store: &St,
     registry: &CollectionDefRegistry,
     segment_id: SegmentId,
-) -> Result<(), DescriptorIdentityError<St::Error>>
+) -> Result<Vec<StateName>, DescriptorIdentityError<St::Error>>
 where
     St: DescriptorIdentityStore,
 {
@@ -123,7 +133,7 @@ where
         .map(|(name, identity)| DurableDescriptorIdentity::from_identity(name, identity))
         .collect();
     if asserted.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let stored = store
@@ -134,16 +144,16 @@ where
         stored.iter().map(|row| (row.name.as_str(), row)).collect();
 
     let mut missing = Vec::new();
-    for row in asserted {
+    for row in &asserted {
         match by_name.get(row.name.as_str()) {
-            Some(&existing) if *existing == row => {}
+            Some(&existing) if existing == row => {}
             Some(&existing) => {
                 return Err(DescriptorIdentityError::Mismatch {
                     stored: Box::new(existing.clone()),
-                    asserted: Box::new(row),
+                    asserted: Box::new(row.clone()),
                 });
             }
-            None => missing.push(row),
+            None => missing.push(row.clone()),
         }
     }
     if !missing.is_empty() {
@@ -152,7 +162,21 @@ where
             .await
             .map_err(DescriptorIdentityError::Store)?;
     }
-    Ok(())
+
+    // The durable name set: every stored row (including deregistered
+    // collections this build no longer asserts) plus every asserted name.
+    let mut names: Vec<StateName> = Vec::with_capacity(stored.len() + asserted.len());
+    let mut seen: HashSet<&str> = HashSet::new();
+    for row_name in stored
+        .iter()
+        .map(|row| row.name.as_str())
+        .chain(asserted.iter().map(|row| row.name.as_str()))
+    {
+        if seen.insert(row_name) {
+            names.push(StateName::try_new(row_name)?);
+        }
+    }
+    Ok(names)
 }
 
 /// Error raised by durable descriptor-identity validation.
@@ -179,6 +203,11 @@ where
     /// The identity store failed.
     #[error("descriptor identity store failed")]
     Store(#[source] StoreErr),
+
+    /// A durable identity row carried an empty collection name — only
+    /// reachable from a corrupt row, since registration rejects empty names.
+    #[error(transparent)]
+    Name(#[from] StateNameError),
 }
 
 impl<StoreErr> ClassifyError for DescriptorIdentityError<StoreErr>
@@ -187,8 +216,71 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Mismatch { .. } => ErrorCategory::Permanent,
+            Self::Mismatch { .. } | Self::Name(_) => ErrorCategory::Permanent,
             Self::Store(e) => e.classify_error(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DurableDescriptorIdentity, acquire_descriptor_identities};
+    use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
+    use crate::state::memory::MemoryCellStore;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::{StateName, descriptor_identity::DescriptorIdentityStore};
+    use color_eyre::eyre::Result;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    /// The durable name set returned by acquisition is the union of the
+    /// stored rows and the registered descriptors — so a collection whose
+    /// descriptor was since removed from the application (a stored row with
+    /// no registry entry) is still enumerated for the recovery sweep
+    /// (invariant 5). Regression: this fails if acquisition returns only the
+    /// asserted (registered) names.
+    #[tokio::test]
+    async fn returns_stored_names_the_registry_no_longer_holds() -> Result<()> {
+        let store = MemoryCellStore::new();
+        let segment_id = Uuid::from_u128(0xABC);
+
+        // A prior deployment registered "wishlist" and wrote its identity row.
+        let wishlist: ValueDescriptor = value_state("wishlist");
+        let wishlist_name = StateName::try_new("wishlist")?;
+        store
+            .write_descriptor_identities(
+                segment_id,
+                vec![DurableDescriptorIdentity::from_identity(
+                    &wishlist_name,
+                    &wishlist.structural_identity(),
+                )],
+            )
+            .await?;
+
+        // The current deployment registers only "cart".
+        let mut registry = CollectionDefRegistry::default();
+        let cart: ValueDescriptor = value_state("cart");
+        registry.register(&cart, CollectionDef::new(None))?;
+
+        let names = acquire_descriptor_identities(&store, &registry, segment_id).await?;
+        let set: HashSet<&str> = names.iter().map(StateName::as_str).collect();
+
+        assert!(set.contains("cart"), "the registered name must be present");
+        assert!(
+            set.contains("wishlist"),
+            "the deregistered durable name must still be swept"
+        );
+        Ok(())
+    }
+
+    /// An empty registry does no identity I/O and returns no names — the
+    /// inert state layer.
+    #[tokio::test]
+    async fn empty_registry_returns_no_names() -> Result<()> {
+        let store = MemoryCellStore::new();
+        let registry = CollectionDefRegistry::default();
+        let names = acquire_descriptor_identities(&store, &registry, Uuid::from_u128(1)).await?;
+        assert!(names.is_empty());
+        Ok(())
     }
 }

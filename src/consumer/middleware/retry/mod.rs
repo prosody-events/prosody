@@ -138,7 +138,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
-    abandon, settle,
+    RollbackSafety, abandon, settle,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
 use crate::state::session::LifecycleAccess;
@@ -769,7 +769,15 @@ where
         match resolution {
             Resolution::Commit(result) => settle(self, context, uncommitted_offset, result).await,
             Resolution::Abort(error) => {
-                abandon(self, context, uncommitted_offset, Err(error)).await;
+                // Terminal abort: nothing staged, so rollback is a no-op.
+                abandon(
+                    self,
+                    context,
+                    uncommitted_offset,
+                    Err(error),
+                    RollbackSafety::BeforeMarkerFlush,
+                )
+                .await;
             }
         }
     }
@@ -795,7 +803,15 @@ where
         match resolution {
             Resolution::Commit(result) => settle(self, context, uncommitted, result).await,
             Resolution::Abort(error) => {
-                abandon(self, context, uncommitted, Err(error)).await;
+                // Terminal abort: nothing staged, so rollback is a no-op.
+                abandon(
+                    self,
+                    context,
+                    uncommitted,
+                    Err(error),
+                    RollbackSafety::BeforeMarkerFlush,
+                )
+                .await;
             }
         }
     }

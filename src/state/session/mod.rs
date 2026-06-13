@@ -1,16 +1,17 @@
 //! Per-event keyed-state sessions.
 //!
 //! A [`StateSession`] is the per-event view over a partition's keyed-state
-//! stores: byte-cell reads and writes join one shared per-event transaction
-//! map, and the framework drives the seal/apply lifecycle through a sealed
+//! stores: byte-cell reads and writes buffer in a per-event dirty workspace,
+//! and the framework drives the stage/promote lifecycle through a sealed
 //! supertrait that downstream crates can neither implement nor call.
 //!
 //! [`ValueStateSession`] is the sole implementation — the real session,
-//! minted per event by the partition's state manager. It holds the
-//! partition-lifetime durable bundle plus a per-event dirty workspace scope;
-//! clones share the transaction map, so repeated descriptor binds of the same
-//! collection accumulate into one transaction. Keyed state is always wired, so
-//! there is no stateless stub.
+//! minted per event by the partition's state manager. It holds an `Arc`-clone
+//! of the partition-lifetime [`PartitionStateStore`] (cell store + oracle +
+//! committed-value cache + status map) plus a per-event dirty workspace scope.
+//! Clones share the per-event buffer, so repeated descriptor binds of the same
+//! collection accumulate into one write. Keyed state is always wired, so there
+//! is no stateless stub outside tests.
 //!
 //! # Lifecycle
 //!
@@ -21,46 +22,57 @@
 //! 1. Handler ops buffer into the dirty scope through the byte-cell methods;
 //!    the deduplication middleware buffers the message's commit marker into the
 //!    session via `register_marker` during unwind.
-//! 2. On the final handler success, `finalize` seals every dirty `Wal`
-//!    collection (recording the sealed set inside the session) and
-//!    direct-applies `Direct` collections.
-//! 3. Strictly after the seal, `flush_marker` writes the registered dedup
+//! 2. On the final handler success, `finalize` stages every touched
+//!    `ReadCommitted` collection as a provisional cell (recording the staged
+//!    set inside the session) and writes `ReadUncommitted` collections as
+//!    resolved values.
+//! 3. Strictly after the stage, `flush_marker` writes the registered dedup
 //!    marker through the commit oracle — so a present marker always certifies a
-//!    durable seal. Then `commit_apply` / `rollback_aborted` resolve the
-//!    recorded sealed set against the durable store.
+//!    durable stage. After the offset/trigger commit, `commit_apply` promotes
+//!    the staged cells (O(1) per cell); `rollback_aborted` rolls them back when
+//!    the event aborts.
 //! 4. At attempt boundaries (retry, defer), `reset` discards the dirty scope,
-//!    the transaction map, the sealed set, and the registered marker so the
-//!    next attempt starts clean. A defer-swallow therefore flushes no marker,
-//!    so the deferred reload is not deduped — with no flag and no outcome
-//!    inspection.
+//!    the touched set, the staged set, and the registered marker so the next
+//!    attempt starts clean. A defer-swallow therefore flushes no marker, so the
+//!    deferred reload is not deduped — with no flag and no outcome inspection.
 
+use crate::Key;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::partition::ShutdownPhase;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
+use crate::state::cell::ProvisionalWrite;
 use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
 use crate::state::oracle::CommitOracle;
+use crate::state::partition_store::{CommittedCache, PartitionStateStore};
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore, ValueKind,
-    ValueStore,
-};
+use crate::state::store::CellStore;
+use crate::state::value::{PendingOpSource, ValueKind, ValueStore, fold_value_ops};
 use crate::state::{
     CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyStoreProvider, EventRef,
     EventScopeId, Read, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
+use ahash::RandomState;
 use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
+use scc::HashSet as ConcurrentHashSet;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
+
+/// Shared per-partition set of keys with a standing `StateRecovery` backstop.
+///
+/// A lock-free [`scc::HashSet`](ConcurrentHashSet) (not a `Mutex<HashSet>`):
+/// the durability boundary touches it on every stateful commit, concurrently
+/// across the partition's keys, so a single mutex would serialize unrelated
+/// keys.
+pub(crate) type ArmedKeys = Arc<ConcurrentHashSet<Key, RandomState>>;
 
 /// Bundle bound for the per-event dirty Value store a session composes
 /// with.
@@ -79,39 +91,14 @@ impl<T> DirtyValueBundle for T where
 {
 }
 
-/// Bundle bound for the durable Value store a session composes with.
-pub trait DurableValueBundle:
-    ValueStore<Error = <Self as DurableWalStore<ValueKind>>::Error>
-    + DurableWalStore<ValueKind>
-    + DirectApplyStore<ValueKind, Error = <Self as DurableWalStore<ValueKind>>::Error>
-    + fmt::Debug
-    + Clone
-    + Send
-    + Sync
-    + 'static
-{
-}
-
-impl<T> DurableValueBundle for T where
-    T: ValueStore<Error = <T as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <T as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static
-{
-}
-
 /// Per-event keyed-state session: typed descriptor handles operate over
 /// its byte cells, the framework drives its (crate-sealed) lifecycle.
 ///
 /// Sessions are cheap `Arc`-backed clones; every clone shares the same
-/// per-event transaction map, so repeated descriptor binds of one
-/// collection accumulate into one transaction. The trait is sealed —
-/// downstream crates name it in bounds but cannot implement it or call
-/// the lifecycle methods.
+/// per-event dirty workspace and staged set, so repeated descriptor binds of
+/// one collection accumulate into one write. The trait is sealed — downstream
+/// crates name it in bounds but cannot implement it or call the lifecycle
+/// methods.
 pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
@@ -176,14 +163,13 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
         name: &StateName,
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-    /// Drains a collection's buffered ops directly to authoritative state
-    /// and returns its transaction to `Clean`.
+    /// Writes a collection's buffered op directly to committed state and
+    /// clears the buffer — the mid-handler write-through escape hatch.
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails
-    /// (including an illegal flush after seal).
+    /// [`StateAccessError::Store`] when the underlying store fails.
     fn flush_state_cell(
         &self,
         name: &StateName,
@@ -198,32 +184,33 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
 ///
 /// The module is `pub(crate)`, so downstream crates can name
 /// [`StateSession`] in bounds but can neither implement it nor reach the
-/// lifecycle: sealing, applying, and resetting are framework-only moves.
+/// lifecycle: staging, promoting, and resetting are framework-only moves.
 pub(crate) mod sealed {
-    use super::{Future, StateAccessError, Uuid};
-    use crate::timers::duration::CompactDuration;
+    use super::{CompactDuration, Future, StateAccessError, Uuid};
 
-    /// Whether `finalize` produced sealed collections.
+    /// Whether `finalize` staged any provisional cells.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum FinalizeOutcome {
-        /// At least one `Wal` collection sealed; the caller must arm the
-        /// `StateRecovery` backstop timer.
-        Sealed,
+        /// At least one `ReadCommitted` collection staged a provisional cell;
+        /// the caller must arm the `StateRecovery` backstop timer and promote
+        /// after the commit.
+        Staged,
 
-        /// Nothing sealed: no collection was dirtied, or every dirty
-        /// collection was `Direct` and applied during `finalize`.
+        /// Nothing staged: no collection was dirtied, or every dirty
+        /// collection was `ReadUncommitted` and written resolved during
+        /// `finalize`.
         Clean,
     }
 
-    /// Result of resolving the recorded sealed set in `commit_apply` /
+    /// Result of resolving the recorded staged set in `commit_apply` /
     /// `rollback_aborted`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ApplyOutcome {
-        /// No sealed set was recorded for this event — nothing to resolve.
-        NothingSealed,
+        /// No staged set was recorded for this event — nothing to resolve.
+        NothingStaged,
 
-        /// Every recorded sealed collection resolved (applied to
-        /// authoritative state and its WAL cleared).
+        /// Every staged cell resolved (promoted to committed, or rolled back
+        /// to its committed base).
         Resolved,
 
         /// At least one resolution failed; the per-key `StateRecovery`
@@ -234,25 +221,26 @@ pub(crate) mod sealed {
 
     /// Framework-only lifecycle over a per-event session.
     pub trait StateLifecycle {
-        /// Resolves every touched collection by its commit mode: `Wal`
-        /// collections seal (the sealed set is recorded inside the
-        /// session), `Direct` collections apply.
+        /// Resolves every touched collection by its commit mode:
+        /// `ReadCommitted` collections stage a provisional cell (the staged
+        /// set is recorded inside the session), `ReadUncommitted` collections
+        /// write a resolved value.
         ///
         /// # Errors
         ///
-        /// Returns a type-erased store error when sealing or applying
-        /// fails; nothing is recorded in that case.
+        /// Returns a type-erased store error when staging or writing fails;
+        /// nothing is recorded in that case.
         fn finalize(
             &self,
         ) -> impl Future<Output = Result<FinalizeOutcome, StateAccessError>> + Send;
 
-        /// Applies the recorded sealed set after the event committed.
+        /// Promotes the recorded staged set after the event committed.
         /// Best-effort: individual failures are logged and reported via
         /// [`ApplyOutcome::Incomplete`].
         fn commit_apply(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
-        /// Rolls the recorded sealed set back after the event aborted.
-        /// Best-effort, symmetric with `commit_apply`.
+        /// Rolls the recorded staged set back after the event aborted.
+        /// Best-effort, symmetric with [`Self::commit_apply`].
         fn rollback_aborted(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
         /// Buffers the message commit marker (`dedup_id`) for this event.
@@ -261,8 +249,8 @@ pub(crate) mod sealed {
         /// during unwind on a handler `Ok` or permanent error. The marker
         /// rides the session — not derived from the session's `EventRef` —
         /// because on a deferred-message reload the marker is the reloaded
-        /// *message's* dedup id while the session seals under the *timer's*
-        /// `EventRef`. The boundary flushes it strictly after the seal;
+        /// *message's* dedup id while the session stages under the *timer's*
+        /// `EventRef`. The boundary flushes it strictly after the stage;
         /// [`Self::reset`] discards it at attempt boundaries.
         fn register_marker(&self, dedup_id: Uuid);
 
@@ -276,14 +264,31 @@ pub(crate) mod sealed {
         /// when the oracle write fails.
         fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Discards the per-event dirty scope, transaction map, recorded
-        /// sealed set, and registered marker so the next attempt starts
-        /// clean. Called at attempt boundaries (retry, defer-swallow).
+        /// Discards the per-event dirty scope, touched set, recorded staged
+        /// set, and registered marker so the next attempt starts clean.
+        /// Called at attempt boundaries (retry, defer-swallow).
         fn reset(&self);
 
-        /// Delay between sealing and the `StateRecovery` sweep, used by
+        /// Delay between staging and the `StateRecovery` sweep, used by
         /// the durability boundary to arm the backstop timer.
         fn recovery_fire_delay(&self) -> CompactDuration;
+
+        /// Whether a `StateRecovery` backstop is already standing for this
+        /// session's key (a not-yet-fired timer the durability boundary armed
+        /// for an earlier commit).
+        ///
+        /// When `true`, the boundary skips re-arming: the standing timer
+        /// already covers this commit's staged cells, so rapid commits issue
+        /// at most one timer write per backstop generation. Per-key
+        /// serialization (one handler or sweep per key at a time) makes this
+        /// race-free — the sweep that consumes the backstop cannot run while a
+        /// commit is deciding whether to re-arm.
+        fn backstop_armed(&self) -> impl Future<Output = bool> + Send;
+
+        /// Records that a `StateRecovery` backstop is now standing for this
+        /// session's key. Called by the boundary strictly after a successful
+        /// arm; cleared when the sweep fires (the manager's `recover`).
+        fn mark_backstop_armed(&self) -> impl Future<Output = ()> + Send;
     }
 }
 
@@ -312,38 +317,27 @@ impl TerminationWatch {
     }
 }
 
-type ValueTx<D, S> = Arc<AsyncMutex<TransactionValueStore<D, S>>>;
-
-/// The sealed set `finalize` records for the apply hooks.
+/// The provisional cells `finalize` staged for the promote / rollback hooks.
 ///
-/// The owning event is not stored here — it is always `self.inner.event`,
-/// read at apply time.
-struct SealedSet {
-    collections: Vec<CollectionRef<ValueKind>>,
-}
-
-/// Which durable resolution the apply hooks drive the recorded sealed set
-/// through after the event's durability marker settles.
-#[derive(Clone, Copy, Debug)]
-enum Resolution {
-    /// The event committed: apply each sealed collection.
-    Commit,
-
-    /// The event aborted: roll each sealed collection back.
-    Rollback,
+/// Each entry pairs the collection ref (carrying its TTL) with the staged
+/// write, whose `data` is the value to promote to and whose `prev` is the
+/// committed base to roll back to. Only `ReadCommitted` collections appear —
+/// `ReadUncommitted` writes resolve at stage time with nothing to resolve.
+struct StagedSet {
+    entries: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)>,
 }
 
 /// Construction parameters for [`ValueStateSession`], bundled so the
 /// constructor stays readable.
-pub struct SessionParts<D, O, P, L>
+pub struct SessionParts<S, O, C, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
-    /// Partition-lifetime durable Value bundle.
-    pub durable: D,
+    /// Partition-lifetime cell store + oracle + cache + status map.
+    pub store: PartitionStateStore<ValueKind, S, O, C>,
 
     /// Partition-lifetime commit oracle; the marker flush writes the
-    /// message commit row through it.
+    /// message commit row through it. Same instance baked into `store`.
     pub oracle: O,
 
     /// Partition-lifetime dirty-workspace provider; `reset` mints fresh
@@ -362,21 +356,26 @@ where
     /// Segment-qualified key this session's collections live under.
     pub state_key: StateKey,
 
-    /// The event whose seals this session owns.
+    /// The event whose stages this session owns.
     pub event: EventRef,
 
-    /// Delay between sealing and the `StateRecovery` sweep.
+    /// Delay between staging and the `StateRecovery` sweep.
     pub recovery_delay: CompactDuration,
+
+    /// Per-partition set of keys with a standing `StateRecovery` backstop,
+    /// shared with the manager's `recover` so a fired sweep clears the flag.
+    /// Lets the durability boundary skip re-arming while a backstop stands.
+    pub armed: ArmedKeys,
 
     /// Termination signals captured at mint.
     pub termination: TerminationWatch,
 }
 
-struct SessionInner<D, O, P, L>
+struct SessionInner<S, O, C, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
-    durable: D,
+    store: PartitionStateStore<ValueKind, S, O, C>,
     oracle: O,
     dirty_provider: P,
     /// Current per-event dirty workspace; swapped for a fresh scope on
@@ -387,30 +386,35 @@ where
     state_key: StateKey,
     event: EventRef,
     recovery_delay: CompactDuration,
+    /// Shared per-partition set of keys with a standing `StateRecovery`
+    /// backstop. Read/written for this session's own key only; the manager's
+    /// `recover` removes the key when the sweep fires.
+    armed: ArmedKeys,
     termination: TerminationWatch,
-    transactions: SyncMutex<HashMap<StateName, ValueTx<D, P::Store>>>,
-    sealed: SyncMutex<Option<SealedSet>>,
+    /// Collections written this event, the finalize work-list.
+    touched: SyncMutex<HashSet<StateName>>,
+    staged: SyncMutex<Option<StagedSet>>,
     /// The registered message commit marker, flushed strictly after the
-    /// seal and cleared by `reset`. `None` until the deduplication
+    /// stage and cleared by `reset`. `None` until the deduplication
     /// middleware registers it (or always, on the timer arm).
     marker: SyncMutex<Option<Uuid>>,
 }
 
-/// The real per-event session over a partition's Value stores.
+/// The real per-event session over a partition's cell store.
 ///
 /// One session is minted per event by the partition's state manager;
-/// clones share the per-event transaction map, dirty scope, recorded
-/// sealed set, and registered marker. `D` is the durable Value bundle, `O`
-/// the commit oracle, `P` the per-partition dirty-workspace provider, `L`
-/// the message loader.
-pub struct ValueStateSession<D, O, P, L>
+/// clones share the per-event dirty scope, touched set, recorded staged set,
+/// and registered marker. `S` is the cell store, `O` the commit oracle, `C`
+/// the committed-value cache, `P` the per-partition dirty-workspace provider,
+/// `L` the message loader.
+pub struct ValueStateSession<S, O, C, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
-    inner: Arc<SessionInner<D, O, P, L>>,
+    inner: Arc<SessionInner<S, O, C, P, L>>,
 }
 
-impl<D, O, P, L> Clone for ValueStateSession<D, O, P, L>
+impl<S, O, C, P, L> Clone for ValueStateSession<S, O, C, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
@@ -421,7 +425,7 @@ where
     }
 }
 
-impl<D, O, P, L> fmt::Debug for ValueStateSession<D, O, P, L>
+impl<S, O, C, P, L> fmt::Debug for ValueStateSession<S, O, C, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
@@ -433,15 +437,15 @@ where
     }
 }
 
-impl<D, O, P, L> ValueStateSession<D, O, P, L>
+impl<S, O, C, P, L> ValueStateSession<S, O, C, P, L>
 where
     P: DirtyStoreProvider<ValueKind>,
 {
     /// Creates a session for one event, opening a fresh dirty scope.
     #[must_use]
-    pub fn new(parts: SessionParts<D, O, P, L>) -> Self {
+    pub fn new(parts: SessionParts<S, O, C, P, L>) -> Self {
         let SessionParts {
-            durable,
+            store,
             oracle,
             dirty,
             loader,
@@ -449,12 +453,13 @@ where
             state_key,
             event,
             recovery_delay,
+            armed,
             termination,
         } = parts;
         let scope = dirty.for_scope(EventScopeId::fresh());
         Self {
             inner: Arc::new(SessionInner {
-                durable,
+                store,
                 oracle,
                 dirty_provider: dirty,
                 dirty: SyncMutex::new(scope),
@@ -463,24 +468,13 @@ where
                 state_key,
                 event,
                 recovery_delay,
+                armed,
                 termination,
-                transactions: SyncMutex::new(HashMap::new()),
-                sealed: SyncMutex::new(None),
+                touched: SyncMutex::new(HashSet::new()),
+                staged: SyncMutex::new(None),
                 marker: SyncMutex::new(None),
             }),
         }
-    }
-
-    /// The event this session's seals belong to (test observability).
-    #[cfg(test)]
-    pub(crate) fn event(&self) -> EventRef {
-        self.inner.event
-    }
-
-    /// The currently registered marker (test observability).
-    #[cfg(test)]
-    pub(crate) fn registered_marker(&self) -> Option<Uuid> {
-        *self.inner.marker.lock()
     }
 
     fn collection_id_for(&self, name: &StateName) -> CollectionId<ValueKind> {
@@ -499,37 +493,23 @@ where
     }
 }
 
-impl<D, O, P, L> ValueStateSession<D, O, P, L>
+impl<S, O, C, P, L> ValueStateSession<S, O, C, P, L>
 where
-    D: Clone,
     P: DirtyStoreProvider<ValueKind>,
     P::Store: Clone,
 {
-    fn open_transaction(&self, name: &StateName) -> ValueTx<D, P::Store> {
-        let mut txs = self.inner.transactions.lock();
-        if let Some(existing) = txs.get(name) {
-            return existing.clone();
-        }
-
-        let collection = self.collection_ref_for(name);
-        let mode = self.inner.registry.commit_mode_for(name);
-        let tx = TransactionValueStore::new(
-            self.inner.durable.clone(),
-            self.inner.dirty.lock().clone(),
-            collection,
-            self.inner.event,
-            mode,
-        );
-        let handle = Arc::new(AsyncMutex::new(tx));
-        txs.insert(name.clone(), handle.clone());
-        handle
+    /// Clones the current per-event dirty scope so its async ops run without
+    /// holding the swap mutex across an await.
+    fn dirty_scope(&self) -> P::Store {
+        self.inner.dirty.lock().clone()
     }
 }
 
-impl<D, O, P, L> StateSession for ValueStateSession<D, O, P, L>
+impl<S, O, C, P, L> StateSession for ValueStateSession<S, O, C, P, L>
 where
-    D: DurableValueBundle,
+    S: CellStore<ValueKind>,
     O: CommitOracle,
+    C: CommittedCache<ValueKind>,
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + Send + Sync,
     L: Clone + Send + Sync + 'static,
@@ -558,40 +538,65 @@ where
     }
 
     async fn state_cell(&self, name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
-        let tx = self.open_transaction(name);
-        let guard = tx.lock().await;
-        let read = guard
-            .get(&self.collection_id_for(name))
+        let id = self.collection_id_for(name);
+        let dirty = self.dirty_scope();
+        match dirty
+            .get(&id)
             .await
-            .map_err(|e| StateAccessError::store(&e))?;
-        Ok(match read {
-            Read::Present(payload) => Some(payload),
-            Read::Absent | Read::Unknown => None,
-        })
+            .map_err(|e| StateAccessError::store(&e))?
+        {
+            Read::Present(payload) => Ok(Some(payload)),
+            Read::Absent => Ok(None),
+            Read::Unknown => self
+                .inner
+                .store
+                .committed_value(&id, &(), self.inner.event)
+                .await
+                .map_err(|e| StateAccessError::store(&e)),
+        }
     }
 
     async fn set_state_cell(&self, name: &StateName, cell: Bytes) -> Result<(), StateAccessError> {
-        let tx = self.open_transaction(name);
-        let guard = tx.lock().await;
-        guard
-            .set(&self.collection_id_for(name), cell)
+        let id = self.collection_id_for(name);
+        self.dirty_scope()
+            .set(&id, cell)
             .await
-            .map_err(|e| StateAccessError::store(&e))
+            .map_err(|e| StateAccessError::store(&e))?;
+        self.inner.touched.lock().insert(name.clone());
+        Ok(())
     }
 
     async fn clear_state_cell(&self, name: &StateName) -> Result<(), StateAccessError> {
-        let tx = self.open_transaction(name);
-        let guard = tx.lock().await;
-        guard
-            .clear(&self.collection_id_for(name))
+        let id = self.collection_id_for(name);
+        self.dirty_scope()
+            .clear(&id)
             .await
-            .map_err(|e| StateAccessError::store(&e))
+            .map_err(|e| StateAccessError::store(&e))?;
+        self.inner.touched.lock().insert(name.clone());
+        Ok(())
     }
 
     async fn flush_state_cell(&self, name: &StateName) -> Result<StoreOutcome, StateAccessError> {
-        let tx = self.open_transaction(name);
-        let mut guard = tx.lock().await;
-        guard.flush().await.map_err(|e| StateAccessError::store(&e))
+        let id = self.collection_id_for(name);
+        let dirty = self.dirty_scope();
+        let Some(pending) = dirty
+            .pending_ops(&id)
+            .map_err(|e| StateAccessError::store(&e))?
+        else {
+            return Ok(StoreOutcome::NoOp);
+        };
+        let ops: Vec<_> = pending.ops.collect();
+        let value = fold_value_ops(None, ops.iter());
+        let collection_ref = self.collection_ref_for(name);
+        self.inner
+            .store
+            .write_resolved(&collection_ref, &(), value.as_ref())
+            .await
+            .map_err(|e| StateAccessError::store(&e))?;
+        dirty
+            .clear_pending_ops(&id)
+            .map_err(|e| StateAccessError::store(&e))?;
+        Ok(StoreOutcome::Applied)
     }
 
     fn is_terminated(&self) -> bool {
@@ -599,33 +604,87 @@ where
     }
 }
 
-impl<D, O, P, L> ValueStateSession<D, O, P, L>
+impl<S, O, C, P, L> StateLifecycle for ValueStateSession<S, O, C, P, L>
 where
-    D: DurableValueBundle,
+    S: CellStore<ValueKind>,
+    O: CommitOracle,
+    C: CommittedCache<ValueKind>,
     P: DirtyStoreProvider<ValueKind>,
+    P::Store: DirtyValueBundle + Send + Sync,
+    L: Send + Sync + 'static,
 {
-    /// Drives the recorded sealed set through one durable resolution after
-    /// the event's durability marker settles. Best-effort: individual
-    /// failures are logged and surface as [`ApplyOutcome::Incomplete`] so
-    /// the caller leaves the `StateRecovery` timer armed for the sweep.
-    async fn resolve_sealed(&self, resolution: Resolution) -> ApplyOutcome {
-        let Some(set) = self.inner.sealed.lock().take() else {
-            return ApplyOutcome::NothingSealed;
-        };
-        let event = self.inner.event;
-        let mut all_resolved = true;
-        for collection_ref in &set.collections {
-            let result = match resolution {
-                Resolution::Commit => self.inner.durable.apply_sealed(collection_ref, event).await,
-                Resolution::Rollback => {
-                    self.inner
-                        .durable
-                        .rollback_sealed(collection_ref, event)
-                        .await
-                }
+    /// Stages dirty `ReadCommitted` collections as provisional cells and
+    /// writes `ReadUncommitted` ones resolved, recording the staged set.
+    ///
+    /// **Idempotent under retry**: the durability boundary retries a transient
+    /// failure in place without resetting the session. Re-reading the same
+    /// buffered ops and re-staging is idempotent — a provisional write
+    /// overwrites the cell with the same `(data, prev, event)` triple, and
+    /// re-reading `prev` returns the same committed base (the cell is now
+    /// `Provisional` owned by this event, so `committed` reads its `prev`).
+    /// The staged set is replaced only after every write succeeds.
+    async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
+        let names: Vec<StateName> = self.inner.touched.lock().iter().cloned().collect();
+        let dirty = self.dirty_scope();
+        let mut staged = Vec::new();
+        for name in names {
+            let id = self.collection_id_for(&name);
+            let Some(pending) = dirty
+                .pending_ops(&id)
+                .map_err(|e| StateAccessError::store(&e))?
+            else {
+                // Touched (e.g. via `get`) but never written — nothing to stage.
+                continue;
             };
-            if let Err(error) = result {
-                warn!(error = ?error, ?resolution, "sealed resolution failed");
+            let ops: Vec<_> = pending.ops.collect();
+            let value = fold_value_ops(None, ops.iter());
+            let collection_ref = self.collection_ref_for(&name);
+            match self.inner.registry.commit_mode_for(&name) {
+                CommitMode::ReadCommitted => {
+                    let prev = self
+                        .inner
+                        .store
+                        .committed(&id, &(), self.inner.event)
+                        .await
+                        .map_err(|e| StateAccessError::store(&e))?;
+                    let write = ProvisionalWrite::new(value, prev, self.inner.event);
+                    self.inner
+                        .store
+                        .write_provisional(&collection_ref, &(), &write)
+                        .await
+                        .map_err(|e| StateAccessError::store(&e))?;
+                    staged.push((collection_ref, write));
+                }
+                CommitMode::ReadUncommitted => {
+                    self.inner
+                        .store
+                        .write_resolved(&collection_ref, &(), value.as_ref())
+                        .await
+                        .map_err(|e| StateAccessError::store(&e))?;
+                }
+            }
+        }
+        if staged.is_empty() {
+            Ok(FinalizeOutcome::Clean)
+        } else {
+            *self.inner.staged.lock() = Some(StagedSet { entries: staged });
+            Ok(FinalizeOutcome::Staged)
+        }
+    }
+
+    async fn commit_apply(&self) -> ApplyOutcome {
+        let Some(set) = self.inner.staged.lock().take() else {
+            return ApplyOutcome::NothingStaged;
+        };
+        let mut all_resolved = true;
+        for (collection_ref, write) in &set.entries {
+            if let Err(error) = self
+                .inner
+                .store
+                .promote(collection_ref, &(), write.data())
+                .await
+            {
+                warn!(error = ?error, "cell promote failed; leaving provisional for the sweep");
                 all_resolved = false;
             }
         }
@@ -635,77 +694,28 @@ where
             ApplyOutcome::Incomplete
         }
     }
-}
-
-impl<D, O, P, L> StateLifecycle for ValueStateSession<D, O, P, L>
-where
-    D: DurableValueBundle,
-    O: CommitOracle,
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: DirtyValueBundle + Send + Sync,
-    L: Send + Sync + 'static,
-{
-    /// Seals dirty `Wal` collections and direct-applies `Direct` ones,
-    /// recording the sealed set. **Idempotent under retry**: the durability
-    /// boundary retries a transient seal failure in place, so a partial seal
-    /// (collection A sealed, B failed) must not poison the re-run. An
-    /// already-`Sealed` `Wal` collection re-collects into the sealed set
-    /// rather than erroring `AlreadySealed`, and a `Finished` `Direct`
-    /// collection (applied on a prior attempt) is tolerated.
-    async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        use crate::state::value::TransactionValueStoreError;
-
-        // Snapshot every touched collection under one lock, then drop the
-        // sync guard before awaiting — the per-event map only grows, so
-        // every name already maps to its open transaction.
-        let transactions: Vec<(StateName, ValueTx<D, P::Store>)> = {
-            let txs = self.inner.transactions.lock();
-            txs.iter().map(|(n, tx)| (n.clone(), tx.clone())).collect()
-        };
-        let mut sealed = Vec::new();
-        for (name, tx) in transactions {
-            let mut guard = tx.lock().await;
-            match self.inner.registry.commit_mode_for(&name) {
-                CommitMode::Wal => match guard.seal().await {
-                    Ok(sealed_collection) => sealed.push(sealed_collection.collection().clone()),
-                    Err(TransactionValueStoreError::NoPendingOps) => {
-                        // Touched the collection (e.g. via `get`) but
-                        // never mutated it — nothing to seal.
-                    }
-                    // A prior attempt of this same finalize already sealed
-                    // this collection; re-collect it so the retry records the
-                    // complete sealed set instead of failing forever.
-                    Err(TransactionValueStoreError::AlreadySealed) => {
-                        sealed.push(self.collection_ref_for(&name));
-                    }
-                    Err(err) => return Err(StateAccessError::store(&err)),
-                },
-                CommitMode::Direct => match guard.direct_apply().await {
-                    Ok(_)
-                    | Err(
-                        TransactionValueStoreError::NoPendingOps
-                        | TransactionValueStoreError::Finished,
-                    ) => {}
-                    Err(err) => return Err(StateAccessError::store(&err)),
-                },
-            }
-        }
-        if sealed.is_empty() {
-            Ok(FinalizeOutcome::Clean)
-        } else {
-            *self.inner.sealed.lock() = Some(SealedSet {
-                collections: sealed,
-            });
-            Ok(FinalizeOutcome::Sealed)
-        }
-    }
-
-    async fn commit_apply(&self) -> ApplyOutcome {
-        self.resolve_sealed(Resolution::Commit).await
-    }
 
     async fn rollback_aborted(&self) -> ApplyOutcome {
-        self.resolve_sealed(Resolution::Rollback).await
+        let Some(set) = self.inner.staged.lock().take() else {
+            return ApplyOutcome::NothingStaged;
+        };
+        let mut all_resolved = true;
+        for (collection_ref, write) in &set.entries {
+            if let Err(error) = self
+                .inner
+                .store
+                .rollback_provisional(collection_ref, &(), write.prev())
+                .await
+            {
+                warn!(error = ?error, "cell rollback failed; leaving provisional for the sweep");
+                all_resolved = false;
+            }
+        }
+        if all_resolved {
+            ApplyOutcome::Resolved
+        } else {
+            ApplyOutcome::Incomplete
+        }
     }
 
     fn register_marker(&self, dedup_id: Uuid) {
@@ -729,21 +739,38 @@ where
     }
 
     fn reset(&self) {
-        // Swap in a fresh dirty scope first so no cleared transaction can
-        // observe the old workspace through a racing re-open.
+        // Swap in a fresh dirty scope first so no cleared op can observe the
+        // old workspace through a racing re-open.
         *self.inner.dirty.lock() = self.inner.dirty_provider.for_scope(EventScopeId::fresh());
-        self.inner.transactions.lock().clear();
-        *self.inner.sealed.lock() = None;
+        self.inner.touched.lock().clear();
+        *self.inner.staged.lock() = None;
         *self.inner.marker.lock() = None;
     }
 
     fn recovery_fire_delay(&self) -> CompactDuration {
         self.inner.recovery_delay
     }
+
+    async fn backstop_armed(&self) -> bool {
+        self.inner
+            .armed
+            .contains_async(&self.inner.state_key.key)
+            .await
+    }
+
+    async fn mark_backstop_armed(&self) {
+        // `insert_async` returns `Err(key)` if already present — harmless; the
+        // flag is idempotent.
+        let _ = self
+            .inner
+            .armed
+            .insert_async(self.inner.state_key.key.clone())
+            .await;
+    }
 }
 
 /// Crate-private descriptor the framework uses to reach a session's
-/// sealed lifecycle through the one public [`EventContext::state`] method.
+/// staged lifecycle through the one public [`EventContext::state`] method.
 ///
 /// `bind` skips registration (the lifecycle is registration-independent)
 /// and returns a [`LifecycleView`] unconditionally. Downstream crates can
@@ -779,7 +806,7 @@ impl StateDescriptor for LifecycleAccess {
     }
 }
 
-/// Crate-private view over a session's sealed lifecycle, returned by
+/// Crate-private view over a session's staged lifecycle, returned by
 /// binding [`LifecycleAccess`].
 pub(crate) struct LifecycleView<S> {
     session: S,
@@ -793,7 +820,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a type-erased store error when sealing or applying fails.
+    /// Returns a type-erased store error when staging fails.
     pub(crate) async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
         self.session.finalize().await
     }
@@ -830,6 +857,16 @@ where
     /// See [`StateLifecycle::recovery_fire_delay`].
     pub(crate) fn recovery_fire_delay(&self) -> CompactDuration {
         self.session.recovery_fire_delay()
+    }
+
+    /// See [`StateLifecycle::backstop_armed`].
+    pub(crate) async fn backstop_armed(&self) -> bool {
+        self.session.backstop_armed().await
+    }
+
+    /// See [`StateLifecycle::mark_backstop_armed`].
+    pub(crate) async fn mark_backstop_armed(&self) {
+        self.session.mark_backstop_armed().await;
     }
 }
 
@@ -944,11 +981,11 @@ where
     }
 
     async fn commit_apply(&self) -> ApplyOutcome {
-        ApplyOutcome::NothingSealed
+        ApplyOutcome::NothingStaged
     }
 
     async fn rollback_aborted(&self) -> ApplyOutcome {
-        ApplyOutcome::NothingSealed
+        ApplyOutcome::NothingStaged
     }
 
     fn register_marker(&self, dedup_id: Uuid) {
@@ -966,7 +1003,10 @@ where
     fn recovery_fire_delay(&self) -> CompactDuration {
         CompactDuration::MIN
     }
-}
 
-#[cfg(test)]
-mod tests;
+    async fn backstop_armed(&self) -> bool {
+        false
+    }
+
+    async fn mark_backstop_armed(&self) {}
+}

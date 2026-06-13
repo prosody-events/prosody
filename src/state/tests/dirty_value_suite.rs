@@ -116,60 +116,6 @@ where
     Ok(true)
 }
 
-/// Drives the same trace against `lhs` and `rhs` and asserts they remain
-/// observationally equivalent at every step. Used to prove cross-backend
-/// equivalence (Memory dirty vs Fjall dirty).
-///
-/// # Errors
-///
-/// Propagates store errors raised by either backend.
-pub(crate) async fn run_dirty_parity<A, B>(lhs: A, rhs: B, trace: DirtyTrace) -> Result<bool>
-where
-    A: DirtyStore,
-    B: DirtyStore,
-{
-    let collection = collection_id("profile")?;
-    for op in trace.ops {
-        match op {
-            DirtyTraceOp::Set(byte) => {
-                let payload = bytes(byte);
-                lhs.set(&collection, payload.clone()).await?;
-                rhs.set(&collection, payload).await?;
-            }
-            DirtyTraceOp::Clear => {
-                lhs.clear(&collection).await?;
-                rhs.clear(&collection).await?;
-            }
-            DirtyTraceOp::Get | DirtyTraceOp::PendingOps => {}
-            DirtyTraceOp::ClearPendingOps => {
-                lhs.clear_pending_ops(&collection)?;
-                rhs.clear_pending_ops(&collection)?;
-            }
-        }
-
-        let lhs_get = lhs.get(&collection).await?;
-        let rhs_get = rhs.get(&collection).await?;
-        if lhs_get != rhs_get {
-            return Ok(false);
-        }
-
-        let lhs_pending = lhs.pending_ops(&collection)?;
-        let rhs_pending = rhs.pending_ops(&collection)?;
-        match (lhs_pending, rhs_pending) {
-            (None, None) => {}
-            (Some(a), Some(b)) => {
-                let a_folded = fold_value_ops(None, a.ops.collect::<Vec<_>>().iter());
-                let b_folded = fold_value_ops(None, b.ops.collect::<Vec<_>>().iter());
-                if a_folded != b_folded {
-                    return Ok(false);
-                }
-            }
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
-}
-
 /// Quickcheck-shrinking trace of dirty-store operations.
 #[derive(Clone, Debug)]
 pub(crate) struct DirtyTrace {

@@ -1,9 +1,9 @@
 //! Fjall-backed Value cache.
 //!
-//! `FjallValueStore` implements [`ValueStore`] by storing a per-collection
-//! cell in a fjall partition. It is wired as the **cache** half of
-//! [`LayeredValueStore`](crate::state::layered::LayeredValueStore); the
-//! dirty Value workspace is the Fjall-backed [`FjallDirtyValueStore`].
+//! `FjallValueStore` stores a per-collection cell in a fjall partition and is
+//! wired as the per-partition [`CommittedCache`] for the
+//! [`PartitionStateStore`](crate::state::partition_store::PartitionStateStore);
+//! the dirty Value workspace is the Fjall-backed [`FjallDirtyValueStore`].
 //!
 //! # Three-valued reads
 //!
@@ -32,15 +32,13 @@ mod dirty;
 mod error;
 mod workspace;
 
-#[cfg(test)]
-mod tests;
-
 pub use config::FjallConfiguration;
 pub use dirty::{FjallDirtyValueStore, FjallDirtyValueStoreProvider, FjallFactoryError};
 pub use error::FjallValueStoreError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
-use crate::state::layered::ValueCache;
+use crate::state::cell::Committed;
+use crate::state::partition_store::CommittedCache;
 use crate::state::value::{ValueKind, ValueStore};
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
@@ -115,11 +113,47 @@ impl ValueStore for FjallValueStore {
     }
 }
 
-/// True invalidation: removes the cell, so the next read decodes
-/// [`Read::Unknown`] and the layered store falls through to the backing —
-/// unlike [`ValueStore::clear`], which writes an authoritative `Absent` cell.
-impl ValueCache for FjallValueStore {
-    async fn invalidate(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {
+/// Committed-value cache over the fjall cache partition.
+///
+/// The three-valued cell read maps onto the cache lookup: a `Present`/`Absent`
+/// cell is a committed-value hit (`Some`), a removed/never-written cell is a
+/// miss (`None`). Patching to a present committed value writes the payload
+/// cell; patching to a known-absent committed value writes the `Absent` tag.
+impl CommittedCache<ValueKind> for FjallValueStore {
+    type Error = FjallValueStoreError;
+
+    async fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+    ) -> Result<Option<Committed>, Self::Error> {
+        Ok(match ValueStore::get(self, collection).await? {
+            Read::Present(payload) => Some(Committed::new(Some(payload))),
+            Read::Absent => Some(Committed::new(None)),
+            Read::Unknown => None,
+        })
+    }
+
+    async fn put<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+        value: &'a Committed,
+    ) -> Result<(), Self::Error> {
+        match value.get() {
+            Some(payload) => ValueStore::set(self, collection, payload.clone()).await,
+            None => ValueStore::clear(self, collection).await,
+        }
+    }
+
+    async fn invalidate<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        (): &'a (),
+    ) -> Result<(), Self::Error> {
+        // True invalidation: removes the cell so the next read decodes
+        // `Read::Unknown` (a miss), unlike `ValueStore::clear`, which writes
+        // an authoritative `Absent` cell.
         cell_io::remove_cell(&self.inner.partition, codec::collection_prefix(collection)).await
     }
 }

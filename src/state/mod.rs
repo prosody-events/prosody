@@ -12,29 +12,35 @@
 //!   [`CollectionRef`], [`StateKey`], [`CollectionKind`], …).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
-//! * [`encoding`] — payload/WAL encoding selectors ([`PayloadEncoding`],
-//!   [`WalFormat`], [`EncodingError`]).
-//! * [`wal`] — write-ahead-log payloads ([`WalEnvelope`], [`WalBlob`],
-//!   [`SealedWal`], [`NonEmptyOps`], …).
-//! * [`value`] — the Value collection kind ([`ValueKind`], [`ValueOp`],
-//!   [`ValueApplied`], …).
+//! * [`encoding`] — payload encoding selectors ([`PayloadEncoding`],
+//!   [`EncodingError`]).
+//! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
+//!   [`ProvisionalCell`], [`ProvisionalWrite`]).
+//! * [`value`] — the Value collection kind ([`ValueKind`], [`ValueOp`], …).
 //! * [`descriptor`] — typed descriptors and handles bound over the raw byte
 //!   cells the stores persist.
-//! * [`transaction`] — transaction-side state ([`DurableState`], [`LocalTx`],
-//!   [`CommitMode`], [`SealedCollection`], …).
+//! * [`transaction`] — transaction-side state ([`CommitMode`], [`Read`], …).
 //!
 //! The cross-cutting factory traits ([`DirtyStoreProvider`],
 //! [`StateBackendFactory`]) belong to no leaf and stay here.
+//!
+//! [`Cell`]: cell::Cell
+//! [`Committed`]: cell::Committed
+//! [`ProvisionalCell`]: cell::ProvisionalCell
+//! [`ProvisionalWrite`]: cell::ProvisionalWrite
 
 use crate::error::ClassifyError;
+use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::oracle::CommitOracle;
-use crate::state::pending::PendingIndexScanner;
+use crate::state::partition_store::CommittedCache;
+use crate::state::store::CellStore;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
 pub mod cassandra;
+pub mod cell;
 pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
@@ -42,89 +48,82 @@ pub mod encoding;
 pub mod event_ref;
 pub mod fjall;
 pub mod identity;
-pub mod layered;
 pub mod manager;
 pub mod memory;
 pub mod oracle;
-pub mod pending;
+pub mod partition_store;
 pub mod production;
-pub mod recovering;
 pub mod registry;
+pub mod resolve;
 pub mod session;
+pub mod store;
 pub mod transaction;
 pub mod value;
-pub mod wal;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
+pub use encoding::{EncodingError, PayloadEncoding};
 pub use event_ref::{CommitDecision, EventRef, EventScopeId, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,
     StateNameError, StateType,
 };
-pub use transaction::{CommitMode, DurableState, LocalTx, PendingOps, Read, SealedCollection};
-pub use value::{ValueApplied, ValueKind, ValueOp};
-pub use wal::{EmptyOperationsError, NonEmptyOps, SealedWal, WalBlob, WalEnvelope};
+pub use transaction::{CommitMode, PendingOps, Read};
+pub use value::{ValueKind, ValueOp};
 
-/// The per-partition keyed-state backend: the durable Value bundle, the
-/// commit oracle it recovers through, the dirty-workspace provider, and the
-/// pending-index scanner the recovery sweep streams.
+/// The per-partition keyed-state backend: the durable cell store, the commit
+/// oracle it resolves provisional cells through, the committed-value cache,
+/// and the dirty-workspace provider.
 ///
-/// Minted as one unit by [`StateBackendFactory::for_partition`] so the
-/// oracle baked into the durable bundle's recovery wrapper and the oracle
-/// the middleware's sweep consults are the *same* instance, and the
-/// fjall workspace backing the dirty provider and the durable cache is
-/// opened once.
-///
-/// `scanner` and `durable` play distinct recovery roles: the scanner
-/// streams the pending-index rows (`scan_pending`), while the durable
-/// bundle does the point reads and resolutions (`read_partition`,
-/// `apply_sealed`, …). They are the *un-wrapped* inner store and the
-/// recovery-wrapped bundle respectively — distinct types even when both
-/// front the same backing store.
-pub struct StateBackend<D, O, P, Sc> {
-    /// Durable Value bundle for this partition.
-    pub durable: D,
+/// Minted as one unit by [`StateBackendFactory::for_partition`] so the oracle
+/// the sessions stage against and the oracle the recovery sweep resolves
+/// through are the *same* instance, and the fjall workspace backing the dirty
+/// provider and the committed-value cache is opened once.
+pub struct StateBackend<S, O, C, P> {
+    /// Durable cell store for this partition.
+    pub cell: S,
 
-    /// Commit oracle for this partition's recovery decisions.
+    /// Commit oracle for this partition's resolution decisions.
     pub oracle: O,
+
+    /// Committed-value cache for this partition.
+    pub cache: C,
 
     /// Per-event dirty-workspace provider for this partition.
     pub dirty: P,
-
-    /// Pending-index scanner for this partition's recovery sweep.
-    pub scanner: Sc,
 }
 
 /// The backend bundle a [`StateBackendFactory`] mints for one partition.
 pub type BackendOf<B> = StateBackend<
-    <B as StateBackendFactory>::Durable,
+    <B as StateBackendFactory>::Cell,
     <B as StateBackendFactory>::Oracle,
+    <B as StateBackendFactory>::Cache,
     <B as StateBackendFactory>::DirtyProvider,
-    <B as StateBackendFactory>::Scanner,
 >;
 
 /// Process-wide factory minting the per-partition keyed-state backend.
 ///
-/// Both the commit oracle's timer-tag reads and the durable stores are
+/// Both the commit oracle's timer-tag reads and the cell store are
 /// partition-scoped (timer tags live in segment-keyed tables; the fjall
 /// workspace is per assignment), so the backend cannot be a single global
-/// value — the keyed-state middleware calls [`Self::for_partition`] inside
-/// `handler_for_partition` and surfaces failures on first dispatch.
+/// value — the keyed-state manager calls [`Self::for_partition`] at partition
+/// acquisition and surfaces failures on the retry-until-shutdown loop.
 pub trait StateBackendFactory: Clone + Send + Sync + 'static {
-    /// Durable Value bundle minted per partition.
-    type Durable;
+    /// Durable cell store minted per partition. It also persists the
+    /// segment's descriptor-identity rows, validated eagerly at acquisition,
+    /// so it carries [`DescriptorIdentityStore`] under the same error type.
+    type Cell: CellStore<ValueKind>
+        + DescriptorIdentityStore<Error = <Self::Cell as CellStore<ValueKind>>::Error>;
 
     /// Commit oracle minted per partition.
     type Oracle: CommitOracle;
 
+    /// Committed-value cache minted per partition.
+    type Cache: CommittedCache<ValueKind>;
+
     /// Per-event dirty-workspace provider minted per partition.
     type DirtyProvider: DirtyStoreProvider<ValueKind>;
-
-    /// Pending-index scanner minted per partition for the recovery sweep.
-    type Scanner: PendingIndexScanner;
 
     /// Error returned when a partition's backend cannot be materialized.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -142,46 +141,48 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
     ) -> Result<BackendOf<Self>, Self::Error>;
 }
 
-/// Partition-agnostic [`StateBackendFactory`]: clones the same durable
-/// bundle, oracle, and dirty provider for every partition.
+/// Partition-agnostic [`StateBackendFactory`]: clones the same cell store,
+/// oracle, cache, and dirty provider for every partition.
 ///
 /// Suits compositions whose stores are not partition-scoped — memory-backed
 /// tests and bespoke wiring; production uses the partition-scoped factories
 /// in [`production`].
 #[derive(Clone, Debug)]
-pub struct SharedStateBackend<D, O, P, Sc> {
-    durable: D,
+pub struct SharedStateBackend<S, O, C, P> {
+    cell: S,
     oracle: O,
+    cache: C,
     dirty: P,
-    scanner: Sc,
 }
 
-impl<D, O, P, Sc> SharedStateBackend<D, O, P, Sc> {
+impl<S, O, C, P> SharedStateBackend<S, O, C, P> {
     /// Creates a backend factory that hands out clones of the supplied
     /// parts.
     #[must_use]
-    pub fn new(durable: D, oracle: O, dirty: P, scanner: Sc) -> Self {
+    pub fn new(cell: S, oracle: O, cache: C, dirty: P) -> Self {
         Self {
-            durable,
+            cell,
             oracle,
+            cache,
             dirty,
-            scanner,
         }
     }
 }
 
-impl<D, O, P, Sc> StateBackendFactory for SharedStateBackend<D, O, P, Sc>
+impl<S, O, C, P> StateBackendFactory for SharedStateBackend<S, O, C, P>
 where
-    D: Clone + Send + Sync + 'static,
+    S: CellStore<ValueKind>
+        + DescriptorIdentityStore<Error = <S as CellStore<ValueKind>>::Error>
+        + Clone,
     O: CommitOracle,
+    C: CommittedCache<ValueKind>,
     P: DirtyStoreProvider<ValueKind>,
-    Sc: PendingIndexScanner,
 {
+    type Cache = C;
+    type Cell = S;
     type DirtyProvider = P;
-    type Durable = D;
     type Error = Infallible;
     type Oracle = O;
-    type Scanner = Sc;
 
     fn for_partition(
         &self,
@@ -189,10 +190,10 @@ where
         _partition: Partition,
     ) -> Result<BackendOf<Self>, Self::Error> {
         Ok(StateBackend {
-            durable: self.durable.clone(),
+            cell: self.cell.clone(),
             oracle: self.oracle.clone(),
+            cache: self.cache.clone(),
             dirty: self.dirty.clone(),
-            scanner: self.scanner.clone(),
         })
     }
 }

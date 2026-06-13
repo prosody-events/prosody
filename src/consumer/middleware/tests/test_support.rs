@@ -4,22 +4,36 @@
 //! implementations across test modules. Supports configurable behavior for
 //! testing different middleware scenarios.
 
-use std::convert::Infallible;
 use std::future::{self, Future};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use educe::Educe;
 use parking_lot::Mutex;
+use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::descriptor::StateDescriptor;
 use crate::state::session::{StateSession, UnavailableState};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
+
+/// Timer-operation error the mock injects on demand. Always classifies
+/// [`ErrorCategory::Permanent`] so a `with_arm_failure` context drives the
+/// backstop arm to [`StepOutcome::Skip`](crate::consumer::middleware).
+#[derive(Debug, Error)]
+#[error("mock timer operation failed")]
+pub struct MockTimerError;
+
+impl ClassifyError for MockTimerError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
 
 /// Records timer operations for verification in tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +83,10 @@ pub struct MockEventContext<P = serde_json::Value, S = UnavailableState<P>> {
     /// Timer operation tracking (None = disabled).
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
 
+    /// When set, every timer schedule fails permanently — used to drive the
+    /// backstop arm to `Skip` (invariant 8).
+    arm_failure: bool,
+
     /// Keyed-state session descriptor binds route to; defaults to the
     /// [`UnavailableState`] stub.
     session: S,
@@ -103,6 +121,7 @@ where
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
             timer_operations: None,
+            arm_failure: false,
             session: UnavailableState::new(),
             _payload: PhantomData,
         }
@@ -119,8 +138,19 @@ impl<P, S> MockEventContext<P, S> {
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             timer_operations: self.timer_operations,
+            arm_failure: self.arm_failure,
             session,
             _payload: PhantomData,
+        }
+    }
+
+    /// Make every timer schedule fail permanently, so the backstop arm
+    /// resolves to `Skip` (invariant 8: arm-gates-marker).
+    #[must_use]
+    pub fn with_arm_failure(self) -> Self {
+        Self {
+            arm_failure: true,
+            ..self
         }
     }
 
@@ -204,6 +234,16 @@ impl<P, S> MockEventContext<P, S> {
             ops.lock().push(op);
         }
     }
+
+    /// The result a schedule returns: a permanent failure when
+    /// `with_arm_failure` is set, otherwise success.
+    fn timer_result(&self) -> Result<(), MockTimerError> {
+        if self.arm_failure {
+            Err(MockTimerError)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl<P, S> TerminationSignals for MockEventContext<P, S> {
@@ -235,7 +275,7 @@ where
     P: Send + Sync + 'static,
     S: StateSession<Loader: MessageLoader<Payload = P>>,
 {
-    type Error = Infallible;
+    type Error = MockTimerError;
     type Payload = P;
     type State = S;
 
@@ -275,7 +315,7 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.record(TimerOperation::Schedule(time, timer_type));
-        future::ready(Ok(()))
+        future::ready(self.timer_result())
     }
 
     fn clear_and_schedule(
@@ -284,7 +324,7 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.record(TimerOperation::ClearAndSchedule(time, timer_type));
-        future::ready(Ok(()))
+        future::ready(self.timer_result())
     }
 
     fn unschedule(

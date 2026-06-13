@@ -22,9 +22,8 @@ use thiserror::Error;
 ///
 /// `#[serde(into = "i8", try_from = "i8")]` routes serde through the
 /// [`From`]/[`TryFrom`] pair, so the only durable wire surface is the `i8`
-/// discriminator — both the Cassandra discriminator column **and** the
-/// `MsgPack` WAL header encode the integer, never the variant name. A
-/// variant rename therefore cannot drift the on-wire encoding away from the
+/// discriminator the Cassandra `kind` column stores, never the variant name.
+/// A variant rename therefore cannot drift the on-wire encoding away from the
 /// type it encodes; an unknown discriminator decodes as
 /// [`UnknownCollectionKindId`], which classifies `Permanent`.
 #[repr(i8)]
@@ -34,9 +33,10 @@ pub enum CollectionKindId {
     /// A single optional byte payload.
     Value = 1,
 
-    /// Test-only fixture kind used by the encoding property tests to
-    /// exercise WAL kind-mismatch detection before any production kind
-    /// other than [`Self::Value`] exists.
+    /// Test-only fixture kind used by the identity property tests to
+    /// exercise discriminator round-trip and unknown-discriminator
+    /// detection before any production kind other than [`Self::Value`]
+    /// exists.
     #[cfg(test)]
     TestSecondary = 2,
 }
@@ -68,8 +68,15 @@ pub trait CollectionKind: Clone + Copy + fmt::Debug + Send + Sync + 'static {
     /// Ordered operation persisted for this collection kind.
     type Op: Clone + fmt::Debug + Eq + Send + Sync + 'static;
 
-    /// Authoritative applied state for this collection kind.
-    type Applied: Clone + fmt::Debug + Eq + Send + Sync + 'static;
+    /// Address of one cell within a collection.
+    ///
+    /// A collection is a set of independently durable cells, each carrying
+    /// its own [`Cell`](crate::state::cell::Cell). Value is a single cell,
+    /// so its address is `()`. Map's address is the encoded entry key;
+    /// Deque's is the slot index or header marker. The durability layer is
+    /// written once over this address; only the per-kind table shape and the
+    /// read-side fold differ.
+    type CellAddr: Clone + fmt::Debug + Hash + Eq + Send + Sync + 'static;
 }
 
 /// Key qualified by the timer segment that owns the Kafka partition.
@@ -164,12 +171,36 @@ impl Borrow<str> for StateName {
 }
 
 /// Fully qualified typed collection identity.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+///
+/// Equality, hashing, and ordering use only the data fields; the phantom
+/// `K` is hand-rolled out of those impls so `CollectionId<K>` is `Hash`/`Eq`
+/// without requiring `K: Hash + Eq` (the kind is carried for type safety,
+/// not identity). `Clone`/`Debug` derive cleanly because [`CollectionKind`]
+/// already requires `Clone + Copy + Debug`.
+#[derive(Clone, Debug)]
 pub struct CollectionId<K> {
     state_key: StateKey,
     state_type: StateType,
     name: StateName,
     _kind: PhantomData<K>,
+}
+
+impl<K> PartialEq for CollectionId<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.state_key == other.state_key
+            && self.state_type == other.state_type
+            && self.name == other.name
+    }
+}
+
+impl<K> Eq for CollectionId<K> {}
+
+impl<K> Hash for CollectionId<K> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.state_key.hash(state);
+        self.state_type.hash(state);
+        self.name.hash(state);
+    }
 }
 
 impl<K> CollectionId<K> {

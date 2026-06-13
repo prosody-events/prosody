@@ -35,8 +35,7 @@ use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::oracle::CommitOracle;
-use crate::state::value::ValueKind;
-use crate::state::{CollectionId, CommitDecision, EventRef, TimerEventRef};
+use crate::state::{CommitDecision, EventRef, StateKey, TimerEventRef};
 use crate::timers::TimerManager;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
@@ -210,7 +209,7 @@ where
 
     async fn resolve<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
+        state_key: &'a StateKey,
         event: EventRef,
     ) -> Result<CommitDecision, Self::Error> {
         let committed = match event {
@@ -220,7 +219,7 @@ where
                 time,
                 tag,
             }) => {
-                self.is_timer_committed(&collection.state_key().key, timer_type, time, tag)
+                self.is_timer_committed(&state_key.key, timer_type, time, tag)
                     .await?
             }
         };

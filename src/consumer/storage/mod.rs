@@ -22,7 +22,7 @@ use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::state::cassandra::{CassandraValueStore, ValueQueries};
+use crate::state::cassandra::{CassandraCellStore, CellQueries};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
@@ -162,7 +162,7 @@ impl StorageBackend {
 ///         message_provider,
 ///         timer_provider,
 ///         dedup_provider,
-///         value_store,
+///         cell_store,
 ///     } => {
 ///         // All are Cassandra
 ///     }
@@ -195,8 +195,8 @@ pub enum StorePair {
         /// Deduplication store provider (Cassandra) — the mandatory commit
         /// oracle; `DeduplicationQueries` are always prepared.
         dedup_provider: CassandraDeduplicationStoreProvider,
-        /// Keyed-state Value store sharing the same session.
-        value_store: CassandraValueStore,
+        /// Keyed-state cell store sharing the same session.
+        cell_store: CassandraCellStore,
     },
 }
 
@@ -306,16 +306,15 @@ impl StorePair {
                 );
 
                 validate_keyed_state_ttl(keyed_state_ttl)?;
-                let value_queries = Arc::new(ValueQueries::new(store.session(), keyspace).await?);
-                let value_store =
-                    CassandraValueStore::new(store.clone(), value_queries, keyed_state_ttl);
+                let cell_queries = Arc::new(CellQueries::new(store.session(), keyspace).await?);
+                let cell_store = CassandraCellStore::new(store.clone(), cell_queries);
 
                 Ok(Self::Cassandra {
                     trigger_provider,
                     message_provider,
                     timer_provider,
                     dedup_provider,
-                    value_store,
+                    cell_store,
                 })
             }
         }
