@@ -8,12 +8,12 @@
 //! layer re-introducing a shared clone that would silently demote the read to
 //! the copying fallback.
 
-use super::FjallValueStore;
 use super::codec::collection_prefix;
-use crate::Key;
+use super::{AssignmentEpoch, FjallClient, FjallConfiguration, FjallValueStore};
 use crate::state::value::ValueStore;
 use crate::state::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
 use crate::test_util::TEST_RUNTIME;
+use crate::{Key, Topic};
 use color_eyre::eyre::{Result, eyre};
 use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use quickcheck::{QuickCheck, TestResult};
@@ -110,5 +110,43 @@ fn stored_cells_are_raw_tagged_payload() -> Result<()> {
         "cache cell not raw"
     );
 
+    Ok(())
+}
+
+/// `for_workspace` must *retain* the workspace it is handed, not extract the
+/// cache handle and drop the workspace.
+///
+/// This is the one ownership decision the type system does not enforce: both
+/// `new` (bare handle, no workspace) and `for_workspace` return `Self`, so a
+/// `for_workspace` rewritten to `Self::new(ws.cache_handle().clone())` compiles
+/// — and silently deletes the cache partition the moment the dropped
+/// workspace's `Drop` runs. The cache is a read-through optimization, so that
+/// degrades every op to a backing read with no other test failing. We move the
+/// workspace in with no other binding to it and confirm — through the keyspace,
+/// the only channel a `Drop` side-effect is observable on — that the partition
+/// is still live after construction. A discarding `for_workspace` would show
+/// zero.
+#[test]
+fn for_workspace_retains_the_workspace() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = FjallClient::open(&FjallConfiguration {
+        cache_dir: dir.path().to_path_buf(),
+    })?;
+    let keyspace = client.keyspace().clone();
+    let live_cache_partitions = || {
+        keyspace
+            .list_partitions()
+            .iter()
+            .filter(|name| name.starts_with("value_cache_"))
+            .count()
+    };
+
+    let workspace = client.workspace(Topic::from("orders.v1"), 0, AssignmentEpoch::mint())?;
+    let _cache = FjallValueStore::for_workspace(workspace);
+    assert_eq!(
+        live_cache_partitions(),
+        1,
+        "for_workspace must keep the workspace alive, not drop it on return"
+    );
     Ok(())
 }
