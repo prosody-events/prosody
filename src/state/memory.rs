@@ -66,12 +66,17 @@ impl ValueStore for MemoryDirtyValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: &'a [u8],
     ) -> Result<(), Self::Error> {
-        self.inner
-            .lock()
-            .entries
-            .insert(collection.clone(), Some(ValueOp::Set { payload }));
+        // The buffered op owns its payload, so the borrowed slice is copied
+        // once here. Acceptable for this in-memory test backend; production
+        // fjall stores frame the slice into a cell buffer without a copy.
+        self.inner.lock().entries.insert(
+            collection.clone(),
+            Some(ValueOp::Set {
+                payload: Bytes::copy_from_slice(payload),
+            }),
+        );
         Ok(())
     }
 

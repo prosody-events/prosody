@@ -181,6 +181,58 @@ async fn absent_row_and_provisional_cells_stream() -> Result<()> {
     Ok(())
 }
 
+/// The durable Cassandra cell stays zstd-compressed (`RawZstdV1`), unlike the
+/// fjall stores which now store raw and let fjall block-compress on disk. Pins
+/// the explicit requirement that Change 1 left the durable path untouched: the
+/// stored `data` column bytes differ from the raw payload and decompress back
+/// to it. Reads the column with a raw CQL `SELECT` so the store's transparent
+/// decompression cannot mask a regression to raw storage.
+#[tokio::test]
+async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_VALUE;
+    use crate::state::encoding::{PayloadEncoding, decode_payload};
+
+    init_test_logging();
+    let store = setup().await?;
+    let c = collection("cart")?;
+    // A long, repetitive payload so the zstd frame is unmistakably smaller than
+    // the raw bytes — a regression to raw storage would fail both assertions.
+    let payload = Bytes::from(vec![0xAB_u8; 4096]);
+    store.write_resolved(&c, &(), Some(&payload)).await?;
+
+    let cql = format!(
+        "SELECT data FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id = ? AND key \
+         = ? AND state_type = ? AND name = ?"
+    );
+    let (segment_id, key, state_type, name) = super::primary_components(c.id());
+    let raw = store
+        .session()
+        .query_unpaged(cql, (segment_id, key, state_type, name))
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<Vec<u8>>,)>()?
+        .and_then(|(data,)| data)
+        .ok_or_else(|| eyre!("data column missing"))?;
+
+    assert_ne!(
+        raw.as_slice(),
+        payload.as_ref(),
+        "durable data column must be compressed, not stored raw"
+    );
+    assert!(
+        raw.len() < payload.len(),
+        "zstd frame ({} bytes) should be smaller than the {} raw bytes",
+        raw.len(),
+        payload.len()
+    );
+    let decoded = decode_payload(&raw, PayloadEncoding::RawZstdV1)?;
+    assert_eq!(
+        decoded, payload,
+        "zstd frame must decompress to the payload"
+    );
+    Ok(())
+}
+
 /// Read-path uniqueness invariant: a present cell read back from the Cassandra
 /// decode path is **uniquely owned** (`try_into_mut().is_ok()`). This pins the
 /// production fast path `StateHandle::get` relies on — every backend decode

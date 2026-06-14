@@ -13,7 +13,8 @@
 //! entry** in the fjall partition, and decodes as
 //! [`Read::Unknown`]. Tag byte `0x00` is
 //! `Absent` (known cleared); tag byte `0x01` is `Present` with the
-//! encoded payload bytes that follow.
+//! raw payload bytes that follow (stored verbatim — fjall block-compresses
+//! the on-disk data block via LZ4, so there is no per-cell codec layer).
 //!
 //! # Blocking I/O
 //!
@@ -93,12 +94,12 @@ impl ValueStore for FjallValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: &'a [u8],
     ) -> Result<(), Self::Error> {
         cell_io::write_cell(
             &self.inner.partition,
             codec::collection_prefix(collection),
-            codec::encode_present_cell(&payload)?,
+            codec::encode_present_cell(payload),
         )
         .await
     }
@@ -144,7 +145,7 @@ impl CommittedCache<ValueKind> for FjallValueStore {
         value: &'a Committed,
     ) -> Result<(), Self::Error> {
         match value.get() {
-            Some(payload) => ValueStore::set(self, collection, payload.clone()).await,
+            Some(payload) => ValueStore::set(self, collection, payload).await,
             None => ValueStore::clear(self, collection).await,
         }
     }

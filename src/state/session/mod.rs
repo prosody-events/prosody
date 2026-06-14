@@ -144,6 +144,9 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Buffers a set of a collection's cell bytes within this event's
     /// transaction.
     ///
+    /// Takes the cell by shared slice so the caller can pass a pooled or
+    /// transient serialize buffer rather than forcing an owned `Bytes`.
+    ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
@@ -151,7 +154,7 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     fn set_state_cell(
         &self,
         name: &StateName,
-        cell: Bytes,
+        cell: &[u8],
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
     /// Buffers a clear of a collection within this event's transaction.
@@ -599,7 +602,7 @@ where
         }
     }
 
-    async fn set_state_cell(&self, name: &StateName, cell: Bytes) -> Result<(), StateAccessError> {
+    async fn set_state_cell(&self, name: &StateName, cell: &[u8]) -> Result<(), StateAccessError> {
         let id = self.collection_id_for(name);
         self.dirty_scope()
             .set(&id, cell)
@@ -1030,7 +1033,7 @@ where
     async fn set_state_cell(
         &self,
         _name: &StateName,
-        _cell: Bytes,
+        _cell: &[u8],
     ) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }

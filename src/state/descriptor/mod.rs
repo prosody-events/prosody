@@ -1,8 +1,8 @@
 //! Typed descriptors for keyed-state collections.
 //!
-//! Stores speak raw [`Bytes`]; this layer owns the typing. A descriptor is
-//! a plain `Copy` value — build it wherever it's needed (names are
-//! interned, so equal names produce interchangeable descriptors). Register
+//! Stores speak raw [`Bytes`](bytes::Bytes); this layer owns the typing. A
+//! descriptor is a plain `Copy` value — build it wherever it's needed (names
+//! are interned, so equal names produce interchangeable descriptors). Register
 //! it with the consumer, then bind it to *any*
 //! [`EventContext`](crate::consumer::event_context::EventContext) to obtain a
 //! typed, owned handle:
@@ -43,13 +43,12 @@
 //! identity table on first use, so a process carrying an incompatible
 //! descriptor fails loudly instead of silently misreading cells.
 
-use crate::codec::{Codec, JsonCodec};
+use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
 use crate::state::session::StateSession;
 use crate::state::{StateName, StoreOutcome};
-use bytes::Bytes;
 use internment::Intern;
 use std::error::Error;
 use std::fmt;
@@ -386,13 +385,14 @@ where
     pub async fn set(&self, value: R::Write<'_>) -> Result<(), ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
         let stored = R::stored_from(value);
-        let mut buf = Vec::new();
+        // Serialize into a pooled, reusable buffer. The guard owns its buffer
+        // (moved out of thread-local storage), so it is `Send` and rides the
+        // cell write across the await; on drop it returns the buffer to the
+        // pool for the next `set`.
+        let mut buf = SerializeBufGuard::acquire();
         C::with_cached_local(|codec| codec.serialize(stored, &mut buf))
             .map_err(ValueStateError::Codec)?;
-        Ok(self
-            .session
-            .set_state_cell(&self.name, Bytes::from(buf))
-            .await?)
+        Ok(self.session.set_state_cell(&self.name, &buf).await?)
     }
 
     /// Buffers a clear operation.

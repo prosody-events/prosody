@@ -83,12 +83,12 @@ impl ValueStore for FjallDirtyValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: &'a [u8],
     ) -> Result<(), Self::Error> {
         cell_io::write_cell(
             &self.overlay,
             dirty_collection_key(self.scope, collection),
-            encode_present_cell(&payload)?,
+            encode_present_cell(payload),
         )
         .await
     }

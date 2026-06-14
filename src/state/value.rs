@@ -52,10 +52,16 @@ pub trait ValueStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Read<Bytes>, Self::Error>> + Send + 'a;
 
     /// Buffers or applies a Value set.
+    ///
+    /// Takes the payload by shared slice so the caller never has to clone or
+    /// hand over a `Bytes`: it can pass a transient or pooled, reusable
+    /// serialize buffer. Each implementation frames the slice into its own
+    /// cell buffer as its storage requires — the fjall stores frame it without
+    /// a copy, while an owning backend may copy it once.
     fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: &'a [u8],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     /// Buffers or applies a Value clear.

@@ -4,12 +4,16 @@ use std::error::Error;
 
 mod binary;
 mod json;
+mod serialize_buf;
 
 pub use binary::{
     BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryMetadata, BinaryPayload, JsonBinaryCodec,
     JsonExtractError, JsonExtractor,
 };
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
+
+// Crate-internal: not part of the public codec API surface.
+pub(crate) use serialize_buf::SerializeBufGuard;
 
 /// Wire-format abstraction for encoding and decoding message payloads.
 ///

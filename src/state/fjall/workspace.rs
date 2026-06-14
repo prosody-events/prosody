@@ -35,7 +35,7 @@ use super::error::FjallValueStoreError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::{Partition, Topic};
 use educe::Educe;
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
+use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -134,10 +134,10 @@ impl FjallClient {
 
         let cache = self
             .keyspace
-            .open_partition(&cache_name, PartitionCreateOptions::default())?;
+            .open_partition(&cache_name, partition_options())?;
         let overlay = self
             .keyspace
-            .open_partition(&overlay_name, PartitionCreateOptions::default())?;
+            .open_partition(&overlay_name, partition_options())?;
 
         Ok(FjallWorkspace {
             client: Arc::clone(self),
@@ -225,7 +225,7 @@ fn sweep_orphaned(keyspace: &Arc<Keyspace>) -> Result<(), FjallClientError> {
         if !name.starts_with(PARTITION_NAME_PREFIX) {
             continue;
         }
-        let handle = keyspace.open_partition(&name, PartitionCreateOptions::default())?;
+        let handle = keyspace.open_partition(&name, partition_options())?;
         if let Err(err) = keyspace.delete_partition(handle) {
             warn!(
                 partition = %name,
@@ -236,6 +236,16 @@ fn sweep_orphaned(keyspace: &Arc<Keyspace>) -> Result<(), FjallClientError> {
         }
     }
     Ok(())
+}
+
+/// Creation options shared by every keyed-state fjall partition (`cache`,
+/// `dirty_overlay`, and the sweep's reopen).
+///
+/// Cells are stored raw; fjall compresses data blocks at flush/compaction.
+/// LZ4 is already fjall's default — pinning it documents that intent and
+/// guards against a future change to fjall's default.
+fn partition_options() -> PartitionCreateOptions {
+    PartitionCreateOptions::default().compression(CompressionType::Lz4)
 }
 
 fn partition_name(

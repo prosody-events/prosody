@@ -29,7 +29,7 @@ use crate::state::{
 use crate::test_util::{ArbJson, TEST_RUNTIME};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
-use fjall::{Config, PartitionCreateOptions};
+use fjall::{CompressionType, Config, PartitionCreateOptions};
 use futures::executor;
 use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
@@ -200,8 +200,12 @@ where
 fn fjall_dirty() -> Result<(TempDir, FjallDirtyValueStore)> {
     let dir = tempfile::tempdir()?;
     let keyspace = Config::new(dir.path()).open()?;
-    let overlay =
-        keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
+    // Mirror production's `partition_options()` (LZ4) in `fjall/workspace.rs`
+    // so the round-trip exercises set→get through the same compressed block path.
+    let overlay = keyspace.open_partition(
+        "value_dirty_overlay",
+        PartitionCreateOptions::default().compression(CompressionType::Lz4),
+    )?;
     Ok((
         dir,
         FjallDirtyValueStore::new(overlay, EventScopeId::fresh()),

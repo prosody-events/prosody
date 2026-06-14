@@ -15,12 +15,10 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
-use std::cell::RefCell;
 use std::env::var;
 use std::hash::Hasher;
 use std::mem::take;
 use std::num::NonZeroUsize;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Span, info_span, instrument};
@@ -28,7 +26,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::codec::JsonCodec;
+use crate::codec::{JsonCodec, SerializeBufGuard};
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::telemetry::sender::TelemetrySender;
@@ -49,50 +47,6 @@ pub use error::ProducerError;
 
 /// Environment variable name for the source system identifier.
 const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
-
-thread_local! {
-    static SERIALIZE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// RAII guard that takes the per-thread serialize buffer for the duration of a
-/// send and returns it on drop, preserving its capacity for reuse.
-struct SerializeBufGuard {
-    buf: Vec<u8>,
-}
-
-impl SerializeBufGuard {
-    fn acquire() -> Self {
-        Self {
-            buf: SERIALIZE_BUF.with_borrow_mut(take),
-        }
-    }
-}
-
-impl Drop for SerializeBufGuard {
-    fn drop(&mut self) {
-        let mut buf = take(&mut self.buf);
-        buf.clear();
-        SERIALIZE_BUF.with_borrow_mut(|tls| {
-            if buf.capacity() > tls.capacity() {
-                *tls = buf;
-            }
-        });
-    }
-}
-
-impl Deref for SerializeBufGuard {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Vec<u8> {
-        &self.buf
-    }
-}
-
-impl DerefMut for SerializeBufGuard {
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.buf
-    }
-}
 
 /// Configuration for the Kafka producer.
 ///

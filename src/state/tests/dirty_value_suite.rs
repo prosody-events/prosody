@@ -56,7 +56,7 @@ where
         match op {
             DirtyTraceOp::Set(byte) => {
                 let payload = bytes(byte);
-                store.set(&collection, payload.clone()).await?;
+                store.set(&collection, &payload).await?;
                 overlay = Read::Present(payload);
             }
             DirtyTraceOp::Clear => {

@@ -231,7 +231,7 @@ async fn stage_under_timer(manager: &TestManager, key: &Key, value: u8) -> Resul
     ));
     let session = manager.session(key.clone(), event, termination());
     session
-        .set_state_cell(&StateName::try_new("cart")?, bytes(value))
+        .set_state_cell(&StateName::try_new("cart")?, &bytes(value))
         .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
     manager.inner.armed.insert_async(key.clone()).await.ok();
@@ -329,13 +329,13 @@ async fn write_mixed(manager: &TestManager, key: &Key) -> Result<(TestSession, E
     let event = timer_event(key);
     let session = manager.session(key.clone(), event, termination());
     session
-        .set_state_cell(&StateName::try_new("cart")?, bytes(7))
+        .set_state_cell(&StateName::try_new("cart")?, &bytes(7))
         .await?;
     session
-        .set_state_cell(&StateName::try_new("wishlist")?, bytes(13))
+        .set_state_cell(&StateName::try_new("wishlist")?, &bytes(13))
         .await?;
     session
-        .set_state_cell(&StateName::try_new("last_seen")?, bytes(42))
+        .set_state_cell(&StateName::try_new("last_seen")?, &bytes(42))
         .await?;
     Ok((session, event))
 }
@@ -603,10 +603,10 @@ async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
     let event = timer_event(&key);
     let session = manager.session(key.clone(), event, termination());
     session
-        .set_state_cell(&StateName::try_new("cart")?, bytes(7))
+        .set_state_cell(&StateName::try_new("cart")?, &bytes(7))
         .await?;
     session
-        .set_state_cell(&StateName::try_new("wishlist")?, bytes(13))
+        .set_state_cell(&StateName::try_new("wishlist")?, &bytes(13))
         .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
 

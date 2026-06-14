@@ -35,7 +35,6 @@
 //! fjall keyspace.
 
 use super::error::FjallValueStoreError;
-use crate::state::encoding::{PayloadEncoding, decode_payload, encode_payload};
 use crate::state::{CollectionId, CollectionKind, EventScopeId, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3;
@@ -45,9 +44,6 @@ const CACHE_TAG_ABSENT: u8 = 0x00;
 
 /// Tag byte for "known present" entries.
 const CACHE_TAG_PRESENT: u8 = 0x01;
-
-/// Payload encoding used for cached `Present` cells.
-const CACHE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::RawZstdV1;
 
 /// Returns the 16-byte collection prefix for a typed collection identity.
 ///
@@ -91,15 +87,16 @@ pub fn encode_absent_cell() -> Bytes {
 
 /// Encodes a `Present` cache cell from raw payload bytes.
 ///
-/// # Errors
-///
-/// Returns [`FjallValueStoreError::Encoding`] when payload encoding fails.
-pub fn encode_present_cell(payload: &Bytes) -> Result<Bytes, FjallValueStoreError> {
-    let payload_bytes = encode_payload(payload, CACHE_PAYLOAD_ENCODING)?;
-    let mut buf = Vec::with_capacity(1 + payload_bytes.len());
+/// The cell is framed `[CACHE_TAG_PRESENT][raw payload]` — the payload is
+/// stored verbatim, with no app-level compression. fjall block-compresses the
+/// containing data block (LZ4) on disk at flush/compaction, so a redundant
+/// per-cell codec layer is neither needed nor applied.
+#[must_use]
+pub fn encode_present_cell(payload: &[u8]) -> Bytes {
+    let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(CACHE_TAG_PRESENT);
-    buf.extend_from_slice(payload_bytes.as_ref());
-    Ok(Bytes::from(buf))
+    buf.extend_from_slice(payload);
+    Bytes::from(buf)
 }
 
 /// Decodes a cache cell into a three-valued read.
@@ -108,10 +105,14 @@ pub fn encode_present_cell(payload: &Bytes) -> Result<Bytes, FjallValueStoreErro
 /// - `Ok(Read::Unknown)` only when the cache had no entry (caller signals this
 ///   by passing `None` here).
 /// - `Ok(Read::Absent)` for a `0x00`-tagged cell.
-/// - `Ok(Read::Present(payload))` for a `0x01`-tagged cell with a non-empty
-///   zstd-compressed payload tail.
-/// - `Err(_)` for any malformed cell (empty, unknown tag, empty Present
-///   payload, codec failure).
+/// - `Ok(Read::Present(payload))` for a `0x01`-tagged cell with the raw payload
+///   tail (which may be empty — a `Set` of empty bytes is a present value
+///   distinct from `Absent`).
+/// - `Err(_)` for any malformed cell (empty buffer with no tag, unknown tag).
+///
+/// The returned `Bytes` is a fresh `copy_from_slice` of the payload tail, so
+/// it is uniquely owned — preserving the `try_into_mut` read fast path the
+/// handle relies on.
 ///
 /// # Errors
 ///
@@ -125,13 +126,11 @@ pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<Bytes>, FjallValueStoreE
         .ok_or(FjallValueStoreError::EmptyCacheCell)?;
     match *tag {
         CACHE_TAG_ABSENT => Ok(Read::Absent),
-        CACHE_TAG_PRESENT => {
-            if rest.is_empty() {
-                return Err(FjallValueStoreError::EmptyPresentPayload);
-            }
-            let payload = decode_payload(rest, CACHE_PAYLOAD_ENCODING)?;
-            Ok(Read::Present(payload))
-        }
+        // An empty tail is valid: a `Set` of empty bytes frames as `[0x01]`,
+        // so do NOT re-add an "empty tail ⇒ corrupt" guard. (The old guard was
+        // safe only because zstd padded empty payloads into a non-empty frame;
+        // raw framing has no such padding.)
+        CACHE_TAG_PRESENT => Ok(Read::Present(Bytes::copy_from_slice(rest))),
         other => Err(FjallValueStoreError::UnknownCacheTag(other)),
     }
 }

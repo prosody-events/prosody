@@ -39,10 +39,7 @@ fn absent_round_trip() -> Result<()> {
 fn present_round_trip() {
     fn prop(payload: Vec<u8>) -> TestResult {
         let payload = Bytes::from(payload);
-        let cell = match encode_present_cell(&payload) {
-            Ok(cell) => cell,
-            Err(e) => return TestResult::error(format!("encode_present_cell failed: {e}")),
-        };
+        let cell = encode_present_cell(&payload);
         match decode_cell(Some(cell.as_ref())) {
             Ok(Read::Present(decoded)) => TestResult::from_bool(decoded == payload),
             Ok(other) => TestResult::error(format!("round-trip produced {other:?}, not Present")),
@@ -51,6 +48,34 @@ fn present_round_trip() {
     }
 
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
+}
+
+/// A present cell is framed `[0x01] ++ raw payload` — byte-for-byte, no
+/// app-level compression. This pins Change 1: the fjall codec stores the
+/// payload verbatim (fjall block-compresses on disk via LZ4), so the cell is
+/// not a zstd frame. A zstd frame would begin with the magic `0x28` and differ
+/// from the raw tail for any payload, so the equality check is discriminating.
+#[test]
+fn present_cell_is_raw_tagged_payload() {
+    let payload = b"profile-payload-not-compressed".as_slice();
+    let cell = encode_present_cell(payload);
+    let mut expected = vec![0x01_u8];
+    expected.extend_from_slice(payload);
+    assert_eq!(cell.as_ref(), expected.as_slice());
+}
+
+/// A `Set` of empty bytes is a present cell distinct from `Absent`, and must
+/// round-trip as `Present(empty)`. Raw framing has no compression frame to pad
+/// an empty tail (zstd used to), so this pins the empty case deterministically
+/// rather than leaving it to the property test's dice.
+#[test]
+fn empty_payload_round_trips_as_present() -> Result<()> {
+    let cell = encode_present_cell(&[]);
+    assert_eq!(
+        decode_cell(Some(cell.as_ref()))?,
+        Read::Present(Bytes::new())
+    );
+    Ok(())
 }
 
 #[test]
@@ -73,18 +98,6 @@ fn unknown_tag_byte_is_rejected() {
             Err(super::FjallValueStoreError::UnknownCacheTag(0xFE))
         ),
         "expected UnknownCacheTag, got {result:?}"
-    );
-}
-
-#[test]
-fn present_with_zero_length_payload_is_rejected() {
-    let result = decode_cell(Some(&[0x01]));
-    assert!(
-        matches!(
-            result,
-            Err(super::FjallValueStoreError::EmptyPresentPayload)
-        ),
-        "expected EmptyPresentPayload, got {result:?}"
     );
 }
 

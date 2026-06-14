@@ -9,24 +9,41 @@
 //! the copying fallback.
 
 use super::FjallValueStore;
+use super::codec::{collection_prefix, dirty_collection_key};
+use super::dirty::FjallDirtyValueStore;
 use crate::Key;
 use crate::state::value::ValueStore;
-use crate::state::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
+use crate::state::{CollectionId, EventScopeId, Read, StateKey, StateName, StateType, ValueKind};
 use crate::test_util::TEST_RUNTIME;
-use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use fjall::{Config, PartitionCreateOptions};
+use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-/// Opens a fresh tempdir-backed cache partition and wraps it in a store. The
-/// returned `TempDir` keeps the keyspace alive for the store's lifetime.
-fn setup() -> Result<(TempDir, FjallValueStore)> {
+/// LZ4 block compression, matching the production workspace's
+/// `partition_options`.
+fn partition_options() -> PartitionCreateOptions {
+    PartitionCreateOptions::default().compression(CompressionType::Lz4)
+}
+
+/// Opens a fresh tempdir-backed keyspace and one named partition under it. The
+/// returned `TempDir` keeps the backing directory alive; the `PartitionHandle`
+/// (and any handle cloned from it) is what operates the store, so the
+/// `Keyspace` itself need not outlive the handles in-process.
+fn open(name: &str) -> Result<(TempDir, Keyspace, PartitionHandle)> {
     let dir = tempfile::tempdir()?;
     let keyspace = Config::new(dir.path()).open()?;
-    let partition = keyspace.open_partition("value_cache", PartitionCreateOptions::default())?;
+    let partition = keyspace.open_partition(name, partition_options())?;
+    Ok((dir, keyspace, partition))
+}
+
+/// Opens a fresh tempdir-backed cache partition and wraps it in a store. The
+/// returned `TempDir` keeps the backing directory alive; the store operates
+/// through the `PartitionHandle`, so the intermediate `Keyspace` is dropped.
+fn setup() -> Result<(TempDir, FjallValueStore)> {
+    let (dir, _keyspace, partition) = open("value_cache")?;
     Ok((dir, FjallValueStore::new(partition)))
 }
 
@@ -47,7 +64,7 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {
         let (_dir, store) = setup()?;
         let c = collection("uniq")?;
-        store.set(&c, Bytes::from(payload)).await?;
+        store.set(&c, &payload).await?;
         let Read::Present(bytes) = store.get(&c).await? else {
             return Err(eyre!("expected present cell"));
         };
@@ -66,4 +83,48 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
     }
 
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
+}
+
+/// Change 1, end-to-end through the stores: a present cell written via the
+/// committed cache AND via the dirty overlay is stored `[0x01] ++ raw payload`
+/// byte-for-byte. `partition.get` returns the logical value (fjall decompresses
+/// any on-disk LZ4 transparently), so an equal-to-raw result proves the app
+/// layer dropped its zstd frame — a zstd frame would differ from the raw tail
+/// for any payload.
+#[test]
+fn stored_cells_are_raw_tagged_payload() -> Result<()> {
+    let payload = b"a raw, uncompressed keyed-state payload".as_slice();
+    let mut expected = vec![0x01_u8];
+    expected.extend_from_slice(payload);
+
+    let (_dir, keyspace, cache_partition) = open("value_cache")?;
+    let overlay = keyspace.open_partition("value_dirty_overlay", partition_options())?;
+    let c = collection("raw")?;
+
+    // Committed cache.
+    let cache = FjallValueStore::new(cache_partition.clone());
+    TEST_RUNTIME.block_on(cache.set(&c, payload))?;
+    let cache_raw = cache_partition
+        .get(collection_prefix(&c))?
+        .ok_or_else(|| eyre!("cache cell missing"))?;
+    assert_eq!(
+        cache_raw.as_ref(),
+        expected.as_slice(),
+        "cache cell not raw"
+    );
+
+    // Dirty overlay.
+    let scope = EventScopeId::fresh();
+    let dirty = FjallDirtyValueStore::new(overlay.clone(), scope);
+    TEST_RUNTIME.block_on(dirty.set(&c, payload))?;
+    let overlay_raw = overlay
+        .get(dirty_collection_key(scope, &c))?
+        .ok_or_else(|| eyre!("overlay cell missing"))?;
+    assert_eq!(
+        overlay_raw.as_ref(),
+        expected.as_slice(),
+        "overlay cell not raw"
+    );
+
+    Ok(())
 }
