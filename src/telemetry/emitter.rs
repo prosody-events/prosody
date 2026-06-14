@@ -323,7 +323,11 @@ fn event_key(data: &Data) -> Option<&str> {
 /// Spawns a background task that subscribes to the telemetry broadcast channel
 /// and produces serialized events to Kafka concurrently.
 ///
-/// If `config.enabled` is `false`, this is a no-op and returns `Ok(())`.
+/// This is a no-op returning `Ok(false)` when `mock` is `true` or
+/// `config.enabled` is `false` — in either case no producer is built and no
+/// broker connection is opened. Mock mode is offline by contract, so the
+/// emitter must not contact a real broker. Returns `Ok(true)` after a
+/// successful spawn.
 ///
 /// # Errors
 ///
@@ -333,9 +337,10 @@ pub fn spawn_telemetry_emitter(
     config: &TelemetryEmitterConfiguration,
     bootstrap_servers: &[String],
     telemetry: &Telemetry,
-) -> Result<(), EmitterError> {
-    if !config.enabled {
-        return Ok(());
+    mock: bool,
+) -> Result<bool, EmitterError> {
+    if mock || !config.enabled {
+        return Ok(false);
     }
 
     let hostname: Arc<str> = hostname()?.into();
@@ -401,7 +406,7 @@ pub fn spawn_telemetry_emitter(
             .await;
     });
 
-    Ok(())
+    Ok(true)
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -735,13 +740,32 @@ mod tests {
     }
 
     #[test]
-    fn spawn_emitter_disabled_returns_ok() -> Result<()> {
+    fn spawn_emitter_disabled_returns_false() -> Result<()> {
         let config = TelemetryEmitterConfiguration {
             topic: "test".to_owned(),
             enabled: false,
         };
         let telemetry = Telemetry::new();
-        spawn_telemetry_emitter(&config, &[], &telemetry)?;
+        ensure!(
+            !spawn_telemetry_emitter(&config, &[], &telemetry, false)?,
+            "disabled emitter must not spawn"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_emitter_mock_returns_false() -> Result<()> {
+        // Enabled, but mock mode must short-circuit before any producer is
+        // built — the unresolvable bootstrap would otherwise trigger the bug.
+        let config = TelemetryEmitterConfiguration {
+            topic: "test".to_owned(),
+            enabled: true,
+        };
+        let telemetry = Telemetry::new();
+        ensure!(
+            !spawn_telemetry_emitter(&config, &["kafka:9092".to_owned()], &telemetry, true)?,
+            "mock-mode emitter must not spawn"
+        );
         Ok(())
     }
 
