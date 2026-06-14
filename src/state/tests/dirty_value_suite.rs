@@ -1,9 +1,8 @@
-//! Shared property-test fixture for dirty Value store implementations.
+//! Property-test fixture for the in-memory dirty Value store.
 //!
-//! Parallels [`super::value_suite`] in shape but tests only the
-//! dirty side. The Memory and Fjall dirty implementations are both
-//! proved against the same traces so higher layers can rely on
-//! cross-backend equivalence.
+//! Parallels [`super::value_suite`] in shape but tests only the dirty side.
+//! There is a single dirty implementation ([`DirtyValueStore`]); the trace is
+//! the contract it must uphold.
 //!
 //! Universal dirty contract enforced by [`run_dirty_trace`]:
 //!
@@ -14,41 +13,21 @@
 //! 4. Fold equivalence: `fold_value_ops(None, pending_ops().ops)` converted to
 //!    `Read<T>` equals `get()`.
 
+use super::super::dirty::DirtyValueStore;
 use super::super::value::{PendingOpSource, ValueStore, fold_value_ops};
 use super::super::{CollectionId, Read, ValueKind};
 use super::value_suite::{MAX_TRACE_OPS, bytes, capped_vec, collection_id};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen};
-use std::fmt;
-
-/// Bundle trait for any dirty Value backend.
-pub(crate) trait DirtyStore:
-    ValueStore<Error = <Self as PendingOpSource<ValueKind>>::Error>
-    + PendingOpSource<ValueKind>
-    + fmt::Debug
-    + Clone
-{
-}
-
-impl<T> DirtyStore for T where
-    T: ValueStore<Error = <Self as PendingOpSource<ValueKind>>::Error>
-        + PendingOpSource<ValueKind>
-        + fmt::Debug
-        + Clone
-{
-}
 
 /// Drives `trace` against `store` and returns `true` iff every per-op
 /// invariant held.
 ///
 /// # Errors
 ///
-/// Propagates store errors raised by the dirty backend.
-pub(crate) async fn run_dirty_trace<S>(store: S, trace: DirtyTrace) -> Result<bool>
-where
-    S: DirtyStore,
-{
+/// Propagates store errors raised by the dirty store.
+pub(crate) async fn run_dirty_trace(store: DirtyValueStore, trace: DirtyTrace) -> Result<bool> {
     let collection = collection_id("profile")?;
     let mut overlay = Read::Unknown;
 
@@ -78,14 +57,11 @@ where
     Ok(true)
 }
 
-async fn check_invariants<S>(
-    store: &S,
+async fn check_invariants(
+    store: &DirtyValueStore,
     collection: &CollectionId<ValueKind>,
     overlay: &Read<Bytes>,
-) -> Result<bool>
-where
-    S: DirtyStore,
-{
+) -> Result<bool> {
     let read = store.get(collection).await?;
     if &read != overlay {
         return Ok(false);

@@ -13,7 +13,6 @@ use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::tests::bind_registered;
-use crate::state::memory::MemoryDirtyValueStore;
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::{Value, json};
@@ -92,7 +91,7 @@ async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
     let loader = MemoryLoader::<Value>::new();
     loader.store_message(topic, partition, offset, key, payload.clone());
 
-    let handle = bind_registered(last_seen(), MemoryDirtyValueStore::new(), loader)?;
+    let handle = bind_registered(last_seen(), loader)?;
     handle.set(&message_for_testing(payload.clone())?).await?;
 
     let message = handle
@@ -115,7 +114,7 @@ async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
     let loader = MemoryLoader::<Value>::new();
     loader.store_message(topic, partition, offset, Arc::from("user-1"), json!(1_i32));
 
-    let handle = bind_registered(last_seen(), MemoryDirtyValueStore::new(), loader.clone())?;
+    let handle = bind_registered(last_seen(), loader.clone())?;
     handle.set(&message_for_testing(json!(1_i32))?).await?;
     loader.remove_message(topic, partition, offset);
 
@@ -133,11 +132,7 @@ async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
 /// An absent cell reads as `Ok(None)` without consulting the loader.
 #[tokio::test]
 async fn kafka_descriptor_absent_cell_returns_none() -> Result<()> {
-    let handle = bind_registered(
-        last_seen(),
-        MemoryDirtyValueStore::new(),
-        MemoryLoader::<Value>::new(),
-    )?;
+    let handle = bind_registered(last_seen(), MemoryLoader::<Value>::new())?;
     assert!(handle.get().await?.is_none());
     Ok(())
 }

@@ -2,8 +2,19 @@
 //!
 //! `FjallValueStore` stores a per-collection cell in a fjall partition and is
 //! wired as the per-partition [`CommittedCache`] for the
-//! [`PartitionStateStore`](crate::state::partition_store::PartitionStateStore);
-//! the dirty Value workspace is the Fjall-backed [`FjallDirtyValueStore`].
+//! [`PartitionStateStore`](crate::state::partition_store::PartitionStateStore).
+//! It is a read-through optimization over the authoritative cell store; the
+//! per-event dirty workspace is a separate in-memory
+//! [`DirtyValueStore`](crate::state::dirty::DirtyValueStore).
+//!
+//! # Workspace ownership
+//!
+//! In production the cache store **owns** its [`FjallWorkspace`] (built via
+//! [`FjallValueStore::for_workspace`]). The workspace's `Drop` deletes the
+//! fjall partition, so the cache must hold it alive for the whole partition
+//! assignment — it lives in the partition's state manager and drops only at
+//! revocation. Test stores built from a bare handle ([`FjallValueStore::new`])
+//! own no workspace.
 //!
 //! # Three-valued reads
 //!
@@ -21,15 +32,11 @@
 //! fjall's public API is synchronous, so the cache's reads and writes are
 //! dispatched through [`tokio::task::spawn_blocking`] (in the `cell_io`
 //! submodule), which clones the cheap `Arc`-backed handle into each blocking
-//! closure. The lone exception is the dirty store's synchronous
-//! [`PendingOpSource`](crate::state::value::PendingOpSource) path: that trait
-//! is synchronous, so its methods call fjall directly off the caller's thread
-//! rather than through `spawn_blocking` (see the `dirty` submodule).
+//! closure.
 
 mod cell_io;
 mod codec;
 mod config;
-mod dirty;
 mod error;
 mod workspace;
 
@@ -37,7 +44,6 @@ mod workspace;
 mod tests;
 
 pub use config::FjallConfiguration;
-pub use dirty::{FjallDirtyValueStore, FjallDirtyValueStoreProvider, FjallFactoryError};
 pub use error::FjallValueStoreError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
@@ -54,27 +60,54 @@ use std::sync::Arc;
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct FjallValueStore {
+    #[educe(Debug(ignore))]
     inner: Arc<Inner>,
 }
 
-#[derive(Educe)]
-#[educe(Debug)]
-struct Inner {
-    #[educe(Debug(ignore))]
-    partition: PartitionHandle,
+/// Backing for a [`FjallValueStore`]: either a bare cache handle (tests) or
+/// an owned per-partition workspace whose cache handle the store operates and
+/// whose `Drop` deletes the partition at revocation (production).
+enum Inner {
+    Bare(PartitionHandle),
+    Owned(FjallWorkspace),
+}
+
+impl Inner {
+    /// The cache partition handle this store operates.
+    fn partition(&self) -> &PartitionHandle {
+        match self {
+            Self::Bare(partition) => partition,
+            Self::Owned(workspace) => workspace.cache_handle(),
+        }
+    }
 }
 
 impl FjallValueStore {
-    /// Builds a cache store over an opened cache `PartitionHandle`.
+    /// Builds a cache store over an opened cache `PartitionHandle`, owning no
+    /// workspace.
     ///
-    /// The caller owns the keyspace the handle belongs to and is
-    /// responsible for keeping it alive for the store's lifetime —
-    /// production passes [`FjallWorkspace::cache_handle`], whose keyspace
-    /// the per-process [`FjallClient`] holds open.
+    /// The caller owns the keyspace the handle belongs to and is responsible
+    /// for keeping it (and the partition) alive for the store's lifetime.
+    /// Used by tests; production uses [`Self::for_workspace`], which owns the
+    /// workspace.
     #[must_use]
     pub fn new(partition: PartitionHandle) -> Self {
         Self {
-            inner: Arc::new(Inner { partition }),
+            inner: Arc::new(Inner::Bare(partition)),
+        }
+    }
+
+    /// Builds the production cache store, taking ownership of the
+    /// per-partition [`FjallWorkspace`].
+    ///
+    /// The store operates the workspace's cache handle and holds the
+    /// workspace alive, so the workspace's `Drop` — which deletes the fjall
+    /// partition — fires only when the store (and thus the partition's state
+    /// manager) is dropped at revocation.
+    #[must_use]
+    pub fn for_workspace(workspace: FjallWorkspace) -> Self {
+        Self {
+            inner: Arc::new(Inner::Owned(workspace)),
         }
     }
 }
@@ -86,8 +119,8 @@ impl ValueStore for FjallValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Read<Bytes>, Self::Error> {
-        let raw =
-            cell_io::read_cell(&self.inner.partition, codec::collection_prefix(collection)).await?;
+        let raw = cell_io::read_cell(self.inner.partition(), codec::collection_prefix(collection))
+            .await?;
         codec::decode_cell(raw.as_deref())
     }
 
@@ -97,7 +130,7 @@ impl ValueStore for FjallValueStore {
         payload: &'a [u8],
     ) -> Result<(), Self::Error> {
         cell_io::write_cell(
-            &self.inner.partition,
+            self.inner.partition(),
             codec::collection_prefix(collection),
             codec::encode_present_cell(payload),
         )
@@ -109,7 +142,7 @@ impl ValueStore for FjallValueStore {
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
         cell_io::write_cell(
-            &self.inner.partition,
+            self.inner.partition(),
             codec::collection_prefix(collection),
             codec::encode_absent_cell(),
         )
@@ -158,6 +191,6 @@ impl CommittedCache<ValueKind> for FjallValueStore {
         // True invalidation: removes the cell so the next read decodes
         // `Read::Unknown` (a miss), unlike `ValueStore::clear`, which writes
         // an authoritative `Absent` cell.
-        cell_io::remove_cell(&self.inner.partition, codec::collection_prefix(collection)).await
+        cell_io::remove_cell(self.inner.partition(), codec::collection_prefix(collection)).await
     }
 }

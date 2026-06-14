@@ -38,8 +38,8 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// ```
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
-    /// Root directory for the local fjall workspace (committed-value cache
-    /// + dirty overlays).
+    /// Root directory for the local fjall workspace (the committed-value
+    /// cache).
     ///
     /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
     /// **must** set it — the cache is wiped on process restart, so the mount

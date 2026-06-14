@@ -9,7 +9,8 @@ use self::cell_suite::{
 };
 use self::dirty_value_suite::DirtyTrace;
 use self::value_suite::{bytes, collection_id};
-use super::memory::{MemoryCellStore, MemoryDirtyValueStore};
+use super::dirty::DirtyValueStore;
+use super::memory::MemoryCellStore;
 use super::value::{ValueOp, fold_value_ops};
 use super::{CollectionKindId, CollectionRef, ValueKind};
 use color_eyre::eyre::Result;
@@ -70,10 +71,10 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
 }
 
 #[test]
-fn prop_memory_dirty_satisfies_invariants() {
+fn prop_dirty_store_satisfies_invariants() {
     fn property(trace: DirtyTrace) -> Result<bool> {
         executor::block_on(dirty_value_suite::run_dirty_trace(
-            MemoryDirtyValueStore::new(),
+            DirtyValueStore::new(),
             trace,
         ))
     }

@@ -527,7 +527,7 @@ mod rollback_safety {
     use crate::state::cell::Cell;
     use crate::state::descriptor::tests::{TestSession, test_session_parts};
     use crate::state::descriptor::{ValueDescriptor, value_state};
-    use crate::state::memory::{MemoryCellStore, MemoryDirtyValueStore};
+    use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
     use crate::state::session::LifecycleAccess;
     use crate::state::session::sealed::FinalizeOutcome;
@@ -564,7 +564,7 @@ mod rollback_safety {
         }
     }
 
-    type Ctx = MockEventContext<serde_json::Value, TestSession<MemoryDirtyValueStore>>;
+    type Ctx = MockEventContext<serde_json::Value, TestSession>;
 
     /// The `cart` descriptor with the default JSON codec.
     fn cart() -> ValueDescriptor {
@@ -579,12 +579,8 @@ mod rollback_safety {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&cart(), CollectionDef::new(None))?;
         let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
-        let (session, cell_store) = test_session_parts(
-            MemoryDirtyValueStore::new(),
-            MemoryLoader::new(),
-            registry,
-            state_key.clone(),
-        );
+        let (session, cell_store) =
+            test_session_parts(MemoryLoader::new(), registry, state_key.clone());
         let base = MockEventContext::new().with_session(session);
         let context: Ctx = if arm_failure {
             base.with_arm_failure()
@@ -718,7 +714,6 @@ mod backstop_amortization {
     use crate::state::StateKey;
     use crate::state::descriptor::tests::test_session_with_armed;
     use crate::state::descriptor::{ValueDescriptor, value_state};
-    use crate::state::memory::MemoryDirtyValueStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
     use crate::state::session::{ArmedKeys, LifecycleAccess};
     use color_eyre::eyre::{Result, eyre};
@@ -745,7 +740,6 @@ mod backstop_amortization {
             // A fresh session per event, all sharing the one `armed` set and key
             // — exactly how the manager mints sessions for a partition.
             let (session, _store) = test_session_with_armed(
-                MemoryDirtyValueStore::new(),
                 MemoryLoader::new(),
                 registry,
                 state_key.clone(),
@@ -792,13 +786,8 @@ mod backstop_amortization {
             let state_key = StateKey::new(Uuid::from_u128(0xA), Arc::from(raw_key));
             let mut registry = CollectionDefRegistry::default();
             registry.register(&cart(), CollectionDef::new(None))?;
-            let (session, _store) = test_session_with_armed(
-                MemoryDirtyValueStore::new(),
-                MemoryLoader::new(),
-                registry,
-                state_key,
-                armed.clone(),
-            );
+            let (session, _store) =
+                test_session_with_armed(MemoryLoader::new(), registry, state_key, armed.clone());
             let context = MockEventContext::new()
                 .with_session(session)
                 .with_timer_tracking();

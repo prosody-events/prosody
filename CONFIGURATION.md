@@ -75,7 +75,7 @@ reloads and keyed-state message resolution.
 
 | Environment Variable      | Description                                        | Default                  |
 |---------------------------|----------------------------------------------------|--------------------------|
-| `PROSODY_FJALL_CACHE_DIR` | Local fjall workspace (committed-value cache + dirty overlays). Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
+| `PROSODY_FJALL_CACHE_DIR` | Local fjall workspace (the committed-value cache). Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
 
 ## Deduplication (All Modes)
 

@@ -5,7 +5,7 @@
 //!
 //! * [`CassandraStateBackendFactory`] mints, per partition, the
 //!   [`CassandraCellStore`] (shared), a per-partition fjall committed-value
-//!   cache and dirty workspace, and the segment-scoped commit oracle.
+//!   cache, and the segment-scoped commit oracle.
 //! * [`MemoryStateBackendFactory`] mints the in-memory equivalents over a
 //!   process-wide shared [`MemoryCellStore`].
 //! * [`ProductionOracle`] names the commit oracle ([`CommitManager`]) that
@@ -18,10 +18,8 @@ use crate::ConsumerGroup;
 use crate::commit_manager::{CommitManager, StoreTagSource};
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::state::cassandra::CassandraCellStore;
-use crate::state::fjall::{
-    AssignmentEpoch, FjallClient, FjallDirtyValueStoreProvider, FjallFactoryError, FjallValueStore,
-};
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStoreProvider};
+use crate::state::fjall::{AssignmentEpoch, FjallClient, FjallValueStore, FjallValueStoreError};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
 use crate::state::{BackendOf, StateBackend, StateBackendFactory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStoreProvider};
@@ -44,11 +42,12 @@ pub type ProductionOracle<DP, TP> = CommitManager<
 
 /// [`StateBackendFactory`] for the Cassandra storage backend.
 ///
-/// Per partition it opens one fjall workspace (committed cache + dirty
-/// overlay), mints the segment-scoped commit oracle, and hands out a clone of
-/// the shared [`CassandraCellStore`] — so the sessions stage and the recovery
-/// sweep resolve through one oracle, and the cache and dirty workspaces share
-/// one fjall instance.
+/// Per partition it opens one fjall workspace (the committed-value cache),
+/// mints the segment-scoped commit oracle, and hands out a clone of the shared
+/// [`CassandraCellStore`] — so the sessions stage and the recovery sweep
+/// resolve through one oracle. The cache store owns the workspace, so the
+/// workspace's `Drop` (which deletes the fjall partition) fires only at
+/// partition revocation.
 #[derive(Clone)]
 pub struct CassandraStateBackendFactory<DP, TP> {
     client: Arc<FjallClient>,
@@ -94,8 +93,7 @@ where
 {
     type Cache = FjallValueStore;
     type Cell = CassandraCellStore;
-    type DirtyProvider = FjallDirtyValueStoreProvider;
-    type Error = FjallFactoryError;
+    type Error = FjallValueStoreError;
     type Oracle = ProductionOracle<DP, TP>;
 
     fn for_partition(
@@ -104,12 +102,11 @@ where
         partition: Partition,
     ) -> Result<BackendOf<Self>, Self::Error> {
         let epoch = AssignmentEpoch::mint();
-        let workspace = Arc::new(
-            self.client
-                .workspace(topic, partition, epoch)
-                .map_err(FjallFactoryError::Workspace)?,
-        );
-        let cache = FjallValueStore::new(workspace.cache_handle().clone());
+        let workspace = self.client.workspace(topic, partition, epoch)?;
+        // The cache store takes ownership of the workspace, holding it (and so
+        // its on-disk partition) alive until the partition's state manager is
+        // dropped at revocation.
+        let cache = FjallValueStore::for_workspace(workspace);
         let oracle = mint_oracle(
             &self.dedup,
             &self.triggers,
@@ -122,7 +119,6 @@ where
             cell: self.cell.clone(),
             oracle,
             cache,
-            dirty: FjallDirtyValueStoreProvider::new(workspace),
         })
     }
 }
@@ -170,7 +166,6 @@ where
 {
     type Cache = MemoryCommittedCache;
     type Cell = MemoryCellStore;
-    type DirtyProvider = MemoryDirtyValueStoreProvider;
     type Error = Infallible;
     type Oracle = ProductionOracle<DP, TP>;
 
@@ -191,7 +186,6 @@ where
             cell: self.cell.clone(),
             oracle,
             cache: MemoryCommittedCache::new(),
-            dirty: MemoryDirtyValueStoreProvider,
         })
     }
 }

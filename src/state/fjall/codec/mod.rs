@@ -35,7 +35,7 @@
 //! fjall keyspace.
 
 use super::error::FjallValueStoreError;
-use crate::state::{CollectionId, CollectionKind, EventScopeId, Read};
+use crate::state::{CollectionId, CollectionKind, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -133,31 +133,6 @@ pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<Bytes>, FjallValueStoreE
         CACHE_TAG_PRESENT => Ok(Read::Present(Bytes::copy_from_slice(rest))),
         other => Err(FjallValueStoreError::UnknownCacheTag(other)),
     }
-}
-
-/// Returns the `dirty_overlay` partition key for `(scope, collection)`.
-///
-/// The key is `[scope_be_16][collection_prefix_16]`: the 16-byte big-endian
-/// event scope followed verbatim by the collection's [`collection_prefix`].
-/// Prefixing with the scope keeps two concurrent events on the same Kafka
-/// partition from colliding in the shared dirty workspace, while preserving
-/// the collection hash as a stable, scannable suffix — the per-element-keying
-/// structure the Map/Deque overlays will build on. No second hash is needed:
-/// the scope is already fixed-width, so concatenation is injective.
-///
-/// The dirty workspace is a single compacted overlay cell per collection —
-/// the same tagged-cell shape as the committed cache (`0x01` = pending Set,
-/// `0x00` = pending Clear, key-absent = no pending op). It carries the LWW
-/// final op directly, so there is no separate ops log or sequence counter.
-#[must_use]
-pub fn dirty_collection_key<K>(scope: EventScopeId, id: &CollectionId<K>) -> [u8; 32]
-where
-    K: CollectionKind,
-{
-    let mut buf = [0_u8; 32];
-    buf[..16].copy_from_slice(&scope.get().to_be_bytes());
-    buf[16..].copy_from_slice(&collection_prefix(id));
-    buf
 }
 
 #[cfg(test)]

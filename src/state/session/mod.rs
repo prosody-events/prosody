@@ -43,14 +43,15 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell::ProvisionalWrite;
 use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
+use crate::state::dirty::DirtyValueStore;
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::value::{PendingOpSource, ValueApplied, ValueKind, ValueStore, fold_value_ops};
 use crate::state::{
-    CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyStoreProvider, EventRef,
-    EventScopeId, Read, STATE_FANOUT_CONCURRENCY, StateKey, StateName, StateType, StoreOutcome,
+    CollectionId, CollectionKindId, CollectionRef, CommitMode, EventRef, Read,
+    STATE_FANOUT_CONCURRENCY, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -75,23 +76,6 @@ use uuid::Uuid;
 /// across the partition's keys, so a single mutex would serialize unrelated
 /// keys.
 pub(crate) type ArmedKeys = Arc<ConcurrentHashSet<Key, RandomState>>;
-
-/// Bundle bound for the per-event dirty Value store a session composes
-/// with.
-///
-/// Pulled out so impl blocks downstream can reference the bound without
-/// repeating the individual trait constraints. Both
-/// [`crate::state::memory::MemoryDirtyValueStore`] and
-/// [`crate::state::fjall::FjallDirtyValueStore`] satisfy it.
-pub trait DirtyValueBundle:
-    ValueStore + PendingOpSource<ValueKind, Error = <Self as ValueStore>::Error> + Clone
-{
-}
-
-impl<T> DirtyValueBundle for T where
-    T: ValueStore + PendingOpSource<ValueKind, Error = <T as ValueStore>::Error> + Clone
-{
-}
 
 /// Per-event keyed-state session: typed descriptor handles operate over
 /// its byte cells, the framework drives its (crate-sealed) lifecycle.
@@ -344,20 +328,13 @@ struct StagePrep {
 
 /// Construction parameters for [`ValueStateSession`], bundled so the
 /// constructor stays readable.
-pub struct SessionParts<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-{
+pub struct SessionParts<S, O, C, L> {
     /// Partition-lifetime cell store + oracle + cache + status map.
     pub store: PartitionStateStore<ValueKind, S, O, C>,
 
     /// Partition-lifetime commit oracle; the marker flush writes the
     /// message commit row through it. Same instance baked into `store`.
     pub oracle: O,
-
-    /// Partition-lifetime dirty-workspace provider; `reset` mints fresh
-    /// scopes from it.
-    pub dirty: P,
 
     /// Opaque per-session capability slot a [`CellResolver`] reads at
     /// resolve time (the consumer pins it to its message loader).
@@ -386,16 +363,13 @@ where
     pub termination: TerminationWatch,
 }
 
-struct SessionInner<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-{
+struct SessionInner<S, O, C, L> {
     store: PartitionStateStore<ValueKind, S, O, C>,
     oracle: O,
-    dirty_provider: P,
-    /// Current per-event dirty workspace; swapped for a fresh scope on
-    /// `reset`.
-    dirty: SyncMutex<P::Store>,
+    /// Per-event dirty workspace; cleared in place on `reset`. A single
+    /// in-memory store owned uniquely by this session — never shared, never a
+    /// durability or recovery source.
+    dirty: DirtyValueStore,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
@@ -420,19 +394,12 @@ where
 /// One session is minted per event by the partition's state manager;
 /// clones share the per-event dirty scope, touched set, recorded staged set,
 /// and registered marker. `S` is the cell store, `O` the commit oracle, `C`
-/// the committed-value cache, `P` the per-partition dirty-workspace provider,
-/// `L` the message loader.
-pub struct ValueStateSession<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-{
-    inner: Arc<SessionInner<S, O, C, P, L>>,
+/// the committed-value cache, `L` the message loader.
+pub struct ValueStateSession<S, O, C, L> {
+    inner: Arc<SessionInner<S, O, C, L>>,
 }
 
-impl<S, O, C, P, L> Clone for ValueStateSession<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-{
+impl<S, O, C, L> Clone for ValueStateSession<S, O, C, L> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -440,10 +407,7 @@ where
     }
 }
 
-impl<S, O, C, P, L> fmt::Debug for ValueStateSession<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-{
+impl<S, O, C, L> fmt::Debug for ValueStateSession<S, O, C, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValueStateSession")
             .field("state_key", &self.inner.state_key)
@@ -452,17 +416,13 @@ where
     }
 }
 
-impl<S, O, C, P, L> ValueStateSession<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-{
+impl<S, O, C, L> ValueStateSession<S, O, C, L> {
     /// Creates a session for one event, opening a fresh dirty scope.
     #[must_use]
-    pub fn new(parts: SessionParts<S, O, C, P, L>) -> Self {
+    pub fn new(parts: SessionParts<S, O, C, L>) -> Self {
         let SessionParts {
             store,
             oracle,
-            dirty,
             loader,
             registry,
             state_key,
@@ -471,13 +431,11 @@ where
             armed,
             termination,
         } = parts;
-        let scope = dirty.for_scope(EventScopeId::fresh());
         Self {
             inner: Arc::new(SessionInner {
                 store,
                 oracle,
-                dirty_provider: dirty,
-                dirty: SyncMutex::new(scope),
+                dirty: DirtyValueStore::new(),
                 loader,
                 registry,
                 state_key,
@@ -506,36 +464,17 @@ where
             self.inner.registry.ttl_for(name),
         )
     }
-}
 
-impl<S, O, C, P, L> ValueStateSession<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: Clone,
-{
-    /// Clones the current per-event dirty scope so its async ops run without
-    /// holding the swap mutex across an await.
-    fn dirty_scope(&self) -> P::Store {
-        self.inner.dirty.lock().clone()
-    }
-}
-
-impl<S, O, C, P, L> ValueStateSession<S, O, C, P, L>
-where
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: DirtyValueBundle,
-{
     /// Folds a touched collection's buffered ops into the write `finalize`
-    /// will stage, reading from `dirty` synchronously so the `Ops<'a>` borrow
-    /// is released before any await. `None` means the collection was touched
-    /// (e.g. via `get`) but never written, so there is nothing to stage.
-    fn stage_prep(
-        &self,
-        dirty: &P::Store,
-        name: &StateName,
-    ) -> Result<Option<StagePrep>, StateAccessError> {
+    /// will stage, reading the dirty store synchronously so the `Ops<'a>`
+    /// borrow is released before any await. `None` means the collection was
+    /// touched (e.g. via `get`) but never written, so there is nothing to
+    /// stage.
+    fn stage_prep(&self, name: &StateName) -> Result<Option<StagePrep>, StateAccessError> {
         let id = self.collection_id_for(name);
-        let value = match dirty
+        let value = match self
+            .inner
+            .dirty
             .pending_ops(&id)
             .map_err(|e| StateAccessError::store(&e))?
         {
@@ -551,13 +490,11 @@ where
     }
 }
 
-impl<S, O, C, P, L> StateSession for ValueStateSession<S, O, C, P, L>
+impl<S, O, C, L> StateSession for ValueStateSession<S, O, C, L>
 where
     S: CellStore<ValueKind>,
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: DirtyValueBundle + Send + Sync,
     L: Clone + Send + Sync + 'static,
 {
     type Loader = L;
@@ -585,8 +522,9 @@ where
 
     async fn state_cell(&self, name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
         let id = self.collection_id_for(name);
-        let dirty = self.dirty_scope();
-        match dirty
+        match self
+            .inner
+            .dirty
             .get(&id)
             .await
             .map_err(|e| StateAccessError::store(&e))?
@@ -604,7 +542,8 @@ where
 
     async fn set_state_cell(&self, name: &StateName, cell: &[u8]) -> Result<(), StateAccessError> {
         let id = self.collection_id_for(name);
-        self.dirty_scope()
+        self.inner
+            .dirty
             .set(&id, cell)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
@@ -614,7 +553,8 @@ where
 
     async fn clear_state_cell(&self, name: &StateName) -> Result<(), StateAccessError> {
         let id = self.collection_id_for(name);
-        self.dirty_scope()
+        self.inner
+            .dirty
             .clear(&id)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
@@ -624,8 +564,9 @@ where
 
     async fn flush_state_cell(&self, name: &StateName) -> Result<StoreOutcome, StateAccessError> {
         let id = self.collection_id_for(name);
-        let dirty = self.dirty_scope();
-        let Some(pending) = dirty
+        let Some(pending) = self
+            .inner
+            .dirty
             .pending_ops(&id)
             .map_err(|e| StateAccessError::store(&e))?
         else {
@@ -638,7 +579,8 @@ where
             .write_resolved(&collection_ref, &(), value.as_ref())
             .await
             .map_err(|e| StateAccessError::store(&e))?;
-        dirty
+        self.inner
+            .dirty
             .clear_pending_ops(&id)
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(StoreOutcome::Applied)
@@ -649,13 +591,11 @@ where
     }
 }
 
-impl<S, O, C, P, L> StateLifecycle for ValueStateSession<S, O, C, P, L>
+impl<S, O, C, L> StateLifecycle for ValueStateSession<S, O, C, L>
 where
     S: CellStore<ValueKind>,
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
-    P: DirtyStoreProvider<ValueKind>,
-    P::Store: DirtyValueBundle + Send + Sync,
     L: Send + Sync + 'static,
 {
     /// Stages dirty `ReadCommitted` collections as provisional cells and
@@ -672,24 +612,23 @@ where
         // Clone the touched set (don't drain): an in-place transient retry
         // re-runs `finalize` and needs `touched` intact.
         let names: Vec<StateName> = self.inner.touched.lock().iter().cloned().collect();
-        let dirty = self.dirty_scope();
         let store = &self.inner.store;
         let event = self.inner.event;
         // Distinct collections are distinct ids = distinct cache keys, status
         // keys, and Cassandra partitions, so per-collection staging fans out
         // concurrently with no intra-event races. The fallible synchronous prep
-        // (pending ops + fold + refs) runs in the `map` closure, borrowing the
-        // cloned dirty scope, and only owned data crosses into the future — no
+        // (pending ops + fold + refs) runs in the `map` closure, reading the
+        // dirty store, and only owned data crosses into the future — no
         // `Ops<'a>` borrow spans an await.
         let staged: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)> = stream::iter(names)
             .map(|name| {
-                let prepared = self.stage_prep(&dirty, &name);
+                let prepared = self.stage_prep(&name);
                 // `cooperative` adds a per-item coop-budget checkpoint: the
-                // in-memory and fjall stores complete each future without a
-                // tokio leaf await, so a key touching many collections would
-                // otherwise drain the whole batch in one poll and starve the
-                // worker. Concurrency is unchanged — `buffer_unordered` still
-                // drives `STATE_FANOUT_CONCURRENCY` of these at once.
+                // in-memory store completes each future without a tokio leaf
+                // await, so a key touching many collections would otherwise
+                // drain the whole batch in one poll and starve the worker.
+                // Concurrency is unchanged — `buffer_unordered` still drives
+                // `STATE_FANOUT_CONCURRENCY` of these at once.
                 cooperative(async move {
                     let Some(StagePrep {
                         id,
@@ -819,9 +758,10 @@ where
     }
 
     fn reset(&self) {
-        // Swap in a fresh dirty scope first so no cleared op can observe the
-        // old workspace through a racing re-open.
-        *self.inner.dirty.lock() = self.inner.dirty_provider.for_scope(EventScopeId::fresh());
+        // Clear the dirty store in place, reusing its allocation. Per-key
+        // serialization means no handler op is in flight here, so there is no
+        // racing observer to guard against.
+        self.inner.dirty.clear_all();
         self.inner.touched.lock().clear();
         *self.inner.staged.lock() = None;
         *self.inner.marker.lock() = None;

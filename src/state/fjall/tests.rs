@@ -9,11 +9,10 @@
 //! the copying fallback.
 
 use super::FjallValueStore;
-use super::codec::{collection_prefix, dirty_collection_key};
-use super::dirty::FjallDirtyValueStore;
+use super::codec::collection_prefix;
 use crate::Key;
 use crate::state::value::ValueStore;
-use crate::state::{CollectionId, EventScopeId, Read, StateKey, StateName, StateType, ValueKind};
+use crate::state::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::eyre::{Result, eyre};
 use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
@@ -85,23 +84,21 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
-/// Change 1, end-to-end through the stores: a present cell written via the
-/// committed cache AND via the dirty overlay is stored `[0x01] ++ raw payload`
-/// byte-for-byte. `partition.get` returns the logical value (fjall decompresses
-/// any on-disk LZ4 transparently), so an equal-to-raw result proves the app
-/// layer dropped its zstd frame — a zstd frame would differ from the raw tail
-/// for any payload.
+/// Change 1, end-to-end through the cache store: a present cell written via the
+/// committed cache is stored `[0x01] ++ raw payload` byte-for-byte.
+/// `partition.get` returns the logical value (fjall decompresses any on-disk
+/// LZ4 transparently), so an equal-to-raw result proves the app layer dropped
+/// its zstd frame — a zstd frame would differ from the raw tail for any
+/// payload.
 #[test]
 fn stored_cells_are_raw_tagged_payload() -> Result<()> {
     let payload = b"a raw, uncompressed keyed-state payload".as_slice();
     let mut expected = vec![0x01_u8];
     expected.extend_from_slice(payload);
 
-    let (_dir, keyspace, cache_partition) = open("value_cache")?;
-    let overlay = keyspace.open_partition("value_dirty_overlay", partition_options())?;
+    let (_dir, _keyspace, cache_partition) = open("value_cache")?;
     let c = collection("raw")?;
 
-    // Committed cache.
     let cache = FjallValueStore::new(cache_partition.clone());
     TEST_RUNTIME.block_on(cache.set(&c, payload))?;
     let cache_raw = cache_partition
@@ -111,19 +108,6 @@ fn stored_cells_are_raw_tagged_payload() -> Result<()> {
         cache_raw.as_ref(),
         expected.as_slice(),
         "cache cell not raw"
-    );
-
-    // Dirty overlay.
-    let scope = EventScopeId::fresh();
-    let dirty = FjallDirtyValueStore::new(overlay.clone(), scope);
-    TEST_RUNTIME.block_on(dirty.set(&c, payload))?;
-    let overlay_raw = overlay
-        .get(dirty_collection_key(scope, &c))?
-        .ok_or_else(|| eyre!("overlay cell missing"))?;
-    assert_eq!(
-        overlay_raw.as_ref(),
-        expected.as_slice(),
-        "overlay cell not raw"
     );
 
     Ok(())

@@ -56,8 +56,9 @@ pub trait ValueStore: Send + Sync + 'static {
     /// Takes the payload by shared slice so the caller never has to clone or
     /// hand over a `Bytes`: it can pass a transient or pooled, reusable
     /// serialize buffer. Each implementation frames the slice into its own
-    /// cell buffer as its storage requires — the fjall stores frame it without
-    /// a copy, while an owning backend may copy it once.
+    /// cell buffer as its storage requires — the in-memory dirty store copies
+    /// it once into an owned `Bytes`; the fjall cache frames it into a tagged
+    /// cell.
     fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
@@ -72,7 +73,7 @@ pub trait ValueStore: Send + Sync + 'static {
 }
 
 /// Source of compacted pending operations for a collection kind.
-pub trait PendingOpSource<K>: Clone + Send + Sync + 'static
+pub trait PendingOpSource<K>: Send + Sync + 'static
 where
     K: CollectionKind,
 {

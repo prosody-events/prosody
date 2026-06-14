@@ -1,10 +1,9 @@
 //! Descriptor binding, registration, and typed round-trip tests.
 //!
 //! N2 — the typed `set(T) → cell bytes → store → get() → T` round-trip over
-//! the real per-event session machinery, run against both the memory and
-//! fjall dirty backends. N4 — the two-instance interface proof: the JSON and
-//! Kafka descriptors bind through the *same* session machinery
-//! ([`bind_registered`]). N5 — registration and bind error surfaces,
+//! the real per-event session machinery. N4 — the two-instance interface
+//! proof: the JSON and Kafka descriptors bind through the *same* session
+//! machinery ([`bind_registered`]). N5 — registration and bind error surfaces,
 //! including the state-unavailable stub on contexts without keyed state.
 
 use super::*;
@@ -14,22 +13,15 @@ use crate::consumer::kafka_state::kafka_message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::fjall::FjallDirtyValueStore;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStore};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
-use crate::state::session::{
-    ArmedKeys, DirtyValueBundle, SessionParts, TerminationWatch, ValueStateSession,
-};
-use crate::state::value::{PendingOpSource, ValueKind};
-use crate::state::{
-    CommitDecision, CommitMode, DirtyStoreProvider, EventRef, EventScopeId, StateKey, StateName,
-};
-use crate::test_util::{ArbJson, TEST_RUNTIME};
+use crate::state::session::{ArmedKeys, SessionParts, TerminationWatch, ValueStateSession};
+use crate::state::{CommitDecision, CommitMode, EventRef, StateKey, StateName};
+use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
-use fjall::{CompressionType, Config, PartitionCreateOptions};
 use futures::executor;
 use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
@@ -37,7 +29,6 @@ use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tempfile::TempDir;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -78,62 +69,34 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
     }
 }
 
-/// Test-only dirty provider handing out clones of one pre-built store, so
-/// the round-trip properties can inject either dirty backend.
-#[derive(Clone, Debug)]
-pub(crate) struct FixedDirtyProvider<S>(S);
-
-impl<S> DirtyStoreProvider<ValueKind> for FixedDirtyProvider<S>
-where
-    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
-{
-    type Store = S;
-
-    fn for_scope(&self, _scope: EventScopeId) -> S {
-        self.0.clone()
-    }
-}
-
-pub(crate) type TestSession<S> = ValueStateSession<
-    MemoryCellStore,
-    FixedOracle,
-    MemoryCommittedCache,
-    FixedDirtyProvider<S>,
-    MemoryLoader<Value>,
->;
+pub(crate) type TestSession =
+    ValueStateSession<MemoryCellStore, FixedOracle, MemoryCommittedCache, MemoryLoader<Value>>;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
 /// kind runs through (the N4 proof is that both the JSON tests here and
 /// the Kafka-message tests in
 /// [`crate::consumer::kafka_state::tests`] call exactly this).
-pub(crate) fn bind_registered<DESC, S>(
+pub(crate) fn bind_registered<DESC>(
     descriptor: DESC,
-    dirty: S,
     loader: MemoryLoader<Value>,
-) -> Result<DESC::Handle<TestSession<S>>>
+) -> Result<DESC::Handle<TestSession>>
 where
     DESC: StateDescriptor,
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&descriptor, CollectionDef::new(None))?;
-    let session = test_session(dirty, loader, registry);
+    let session = test_session(loader, registry);
     descriptor
         .bind(&session)
         .map_err(|e| eyre!("bind failed: {e}"))
 }
 
-pub(crate) fn test_session<S>(
-    dirty: S,
+pub(crate) fn test_session(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
-) -> TestSession<S>
-where
-    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
-{
+) -> TestSession {
     test_session_parts(
-        dirty,
         loader,
         registry,
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
@@ -145,31 +108,23 @@ where
 /// the underlying [`MemoryCellStore`] (a clone sharing the durable `Arc`), so a
 /// caller can inspect the durable cell directly after driving the session
 /// through its lifecycle.
-pub(crate) fn test_session_parts<S>(
-    dirty: S,
+pub(crate) fn test_session_parts(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-) -> (TestSession<S>, MemoryCellStore)
-where
-    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
-{
-    test_session_with_armed(dirty, loader, registry, state_key, Arc::default())
+) -> (TestSession, MemoryCellStore) {
+    test_session_with_armed(loader, registry, state_key, Arc::default())
 }
 
 /// Like [`test_session_parts`] but shares an explicit `armed` set across
 /// sessions, so a test can drive several events on the same key through one
 /// per-partition backstop-amortization state.
-pub(crate) fn test_session_with_armed<S>(
-    dirty: S,
+pub(crate) fn test_session_with_armed(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
     state_key: StateKey,
     armed: ArmedKeys,
-) -> (TestSession<S>, MemoryCellStore)
-where
-    S: PendingOpSource<ValueKind> + fmt::Debug + Clone + Send + Sync + 'static,
-{
+) -> (TestSession, MemoryCellStore) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let registry = Arc::new(registry);
@@ -183,7 +138,6 @@ where
     let session = ValueStateSession::new(SessionParts {
         store,
         oracle: FixedOracle::committed(),
-        dirty: FixedDirtyProvider(dirty),
         loader,
         registry,
         state_key,
@@ -197,21 +151,6 @@ where
     (session, cell_store)
 }
 
-fn fjall_dirty() -> Result<(TempDir, FjallDirtyValueStore)> {
-    let dir = tempfile::tempdir()?;
-    let keyspace = Config::new(dir.path()).open()?;
-    // Mirror production's `partition_options()` (LZ4) in `fjall/workspace.rs`
-    // so the round-trip exercises set→get through the same compressed block path.
-    let overlay = keyspace.open_partition(
-        "value_dirty_overlay",
-        PartitionCreateOptions::default().compression(CompressionType::Lz4),
-    )?;
-    Ok((
-        dir,
-        FjallDirtyValueStore::new(overlay, EventScopeId::fresh()),
-    ))
-}
-
 fn cart() -> ValueDescriptor {
     value_state("cart")
 }
@@ -220,33 +159,17 @@ fn cart() -> ValueDescriptor {
 /// returns `Some(v)` — the value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
 /// the real session substrate.
-async fn roundtrip<S>(dirty: S, value: Value) -> Result<bool>
-where
-    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
-{
-    let handle = bind_registered(cart(), dirty, MemoryLoader::new())?;
+async fn roundtrip(value: Value) -> Result<bool> {
+    let handle = bind_registered(cart(), MemoryLoader::new())?;
     handle.set(value.clone()).await?;
     Ok(handle.get().await? == Some(value))
 }
 
 #[test]
-fn prop_descriptor_set_get_roundtrip_memory() {
+fn prop_descriptor_set_get_roundtrip() {
     fn prop(value: ArbJson) -> TestResult {
         let input_dbg = format!("{value:#?}");
-        let result = executor::block_on(roundtrip(MemoryDirtyValueStore::new(), value.0));
-        finish_trace(result, "typed roundtrip lost", &input_dbg)
-    }
-    QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
-}
-
-#[test]
-fn prop_descriptor_set_get_roundtrip_fjall() {
-    fn prop(value: ArbJson) -> TestResult {
-        let input_dbg = format!("{value:#?}");
-        let result = fjall_dirty().and_then(|(_dir, dirty)| {
-            // `_dir` lives until the round-trip completes.
-            TEST_RUNTIME.block_on(roundtrip(dirty, value.0))
-        });
+        let result = executor::block_on(roundtrip(value.0));
         finish_trace(result, "typed roundtrip lost", &input_dbg)
     }
     QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
@@ -255,7 +178,7 @@ fn prop_descriptor_set_get_roundtrip_fjall() {
 /// A never-written collection reads as `None`.
 #[tokio::test]
 async fn descriptor_get_absent_returns_none() -> Result<()> {
-    let handle = bind_registered(cart(), MemoryDirtyValueStore::new(), MemoryLoader::new())?;
+    let handle = bind_registered(cart(), MemoryLoader::new())?;
     assert_eq!(handle.get().await?, None);
     Ok(())
 }
@@ -263,7 +186,7 @@ async fn descriptor_get_absent_returns_none() -> Result<()> {
 /// `set` then `clear` reads as `None`.
 #[tokio::test]
 async fn descriptor_clear_then_get_none() -> Result<()> {
-    let handle = bind_registered(cart(), MemoryDirtyValueStore::new(), MemoryLoader::new())?;
+    let handle = bind_registered(cart(), MemoryLoader::new())?;
     handle.set(json!({"items": [1_i32, 2_i32]})).await?;
     handle.clear().await?;
     assert_eq!(handle.get().await?, None);
@@ -309,11 +232,7 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
     let typed_cart: ValueDescriptor<CartCodec> = value_state("typed_cart");
     assert_eq!(typed_cart.structural_identity().codec_id, Some("test-cart"));
 
-    let handle = bind_registered(
-        typed_cart,
-        MemoryDirtyValueStore::new(),
-        MemoryLoader::new(),
-    )?;
+    let handle = bind_registered(typed_cart, MemoryLoader::new())?;
     let cart = Cart {
         items: vec!["a".into(), "b".into()],
     };
@@ -342,11 +261,7 @@ fn state_unavailable_without_keyed_state() -> Result<()> {
 /// registration.
 #[tokio::test]
 async fn state_with_unregistered_descriptor_errors() -> Result<()> {
-    let session = test_session(
-        MemoryDirtyValueStore::new(),
-        MemoryLoader::new(),
-        CollectionDefRegistry::new(None),
-    );
+    let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
     let Err(error) = cart().bind(&session) else {
         return Err(eyre!("unregistered bind must fail"));
     };
@@ -365,7 +280,7 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
     let recoded: ValueDescriptor<CartCodec> = value_state("cart");
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(None))?;
-    let session = test_session(MemoryDirtyValueStore::new(), MemoryLoader::new(), registry);
+    let session = test_session(MemoryLoader::new(), registry);
 
     let Err(error) = recoded.bind(&session) else {
         return Err(eyre!("mismatched bind must fail"));

@@ -4,10 +4,9 @@
 //! `docs/keyed-state/design-summary.md`. One
 //! `FjallClient` owns a shared `fjall::Keyspace` rooted at the configured
 //! `cache_dir`; per Kafka partition assignment the client mints a
-//! `FjallWorkspace` carrying two named Fjall partitions (`cache`,
-//! `dirty_overlay`) tagged with an `AssignmentEpoch` so a fast
-//! assign→revoke→assign cycle cannot collide even if `delete_partition` is
-//! delayed.
+//! `FjallWorkspace` carrying one named Fjall partition (`cache`) tagged with
+//! an `AssignmentEpoch` so a fast assign→revoke→assign cycle cannot collide
+//! even if `delete_partition` is delayed.
 //!
 //! # Partition naming
 //!
@@ -20,8 +19,8 @@
 //!
 //! # Lifecycle
 //!
-//! On revocation, the workspace's `Drop` impl deletes its two named
-//! partitions. The keyspace stays open for other Kafka partitions still
+//! On revocation, the workspace's `Drop` impl deletes its named
+//! partition. The keyspace stays open for other Kafka partitions still
 //! owned by the process. `PartitionHandle` is internally an `Arc`, so
 //! cloning a handle into `delete_partition` is cheap and lets the Drop
 //! impl read fields by reference.
@@ -47,7 +46,6 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 const PARTITION_NAME_PREFIX: &str = "value_";
 const CACHE_ROLE: &str = "cache";
-const DIRTY_OVERLAY_ROLE: &str = "dirty_overlay";
 
 /// Per-Kafka-partition workspace creation epoch.
 ///
@@ -114,14 +112,14 @@ impl FjallClient {
 
     /// Mints a fresh per-Kafka-partition workspace tagged with `epoch`.
     ///
-    /// Opens two named Fjall partitions (`cache`, `dirty_overlay`) named via
+    /// Opens one named Fjall partition (`cache`) named via
     /// `xxh3_128(role, topic, partition, epoch)` so concurrent assign/revoke
     /// cycles cannot collide and arbitrary topic names cannot violate
     /// fjall's partition-name charset.
     ///
     /// # Errors
     ///
-    /// Returns [`FjallValueStoreError::Engine`] when either partition cannot
+    /// Returns [`FjallValueStoreError::Engine`] when the partition cannot
     /// be opened.
     pub fn workspace(
         self: &Arc<Self>,
@@ -130,14 +128,10 @@ impl FjallClient {
         epoch: AssignmentEpoch,
     ) -> Result<FjallWorkspace, FjallValueStoreError> {
         let cache_name = partition_name(CACHE_ROLE, topic, partition, epoch);
-        let overlay_name = partition_name(DIRTY_OVERLAY_ROLE, topic, partition, epoch);
 
         let cache = self
             .keyspace
             .open_partition(&cache_name, partition_options())?;
-        let overlay = self
-            .keyspace
-            .open_partition(&overlay_name, partition_options())?;
 
         Ok(FjallWorkspace {
             client: Arc::clone(self),
@@ -145,16 +139,15 @@ impl FjallClient {
             topic,
             partition,
             cache,
-            overlay,
         })
     }
 }
 
 /// Per-Kafka-partition workspace.
 ///
-/// Owns the two named Fjall partitions for one `(topic, partition,
-/// epoch)`. Drop deletes both; if delete fails it logs and continues
-/// — the next process startup will reap the leftovers via
+/// Owns the named Fjall cache partition for one `(topic, partition,
+/// epoch)`. Drop deletes it; if delete fails it logs and continues
+/// — the next process startup will reap the leftover via
 /// [`FjallClient::open`].
 #[derive(Educe)]
 #[educe(Debug)]
@@ -166,8 +159,6 @@ pub struct FjallWorkspace {
     partition: Partition,
     #[educe(Debug(ignore))]
     cache: PartitionHandle,
-    #[educe(Debug(ignore))]
-    overlay: PartitionHandle,
 }
 
 impl FjallWorkspace {
@@ -182,33 +173,22 @@ impl FjallWorkspace {
     pub fn cache_handle(&self) -> &PartitionHandle {
         &self.cache
     }
-
-    /// Returns the dirty-overlay partition handle.
-    #[must_use]
-    pub fn dirty_overlay_handle(&self) -> &PartitionHandle {
-        &self.overlay
-    }
 }
 
 impl Drop for FjallWorkspace {
     fn drop(&mut self) {
         // `PartitionHandle` wraps an `Arc`, so cloning here is cheap and
         // matches fjall's expected ownership for `delete_partition`.
-        for (role, handle) in [
-            (CACHE_ROLE, &self.cache),
-            (DIRTY_OVERLAY_ROLE, &self.overlay),
-        ] {
-            if let Err(err) = self.client.keyspace.delete_partition(handle.clone()) {
-                warn!(
-                    role,
-                    topic = ?self.topic,
-                    partition = self.partition,
-                    epoch = ?self.epoch,
-                    error = ?err,
-                    "delete_partition failed on workspace drop; \
-                     stale partition will be reaped on next startup"
-                );
-            }
+        if let Err(err) = self.client.keyspace.delete_partition(self.cache.clone()) {
+            warn!(
+                role = CACHE_ROLE,
+                topic = ?self.topic,
+                partition = self.partition,
+                epoch = ?self.epoch,
+                error = ?err,
+                "delete_partition failed on workspace drop; \
+                 stale partition will be reaped on next startup"
+            );
         }
     }
 }
@@ -238,8 +218,8 @@ fn sweep_orphaned(keyspace: &Arc<Keyspace>) -> Result<(), FjallClientError> {
     Ok(())
 }
 
-/// Creation options shared by every keyed-state fjall partition (`cache`,
-/// `dirty_overlay`, and the sweep's reopen).
+/// Creation options shared by every keyed-state fjall partition (the `cache`
+/// partition and the startup sweep's reopen).
 ///
 /// Cells are stored raw; fjall compresses data blocks at flush/compaction.
 /// LZ4 is already fjall's default — pinning it documents that intent and

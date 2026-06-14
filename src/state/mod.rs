@@ -21,8 +21,8 @@
 //!   cells the stores persist.
 //! * [`transaction`] — transaction-side state ([`CommitMode`], [`Read`], …).
 //!
-//! The cross-cutting factory traits ([`DirtyStoreProvider`],
-//! [`StateBackendFactory`]) belong to no leaf and stay here.
+//! The cross-cutting factory trait [`StateBackendFactory`] belongs to no leaf
+//! and stays here.
 //!
 //! [`Cell`]: cell::Cell
 //! [`Committed`]: cell::Committed
@@ -37,13 +37,13 @@ use crate::state::store::CellStore;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
-use std::fmt;
 
 pub mod cassandra;
 pub mod cell;
 pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
+pub mod dirty;
 pub mod encoding;
 pub mod event_ref;
 pub mod fjall;
@@ -63,8 +63,9 @@ pub mod value;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub use dirty::DirtyValueStore;
 pub use encoding::{EncodingError, PayloadEncoding};
-pub use event_ref::{CommitDecision, EventRef, EventScopeId, StoreOutcome, TimerEventRef};
+pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,
     StateNameError, StateType,
@@ -78,14 +79,16 @@ pub use value::{ValueKind, ValueOp};
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
 /// The per-partition keyed-state backend: the durable cell store, the commit
-/// oracle it resolves provisional cells through, the committed-value cache,
-/// and the dirty-workspace provider.
+/// oracle it resolves provisional cells through, and the committed-value
+/// cache.
 ///
 /// Minted as one unit by [`StateBackendFactory::for_partition`] so the oracle
 /// the sessions stage against and the oracle the recovery sweep resolves
-/// through are the *same* instance, and the fjall workspace backing the dirty
-/// provider and the committed-value cache is opened once.
-pub struct StateBackend<S, O, C, P> {
+/// through are the *same* instance, and the fjall workspace backing the
+/// committed-value cache is opened once. The per-event dirty workspace is not
+/// part of the backend — it is a single in-memory [`DirtyValueStore`] the
+/// session owns and rebuilds per event, never a durability or recovery source.
+pub struct StateBackend<S, O, C> {
     /// Durable cell store for this partition.
     pub cell: S,
 
@@ -94,9 +97,6 @@ pub struct StateBackend<S, O, C, P> {
 
     /// Committed-value cache for this partition.
     pub cache: C,
-
-    /// Per-event dirty-workspace provider for this partition.
-    pub dirty: P,
 }
 
 /// The backend bundle a [`StateBackendFactory`] mints for one partition.
@@ -104,7 +104,6 @@ pub type BackendOf<B> = StateBackend<
     <B as StateBackendFactory>::Cell,
     <B as StateBackendFactory>::Oracle,
     <B as StateBackendFactory>::Cache,
-    <B as StateBackendFactory>::DirtyProvider,
 >;
 
 /// Process-wide factory minting the per-partition keyed-state backend.
@@ -127,9 +126,6 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
     /// Committed-value cache minted per partition.
     type Cache: CommittedCache<ValueKind>;
 
-    /// Per-event dirty-workspace provider minted per partition.
-    type DirtyProvider: DirtyStoreProvider<ValueKind>;
-
     /// Error returned when a partition's backend cannot be materialized.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
@@ -147,45 +143,41 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
 }
 
 /// Partition-agnostic [`StateBackendFactory`]: clones the same cell store,
-/// oracle, cache, and dirty provider for every partition.
+/// oracle, and cache for every partition.
 ///
 /// Suits compositions whose stores are not partition-scoped — memory-backed
 /// tests and bespoke wiring; production uses the partition-scoped factories
 /// in [`production`].
 #[derive(Clone, Debug)]
-pub struct SharedStateBackend<S, O, C, P> {
+pub struct SharedStateBackend<S, O, C> {
     cell: S,
     oracle: O,
     cache: C,
-    dirty: P,
 }
 
-impl<S, O, C, P> SharedStateBackend<S, O, C, P> {
+impl<S, O, C> SharedStateBackend<S, O, C> {
     /// Creates a backend factory that hands out clones of the supplied
     /// parts.
     #[must_use]
-    pub fn new(cell: S, oracle: O, cache: C, dirty: P) -> Self {
+    pub fn new(cell: S, oracle: O, cache: C) -> Self {
         Self {
             cell,
             oracle,
             cache,
-            dirty,
         }
     }
 }
 
-impl<S, O, C, P> StateBackendFactory for SharedStateBackend<S, O, C, P>
+impl<S, O, C> StateBackendFactory for SharedStateBackend<S, O, C>
 where
     S: CellStore<ValueKind>
         + DescriptorIdentityStore<Error = <S as CellStore<ValueKind>>::Error>
         + Clone,
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
-    P: DirtyStoreProvider<ValueKind>,
 {
     type Cache = C;
     type Cell = S;
-    type DirtyProvider = P;
     type Error = Infallible;
     type Oracle = O;
 
@@ -198,25 +190,6 @@ where
             cell: self.cell.clone(),
             oracle: self.oracle.clone(),
             cache: self.cache.clone(),
-            dirty: self.dirty.clone(),
         })
     }
-}
-
-/// Per-partition factory for dirty stores of one collection kind.
-///
-/// A [`DirtyStoreProvider`] is minted *per Kafka partition* — its
-/// [`Self::Store`] type owns whichever partition-scoped state (e.g. Fjall
-/// partition handles) the dirty workspace needs. The middleware calls
-/// [`Self::for_scope`] once per event handler invocation to materialize
-/// the per-event dirty workspace.
-pub trait DirtyStoreProvider<K>: Clone + Send + Sync + 'static
-where
-    K: CollectionKind,
-{
-    /// Per-event dirty workspace this provider mints.
-    type Store: value::PendingOpSource<K> + fmt::Debug + 'static;
-
-    /// Returns a fresh per-event dirty workspace bound to `scope`.
-    fn for_scope(&self, scope: EventScopeId) -> Self::Store;
 }

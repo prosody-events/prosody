@@ -5,9 +5,9 @@
 //! [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider)),
 //! then mints one [`StateSession`] per event from it. The manager owns the
 //! partition-lifetime pieces — the [`PartitionStateStore`] (cell store +
-//! oracle + committed-value cache + status map), the dirty-workspace
-//! provider, and the message loader — while each session gets `Arc`-clones
-//! plus a fresh per-event dirty scope. The recovery sweep shares the *same*
+//! oracle + committed-value cache + status map) and the message loader —
+//! while each session gets `Arc`-clones plus its own in-memory per-event
+//! dirty store. The recovery sweep shares the *same*
 //! [`PartitionStateStore`], so the status marks sessions set are visible to
 //! it.
 //!
@@ -34,13 +34,13 @@ use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore, PartitionStoreError};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
-    ArmedKeys, DirtyValueBundle, SessionParts, StateSession, TerminationWatch, ValueStateSession,
+    ArmedKeys, SessionParts, StateSession, TerminationWatch, ValueStateSession,
 };
 use crate::state::store::CellStore;
 use crate::state::value::ValueKind;
 use crate::state::{
-    CollectionId, CollectionRef, DirtyStoreProvider, EventRef, STATE_FANOUT_CONCURRENCY,
-    StateBackend, StateBackendFactory, StateKey, StateName, StateType,
+    CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
+    StateBackendFactory, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{SegmentId, TriggerStore};
@@ -120,10 +120,9 @@ pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send;
 }
 
-struct StateManagerInner<S, O, C, DP, L> {
+struct StateManagerInner<S, O, C, L> {
     store: PartitionStateStore<ValueKind, S, O, C>,
     oracle: O,
-    dirty: DP,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     /// Every collection name durable on the segment at acquisition time —
@@ -140,13 +139,13 @@ struct StateManagerInner<S, O, C, DP, L> {
 }
 
 /// The real per-partition state manager: owns the partition-lifetime
-/// [`PartitionStateStore`], oracle, dirty provider, and loader; mints
-/// per-event [`ValueStateSession`]s sharing that store.
-pub struct StateManager<S, O, C, DP, L> {
-    inner: Arc<StateManagerInner<S, O, C, DP, L>>,
+/// [`PartitionStateStore`], oracle, and loader; mints per-event
+/// [`ValueStateSession`]s sharing that store.
+pub struct StateManager<S, O, C, L> {
+    inner: Arc<StateManagerInner<S, O, C, L>>,
 }
 
-impl<S, O, C, DP, L> Clone for StateManager<S, O, C, DP, L> {
+impl<S, O, C, L> Clone for StateManager<S, O, C, L> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -154,7 +153,7 @@ impl<S, O, C, DP, L> Clone for StateManager<S, O, C, DP, L> {
     }
 }
 
-impl<S, O, C, DP, L> fmt::Debug for StateManager<S, O, C, DP, L> {
+impl<S, O, C, L> fmt::Debug for StateManager<S, O, C, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateManager")
             .field("segment_id", &self.inner.segment_id)
@@ -162,23 +161,20 @@ impl<S, O, C, DP, L> fmt::Debug for StateManager<S, O, C, DP, L> {
     }
 }
 
-impl<S, O, C, DP, L> PartitionStateManager for StateManager<S, O, C, DP, L>
+impl<S, O, C, L> PartitionStateManager for StateManager<S, O, C, L>
 where
     S: CellStore<ValueKind>,
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
-    DP: DirtyStoreProvider<ValueKind>,
-    DP::Store: DirtyValueBundle + Send + Sync,
     L: Clone + Send + Sync + 'static,
 {
     type RecoveryError = RecoveryError<S::Error, O::Error>;
-    type Session = ValueStateSession<S, O, C, DP, L>;
+    type Session = ValueStateSession<S, O, C, L>;
 
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
         ValueStateSession::new(SessionParts {
             store: self.inner.store.clone(),
             oracle: self.inner.oracle.clone(),
-            dirty: self.inner.dirty.clone(),
             loader: self.inner.loader.clone(),
             registry: self.inner.registry.clone(),
             state_key: StateKey::new(self.inner.segment_id, key),
@@ -292,11 +288,10 @@ impl<B, L> fmt::Debug for StateManagerProvider<B, L> {
 impl<B, L> PartitionStateProvider for StateManagerProvider<B, L>
 where
     B: StateBackendFactory,
-    DirtyStoreOf<B>: DirtyValueBundle + Send + Sync,
     L: Clone + Send + Sync + 'static,
 {
     type AcquireError = StateAcquireError<B::Error, CellErr<B>>;
-    type Manager = StateManager<B::Cell, B::Oracle, B::Cache, B::DirtyProvider, L>;
+    type Manager = StateManager<B::Cell, B::Oracle, B::Cache, L>;
 
     async fn acquire(
         &self,
@@ -308,7 +303,6 @@ where
             cell,
             oracle,
             cache,
-            dirty,
         } = self
             .backend
             .for_partition(topic, partition)
@@ -324,7 +318,6 @@ where
             inner: Arc::new(StateManagerInner {
                 store,
                 oracle,
-                dirty,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
                 names: names.into(),
@@ -335,10 +328,6 @@ where
         })
     }
 }
-
-/// The per-event dirty store behind a backend factory's provider.
-type DirtyStoreOf<B> =
-    <<B as StateBackendFactory>::DirtyProvider as DirtyStoreProvider<ValueKind>>::Store;
 
 /// Sweeps every durable collection on `(segment, key)`, resolving any
 /// provisional cell through the oracle.

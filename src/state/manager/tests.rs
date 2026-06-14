@@ -20,7 +20,7 @@ use crate::loader::MemoryLoader;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStoreProvider};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
 use crate::state::registry::CollectionDef;
 use crate::state::session::StateSession;
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
@@ -77,18 +77,12 @@ impl CommitOracle for FixedOracle {
     }
 }
 
-type TestBackend = SharedStateBackend<
-    MemoryCellStore,
-    FixedOracle,
-    MemoryCommittedCache,
-    MemoryDirtyValueStoreProvider,
->;
+type TestBackend = SharedStateBackend<MemoryCellStore, FixedOracle, MemoryCommittedCache>;
 type TestProvider = StateManagerProvider<TestBackend, MemoryLoader<serde_json::Value>>;
 type TestManager = StateManager<
     MemoryCellStore,
     FixedOracle,
     MemoryCommittedCache,
-    MemoryDirtyValueStoreProvider,
     MemoryLoader<serde_json::Value>,
 >;
 
@@ -135,12 +129,7 @@ fn provider_with(
     registry: Arc<CollectionDefRegistry>,
 ) -> TestProvider {
     StateManagerProvider::new(
-        SharedStateBackend::new(
-            cell,
-            oracle,
-            MemoryCommittedCache::new(),
-            MemoryDirtyValueStoreProvider,
-        ),
+        SharedStateBackend::new(cell, oracle, MemoryCommittedCache::new()),
         MemoryLoader::new(),
         registry,
         Arc::from("test-group"),
@@ -554,12 +543,7 @@ fn never(error: Infallible) -> PromotePoison {
 }
 
 type PoisonProvider = StateManagerProvider<
-    SharedStateBackend<
-        PoisonPromoteCell,
-        FixedOracle,
-        MemoryCommittedCache,
-        MemoryDirtyValueStoreProvider,
-    >,
+    SharedStateBackend<PoisonPromoteCell, FixedOracle, MemoryCommittedCache>,
     MemoryLoader<serde_json::Value>,
 >;
 
@@ -570,12 +554,7 @@ fn poison_provider(
     registry: Arc<CollectionDefRegistry>,
 ) -> PoisonProvider {
     StateManagerProvider::new(
-        SharedStateBackend::new(
-            cell,
-            FixedOracle::committed(),
-            MemoryCommittedCache::new(),
-            MemoryDirtyValueStoreProvider,
-        ),
+        SharedStateBackend::new(cell, FixedOracle::committed(), MemoryCommittedCache::new()),
         MemoryLoader::new(),
         registry,
         Arc::from("test-group"),

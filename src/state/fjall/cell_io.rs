@@ -1,13 +1,10 @@
 //! Shared async wrappers over fjall's synchronous per-cell I/O.
 //!
-//! Both the cache ([`FjallValueStore`](super::FjallValueStore)) and the
-//! dirty overlay ([`FjallDirtyValueStore`](super::FjallDirtyValueStore))
-//! store one tagged cell per key in a fjall [`PartitionHandle`]. fjall's API
-//! is synchronous, so each call clones the cheap `Arc`-backed handle and
-//! dispatches the blocking get/insert through
-//! [`tokio::task::spawn_blocking`]. The key is generic over its byte width so
-//! both the cache's collection prefix and the dirty overlay's wider
-//! scope-qualified key share one path.
+//! The cache ([`FjallValueStore`](super::FjallValueStore)) stores one tagged
+//! cell per key in a fjall [`PartitionHandle`]. fjall's API is synchronous, so
+//! each call clones the cheap `Arc`-backed handle and dispatches the blocking
+//! get/insert through [`tokio::task::spawn_blocking`]. The key is generic over
+//! its byte width.
 
 use super::error::FjallValueStoreError;
 use bytes::Bytes;

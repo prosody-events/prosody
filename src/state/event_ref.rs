@@ -1,46 +1,13 @@
 //! Event identity and store/oracle verdicts.
 //!
 //! [`EventRef`] is the durable reference to the upstream event that owns a
-//! provisional cell; [`EventScopeId`] distinguishes concurrent handler
-//! invocations. [`CommitDecision`] and [`StoreOutcome`] are the two
+//! provisional cell. [`CommitDecision`] and [`StoreOutcome`] are the two
 //! distinct verdicts threaded through recovery: the oracle decides, the
 //! store acts and reports.
 
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use uuid::Uuid;
-
-/// Per-event scope identity used by commit recovery.
-///
-/// The keyed-state middleware mints a fresh scope per handler invocation
-/// (via [`Self::fresh`]) so dirty workspaces can be keyed by scope without
-/// colliding across events. Both the in-memory and the Fjall dirty
-/// workspaces key on this identity — the Fjall overlay prefixes its
-/// collection key with the scope (see `dirty_collection_key`) so concurrent
-/// events on one Kafka partition cannot collide.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct EventScopeId(u128);
-
-impl EventScopeId {
-    /// Creates an event scope identifier.
-    #[must_use]
-    pub fn new(id: u128) -> Self {
-        Self(id)
-    }
-
-    /// Returns the raw identifier value.
-    #[must_use]
-    pub fn get(self) -> u128 {
-        self.0
-    }
-
-    /// Mints a fresh random scope identifier. Used by the keyed-state
-    /// middleware to scope per-event dirty workspaces.
-    #[must_use]
-    pub fn fresh() -> Self {
-        Self(Uuid::new_v4().as_u128())
-    }
-}
 
 /// Durable reference to the upstream event that owns a provisional cell.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]

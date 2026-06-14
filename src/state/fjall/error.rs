@@ -1,11 +1,11 @@
-//! Errors for the fjall-backed Value cache and dirty store.
+//! Errors for the fjall-backed Value cache.
 
 use crate::error::{ClassifyError, ErrorCategory};
 use fjall::Error as FjallEngineError;
 use thiserror::Error;
 use tokio::task::JoinError;
 
-/// Errors that can occur while using the fjall Value cache or dirty store.
+/// Errors that can occur while using the fjall Value cache.
 #[derive(Debug, Error)]
 pub enum FjallValueStoreError {
     /// Underlying fjall engine error.
@@ -33,7 +33,7 @@ impl ClassifyError for FjallValueStoreError {
             Self::Engine(_) | Self::BlockingTaskJoin(_) => ErrorCategory::Transient,
             // A corrupt stored cell is permanent for that cell: re-reading the
             // same bytes cannot succeed. The cache combinator invalidates and
-            // re-populates; the dirty store discards the bad overlay op.
+            // re-populates from the authoritative cell store.
             Self::UnknownCacheTag(_) | Self::EmptyCacheCell => ErrorCategory::Permanent,
         }
     }

@@ -4,10 +4,8 @@ use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use super::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use super::partition_store::CommittedCache;
 use super::store::CellStore;
-use super::value::{PendingOpSource, ValueKind, ValueOp, ValueStore};
-use super::{
-    CollectionId, CollectionRef, DirtyStoreProvider, EventRef, EventScopeId, PendingOps, Read,
-};
+use super::value::ValueKind;
+use super::{CollectionId, CollectionRef, EventRef};
 use crate::timers::store::SegmentId;
 use ahash::RandomState;
 use bytes::Bytes;
@@ -15,116 +13,7 @@ use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
-
-/// In-memory dirty Value store.
-///
-/// The store keeps only the compact final Value operation. Collections absent
-/// from this store are untouched, so reads return [`Read::Unknown`].
-#[derive(Clone, Debug)]
-pub struct MemoryDirtyValueStore {
-    inner: Arc<Mutex<DirtyInner>>,
-}
-
-impl MemoryDirtyValueStore {
-    /// Creates an empty dirty Value store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for MemoryDirtyValueStore {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(DirtyInner::default())),
-        }
-    }
-}
-
-impl ValueStore for MemoryDirtyValueStore {
-    type Error = Infallible;
-
-    async fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<Bytes>, Self::Error> {
-        Ok(self
-            .inner
-            .lock()
-            .entries
-            .get(collection)
-            .cloned()
-            .flatten()
-            .map_or(Read::Unknown, |op| match op {
-                ValueOp::Set { payload } => Read::Present(payload),
-                ValueOp::Clear => Read::Absent,
-            }))
-    }
-
-    async fn set<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-        payload: &'a [u8],
-    ) -> Result<(), Self::Error> {
-        // The buffered op owns its payload, so the borrowed slice is copied
-        // once here. Acceptable for this in-memory test backend; production
-        // fjall stores frame the slice into a cell buffer without a copy.
-        self.inner.lock().entries.insert(
-            collection.clone(),
-            Some(ValueOp::Set {
-                payload: Bytes::copy_from_slice(payload),
-            }),
-        );
-        Ok(())
-    }
-
-    async fn clear<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<(), Self::Error> {
-        self.inner
-            .lock()
-            .entries
-            .insert(collection.clone(), Some(ValueOp::Clear));
-        Ok(())
-    }
-}
-
-/// Per-partition provider for [`MemoryDirtyValueStore`].
-///
-/// In-memory dirty stores have no per-partition state, so the provider
-/// is unit-shaped and `for_scope` returns a fresh
-/// [`MemoryDirtyValueStore`] each call.
-#[derive(Clone, Debug, Default)]
-pub struct MemoryDirtyValueStoreProvider;
-
-impl DirtyStoreProvider<ValueKind> for MemoryDirtyValueStoreProvider {
-    type Store = MemoryDirtyValueStore;
-
-    fn for_scope(&self, _scope: EventScopeId) -> Self::Store {
-        MemoryDirtyValueStore::new()
-    }
-}
-
-impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
-    type Error = Infallible;
-    type Ops<'a> = OptionIntoIter<ValueOp>;
-
-    fn pending_ops<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error> {
-        let op = self.inner.lock().entries.get(collection).cloned().flatten();
-        Ok(op.map(PendingOps::single))
-    }
-
-    fn clear_pending_ops(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {
-        self.inner.lock().entries.remove(collection);
-        Ok(())
-    }
-}
 
 /// In-memory [`CellStore`] for the Value kind.
 ///
@@ -304,11 +193,6 @@ impl CommittedCache<ValueKind> for MemoryCommittedCache {
         self.inner.lock().remove(collection);
         Ok(())
     }
-}
-
-#[derive(Debug, Default)]
-struct DirtyInner {
-    entries: HashMap<CollectionId<ValueKind>, Option<ValueOp>, RandomState>,
 }
 
 #[derive(Debug, Default)]
