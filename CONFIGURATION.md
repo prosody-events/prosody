@@ -94,6 +94,9 @@ Publishes message and timer lifecycle events to a Kafka topic:
 | `PROSODY_TELEMETRY_ENABLED` | Enable the telemetry event emitter         | true                     |
 | `PROSODY_TELEMETRY_TOPIC`   | Kafka topic to publish telemetry events to | prosody.telemetry-events |
 
+The emitter is disabled automatically when `PROSODY_MOCK=true`, regardless of
+`PROSODY_TELEMETRY_ENABLED` — mock mode opens no real broker connection.
+
 ## Monopolization Detection (Pipeline Mode)
 
 | Environment Variable                | Description                            | Default |

@@ -240,6 +240,7 @@ In mock mode:
 
 - **Kafka Brokers**: Uses an in-memory mock Kafka cluster instead of real brokers
 - **Timer Storage**: Uses in-memory storage instead of Cassandra
+- **Telemetry**: The telemetry emitter is disabled, opening no real broker connection (regardless of `PROSODY_TELEMETRY_ENABLED`)
 - **Topic Creation**: Automatically creates topics listed in `PROSODY_SUBSCRIBED_TOPICS`
 - **Message Processing**: Full message processing pipeline works as in production
 - **Networking**: No external network dependencies required
