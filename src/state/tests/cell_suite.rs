@@ -39,12 +39,11 @@ use super::super::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
 };
 use super::value_suite::{MAX_TRACE_OPS, bytes, capped_vec};
+use ahash::RandomState;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::Stream;
-use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
-use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,14 +62,16 @@ const POOL: u8 = 3;
 /// dedup store does.
 #[derive(Clone, Default)]
 struct ScriptedOracle {
-    committed: Arc<Mutex<HashSet<Uuid>>>,
+    committed: Arc<scc::HashSet<Uuid, RandomState>>,
 }
 
 impl CommitOracle for ScriptedOracle {
     type Error = Infallible;
 
     async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
-        self.committed.lock().insert(dedup_id);
+        // `insert_async` returns `Err(key)` if already present — harmless; the
+        // marker is idempotent.
+        let _ = self.committed.insert_async(dedup_id).await;
         Ok(())
     }
 
@@ -80,7 +81,7 @@ impl CommitOracle for ScriptedOracle {
         event: EventRef,
     ) -> Result<CommitDecision, Self::Error> {
         let committed = match event {
-            EventRef::Message { dedup_id } => self.committed.lock().contains(&dedup_id),
+            EventRef::Message { dedup_id } => self.committed.contains_async(&dedup_id).await,
             EventRef::Timer(_) => false,
         };
         Ok(if committed {

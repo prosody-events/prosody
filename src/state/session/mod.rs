@@ -32,9 +32,9 @@
 //!    the staged cells (O(1) per cell); `rollback_aborted` rolls them back when
 //!    the event aborts.
 //! 4. At attempt boundaries (retry, defer), `reset` discards the dirty scope,
-//!    the touched set, the staged set, and the registered marker so the next
-//!    attempt starts clean. A defer-swallow therefore flushes no marker, so the
-//!    deferred reload is not deduped — with no flag and no outcome inspection.
+//!    the staged set, and the registered marker so the next attempt starts
+//!    clean. A defer-swallow therefore flushes no marker, so the deferred
+//!    reload is not deduped — with no flag and no outcome inspection.
 
 use crate::Key;
 use crate::consumer::event_context::StateAccessError;
@@ -60,7 +60,6 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
 use scc::HashSet as ConcurrentHashSet;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -253,8 +252,8 @@ pub(crate) mod sealed {
         /// when the oracle write fails.
         fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Discards the per-event dirty scope, touched set, recorded staged
-        /// set, and registered marker so the next attempt starts clean.
+        /// Discards the per-event dirty scope, recorded staged set, and
+        /// registered marker so the next attempt starts clean.
         /// Called at attempt boundaries (retry, defer-swallow).
         fn reset(&self);
 
@@ -320,7 +319,6 @@ struct StagedSet {
 /// dirty scope before `finalize`'s concurrent fan-out so no `Ops<'a>` borrow
 /// crosses an await.
 struct StagePrep {
-    id: CollectionId<ValueKind>,
     value: ValueApplied,
     collection_ref: CollectionRef<ValueKind>,
     mode: CommitMode,
@@ -380,8 +378,6 @@ struct SessionInner<S, O, C, L> {
     /// `recover` removes the key when the sweep fires.
     armed: ArmedKeys,
     termination: TerminationWatch,
-    /// Collections written this event, the finalize work-list.
-    touched: SyncMutex<HashSet<StateName>>,
     staged: SyncMutex<Option<StagedSet>>,
     /// The registered message commit marker, flushed strictly after the
     /// stage and cleared by `reset`. `None` until the deduplication
@@ -392,8 +388,8 @@ struct SessionInner<S, O, C, L> {
 /// The real per-event session over a partition's cell store.
 ///
 /// One session is minted per event by the partition's state manager;
-/// clones share the per-event dirty scope, touched set, recorded staged set,
-/// and registered marker. `S` is the cell store, `O` the commit oracle, `C`
+/// clones share the per-event dirty scope, recorded staged set, and
+/// registered marker. `S` is the cell store, `O` the commit oracle, `C`
 /// the committed-value cache, `L` the message loader.
 pub struct ValueStateSession<S, O, C, L> {
     inner: Arc<SessionInner<S, O, C, L>>,
@@ -443,7 +439,6 @@ impl<S, O, C, L> ValueStateSession<S, O, C, L> {
                 recovery_delay,
                 armed,
                 termination,
-                touched: SyncMutex::new(HashSet::new()),
                 staged: SyncMutex::new(None),
                 marker: SyncMutex::new(None),
             }),
@@ -467,24 +462,24 @@ impl<S, O, C, L> ValueStateSession<S, O, C, L> {
 
     /// Folds a touched collection's buffered ops into the write `finalize`
     /// will stage, reading the dirty store synchronously so the `Ops<'a>`
-    /// borrow is released before any await. `None` means the collection was
-    /// touched (e.g. via `get`) but never written, so there is nothing to
-    /// stage.
+    /// borrow is released before any await. `None` means the collection has no
+    /// buffered op, so there is nothing to stage. Since the work-list is the
+    /// dirty keyset itself, that arm is unreachable defense — every id fed here
+    /// came from a `set`/`clear`.
     fn stage_prep(&self, name: &StateName) -> Result<Option<StagePrep>, StateAccessError> {
-        let id = self.collection_id_for(name);
+        let collection_ref = self.collection_ref_for(name);
         let value = match self
             .inner
             .dirty
-            .pending_ops(&id)
+            .pending_ops(collection_ref.id())
             .map_err(|e| StateAccessError::store(&e))?
         {
             Some(pending) => fold_value_ops(None, pending.ops),
             None => return Ok(None),
         };
         Ok(Some(StagePrep {
-            id,
             value,
-            collection_ref: self.collection_ref_for(name),
+            collection_ref,
             mode: self.inner.registry.commit_mode_for(name),
         }))
     }
@@ -547,7 +542,6 @@ where
             .set(&id, cell)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
-        self.inner.touched.lock().insert(name.clone());
         Ok(())
     }
 
@@ -558,7 +552,6 @@ where
             .clear(&id)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
-        self.inner.touched.lock().insert(name.clone());
         Ok(())
     }
 
@@ -609,9 +602,12 @@ where
     /// `Provisional` owned by this event, so `committed` reads its `prev`).
     /// The staged set is replaced only after every write succeeds.
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        // Clone the touched set (don't drain): an in-place transient retry
-        // re-runs `finalize` and needs `touched` intact.
-        let names: Vec<StateName> = self.inner.touched.lock().iter().cloned().collect();
+        // The dirty-store keyset is the finalize work-list: a `set`/`clear`
+        // wrote an op there, a `get` did not. Materialize it once (don't
+        // drain): scc has no borrowing iterator, and the keyset must outlive
+        // the async fan-out below. An in-place transient retry re-runs
+        // `finalize` over the same ops.
+        let ids = self.inner.dirty.touched_collections();
         let store = &self.inner.store;
         let event = self.inner.event;
         // Distinct collections are distinct ids = distinct cache keys, status
@@ -620,9 +616,9 @@ where
         // (pending ops + fold + refs) runs in the `map` closure, reading the
         // dirty store, and only owned data crosses into the future — no
         // `Ops<'a>` borrow spans an await.
-        let staged: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)> = stream::iter(names)
-            .map(|name| {
-                let prepared = self.stage_prep(&name);
+        let staged: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)> = stream::iter(ids)
+            .map(|id| {
+                let prepared = self.stage_prep(id.name());
                 // `cooperative` adds a per-item coop-budget checkpoint: the
                 // in-memory store completes each future without a tokio leaf
                 // await, so a key touching many collections would otherwise
@@ -631,7 +627,6 @@ where
                 // `STATE_FANOUT_CONCURRENCY` of these at once.
                 cooperative(async move {
                     let Some(StagePrep {
-                        id,
                         value,
                         collection_ref,
                         mode,
@@ -642,7 +637,7 @@ where
                     match mode {
                         CommitMode::ReadCommitted => {
                             let prev = store
-                                .committed(&id, &(), event)
+                                .committed(collection_ref.id(), &(), event)
                                 .await
                                 .map_err(|e| StateAccessError::store(&e))?;
                             let write = ProvisionalWrite::new(value, prev, event);
@@ -762,7 +757,6 @@ where
         // serialization means no handler op is in flight here, so there is no
         // racing observer to guard against.
         self.inner.dirty.clear_all();
-        self.inner.touched.lock().clear();
         *self.inner.staged.lock() = None;
         *self.inner.marker.lock() = None;
     }

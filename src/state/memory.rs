@@ -10,8 +10,7 @@ use crate::timers::store::SegmentId;
 use ahash::RandomState;
 use bytes::Bytes;
 use futures::{Stream, stream};
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use scc::hash_map::Entry;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ use std::sync::Arc;
 /// so committed state and identities survive a rebalance within the process.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCellStore {
-    inner: Arc<Mutex<CellInner>>,
+    inner: Arc<CellInner>,
 }
 
 impl MemoryCellStore {
@@ -45,23 +44,26 @@ impl CellStore<ValueKind> for MemoryCellStore {
     ) -> Result<Cell, Self::Error> {
         Ok(self
             .inner
-            .lock()
             .cells
-            .get(collection)
-            .map_or_else(|| Cell::Resolved(Committed::new(None)), StoredCell::to_cell))
+            .read_async(collection, |_, cell| cell.to_cell())
+            .await
+            .unwrap_or_else(|| Cell::Resolved(Committed::new(None))))
     }
 
     fn provisional_cells<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> impl Stream<Item = Result<((), ProvisionalCell), Self::Error>> + Send + 'a {
-        let provisional = match self.inner.lock().cells.get(collection) {
-            Some(StoredCell::Provisional { data, prev, event }) => {
-                Some(ProvisionalCell::new(data.clone(), prev.clone(), *event))
-            }
-            _ => None,
-        };
-        stream::iter(provisional.map(|cell| Ok(((), cell))))
+        let provisional = self
+            .inner
+            .cells
+            .read_sync(collection, |_, cell| match cell {
+                StoredCell::Provisional { data, prev, event } => {
+                    Some(ProvisionalCell::new(data.clone(), prev.clone(), *event))
+                }
+                StoredCell::Resolved(_) => None,
+            });
+        stream::iter(provisional.flatten().map(|cell| Ok(((), cell))))
     }
 
     async fn write_provisional<'a>(
@@ -70,14 +72,17 @@ impl CellStore<ValueKind> for MemoryCellStore {
         (): &'a (),
         write: &'a ProvisionalWrite,
     ) -> Result<(), Self::Error> {
-        self.inner.lock().cells.insert(
-            collection.id().clone(),
-            StoredCell::Provisional {
-                data: write.data().cloned(),
-                prev: write.prev().cloned(),
-                event: write.event(),
-            },
-        );
+        self.inner
+            .cells
+            .upsert_async(
+                collection.id().clone(),
+                StoredCell::Provisional {
+                    data: write.data().cloned(),
+                    prev: write.prev().cloned(),
+                    event: write.event(),
+                },
+            )
+            .await;
         Ok(())
     }
 
@@ -88,9 +93,9 @@ impl CellStore<ValueKind> for MemoryCellStore {
         data: Option<&'a Bytes>,
     ) -> Result<(), Self::Error> {
         self.inner
-            .lock()
             .cells
-            .insert(collection.id().clone(), StoredCell::Resolved(data.cloned()));
+            .upsert_async(collection.id().clone(), StoredCell::Resolved(data.cloned()))
+            .await;
         Ok(())
     }
 
@@ -99,12 +104,12 @@ impl CellStore<ValueKind> for MemoryCellStore {
         collection: &'a CollectionRef<ValueKind>,
         (): &'a (),
     ) -> Result<(), Self::Error> {
-        let mut inner = self.inner.lock();
-        if let Some(StoredCell::Provisional { data, .. }) = inner.cells.get(collection.id()) {
+        if let Entry::Occupied(mut entry) =
+            self.inner.cells.entry_async(collection.id().clone()).await
+            && let StoredCell::Provisional { data, .. } = entry.get()
+        {
             let data = data.clone();
-            inner
-                .cells
-                .insert(collection.id().clone(), StoredCell::Resolved(data));
+            *entry.get_mut() = StoredCell::Resolved(data);
         }
         Ok(())
     }
@@ -119,10 +124,9 @@ impl DescriptorIdentityStore for MemoryCellStore {
     ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
         Ok(self
             .inner
-            .lock()
             .identities
-            .get(&segment_id)
-            .cloned()
+            .read_async(&segment_id, |_, rows| rows.clone())
+            .await
             .unwrap_or_default())
     }
 
@@ -134,8 +138,13 @@ impl DescriptorIdentityStore for MemoryCellStore {
         // Upsert by name, mirroring Cassandra's INSERT-overwrites-row
         // semantics so the shared acquisition tests observe one row per
         // collection on both backends.
-        let mut inner = self.inner.lock();
-        let segment = inner.identities.entry(segment_id).or_default();
+        let mut entry = self
+            .inner
+            .identities
+            .entry_async(segment_id)
+            .await
+            .or_default();
+        let segment = entry.get_mut();
         for row in rows {
             if let Some(existing) = segment.iter_mut().find(|r| r.name == row.name) {
                 *existing = row;
@@ -153,7 +162,7 @@ impl DescriptorIdentityStore for MemoryCellStore {
 /// memory production wiring. Infallible — its error is [`Infallible`].
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCommittedCache {
-    inner: Arc<Mutex<HashMap<CollectionId<ValueKind>, Committed, RandomState>>>,
+    inner: Arc<scc::HashMap<CollectionId<ValueKind>, Committed, RandomState>>,
 }
 
 impl MemoryCommittedCache {
@@ -172,7 +181,7 @@ impl CommittedCache<ValueKind> for MemoryCommittedCache {
         collection: &'a CollectionId<ValueKind>,
         (): &'a (),
     ) -> Result<Option<Committed>, Self::Error> {
-        Ok(self.inner.lock().get(collection).cloned())
+        Ok(self.inner.read_async(collection, |_, v| v.clone()).await)
     }
 
     async fn put<'a>(
@@ -181,7 +190,9 @@ impl CommittedCache<ValueKind> for MemoryCommittedCache {
         (): &'a (),
         value: &'a Committed,
     ) -> Result<(), Self::Error> {
-        self.inner.lock().insert(collection.clone(), value.clone());
+        self.inner
+            .upsert_async(collection.clone(), value.clone())
+            .await;
         Ok(())
     }
 
@@ -190,15 +201,15 @@ impl CommittedCache<ValueKind> for MemoryCommittedCache {
         collection: &'a CollectionId<ValueKind>,
         (): &'a (),
     ) -> Result<(), Self::Error> {
-        self.inner.lock().remove(collection);
+        self.inner.remove_async(collection).await;
         Ok(())
     }
 }
 
 #[derive(Debug, Default)]
 struct CellInner {
-    cells: HashMap<CollectionId<ValueKind>, StoredCell, RandomState>,
-    identities: HashMap<SegmentId, Vec<DurableDescriptorIdentity>, RandomState>,
+    cells: scc::HashMap<CollectionId<ValueKind>, StoredCell, RandomState>,
+    identities: scc::HashMap<SegmentId, Vec<DurableDescriptorIdentity>, RandomState>,
 }
 
 /// One stored cell in [`MemoryCellStore`].

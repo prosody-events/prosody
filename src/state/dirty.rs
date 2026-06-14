@@ -19,8 +19,13 @@ use super::value::{PendingOpSource, ValueKind, ValueOp, ValueStore};
 use super::{CollectionId, PendingOps, Read};
 use ahash::RandomState;
 use bytes::Bytes;
+use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::option::IntoIter as OptionIntoIter;
+
+/// Inline capacity of the `finalize` work-list: the touched-collection count
+/// most events stay at or below, so the keyset never spills to the heap.
+const TOUCHED_INLINE: usize = 4;
 
 /// In-memory dirty Value store: one compacted op per touched collection.
 #[derive(Debug, Default)]
@@ -40,6 +45,27 @@ impl DirtyValueStore {
     /// serialization guarantees no handler op is in flight when it runs.
     pub(crate) fn clear_all(&self) {
         self.entries.clear_sync();
+    }
+
+    /// Collects the ids of every collection touched this event — the
+    /// `finalize` work-list. A `set`/`clear` writes an op here, so the keyset
+    /// is exactly the set of collections that need staging; a `get` never
+    /// inserts, so a read-only collection is correctly absent.
+    ///
+    /// scc exposes no borrowing iterator (traversal is the closure-based
+    /// `iter_sync`), and the keyset must outlive `finalize`'s async fan-out, so
+    /// the work-list is materialized here. The id clones are refcount bumps
+    /// (`CollectionId` is all `Arc`), and the inline `SmallVec` keeps the
+    /// common small-event case off the heap entirely.
+    pub(crate) fn touched_collections(
+        &self,
+    ) -> SmallVec<[CollectionId<ValueKind>; TOUCHED_INLINE]> {
+        let mut ids = SmallVec::new();
+        self.entries.iter_sync(|id, _| {
+            ids.push(id.clone());
+            true
+        });
+        ids
     }
 }
 

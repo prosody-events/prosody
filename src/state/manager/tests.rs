@@ -223,7 +223,9 @@ async fn stage_under_timer(manager: &TestManager, key: &Key, value: u8) -> Resul
         .set_state_cell(&StateName::try_new("cart")?, &bytes(value))
         .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    manager.inner.armed.insert_async(key.clone()).await.ok();
+    // `insert_async` returns `Err(key)` if already present — harmless; the
+    // flag is idempotent.
+    let _ = manager.inner.armed.insert_async(key.clone()).await;
     Ok(())
 }
 
