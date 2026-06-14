@@ -361,11 +361,19 @@ where
         let Some(cell) = self.session.state_cell(&self.name).await? else {
             return Ok(None);
         };
-        // `Codec::deserialize` parses in place (destructive); cells live in
-        // shared `Bytes`, so copy first.
-        let mut buf = cell.to_vec();
-        let stored = C::with_cached_local(|codec| codec.deserialize(&mut buf))
-            .map_err(ValueStateError::Codec)?;
+        // `Codec::deserialize` parses in place (destructive). In production the
+        // cell `Bytes` is uniquely owned (every backend decode mints a fresh
+        // `Bytes`), so reclaim it as a mutable buffer with zero copy and parse
+        // in place. Only the shared-clone case (the in-memory test backend)
+        // copies, exactly as before — no worse than the status quo.
+        let stored = match cell.try_into_mut() {
+            Ok(mut buf) => C::with_cached_local(|codec| codec.deserialize(&mut buf)),
+            Err(cell) => {
+                let mut buf = cell.to_vec();
+                C::with_cached_local(|codec| codec.deserialize(&mut buf))
+            }
+        }
+        .map_err(ValueStateError::Codec)?;
         Ok(Some(R::resolve(&self.session, stored).await?))
     }
 

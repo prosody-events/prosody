@@ -2,12 +2,15 @@ use super::{
     collection_prefix, decode_cell, dirty_collection_key, encode_absent_cell, encode_present_cell,
 };
 use crate::Key;
-use crate::state::{CollectionId, EventScopeId, Read, StateKey, StateName, StateType, ValueKind};
+use crate::state::{
+    CollectionId, CollectionKind, EventScopeId, Read, StateKey, StateName, StateType, ValueKind,
+};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::sync::Arc;
 use uuid::Uuid;
+use xxhash_rust::xxh3::xxh3_128;
 
 fn key(value: &str) -> Key {
     Arc::from(value)
@@ -124,17 +127,59 @@ fn null_prone_string(g: &mut Gen, non_empty: bool) -> String {
         .collect()
 }
 
-fn prefix_for(fields: PrefixFields) -> Result<[u8; 16]> {
-    let name = StateName::try_new(&fields.name)?;
-    let id = CollectionId::<ValueKind>::new(
+fn id_from(fields: PrefixFields) -> Result<CollectionId<ValueKind>> {
+    Ok(CollectionId::new(
         StateKey::new(
             Uuid::from_u128(fields.segment),
             Arc::<str>::from(fields.key),
         ),
         StateType::Application,
-        name,
-    );
-    Ok(collection_prefix(&id))
+        StateName::try_new(&fields.name)?,
+    ))
+}
+
+fn prefix_for(fields: PrefixFields) -> Result<[u8; 16]> {
+    Ok(collection_prefix(&id_from(fields)?))
+}
+
+/// Pre-streaming oracle: builds the transient buffer the old
+/// `collection_prefix` allocated and hashes it in one shot. The streamed
+/// implementation must produce byte-identical hasher input, so this and
+/// `collection_prefix` agree.
+fn prefix_via_buffer<K>(id: &CollectionId<K>) -> [u8; 16]
+where
+    K: CollectionKind,
+{
+    let segment_bytes = id.state_key().segment_id.as_bytes();
+    let key_bytes = id.state_key().key.as_bytes();
+    let state_type_byte = i8::from(id.state_type()).cast_unsigned();
+    let name_bytes = id.name().as_str().as_bytes();
+
+    let mut buf =
+        Vec::with_capacity(segment_bytes.len() + 1 + 8 + key_bytes.len() + 8 + name_bytes.len());
+    buf.extend_from_slice(segment_bytes);
+    buf.push(state_type_byte);
+    buf.extend_from_slice(&(key_bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(key_bytes);
+    buf.extend_from_slice(&(name_bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(name_bytes);
+
+    xxh3_128(&buf).to_be_bytes()
+}
+
+/// Behavior-preservation for the streamed hash: the streamed
+/// `collection_prefix` is byte-for-byte the old buffer-then-`xxh3_128` result
+/// over random identities. Total proof the durable cache key is unchanged.
+#[test]
+fn prop_streamed_prefix_matches_buffer_oracle() {
+    fn prop(fields: PrefixFields) -> TestResult {
+        let id = match id_from(fields) {
+            Ok(id) => id,
+            Err(e) => return TestResult::error(format!("invalid identity: {e}")),
+        };
+        TestResult::from_bool(collection_prefix(&id) == prefix_via_buffer(&id))
+    }
+    QuickCheck::new().quickcheck(prop as fn(PrefixFields) -> TestResult);
 }
 
 /// Injectivity: any two collection identities that differ in at least one

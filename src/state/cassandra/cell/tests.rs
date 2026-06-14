@@ -181,6 +181,50 @@ async fn absent_row_and_provisional_cells_stream() -> Result<()> {
     Ok(())
 }
 
+/// Read-path uniqueness invariant: a present cell read back from the Cassandra
+/// decode path is **uniquely owned** (`try_into_mut().is_ok()`). This pins the
+/// production fast path `StateHandle::get` relies on — every backend decode
+/// mints a fresh `Bytes`, so the read parses in place with zero copy. It is the
+/// regression guard against a future layer re-introducing a shared clone that
+/// would silently demote the read to the copying fallback. Run over random
+/// non-empty payloads so the property holds across the byte space, not one
+/// fixture.
+#[test]
+fn prop_cassandra_present_cell_is_uniquely_owned() {
+    use crate::test_util::TEST_RUNTIME;
+    use quickcheck::{QuickCheck, TestResult};
+
+    async fn check(payload: Vec<u8>) -> Result<bool> {
+        let store = setup().await?;
+        let c = collection("uniq")?;
+        let data = Bytes::from(payload);
+        store.write_resolved(&c, &(), Some(&data)).await?;
+        let Cell::Resolved(committed) = store.read_cell(c.id(), &()).await? else {
+            return Err(eyre!("expected resolved cell"));
+        };
+        let Some(bytes) = committed.into_inner() else {
+            return Err(eyre!("expected present committed value"));
+        };
+        Ok(bytes.try_into_mut().is_ok())
+    }
+
+    fn prop(payload: Vec<u8>) -> TestResult {
+        if payload.is_empty() {
+            return TestResult::discard();
+        }
+        match TEST_RUNTIME.block_on(check(payload)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::error("present cell was a shared clone, not uniquely owned"),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+
+    init_test_logging();
+    QuickCheck::new()
+        .tests(get_test_count())
+        .quickcheck(prop as fn(Vec<u8>) -> TestResult);
+}
+
 /// The crash-recovery-equivalence property over the **Cassandra** cell store.
 /// Runs the same backend-generic trace runner as the memory suite, so both
 /// backends prove identical invariants (parity by transitivity through the

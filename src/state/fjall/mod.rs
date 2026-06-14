@@ -32,6 +32,9 @@ mod dirty;
 mod error;
 mod workspace;
 
+#[cfg(test)]
+mod tests;
+
 pub use config::FjallConfiguration;
 pub use dirty::{FjallDirtyValueStore, FjallDirtyValueStoreProvider, FjallFactoryError};
 pub use error::FjallValueStoreError;

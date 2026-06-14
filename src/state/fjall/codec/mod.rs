@@ -38,7 +38,7 @@ use super::error::FjallValueStoreError;
 use crate::state::encoding::{PayloadEncoding, decode_payload, encode_payload};
 use crate::state::{CollectionId, CollectionKind, EventScopeId, Read};
 use bytes::Bytes;
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::Xxh3;
 
 /// Tag byte for "known absent" entries.
 const CACHE_TAG_ABSENT: u8 = 0x00;
@@ -66,16 +66,21 @@ where
     // field length-prefixed. A delimiter byte would not be injective — a key
     // or name containing it could shift the field boundary (Kafka keys are
     // arbitrary bytes) — so two distinct collections could share a buffer.
-    let mut buf =
-        Vec::with_capacity(segment_bytes.len() + 1 + 8 + key_bytes.len() + 8 + name_bytes.len());
-    buf.extend_from_slice(segment_bytes);
-    buf.push(state_type_byte);
-    buf.extend_from_slice(&(key_bytes.len() as u64).to_be_bytes());
-    buf.extend_from_slice(key_bytes);
-    buf.extend_from_slice(&(name_bytes.len() as u64).to_be_bytes());
-    buf.extend_from_slice(name_bytes);
+    //
+    // Streamed through `Xxh3` (seed 0, identical to `xxh3_128`) so no transient
+    // buffer is allocated. The byte sequence fed here is load-bearing: it is the
+    // durable cache key, so the field order and the big-endian `u64` length
+    // prefixes must stay byte-for-byte what the buffer build produced. Never
+    // substitute `write_u64`/`write_u32` — those are native-endian.
+    let mut hasher = Xxh3::new();
+    hasher.update(segment_bytes);
+    hasher.update(&[state_type_byte]);
+    hasher.update(&(key_bytes.len() as u64).to_be_bytes());
+    hasher.update(key_bytes);
+    hasher.update(&(name_bytes.len() as u64).to_be_bytes());
+    hasher.update(name_bytes);
 
-    xxh3_128(&buf).to_be_bytes()
+    hasher.digest128().to_be_bytes()
 }
 
 /// Encodes an `Absent` cache cell.
