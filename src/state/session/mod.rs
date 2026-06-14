@@ -64,6 +64,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::watch;
+use tokio::task::coop::cooperative;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -680,7 +681,13 @@ where
         let staged: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)> = stream::iter(names)
             .map(|name| {
                 let prepared = self.stage_prep(&dirty, &name);
-                async move {
+                // `cooperative` adds a per-item coop-budget checkpoint: the
+                // in-memory and fjall stores complete each future without a
+                // tokio leaf await, so a key touching many collections would
+                // otherwise drain the whole batch in one poll and starve the
+                // worker. Concurrency is unchanged — `buffer_unordered` still
+                // drives `STATE_FANOUT_CONCURRENCY` of these at once.
+                cooperative(async move {
                     let Some(StagePrep {
                         id,
                         value,
@@ -711,7 +718,7 @@ where
                             Ok(None)
                         }
                     }
-                }
+                })
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .try_filter_map(|opt| async move { Ok(opt) })
@@ -734,15 +741,19 @@ where
         let store = &self.inner.store;
         // Best-effort: `fold` drives every promote to completion regardless of
         // siblings' failures, reducing to a single `bool` accumulator.
+        // `cooperative` wraps each promote so the fan-out yields to the runtime
+        // every ~128 cells instead of draining the whole batch in one poll.
         let all_resolved = stream::iter(set.entries)
-            .map(|(collection_ref, write)| async move {
-                match store.promote(&collection_ref, &(), write.data()).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        warn!(error = ?error, "cell promote failed; leaving provisional for the sweep");
-                        false
+            .map(|(collection_ref, write)| {
+                cooperative(async move {
+                    match store.promote(&collection_ref, &(), write.data()).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!(error = ?error, "cell promote failed; leaving provisional for the sweep");
+                            false
+                        }
                     }
-                }
+                })
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .fold(true, |all, ok| async move { all && ok })
@@ -760,17 +771,19 @@ where
         };
         let store = &self.inner.store;
         let all_resolved = stream::iter(set.entries)
-            .map(|(collection_ref, write)| async move {
-                match store
-                    .rollback_provisional(&collection_ref, &(), write.prev())
-                    .await
-                {
-                    Ok(()) => true,
-                    Err(error) => {
-                        warn!(error = ?error, "cell rollback failed; leaving provisional for the sweep");
-                        false
+            .map(|(collection_ref, write)| {
+                cooperative(async move {
+                    match store
+                        .rollback_provisional(&collection_ref, &(), write.prev())
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!(error = ?error, "cell rollback failed; leaving provisional for the sweep");
+                            false
+                        }
                     }
-                }
+                })
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .fold(true, |all, ok| async move { all && ok })

@@ -52,6 +52,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::task::coop::cooperative;
 
 /// The cell-store error of a backend factory's cell store.
 type CellErr<B> = <<B as StateBackendFactory>::Cell as CellStore<ValueKind>>::Error;
@@ -377,13 +378,17 @@ where
     // fan out concurrently. `try_fold` reduces to one `bool` and short-circuits
     // on a transient/terminal error (propagated via `?`), exactly as the
     // sequential `?` did; per-cell Permanent failures are logged and skipped
-    // inside `sweep_collection` (returning `false`).
+    // inside `sweep_collection` (returning `false`). `cooperative` wraps each
+    // sweep so the fan-out yields to the runtime every ~128 collections rather
+    // than draining the whole batch in one poll.
     let all_resolved = stream::iter(names.iter().cloned())
-        .map(|name| async move {
-            let ttl = registry.ttl_for(&name);
-            let id =
-                CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name);
-            store.sweep_collection(&CollectionRef::new(id, ttl)).await
+        .map(|name| {
+            cooperative(async move {
+                let ttl = registry.ttl_for(&name);
+                let id =
+                    CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name);
+                store.sweep_collection(&CollectionRef::new(id, ttl)).await
+            })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)
         .try_fold(true, |all, resolved| async move { Ok(all && resolved) })

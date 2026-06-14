@@ -310,6 +310,25 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
   async interface (`insert_async` / `contains_async` / `remove_async`); pair it
   with `ahash::RandomState` as the hasher.
 - Use `tokio::sync` primitives (`Notify`, channels, `select!`) for async
+- **Drive streams/futures over non-tokio primitives through the cooperative
+  budget.** Tokio auto-decrements its per-task coop budget (and forces a yield
+  when it hits zero) only at its *own* leaf awaits — network/channel/timer I/O.
+  A future that completes without touching one of those leaves — an in-memory or
+  fjall store op, a `futures` channel, a `buffer_unordered` of CPU-bound work —
+  never decrements the budget, so a fan-out or a `while let Some(x) =
+  stream.next()` loop over ready items can drain the whole batch in one poll and
+  starve the worker. Wrap each such future with
+  [`tokio::task::coop::cooperative`] — it adds a per-poll budget checkpoint so
+  the work yields every ~128 items. There is **no** `.cooperative()` method and
+  no coop *stream* adapter: `cooperative(fut)` is a free function returning a
+  `Coop<F>` future. The idiomatic combinator form keeps full concurrency —
+  `stream.map(|x| cooperative(async move { … })).buffer_unordered(N)` (a
+  `FuturesUnordered<Coop<…>>`, as `KeyManager` does). Wrap the **per-item**
+  future inside the `map`, not the outer `fold`/`try_collect` — wrapping the
+  combinator only checkpoints once for the entire drain. Pass `cooperative`
+  inline in the producing closure; `.map(cooperative)` / `.map(|f|
+  cooperative(f))` as a separate stage trips a higher-ranked-lifetime error on
+  non-`'static` futures.
 - Mark builders with `#[must_use]`
 - Use `LazyLock` for expensive static initialization
 - Implement `Arbitrary` for QuickCheck property tests
