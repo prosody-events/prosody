@@ -323,7 +323,11 @@ fn event_key(data: &Data) -> Option<&str> {
 /// Spawns a background task that subscribes to the telemetry broadcast channel
 /// and produces serialized events to Kafka concurrently.
 ///
-/// If `config.enabled` is `false`, this is a no-op and returns `Ok(())`.
+/// This is a no-op returning `Ok(false)` when `mock` is `true` or
+/// `config.enabled` is `false` — in either case no producer is built and no
+/// broker connection is opened. Mock mode is offline by contract, so the
+/// emitter must not contact a real broker. Returns `Ok(true)` after a
+/// successful spawn.
 ///
 /// # Errors
 ///
@@ -333,9 +337,10 @@ pub fn spawn_telemetry_emitter(
     config: &TelemetryEmitterConfiguration,
     bootstrap_servers: &[String],
     telemetry: &Telemetry,
-) -> Result<(), EmitterError> {
-    if !config.enabled {
-        return Ok(());
+    mock: bool,
+) -> Result<bool, EmitterError> {
+    if mock || !config.enabled {
+        return Ok(false);
     }
 
     let hostname: Arc<str> = hostname()?.into();
@@ -401,7 +406,7 @@ pub fn spawn_telemetry_emitter(
             .await;
     });
 
-    Ok(())
+    Ok(true)
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

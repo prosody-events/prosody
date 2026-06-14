@@ -313,13 +313,32 @@ fn config_builder_enabled_false() -> Result<()> {
 }
 
 #[test]
-fn spawn_emitter_disabled_returns_ok() -> Result<()> {
+fn spawn_emitter_disabled_returns_false() -> Result<()> {
     let config = TelemetryEmitterConfiguration {
         topic: "test".to_owned(),
         enabled: false,
     };
     let telemetry = Telemetry::new();
-    spawn_telemetry_emitter(&config, &[], &telemetry)?;
+    ensure!(
+        !spawn_telemetry_emitter(&config, &[], &telemetry, false)?,
+        "disabled emitter must not spawn"
+    );
+    Ok(())
+}
+
+#[test]
+fn spawn_emitter_mock_returns_false() -> Result<()> {
+    // Enabled, but mock mode must short-circuit before any producer is
+    // built — the unresolvable bootstrap would otherwise trigger the bug.
+    let config = TelemetryEmitterConfiguration {
+        topic: "test".to_owned(),
+        enabled: true,
+    };
+    let telemetry = Telemetry::new();
+    ensure!(
+        !spawn_telemetry_emitter(&config, &["kafka:9092".to_owned()], &telemetry, true)?,
+        "mock-mode emitter must not spawn"
+    );
     Ok(())
 }
 

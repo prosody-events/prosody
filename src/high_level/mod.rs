@@ -170,10 +170,14 @@ where
             }
         }?;
 
+        // Mock mode is offline: the emitter opens no real broker connection
+        // (just as `check_topic_existence` below is skipped). The returned
+        // spawn flag is unused here.
         spawn_telemetry_emitter(
             &consumer_builders.emitter,
             &producer_config.bootstrap_servers,
             &telemetry,
+            producer_config.mock,
         )?;
 
         let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
