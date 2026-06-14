@@ -110,12 +110,12 @@ where
 /// Value operations are last-writer-wins, so only the final op in the slice
 /// affects the applied state.
 #[must_use]
-pub fn fold_value_ops<'a, I>(applied: ValueApplied, ops: I) -> ValueApplied
+pub fn fold_value_ops<I>(applied: ValueApplied, ops: I) -> ValueApplied
 where
-    I: IntoIterator<Item = &'a ValueOp>,
+    I: IntoIterator<Item = ValueOp>,
 {
     ops.into_iter().last().map_or(applied, |op| match op {
-        ValueOp::Set { payload } => Some(payload.clone()),
+        ValueOp::Set { payload } => Some(payload),
         ValueOp::Clear => None,
     })
 }

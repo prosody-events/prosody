@@ -72,6 +72,11 @@ pub use identity::{
 pub use transaction::{CommitMode, PendingOps, Read};
 pub use value::{ValueKind, ValueOp};
 
+/// Maximum concurrent per-collection durable operations in the keyed-state
+/// Value lifecycle (finalize stage, commit promote, rollback, recovery sweep).
+/// Each collection is its own Cassandra partition, so the fan-out is safe.
+pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
+
 /// The per-partition keyed-state backend: the durable cell store, the commit
 /// oracle it resolves provisional cells through, the committed-value cache,
 /// and the dirty-workspace provider.

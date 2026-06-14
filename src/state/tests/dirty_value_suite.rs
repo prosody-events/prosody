@@ -106,7 +106,7 @@ where
         if p.count.get() != 1 {
             return Ok(false);
         }
-        let folded = fold_value_ops(None, p.ops.collect::<Vec<_>>().iter());
+        let folded = fold_value_ops(None, p.ops);
         let folded_read: Read<Bytes> = folded.map_or(Read::Absent, Read::Present);
         if folded_read != read {
             return Ok(false);

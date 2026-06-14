@@ -25,10 +25,10 @@ fn value_folding_uses_last_ordered_op() {
         ValueOp::Set { payload: bytes(3) },
     ];
 
-    assert_eq!(fold_value_ops(initial, &ops), Some(bytes(3)));
-    assert_eq!(fold_value_ops(Some(bytes(1)), &[ValueOp::Clear]), None);
+    assert_eq!(fold_value_ops(initial, ops), Some(bytes(3)));
+    assert_eq!(fold_value_ops(Some(bytes(1)), [ValueOp::Clear]), None);
     assert_eq!(
-        fold_value_ops(None, &[ValueOp::Set { payload: bytes(9) }]),
+        fold_value_ops(None, [ValueOp::Set { payload: bytes(9) }]),
         Some(bytes(9))
     );
 }

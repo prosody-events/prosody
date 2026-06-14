@@ -39,13 +39,14 @@ use crate::state::session::{
 use crate::state::store::CellStore;
 use crate::state::value::ValueKind;
 use crate::state::{
-    CollectionId, CollectionRef, DirtyStoreProvider, EventRef, StateBackend, StateBackendFactory,
-    StateKey, StateName, StateType,
+    CollectionId, CollectionRef, DirtyStoreProvider, EventRef, STATE_FANOUT_CONCURRENCY,
+    StateBackend, StateBackendFactory, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{SegmentId, TriggerStore};
 use crate::timers::{TimerManager, TimerType};
 use crate::{Key, Partition, Topic};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -372,16 +373,21 @@ where
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
 {
-    let mut all_resolved = true;
-    for name in names {
-        let ttl = registry.ttl_for(name);
-        let id =
-            CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name.clone());
-        let collection_ref = CollectionRef::new(id, ttl);
-        if !store.sweep_collection(&collection_ref).await? {
-            all_resolved = false;
-        }
-    }
+    // Each name is its own Cassandra partition, so the per-collection sweeps
+    // fan out concurrently. `try_fold` reduces to one `bool` and short-circuits
+    // on a transient/terminal error (propagated via `?`), exactly as the
+    // sequential `?` did; per-cell Permanent failures are logged and skipped
+    // inside `sweep_collection` (returning `false`).
+    let all_resolved = stream::iter(names.iter().cloned())
+        .map(|name| async move {
+            let ttl = registry.ttl_for(&name);
+            let id =
+                CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name);
+            store.sweep_collection(&CollectionRef::new(id, ttl)).await
+        })
+        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+        .try_fold(true, |all, resolved| async move { Ok(all && resolved) })
+        .await?;
     Ok(all_resolved)
 }
 

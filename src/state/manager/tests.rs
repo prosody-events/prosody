@@ -17,15 +17,16 @@ use super::*;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
-use crate::state::cell::{Cell, Committed};
+use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor::{ValueDescriptor, value_state};
+use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDirtyValueStoreProvider};
 use crate::state::registry::CollectionDef;
 use crate::state::session::StateSession;
-use crate::state::session::sealed::{FinalizeOutcome, StateLifecycle};
+use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use crate::state::tests::value_suite::bytes;
 use crate::state::{
-    CommitDecision, EventRef, SharedStateBackend, StateName, StateType, TimerEventRef,
+    CommitDecision, CommitMode, EventRef, SharedStateBackend, StateName, StateType, TimerEventRef,
 };
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
@@ -36,8 +37,9 @@ use crate::timers::store::{Segment, SegmentVersion};
 use crate::timers::{
     PendingTimer, TimerManagerConfig, TimerRequest, TimerSemaphores, TimerType, Trigger,
 };
+use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use std::array::from_fn;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -90,8 +92,19 @@ type TestManager = StateManager<
     MemoryLoader<serde_json::Value>,
 >;
 
+/// Per-event session type the test manager mints.
+type TestSession = <TestManager as PartitionStateManager>::Session;
+
 fn cart() -> ValueDescriptor {
     value_state("cart")
+}
+
+fn wishlist() -> ValueDescriptor {
+    value_state("wishlist")
+}
+
+fn last_seen() -> ValueDescriptor {
+    value_state("last_seen")
 }
 
 fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {
@@ -100,10 +113,28 @@ fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {
     Ok(Arc::new(registry))
 }
 
+/// A registry with three collections exercising both commit modes: two
+/// `ReadCommitted` (`cart`, `wishlist`) that stage provisional cells and one
+/// `ReadUncommitted` (`last_seen`) that writes resolved at finalize.
+fn registry_with_mixed() -> Result<Arc<CollectionDefRegistry>> {
+    let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
+    registry.register(&cart(), CollectionDef::new(None))?;
+    registry.register(&wishlist(), CollectionDef::new(None))?;
+    registry.register(
+        &last_seen(),
+        CollectionDef::new(None).with_commit_mode(CommitMode::ReadUncommitted),
+    )?;
+    Ok(Arc::new(registry))
+}
+
 /// Builds a provider sharing `cell` (so a test can read the durable cell back
-/// after `recover`) with the given oracle.
-fn provider(cell: MemoryCellStore, oracle: FixedOracle) -> Result<TestProvider> {
-    Ok(StateManagerProvider::new(
+/// after `recover`) with the given oracle and registry.
+fn provider_with(
+    cell: MemoryCellStore,
+    oracle: FixedOracle,
+    registry: Arc<CollectionDefRegistry>,
+) -> TestProvider {
+    StateManagerProvider::new(
         SharedStateBackend::new(
             cell,
             oracle,
@@ -111,10 +142,15 @@ fn provider(cell: MemoryCellStore, oracle: FixedOracle) -> Result<TestProvider> 
             MemoryDirtyValueStoreProvider,
         ),
         MemoryLoader::new(),
-        registry_with_cart()?,
+        registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
-    ))
+    )
+}
+
+/// A provider over the single-`cart` registry the recovery tests use.
+fn provider(cell: MemoryCellStore, oracle: FixedOracle) -> Result<TestProvider> {
+    Ok(provider_with(cell, oracle, registry_with_cart()?))
 }
 
 async fn acquire(provider: &TestProvider) -> Result<TestManager> {
@@ -130,18 +166,23 @@ fn termination() -> TerminationWatch {
     TerminationWatch::new(shutdown_rx, cancel_rx)
 }
 
-/// The `cart` collection identity for `key` in the fixed test segment —
+/// The `name` collection identity for `key` in the fixed test segment —
 /// re-derived through [`compute_segment_id`] so it matches what `acquire`
 /// wrote, exactly as recovery does.
-fn cart_id(key: &Key) -> Result<CollectionId<ValueKind>> {
+fn id_for(key: &Key, name: &str) -> Result<CollectionId<ValueKind>> {
     Ok(CollectionId::new(
         StateKey::new(
             compute_segment_id(Topic::from("t"), 0, "test-group"),
             key.clone(),
         ),
         StateType::Application,
-        StateName::try_new("cart")?,
+        StateName::try_new(name)?,
     ))
+}
+
+/// The `cart` collection identity for `key`.
+fn cart_id(key: &Key) -> Result<CollectionId<ValueKind>> {
+    id_for(key, "cart")
 }
 
 /// Builds a real in-memory `TimerManager`; the pending stream is returned so it
@@ -263,6 +304,326 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
         cell.read_cell(&id, &()).await?,
         Cell::Resolved(Committed::new(None)),
         "an uncommitted cell rolls back to its (absent) committed base",
+    );
+    Ok(())
+}
+
+/// The timer `EventRef` the multi-collection lifecycle tests stage under.
+fn timer_event(key: &Key) -> EventRef {
+    let trigger = Trigger::for_testing(
+        key.clone(),
+        CompactDateTime::from(99_u32),
+        TimerType::DeferredMessage,
+    );
+    EventRef::Timer(TimerEventRef::new(
+        trigger.timer_type,
+        trigger.time,
+        trigger.tag,
+    ))
+}
+
+/// Buffers writes to two `ReadCommitted` collections (`cart`, `wishlist`) and
+/// one `ReadUncommitted` collection (`last_seen`) through one session, before
+/// `finalize`.
+async fn write_mixed(manager: &TestManager, key: &Key) -> Result<(TestSession, EventRef)> {
+    let event = timer_event(key);
+    let session = manager.session(key.clone(), event, termination());
+    session
+        .set_state_cell(&StateName::try_new("cart")?, bytes(7))
+        .await?;
+    session
+        .set_state_cell(&StateName::try_new("wishlist")?, bytes(13))
+        .await?;
+    session
+        .set_state_cell(&StateName::try_new("last_seen")?, bytes(42))
+        .await?;
+    Ok((session, event))
+}
+
+/// `finalize` over a mix of commit modes stages every `ReadCommitted`
+/// collection as a provisional cell and writes every `ReadUncommitted`
+/// collection resolved. Assertions are set-keyed by collection id, never by
+/// staged-set iteration order (the concurrent fan-out makes order
+/// nondeterministic).
+#[tokio::test]
+async fn finalize_stages_mixed_collections_by_mode() -> Result<()> {
+    let cell = MemoryCellStore::new();
+    let manager = acquire(&provider_with(
+        cell.clone(),
+        FixedOracle::committed(),
+        registry_with_mixed()?,
+    ))
+    .await?;
+    let key: Key = Arc::from("k");
+
+    let (session, event) = write_mixed(&manager, &key).await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "cart")?, &()).await?,
+        Cell::Provisional(ProvisionalCell::new(Some(bytes(7)), None, event)),
+        "a ReadCommitted collection stages a provisional cell over its absent base",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "wishlist")?, &()).await?,
+        Cell::Provisional(ProvisionalCell::new(Some(bytes(13)), None, event)),
+        "the second ReadCommitted collection stages its own provisional cell",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "last_seen")?, &()).await?,
+        Cell::Resolved(Committed::new(Some(bytes(42)))),
+        "a ReadUncommitted collection writes a resolved value at stage time",
+    );
+    Ok(())
+}
+
+/// After `finalize`, `commit_apply` promotes every staged `ReadCommitted` cell
+/// to its committed data; the `ReadUncommitted` cell was already resolved.
+#[tokio::test]
+async fn commit_apply_promotes_all_staged_cells() -> Result<()> {
+    let cell = MemoryCellStore::new();
+    let manager = acquire(&provider_with(
+        cell.clone(),
+        FixedOracle::committed(),
+        registry_with_mixed()?,
+    ))
+    .await?;
+    let key: Key = Arc::from("k");
+
+    let (session, _event) = write_mixed(&manager, &key).await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    assert_eq!(session.commit_apply().await, ApplyOutcome::Resolved);
+
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "cart")?, &()).await?,
+        Cell::Resolved(Committed::new(Some(bytes(7)))),
+        "the first ReadCommitted cell promotes to its staged data",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "wishlist")?, &()).await?,
+        Cell::Resolved(Committed::new(Some(bytes(13)))),
+        "the second ReadCommitted cell promotes to its staged data",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "last_seen")?, &()).await?,
+        Cell::Resolved(Committed::new(Some(bytes(42)))),
+        "the ReadUncommitted cell stays resolved",
+    );
+    Ok(())
+}
+
+/// After `finalize`, `rollback_aborted` rolls every staged `ReadCommitted` cell
+/// back to its committed base (here absent).
+#[tokio::test]
+async fn rollback_aborted_rolls_back_all_staged_cells() -> Result<()> {
+    let cell = MemoryCellStore::new();
+    let manager = acquire(&provider_with(
+        cell.clone(),
+        FixedOracle::committed(),
+        registry_with_mixed()?,
+    ))
+    .await?;
+    let key: Key = Arc::from("k");
+
+    let (session, _event) = write_mixed(&manager, &key).await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    assert_eq!(session.rollback_aborted().await, ApplyOutcome::Resolved);
+
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "cart")?, &()).await?,
+        Cell::Resolved(Committed::new(None)),
+        "the first ReadCommitted cell rolls back to its absent base",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "wishlist")?, &()).await?,
+        Cell::Resolved(Committed::new(None)),
+        "the second ReadCommitted cell rolls back to its absent base",
+    );
+    Ok(())
+}
+
+/// A cell store that fails the promote (`mark_resolved`) arm with a *permanent*
+/// error for one named collection and delegates everything else (including the
+/// descriptor-identity rows acquisition reads) to an inner memory store. Drives
+/// the session-level best-effort `commit_apply` path: one poisoned cell must be
+/// left provisional for the sweep without cancelling its siblings' promotes.
+#[derive(Clone)]
+struct PoisonPromoteCell {
+    inner: MemoryCellStore,
+    poison: StateName,
+}
+
+#[derive(Debug, Error)]
+#[error("permanent promote poison")]
+struct PromotePoison;
+
+impl ClassifyError for PromotePoison {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
+
+impl CellStore<ValueKind> for PoisonPromoteCell {
+    type Error = PromotePoison;
+
+    async fn read_cell<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        addr: &'a (),
+    ) -> Result<Cell, Self::Error> {
+        self.inner.read_cell(collection, addr).await.map_err(never)
+    }
+
+    fn provisional_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+    ) -> impl Stream<Item = Result<((), ProvisionalCell), Self::Error>> + Send + 'a {
+        self.inner
+            .provisional_cells(collection)
+            .map(|item| item.map_err(never))
+    }
+
+    async fn write_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef<ValueKind>,
+        addr: &'a (),
+        write: &'a ProvisionalWrite,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write_provisional(collection, addr, write)
+            .await
+            .map_err(never)
+    }
+
+    async fn write_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef<ValueKind>,
+        addr: &'a (),
+        data: Option<&'a Bytes>,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write_resolved(collection, addr, data)
+            .await
+            .map_err(never)
+    }
+
+    async fn mark_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef<ValueKind>,
+        addr: &'a (),
+    ) -> Result<(), Self::Error> {
+        if *collection.id().name() == self.poison {
+            return Err(PromotePoison);
+        }
+        self.inner
+            .mark_resolved(collection, addr)
+            .await
+            .map_err(never)
+    }
+}
+
+impl DescriptorIdentityStore for PoisonPromoteCell {
+    type Error = PromotePoison;
+
+    async fn read_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        self.inner
+            .read_descriptor_identities(segment_id)
+            .await
+            .map_err(never)
+    }
+
+    async fn write_descriptor_identities(
+        &self,
+        segment_id: SegmentId,
+        rows: Vec<DurableDescriptorIdentity>,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write_descriptor_identities(segment_id, rows)
+            .await
+            .map_err(never)
+    }
+}
+
+/// Lifts the inner store's [`Infallible`] error into [`PromotePoison`]; never
+/// called, because [`Infallible`] is uninhabited.
+fn never(error: Infallible) -> PromotePoison {
+    match error {}
+}
+
+type PoisonProvider = StateManagerProvider<
+    SharedStateBackend<
+        PoisonPromoteCell,
+        FixedOracle,
+        MemoryCommittedCache,
+        MemoryDirtyValueStoreProvider,
+    >,
+    MemoryLoader<serde_json::Value>,
+>;
+
+/// A provider over a [`PoisonPromoteCell`] sharing `cell` so a test can read
+/// the durable cells back after `commit_apply`.
+fn poison_provider(
+    cell: PoisonPromoteCell,
+    registry: Arc<CollectionDefRegistry>,
+) -> PoisonProvider {
+    StateManagerProvider::new(
+        SharedStateBackend::new(
+            cell,
+            FixedOracle::committed(),
+            MemoryCommittedCache::new(),
+            MemoryDirtyValueStoreProvider,
+        ),
+        MemoryLoader::new(),
+        registry,
+        Arc::from("test-group"),
+        CompactDuration::new(30),
+    )
+}
+
+/// `commit_apply` is best-effort under a per-cell promote failure: the poisoned
+/// `ReadCommitted` cell is left provisional (for the sweep) and the outcome is
+/// `Incomplete`, but every healthy sibling still promotes. This pins the
+/// `fold`-not-`try_fold` reduction — one failure must never cancel the rest of
+/// the concurrent fan-out.
+#[tokio::test]
+async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
+    let cell = PoisonPromoteCell {
+        inner: MemoryCellStore::new(),
+        poison: StateName::try_new("wishlist")?,
+    };
+    let manager = poison_provider(cell.clone(), registry_with_mixed()?)
+        .acquire(Topic::from("t"), 0)
+        .await
+        .map_err(|e| eyre!("acquire failed: {e}"))?;
+    let key: Key = Arc::from("k");
+
+    let event = timer_event(&key);
+    let session = manager.session(key.clone(), event, termination());
+    session
+        .set_state_cell(&StateName::try_new("cart")?, bytes(7))
+        .await?;
+    session
+        .set_state_cell(&StateName::try_new("wishlist")?, bytes(13))
+        .await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+
+    assert_eq!(
+        session.commit_apply().await,
+        ApplyOutcome::Incomplete,
+        "a failed promote yields Incomplete so the boundary leaves the backstop armed",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "cart")?, &()).await?,
+        Cell::Resolved(Committed::new(Some(bytes(7)))),
+        "the healthy sibling still promotes despite the poisoned cell failing",
+    );
+    assert_eq!(
+        cell.read_cell(&id_for(&key, "wishlist")?, &()).await?,
+        Cell::Provisional(ProvisionalCell::new(Some(bytes(13)), None, event)),
+        "the poisoned cell stays provisional for the recovery sweep",
     );
     Ok(())
 }

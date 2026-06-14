@@ -47,14 +47,15 @@ use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
-use crate::state::value::{PendingOpSource, ValueKind, ValueStore, fold_value_ops};
+use crate::state::value::{PendingOpSource, ValueApplied, ValueKind, ValueStore, fold_value_ops};
 use crate::state::{
     CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyStoreProvider, EventRef,
-    EventScopeId, Read, StateKey, StateName, StateType, StoreOutcome,
+    EventScopeId, Read, STATE_FANOUT_CONCURRENCY, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
 use scc::HashSet as ConcurrentHashSet;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
@@ -327,6 +328,16 @@ struct StagedSet {
     entries: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)>,
 }
 
+/// One touched collection's staged write, prepared synchronously from the
+/// dirty scope before `finalize`'s concurrent fan-out so no `Ops<'a>` borrow
+/// crosses an await.
+struct StagePrep {
+    id: CollectionId<ValueKind>,
+    value: ValueApplied,
+    collection_ref: CollectionRef<ValueKind>,
+    mode: CommitMode,
+}
+
 /// Construction parameters for [`ValueStateSession`], bundled so the
 /// constructor stays readable.
 pub struct SessionParts<S, O, C, P, L>
@@ -505,6 +516,37 @@ where
     }
 }
 
+impl<S, O, C, P, L> ValueStateSession<S, O, C, P, L>
+where
+    P: DirtyStoreProvider<ValueKind>,
+    P::Store: DirtyValueBundle,
+{
+    /// Folds a touched collection's buffered ops into the write `finalize`
+    /// will stage, reading from `dirty` synchronously so the `Ops<'a>` borrow
+    /// is released before any await. `None` means the collection was touched
+    /// (e.g. via `get`) but never written, so there is nothing to stage.
+    fn stage_prep(
+        &self,
+        dirty: &P::Store,
+        name: &StateName,
+    ) -> Result<Option<StagePrep>, StateAccessError> {
+        let id = self.collection_id_for(name);
+        let value = match dirty
+            .pending_ops(&id)
+            .map_err(|e| StateAccessError::store(&e))?
+        {
+            Some(pending) => fold_value_ops(None, pending.ops),
+            None => return Ok(None),
+        };
+        Ok(Some(StagePrep {
+            id,
+            value,
+            collection_ref: self.collection_ref_for(name),
+            mode: self.inner.registry.commit_mode_for(name),
+        }))
+    }
+}
+
 impl<S, O, C, P, L> StateSession for ValueStateSession<S, O, C, P, L>
 where
     S: CellStore<ValueKind>,
@@ -585,8 +627,7 @@ where
         else {
             return Ok(StoreOutcome::NoOp);
         };
-        let ops: Vec<_> = pending.ops.collect();
-        let value = fold_value_ops(None, ops.iter());
+        let value = fold_value_ops(None, pending.ops);
         let collection_ref = self.collection_ref_for(name);
         self.inner
             .store
@@ -624,46 +665,60 @@ where
     /// `Provisional` owned by this event, so `committed` reads its `prev`).
     /// The staged set is replaced only after every write succeeds.
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
+        // Clone the touched set (don't drain): an in-place transient retry
+        // re-runs `finalize` and needs `touched` intact.
         let names: Vec<StateName> = self.inner.touched.lock().iter().cloned().collect();
         let dirty = self.dirty_scope();
-        let mut staged = Vec::new();
-        for name in names {
-            let id = self.collection_id_for(&name);
-            let Some(pending) = dirty
-                .pending_ops(&id)
-                .map_err(|e| StateAccessError::store(&e))?
-            else {
-                // Touched (e.g. via `get`) but never written — nothing to stage.
-                continue;
-            };
-            let ops: Vec<_> = pending.ops.collect();
-            let value = fold_value_ops(None, ops.iter());
-            let collection_ref = self.collection_ref_for(&name);
-            match self.inner.registry.commit_mode_for(&name) {
-                CommitMode::ReadCommitted => {
-                    let prev = self
-                        .inner
-                        .store
-                        .committed(&id, &(), self.inner.event)
-                        .await
-                        .map_err(|e| StateAccessError::store(&e))?;
-                    let write = ProvisionalWrite::new(value, prev, self.inner.event);
-                    self.inner
-                        .store
-                        .write_provisional(&collection_ref, &(), &write)
-                        .await
-                        .map_err(|e| StateAccessError::store(&e))?;
-                    staged.push((collection_ref, write));
+        let store = &self.inner.store;
+        let event = self.inner.event;
+        // Distinct collections are distinct ids = distinct cache keys, status
+        // keys, and Cassandra partitions, so per-collection staging fans out
+        // concurrently with no intra-event races. The fallible synchronous prep
+        // (pending ops + fold + refs) runs in the `map` closure, borrowing the
+        // cloned dirty scope, and only owned data crosses into the future — no
+        // `Ops<'a>` borrow spans an await.
+        let staged: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)> = stream::iter(names)
+            .map(|name| {
+                let prepared = self.stage_prep(&dirty, &name);
+                async move {
+                    let Some(StagePrep {
+                        id,
+                        value,
+                        collection_ref,
+                        mode,
+                    }) = prepared?
+                    else {
+                        return Ok(None);
+                    };
+                    match mode {
+                        CommitMode::ReadCommitted => {
+                            let prev = store
+                                .committed(&id, &(), event)
+                                .await
+                                .map_err(|e| StateAccessError::store(&e))?;
+                            let write = ProvisionalWrite::new(value, prev, event);
+                            store
+                                .write_provisional(&collection_ref, &(), &write)
+                                .await
+                                .map_err(|e| StateAccessError::store(&e))?;
+                            Ok(Some((collection_ref, write)))
+                        }
+                        CommitMode::ReadUncommitted => {
+                            store
+                                .write_resolved(&collection_ref, &(), value.as_ref())
+                                .await
+                                .map_err(|e| StateAccessError::store(&e))?;
+                            Ok(None)
+                        }
+                    }
                 }
-                CommitMode::ReadUncommitted => {
-                    self.inner
-                        .store
-                        .write_resolved(&collection_ref, &(), value.as_ref())
-                        .await
-                        .map_err(|e| StateAccessError::store(&e))?;
-                }
-            }
-        }
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_filter_map(|opt| async move { Ok(opt) })
+            .try_collect()
+            .await?;
+        // Replace the staged set only after every write succeeded: any error
+        // returns above via `?`, leaving the prior staged set untouched.
         if staged.is_empty() {
             Ok(FinalizeOutcome::Clean)
         } else {
@@ -676,18 +731,22 @@ where
         let Some(set) = self.inner.staged.lock().take() else {
             return ApplyOutcome::NothingStaged;
         };
-        let mut all_resolved = true;
-        for (collection_ref, write) in &set.entries {
-            if let Err(error) = self
-                .inner
-                .store
-                .promote(collection_ref, &(), write.data())
-                .await
-            {
-                warn!(error = ?error, "cell promote failed; leaving provisional for the sweep");
-                all_resolved = false;
-            }
-        }
+        let store = &self.inner.store;
+        // Best-effort: `fold` drives every promote to completion regardless of
+        // siblings' failures, reducing to a single `bool` accumulator.
+        let all_resolved = stream::iter(set.entries)
+            .map(|(collection_ref, write)| async move {
+                match store.promote(&collection_ref, &(), write.data()).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(error = ?error, "cell promote failed; leaving provisional for the sweep");
+                        false
+                    }
+                }
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .fold(true, |all, ok| async move { all && ok })
+            .await;
         if all_resolved {
             ApplyOutcome::Resolved
         } else {
@@ -699,18 +758,23 @@ where
         let Some(set) = self.inner.staged.lock().take() else {
             return ApplyOutcome::NothingStaged;
         };
-        let mut all_resolved = true;
-        for (collection_ref, write) in &set.entries {
-            if let Err(error) = self
-                .inner
-                .store
-                .rollback_provisional(collection_ref, &(), write.prev())
-                .await
-            {
-                warn!(error = ?error, "cell rollback failed; leaving provisional for the sweep");
-                all_resolved = false;
-            }
-        }
+        let store = &self.inner.store;
+        let all_resolved = stream::iter(set.entries)
+            .map(|(collection_ref, write)| async move {
+                match store
+                    .rollback_provisional(&collection_ref, &(), write.prev())
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(error = ?error, "cell rollback failed; leaving provisional for the sweep");
+                        false
+                    }
+                }
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .fold(true, |all, ok| async move { all && ok })
+            .await;
         if all_resolved {
             ApplyOutcome::Resolved
         } else {
