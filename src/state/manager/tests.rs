@@ -21,7 +21,6 @@ use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
-use crate::state::proof_kind::{CounterDescriptor, CounterKind, decode_i64, encode_delta};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellAccess;
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
@@ -80,12 +79,8 @@ impl CommitOracle for FixedOracle {
 
 type TestBackend = SharedStateBackend<MemoryCellStore, FixedOracle, MemoryCommittedCache>;
 type TestProvider = StateManagerProvider<TestBackend, MemoryLoader<serde_json::Value>>;
-type TestManager = StateManager<
-    MemoryCellStore,
-    FixedOracle,
-    MemoryCommittedCache,
-    MemoryLoader<serde_json::Value>,
->;
+type TestManager =
+    StateManager<<TestBackend as StateBackendFactory>::Backend, MemoryLoader<serde_json::Value>>;
 
 /// Per-event session type the test manager mints.
 type TestSession = <TestManager as PartitionStateManager>::Session;
@@ -598,173 +593,6 @@ async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
         cell.read_cell(&id_for(&key, "wishlist")?, &()).await?,
         Cell::Provisional(ProvisionalCell::new(Some(bytes(13)), None, event)),
         "the poisoned cell stays provisional for the recovery sweep",
-    );
-    Ok(())
-}
-
-/// A registry with the Value `cart` collection **and** a `#[cfg(test)]`
-/// [`CounterKind`] collection, so acquisition buckets `tally` into the test
-/// sweep and `cart` into the Value sweep — the per-kind name partitioning the
-/// recovery sweep ANDs over.
-fn registry_with_cart_and_counter() -> Result<Arc<CollectionDefRegistry>> {
-    let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
-    registry.register(&cart(), CollectionDef::new(None))?;
-    registry.register(&CounterDescriptor::new("tally"), CollectionDef::new(None))?;
-    Ok(Arc::new(registry))
-}
-
-/// The `tally` counter cell identity for `key` at `addr`.
-fn tally_id(key: &Key) -> Result<CollectionId<CounterKind>> {
-    Ok(CollectionId::new(
-        StateKey::new(
-            compute_segment_id(Topic::from("t"), 0, "test-group"),
-            key.clone(),
-        ),
-        StateType::Application,
-        StateName::try_new("tally")?,
-    ))
-}
-
-/// The recovery sweep covers **both** kinds: a session stages a Value cell and
-/// a counter cell under a timer `EventRef`; `recover` sweeps each lane against
-/// its own name bucket, both resolve through the one oracle, and the single
-/// backstop unschedules only because *every* kind resolved.
-#[tokio::test]
-async fn recover_sweeps_both_kinds_and_clears_backstop() -> Result<()> {
-    let cell = MemoryCellStore::new();
-    let manager = acquire(&provider_with(
-        cell.clone(),
-        FixedOracle::committed(),
-        registry_with_cart_and_counter()?,
-    ))
-    .await?;
-    let (_stream, timers, _shutdown_tx) = timer_manager().await?;
-    let key: Key = Arc::from("k");
-
-    // Stage a Value cell and a counter cell in one event (the crash window:
-    // staged, promote never ran), and arm the backstop.
-    let event = timer_event(&key);
-    let session = manager.session(key.clone(), event, termination());
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("cart")?, &(), &bytes(7))
-        .await?;
-    CellAccess::<CounterKind>::set_cell(
-        &session,
-        &StateName::try_new("tally")?,
-        &0,
-        &encode_delta(5),
-    )
-    .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    let _ = manager.inner.armed.insert_async(key.clone()).await;
-
-    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
-    timers
-        .schedule(TimerRequest::new(
-            key.clone(),
-            fire,
-            TimerType::StateRecovery,
-            Span::current(),
-        ))
-        .await?;
-
-    manager
-        .recover(key.clone(), &timers)
-        .await
-        .map_err(|e| eyre!("recover failed: {e}"))?;
-
-    assert_eq!(
-        cell.read_cell(&cart_id(&key)?, &()).await?,
-        Cell::Resolved(Committed::new(Some(bytes(7)))),
-        "the Value lane's committed cell promoted",
-    );
-    let tally = manager
-        .inner
-        .test_store
-        .read_cell(&tally_id(&key)?, &0)
-        .await?;
-    assert!(
-        matches!(tally, Cell::Resolved(_))
-            && tally.project_committed().map_or(0, |b| decode_i64(b)) == 5,
-        "the counter lane's committed cell promoted to its applied value",
-    );
-    assert!(
-        timers
-            .scheduled_times(&key, TimerType::StateRecovery)
-            .await?
-            .is_empty(),
-        "the backstop unschedules only because both kinds resolved",
-    );
-    Ok(())
-}
-
-/// The per-kind no-strand AND: when the Value lane cannot resolve (a permanent
-/// promote poison), `recover` leaves the single backstop armed **even though
-/// the counter lane resolved**. Proves the sweep ANDs across kinds — one lane
-/// short of resolved keeps the timer for first-touch / a later sweep.
-#[tokio::test]
-async fn recover_keeps_backstop_when_one_lane_is_unresolved() -> Result<()> {
-    let cell = PoisonPromoteCell {
-        inner: MemoryCellStore::new(),
-        poison: StateName::try_new("cart")?,
-    };
-    let manager = poison_provider(cell.clone(), registry_with_cart_and_counter()?)
-        .acquire(Topic::from("t"), 0)
-        .await
-        .map_err(|e| eyre!("acquire failed: {e}"))?;
-    let (_stream, timers, _shutdown_tx) = timer_manager().await?;
-    let key: Key = Arc::from("k");
-
-    let event = timer_event(&key);
-    let session = manager.session(key.clone(), event, termination());
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("cart")?, &(), &bytes(7))
-        .await?;
-    CellAccess::<CounterKind>::set_cell(
-        &session,
-        &StateName::try_new("tally")?,
-        &0,
-        &encode_delta(5),
-    )
-    .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    let _ = manager.inner.armed.insert_async(key.clone()).await;
-
-    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
-    timers
-        .schedule(TimerRequest::new(
-            key.clone(),
-            fire,
-            TimerType::StateRecovery,
-            Span::current(),
-        ))
-        .await?;
-
-    manager
-        .recover(key.clone(), &timers)
-        .await
-        .map_err(|e| eyre!("recover failed: {e}"))?;
-
-    assert_eq!(
-        cell.read_cell(&cart_id(&key)?, &()).await?,
-        Cell::Provisional(ProvisionalCell::new(Some(bytes(7)), None, event)),
-        "the poisoned Value cell stays provisional (its sweep reported unresolved)",
-    );
-    assert!(
-        matches!(
-            manager
-                .inner
-                .test_store
-                .read_cell(&tally_id(&key)?, &0)
-                .await?,
-            Cell::Resolved(_)
-        ),
-        "the counter lane still resolved — it is not stranded by the Value lane",
-    );
-    assert!(
-        !timers
-            .scheduled_times(&key, TimerType::StateRecovery)
-            .await?
-            .is_empty(),
-        "the backstop stays armed because not every kind resolved (no-strand AND)",
     );
     Ok(())
 }

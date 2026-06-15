@@ -1,8 +1,11 @@
-//! A `#[cfg(test)]` second collection kind, exercised **alongside Value in one
-//! real session** to prove the multi-kind composition scaffold — not a parallel
-//! test copy of it.
+//! A `#[cfg(test)]` second collection kind that drives the **real generic
+//! [`Lane`](crate::state::session::lane) body** directly (the
+//! `Lane<CounterKind>` trace+model property in that module), proving the
+//! per-kind machinery the Value lane shares generalizes to a non-Value kind —
+//! without a test kind in any production type. It is **not** a parallel test
+//! copy of the lane, and it is no longer wired into the session.
 //!
-//! [`CounterKind`] is deliberately unlike Value on the three axes the scaffold
+//! [`CounterKind`] is deliberately unlike Value on the three axes the machinery
 //! must generalize over:
 //!
 //! * a **non-`()` `CellAddr`** ([`u32`]), so a collection holds many addressed
@@ -20,7 +23,6 @@
 //! call per collection.
 
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
-use super::descriptor::{CellKind, DescriptorIdentity, StructuralIdentity};
 use super::identity::{CollectionId, CollectionKind, CollectionKindId, CollectionRef};
 use super::partition_store::CommittedCache;
 use super::store::CellStore;
@@ -128,34 +130,6 @@ pub(crate) fn decode_i64(bytes: &[u8]) -> i64 {
 /// takes.
 pub(crate) fn encode_delta(delta: i64) -> [u8; 8] {
     delta.to_le_bytes()
-}
-
-/// A [`DescriptorIdentity`] for a counter collection, so the registry and the
-/// durable identity table classify it under [`CollectionKindId::TestSecondary`]
-/// — which is what routes its names into the test sweep bucket.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CounterDescriptor {
-    name: &'static str,
-}
-
-impl CounterDescriptor {
-    pub(crate) fn new(name: &'static str) -> Self {
-        Self { name }
-    }
-}
-
-impl DescriptorIdentity for CounterDescriptor {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn structural_identity(&self) -> StructuralIdentity {
-        StructuralIdentity {
-            kind: CollectionKindId::TestSecondary,
-            cell_kind: CellKind::Codec,
-            codec_id: None,
-        }
-    }
 }
 
 /// In-memory [`CellStore`] for [`CounterKind`], counting its batch calls so the
@@ -369,74 +343,4 @@ impl CommittedCache<CounterKind> for MemoryCounterCache {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-
-    /// Generates a counter op, biased so resets are exercised but deltas
-    /// dominate. Deltas are bounded so a long fold cannot overflow `i64`.
-    impl Arbitrary for CounterOp {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Self {
-                reset_first: u8::arbitrary(g) % 4 == 0,
-                delta: i64::from(i16::arbitrary(g)),
-            }
-        }
-    }
-
-    /// Replays ops one at a time over the base — the naive oracle the compacted
-    /// `combine`-then-`apply` must match. Consumes `ops`.
-    fn naive_replay(base: Option<Bytes>, ops: Vec<CounterOp>) -> Option<Bytes> {
-        ops.into_iter()
-            .fold(base, |acc, op| CounterKind::apply(acc, &op))
-    }
-
-    /// Compacts ops left-to-right via `combine` (the dirty store's
-    /// arrival-order fold), then applies the single combined op. Consumes
-    /// `ops`.
-    fn compact_then_apply(base: Option<Bytes>, ops: Vec<CounterOp>) -> Option<Bytes> {
-        let mut ops = ops.into_iter();
-        match ops.next() {
-            None => base,
-            Some(first) => {
-                let combined = ops.fold(first, CounterKind::combine);
-                CounterKind::apply(base, &combined)
-            }
-        }
-    }
-
-    fn base_bytes(base: i64) -> Bytes {
-        Bytes::copy_from_slice(&base.to_le_bytes())
-    }
-
-    /// Invariant: `combine`-then-`apply` equals naive op replay over the same
-    /// base — the compacted one-op-per-cell dirty store is observationally
-    /// identical to replaying every op. Covers the non-LWW additive fold and
-    /// arrival-ordered resets.
-    #[test]
-    fn prop_combine_then_apply_equals_naive_replay() {
-        fn prop(ops: Vec<CounterOp>, base: i64) -> TestResult {
-            let compacted = compact_then_apply(Some(base_bytes(base)), ops.clone());
-            let naive = naive_replay(Some(base_bytes(base)), ops);
-            TestResult::from_bool(compacted == naive)
-        }
-        QuickCheck::new().quickcheck(prop as fn(Vec<CounterOp>, i64) -> TestResult);
-    }
-
-    /// Invariant: re-applying the same combined op over the same base is
-    /// idempotent — the contract `Lane::stage` relies on for an in-place
-    /// transient retry (the own-event committed read returns the same `prev`,
-    /// so the stage recomputes the identical write).
-    #[test]
-    fn prop_apply_over_same_base_is_idempotent() {
-        fn prop(ops: Vec<CounterOp>, base: i64) -> TestResult {
-            if ops.is_empty() {
-                return TestResult::discard();
-            }
-            let once = compact_then_apply(Some(base_bytes(base)), ops.clone());
-            let twice = compact_then_apply(Some(base_bytes(base)), ops);
-            TestResult::from_bool(once == twice)
-        }
-        QuickCheck::new().quickcheck(prop as fn(Vec<CounterOp>, i64) -> TestResult);
-    }
-}
+mod tests;

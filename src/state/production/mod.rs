@@ -20,7 +20,7 @@ use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::state::cassandra::CassandraCellStore;
 use crate::state::fjall::{AssignmentEpoch, FjallClient, FjallValueStore, FjallValueStoreError};
 use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
-use crate::state::{BackendOf, StateBackend, StateBackendFactory};
+use crate::state::{PartitionBackend, StateBackendFactory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStoreProvider};
 use crate::{Partition, Topic};
@@ -91,16 +91,19 @@ where
     DP: DeduplicationStoreProvider,
     TP: TriggerStoreProvider,
 {
-    type Cache = FjallValueStore;
-    type Cell = CassandraCellStore;
+    type Backend = PartitionBackend<
+        ProductionOracle<DP, TP>,
+        CassandraCellStore,
+        CassandraCellStore,
+        FjallValueStore,
+    >;
     type Error = FjallValueStoreError;
-    type Oracle = ProductionOracle<DP, TP>;
 
     fn for_partition(
         &self,
         topic: Topic,
         partition: Partition,
-    ) -> Result<BackendOf<Self>, Self::Error> {
+    ) -> Result<Self::Backend, Self::Error> {
         let epoch = AssignmentEpoch::mint();
         let workspace = self.client.workspace(topic, partition, epoch)?;
         // The cache store takes ownership of the workspace, holding it (and so
@@ -115,11 +118,13 @@ where
             topic,
             partition,
         );
-        Ok(StateBackend {
-            cell: self.cell.clone(),
+        // The cell store doubles as the shared descriptor-identity store.
+        Ok(PartitionBackend::new(
             oracle,
+            self.cell.clone(),
+            self.cell.clone(),
             cache,
-        })
+        ))
     }
 }
 
@@ -164,16 +169,19 @@ where
     DP: DeduplicationStoreProvider,
     TP: TriggerStoreProvider,
 {
-    type Cache = MemoryCommittedCache;
-    type Cell = MemoryCellStore;
+    type Backend = PartitionBackend<
+        ProductionOracle<DP, TP>,
+        MemoryCellStore,
+        MemoryCellStore,
+        MemoryCommittedCache,
+    >;
     type Error = Infallible;
-    type Oracle = ProductionOracle<DP, TP>;
 
     fn for_partition(
         &self,
         topic: Topic,
         partition: Partition,
-    ) -> Result<BackendOf<Self>, Self::Error> {
+    ) -> Result<Self::Backend, Self::Error> {
         let oracle = mint_oracle(
             &self.dedup,
             &self.triggers,
@@ -182,11 +190,13 @@ where
             topic,
             partition,
         );
-        Ok(StateBackend {
-            cell: self.cell.clone(),
+        // The cell store doubles as the shared descriptor-identity store.
+        Ok(PartitionBackend::new(
             oracle,
-            cache: MemoryCommittedCache::new(),
-        })
+            self.cell.clone(),
+            self.cell.clone(),
+            MemoryCommittedCache::new(),
+        ))
     }
 }
 

@@ -103,10 +103,11 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
 /// The segment's durable collection names, **partitioned by kind**.
 ///
 /// Each kind has its own durable cell store, so the recovery sweep enumerates
-/// each lane's names against *that lane's* store. A single flat name list would
-/// sweep every name as one kind — wrong once a second kind exists. The
-/// identity row carries the kind discriminator, so acquisition buckets names by
-/// it.
+/// each lane's names against *that lane's* store via [`Self::names`]. A single
+/// flat name list would sweep every name as one kind — wrong once a second kind
+/// exists. The identity row carries the kind discriminator, so acquisition
+/// buckets names by it, keyed by [`CollectionKindId`] so adding a kind needs
+/// **zero** per-kind code here.
 ///
 /// A stored row whose kind discriminator this build does not recognise (a
 /// forward-compat residue written by a future build) belongs to no lane here
@@ -116,26 +117,23 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
 /// name lands in exactly one bucket.
 #[derive(Debug, Default)]
 pub(crate) struct DurableNames {
-    /// Durable Value-collection names.
-    pub(crate) value: Vec<StateName>,
-
-    /// Durable names of the `#[cfg(test)]` proof kind, exercised alongside
-    /// Value to prove the multi-kind sweep partitioning.
-    #[cfg(test)]
-    pub(crate) test: Vec<StateName>,
+    by_kind: HashMap<CollectionKindId, Vec<StateName>>,
 }
 
 impl DurableNames {
     /// Buckets a `(name, kind discriminator)` pair, skipping a kind this build
-    /// does not recognise.
+    /// does not recognise (forward-compat residue of a future build).
     fn push(&mut self, name: StateName, kind: i8) {
-        match CollectionKindId::try_from(kind) {
-            Ok(CollectionKindId::Value) => self.value.push(name),
-            #[cfg(test)]
-            Ok(CollectionKindId::TestSecondary) => self.test.push(name),
-            // Forward-compat residue of a kind this build has no lane for.
-            Err(_) => {}
+        if let Ok(kind) = CollectionKindId::try_from(kind) {
+            self.by_kind.entry(kind).or_default().push(name);
         }
+    }
+
+    /// The durable names bucketed under `kind` — what the recovery sweep
+    /// enumerates against that kind's lane. An empty slice for a kind with no
+    /// durable names on the segment.
+    pub(crate) fn names(&self, kind: CollectionKindId) -> &[StateName] {
+        self.by_kind.get(&kind).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -263,65 +261,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{DurableDescriptorIdentity, acquire_descriptor_identities};
-    use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
-    use crate::state::memory::MemoryCellStore;
-    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::{StateName, descriptor_identity::DescriptorIdentityStore};
-    use color_eyre::eyre::Result;
-    use std::collections::HashSet;
-    use uuid::Uuid;
-
-    /// The durable name set returned by acquisition is the union of the
-    /// stored rows and the registered descriptors — so a collection whose
-    /// descriptor was since removed from the application (a stored row with
-    /// no registry entry) is still enumerated for the recovery sweep
-    /// (invariant 5). Regression: this fails if acquisition returns only the
-    /// asserted (registered) names.
-    #[tokio::test]
-    async fn returns_stored_names_the_registry_no_longer_holds() -> Result<()> {
-        let store = MemoryCellStore::new();
-        let segment_id = Uuid::from_u128(0xABC);
-
-        // A prior deployment registered "wishlist" and wrote its identity row.
-        let wishlist: ValueDescriptor = value_state("wishlist");
-        let wishlist_name = StateName::try_new("wishlist")?;
-        store
-            .write_descriptor_identities(
-                segment_id,
-                vec![DurableDescriptorIdentity::from_identity(
-                    &wishlist_name,
-                    &wishlist.structural_identity(),
-                )],
-            )
-            .await?;
-
-        // The current deployment registers only "cart".
-        let mut registry = CollectionDefRegistry::default();
-        let cart: ValueDescriptor = value_state("cart");
-        registry.register(&cart, CollectionDef::new(None))?;
-
-        let names = acquire_descriptor_identities(&store, &registry, segment_id).await?;
-        let set: HashSet<&str> = names.value.iter().map(StateName::as_str).collect();
-
-        assert!(set.contains("cart"), "the registered name must be present");
-        assert!(
-            set.contains("wishlist"),
-            "the deregistered durable name must still be swept"
-        );
-        Ok(())
-    }
-
-    /// An empty registry does no identity I/O and returns no names — the
-    /// inert state layer.
-    #[tokio::test]
-    async fn empty_registry_returns_no_names() -> Result<()> {
-        let store = MemoryCellStore::new();
-        let registry = CollectionDefRegistry::default();
-        let names = acquire_descriptor_identities(&store, &registry, Uuid::from_u128(1)).await?;
-        assert!(names.value.is_empty());
-        assert!(names.test.is_empty());
-        Ok(())
-    }
-}
+mod tests;

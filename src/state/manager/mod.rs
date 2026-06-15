@@ -29,11 +29,11 @@ mod tests;
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor_identity::{DescriptorIdentityError, acquire_descriptor_identities};
+use crate::state::descriptor_identity::{
+    DescriptorIdentityError, DescriptorIdentityStore, DurableNames, acquire_descriptor_identities,
+};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore, PartitionStoreError};
-#[cfg(test)]
-use crate::state::proof_kind::{CounterKind, MemoryCounterCache, MemoryCounterStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
     ArmedKeys, KeyedStateSession, SessionParts, StateSession, TerminationWatch,
@@ -49,8 +49,6 @@ use crate::timers::store::{SegmentId, TriggerStore};
 use crate::timers::{TimerManager, TimerType};
 use crate::{Key, Partition, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
-#[cfg(test)]
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -58,8 +56,14 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
 
-/// The cell-store error of a backend factory's cell store.
-type CellErr<B> = <<B as StateBackendFactory>::Cell as CellStore<ValueKind>>::Error;
+/// The Value lane's durable cell-store error of a [`StateBackend`] bundle.
+type ValueCellErr<B> = <<B as StateBackend>::ValueCell as CellStore<ValueKind>>::Error;
+
+/// The shared commit oracle's error of a [`StateBackend`] bundle.
+type OracleErr<B> = <<B as StateBackend>::Oracle as CommitOracle>::Error;
+
+/// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
+type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
 
 /// Per-partition keyed-state manager minted by a
 /// [`PartitionStateProvider`].
@@ -124,27 +128,23 @@ pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send;
 }
 
-struct StateManagerInner<S, O, C, L> {
-    store: PartitionStateStore<ValueKind, S, O, C>,
-    oracle: O,
+struct StateManagerInner<B, L>
+where
+    B: StateBackend,
+{
+    store: PartitionStateStore<ValueKind, B::ValueCell, B::Oracle, B::ValueCache>,
+    oracle: B::Oracle,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
-    /// Every Value-collection name durable on the segment at acquisition time
-    /// — the union of the registered descriptors and any stored identity row
-    /// whose descriptor was since removed. The recovery sweep enumerates this
-    /// set against the Value lane so deregistered crash residue is still swept
+    /// Every collection name durable on the segment at acquisition time,
+    /// partitioned by kind — the union of the registered descriptors and any
+    /// stored identity row whose descriptor was since removed. The recovery
+    /// sweep enumerates each kind's bucket ([`DurableNames::names`]) against
+    /// *that kind's* lane so deregistered crash residue is still swept
     /// (invariant 5), rather than the live registry alone. As kinds land, each
-    /// gets its own name set swept against its own lane and combined with
-    /// logical-and for the no-strand invariant.
-    value_names: Arc<[StateName]>,
-    /// The `#[cfg(test)]` proof kind's partition store and durable names,
-    /// minted at acquisition sharing the one oracle. The recovery sweep sweeps
-    /// this lane against its own names and ANDs the result with the Value lane,
-    /// proving the per-kind no-strand sweep with two kinds.
-    #[cfg(test)]
-    test_store: PartitionStateStore<CounterKind, MemoryCounterStore, O, MemoryCounterCache>,
-    #[cfg(test)]
-    test_names: Arc<[StateName]>,
+    /// gets its bucket swept against its own lane and combined with logical-and
+    /// for the no-strand invariant — no change to this field.
+    names: DurableNames,
     segment_id: SegmentId,
     recovery_delay: CompactDuration,
     /// Keys with a standing `StateRecovery` backstop. Sessions read/set it to
@@ -154,12 +154,19 @@ struct StateManagerInner<S, O, C, L> {
 
 /// The real per-partition state manager: owns the partition-lifetime
 /// [`PartitionStateStore`], oracle, and loader; mints per-event
-/// [`KeyedStateSession`]s sharing that store.
-pub struct StateManager<S, O, C, L> {
-    inner: Arc<StateManagerInner<S, O, C, L>>,
+/// [`KeyedStateSession`]s sharing that store. Parameterized by the one
+/// [`StateBackend`] bundle `B` and the loader `L`.
+pub struct StateManager<B, L>
+where
+    B: StateBackend,
+{
+    inner: Arc<StateManagerInner<B, L>>,
 }
 
-impl<S, O, C, L> Clone for StateManager<S, O, C, L> {
+impl<B, L> Clone for StateManager<B, L>
+where
+    B: StateBackend,
+{
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -167,7 +174,10 @@ impl<S, O, C, L> Clone for StateManager<S, O, C, L> {
     }
 }
 
-impl<S, O, C, L> fmt::Debug for StateManager<S, O, C, L> {
+impl<B, L> fmt::Debug for StateManager<B, L>
+where
+    B: StateBackend,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateManager")
             .field("segment_id", &self.inner.segment_id)
@@ -175,21 +185,17 @@ impl<S, O, C, L> fmt::Debug for StateManager<S, O, C, L> {
     }
 }
 
-impl<S, O, C, L> PartitionStateManager for StateManager<S, O, C, L>
+impl<B, L> PartitionStateManager for StateManager<B, L>
 where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
-    type RecoveryError = RecoveryError<S::Error, O::Error>;
-    type Session = KeyedStateSession<S, O, C, L>;
+    type RecoveryError = RecoveryError<ValueCellErr<B>, OracleErr<B>>;
+    type Session = KeyedStateSession<B, L>;
 
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
         KeyedStateSession::new(SessionParts {
             store: self.inner.store.clone(),
-            #[cfg(test)]
-            test_store: self.inner.test_store.clone(),
             oracle: self.inner.oracle.clone(),
             loader: self.inner.loader.clone(),
             registry: self.inner.registry.clone(),
@@ -217,29 +223,20 @@ where
         // refires, the next commit's re-arm (`clear_and_schedule`, a singleton
         // overwrite) simply replaces the refiring timer — still one backstop.
         self.inner.armed.remove_async(&key).await;
-        // Sweep each kind's names against its own lane and AND the results: the
-        // single backstop unschedules only when every kind on the key resolved
-        // (the no-strand invariant). Value is the only production kind today;
-        // the `#[cfg(test)]` proof kind proves the per-kind AND with two kinds.
+        // Sweep each kind's name bucket against its own lane and AND the
+        // results: the single backstop unschedules only when every kind on the
+        // key resolved (the no-strand invariant). Value is the only production
+        // kind today, so this is a single-operand AND; a future kind adds
+        // `&& sweep_partition(map_store, names.names(MapKind::ID), …)` — keep the
+        // `all_resolved` binding as the AND accumulator so that growth is local.
         let value_resolved = sweep_partition(
             &self.inner.store,
-            &self.inner.value_names,
+            self.inner.names.names(ValueKind::ID),
             &self.inner.registry,
             &state_key,
         )
         .await?;
-        #[cfg(test)]
-        let test_resolved = sweep_partition(
-            &self.inner.test_store,
-            &self.inner.test_names,
-            &self.inner.registry,
-            &state_key,
-        )
-        .await
-        .map_err(lift_infallible_store)?;
-        #[cfg(not(test))]
-        let test_resolved = true;
-        let all_resolved = value_resolved && test_resolved;
+        let all_resolved = value_resolved;
         // Only clear the backstop when every cell ended resolved (the
         // no-strand invariant): a skipped Permanent cell leaves the timer
         // armed for first-touch / a later sweep.
@@ -257,15 +254,15 @@ where
 /// [`StateBackendFactory`]: acquisition mints the partition's backend,
 /// eagerly validates descriptor identities, and composes the
 /// [`PartitionStateStore`].
-pub struct StateManagerProvider<B, L> {
-    backend: B,
+pub struct StateManagerProvider<F, L> {
+    backend: F,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     recovery_delay: CompactDuration,
 }
 
-impl<B, L> StateManagerProvider<B, L> {
+impl<F, L> StateManagerProvider<F, L> {
     /// Creates the provider.
     ///
     /// `consumer_group` derives the partition's segment id for **state-cell
@@ -276,7 +273,7 @@ impl<B, L> StateManagerProvider<B, L> {
     /// the per-partition trigger store, never by the state segment id.
     #[must_use]
     pub fn new(
-        backend: B,
+        backend: F,
         loader: L,
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
@@ -292,9 +289,9 @@ impl<B, L> StateManagerProvider<B, L> {
     }
 }
 
-impl<B, L> Clone for StateManagerProvider<B, L>
+impl<F, L> Clone for StateManagerProvider<F, L>
 where
-    B: Clone,
+    F: Clone,
     L: Clone,
 {
     fn clone(&self) -> Self {
@@ -308,7 +305,7 @@ where
     }
 }
 
-impl<B, L> fmt::Debug for StateManagerProvider<B, L> {
+impl<F, L> fmt::Debug for StateManagerProvider<F, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateManagerProvider")
             .field("consumer_group", &self.consumer_group)
@@ -317,13 +314,13 @@ impl<B, L> fmt::Debug for StateManagerProvider<B, L> {
     }
 }
 
-impl<B, L> PartitionStateProvider for StateManagerProvider<B, L>
+impl<F, L> PartitionStateProvider for StateManagerProvider<F, L>
 where
-    B: StateBackendFactory,
+    F: StateBackendFactory,
     L: Clone + Send + Sync + 'static,
 {
-    type AcquireError = StateAcquireError<B::Error, CellErr<B>>;
-    type Manager = StateManager<B::Cell, B::Oracle, B::Cache, L>;
+    type AcquireError = StateAcquireError<F::Error, IdentityErr<F::Backend>>;
+    type Manager = StateManager<F::Backend, L>;
 
     async fn acquire(
         &self,
@@ -331,29 +328,23 @@ where
         partition: Partition,
     ) -> Result<Self::Manager, Self::AcquireError> {
         let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
-        let StateBackend {
-            cell,
-            oracle,
-            cache,
-        } = self
+        let backend = self
             .backend
             .for_partition(topic, partition)
             .map_err(StateAcquireError::Factory)?;
+        let oracle = backend.oracle();
         // Invariant: no state op executes under an unvalidated identity —
         // the manager does not exist until the segment's durable identity
-        // rows match the registered descriptors.
-        let names = acquire_descriptor_identities(&cell, &self.registry, segment_id)
+        // rows match the registered descriptors. Identity lives on the shared
+        // control-plane store, decoupled from any kind's data store.
+        let identity = backend.identity();
+        let names = acquire_descriptor_identities(&identity, &self.registry, segment_id)
             .await
             .map_err(StateAcquireError::Identity)?;
-        let store = PartitionStateStore::new(cell, oracle.clone(), cache, self.registry.clone());
-        // The `#[cfg(test)]` proof kind's lane: fresh in-memory stores sharing
-        // the one oracle, so a counter provisional cell resolves against the
-        // exact commit record the value cells do.
-        #[cfg(test)]
-        let test_store = PartitionStateStore::new(
-            MemoryCounterStore::new(),
+        let store = PartitionStateStore::new(
+            backend.value_cell(),
             oracle.clone(),
-            MemoryCounterCache::new(),
+            backend.value_cache(),
             self.registry.clone(),
         );
         Ok(StateManager {
@@ -362,34 +353,12 @@ where
                 oracle,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
-                value_names: names.value.into(),
-                #[cfg(test)]
-                test_store,
-                #[cfg(test)]
-                test_names: names.test.into(),
+                names,
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
             }),
         })
-    }
-}
-
-/// Lifts a test-lane recovery error (whose store is infallible) into the
-/// value lane's error type so `recover` can `?` it. The `Store` arm is
-/// uninhabited, so this never actually maps a store error.
-#[cfg(test)]
-fn lift_infallible_store<StoreErr, OracleErr>(
-    error: RecoveryError<Infallible, OracleErr>,
-) -> RecoveryError<StoreErr, OracleErr>
-where
-    StoreErr: Error + 'static,
-    OracleErr: Error + 'static,
-{
-    match error {
-        RecoveryError::Store(never) => match never {},
-        RecoveryError::Oracle(e) => RecoveryError::Oracle(e),
-        RecoveryError::Timer(e) => RecoveryError::Timer(e),
     }
 }
 

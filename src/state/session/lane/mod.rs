@@ -20,6 +20,9 @@
 //! — `PartitionStateStore::*_batch`). Value is single-cell, so each batch is
 //! size-1, identical to the original Value lifecycle.
 
+#[cfg(test)]
+mod tests;
+
 use super::sealed::ApplyOutcome;
 use crate::consumer::event_context::StateAccessError;
 use crate::state::cell::ProvisionalWrite;

@@ -20,12 +20,16 @@
 //! [`StateSession`] is the **kind-agnostic** core (registration, loader,
 //! termination, the sealed lifecycle). The only per-kind surface is
 //! [`CellAccess<K>`], implemented once per lane: every kind's handle — Value's
-//! `StateHandle`, future Map/Deque handles, the `#[cfg(test)]` proof kind —
-//! bounds its op methods on `CellAccess<K>` for its own `K` (Value's `CellAddr`
-//! is `()`). Adding a kind is therefore additive: a new lane field (which fails
-//! every exhaustive lifecycle destructure until wired), a `CellAccess<K>` impl,
-//! a `+ CellAccess<K>` bound on `EventContext::State`, and a sweep name set —
-//! the marker, backstop, and `settle`/`abandon` machinery are untouched.
+//! `StateHandle`, future Map/Deque handles — bounds its op methods on
+//! `CellAccess<K>` for its own `K` (Value's `CellAddr` is `()`). Adding a kind
+//! is therefore additive: a new lane field (which fails every exhaustive
+//! lifecycle destructure until wired), a `CellAccess<K>` impl, a `+
+//! CellAccess<K>` bound on `EventContext::State`, and a sweep name set — the
+//! marker, backstop, and `settle`/`abandon` machinery are untouched. The
+//! generic `Lane` body is exercised on a non-Value kind by the direct
+//! `Lane<CounterKind>` property test in the `lane` module's test submodule, so
+//! the machinery the Value lane shares stays covered without a test kind in
+//! production types.
 //!
 //! # Lifecycle
 //!
@@ -56,13 +60,12 @@ use crate::loader::MemoryLoader;
 use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
 use crate::state::identity::{CollectionId, CollectionKind, CollectionRef};
 use crate::state::oracle::CommitOracle;
-use crate::state::partition_store::{CommittedCache, PartitionStateStore};
-#[cfg(test)]
-use crate::state::proof_kind::{CounterKind, MemoryCounterCache, MemoryCounterStore};
+use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::store::CellStore;
 use crate::state::value::ValueKind;
-use crate::state::{CollectionKindId, EventRef, StateKey, StateName, StateType, StoreOutcome};
+use crate::state::{
+    CollectionKindId, EventRef, StateBackend, StateKey, StateName, StateType, StoreOutcome,
+};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
@@ -360,38 +363,35 @@ impl TerminationWatch {
     }
 }
 
-/// The session's per-kind lanes. The destructure at every lifecycle fan-out
-/// site is **exhaustive** (no `..`), so adding a kind's lane fails to compile
-/// until it is wired into `finalize`/`commit_apply`/`rollback_aborted`/`reset`
-/// — invalid-states-unrepresentable applied to the composition itself.
-struct Lanes<S, O, C> {
-    value: Lane<ValueKind, S, O, C>,
-
-    /// The `#[cfg(test)]` proof kind, composed alongside Value through the
-    /// **same** lifecycle fan-out (exhaustive destructure, `try_join!`/`join!`,
-    /// per-lane sweep) to prove the multi-kind composition with two kinds in
-    /// one real session. It rides concrete in-memory stores sharing the
-    /// session's one oracle `O` — not a parallel test harness.
-    #[cfg(test)]
-    test: Lane<CounterKind, MemoryCounterStore, O, MemoryCounterCache>,
+/// The session's per-kind lanes, projected from the one backend bundle `B`. The
+/// destructure at every lifecycle fan-out site is **exhaustive** (no `..`), so
+/// adding a kind's lane fails to compile until it is wired into
+/// `finalize`/`commit_apply`/`rollback_aborted`/`reset` —
+/// invalid-states-unrepresentable applied to the composition itself.
+///
+/// Today only the Value lane exists, so the fan-out sites are single-element
+/// `try_join!`/`merge_apply([…])`; that shape is preserved deliberately (with a
+/// comment at each site) so a future kind ANDs its lane in alongside Value
+/// rather than a reader collapsing the array-of-one back to a scalar.
+struct Lanes<B>
+where
+    B: StateBackend,
+{
+    value: Lane<ValueKind, B::ValueCell, B::Oracle, B::ValueCache>,
 }
 
 /// Construction parameters for [`KeyedStateSession`], bundled so the
 /// constructor stays readable.
-pub struct SessionParts<S, O, C, L> {
+pub struct SessionParts<B, L>
+where
+    B: StateBackend,
+{
     /// Partition-lifetime Value cell store + oracle + cache + status map.
-    pub store: PartitionStateStore<ValueKind, S, O, C>,
-
-    /// Partition-lifetime store for the `#[cfg(test)]` proof kind, threading
-    /// the **same** oracle as `store` so a provisional cell of either kind
-    /// resolves against the exact commit record the one marker certifies.
-    #[cfg(test)]
-    pub(crate) test_store:
-        PartitionStateStore<CounterKind, MemoryCounterStore, O, MemoryCounterCache>,
+    pub store: PartitionStateStore<ValueKind, B::ValueCell, B::Oracle, B::ValueCache>,
 
     /// Partition-lifetime commit oracle; the marker flush writes the
     /// message commit row through it. Same instance baked into `store`.
-    pub oracle: O,
+    pub oracle: B::Oracle,
 
     /// Opaque per-session capability slot a [`CellResolver`] reads at
     /// resolve time (the consumer pins it to its message loader).
@@ -420,9 +420,12 @@ pub struct SessionParts<S, O, C, L> {
     pub termination: TerminationWatch,
 }
 
-struct SessionInner<S, O, C, L> {
-    lanes: Lanes<S, O, C>,
-    oracle: O,
+struct SessionInner<B, L>
+where
+    B: StateBackend,
+{
+    lanes: Lanes<B>,
+    oracle: B::Oracle,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
@@ -443,14 +446,20 @@ struct SessionInner<S, O, C, L> {
 /// The real per-event session over a partition's cell stores.
 ///
 /// One session is minted per event by the partition's state manager; clones
-/// share the per-event lanes and singletons. `S` is the Value cell store, `O`
-/// the commit oracle (shared across every lane), `C` the Value committed-value
-/// cache, `L` the message loader.
-pub struct KeyedStateSession<S, O, C, L> {
-    inner: Arc<SessionInner<S, O, C, L>>,
+/// share the per-event lanes and singletons. `B` is the per-partition
+/// [`StateBackend`] bundle (every lane's cell store + cache and the one shared
+/// oracle, projected behind the single parameter); `L` is the message loader.
+pub struct KeyedStateSession<B, L>
+where
+    B: StateBackend,
+{
+    inner: Arc<SessionInner<B, L>>,
 }
 
-impl<S, O, C, L> Clone for KeyedStateSession<S, O, C, L> {
+impl<B, L> Clone for KeyedStateSession<B, L>
+where
+    B: StateBackend,
+{
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -458,7 +467,10 @@ impl<S, O, C, L> Clone for KeyedStateSession<S, O, C, L> {
     }
 }
 
-impl<S, O, C, L> fmt::Debug for KeyedStateSession<S, O, C, L> {
+impl<B, L> fmt::Debug for KeyedStateSession<B, L>
+where
+    B: StateBackend,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyedStateSession")
             .field("state_key", &self.inner.state_key)
@@ -467,19 +479,15 @@ impl<S, O, C, L> fmt::Debug for KeyedStateSession<S, O, C, L> {
     }
 }
 
-impl<S, O, C, L> KeyedStateSession<S, O, C, L>
+impl<B, L> KeyedStateSession<B, L>
 where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    B: StateBackend,
 {
     /// Creates a session for one event, opening a fresh dirty scope per lane.
     #[must_use]
-    pub fn new(parts: SessionParts<S, O, C, L>) -> Self {
+    pub fn new(parts: SessionParts<B, L>) -> Self {
         let SessionParts {
             store,
-            #[cfg(test)]
-            test_store,
             oracle,
             loader,
             registry,
@@ -493,8 +501,6 @@ where
             inner: Arc::new(SessionInner {
                 lanes: Lanes {
                     value: Lane::new(store),
-                    #[cfg(test)]
-                    test: Lane::new(test_store),
                 },
                 oracle,
                 loader,
@@ -508,9 +514,7 @@ where
             }),
         }
     }
-}
 
-impl<S, O, C, L> KeyedStateSession<S, O, C, L> {
     /// The collection id for `name` under this session's key, for any kind
     /// `K` (the kind is carried only at the type level, so no bound is needed).
     fn id_for<K>(&self, name: &StateName) -> CollectionId<K> {
@@ -529,11 +533,9 @@ impl<S, O, C, L> KeyedStateSession<S, O, C, L> {
 
 /// Value access surface (`CellAddr = ()`), forwarding to the value lane — the
 /// "one `CellAccess<K>` impl per lane" pattern, here for the Value lane.
-impl<S, O, C, L> CellAccess<ValueKind> for KeyedStateSession<S, O, C, L>
+impl<B, L> CellAccess<ValueKind> for KeyedStateSession<B, L>
 where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
     async fn read_cell(
@@ -580,66 +582,9 @@ where
     }
 }
 
-/// The `#[cfg(test)]` proof kind's access surface, forwarding to the test lane
-/// exactly as the Value impl forwards to the value lane — the "one
-/// `CellAccess<K>` impl per lane" pattern, now exercised by a second kind.
-#[cfg(test)]
-impl<S, O, C, L> CellAccess<CounterKind> for KeyedStateSession<S, O, C, L>
+impl<B, L> StateSession for KeyedStateSession<B, L>
 where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
-    L: Clone + Send + Sync + 'static,
-{
-    async fn read_cell(
-        &self,
-        name: &StateName,
-        addr: &u32,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        let id = self.id_for(name);
-        self.inner
-            .lanes
-            .test
-            .read_cell(&id, addr, self.inner.event)
-            .await
-    }
-
-    async fn set_cell(
-        &self,
-        name: &StateName,
-        addr: &u32,
-        cell: &[u8],
-    ) -> Result<(), StateAccessError> {
-        let id = self.id_for(name);
-        self.inner.lanes.test.set_cell(&id, addr, cell).await;
-        Ok(())
-    }
-
-    async fn clear_cell(&self, name: &StateName, addr: &u32) -> Result<(), StateAccessError> {
-        let id = self.id_for(name);
-        self.inner.lanes.test.clear_cell(&id, addr).await;
-        Ok(())
-    }
-
-    async fn flush_cell(
-        &self,
-        name: &StateName,
-        addr: &u32,
-    ) -> Result<StoreOutcome, StateAccessError> {
-        let collection_ref = self.ref_for(name);
-        self.inner
-            .lanes
-            .test
-            .flush_cell(&collection_ref, addr)
-            .await
-    }
-}
-
-impl<S, O, C, L> StateSession for KeyedStateSession<S, O, C, L>
-where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
     type Loader = L;
@@ -670,11 +615,9 @@ where
     }
 }
 
-impl<S, O, C, L> KeyedStateSession<S, O, C, L>
+impl<B, L> KeyedStateSession<B, L>
 where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    B: StateBackend,
     L: Send + Sync + 'static,
 {
     /// Resolves every lane's staged set the same way and folds the per-lane
@@ -686,30 +629,18 @@ where
     /// any kind failed. The destructure is exhaustive (no `..`), so a new lane
     /// must be wired here too.
     async fn apply_all(&self, how: Resolve) -> ApplyOutcome {
-        let Lanes {
-            value,
-            #[cfg(test)]
-            test,
-        } = &self.inner.lanes;
-        #[cfg(test)]
-        let outcomes = {
-            let (v, t) = join!(value.resolve(how), test.resolve(how));
-            [v, t]
-        };
-        #[cfg(not(test))]
-        let outcomes = {
-            let (v,) = join!(value.resolve(how));
-            [v]
-        };
-        merge_apply(outcomes)
+        let Lanes { value } = &self.inner.lanes;
+        // Single-element `join!`/array kept deliberately: a future kind adds its
+        // `resolve` to the `join!` and its outcome to the array, and
+        // `merge_apply` folds them. Do not collapse `[v]`/`join!` to a scalar.
+        let (v,) = join!(value.resolve(how));
+        merge_apply([v])
     }
 }
 
-impl<S, O, C, L> StateLifecycle for KeyedStateSession<S, O, C, L>
+impl<B, L> StateLifecycle for KeyedStateSession<B, L>
 where
-    S: CellStore<ValueKind>,
-    O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    B: StateBackend,
     L: Send + Sync + 'static,
 {
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
@@ -717,21 +648,13 @@ where
         // here until wired. `try_join!` awaits *all* lanes and returns a lane
         // error via `?` — before the marker flush in `settle` — so "every kind
         // staged" strictly precedes the single marker (invariant 1).
-        let Lanes {
-            value,
-            #[cfg(test)]
-            test,
-        } = &self.inner.lanes;
+        let Lanes { value } = &self.inner.lanes;
         let event = self.inner.event;
         let registry = &self.inner.registry;
-        #[cfg(test)]
-        let (value_staged, test_staged) =
-            try_join!(value.stage(event, registry), test.stage(event, registry))?;
-        #[cfg(not(test))]
+        // Single-element `try_join!`/tuple kept deliberately: a future kind adds
+        // its `stage` to the `try_join!` and `|| kind_staged` to the fold below.
+        // Do not collapse the tuple to a bare `await`.
         let (value_staged,) = try_join!(value.stage(event, registry))?;
-        #[cfg(test)]
-        let staged = value_staged || test_staged;
-        #[cfg(not(test))]
         let staged = value_staged;
         Ok(if staged {
             FinalizeOutcome::Staged
@@ -770,15 +693,10 @@ where
 
     fn reset(&self) {
         // Per-key serialization means no handler op is in flight here, so there
-        // is no racing observer to guard against.
-        let Lanes {
-            value,
-            #[cfg(test)]
-            test,
-        } = &self.inner.lanes;
+        // is no racing observer to guard against. Exhaustive destructure (no
+        // `..`) kept deliberately: a future kind's lane must `reset()` here too.
+        let Lanes { value } = &self.inner.lanes;
         value.reset();
-        #[cfg(test)]
-        test.reset();
         *self.inner.marker.lock() = None;
     }
 
