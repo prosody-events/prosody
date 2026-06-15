@@ -11,6 +11,16 @@
 //! [`K::CellAddr`](CollectionKind::CellAddr) — `()` for Value, the entry key
 //! for Map, a slot marker for Deque — so the durability layer is written
 //! once and only the per-kind table shape differs.
+//!
+//! # Collection-grain batches
+//!
+//! The three mutators work at **collection grain**: each takes the touched
+//! cells of one collection as a slice, so a kind with many cells per collection
+//! (a Map entry set, a Deque slot range and its header) stages or promotes them
+//! in **one same-partition `UNLOGGED BATCH`** rather than one round-trip per
+//! cell. A collection's cells share its row key, so the batch is a single
+//! atomic mutation on the replica. Value is single-cell (`CellAddr = ()`), so
+//! every slice is size-1 and the batch degenerates to one statement.
 
 use super::cell::{Cell, ProvisionalCell, ProvisionalWrite};
 use super::identity::{CollectionId, CollectionKind, CollectionRef};
@@ -22,12 +32,13 @@ use std::future::Future;
 
 /// Durable storage for the cells of one collection kind.
 ///
-/// Every method writes or reads a single self-consistent cell shape. The
-/// three mutators map onto the durability sequence:
+/// `read_cell` is a point read and `provisional_cells` a per-collection stream;
+/// the three mutators take a collection's touched cells as a batch and map onto
+/// the durability sequence:
 ///
-/// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` in one
-///   statement (the `ReadCommitted` outcome path).
-/// * [`CellStore::write_resolved`] — writes a committed value with `event` and
+/// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
+///   each cell (the `ReadCommitted` outcome path).
+/// * [`CellStore::write_resolved`] — writes committed values with `event` and
 ///   `prev` null (the `ReadUncommitted` direct write, the mid-handler flush,
 ///   and rollback resolution, where the committed value is the staged `prev`).
 /// * [`CellStore::mark_resolved`] — *promote*: nulls `event` and `prev`,
@@ -60,8 +71,8 @@ where
         collection: &'a CollectionId<K>,
     ) -> impl Stream<Item = Result<(K::CellAddr, ProvisionalCell), Self::Error>> + Send + 'a;
 
-    /// Stages a provisional write (`data | prev | event`) in one statement,
-    /// binding `collection`'s TTL.
+    /// Stages each `(addr, write)`'s provisional cell (`data | prev | event`)
+    /// in one same-partition batch, binding `collection`'s TTL.
     ///
     /// # Errors
     ///
@@ -69,12 +80,12 @@ where
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef<K>,
-        addr: &'a K::CellAddr,
-        write: &'a ProvisionalWrite,
+        writes: &'a [(K::CellAddr, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Writes a resolved cell (`data` committed; `event`/`prev` null) in one
-    /// statement, binding `collection`'s TTL.
+    /// Writes each `(addr, data)` as a resolved cell (`data` committed;
+    /// `event`/`prev` null) in one same-partition batch, binding `collection`'s
+    /// TTL.
     ///
     /// # Errors
     ///
@@ -82,13 +93,12 @@ where
     fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<K>,
-        addr: &'a K::CellAddr,
-        data: Option<&'a Bytes>,
+        cells: &'a [(K::CellAddr, Option<Bytes>)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Promotes a provisional cell to resolved: nulls `event` and `prev`,
-    /// keeping `data`. O(1) bytes. Idempotent — promoting a resolved cell is
-    /// a harmless no-op write.
+    /// Promotes each `addr`'s provisional cell to resolved: nulls `event` and
+    /// `prev`, keeping `data`. O(1) bytes per cell. Idempotent — promoting a
+    /// resolved cell is a harmless no-op write.
     ///
     /// # Errors
     ///
@@ -96,6 +106,6 @@ where
     fn mark_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<K>,
-        addr: &'a K::CellAddr,
+        addrs: &'a [K::CellAddr],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 }

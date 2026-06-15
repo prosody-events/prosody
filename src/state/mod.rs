@@ -53,6 +53,8 @@ pub mod memory;
 pub mod oracle;
 pub mod partition_store;
 pub mod production;
+#[cfg(test)]
+pub(crate) mod proof_kind;
 pub mod registry;
 pub mod resolve;
 pub mod session;
@@ -70,7 +72,7 @@ pub use identity::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,
     StateNameError, StateType,
 };
-pub use transaction::{CommitMode, PendingOps, Read};
+pub use transaction::{CommitMode, Read};
 pub use value::{ValueKind, ValueOp};
 
 /// Maximum concurrent per-collection durable operations in the keyed-state

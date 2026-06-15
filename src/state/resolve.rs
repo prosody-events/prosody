@@ -15,6 +15,7 @@ use super::oracle::CommitOracle;
 use super::store::CellStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use std::error::Error;
+use std::slice;
 use thiserror::Error;
 
 /// Resolves one provisional cell through the commit oracle.
@@ -46,14 +47,14 @@ where
     match decision {
         CommitDecision::Committed => {
             store
-                .mark_resolved(collection, addr)
+                .mark_resolved(collection, slice::from_ref(addr))
                 .await
                 .map_err(ResolveCellError::Store)?;
             Ok(Committed::new(cell.into_data()))
         }
         CommitDecision::NotCommitted => {
             store
-                .write_resolved(collection, addr, cell.prev())
+                .write_resolved(collection, &[(addr.clone(), cell.prev().cloned())])
                 .await
                 .map_err(ResolveCellError::Store)?;
             Ok(Committed::new(cell.into_prev()))

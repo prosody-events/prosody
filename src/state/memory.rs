@@ -69,47 +69,53 @@ impl CellStore<ValueKind> for MemoryCellStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        (): &'a (),
-        write: &'a ProvisionalWrite,
+        writes: &'a [((), ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        self.inner
-            .cells
-            .upsert_async(
-                collection.id().clone(),
-                StoredCell::Provisional {
-                    data: write.data().cloned(),
-                    prev: write.prev().cloned(),
-                    event: write.event(),
-                },
-            )
-            .await;
+        // Value is single-cell, so the slice is size-1; the loop is the
+        // collection-grain batch a multi-cell kind would issue as one mutation.
+        for ((), write) in writes {
+            self.inner
+                .cells
+                .upsert_async(
+                    collection.id().clone(),
+                    StoredCell::Provisional {
+                        data: write.data().cloned(),
+                        prev: write.prev().cloned(),
+                        event: write.event(),
+                    },
+                )
+                .await;
+        }
         Ok(())
     }
 
     async fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        (): &'a (),
-        data: Option<&'a Bytes>,
+        cells: &'a [((), Option<Bytes>)],
     ) -> Result<(), Self::Error> {
-        self.inner
-            .cells
-            .upsert_async(collection.id().clone(), StoredCell::Resolved(data.cloned()))
-            .await;
+        for ((), data) in cells {
+            self.inner
+                .cells
+                .upsert_async(collection.id().clone(), StoredCell::Resolved(data.clone()))
+                .await;
+        }
         Ok(())
     }
 
     async fn mark_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        (): &'a (),
+        addrs: &'a [()],
     ) -> Result<(), Self::Error> {
-        if let Entry::Occupied(mut entry) =
-            self.inner.cells.entry_async(collection.id().clone()).await
-            && let StoredCell::Provisional { data, .. } = entry.get()
-        {
-            let data = data.clone();
-            *entry.get_mut() = StoredCell::Resolved(data);
+        for () in addrs {
+            if let Entry::Occupied(mut entry) =
+                self.inner.cells.entry_async(collection.id().clone()).await
+                && let StoredCell::Provisional { data, .. } = entry.get()
+            {
+                let data = data.clone();
+                *entry.get_mut() = StoredCell::Resolved(data);
+            }
         }
         Ok(())
     }

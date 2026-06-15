@@ -32,14 +32,16 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor_identity::{DescriptorIdentityError, acquire_descriptor_identities};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore, PartitionStoreError};
+#[cfg(test)]
+use crate::state::proof_kind::{CounterKind, MemoryCounterCache, MemoryCounterStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
-    ArmedKeys, SessionParts, StateSession, TerminationWatch, ValueStateSession,
+    ArmedKeys, KeyedStateSession, SessionParts, StateSession, TerminationWatch,
 };
 use crate::state::store::CellStore;
 use crate::state::value::ValueKind;
 use crate::state::{
-    CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
+    CollectionId, CollectionKind, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
     StateBackendFactory, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
@@ -47,6 +49,8 @@ use crate::timers::store::{SegmentId, TriggerStore};
 use crate::timers::{TimerManager, TimerType};
 use crate::{Key, Partition, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
+#[cfg(test)]
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -125,12 +129,22 @@ struct StateManagerInner<S, O, C, L> {
     oracle: O,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
-    /// Every collection name durable on the segment at acquisition time —
-    /// the union of the registered descriptors and any stored identity row
-    /// whose descriptor was since removed. The recovery sweep enumerates
-    /// this set so deregistered crash residue is still swept (invariant 5),
-    /// rather than the live registry alone.
-    names: Arc<[StateName]>,
+    /// Every Value-collection name durable on the segment at acquisition time
+    /// — the union of the registered descriptors and any stored identity row
+    /// whose descriptor was since removed. The recovery sweep enumerates this
+    /// set against the Value lane so deregistered crash residue is still swept
+    /// (invariant 5), rather than the live registry alone. As kinds land, each
+    /// gets its own name set swept against its own lane and combined with
+    /// logical-and for the no-strand invariant.
+    value_names: Arc<[StateName]>,
+    /// The `#[cfg(test)]` proof kind's partition store and durable names,
+    /// minted at acquisition sharing the one oracle. The recovery sweep sweeps
+    /// this lane against its own names and ANDs the result with the Value lane,
+    /// proving the per-kind no-strand sweep with two kinds.
+    #[cfg(test)]
+    test_store: PartitionStateStore<CounterKind, MemoryCounterStore, O, MemoryCounterCache>,
+    #[cfg(test)]
+    test_names: Arc<[StateName]>,
     segment_id: SegmentId,
     recovery_delay: CompactDuration,
     /// Keys with a standing `StateRecovery` backstop. Sessions read/set it to
@@ -140,7 +154,7 @@ struct StateManagerInner<S, O, C, L> {
 
 /// The real per-partition state manager: owns the partition-lifetime
 /// [`PartitionStateStore`], oracle, and loader; mints per-event
-/// [`ValueStateSession`]s sharing that store.
+/// [`KeyedStateSession`]s sharing that store.
 pub struct StateManager<S, O, C, L> {
     inner: Arc<StateManagerInner<S, O, C, L>>,
 }
@@ -169,11 +183,13 @@ where
     L: Clone + Send + Sync + 'static,
 {
     type RecoveryError = RecoveryError<S::Error, O::Error>;
-    type Session = ValueStateSession<S, O, C, L>;
+    type Session = KeyedStateSession<S, O, C, L>;
 
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
-        ValueStateSession::new(SessionParts {
+        KeyedStateSession::new(SessionParts {
             store: self.inner.store.clone(),
+            #[cfg(test)]
+            test_store: self.inner.test_store.clone(),
             oracle: self.inner.oracle.clone(),
             loader: self.inner.loader.clone(),
             registry: self.inner.registry.clone(),
@@ -201,13 +217,29 @@ where
         // refires, the next commit's re-arm (`clear_and_schedule`, a singleton
         // overwrite) simply replaces the refiring timer — still one backstop.
         self.inner.armed.remove_async(&key).await;
-        let all_resolved = sweep_partition(
+        // Sweep each kind's names against its own lane and AND the results: the
+        // single backstop unschedules only when every kind on the key resolved
+        // (the no-strand invariant). Value is the only production kind today;
+        // the `#[cfg(test)]` proof kind proves the per-kind AND with two kinds.
+        let value_resolved = sweep_partition(
             &self.inner.store,
-            &self.inner.names,
+            &self.inner.value_names,
             &self.inner.registry,
             &state_key,
         )
         .await?;
+        #[cfg(test)]
+        let test_resolved = sweep_partition(
+            &self.inner.test_store,
+            &self.inner.test_names,
+            &self.inner.registry,
+            &state_key,
+        )
+        .await
+        .map_err(lift_infallible_store)?;
+        #[cfg(not(test))]
+        let test_resolved = true;
+        let all_resolved = value_resolved && test_resolved;
         // Only clear the backstop when every cell ended resolved (the
         // no-strand invariant): a skipped Permanent cell leaves the timer
         // armed for first-touch / a later sweep.
@@ -314,18 +346,50 @@ where
             .await
             .map_err(StateAcquireError::Identity)?;
         let store = PartitionStateStore::new(cell, oracle.clone(), cache, self.registry.clone());
+        // The `#[cfg(test)]` proof kind's lane: fresh in-memory stores sharing
+        // the one oracle, so a counter provisional cell resolves against the
+        // exact commit record the value cells do.
+        #[cfg(test)]
+        let test_store = PartitionStateStore::new(
+            MemoryCounterStore::new(),
+            oracle.clone(),
+            MemoryCounterCache::new(),
+            self.registry.clone(),
+        );
         Ok(StateManager {
             inner: Arc::new(StateManagerInner {
                 store,
                 oracle,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
-                names: names.into(),
+                value_names: names.value.into(),
+                #[cfg(test)]
+                test_store,
+                #[cfg(test)]
+                test_names: names.test.into(),
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
             }),
         })
+    }
+}
+
+/// Lifts a test-lane recovery error (whose store is infallible) into the
+/// value lane's error type so `recover` can `?` it. The `Store` arm is
+/// uninhabited, so this never actually maps a store error.
+#[cfg(test)]
+fn lift_infallible_store<StoreErr, OracleErr>(
+    error: RecoveryError<Infallible, OracleErr>,
+) -> RecoveryError<StoreErr, OracleErr>
+where
+    StoreErr: Error + 'static,
+    OracleErr: Error + 'static,
+{
+    match error {
+        RecoveryError::Store(never) => match never {},
+        RecoveryError::Oracle(e) => RecoveryError::Oracle(e),
+        RecoveryError::Timer(e) => RecoveryError::Timer(e),
     }
 }
 
@@ -352,16 +416,17 @@ where
 ///
 /// Returns [`RecoveryError`] on a transient/terminal backend or oracle
 /// failure.
-pub(crate) async fn sweep_partition<S, O, C>(
-    store: &PartitionStateStore<ValueKind, S, O, C>,
+pub(crate) async fn sweep_partition<K, S, O, C>(
+    store: &PartitionStateStore<K, S, O, C>,
     names: &[StateName],
     registry: &CollectionDefRegistry,
     state_key: &StateKey,
 ) -> Result<bool, RecoveryError<S::Error, O::Error>>
 where
-    S: CellStore<ValueKind>,
+    K: CollectionKind,
+    S: CellStore<K>,
     O: CommitOracle,
-    C: CommittedCache<ValueKind>,
+    C: CommittedCache<K>,
 {
     // Each name is its own Cassandra partition, so the per-collection sweeps
     // fan out concurrently. `try_fold` reduces to one `bool` and short-circuits
@@ -374,8 +439,7 @@ where
         .map(|name| {
             cooperative(async move {
                 let ttl = registry.ttl_for(&name);
-                let id =
-                    CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name);
+                let id = CollectionId::<K>::new(state_key.clone(), StateType::Application, name);
                 store.sweep_collection(&CollectionRef::new(id, ttl)).await
             })
         })

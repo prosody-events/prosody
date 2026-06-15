@@ -16,8 +16,9 @@ use crate::loader::MemoryLoader;
 use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::PartitionStateStore;
+use crate::state::proof_kind::{MemoryCounterCache, MemoryCounterStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
-use crate::state::session::{ArmedKeys, SessionParts, TerminationWatch, ValueStateSession};
+use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{CommitDecision, CommitMode, EventRef, StateKey, StateName};
 use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
@@ -70,7 +71,7 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
 }
 
 pub(crate) type TestSession =
-    ValueStateSession<MemoryCellStore, FixedOracle, MemoryCommittedCache, MemoryLoader<Value>>;
+    KeyedStateSession<MemoryCellStore, FixedOracle, MemoryCommittedCache, MemoryLoader<Value>>;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
@@ -135,8 +136,15 @@ pub(crate) fn test_session_with_armed(
         MemoryCommittedCache::new(),
         registry.clone(),
     );
-    let session = ValueStateSession::new(SessionParts {
+    let test_store = PartitionStateStore::new(
+        MemoryCounterStore::new(),
+        FixedOracle::committed(),
+        MemoryCounterCache::new(),
+        registry.clone(),
+    );
+    let session = KeyedStateSession::new(SessionParts {
         store,
+        test_store,
         oracle: FixedOracle::committed(),
         loader,
         registry,

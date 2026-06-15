@@ -1,19 +1,12 @@
-//! Value collection contracts: the dirty-workspace store trait and the
-//! Value op fold.
+//! Value collection contracts: the kind marker, its op, and the
+//! dirty-workspace store trait.
 
-use super::{CollectionId, CollectionKind, CollectionKindId, PendingOps, Read};
+use super::{CollectionId, CollectionKind, CollectionKindId, Read};
 use crate::error::ClassifyError;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::future::Future;
-
-/// Applied Value state: the raw cell bytes, or `None` when cleared.
-///
-/// Cell bytes are opaque to every store — typing lives in the descriptor
-/// layer ([`crate::state::descriptor`]), which encodes/decodes at the
-/// handle boundary.
-pub type ValueApplied = Option<Bytes>;
 
 /// Type marker for Value collections.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -24,6 +17,41 @@ impl CollectionKind for ValueKind {
     type Op = ValueOp;
 
     const ID: CollectionKindId = CollectionKindId::Value;
+
+    fn set_op(cell: &[u8]) -> ValueOp {
+        ValueOp::Set {
+            payload: Bytes::copy_from_slice(cell),
+        }
+    }
+
+    fn clear_op() -> ValueOp {
+        ValueOp::Clear
+    }
+
+    /// Last-writer-wins: the newest op wholly determines the cell, so
+    /// `combine` discards the older op.
+    fn combine(_existing: ValueOp, newest: ValueOp) -> ValueOp {
+        newest
+    }
+
+    /// A buffered Value op fully determines the cell without the committed
+    /// base, so the read never falls through.
+    fn read_overlay(op: &ValueOp) -> Read<Bytes> {
+        match op {
+            // Cheap `Bytes` refcount bump, not a payload copy.
+            ValueOp::Set { payload } => Read::Present(payload.clone()),
+            ValueOp::Clear => Read::Absent,
+        }
+    }
+
+    /// Last-writer-wins ignores the committed base: the combined op alone is
+    /// the outcome.
+    fn apply(_committed_base: Option<Bytes>, op: &ValueOp) -> Option<Bytes> {
+        match op {
+            ValueOp::Set { payload } => Some(payload.clone()),
+            ValueOp::Clear => None,
+        }
+    }
 }
 
 /// Ordered operation for a Value collection.
@@ -70,59 +98,4 @@ pub trait ValueStore: Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
-}
-
-/// Source of compacted pending operations for a collection kind.
-pub trait PendingOpSource<K>: Send + Sync + 'static
-where
-    K: CollectionKind,
-{
-    /// Error type for pending operation access.
-    type Error: ClassifyError + Error + Send + Sync + 'static;
-
-    /// Iterator returned alongside the operation count.
-    ///
-    /// `'a` is the borrow lifetime of `&self` at the call site; concrete
-    /// implementations may own the iterator (`Send + 'static`) or borrow
-    /// from the store's internal state.
-    type Ops<'a>: Iterator<Item = K::Op> + Send + 'a
-    where
-        Self: 'a;
-
-    /// Returns the pending operation stream for a collection when any exist.
-    ///
-    /// `None` means no operations are buffered for this collection;
-    /// `Some(PendingOps { count, ops })` means `count` ordered operations
-    /// are available and `ops` will yield exactly that many. The non-zero
-    /// count lets callers size the work without materializing the iterator.
-    ///
-    /// # Errors
-    ///
-    /// Returns a store error if pending operations cannot be read.
-    fn pending_ops<'a>(
-        &'a self,
-        collection: &'a CollectionId<K>,
-    ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error>;
-
-    /// Clears compacted pending operations for the collection.
-    ///
-    /// # Errors
-    ///
-    /// Returns a store error if pending operations cannot be cleared.
-    fn clear_pending_ops(&self, collection: &CollectionId<K>) -> Result<(), Self::Error>;
-}
-
-/// Folds ordered Value operations into applied state.
-///
-/// Value operations are last-writer-wins, so only the final op in the slice
-/// affects the applied state.
-#[must_use]
-pub fn fold_value_ops<I>(applied: ValueApplied, ops: I) -> ValueApplied
-where
-    I: IntoIterator<Item = ValueOp>,
-{
-    ops.into_iter().last().map_or(applied, |op| match op {
-        ValueOp::Set { payload } => Some(payload),
-        ValueOp::Clear => None,
-    })
 }

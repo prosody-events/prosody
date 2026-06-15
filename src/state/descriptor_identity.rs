@@ -16,7 +16,7 @@
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::{StateName, StateNameError};
+use crate::state::{CollectionKindId, StateName, StateNameError};
 use crate::timers::store::SegmentId;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -51,7 +51,7 @@ pub struct DurableDescriptorIdentity {
     /// [`INITIAL_IDENTITY_VERSION`] exists until migration ships.
     pub version: i32,
 
-    /// [`CollectionKindId`](crate::state::CollectionKindId) discriminator.
+    /// [`CollectionKindId`] discriminator.
     pub kind: i8,
 
     /// [`CellKind`](crate::state::descriptor::CellKind) discriminator.
@@ -100,11 +100,50 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
+/// The segment's durable collection names, **partitioned by kind**.
+///
+/// Each kind has its own durable cell store, so the recovery sweep enumerates
+/// each lane's names against *that lane's* store. A single flat name list would
+/// sweep every name as one kind — wrong once a second kind exists. The
+/// identity row carries the kind discriminator, so acquisition buckets names by
+/// it.
+///
+/// A stored row whose kind discriminator this build does not recognise (a
+/// forward-compat residue written by a future build) belongs to no lane here
+/// and is dropped from every bucket: this build has no store to sweep it
+/// through, so the future build that owns the kind sweeps it instead. Within a
+/// segment a name maps to exactly one kind (one identity row per name), so each
+/// name lands in exactly one bucket.
+#[derive(Debug, Default)]
+pub(crate) struct DurableNames {
+    /// Durable Value-collection names.
+    pub(crate) value: Vec<StateName>,
+
+    /// Durable names of the `#[cfg(test)]` proof kind, exercised alongside
+    /// Value to prove the multi-kind sweep partitioning.
+    #[cfg(test)]
+    pub(crate) test: Vec<StateName>,
+}
+
+impl DurableNames {
+    /// Buckets a `(name, kind discriminator)` pair, skipping a kind this build
+    /// does not recognise.
+    fn push(&mut self, name: StateName, kind: i8) {
+        match CollectionKindId::try_from(kind) {
+            Ok(CollectionKindId::Value) => self.value.push(name),
+            #[cfg(test)]
+            Ok(CollectionKindId::TestSecondary) => self.test.push(name),
+            // Forward-compat residue of a kind this build has no lane for.
+            Err(_) => {}
+        }
+    }
+}
+
 /// Validates every registered descriptor against the segment's durable
 /// identity rows, writing rows for first-seen names, and returns **every
-/// name durable on the segment** — the union of the stored rows and the
-/// registered descriptors. An empty registry skips the I/O entirely and
-/// returns no names.
+/// name durable on the segment**, partitioned by kind — the union of the
+/// stored rows and the registered descriptors. An empty registry skips the
+/// I/O entirely and returns no names.
 ///
 /// The returned set is what the recovery sweep enumerates (invariant 5,
 /// sweep-covers-everything): it includes names whose descriptor was since
@@ -124,7 +163,7 @@ pub(crate) async fn acquire_descriptor_identities<St>(
     store: &St,
     registry: &CollectionDefRegistry,
     segment_id: SegmentId,
-) -> Result<Vec<StateName>, DescriptorIdentityError<St::Error>>
+) -> Result<DurableNames, DescriptorIdentityError<St::Error>>
 where
     St: DescriptorIdentityStore,
 {
@@ -133,7 +172,7 @@ where
         .map(|(name, identity)| DurableDescriptorIdentity::from_identity(name, identity))
         .collect();
     if asserted.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DurableNames::default());
     }
 
     let stored = store
@@ -163,17 +202,18 @@ where
             .map_err(DescriptorIdentityError::Store)?;
     }
 
-    // The durable name set: every stored row (including deregistered
-    // collections this build no longer asserts) plus every asserted name.
-    let mut names: Vec<StateName> = Vec::with_capacity(stored.len() + asserted.len());
+    // The durable name set, bucketed by kind: every stored row (including
+    // deregistered collections this build no longer asserts) plus every
+    // asserted name. A name maps to one kind, so dedup is global by name.
+    let mut names = DurableNames::default();
     let mut seen: HashSet<&str> = HashSet::new();
-    for row_name in stored
+    for (row_name, kind) in stored
         .iter()
-        .map(|row| row.name.as_str())
-        .chain(asserted.iter().map(|row| row.name.as_str()))
+        .map(|row| (row.name.as_str(), row.kind))
+        .chain(asserted.iter().map(|row| (row.name.as_str(), row.kind)))
     {
         if seen.insert(row_name) {
-            names.push(StateName::try_new(row_name)?);
+            names.push(StateName::try_new(row_name)?, kind);
         }
     }
     Ok(names)
@@ -263,7 +303,7 @@ mod tests {
         registry.register(&cart, CollectionDef::new(None))?;
 
         let names = acquire_descriptor_identities(&store, &registry, segment_id).await?;
-        let set: HashSet<&str> = names.iter().map(StateName::as_str).collect();
+        let set: HashSet<&str> = names.value.iter().map(StateName::as_str).collect();
 
         assert!(set.contains("cart"), "the registered name must be present");
         assert!(
@@ -280,7 +320,8 @@ mod tests {
         let store = MemoryCellStore::new();
         let registry = CollectionDefRegistry::default();
         let names = acquire_descriptor_identities(&store, &registry, Uuid::from_u128(1)).await?;
-        assert!(names.is_empty());
+        assert!(names.value.is_empty());
+        assert!(names.test.is_empty());
         Ok(())
     }
 }

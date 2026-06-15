@@ -1,20 +1,20 @@
 //! Property-test fixture for the in-memory dirty Value store.
 //!
-//! Parallels [`super::value_suite`] in shape but tests only the dirty side.
 //! There is a single dirty implementation ([`DirtyValueStore`]); the trace is
-//! the contract it must uphold.
+//! the contract it must uphold over the lane-facing inherent API.
 //!
 //! Universal dirty contract enforced by [`run_dirty_trace`]:
 //!
-//! 1. After `Set(x)`: `get` returns `Present(x)`; `pending_ops` is `Some`.
-//! 2. After `Clear`: `get` returns `Absent`; `pending_ops` is `Some`.
-//! 3. After `ClearPendingOps`: `get` returns `Unknown`; `pending_ops` is
-//!    `None`.
-//! 4. Fold equivalence: `fold_value_ops(None, pending_ops().ops)` converted to
-//!    `Read<T>` equals `get()`.
+//! 1. After `Set(x)`: the buffered op overlays to `Present(x)`; a pending op
+//!    exists.
+//! 2. After `Clear`: the buffered op overlays to `Absent`; a pending op exists.
+//! 3. After `ClearCell`: the overlay is `Unknown`; no pending op.
+//! 4. Compaction: a Value cell keeps **one** compacted op (last-writer-wins),
+//!    and `ValueKind::apply(None, &op)` (over the op the store kept) equals the
+//!    overlay — never an accumulation of obviated ops.
 
 use super::super::dirty::DirtyValueStore;
-use super::super::value::{PendingOpSource, ValueStore, fold_value_ops};
+use super::super::identity::CollectionKind;
 use super::super::{CollectionId, Read, ValueKind};
 use super::value_suite::{MAX_TRACE_OPS, bytes, capped_vec, collection_id};
 use bytes::Bytes;
@@ -35,21 +35,21 @@ pub(crate) async fn run_dirty_trace(store: DirtyValueStore, trace: DirtyTrace) -
         match op {
             DirtyTraceOp::Set(byte) => {
                 let payload = bytes(byte);
-                store.set(&collection, &payload).await?;
+                store.set(&collection, &(), &payload).await;
                 overlay = Read::Present(payload);
             }
             DirtyTraceOp::Clear => {
-                store.clear(&collection).await?;
+                store.clear(&collection, &()).await;
                 overlay = Read::Absent;
             }
             DirtyTraceOp::Get | DirtyTraceOp::PendingOps => { /* assertions below */ }
-            DirtyTraceOp::ClearPendingOps => {
-                store.clear_pending_ops(&collection)?;
+            DirtyTraceOp::ClearCell => {
+                store.clear_cell(&collection, &());
                 overlay = Read::Unknown;
             }
         }
 
-        if !check_invariants(&store, &collection, &overlay).await? {
+        if !check_invariants(&store, &collection, &overlay) {
             return Ok(false);
         }
     }
@@ -57,39 +57,29 @@ pub(crate) async fn run_dirty_trace(store: DirtyValueStore, trace: DirtyTrace) -
     Ok(true)
 }
 
-async fn check_invariants(
+fn check_invariants(
     store: &DirtyValueStore,
     collection: &CollectionId<ValueKind>,
     overlay: &Read<Bytes>,
-) -> Result<bool> {
-    let read = store.get(collection).await?;
-    if &read != overlay {
-        return Ok(false);
-    }
+) -> bool {
+    let pending = store.pending_op(collection, &());
 
-    // Pending ops exist iff the overlay has observed a value (Set or Clear).
-    let pending = store.pending_ops(collection)?;
+    // A pending op exists iff the overlay has observed a value (Set or Clear).
     if pending.is_some() == matches!(overlay, Read::Unknown) {
-        return Ok(false);
+        return false;
     }
 
-    if let Some(p) = pending {
-        // Bloat guard: a Value dirty store must compact to exactly one op per
-        // collection (last-writer-wins), never accumulate obviated ops. This
-        // is the invariant that catches an append-only backend; it lives here
-        // (run against every backend via `run_dirty_trace`) rather than in
-        // `run_dirty_parity`, whose fold-to-last masks the count.
-        if p.count.get() != 1 {
-            return Ok(false);
-        }
-        let folded = fold_value_ops(None, p.ops);
-        let folded_read: Read<Bytes> = folded.map_or(Read::Absent, Read::Present);
-        if folded_read != read {
-            return Ok(false);
-        }
-    }
+    let Some(op) = pending else {
+        // Untouched cell: nothing to fold, overlay is Unknown.
+        return matches!(overlay, Read::Unknown);
+    };
 
-    Ok(true)
+    // The kept op overlays to the observed value (read-your-writes), and
+    // applying it over the empty base agrees — proving exactly one compacted
+    // op, never an accumulation.
+    let read = ValueKind::read_overlay(&op);
+    let applied: Read<Bytes> = ValueKind::apply(None, &op).map_or(Read::Absent, Read::Present);
+    &read == overlay && applied == read
 }
 
 /// Quickcheck-shrinking trace of dirty-store operations.
@@ -112,7 +102,7 @@ pub(crate) enum DirtyTraceOp {
     Clear,
     Get,
     PendingOps,
-    ClearPendingOps,
+    ClearCell,
 }
 
 impl Arbitrary for DirtyTraceOp {
@@ -122,7 +112,7 @@ impl Arbitrary for DirtyTraceOp {
             1 => Self::Clear,
             2 => Self::Get,
             3 => Self::PendingOps,
-            _ => Self::ClearPendingOps,
+            _ => Self::ClearCell,
         }
     }
 }

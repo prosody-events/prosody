@@ -47,7 +47,8 @@ use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
-use crate::state::session::StateSession;
+use crate::state::session::{CellAccess, StateSession};
+use crate::state::value::ValueKind;
 use crate::state::{StateName, StoreOutcome};
 use internment::Intern;
 use std::error::Error;
@@ -344,7 +345,7 @@ impl<S: Clone, C, R> Clone for StateHandle<S, C, R> {
 
 impl<S, C, R> StateHandle<S, C, R>
 where
-    S: StateSession,
+    S: CellAccess<ValueKind>,
     C: Codec,
     R: CellResolver<S, Stored = C::Payload>,
 {
@@ -357,7 +358,8 @@ where
     /// error from the resolver.
     pub async fn get(&self) -> Result<Option<R::Resolved>, ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
-        let Some(cell) = self.session.state_cell(&self.name).await? else {
+        // Value is the single-cell kind, so the address is the unit `()`.
+        let Some(cell) = self.session.read_cell(&self.name, &()).await? else {
             return Ok(None);
         };
         // `Codec::deserialize` parses in place (destructive). In production the
@@ -392,7 +394,7 @@ where
         let mut buf = SerializeBufGuard::acquire();
         C::with_cached_local(|codec| codec.serialize(stored, &mut buf))
             .map_err(ValueStateError::Codec)?;
-        Ok(self.session.set_state_cell(&self.name, &buf).await?)
+        Ok(self.session.set_cell(&self.name, &(), &buf).await?)
     }
 
     /// Buffers a clear operation.
@@ -402,7 +404,7 @@ where
     /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
-        Ok(self.session.clear_state_cell(&self.name).await?)
+        Ok(self.session.clear_cell(&self.name, &()).await?)
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
@@ -423,7 +425,7 @@ where
     /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
-        Ok(self.session.flush_state_cell(&self.name).await?)
+        Ok(self.session.flush_cell(&self.name, &()).await?)
     }
 }
 

@@ -8,8 +8,10 @@
 
 use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::transaction::Read;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
@@ -61,6 +63,31 @@ impl TryFrom<i8> for CollectionKindId {
 }
 
 /// Type-level marker for a keyed-state collection family.
+///
+/// # Per-kind divergence: two semantic hooks, plus their byte bridge
+///
+/// A collection's whole per-kind behaviour reduces to two pure functions on
+/// its [`Op`](Self::Op):
+///
+/// * [`combine`](Self::combine) compacts ops in **arrival order at write
+///   time**, so a hot write-loop on one cell stays O(1) (one combined op per
+///   cell, matching the original compact-on-write dirty store). It folds
+///   `combine(existing, newest)` left-to-right, so it need not be commutative —
+///   only consistent with replaying the ops one at a time.
+/// * [`apply`](Self::apply) folds the one combined op over the committed base
+///   **at stage time**, producing the cell's new committed bytes.
+///
+/// Value is last-writer-wins: `combine` keeps the newest op and `apply` ignores
+/// the base. An additive sketch (Count-Min, a counter) makes `combine` add
+/// deltas and `apply` add the combined delta to the base. A kind needing the
+/// full op history sets `Op` to a sequence and `combine` to concatenation, so
+/// these hooks **subsume** a fold-over-vector rather than foreclose it.
+///
+/// [`set_op`](Self::set_op) / [`clear_op`](Self::clear_op) /
+/// [`read_overlay`](Self::read_overlay) are the byte bridge between the
+/// session's uniform point-cell API (set/clear/read raw bytes at a
+/// [`CellAddr`](Self::CellAddr)) and the kind's `Op`: they are mechanical, not
+/// semantic — the divergence lives in `combine`/`apply`.
 pub trait CollectionKind: Clone + Copy + fmt::Debug + Send + Sync + 'static {
     /// Runtime discriminator stored beside durable identity.
     const ID: CollectionKindId;
@@ -77,6 +104,32 @@ pub trait CollectionKind: Clone + Copy + fmt::Debug + Send + Sync + 'static {
     /// written once over this address; only the per-kind table shape and the
     /// read-side fold differ.
     type CellAddr: Clone + fmt::Debug + Hash + Eq + Send + Sync + 'static;
+
+    /// Builds the op for "set this cell to these bytes" — the byte bridge for
+    /// the session's uniform `set_cell`. Value wraps the bytes verbatim; an
+    /// additive kind decodes them into a delta.
+    fn set_op(cell: &[u8]) -> Self::Op;
+
+    /// Builds the op for "clear this cell" — the byte bridge for the session's
+    /// uniform `clear_cell`.
+    fn clear_op() -> Self::Op;
+
+    /// Compacts two ops in **arrival order** into one combined op. The dirty
+    /// store folds `combine(existing, newest)` per write, so this is a left
+    /// fold over the touched cell's op history.
+    fn combine(existing: Self::Op, newest: Self::Op) -> Self::Op;
+
+    /// The cell's visible value from a buffered op **alone**, when the op fully
+    /// determines it without the committed base (Value `Set`/`Clear`).
+    /// [`Read::Unknown`] means the buffered op cannot answer the read on its
+    /// own (an additive delta), so the read falls through to the committed
+    /// base.
+    fn read_overlay(op: &Self::Op) -> Read<Bytes>;
+
+    /// Folds the one combined op over the committed base at stage time,
+    /// producing the cell's new committed bytes (`None` = cleared). Value
+    /// ignores the base; an additive kind adds the combined delta to it.
+    fn apply(committed_base: Option<Bytes>, op: &Self::Op) -> Option<Bytes>;
 }
 
 /// Key qualified by the timer segment that owns the Kafka partition.

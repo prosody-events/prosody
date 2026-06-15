@@ -1,11 +1,7 @@
 //! Transaction-side state shapes.
 //!
 //! [`CommitMode`] is the per-collection read guarantee; [`Read`] is the
-//! three-valued overlay read; [`PendingOps`] carries a collection's compacted
-//! dirty operations from the workspace to the durability step.
-
-use std::num::NonZeroU64;
-use std::option::IntoIter as OptionIntoIter;
+//! three-valued overlay read.
 
 /// Persistence mode for a collection's state changes, chosen per collection
 /// at registration
@@ -49,41 +45,4 @@ pub enum Read<T> {
 
     /// This layer has not observed the value.
     Unknown,
-}
-
-/// Pending operations for one collection, with a typed non-empty proof.
-///
-/// Returned by
-/// [`PendingOpSource::pending_ops`](super::value::PendingOpSource::pending_ops)
-/// wrapped in [`Option`]: `None` means no dirty work is buffered for the
-/// collection, `Some(PendingOps { count, ops })` means at least one
-/// operation exists and `count` matches the iterator. The [`NonZeroU64`]
-/// count lets callers size the work without materializing `ops` first; the
-/// iterator yields the operations themselves in order when `finalize` folds
-/// them into the staged or resolved cell write.
-pub struct PendingOps<I>
-where
-    I: Iterator + Send,
-{
-    /// Number of operations the iterator will yield.
-    pub count: NonZeroU64,
-
-    /// Ordered pending operations.
-    pub ops: I,
-}
-
-impl<T> PendingOps<OptionIntoIter<T>>
-where
-    T: Send,
-{
-    /// Builds a single-operation pending stream (`count` = 1).
-    ///
-    /// The last-writer-wins dirty stores (memory and fjall) buffer at most
-    /// one compacted op per collection, so this is their only constructor.
-    pub fn single(op: T) -> Self {
-        Self {
-            count: NonZeroU64::MIN,
-            ops: Some(op).into_iter(),
-        }
-    }
 }

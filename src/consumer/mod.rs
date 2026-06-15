@@ -177,7 +177,8 @@ use crate::state::manager::{PartitionStateManager, PartitionStateProvider, State
 use crate::state::memory::MemoryCellStore;
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
-use crate::state::session::StateSession;
+use crate::state::session::{CellAccess, StateSession};
+use crate::state::value::ValueKind;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
@@ -837,7 +838,7 @@ impl PipelineMiddlewareStack {
         PP: TriggerStoreProvider,
         SP: PartitionStateProvider,
         <SP::Manager as PartitionStateManager>::Session:
-            StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+            StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
@@ -1100,7 +1101,7 @@ fn memory_state_provider<C: Codec>(
     trigger_provider: &InMemoryTriggerStoreProvider,
 ) -> impl PartitionStateProvider<
     Manager: PartitionStateManager<
-        Session: StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+        Session: StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
     >,
 >
 where
@@ -1131,7 +1132,8 @@ fn cassandra_state_provider<C: Codec>(
 ) -> Result<
     impl PartitionStateProvider<
         Manager: PartitionStateManager<
-            Session: StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+            Session: StateSession<Loader: MessageLoader<Payload = C::Payload>>
+                         + CellAccess<ValueKind>,
         >,
     >,
     ConsumerError,
@@ -1177,7 +1179,7 @@ where
     S: TriggerStoreProvider,
     SP: PartitionStateProvider,
     <SP::Manager as PartitionStateManager>::Session:
-        StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+        StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
 {
@@ -1802,7 +1804,7 @@ where
     P: TriggerStoreProvider,
     SP: PartitionStateProvider,
     <SP::Manager as PartitionStateManager>::Session:
-        StateSession<Loader: MessageLoader<Payload = C::Payload>>,
+        StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
     C: Codec,
     C::Payload: Clone + EventType + EventIdentity,
 {

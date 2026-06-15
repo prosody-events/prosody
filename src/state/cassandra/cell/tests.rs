@@ -75,8 +75,10 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     store
         .write_provisional(
             &c,
-            &(),
-            &ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
+            &[(
+                (),
+                ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
+            )],
         )
         .await?;
     match store.read_cell(c.id(), &()).await? {
@@ -88,13 +90,13 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         Cell::Resolved(_) => return Err(eyre!("expected provisional after stage")),
     }
 
-    store.mark_resolved(&c, &()).await?;
+    store.mark_resolved(&c, &[()]).await?;
     assert_eq!(
         store.read_cell(c.id(), &()).await?,
         Cell::Resolved(Committed::new(Some(data)))
     );
 
-    store.write_resolved(&c, &(), None).await?;
+    store.write_resolved(&c, &[((), None)]).await?;
     assert_eq!(
         store.read_cell(c.id(), &()).await?,
         Cell::Resolved(Committed::new(None))
@@ -116,8 +118,10 @@ async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
     store
         .write_provisional(
             &c,
-            &(),
-            &ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2)),
+            &[(
+                (),
+                ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2)),
+            )],
         )
         .await?;
     match store.read_cell(c.id(), &()).await? {
@@ -128,7 +132,7 @@ async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
         Cell::Resolved(_) => return Err(eyre!("expected provisional after clear-over-present")),
     }
 
-    store.mark_resolved(&c, &()).await?;
+    store.mark_resolved(&c, &[()]).await?;
     assert_eq!(
         store.read_cell(c.id(), &()).await?,
         Cell::Resolved(Committed::new(None))
@@ -154,12 +158,14 @@ async fn absent_row_and_provisional_cells_stream() -> Result<()> {
     store
         .write_provisional(
             &c,
-            &(),
-            &ProvisionalWrite::new(
-                Some(Bytes::from_static(b"v")),
-                Committed::new(None),
-                event(3),
-            ),
+            &[(
+                (),
+                ProvisionalWrite::new(
+                    Some(Bytes::from_static(b"v")),
+                    Committed::new(None),
+                    event(3),
+                ),
+            )],
         )
         .await?;
     let staged: Vec<_> = store
@@ -170,7 +176,7 @@ async fn absent_row_and_provisional_cells_stream() -> Result<()> {
         .collect::<Result<_, _>>()?;
     assert_eq!(staged.len(), 1);
 
-    store.mark_resolved(&c, &()).await?;
+    store.mark_resolved(&c, &[()]).await?;
     let resolved: Vec<_> = store
         .provisional_cells(c.id())
         .collect::<Vec<_>>()
@@ -198,7 +204,9 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     // A long, repetitive payload so the zstd frame is unmistakably smaller than
     // the raw bytes — a regression to raw storage would fail both assertions.
     let payload = Bytes::from(vec![0xAB_u8; 4096]);
-    store.write_resolved(&c, &(), Some(&payload)).await?;
+    store
+        .write_resolved(&c, &[((), Some(payload.clone()))])
+        .await?;
 
     let cql = format!(
         "SELECT data FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id = ? AND key \
@@ -250,7 +258,9 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         let store = setup().await?;
         let c = collection("uniq")?;
         let data = Bytes::from(payload);
-        store.write_resolved(&c, &(), Some(&data)).await?;
+        store
+            .write_resolved(&c, &[((), Some(data.clone()))])
+            .await?;
         let Cell::Resolved(committed) = store.read_cell(c.id(), &()).await? else {
             return Err(eyre!("expected resolved cell"));
         };

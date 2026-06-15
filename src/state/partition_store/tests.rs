@@ -332,11 +332,10 @@ impl CellStore<ValueKind> for PoisonPromoteStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        addr: &'a (),
-        write: &'a ProvisionalWrite,
+        writes: &'a [((), ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         self.inner
-            .write_provisional(collection, addr, write)
+            .write_provisional(collection, writes)
             .await
             .map_err(never)
     }
@@ -344,11 +343,10 @@ impl CellStore<ValueKind> for PoisonPromoteStore {
     async fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        addr: &'a (),
-        data: Option<&'a Bytes>,
+        cells: &'a [((), Option<Bytes>)],
     ) -> Result<(), Self::Error> {
         self.inner
-            .write_resolved(collection, addr, data)
+            .write_resolved(collection, cells)
             .await
             .map_err(never)
     }
@@ -356,13 +354,13 @@ impl CellStore<ValueKind> for PoisonPromoteStore {
     async fn mark_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        addr: &'a (),
+        addrs: &'a [()],
     ) -> Result<(), Self::Error> {
         if *collection.id().name() == self.poison {
             return Err(PromotePoisoned);
         }
         self.inner
-            .mark_resolved(collection, addr)
+            .mark_resolved(collection, addrs)
             .await
             .map_err(never)
     }

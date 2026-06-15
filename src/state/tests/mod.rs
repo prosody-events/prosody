@@ -11,25 +11,33 @@ use self::dirty_value_suite::DirtyTrace;
 use self::value_suite::{bytes, collection_id};
 use super::dirty::DirtyValueStore;
 use super::memory::MemoryCellStore;
-use super::value::{ValueOp, fold_value_ops};
-use super::{CollectionKindId, CollectionRef, ValueKind};
+use super::value::ValueOp;
+use super::{CollectionKind, CollectionKindId, CollectionRef, ValueKind};
 use color_eyre::eyre::Result;
 use futures::executor;
 use quickcheck::QuickCheck;
 
+/// Value's per-kind hooks are last-writer-wins: `combine` keeps the newest op
+/// (arrival order), and `apply` ignores the committed base — the op alone is
+/// the outcome. This is the production fold the dirty store and `Lane::stage`
+/// run, replacing the old multi-op value-op fold helper.
 #[test]
-fn value_folding_uses_last_ordered_op() {
-    let initial = Some(bytes(1));
-    let ops = vec![
-        ValueOp::Set { payload: bytes(2) },
-        ValueOp::Clear,
+fn value_combine_is_last_writer_wins() {
+    // combine folds left-to-right in arrival order, keeping the newest op.
+    let combined = ValueKind::combine(
+        ValueKind::combine(ValueOp::Set { payload: bytes(2) }, ValueOp::Clear),
         ValueOp::Set { payload: bytes(3) },
-    ];
+    );
+    assert_eq!(combined, ValueOp::Set { payload: bytes(3) });
 
-    assert_eq!(fold_value_ops(initial, ops), Some(bytes(3)));
-    assert_eq!(fold_value_ops(Some(bytes(1)), [ValueOp::Clear]), None);
+    // apply ignores the committed base.
+    assert_eq!(ValueKind::apply(Some(bytes(1)), &combined), Some(bytes(3)));
     assert_eq!(
-        fold_value_ops(None, [ValueOp::Set { payload: bytes(9) }]),
+        ValueKind::apply(Some(bytes(1)), &ValueKind::clear_op()),
+        None
+    );
+    assert_eq!(
+        ValueKind::apply(None, &ValueKind::set_op(&[9])),
         Some(bytes(9))
     );
 }

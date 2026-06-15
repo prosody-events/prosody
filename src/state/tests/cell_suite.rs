@@ -23,7 +23,7 @@
 //!   never forget or leak a value to fake a crash (the CLAUDE.md memory rule).
 //! * **`prev` comes from `store.committed`**, never minted, so the staged
 //!   `prev` is always the resolved committed base — the same path `finalize`
-//!   uses (`session::ValueStateSession::finalize`).
+//!   uses (`session::KeyedStateSession::finalize`).
 //! * **A small key pool** so events repeatedly hit the same collections,
 //!   exercising overwrite of a just-resolved cell and the implicit
 //!   resolution-on-read inside `committed`.
@@ -748,32 +748,32 @@ where
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        addr: &'a (),
-        write: &'a ProvisionalWrite,
+        writes: &'a [((), ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
+        // One increment per collection-grain batch call, so the bulk-apply pins
+        // assert "one batched call per collection", not one per cell.
         self.counts
             .write_provisional
             .fetch_add(1, Ordering::Relaxed);
-        self.inner.write_provisional(collection, addr, write).await
+        self.inner.write_provisional(collection, writes).await
     }
 
     async fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        addr: &'a (),
-        data: Option<&'a Bytes>,
+        cells: &'a [((), Option<Bytes>)],
     ) -> Result<(), Self::Error> {
         self.counts.write_resolved.fetch_add(1, Ordering::Relaxed);
-        self.inner.write_resolved(collection, addr, data).await
+        self.inner.write_resolved(collection, cells).await
     }
 
     async fn mark_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        addr: &'a (),
+        addrs: &'a [()],
     ) -> Result<(), Self::Error> {
         self.counts.mark_resolved.fetch_add(1, Ordering::Relaxed);
-        self.inner.mark_resolved(collection, addr).await
+        self.inner.mark_resolved(collection, addrs).await
     }
 }
 

@@ -15,7 +15,8 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::descriptor::{StateDescriptor, StructuralIdentity};
-use crate::state::session::StateSession;
+use crate::state::session::{CellAccess, StateSession};
+use crate::state::value::ValueKind;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
@@ -205,7 +206,12 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// payload tie lives here: the session's loader yields `Self::Payload`,
     /// which keeps Kafka-message handles fully typed inside generic
     /// handlers without `StateSession` ever naming a payload.
-    type State: StateSession<Loader: MessageLoader<Payload = Self::Payload>>;
+    ///
+    /// The `+ CellAccess<ValueKind>` bound is what lets a generic handler call
+    /// a Value descriptor's `get`/`set` (those op methods require it), without
+    /// `state` itself naming any kind. Each addressed kind that lands adds its
+    /// own `+ CellAccess<K>` here — a bounded, compiler-checked extension.
+    type State: StateSession<Loader: MessageLoader<Payload = Self::Payload>> + CellAccess<ValueKind>;
 
     /// Binds a keyed-state descriptor to this context's session, returning
     /// its typed handle.
@@ -407,7 +413,7 @@ where
 impl<T, S> EventContext for PartitionEventContext<T, S>
 where
     T: TriggerStore,
-    S: StateSession<Loader: MessageLoader>,
+    S: StateSession<Loader: MessageLoader> + CellAccess<ValueKind>,
 {
     type Error = TimerManagerError<T::Error>;
     type Payload = <S::Loader as MessageLoader>::Payload;

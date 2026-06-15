@@ -33,6 +33,7 @@ use futures::StreamExt;
 use quick_cache::sync::Cache;
 use std::error::Error;
 use std::future::Future;
+use std::slice;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{error, warn};
@@ -236,7 +237,9 @@ where
     ) -> Result<(), S::Error> {
         self.status
             .insert(collection.id().clone(), CellStatus::Provisional);
-        self.store.write_provisional(collection, addr, write).await
+        self.store
+            .write_provisional(collection, &[(addr.clone(), write.clone())])
+            .await
     }
 
     /// Writes a resolved value directly (the `ReadUncommitted` path and the
@@ -251,7 +254,9 @@ where
         addr: &K::CellAddr,
         data: Option<&Bytes>,
     ) -> Result<(), S::Error> {
-        self.store.write_resolved(collection, addr, data).await?;
+        self.store
+            .write_resolved(collection, &[(addr.clone(), data.cloned())])
+            .await?;
         let committed = Committed::new(data.cloned());
         self.patch_cache(collection.id(), addr, &committed).await;
         self.mark_resolved(collection.id());
@@ -272,9 +277,76 @@ where
         addr: &K::CellAddr,
         data: Option<&Bytes>,
     ) -> Result<(), S::Error> {
-        self.store.mark_resolved(collection, addr).await?;
+        self.store
+            .mark_resolved(collection, slice::from_ref(addr))
+            .await?;
         let committed = Committed::new(data.cloned());
         self.patch_cache(collection.id(), addr, &committed).await;
+        self.mark_resolved(collection.id());
+        Ok(())
+    }
+
+    /// Stages a collection's touched cells in **one** backend batch (the lane's
+    /// bulk stage). Marks the collection `Provisional` before the durable write
+    /// (write-ahead intent) and leaves the cache untouched — the cached value
+    /// is still the committed `prev`. One [`CellStore::write_provisional`]
+    /// call regardless of cell count, so a Map collection's hundreds of
+    /// entries cost one round-trip, not hundreds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when the stage write fails.
+    pub(crate) async fn write_provisional_batch(
+        &self,
+        collection: &CollectionRef<K>,
+        writes: &[(K::CellAddr, ProvisionalWrite)],
+    ) -> Result<(), S::Error> {
+        self.status
+            .insert(collection.id().clone(), CellStatus::Provisional);
+        self.store.write_provisional(collection, writes).await
+    }
+
+    /// Writes a collection's touched cells as resolved values in **one**
+    /// backend batch (the `ReadUncommitted` stage and the rollback arm).
+    /// Patches the cache per cell to the written value and marks the
+    /// collection resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when the write fails.
+    pub(crate) async fn write_resolved_batch(
+        &self,
+        collection: &CollectionRef<K>,
+        cells: &[(K::CellAddr, Option<Bytes>)],
+    ) -> Result<(), S::Error> {
+        self.store.write_resolved(collection, cells).await?;
+        for (addr, data) in cells {
+            self.patch_cache(collection.id(), addr, &Committed::new(data.clone()))
+                .await;
+        }
+        self.mark_resolved(collection.id());
+        Ok(())
+    }
+
+    /// Promotes a collection's staged cells after commit in **one** backend
+    /// batch: nulls each cell's `event`/`prev` (O(1) bytes), patches the cache
+    /// to `data`, and marks the collection resolved. One
+    /// [`CellStore::mark_resolved`] call regardless of cell count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when the promote write fails.
+    pub(crate) async fn promote_batch(
+        &self,
+        collection: &CollectionRef<K>,
+        cells: &[(K::CellAddr, Option<Bytes>)],
+    ) -> Result<(), S::Error> {
+        let addrs: Vec<K::CellAddr> = cells.iter().map(|(addr, _)| addr.clone()).collect();
+        self.store.mark_resolved(collection, &addrs).await?;
+        for (addr, data) in cells {
+            self.patch_cache(collection.id(), addr, &Committed::new(data.clone()))
+                .await;
+        }
         self.mark_resolved(collection.id());
         Ok(())
     }

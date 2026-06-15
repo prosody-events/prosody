@@ -1,62 +1,72 @@
 //! Per-event keyed-state sessions.
 //!
 //! A [`StateSession`] is the per-event view over a partition's keyed-state
-//! stores: byte-cell reads and writes buffer in a per-event dirty workspace,
-//! and the framework drives the stage/promote lifecycle through a sealed
-//! supertrait that downstream crates can neither implement nor call.
+//! stores: byte-cell reads and writes buffer in per-event dirty workspaces, and
+//! the framework drives the stage/promote lifecycle through a sealed supertrait
+//! that downstream crates can neither implement nor call.
 //!
-//! [`ValueStateSession`] is the sole implementation — the real session,
-//! minted per event by the partition's state manager. It holds an `Arc`-clone
-//! of the partition-lifetime [`PartitionStateStore`] (cell store + oracle +
-//! committed-value cache + status map) plus a per-event dirty workspace scope.
-//! Clones share the per-event buffer, so repeated descriptor binds of the same
-//! collection accumulate into one write. Keyed state is always wired, so there
-//! is no stateless stub outside tests.
+//! [`KeyedStateSession`] is the sole implementation — the real session, minted
+//! per event by the partition's state manager. It composes **one `Lane` per
+//! collection kind** (`Lanes`): each lane owns that kind's
+//! partition-lifetime [`PartitionStateStore`] plus a per-event dirty workspace,
+//! and the session owns the cross-kind **singletons** (the commit oracle, the
+//! registered marker, the armed backstop, the event, the registry, …). Clones
+//! share the per-event state, so repeated descriptor binds of one collection
+//! accumulate into one write. Keyed state is always wired, so there is no
+//! stateless stub outside tests.
+//!
+//! # The kind seam
+//!
+//! [`StateSession`] is the **kind-agnostic** core (registration, loader,
+//! termination, the sealed lifecycle). The only per-kind surface is
+//! [`CellAccess<K>`], implemented once per lane: every kind's handle — Value's
+//! `StateHandle`, future Map/Deque handles, the `#[cfg(test)]` proof kind —
+//! bounds its op methods on `CellAccess<K>` for its own `K` (Value's `CellAddr`
+//! is `()`). Adding a kind is therefore additive: a new lane field (which fails
+//! every exhaustive lifecycle destructure until wired), a `CellAccess<K>` impl,
+//! a `+ CellAccess<K>` bound on `EventContext::State`, and a sweep name set —
+//! the marker, backstop, and `settle`/`abandon` machinery are untouched.
 //!
 //! # Lifecycle
 //!
-//! The framework's per-event sequence over a session, driven by the
-//! durability boundary (`crate::consumer::middleware`'s blanket
-//! `EventHandler` impl) in straight-line code:
+//! The framework's per-event sequence, driven by the durability boundary
+//! (`crate::consumer::middleware`'s blanket `EventHandler` impl) in
+//! straight-line code:
 //!
-//! 1. Handler ops buffer into the dirty scope through the byte-cell methods;
-//!    the deduplication middleware buffers the message's commit marker into the
-//!    session via `register_marker` during unwind.
-//! 2. On the final handler success, `finalize` stages every touched
-//!    `ReadCommitted` collection as a provisional cell (recording the staged
-//!    set inside the session) and writes `ReadUncommitted` collections as
-//!    resolved values.
+//! 1. Handler ops buffer into each kind's dirty scope through the cell methods;
+//!    the deduplication middleware buffers the message's commit marker via
+//!    `register_marker` during unwind.
+//! 2. On the final handler success, `finalize` stages **every** lane (awaiting
+//!    all via `try_join!`, so a lane error returns before the marker flush) —
+//!    `ReadCommitted` collections stage provisional cells, `ReadUncommitted`
+//!    ones write resolved values.
 //! 3. Strictly after the stage, `flush_marker` writes the registered dedup
-//!    marker through the commit oracle — so a present marker always certifies a
-//!    durable stage. After the offset/trigger commit, `commit_apply` promotes
-//!    the staged cells (O(1) per cell); `rollback_aborted` rolls them back when
-//!    the event aborts.
-//! 4. At attempt boundaries (retry, defer), `reset` discards the dirty scope,
-//!    the staged set, and the registered marker so the next attempt starts
-//!    clean. A defer-swallow therefore flushes no marker, so the deferred
-//!    reload is not deduped — with no flag and no outcome inspection.
+//!    marker through the commit oracle. After the offset/trigger commit,
+//!    `commit_apply` promotes every lane's staged cells; `rollback_aborted`
+//!    rolls them back. Both drive **all** lanes to completion (`join!`, not
+//!    `try_join!`), so a failure in one kind never strands another.
+//! 4. At attempt boundaries (retry, defer), `reset` discards every lane's dirty
+//!    scope and staged set plus the registered marker.
 
 use crate::Key;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::partition::ShutdownPhase;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
-use crate::state::cell::ProvisionalWrite;
 use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
-use crate::state::dirty::DirtyValueStore;
+use crate::state::identity::{CollectionId, CollectionKind, CollectionRef};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore};
+#[cfg(test)]
+use crate::state::proof_kind::{CounterKind, MemoryCounterCache, MemoryCounterStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
-use crate::state::value::{PendingOpSource, ValueApplied, ValueKind, ValueStore, fold_value_ops};
-use crate::state::{
-    CollectionId, CollectionKindId, CollectionRef, CommitMode, EventRef, Read,
-    STATE_FANOUT_CONCURRENCY, StateKey, StateName, StateType, StoreOutcome,
-};
+use crate::state::value::ValueKind;
+use crate::state::{CollectionKindId, EventRef, StateKey, StateName, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use lane::{Lane, Resolve};
 use parking_lot::Mutex as SyncMutex;
 use scc::HashSet as ConcurrentHashSet;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
@@ -64,9 +74,13 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tokio::task::coop::cooperative;
-use tracing::warn;
+use tokio::{join, try_join};
 use uuid::Uuid;
+
+mod lane;
+
+#[cfg(test)]
+mod tests;
 
 /// Shared per-partition set of keys with a standing `StateRecovery` backstop.
 ///
@@ -76,14 +90,19 @@ use uuid::Uuid;
 /// keys.
 pub(crate) type ArmedKeys = Arc<ConcurrentHashSet<Key, RandomState>>;
 
-/// Per-event keyed-state session: typed descriptor handles operate over
-/// its byte cells, the framework drives its (crate-sealed) lifecycle.
+/// Per-event keyed-state session: typed descriptor handles operate over its
+/// byte cells, the framework drives its (crate-sealed) lifecycle.
 ///
 /// Sessions are cheap `Arc`-backed clones; every clone shares the same
-/// per-event dirty workspace and staged set, so repeated descriptor binds of
-/// one collection accumulate into one write. The trait is sealed — downstream
+/// per-event lanes and singletons, so repeated descriptor binds of one
+/// collection accumulate into one write. The trait is sealed — downstream
 /// crates name it in bounds but cannot implement it or call the lifecycle
 /// methods.
+///
+/// This is the **kind-agnostic** core: registration, the loader slot,
+/// termination, and the sealed lifecycle. Per-kind cell access — the only
+/// per-kind surface — lives on [`CellAccess<K>`], one impl per lane, so adding
+/// a kind never touches this trait.
 pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
@@ -112,60 +131,80 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
         identity: &StructuralIdentity,
     ) -> Result<StateName, StateAccessError>;
 
-    /// Reads the current visible cell bytes of a collection within this
-    /// event's transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
-    fn state_cell(
-        &self,
-        name: &StateName,
-    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
-
-    /// Buffers a set of a collection's cell bytes within this event's
-    /// transaction.
-    ///
-    /// Takes the cell by shared slice so the caller can pass a pooled or
-    /// transient serialize buffer rather than forcing an owned `Bytes`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
-    fn set_state_cell(
-        &self,
-        name: &StateName,
-        cell: &[u8],
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
-
-    /// Buffers a clear of a collection within this event's transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
-    fn clear_state_cell(
-        &self,
-        name: &StateName,
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
-
-    /// Writes a collection's buffered op directly to committed state and
-    /// clears the buffer — the mid-handler write-through escape hatch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
-    fn flush_state_cell(
-        &self,
-        name: &StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
-
     /// Returns `true` once the partition is shutting down or the event has
     /// been cancelled. Descriptor handles guard every operation on this.
     fn is_terminated(&self) -> bool;
+}
+
+/// The uniform **addressed** point-cell access surface for one collection kind.
+///
+/// A handle for kind `K` (Value, Map, Deque, a sketch) bounds its op methods on
+/// `S: CellAccess<K>` — exactly as [`StateHandle::get`] surfaces
+/// `R: CellResolver<S>` — and translates its operations (`push`, `get_entry`,
+/// `increment`, …) into these point-cell ops over the kind's
+/// [`CellAddr`](CollectionKind::CellAddr) plus any header-cell maintenance. The
+/// session impls one per lane, forwarding to that lane; the kind semantics
+/// ([`combine`](CollectionKind::combine)/[`apply`](CollectionKind::apply)) live
+/// in the kind, not here.
+///
+/// Multi-cell **scans** (Map `iterate`, Deque `range`) are deliberately *not*
+/// expressible here — a future bulk-read surface adds them when scannable kinds
+/// land.
+///
+/// [`StateHandle::get`]: crate::state::descriptor::StateHandle::get
+pub trait CellAccess<K>: StateSession
+where
+    K: CollectionKind,
+{
+    /// Reads the cell's current visible value within this event's transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
+    /// [`StateAccessError::Store`] when the underlying store fails.
+    fn read_cell(
+        &self,
+        name: &StateName,
+        addr: &K::CellAddr,
+    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
+
+    /// Buffers a set of the cell's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
+    /// [`StateAccessError::Store`] when the underlying store fails.
+    fn set_cell(
+        &self,
+        name: &StateName,
+        addr: &K::CellAddr,
+        cell: &[u8],
+    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
+    /// Buffers a clear of the cell.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
+    /// [`StateAccessError::Store`] when the underlying store fails.
+    fn clear_cell(
+        &self,
+        name: &StateName,
+        addr: &K::CellAddr,
+    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
+    /// Writes the cell's buffered op straight to committed state — the
+    /// mid-handler write-through escape hatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
+    /// [`StateAccessError::Store`] when the underlying store fails.
+    fn flush_cell(
+        &self,
+        name: &StateName,
+        addr: &K::CellAddr,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
 }
 
 /// Crate-sealed lifecycle half of [`StateSession`].
@@ -209,25 +248,26 @@ pub(crate) mod sealed {
 
     /// Framework-only lifecycle over a per-event session.
     pub trait StateLifecycle {
-        /// Resolves every touched collection by its commit mode:
-        /// `ReadCommitted` collections stage a provisional cell (the staged
-        /// set is recorded inside the session), `ReadUncommitted` collections
-        /// write a resolved value.
+        /// Resolves every touched collection across every kind by its commit
+        /// mode: `ReadCommitted` collections stage a provisional cell (the
+        /// staged set is recorded per lane), `ReadUncommitted` collections
+        /// write a resolved value. Awaits **all** lanes before returning, so a
+        /// lane error returns before the textually-later marker flush.
         ///
         /// # Errors
         ///
         /// Returns a type-erased store error when staging or writing fails;
-        /// nothing is recorded in that case.
+        /// nothing is recorded for the failing lane in that case.
         fn finalize(
             &self,
         ) -> impl Future<Output = Result<FinalizeOutcome, StateAccessError>> + Send;
 
-        /// Promotes the recorded staged set after the event committed.
-        /// Best-effort: individual failures are logged and reported via
-        /// [`ApplyOutcome::Incomplete`].
+        /// Promotes every lane's recorded staged set after the event committed.
+        /// Best-effort across lanes: individual failures are logged and folded
+        /// into [`ApplyOutcome::Incomplete`], never cancelling a sibling lane.
         fn commit_apply(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
-        /// Rolls the recorded staged set back after the event aborted.
+        /// Rolls every lane's recorded staged set back after the event aborted.
         /// Best-effort, symmetric with [`Self::commit_apply`].
         fn rollback_aborted(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
@@ -252,8 +292,8 @@ pub(crate) mod sealed {
         /// when the oracle write fails.
         fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Discards the per-event dirty scope, recorded staged set, and
-        /// registered marker so the next attempt starts clean.
+        /// Discards every lane's per-event dirty scope and staged set, plus the
+        /// registered marker, so the next attempt starts clean.
         /// Called at attempt boundaries (retry, defer-swallow).
         fn reset(&self);
 
@@ -278,6 +318,21 @@ pub(crate) mod sealed {
         /// arm; cleared when the sweep fires (the manager's `recover`).
         fn mark_backstop_armed(&self) -> impl Future<Output = ()> + Send;
     }
+}
+
+/// Folds the per-lane [`ApplyOutcome`]s of `commit_apply`/`rollback_aborted`
+/// into one: `Incomplete` dominates (so the single backstop stays armed if any
+/// kind failed), then `Resolved`, then `NothingStaged`.
+fn merge_apply(outcomes: impl IntoIterator<Item = ApplyOutcome>) -> ApplyOutcome {
+    outcomes
+        .into_iter()
+        .fold(ApplyOutcome::NothingStaged, |acc, next| match (acc, next) {
+            (ApplyOutcome::Incomplete, _) | (_, ApplyOutcome::Incomplete) => {
+                ApplyOutcome::Incomplete
+            }
+            (ApplyOutcome::Resolved, _) | (_, ApplyOutcome::Resolved) => ApplyOutcome::Resolved,
+            _ => ApplyOutcome::NothingStaged,
+        })
 }
 
 /// Clones of the partition's termination signals, captured when a session
@@ -305,30 +360,34 @@ impl TerminationWatch {
     }
 }
 
-/// The provisional cells `finalize` staged for the promote / rollback hooks.
-///
-/// Each entry pairs the collection ref (carrying its TTL) with the staged
-/// write, whose `data` is the value to promote to and whose `prev` is the
-/// committed base to roll back to. Only `ReadCommitted` collections appear —
-/// `ReadUncommitted` writes resolve at stage time with nothing to resolve.
-struct StagedSet {
-    entries: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)>,
+/// The session's per-kind lanes. The destructure at every lifecycle fan-out
+/// site is **exhaustive** (no `..`), so adding a kind's lane fails to compile
+/// until it is wired into `finalize`/`commit_apply`/`rollback_aborted`/`reset`
+/// — invalid-states-unrepresentable applied to the composition itself.
+struct Lanes<S, O, C> {
+    value: Lane<ValueKind, S, O, C>,
+
+    /// The `#[cfg(test)]` proof kind, composed alongside Value through the
+    /// **same** lifecycle fan-out (exhaustive destructure, `try_join!`/`join!`,
+    /// per-lane sweep) to prove the multi-kind composition with two kinds in
+    /// one real session. It rides concrete in-memory stores sharing the
+    /// session's one oracle `O` — not a parallel test harness.
+    #[cfg(test)]
+    test: Lane<CounterKind, MemoryCounterStore, O, MemoryCounterCache>,
 }
 
-/// One touched collection's staged write, prepared synchronously from the
-/// dirty scope before `finalize`'s concurrent fan-out so no `Ops<'a>` borrow
-/// crosses an await.
-struct StagePrep {
-    value: ValueApplied,
-    collection_ref: CollectionRef<ValueKind>,
-    mode: CommitMode,
-}
-
-/// Construction parameters for [`ValueStateSession`], bundled so the
+/// Construction parameters for [`KeyedStateSession`], bundled so the
 /// constructor stays readable.
 pub struct SessionParts<S, O, C, L> {
-    /// Partition-lifetime cell store + oracle + cache + status map.
+    /// Partition-lifetime Value cell store + oracle + cache + status map.
     pub store: PartitionStateStore<ValueKind, S, O, C>,
+
+    /// Partition-lifetime store for the `#[cfg(test)]` proof kind, threading
+    /// the **same** oracle as `store` so a provisional cell of either kind
+    /// resolves against the exact commit record the one marker certifies.
+    #[cfg(test)]
+    pub(crate) test_store:
+        PartitionStateStore<CounterKind, MemoryCounterStore, O, MemoryCounterCache>,
 
     /// Partition-lifetime commit oracle; the marker flush writes the
     /// message commit row through it. Same instance baked into `store`.
@@ -362,12 +421,8 @@ pub struct SessionParts<S, O, C, L> {
 }
 
 struct SessionInner<S, O, C, L> {
-    store: PartitionStateStore<ValueKind, S, O, C>,
+    lanes: Lanes<S, O, C>,
     oracle: O,
-    /// Per-event dirty workspace; cleared in place on `reset`. A single
-    /// in-memory store owned uniquely by this session — never shared, never a
-    /// durability or recovery source.
-    dirty: DirtyValueStore,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
@@ -378,24 +433,24 @@ struct SessionInner<S, O, C, L> {
     /// `recover` removes the key when the sweep fires.
     armed: ArmedKeys,
     termination: TerminationWatch,
-    staged: SyncMutex<Option<StagedSet>>,
-    /// The registered message commit marker, flushed strictly after the
-    /// stage and cleared by `reset`. `None` until the deduplication
-    /// middleware registers it (or always, on the timer arm).
+    /// The registered message commit marker, flushed strictly after the stage
+    /// and cleared by `reset`. A session-level singleton (never per lane), so
+    /// "one marker, after every stage" is structural. `None` until the
+    /// deduplication middleware registers it (or always, on the timer arm).
     marker: SyncMutex<Option<Uuid>>,
 }
 
-/// The real per-event session over a partition's cell store.
+/// The real per-event session over a partition's cell stores.
 ///
-/// One session is minted per event by the partition's state manager;
-/// clones share the per-event dirty scope, recorded staged set, and
-/// registered marker. `S` is the cell store, `O` the commit oracle, `C`
-/// the committed-value cache, `L` the message loader.
-pub struct ValueStateSession<S, O, C, L> {
+/// One session is minted per event by the partition's state manager; clones
+/// share the per-event lanes and singletons. `S` is the Value cell store, `O`
+/// the commit oracle (shared across every lane), `C` the Value committed-value
+/// cache, `L` the message loader.
+pub struct KeyedStateSession<S, O, C, L> {
     inner: Arc<SessionInner<S, O, C, L>>,
 }
 
-impl<S, O, C, L> Clone for ValueStateSession<S, O, C, L> {
+impl<S, O, C, L> Clone for KeyedStateSession<S, O, C, L> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -403,21 +458,28 @@ impl<S, O, C, L> Clone for ValueStateSession<S, O, C, L> {
     }
 }
 
-impl<S, O, C, L> fmt::Debug for ValueStateSession<S, O, C, L> {
+impl<S, O, C, L> fmt::Debug for KeyedStateSession<S, O, C, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ValueStateSession")
+        f.debug_struct("KeyedStateSession")
             .field("state_key", &self.inner.state_key)
             .field("event", &self.inner.event)
             .finish_non_exhaustive()
     }
 }
 
-impl<S, O, C, L> ValueStateSession<S, O, C, L> {
-    /// Creates a session for one event, opening a fresh dirty scope.
+impl<S, O, C, L> KeyedStateSession<S, O, C, L>
+where
+    S: CellStore<ValueKind>,
+    O: CommitOracle,
+    C: CommittedCache<ValueKind>,
+{
+    /// Creates a session for one event, opening a fresh dirty scope per lane.
     #[must_use]
     pub fn new(parts: SessionParts<S, O, C, L>) -> Self {
         let SessionParts {
             store,
+            #[cfg(test)]
+            test_store,
             oracle,
             loader,
             registry,
@@ -429,9 +491,12 @@ impl<S, O, C, L> ValueStateSession<S, O, C, L> {
         } = parts;
         Self {
             inner: Arc::new(SessionInner {
-                store,
+                lanes: Lanes {
+                    value: Lane::new(store),
+                    #[cfg(test)]
+                    test: Lane::new(test_store),
+                },
                 oracle,
-                dirty: DirtyValueStore::new(),
                 loader,
                 registry,
                 state_key,
@@ -439,13 +504,16 @@ impl<S, O, C, L> ValueStateSession<S, O, C, L> {
                 recovery_delay,
                 armed,
                 termination,
-                staged: SyncMutex::new(None),
                 marker: SyncMutex::new(None),
             }),
         }
     }
+}
 
-    fn collection_id_for(&self, name: &StateName) -> CollectionId<ValueKind> {
+impl<S, O, C, L> KeyedStateSession<S, O, C, L> {
+    /// The collection id for `name` under this session's key, for any kind
+    /// `K` (the kind is carried only at the type level, so no bound is needed).
+    fn id_for<K>(&self, name: &StateName) -> CollectionId<K> {
         CollectionId::new(
             self.inner.state_key.clone(),
             StateType::Application,
@@ -453,39 +521,121 @@ impl<S, O, C, L> ValueStateSession<S, O, C, L> {
         )
     }
 
-    fn collection_ref_for(&self, name: &StateName) -> CollectionRef<ValueKind> {
-        CollectionRef::new(
-            self.collection_id_for(name),
-            self.inner.registry.ttl_for(name),
-        )
-    }
-
-    /// Folds a touched collection's buffered ops into the write `finalize`
-    /// will stage, reading the dirty store synchronously so the `Ops<'a>`
-    /// borrow is released before any await. `None` means the collection has no
-    /// buffered op, so there is nothing to stage. Since the work-list is the
-    /// dirty keyset itself, that arm is unreachable defense — every id fed here
-    /// came from a `set`/`clear`.
-    fn stage_prep(&self, name: &StateName) -> Result<Option<StagePrep>, StateAccessError> {
-        let collection_ref = self.collection_ref_for(name);
-        let value = match self
-            .inner
-            .dirty
-            .pending_ops(collection_ref.id())
-            .map_err(|e| StateAccessError::store(&e))?
-        {
-            Some(pending) => fold_value_ops(None, pending.ops),
-            None => return Ok(None),
-        };
-        Ok(Some(StagePrep {
-            value,
-            collection_ref,
-            mode: self.inner.registry.commit_mode_for(name),
-        }))
+    /// The collection ref (id + registry TTL) for `name` under kind `K`.
+    fn ref_for<K>(&self, name: &StateName) -> CollectionRef<K> {
+        CollectionRef::new(self.id_for(name), self.inner.registry.ttl_for(name))
     }
 }
 
-impl<S, O, C, L> StateSession for ValueStateSession<S, O, C, L>
+/// Value access surface (`CellAddr = ()`), forwarding to the value lane — the
+/// "one `CellAccess<K>` impl per lane" pattern, here for the Value lane.
+impl<S, O, C, L> CellAccess<ValueKind> for KeyedStateSession<S, O, C, L>
+where
+    S: CellStore<ValueKind>,
+    O: CommitOracle,
+    C: CommittedCache<ValueKind>,
+    L: Clone + Send + Sync + 'static,
+{
+    async fn read_cell(
+        &self,
+        name: &StateName,
+        addr: &(),
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        let id = self.id_for(name);
+        self.inner
+            .lanes
+            .value
+            .read_cell(&id, addr, self.inner.event)
+            .await
+    }
+
+    async fn set_cell(
+        &self,
+        name: &StateName,
+        addr: &(),
+        cell: &[u8],
+    ) -> Result<(), StateAccessError> {
+        let id = self.id_for(name);
+        self.inner.lanes.value.set_cell(&id, addr, cell).await;
+        Ok(())
+    }
+
+    async fn clear_cell(&self, name: &StateName, addr: &()) -> Result<(), StateAccessError> {
+        let id = self.id_for(name);
+        self.inner.lanes.value.clear_cell(&id, addr).await;
+        Ok(())
+    }
+
+    async fn flush_cell(
+        &self,
+        name: &StateName,
+        addr: &(),
+    ) -> Result<StoreOutcome, StateAccessError> {
+        let collection_ref = self.ref_for(name);
+        self.inner
+            .lanes
+            .value
+            .flush_cell(&collection_ref, addr)
+            .await
+    }
+}
+
+/// The `#[cfg(test)]` proof kind's access surface, forwarding to the test lane
+/// exactly as the Value impl forwards to the value lane — the "one
+/// `CellAccess<K>` impl per lane" pattern, now exercised by a second kind.
+#[cfg(test)]
+impl<S, O, C, L> CellAccess<CounterKind> for KeyedStateSession<S, O, C, L>
+where
+    S: CellStore<ValueKind>,
+    O: CommitOracle,
+    C: CommittedCache<ValueKind>,
+    L: Clone + Send + Sync + 'static,
+{
+    async fn read_cell(
+        &self,
+        name: &StateName,
+        addr: &u32,
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        let id = self.id_for(name);
+        self.inner
+            .lanes
+            .test
+            .read_cell(&id, addr, self.inner.event)
+            .await
+    }
+
+    async fn set_cell(
+        &self,
+        name: &StateName,
+        addr: &u32,
+        cell: &[u8],
+    ) -> Result<(), StateAccessError> {
+        let id = self.id_for(name);
+        self.inner.lanes.test.set_cell(&id, addr, cell).await;
+        Ok(())
+    }
+
+    async fn clear_cell(&self, name: &StateName, addr: &u32) -> Result<(), StateAccessError> {
+        let id = self.id_for(name);
+        self.inner.lanes.test.clear_cell(&id, addr).await;
+        Ok(())
+    }
+
+    async fn flush_cell(
+        &self,
+        name: &StateName,
+        addr: &u32,
+    ) -> Result<StoreOutcome, StateAccessError> {
+        let collection_ref = self.ref_for(name);
+        self.inner
+            .lanes
+            .test
+            .flush_cell(&collection_ref, addr)
+            .await
+    }
+}
+
+impl<S, O, C, L> StateSession for KeyedStateSession<S, O, C, L>
 where
     S: CellStore<ValueKind>,
     O: CommitOracle,
@@ -515,221 +665,87 @@ where
         Ok(state_name.clone())
     }
 
-    async fn state_cell(&self, name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
-        let id = self.collection_id_for(name);
-        match self
-            .inner
-            .dirty
-            .get(&id)
-            .await
-            .map_err(|e| StateAccessError::store(&e))?
-        {
-            Read::Present(payload) => Ok(Some(payload)),
-            Read::Absent => Ok(None),
-            Read::Unknown => self
-                .inner
-                .store
-                .committed_value(&id, &(), self.inner.event)
-                .await
-                .map_err(|e| StateAccessError::store(&e)),
-        }
-    }
-
-    async fn set_state_cell(&self, name: &StateName, cell: &[u8]) -> Result<(), StateAccessError> {
-        let id = self.collection_id_for(name);
-        self.inner
-            .dirty
-            .set(&id, cell)
-            .await
-            .map_err(|e| StateAccessError::store(&e))?;
-        Ok(())
-    }
-
-    async fn clear_state_cell(&self, name: &StateName) -> Result<(), StateAccessError> {
-        let id = self.collection_id_for(name);
-        self.inner
-            .dirty
-            .clear(&id)
-            .await
-            .map_err(|e| StateAccessError::store(&e))?;
-        Ok(())
-    }
-
-    async fn flush_state_cell(&self, name: &StateName) -> Result<StoreOutcome, StateAccessError> {
-        let id = self.collection_id_for(name);
-        let Some(pending) = self
-            .inner
-            .dirty
-            .pending_ops(&id)
-            .map_err(|e| StateAccessError::store(&e))?
-        else {
-            return Ok(StoreOutcome::NoOp);
-        };
-        let value = fold_value_ops(None, pending.ops);
-        let collection_ref = self.collection_ref_for(name);
-        self.inner
-            .store
-            .write_resolved(&collection_ref, &(), value.as_ref())
-            .await
-            .map_err(|e| StateAccessError::store(&e))?;
-        self.inner
-            .dirty
-            .clear_pending_ops(&id)
-            .map_err(|e| StateAccessError::store(&e))?;
-        Ok(StoreOutcome::Applied)
-    }
-
     fn is_terminated(&self) -> bool {
         self.inner.termination.is_terminated()
     }
 }
 
-impl<S, O, C, L> StateLifecycle for ValueStateSession<S, O, C, L>
+impl<S, O, C, L> KeyedStateSession<S, O, C, L>
 where
     S: CellStore<ValueKind>,
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
     L: Send + Sync + 'static,
 {
-    /// Stages dirty `ReadCommitted` collections as provisional cells and
-    /// writes `ReadUncommitted` ones resolved, recording the staged set.
+    /// Resolves every lane's staged set the same way and folds the per-lane
+    /// outcomes — the shared body of `commit_apply`/`rollback_aborted`.
     ///
-    /// **Idempotent under retry**: the durability boundary retries a transient
-    /// failure in place without resetting the session. Re-reading the same
-    /// buffered ops and re-staging is idempotent — a provisional write
-    /// overwrites the cell with the same `(data, prev, event)` triple, and
-    /// re-reading `prev` returns the same committed base (the cell is now
-    /// `Provisional` owned by this event, so `committed` reads its `prev`).
-    /// The staged set is replaced only after every write succeeds.
+    /// `join!` (not `try_join!`): best-effort, drive every lane to completion,
+    /// never cancel a sibling and strand its cells. `merge_apply` folds the
+    /// outcomes so `Incomplete` dominates and the one backstop stays armed if
+    /// any kind failed. The destructure is exhaustive (no `..`), so a new lane
+    /// must be wired here too.
+    async fn apply_all(&self, how: Resolve) -> ApplyOutcome {
+        let Lanes {
+            value,
+            #[cfg(test)]
+            test,
+        } = &self.inner.lanes;
+        #[cfg(test)]
+        let outcomes = {
+            let (v, t) = join!(value.resolve(how), test.resolve(how));
+            [v, t]
+        };
+        #[cfg(not(test))]
+        let outcomes = {
+            let (v,) = join!(value.resolve(how));
+            [v]
+        };
+        merge_apply(outcomes)
+    }
+}
+
+impl<S, O, C, L> StateLifecycle for KeyedStateSession<S, O, C, L>
+where
+    S: CellStore<ValueKind>,
+    O: CommitOracle,
+    C: CommittedCache<ValueKind>,
+    L: Send + Sync + 'static,
+{
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        // The dirty-store keyset is the finalize work-list: a `set`/`clear`
-        // wrote an op there, a `get` did not. Materialize it once (don't
-        // drain): scc has no borrowing iterator, and the keyset must outlive
-        // the async fan-out below. An in-place transient retry re-runs
-        // `finalize` over the same ops.
-        let ids = self.inner.dirty.touched_collections();
-        let store = &self.inner.store;
+        // Exhaustive destructure (no `..`): a new lane field fails to compile
+        // here until wired. `try_join!` awaits *all* lanes and returns a lane
+        // error via `?` — before the marker flush in `settle` — so "every kind
+        // staged" strictly precedes the single marker (invariant 1).
+        let Lanes {
+            value,
+            #[cfg(test)]
+            test,
+        } = &self.inner.lanes;
         let event = self.inner.event;
-        // Distinct collections are distinct ids = distinct cache keys, status
-        // keys, and Cassandra partitions, so per-collection staging fans out
-        // concurrently with no intra-event races. The fallible synchronous prep
-        // (pending ops + fold + refs) runs in the `map` closure, reading the
-        // dirty store, and only owned data crosses into the future — no
-        // `Ops<'a>` borrow spans an await.
-        let staged: Vec<(CollectionRef<ValueKind>, ProvisionalWrite)> = stream::iter(ids)
-            .map(|id| {
-                let prepared = self.stage_prep(id.name());
-                // `cooperative` adds a per-item coop-budget checkpoint: the
-                // in-memory store completes each future without a tokio leaf
-                // await, so a key touching many collections would otherwise
-                // drain the whole batch in one poll and starve the worker.
-                // Concurrency is unchanged — `buffer_unordered` still drives
-                // `STATE_FANOUT_CONCURRENCY` of these at once.
-                cooperative(async move {
-                    let Some(StagePrep {
-                        value,
-                        collection_ref,
-                        mode,
-                    }) = prepared?
-                    else {
-                        return Ok(None);
-                    };
-                    match mode {
-                        CommitMode::ReadCommitted => {
-                            let prev = store
-                                .committed(collection_ref.id(), &(), event)
-                                .await
-                                .map_err(|e| StateAccessError::store(&e))?;
-                            let write = ProvisionalWrite::new(value, prev, event);
-                            store
-                                .write_provisional(&collection_ref, &(), &write)
-                                .await
-                                .map_err(|e| StateAccessError::store(&e))?;
-                            Ok(Some((collection_ref, write)))
-                        }
-                        CommitMode::ReadUncommitted => {
-                            store
-                                .write_resolved(&collection_ref, &(), value.as_ref())
-                                .await
-                                .map_err(|e| StateAccessError::store(&e))?;
-                            Ok(None)
-                        }
-                    }
-                })
-            })
-            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-            .try_filter_map(|opt| async move { Ok(opt) })
-            .try_collect()
-            .await?;
-        // Replace the staged set only after every write succeeded: any error
-        // returns above via `?`, leaving the prior staged set untouched.
-        if staged.is_empty() {
-            Ok(FinalizeOutcome::Clean)
+        let registry = &self.inner.registry;
+        #[cfg(test)]
+        let (value_staged, test_staged) =
+            try_join!(value.stage(event, registry), test.stage(event, registry))?;
+        #[cfg(not(test))]
+        let (value_staged,) = try_join!(value.stage(event, registry))?;
+        #[cfg(test)]
+        let staged = value_staged || test_staged;
+        #[cfg(not(test))]
+        let staged = value_staged;
+        Ok(if staged {
+            FinalizeOutcome::Staged
         } else {
-            *self.inner.staged.lock() = Some(StagedSet { entries: staged });
-            Ok(FinalizeOutcome::Staged)
-        }
+            FinalizeOutcome::Clean
+        })
     }
 
     async fn commit_apply(&self) -> ApplyOutcome {
-        let Some(set) = self.inner.staged.lock().take() else {
-            return ApplyOutcome::NothingStaged;
-        };
-        let store = &self.inner.store;
-        // Best-effort: `fold` drives every promote to completion regardless of
-        // siblings' failures, reducing to a single `bool` accumulator.
-        // `cooperative` wraps each promote so the fan-out yields to the runtime
-        // every ~128 cells instead of draining the whole batch in one poll.
-        let all_resolved = stream::iter(set.entries)
-            .map(|(collection_ref, write)| {
-                cooperative(async move {
-                    match store.promote(&collection_ref, &(), write.data()).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            warn!(error = ?error, "cell promote failed; leaving provisional for the sweep");
-                            false
-                        }
-                    }
-                })
-            })
-            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-            .fold(true, |all, ok| async move { all && ok })
-            .await;
-        if all_resolved {
-            ApplyOutcome::Resolved
-        } else {
-            ApplyOutcome::Incomplete
-        }
+        self.apply_all(Resolve::Promote).await
     }
 
     async fn rollback_aborted(&self) -> ApplyOutcome {
-        let Some(set) = self.inner.staged.lock().take() else {
-            return ApplyOutcome::NothingStaged;
-        };
-        let store = &self.inner.store;
-        let all_resolved = stream::iter(set.entries)
-            .map(|(collection_ref, write)| {
-                cooperative(async move {
-                    match store
-                        .rollback_provisional(&collection_ref, &(), write.prev())
-                        .await
-                    {
-                        Ok(()) => true,
-                        Err(error) => {
-                            warn!(error = ?error, "cell rollback failed; leaving provisional for the sweep");
-                            false
-                        }
-                    }
-                })
-            })
-            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-            .fold(true, |all, ok| async move { all && ok })
-            .await;
-        if all_resolved {
-            ApplyOutcome::Resolved
-        } else {
-            ApplyOutcome::Incomplete
-        }
+        self.apply_all(Resolve::Rollback).await
     }
 
     fn register_marker(&self, dedup_id: Uuid) {
@@ -738,8 +754,8 @@ where
 
     async fn flush_marker(&self) -> Result<(), StateAccessError> {
         // Read without taking: the slot clears only after the oracle write
-        // succeeds, so a transient failure leaves the marker for the
-        // boundary to retry.
+        // succeeds, so a transient failure leaves the marker for the boundary
+        // to retry.
         let Some(dedup_id) = *self.inner.marker.lock() else {
             return Ok(());
         };
@@ -753,11 +769,16 @@ where
     }
 
     fn reset(&self) {
-        // Clear the dirty store in place, reusing its allocation. Per-key
-        // serialization means no handler op is in flight here, so there is no
-        // racing observer to guard against.
-        self.inner.dirty.clear_all();
-        *self.inner.staged.lock() = None;
+        // Per-key serialization means no handler op is in flight here, so there
+        // is no racing observer to guard against.
+        let Lanes {
+            value,
+            #[cfg(test)]
+            test,
+        } = &self.inner.lanes;
+        value.reset();
+        #[cfg(test)]
+        test.reset();
         *self.inner.marker.lock() = None;
     }
 
@@ -960,28 +981,47 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn state_cell(&self, _name: &StateName) -> Result<Option<Bytes>, StateAccessError> {
+    fn is_terminated(&self) -> bool {
+        true
+    }
+}
+
+/// The stub refuses Value cell access too, so a context carrying it satisfies
+/// the `CellAccess<ValueKind>` bound on `EventContext::State` while every op
+/// still reports [`StateAccessError::Unavailable`]. (`bind` fails earlier at
+/// `verify_state_registration`, so these are belt-and-suspenders.)
+#[cfg(test)]
+impl<P> CellAccess<ValueKind> for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    async fn read_cell(
+        &self,
+        _name: &StateName,
+        _addr: &(),
+    ) -> Result<Option<Bytes>, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn set_state_cell(
+    async fn set_cell(
         &self,
         _name: &StateName,
+        _addr: &(),
         _cell: &[u8],
     ) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn clear_state_cell(&self, _name: &StateName) -> Result<(), StateAccessError> {
+    async fn clear_cell(&self, _name: &StateName, _addr: &()) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn flush_state_cell(&self, _name: &StateName) -> Result<StoreOutcome, StateAccessError> {
+    async fn flush_cell(
+        &self,
+        _name: &StateName,
+        _addr: &(),
+    ) -> Result<StoreOutcome, StateAccessError> {
         Err(StateAccessError::Unavailable)
-    }
-
-    fn is_terminated(&self) -> bool {
-        true
     }
 }
 

@@ -155,114 +155,122 @@ impl CellStore<ValueKind> for CassandraCellStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        (): &'a (),
-        write: &'a ProvisionalWrite,
+        writes: &'a [((), ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
+        // Value is single-cell, so this slice is size-1: one `UPDATE`, exactly
+        // as before. A multi-cell kind would group the per-row statements into
+        // one same-partition `UNLOGGED BATCH`; that path lands with that kind.
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let CellBlobs {
-            data,
-            prev_data,
-            encoding,
-            identity_version,
-        } = encode_cell_blobs(write.data(), write.prev())?;
-        let data = data.as_ref().map(Bytes::as_ref);
-        let prev_data = prev_data.as_ref().map(Bytes::as_ref);
-        let event = write.event();
-        self.store
-            .execute_with_optional_ttl(
-                collection.ttl().map(ttl_to_i32),
-                &self.queries.write_provisional,
-                &self.queries.write_provisional_no_ttl,
-                |ttl| {
-                    (
-                        ttl,
-                        data,
-                        prev_data,
-                        encoding,
-                        identity_version,
-                        event,
-                        segment_id,
-                        key,
-                        state_type,
-                        name,
-                    )
-                },
-                || {
-                    (
-                        data,
-                        prev_data,
-                        encoding,
-                        identity_version,
-                        event,
-                        segment_id,
-                        key,
-                        state_type,
-                        name,
-                    )
-                },
-            )
-            .await?;
+        for ((), write) in writes {
+            let CellBlobs {
+                data,
+                prev_data,
+                encoding,
+                identity_version,
+            } = encode_cell_blobs(write.data(), write.prev())?;
+            let data = data.as_ref().map(Bytes::as_ref);
+            let prev_data = prev_data.as_ref().map(Bytes::as_ref);
+            let event = write.event();
+            self.store
+                .execute_with_optional_ttl(
+                    collection.ttl().map(ttl_to_i32),
+                    &self.queries.write_provisional,
+                    &self.queries.write_provisional_no_ttl,
+                    |ttl| {
+                        (
+                            ttl,
+                            data,
+                            prev_data,
+                            encoding,
+                            identity_version,
+                            event,
+                            segment_id,
+                            key,
+                            state_type,
+                            name,
+                        )
+                    },
+                    || {
+                        (
+                            data,
+                            prev_data,
+                            encoding,
+                            identity_version,
+                            event,
+                            segment_id,
+                            key,
+                            state_type,
+                            name,
+                        )
+                    },
+                )
+                .await?;
+        }
         Ok(())
     }
 
     async fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        (): &'a (),
-        data: Option<&'a Bytes>,
+        cells: &'a [((), Option<Bytes>)],
     ) -> Result<(), Self::Error> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let CellBlobs {
-            data,
-            encoding,
-            identity_version,
-            ..
-        } = encode_cell_blobs(data, None)?;
-        let data = data.as_ref().map(Bytes::as_ref);
-        self.store
-            .execute_with_optional_ttl(
-                collection.ttl().map(ttl_to_i32),
-                &self.queries.write_resolved,
-                &self.queries.write_resolved_no_ttl,
-                |ttl| {
-                    (
-                        ttl,
-                        data,
-                        encoding,
-                        identity_version,
-                        segment_id,
-                        key,
-                        state_type,
-                        name,
-                    )
-                },
-                || {
-                    (
-                        data,
-                        encoding,
-                        identity_version,
-                        segment_id,
-                        key,
-                        state_type,
-                        name,
-                    )
-                },
-            )
-            .await?;
+        for ((), data) in cells {
+            let CellBlobs {
+                data,
+                encoding,
+                identity_version,
+                ..
+            } = encode_cell_blobs(data.as_ref(), None)?;
+            let data = data.as_ref().map(Bytes::as_ref);
+            self.store
+                .execute_with_optional_ttl(
+                    collection.ttl().map(ttl_to_i32),
+                    &self.queries.write_resolved,
+                    &self.queries.write_resolved_no_ttl,
+                    |ttl| {
+                        (
+                            ttl,
+                            data,
+                            encoding,
+                            identity_version,
+                            segment_id,
+                            key,
+                            state_type,
+                            name,
+                        )
+                    },
+                    || {
+                        (
+                            data,
+                            encoding,
+                            identity_version,
+                            segment_id,
+                            key,
+                            state_type,
+                            name,
+                        )
+                    },
+                )
+                .await?;
+        }
         Ok(())
     }
 
     async fn mark_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef<ValueKind>,
-        (): &'a (),
+        addrs: &'a [()],
     ) -> Result<(), Self::Error> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        self.execute_unpaged(
-            &self.queries.mark_resolved,
-            (segment_id, key, state_type, name),
-        )
-        .await
+        for () in addrs {
+            self.execute_unpaged(
+                &self.queries.mark_resolved,
+                (segment_id, key, state_type, name),
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 
