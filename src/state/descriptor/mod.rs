@@ -1,23 +1,13 @@
 //! Typed descriptors for keyed-state collections.
 //!
-//! Stores speak raw [`Bytes`](bytes::Bytes); this layer owns the typing. A
-//! descriptor is a plain `Copy` value — build it wherever it's needed (names
-//! are interned, so equal names produce interchangeable descriptors).
-//! *Registering* it with the consumer mints a [`Registered`] capability handle;
+//! A descriptor names a typed keyed-state collection — a plain `Copy` value
+//! (names are interned). Build it with [`value_state`], registering it with
+//! the consumer to mint a [`Registered`] capability handle. A handler binds
+//! that handle via
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
-//! takes that handle (never a raw descriptor) and binds it to obtain a typed,
-//! owned handle — so a handler can only reach collections it registered:
-//!
-//! ```
-//! use prosody::state::descriptor::{ValueDescriptor, value_state};
-//! use std::time::Duration;
-//!
-//! // A descriptor carries its operational settings fluently; registering it
-//! // (see `KeyedStateConfiguration::register`) yields a `Registered<_>` token
-//! // that `ctx.state(token)` binds into a typed handle whose `get`/`set` read
-//! // and write the cell committed by the previous event on the key.
-//! let cart: ValueDescriptor = value_state("cart").read_uncommitted();
-//! ```
+//! to get a typed handle whose `get`/`set` read and write the cell committed
+//! by the previous event on the key. `state` takes the handle, never a raw
+//! descriptor, so a handler can reach only collections it registered.
 //!
 //! # Codec and resolver
 //!
@@ -143,14 +133,11 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings (TTL, commit mode) this descriptor carries
-    /// into registration.
+    /// into registration, set via its fluent methods (see
+    /// [`ValueDescriptor::ttl`]).
     ///
-    /// Defaults to [`CollectionDef::new`] with `None` — indefinite retention,
-    /// read-committed — so framework-internal descriptors need not carry one.
-    /// Descriptors with fluent settings (see [`ValueDescriptor::ttl`]) override
-    /// this to surface their embedded definition. Operational settings are not
-    /// part of [`DescriptorIdentity::structural_identity`]: they may change
-    /// between deploys; the identity may not.
+    /// Defaults to [`CollectionDef::new`] with `None` (indefinite retention,
+    /// read-committed) so framework-internal descriptors need not carry one.
     fn collection_def(&self) -> CollectionDef {
         CollectionDef::new(None)
     }
@@ -161,13 +148,11 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
 ///
 /// # Invariant: unforgeability
 ///
-/// A live `Registered<D>` implies `D` was registered. The wrapped descriptor
-/// is private and the only mint is `new`, which is `pub(crate)` and
-/// called from exactly one place per consumer kind — the registration
-/// mechanism (`KeyedStateConfiguration::register` and the high-level
-/// `client.register`). Downstream crates can neither construct it nor read its
-/// field, so "use a descriptor you never registered" cannot be expressed: the
-/// only `Registered<D>` a handler can hold came from registering `D`.
+/// A live `Registered<D>` implies `D` was registered: the field is private
+/// and the only mint is the `pub(crate)` `new`, called solely from the
+/// registration mechanism (`KeyedStateConfiguration::register` and the
+/// high-level `client.register`). Downstream crates can neither construct nor
+/// unwrap it, so "use a descriptor you never registered" cannot be expressed.
 ///
 /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
 #[derive(Clone, Copy, Debug)]
@@ -327,12 +312,8 @@ impl<C, R> ValueDescriptor<C, R> {
         }
     }
 
-    /// Sets the collection's TTL (the per-write Cassandra `USING TTL`).
-    ///
-    /// A non-identity operational setting: it is excluded from
-    /// [`structural_identity`](DescriptorIdentity::structural_identity) and may
-    /// change between deploys. Validated (against the Cassandra ceiling and the
-    /// recovery delay) at registration, the fallible boundary.
+    /// Sets the collection's TTL (the per-write Cassandra `USING TTL`),
+    /// validated against the ceiling and the recovery delay at registration.
     #[must_use]
     pub fn ttl(mut self, ttl: CompactDuration) -> Self {
         self.def.ttl = Some(ttl);

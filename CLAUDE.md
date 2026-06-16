@@ -63,6 +63,19 @@ If you can't name the invariant, you don't yet understand the code well enough t
 - Never claim "found the issue" without rigorous proof
 - Evidence first (logs, tests, reproducible behavior) → hypothesis → test → verify
 
+**Documentation:**
+
+- Write doc comments for a reader unfamiliar with the codebase: help them
+  navigate the concept. Lead with what the reader needs — what the thing is,
+  how to use it, what guarantee it gives — not the internal mechanism.
+- Capture the key concepts and, whenever applicable, **state the invariant** —
+  but at the type or function that owns it, **once**. Don't restate the same
+  invariant across related items; reference the owning type instead.
+- Be concise. No walls of text, no verbosity, and no examples that don't earn
+  their place (a stub that only shows syntax, or a comment that restates the
+  prose above it, adds nothing). Bad or needless docs **hurt** readability —
+  prefer fewer, sharper words over more.
+
 **Style:**
 
 - Prefer `use` statements over fully qualified prefixes

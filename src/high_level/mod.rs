@@ -238,14 +238,10 @@ where
     /// Registers a keyed-state collection, returning the [`Registered`]
     /// capability handle a handler binds via `ctx.state(...)`.
     ///
-    /// Must be called while the consumer is `Configured` (before
-    /// [`subscribe`](Self::subscribe)). Registrations freeze into the running
-    /// consumer's immutable registry at subscribe; the access-time
-    /// `verify_state_registration` check is the universal backstop for any
-    /// name that slips past the type system. `subscribe`/`unsubscribe` stay
-    /// `&self`, so the bidirectional cycle is preserved and a re-subscribe
-    /// rebuilds the registry from the same registrations — handler tokens
-    /// stay valid without re-registering.
+    /// Call this while the consumer is `Configured`, before
+    /// [`subscribe`](Self::subscribe) freezes the registrations into the
+    /// running consumer. Tokens survive the `unsubscribe`/re-subscribe cycle,
+    /// so a re-subscribe needs no re-registration.
     ///
     /// # Errors
     ///

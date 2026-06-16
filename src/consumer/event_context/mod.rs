@@ -216,28 +216,19 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// own `+ CellAccess<K>` here — a bounded, compiler-checked extension.
     type State: StateSession<Loader: MessageLoader<Payload = Self::Payload>> + CellAccess<ValueKind>;
 
-    /// Binds a **registered** keyed-state descriptor to this context's
-    /// session, returning its typed handle.
+    /// Binds a registered keyed-state collection, returning its typed handle.
     ///
-    /// Takes a [`Registered<DESC>`] capability handle, not a raw descriptor:
-    /// the only mint is the consumer's registration mechanism, so a handler
-    /// can bind only collections it actually registered. Using a descriptor
-    /// that was never registered is therefore a compile error, not a runtime
-    /// one. (The access-time
+    /// Takes a [`Registered<DESC>`] capability handle, not a raw descriptor, so
+    /// a handler can bind only collections it registered — binding an
+    /// unregistered one is a compile error, not a runtime one. (The access-time
     /// [`verify_state_registration`](crate::state::session::StateSession::verify_state_registration)
-    /// check remains the universal backstop for late or foreign-config names
-    /// that slip past the type system — e.g. through the erased FFI seam.)
+    /// check is the backstop for names that slip past the type system, e.g.
+    /// through the erased FFI seam.)
     ///
-    /// Works in any handler with a plain `C: EventContext` bound — message
-    /// and timer scopes alike. The handle owns a clone of the session
-    /// (sessions are cheap `Arc`-backed clones), so it is `Clone + Send +
-    /// Sync + 'static` and survives FFI boundaries. Repeated bindings of
-    /// the same collection in one handler share the per-event transaction.
-    ///
-    /// This method is required (no default) so every context — leaf and
-    /// wrapper alike — makes an explicit choice; a wrapper that forgot to
-    /// forward would fail to compile instead of silently degrading state
-    /// to unavailable.
+    /// Works in message and timer handlers alike. The returned handle owns a
+    /// cheap `Arc`-backed clone of the session, so it is `Send + Sync +
+    /// 'static`; repeated binds of one collection share the per-event
+    /// transaction.
     ///
     /// # Errors
     ///
@@ -253,12 +244,10 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     where
         DESC: StateDescriptor;
 
-    /// Return a boxed, type-erased event context.
+    /// Return a boxed, type-erased event context for the FFI seam.
     ///
-    /// The payload must map to a codec ([`ErasedStateCodec`]) because the
-    /// erased context exposes keyed-state value ops that recover the codec
-    /// from the payload; every FFI payload (`serde_json::Value`,
-    /// `BinaryPayload`) qualifies.
+    /// The payload must map to a codec ([`ErasedStateCodec`]) — the erased
+    /// state ops recover it from the payload — which every FFI payload does.
     fn boxed(self) -> BoxEventContext<Self::Payload>
     where
         Self::Payload: ErasedStateCodec,
@@ -728,13 +717,12 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     fn should_cancel(&self) -> bool;
 
     // Keyed-state ops — the FFI seam the bindings wrap. They reuse the *same*
-    // typed `state(...)` get/set path as the Rust API, with the codec recovered
-    // from the payload (value cells) or fixed by `KafkaRefCodec` (message
-    // refs). The blanket impl is bounded `Self::Payload: ErasedStateCodec`, so
-    // a `Box<dyn DynEventContext<Payload = P>>` exists only for the FFI
-    // payloads (`serde_json::Value`, `BinaryPayload`). Collection names are
-    // validated by the same `verify_state_registration` the typed bind uses;
-    // an unregistered or identity-mismatched name returns a Permanent error.
+    // typed `state(...)` path as the Rust API, recovering the codec from the
+    // payload via [`ErasedStateCodec`] (value cells) or `KafkaRefCodec`
+    // (message refs); the blanket impl's `Self::Payload: ErasedStateCodec`
+    // bound is what restricts a boxed context to the FFI payloads. See
+    // [`ErasedStateCodec`] for the recovered-codec-matches-registration
+    // invariant; each op's `# Errors` notes the per-call failures.
 
     /// Reads the named value collection's cell, decoded with the recovered
     /// consumer codec.
