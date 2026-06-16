@@ -11,7 +11,7 @@ use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::otel::SpanRelation;
-use crate::state::descriptor::StateDescriptor;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::session::UnavailableState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
@@ -97,11 +97,14 @@ impl EventContext for KeyedMockContext {
     type Payload = serde_json::Value;
     type State = UnavailableState<serde_json::Value>;
 
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
         DESC: StateDescriptor,
     {
-        descriptor.bind(&UnavailableState::new())
+        registered.descriptor().bind(&UnavailableState::new())
     }
 
     fn should_cancel(&self) -> bool {

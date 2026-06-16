@@ -2,7 +2,7 @@
 
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::StateName;
-use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
+use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::timers::duration::CompactDuration;
 use crate::util::from_env_with_fallback;
 use derive_builder::Builder;
@@ -20,19 +20,18 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 ///
 /// The layer is always present; with no registered descriptors it is inert
 /// (no durable identity I/O, no cell writes). Register collections with
-/// [`Self::state`]:
+/// [`Self::register`], which returns the [`Registered`] capability handle a
+/// handler binds via `ctx.state(...)`:
 ///
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use prosody::consumer::KeyedStateConfiguration;
 /// use prosody::state::descriptor::{ValueDescriptor, value_state};
-/// use prosody::state::registry::CollectionDef;
 ///
 /// let cart: ValueDescriptor = value_state("cart");
 ///
-/// let keyed_state = KeyedStateConfiguration::builder()
-///     .build()?
-///     .state(&cart, CollectionDef::new(None));
+/// let mut keyed_state = KeyedStateConfiguration::builder().build()?;
+/// let registered_cart = keyed_state.register(cart);
 /// # Ok(())
 /// # }
 /// ```
@@ -94,18 +93,26 @@ impl KeyedStateConfiguration {
         KeyedStateConfigurationBuilder::default()
     }
 
-    /// Registers `descriptor`'s collection with operational settings `def`.
+    /// Registers `descriptor`'s collection, returning the [`Registered`]
+    /// capability handle [`EventContext::state`] requires.
     ///
-    /// Name validation, TTL-ceiling rejection, and identity-conflict
-    /// rejection all run at consumer build, the fallible boundary.
-    #[must_use]
-    pub fn state<DESC>(mut self, descriptor: &DESC, def: CollectionDef) -> Self
+    /// The descriptor carries its own operational settings (TTL, commit mode)
+    /// fluently — `value_state("cart").ttl(d).read_uncommitted()` — recorded
+    /// here via [`StateDescriptor::collection_def`]. Name validation,
+    /// TTL-ceiling rejection, and identity-conflict rejection all run at
+    /// consumer build, the fallible boundary.
+    ///
+    /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
+    pub fn register<D>(&mut self, descriptor: D) -> Registered<D>
     where
-        DESC: DescriptorIdentity,
+        D: StateDescriptor,
     {
-        self.registrations
-            .push((descriptor.name(), descriptor.structural_identity(), def));
-        self
+        self.registrations.push((
+            descriptor.name(),
+            descriptor.structural_identity(),
+            descriptor.collection_def(),
+        ));
+        Registered::new(descriptor)
     }
 
     /// Returns whether any collections are registered.
@@ -141,7 +148,7 @@ impl KeyedStateConfiguration {
                     recovery_seconds: self.recovery_delay.seconds(),
                 });
             }
-            registry.register_identity(name, identity.clone(), def.clone())?;
+            registry.register_identity(name, identity.clone(), *def)?;
         }
         Ok(registry)
     }
@@ -165,7 +172,7 @@ mod tests {
     use super::KeyedStateConfiguration;
     use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
     use crate::state::descriptor::{ValueDescriptor, value_state};
-    use crate::state::registry::{CollectionDef, RegisterStateError};
+    use crate::state::registry::RegisterStateError;
     use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::Result;
     use std::path::PathBuf;
@@ -195,9 +202,8 @@ mod tests {
     /// guards only oversized `Some` values, never the opt-out.
     #[test]
     fn collection_ttl_none_is_allowed() -> Result<()> {
-        let config = KeyedStateConfiguration::builder()
-            .build()?
-            .state(&cart(), CollectionDef::new(None));
+        let mut config = KeyedStateConfiguration::builder().build()?;
+        let _ = config.register(cart());
         assert!(config.build_registry().is_ok());
         Ok(())
     }
@@ -205,9 +211,8 @@ mod tests {
     #[test]
     fn collection_ttl_at_the_ceiling_is_allowed() -> Result<()> {
         let ttl = CompactDuration::new(CEILING_SECS);
-        let config = KeyedStateConfiguration::builder()
-            .build()?
-            .state(&cart(), CollectionDef::new(Some(ttl)));
+        let mut config = KeyedStateConfiguration::builder().build()?;
+        let _ = config.register(cart().ttl(ttl));
         assert!(config.build_registry().is_ok());
         Ok(())
     }
@@ -215,10 +220,8 @@ mod tests {
     #[test]
     fn collection_ttl_over_the_ceiling_is_rejected() -> Result<()> {
         let over = CEILING_SECS + 1;
-        let config = KeyedStateConfiguration::builder().build()?.state(
-            &cart(),
-            CollectionDef::new(Some(CompactDuration::new(over))),
-        );
+        let mut config = KeyedStateConfiguration::builder().build()?;
+        let _ = config.register(cart().ttl(CompactDuration::new(over)));
         assert!(matches!(
             config.build_registry(),
             Err(RegisterStateError::Ttl { seconds, .. }) if seconds == over
@@ -231,10 +234,10 @@ mod tests {
     #[test]
     fn collection_ttl_at_the_recovery_delay_is_rejected() -> Result<()> {
         let delay = CompactDuration::new(60);
-        let config = KeyedStateConfiguration::builder()
+        let mut config = KeyedStateConfiguration::builder()
             .recovery_delay(delay)
-            .build()?
-            .state(&cart(), CollectionDef::new(Some(delay)));
+            .build()?;
+        let _ = config.register(cart().ttl(delay));
         assert!(matches!(
             config.build_registry(),
             Err(RegisterStateError::TtlBelowRecoveryDelay {
@@ -249,10 +252,10 @@ mod tests {
     /// A TTL one second below the recovery delay is rejected.
     #[test]
     fn collection_ttl_below_the_recovery_delay_is_rejected() -> Result<()> {
-        let config = KeyedStateConfiguration::builder()
+        let mut config = KeyedStateConfiguration::builder()
             .recovery_delay(CompactDuration::new(60))
-            .build()?
-            .state(&cart(), CollectionDef::new(Some(CompactDuration::new(59))));
+            .build()?;
+        let _ = config.register(cart().ttl(CompactDuration::new(59)));
         assert!(matches!(
             config.build_registry(),
             Err(RegisterStateError::TtlBelowRecoveryDelay { .. })
@@ -263,10 +266,10 @@ mod tests {
     /// A TTL one second above the recovery delay clears the floor.
     #[test]
     fn collection_ttl_above_the_recovery_delay_is_allowed() -> Result<()> {
-        let config = KeyedStateConfiguration::builder()
+        let mut config = KeyedStateConfiguration::builder()
             .recovery_delay(CompactDuration::new(60))
-            .build()?
-            .state(&cart(), CollectionDef::new(Some(CompactDuration::new(61))));
+            .build()?;
+        let _ = config.register(cart().ttl(CompactDuration::new(61)));
         assert!(config.build_registry().is_ok());
         Ok(())
     }

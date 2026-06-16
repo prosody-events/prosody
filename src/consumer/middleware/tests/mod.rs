@@ -526,10 +526,10 @@ mod rollback_safety {
     use crate::loader::MemoryLoader;
     use crate::state::cell::Cell;
     use crate::state::descriptor::tests::{TestSession, test_session_parts};
-    use crate::state::descriptor::{ValueDescriptor, value_state};
+    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::LifecycleAccess;
+    use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::FinalizeOutcome;
     use crate::state::store::CellStore;
     use crate::state::value::ValueKind;
@@ -589,11 +589,11 @@ mod rollback_safety {
         };
 
         // Write a value and finalize → one provisional cell staged durably.
-        let handle = context.state(cart()).map_err(|e| eyre!("bind cart: {e}"))?;
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind cart: {e}"))?;
         handle.set(json!({ "x": 1_i32 })).await?;
-        let lifecycle = context
-            .state(LifecycleAccess)
-            .map_err(|e| eyre!("lifecycle: {e}"))?;
+        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
         let outcome = lifecycle
             .finalize()
             .await
@@ -713,9 +713,9 @@ mod backstop_amortization {
     use crate::loader::MemoryLoader;
     use crate::state::StateKey;
     use crate::state::descriptor::tests::test_session_with_armed;
-    use crate::state::descriptor::{ValueDescriptor, value_state};
+    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::{ArmedKeys, LifecycleAccess};
+    use crate::state::session::{ArmedKeys, LifecycleAccessExt};
     use color_eyre::eyre::{Result, eyre};
     use serde_json::json;
     use uuid::Uuid;
@@ -750,11 +750,11 @@ mod backstop_amortization {
                 .with_timer_tracking();
 
             // Stage a cell so arming is warranted.
-            let handle = context.state(cart()).map_err(|e| eyre!("bind: {e}"))?;
+            let handle = context
+                .state(Registered::new(cart()))
+                .map_err(|e| eyre!("bind: {e}"))?;
             handle.set(json!({ "i": i as i32 })).await?;
-            let lifecycle = context
-                .state(LifecycleAccess)
-                .map_err(|e| eyre!("lifecycle: {e}"))?;
+            let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
             lifecycle
                 .finalize()
                 .await
@@ -791,11 +791,11 @@ mod backstop_amortization {
             let context = MockEventContext::new()
                 .with_session(session)
                 .with_timer_tracking();
-            let handle = context.state(cart()).map_err(|e| eyre!("bind: {e}"))?;
+            let handle = context
+                .state(Registered::new(cart()))
+                .map_err(|e| eyre!("bind: {e}"))?;
             handle.set(json!({ "x": 1_i32 })).await?;
-            let lifecycle = context
-                .state(LifecycleAccess)
-                .map_err(|e| eyre!("lifecycle: {e}"))?;
+            let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
             lifecycle
                 .finalize()
                 .await

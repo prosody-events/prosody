@@ -14,7 +14,7 @@ use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, Sche
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{
-    ConsumerConfigurationBuilder, ConsumerError, KeyedStateConfiguration, KeyedStateInitError,
+    ConsumerConfigurationBuilder, ConsumerError, KeyedStateConfiguration,
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use crate::high_level::config::{
@@ -27,6 +27,7 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
 use crate::{Codec, JsonCodec, Topic};
@@ -66,6 +67,9 @@ pub struct ConsumerBuilders {
     pub dedup: DeduplicationConfigurationBuilder,
     /// Timeout middleware configuration builder.
     pub timeout: TimeoutConfigurationBuilder,
+    /// Keyed-state configuration (always-on; carries collection
+    /// registrations). Mode-independent — every mode threads it through.
+    pub keyed_state: KeyedStateConfiguration,
     /// Telemetry emitter configuration.
     pub emitter: TelemetryEmitterConfiguration,
 }
@@ -191,6 +195,7 @@ where
             dedup_builder: &consumer_builders.dedup,
             timeout_builder: &consumer_builders.timeout,
             cassandra_builder,
+            keyed_state: &consumer_builders.keyed_state,
         });
 
         // Check for topic existence only if not in mock mode
@@ -228,6 +233,41 @@ where
     ) -> Result<(), HighLevelClientError<C::Error>> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
+    }
+
+    /// Registers a keyed-state collection, returning the [`Registered`]
+    /// capability handle a handler binds via `ctx.state(...)`.
+    ///
+    /// Must be called while the consumer is `Configured` (before
+    /// [`subscribe`](Self::subscribe)). Registrations freeze into the running
+    /// consumer's immutable registry at subscribe; the access-time
+    /// `verify_state_registration` check is the universal backstop for any
+    /// name that slips past the type system. `subscribe`/`unsubscribe` stay
+    /// `&self`, so the bidirectional cycle is preserved and a re-subscribe
+    /// rebuilds the registry from the same registrations — handler tokens
+    /// stay valid without re-registering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HighLevelClientError::AlreadySubscribed`] when the consumer
+    /// is already running (registrations are frozen), or
+    /// [`HighLevelClientError::UnconfiguredConsumer`] when there is no valid
+    /// consumer configuration to register against.
+    pub async fn register<D>(
+        &self,
+        descriptor: D,
+    ) -> Result<Registered<D>, HighLevelClientError<C::Error>>
+    where
+        D: StateDescriptor,
+    {
+        let mut guard = self.consumer.lock().await;
+        match &mut *guard {
+            ConsumerState::Configured(config) => Ok(config.register(descriptor)),
+            ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
+            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
+                Err(HighLevelClientError::UnconfiguredConsumer)
+            }
+        }
     }
 
     /// Subscribes the consumer with the provided handler.
@@ -270,6 +310,7 @@ where
                 monopolization,
                 defer,
                 common,
+                keyed_state,
                 trigger_store,
             } => {
                 ProsodyConsumer::<C>::pipeline_consumer(
@@ -279,12 +320,13 @@ where
                         retry: retry.clone(),
                         monopolization: monopolization.clone(),
                         defer: defer.clone(),
-                        // The high-level (FFI-facing) API does not expose
-                        // keyed-state registrations yet; the always-on layer
-                        // stays inert with an environment-loaded config.
-                        keyed_state: KeyedStateConfiguration::builder().build().map_err(
-                            |error| ConsumerError::from(KeyedStateInitError::Configuration(error)),
-                        )?,
+                        // Clone (never drain) the registered config: the intact
+                        // `ModeConfiguration` is retained in `Running` and moved
+                        // back to `Configured` on `unsubscribe`, so a
+                        // re-subscribe rebuilds the registry from the same
+                        // registrations and existing `Registered<_>` tokens stay
+                        // valid.
+                        keyed_state: keyed_state.clone(),
                     },
                     common,
                     self.telemetry.clone(),
@@ -297,8 +339,8 @@ where
                 retry,
                 failure_topic,
                 common,
+                keyed_state,
                 trigger_store,
-                ..
             } => {
                 ProsodyConsumer::low_latency_consumer(
                     consumer,
@@ -306,6 +348,7 @@ where
                     LowLatencyMiddlewareConfiguration {
                         retry: retry.clone(),
                         failure_topic: failure_topic.clone(),
+                        keyed_state: keyed_state.clone(),
                     },
                     common,
                     self.producer.clone(),
@@ -317,13 +360,14 @@ where
             ModeConfiguration::BestEffort {
                 consumer,
                 common,
+                keyed_state,
                 trigger_store,
-                ..
             } => {
                 ProsodyConsumer::<C>::best_effort_consumer(
                     consumer,
                     trigger_store,
                     common,
+                    keyed_state.clone(),
                     self.telemetry.clone(),
                     handler.clone(),
                 )

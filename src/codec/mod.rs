@@ -70,5 +70,40 @@ pub trait Codec: Default + Send + Sync + 'static {
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R;
 }
 
+/// Maps a consumer payload type to the [`Codec`] that (de)serializes its
+/// keyed-state cells, for the type-erased FFI seam.
+///
+/// Keyed state uses the consumer's codec, so a value cell's payload type *is*
+/// the message payload type. The erased `DynEventContext` value ops carry no
+/// codec type parameter, so they recover the codec from the payload through
+/// this map and feed it to `value_state::<C>(name)`.
+///
+/// # Invariant: recovered codec matches the registration
+///
+/// The recovered codec's [`Codec::CODEC_ID`] rides the bound collection's
+/// `structural_identity()`, which `verify_state_registration` checks at
+/// access. Every reachable erased-seam user is FFI — `JsonCodec` (host
+/// objects) or [`JsonBinaryCodec`] (raw bytes) — so the recovered codec is
+/// *exact*. A consumer whose real codec differs (only reachable through the
+/// Rust-native typed path, which never uses the erased seam) self-rejects with
+/// a Permanent identity mismatch rather than misreading a cell. This map is
+/// the inference; `verify_state_registration` is the enforcement.
+///
+/// The trait is core-local. Both known FFI payloads implement it here; a
+/// future binding with a custom payload implements it for its own local type
+/// (orphan-safe in either direction).
+pub trait ErasedStateCodec: Send + Sync + 'static {
+    /// The codec whose [`Codec::Payload`] is `Self`.
+    type Codec: Codec<Payload = Self>;
+}
+
+impl ErasedStateCodec for serde_json::Value {
+    type Codec = JsonCodec;
+}
+
+impl ErasedStateCodec for BinaryPayload {
+    type Codec = JsonBinaryCodec;
+}
+
 #[cfg(test)]
 mod tests;

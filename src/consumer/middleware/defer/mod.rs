@@ -28,7 +28,7 @@
 //! Message and timer defer middlewares compose independently via `.layer()`.
 
 use crate::consumer::event_context::EventContext;
-use crate::state::session::LifecycleAccess;
+use crate::state::session::LifecycleAccessExt;
 use crate::timers::duration::CompactDuration;
 use rand::RngExt;
 use std::cmp::min;
@@ -104,7 +104,7 @@ pub(crate) fn reset_state_session<C>(context: &C)
 where
     C: EventContext,
 {
-    if let Ok(lifecycle) = context.state(LifecycleAccess) {
+    if let Ok(lifecycle) = context.lifecycle() {
         lifecycle.reset();
     }
 }

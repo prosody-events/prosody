@@ -50,7 +50,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
-use crate::state::session::LifecycleAccess;
+use crate::state::session::LifecycleAccessExt;
 use crate::timers::Trigger;
 use crate::{EventIdentity, Partition, Topic};
 
@@ -336,7 +336,7 @@ where
             Ok(_) => true,
             Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
         };
-        if register && let Ok(lifecycle) = context.state(LifecycleAccess) {
+        if register && let Ok(lifecycle) = context.lifecycle() {
             lifecycle.register_marker(id);
         }
 

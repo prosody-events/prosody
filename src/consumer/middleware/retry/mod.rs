@@ -141,7 +141,7 @@ use crate::consumer::middleware::{
     RollbackSafety, abandon, settle,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
-use crate::state::session::LifecycleAccess;
+use crate::state::session::LifecycleAccessExt;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Offset, Partition, Topic};
@@ -451,7 +451,7 @@ impl<T> RetryHandler<T> {
                     // into the next attempt's transaction — and so its
                     // registered dedup marker is discarded rather than
                     // flushed by `settle` after a later attempt succeeds.
-                    if let Ok(lifecycle) = context.state(LifecycleAccess) {
+                    if let Ok(lifecycle) = context.lifecycle() {
                         lifecycle.reset();
                     }
                 }

@@ -9,7 +9,7 @@ use crate::Key;
 use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::event_context::StateAccessError;
-use crate::state::descriptor::StateDescriptor;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::session::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
@@ -212,11 +212,14 @@ impl EventContext for KeyedCapturingContext {
     type Payload = serde_json::Value;
     type State = UnavailableState<serde_json::Value>;
 
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
         DESC: StateDescriptor,
     {
-        descriptor.bind(&UnavailableState::new())
+        registered.descriptor().bind(&UnavailableState::new())
     }
 
     fn should_cancel(&self) -> bool {

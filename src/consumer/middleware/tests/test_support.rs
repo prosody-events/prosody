@@ -17,7 +17,7 @@ use crate::consumer::event_context::{EventContext, StateAccessError, Termination
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
-use crate::state::descriptor::StateDescriptor;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::session::{CellAccess, StateSession, UnavailableState};
 use crate::state::value::ValueKind;
 use crate::timers::TimerType;
@@ -280,11 +280,11 @@ where
     type Payload = P;
     type State = S;
 
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<S>, StateAccessError>
+    fn state<DESC>(&self, registered: Registered<DESC>) -> Result<DESC::Handle<S>, StateAccessError>
     where
         DESC: StateDescriptor,
     {
-        descriptor.bind(&self.session)
+        registered.descriptor().bind(&self.session)
     }
 
     fn should_cancel(&self) -> bool {

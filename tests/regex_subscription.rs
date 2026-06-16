@@ -129,6 +129,7 @@ fn create_high_level_client(
             enabled: false,
             ..Default::default()
         },
+        ..Default::default()
     };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);

@@ -53,11 +53,13 @@
 //!    scope and staged set plus the registered marker.
 
 use crate::Key;
-use crate::consumer::event_context::StateAccessError;
+use crate::consumer::event_context::{EventContext, StateAccessError};
 use crate::consumer::partition::ShutdownPhase;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
-use crate::state::descriptor::{CellKind, DescriptorIdentity, StateDescriptor, StructuralIdentity};
+use crate::state::descriptor::{
+    CellKind, DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
+};
 use crate::state::identity::{CollectionId, CollectionKind, CollectionRef};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::PartitionStateStore;
@@ -822,6 +824,28 @@ where
         self.session.mark_backstop_armed().await;
     }
 }
+
+/// Crate-private extension giving every [`EventContext`] one-call access to
+/// its session's staged lifecycle through the public [`EventContext::state`]
+/// method.
+///
+/// It hides the one [`Registered::new`] outside the registration mechanism:
+/// the framework-only [`LifecycleAccess`] descriptor binds unconditionally
+/// (registration-independent), so minting its capability handle here is sound
+/// and keeps every other `Registered` strictly registration-derived.
+pub(crate) trait LifecycleAccessExt: EventContext {
+    /// Binds the session's lifecycle view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError`] only when the context is terminated;
+    /// [`LifecycleAccess`] is otherwise registration-independent.
+    fn lifecycle(&self) -> Result<LifecycleView<Self::State>, StateAccessError> {
+        self.state(Registered::new(LifecycleAccess))
+    }
+}
+
+impl<C: EventContext> LifecycleAccessExt for C {}
 
 /// Test-only stateless [`StateSession`]: every state op reports
 /// [`StateAccessError::Unavailable`] and the lifecycle is inert.

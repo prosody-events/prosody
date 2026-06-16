@@ -723,6 +723,9 @@ pub struct LowLatencyMiddlewareConfiguration {
     pub retry: RetryConfiguration,
     /// Failure topic configuration for routing unrecoverable messages.
     pub failure_topic: FailureTopicConfiguration,
+    /// Keyed-state configuration (always-on; inert when no collections are
+    /// registered).
+    pub keyed_state: KeyedStateConfiguration,
 }
 
 /// High-level Kafka consumer implementation.
@@ -977,30 +980,6 @@ async fn build_shared_state(
     let keyed_state =
         KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
     Ok((stores, keyed_state, heartbeats))
-}
-
-/// Builds the shared state for the failure-strategy constructors
-/// ([`ProsodyConsumer::low_latency_consumer`] and
-/// [`ProsodyConsumer::best_effort_consumer`]).
-///
-/// These modes expose no keyed-state registrations and load their state config
-/// from the environment, so the always-on state layer stays inert. Delegates to
-/// [`build_shared_state`] with an env-default [`KeyedStateConfiguration`].
-async fn build_inert_shared_state(
-    consumer_config: &ConsumerConfiguration,
-    trigger_store_config: &TriggerStoreConfiguration,
-    common_config: &CommonMiddlewareConfiguration,
-) -> Result<(StorePair, KeyedStateInputs, HeartbeatRegistry), ConsumerError> {
-    let keyed_state_config = KeyedStateConfiguration::builder()
-        .build()
-        .map_err(KeyedStateInitError::Configuration)?;
-    build_shared_state(
-        consumer_config,
-        trigger_store_config,
-        common_config,
-        keyed_state_config,
-    )
-    .await
 }
 
 /// Builds the storage pair, keyed-state inputs, and shared middleware stack
@@ -1478,14 +1457,19 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats) =
-            build_inert_shared_state(consumer_config, trigger_store_config, common_config).await?;
-        let version = keyed_state.version.clone();
-
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
             failure_topic: topic_config,
+            keyed_state: keyed_state_config,
         } = low_latency_config;
+        let (stores, keyed_state, heartbeats) = build_shared_state(
+            consumer_config,
+            trigger_store_config,
+            common_config,
+            keyed_state_config,
+        )
+        .await?;
+        let version = keyed_state.version.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware =
             FailureTopicMiddleware::new(topic_config, consumer_config.group_id.clone(), producer)?;
@@ -1574,6 +1558,7 @@ where
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,
+        keyed_state_config: KeyedStateConfiguration,
         telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
@@ -1581,8 +1566,13 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats) =
-            build_inert_shared_state(consumer_config, trigger_store_config, common_config).await?;
+        let (stores, keyed_state, heartbeats) = build_shared_state(
+            consumer_config,
+            trigger_store_config,
+            common_config,
+            keyed_state_config,
+        )
+        .await?;
         let version = keyed_state.version.clone();
 
         // dedup lives inside the common block; `log` (which swallows failures)

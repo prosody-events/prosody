@@ -27,8 +27,7 @@ use prosody::consumer::{
 };
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::state::descriptor::{ValueDescriptor, ValueStateError, value_state};
-use prosody::state::registry::CollectionDef;
+use prosody::state::descriptor::{Registered, ValueDescriptor, ValueStateError, value_state};
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::CompactDateTime;
 use prosody::timers::duration::CompactDuration;
@@ -81,6 +80,11 @@ enum Observation {
 #[derive(Clone)]
 struct CartHandler {
     observations_tx: Sender<Observation>,
+    /// The registration handle for the `cart` value collection — the handler
+    /// can bind only collections it was handed a token for.
+    cart: Registered<ValueDescriptor>,
+    /// The registration handle for the `last_seen` Kafka-message collection.
+    last_seen: Registered<KafkaMessageDescriptor>,
 }
 
 impl CartHandler {
@@ -94,7 +98,7 @@ impl CartHandler {
     {
         // Read-modify-write on the value cell: each message appends its
         // item to the array committed by the previous event.
-        let cart = ctx.state(cart())?;
+        let cart = ctx.state(self.cart)?;
         let mut items = match cart.get().await? {
             Some(Value::Array(items)) => items,
             Some(other) => return Err(CartHandlerError::UnexpectedCell(other)),
@@ -111,7 +115,7 @@ impl CartHandler {
         let updated = Value::Array(items);
         cart.set(updated.clone()).await?;
 
-        ctx.state(last_seen())?.set(&message).await?;
+        ctx.state(self.last_seen)?.set(&message).await?;
 
         // The final message completes the cart; schedule the timer that
         // reads the accumulated state back. Per-key serialization
@@ -136,11 +140,11 @@ impl CartHandler {
     where
         C: EventContext<Payload = Value>,
     {
-        let cart = ctx.state(cart())?.get().await?;
+        let cart = ctx.state(self.cart)?.get().await?;
         // Re-fetches the original message body from Kafka through the
         // consumer's loader, decoded by the consumer's own codec.
         let last_seen = ctx
-            .state(last_seen())?
+            .state(self.last_seen)?
             .get()
             .await?
             .map(|message| (message.offset(), message.payload().clone()));
@@ -280,7 +284,17 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
         .build()?;
 
     let (observations_tx, mut observations_rx) = channel(10);
-    let handler = CartHandler { observations_tx };
+
+    // Register the collections; the returned tokens are the only way the
+    // handler can bind them.
+    let mut keyed_state = KeyedStateConfiguration::default();
+    let cart = keyed_state.register(cart());
+    let last_seen = keyed_state.register(last_seen());
+    let handler = CartHandler {
+        observations_tx,
+        cart,
+        last_seen,
+    };
 
     let telemetry = Telemetry::new();
     let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, telemetry.sender())?;
@@ -289,9 +303,7 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
         retry: RetryConfigurationBuilder::default().build()?,
         monopolization: MonopolizationConfigurationBuilder::default().build()?,
         defer: DeferConfigurationBuilder::default().build()?,
-        keyed_state: KeyedStateConfiguration::default()
-            .state(&cart(), CollectionDef::new(None))
-            .state(&last_seen(), CollectionDef::new(None)),
+        keyed_state,
     };
 
     let common_config = CommonMiddlewareConfiguration {

@@ -20,7 +20,7 @@ use crate::consumer::Keyed;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::StateDescriptor;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -126,11 +126,14 @@ where
     // wrapper without `state` does not build.
     type State = C::State;
 
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
         DESC: StateDescriptor,
     {
-        self.inner.state(descriptor)
+        self.inner.state(registered)
     }
 
     fn should_cancel(&self) -> bool {

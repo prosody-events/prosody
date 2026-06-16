@@ -35,9 +35,10 @@ use crate::consumer::middleware::topic::{
 };
 use crate::consumer::{
     CommonMiddlewareConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
-    ConsumerConfigurationBuilderError,
+    ConsumerConfigurationBuilderError, KeyedStateConfiguration,
 };
 use crate::high_level::mode::Mode;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use thiserror::Error;
 
 /// Parameters for building a mode configuration.
@@ -62,6 +63,8 @@ pub(crate) struct ModeConfigurationBuildParams<'a> {
     pub timeout_builder: &'a TimeoutConfigurationBuilder,
     /// Builder for the Cassandra configuration.
     pub cassandra_builder: &'a CassandraConfigurationBuilder,
+    /// The keyed-state configuration (mode-independent; carries registrations).
+    pub keyed_state: &'a KeyedStateConfiguration,
 }
 
 /// Configuration for timer storage backends.
@@ -88,6 +91,8 @@ pub enum ModeConfiguration {
         defer: DeferConfiguration,
         /// Common middleware configuration (scheduler, timeout, dedup).
         common: CommonMiddlewareConfiguration,
+        /// Keyed-state configuration (mode-independent; carries registrations).
+        keyed_state: KeyedStateConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -101,6 +106,8 @@ pub enum ModeConfiguration {
         failure_topic: FailureTopicConfiguration,
         /// Common middleware configuration (scheduler, timeout, dedup).
         common: CommonMiddlewareConfiguration,
+        /// Keyed-state configuration (mode-independent; carries registrations).
+        keyed_state: KeyedStateConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -110,6 +117,8 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// Common middleware configuration (scheduler, timeout, dedup).
         common: CommonMiddlewareConfiguration,
+        /// Keyed-state configuration (mode-independent; carries registrations).
+        keyed_state: KeyedStateConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -157,6 +166,8 @@ impl ModeConfiguration {
             TriggerStoreConfiguration::Cassandra(cassandra_config)
         };
 
+        let keyed_state = params.keyed_state.clone();
+
         Ok(match params.mode {
             Mode::Pipeline => {
                 let monopolization = params.monopolization_builder.build()?;
@@ -167,6 +178,7 @@ impl ModeConfiguration {
                     monopolization,
                     defer,
                     common,
+                    keyed_state,
                     trigger_store,
                 }
             }
@@ -177,12 +189,14 @@ impl ModeConfiguration {
                     retry,
                     failure_topic,
                     common,
+                    keyed_state,
                     trigger_store,
                 }
             }
             Mode::BestEffort => Self::BestEffort {
                 consumer,
                 common,
+                keyed_state,
                 trigger_store,
             },
         })
@@ -237,6 +251,23 @@ impl ModeConfiguration {
             Self::Pipeline { consumer, .. }
             | Self::LowLatency { consumer, .. }
             | Self::BestEffort { consumer, .. } => consumer,
+        }
+    }
+
+    /// Registers `descriptor`'s collection with this configuration, returning
+    /// the [`Registered`] capability handle.
+    ///
+    /// Forwarded by `HighLevelClient::register` while the consumer is
+    /// `Configured`; the moved configuration is rebuilt into the running
+    /// consumer's registry on `subscribe`.
+    pub(crate) fn register<D>(&mut self, descriptor: D) -> Registered<D>
+    where
+        D: StateDescriptor,
+    {
+        match self {
+            Self::Pipeline { keyed_state, .. }
+            | Self::LowLatency { keyed_state, .. }
+            | Self::BestEffort { keyed_state, .. } => keyed_state.register(descriptor),
         }
     }
 }

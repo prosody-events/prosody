@@ -165,7 +165,7 @@ use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{DemandType, EventHandler, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome};
-use crate::state::session::{LifecycleAccess, LifecycleView};
+use crate::state::session::{LifecycleAccessExt, LifecycleView};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
@@ -932,7 +932,7 @@ pub(crate) async fn settle<T, C, G>(
     // Reach the event's sealed lifecycle. Every live context carries one —
     // `LifecycleAccess` binds unconditionally — so `None` means only an
     // invalidated context, which cannot seal anyway.
-    let lifecycle = context.state(LifecycleAccess).ok();
+    let lifecycle = context.lifecycle().ok();
 
     match result.as_ref().err().map(ClassifyError::classify_error) {
         // Terminal: the marker aborts; the event redelivers and re-runs.
@@ -1145,9 +1145,7 @@ pub(crate) async fn abandon<T, C, G>(
     G: Uncommitted + Send,
 {
     guard.abort().await;
-    if let (RollbackSafety::BeforeMarkerFlush, Ok(lifecycle)) =
-        (safety, context.state(LifecycleAccess))
-    {
+    if let (RollbackSafety::BeforeMarkerFlush, Ok(lifecycle)) = (safety, context.lifecycle()) {
         // Best-effort: first-touch / the sweep recover anything left behind.
         // Resolves the shared session's recorded staged set (empty unless a
         // stage was recorded before the abandon point), so a fresh view is

@@ -27,7 +27,7 @@ use thiserror::Error;
 /// Core Invariant #6: "A collection has one `CommitMode` while a handler
 /// is running" — pinned here at registration time, not at event scope
 /// creation time.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CollectionDef {
     /// Per-collection TTL override.
     pub ttl: Option<CompactDuration>,

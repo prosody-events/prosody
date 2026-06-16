@@ -2,19 +2,21 @@
 //!
 //! Stores speak raw [`Bytes`](bytes::Bytes); this layer owns the typing. A
 //! descriptor is a plain `Copy` value — build it wherever it's needed (names
-//! are interned, so equal names produce interchangeable descriptors). Register
-//! it with the consumer, then bind it to *any*
-//! [`EventContext`](crate::consumer::event_context::EventContext) to obtain a
-//! typed, owned handle:
+//! are interned, so equal names produce interchangeable descriptors).
+//! *Registering* it with the consumer mints a [`Registered`] capability handle;
+//! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
+//! takes that handle (never a raw descriptor) and binds it to obtain a typed,
+//! owned handle — so a handler can only reach collections it registered:
 //!
 //! ```
 //! use prosody::state::descriptor::{ValueDescriptor, value_state};
+//! use std::time::Duration;
 //!
-//! // Binding it to an `EventContext` yields a typed, owned handle whose
-//! // `get`/`set` read and write the cell committed by the previous event
-//! // on the key. See the consumer middleware docs (`FallibleHandler`) for
-//! // the full read-modify-write handler.
-//! let cart: ValueDescriptor = value_state("cart");
+//! // A descriptor carries its operational settings fluently; registering it
+//! // (see `KeyedStateConfiguration::register`) yields a `Registered<_>` token
+//! // that `ctx.state(token)` binds into a typed handle whose `get`/`set` read
+//! // and write the cell committed by the previous event on the key.
+//! let cart: ValueDescriptor = value_state("cart").read_uncommitted();
 //! ```
 //!
 //! # Codec and resolver
@@ -47,9 +49,11 @@ use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CollectionKindId;
+use crate::state::registry::CollectionDef;
 use crate::state::session::{CellAccess, StateSession};
 use crate::state::value::ValueKind;
-use crate::state::{StateName, StoreOutcome};
+use crate::state::{CommitMode, StateName, StoreOutcome};
+use crate::timers::duration::CompactDuration;
 use internment::Intern;
 use std::error::Error;
 use std::fmt;
@@ -125,8 +129,9 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     /// Validates registration + structural identity and returns the typed
     /// handle.
     ///
-    /// Consumes the descriptor — descriptors are cheap `Copy` declarations,
-    /// so `ctx.state(DESC)` reads naturally at the call site.
+    /// Consumes the descriptor — descriptors are cheap `Copy` declarations.
+    /// Handlers never call this directly; they pass the [`Registered`] handle
+    /// to `ctx.state(...)`, which unwraps and binds it.
     ///
     /// # Errors
     ///
@@ -136,6 +141,54 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
+
+    /// The operational settings (TTL, commit mode) this descriptor carries
+    /// into registration.
+    ///
+    /// Defaults to [`CollectionDef::new`] with `None` — indefinite retention,
+    /// read-committed — so framework-internal descriptors need not carry one.
+    /// Descriptors with fluent settings (see [`ValueDescriptor::ttl`]) override
+    /// this to surface their embedded definition. Operational settings are not
+    /// part of [`DescriptorIdentity::structural_identity`]: they may change
+    /// between deploys; the identity may not.
+    fn collection_def(&self) -> CollectionDef {
+        CollectionDef::new(None)
+    }
+}
+
+/// Proof that a descriptor was registered with a consumer: the capability
+/// handle [`EventContext::state`] requires.
+///
+/// # Invariant: unforgeability
+///
+/// A live `Registered<D>` implies `D` was registered. The wrapped descriptor
+/// is private and the only mint is `new`, which is `pub(crate)` and
+/// called from exactly one place per consumer kind — the registration
+/// mechanism (`KeyedStateConfiguration::register` and the high-level
+/// `client.register`). Downstream crates can neither construct it nor read its
+/// field, so "use a descriptor you never registered" cannot be expressed: the
+/// only `Registered<D>` a handler can hold came from registering `D`.
+///
+/// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
+#[derive(Clone, Copy, Debug)]
+#[must_use]
+pub struct Registered<D>(D);
+
+impl<D> Registered<D>
+where
+    D: StateDescriptor,
+{
+    /// Mints the capability handle for a registered descriptor. The sole
+    /// constructor, and crate-private, so a live `Registered<D>` always
+    /// witnesses a registration.
+    pub(crate) fn new(descriptor: D) -> Self {
+        Self(descriptor)
+    }
+
+    /// Recovers the wrapped descriptor — an infallible move, not an unwrap.
+    pub(crate) fn descriptor(self) -> D {
+        self.0
+    }
 }
 
 /// Strategy that maps a decoded cell value into the value a handle exposes,
@@ -211,6 +264,7 @@ where
 /// annotate the binding `ValueDescriptor<CartCodec>`.
 pub struct ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> {
     name: &'static str,
+    def: CollectionDef,
     _marker: PhantomData<fn() -> (C, R)>,
 }
 
@@ -226,6 +280,7 @@ impl<C, R> fmt::Debug for ValueDescriptor<C, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValueDescriptor")
             .field("name", &self.name)
+            .field("def", &self.def)
             .finish()
     }
 }
@@ -267,8 +322,45 @@ impl<C, R> ValueDescriptor<C, R> {
     pub fn new(name: &str) -> Self {
         Self {
             name: intern_descriptor_str(name),
+            def: CollectionDef::new(None),
             _marker: PhantomData,
         }
+    }
+
+    /// Sets the collection's TTL (the per-write Cassandra `USING TTL`).
+    ///
+    /// A non-identity operational setting: it is excluded from
+    /// [`structural_identity`](DescriptorIdentity::structural_identity) and may
+    /// change between deploys. Validated (against the Cassandra ceiling and the
+    /// recovery delay) at registration, the fallible boundary.
+    #[must_use]
+    pub fn ttl(mut self, ttl: CompactDuration) -> Self {
+        self.def.ttl = Some(ttl);
+        self
+    }
+
+    /// Clears the collection's TTL, selecting indefinite retention (the
+    /// default).
+    #[must_use]
+    pub fn no_ttl(mut self) -> Self {
+        self.def.ttl = None;
+        self
+    }
+
+    /// Selects [`CommitMode::ReadCommitted`] (the default): writes stage
+    /// provisionally and promote after the event commit.
+    #[must_use]
+    pub fn read_committed(mut self) -> Self {
+        self.def.commit_mode = CommitMode::ReadCommitted;
+        self
+    }
+
+    /// Selects [`CommitMode::ReadUncommitted`]: writes apply to committed
+    /// state on handler success, with at-least-once semantics.
+    #[must_use]
+    pub fn read_uncommitted(mut self) -> Self {
+        self.def.commit_mode = CommitMode::ReadUncommitted;
+        self
     }
 }
 
@@ -302,6 +394,10 @@ where
         // so this compiles through the shared `StateDescriptor` trait.
         let name = session.verify_state_registration(self.name, &self.structural_identity())?;
         Ok(StateHandle::new(session.clone(), name))
+    }
+
+    fn collection_def(&self) -> CollectionDef {
+        self.def
     }
 }
 

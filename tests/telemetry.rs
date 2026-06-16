@@ -987,6 +987,7 @@ fn build_client(
             topic: telemetry_topic.to_owned(),
             enabled: emitter_enabled,
         },
+        ..Default::default()
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
@@ -1042,6 +1043,7 @@ fn build_typed_client_with_defer<T: FallibleHandler>(
             topic: telemetry_topic.to_owned(),
             enabled: true,
         },
+        ..Default::default()
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();

@@ -1,19 +1,27 @@
 use super::*;
-use crate::consumer::ConsumerConfiguration;
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::DeferConfigurationBuilder;
 use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfiguration;
 use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
+use crate::consumer::{ConsumerConfiguration, DemandType, KeyedStateConfiguration};
 use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
+use crate::state::descriptor::value_state;
 use crate::telemetry::Telemetry;
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
+use crate::test_util::TEST_RUNTIME;
+use crate::timers::Trigger;
 use color_eyre::Result;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
+use serde_json::Value;
+use std::convert::Infallible;
 /// Owns the helper-produced mock cluster alongside the producer so the
 /// cluster's Drop runs when the test ends (no `mem::forget` leaks).
 struct ProducerFixture {
@@ -214,6 +222,7 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Cli
         defer: DeferConfigurationBuilder::default(),
         dedup: DeduplicationConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
+        keyed_state: KeyedStateConfiguration::default(),
         emitter: TelemetryEmitterConfiguration::default(),
     };
     let cassandra_builder = CassandraConfigurationBuilder::default();
@@ -254,4 +263,149 @@ fn test_source_system_explicit_value_preserved() -> Result<()> {
     assert_eq!(fixture.client.source_system(), explicit_source);
     assert_ne!(fixture.client.source_system(), group_id);
     Ok(())
+}
+
+/// Minimal no-op handler so the lifecycle tests can drive `subscribe` /
+/// `unsubscribe` in mock mode. It never errors, so `Infallible` is its error.
+#[derive(Clone)]
+struct NoOpHandler;
+
+impl FallibleHandler for NoOpHandler {
+    type Error = Infallible;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _ctx: C,
+        _message: ConsumerMessage<Value>,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        _trigger: Trigger,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Owns the mock cluster alongside a handler-typed client so the cluster's
+/// Drop runs at end of test.
+struct HandlerClientFixture {
+    client: HighLevelClient<NoOpHandler>,
+    _cluster: MockCluster<'static, DefaultProducerContext>,
+}
+
+/// Builds a mock-mode pipeline client typed for [`NoOpHandler`], ready to
+/// `register` (Configured) and `subscribe`/`unsubscribe`.
+fn create_handler_client(group_id: &str) -> Result<HandlerClientFixture> {
+    let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
+    let bootstrap = cluster.bootstrap_servers();
+    cluster.create_topic("test-topic", 1, 1)?;
+
+    let mut producer_builder = ProducerConfiguration::builder();
+    producer_builder
+        .bootstrap_servers(vec![bootstrap.clone()])
+        .mock(true);
+
+    let mut consumer_builder = ConsumerConfiguration::builder();
+    consumer_builder
+        .bootstrap_servers(vec![bootstrap])
+        .group_id(group_id)
+        .subscribed_topics(&["test-topic".to_owned()])
+        .mock(true);
+
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_builder,
+        ..Default::default()
+    };
+    let cassandra_builder = CassandraConfigurationBuilder::default();
+
+    let client = HighLevelClient::new(
+        Mode::Pipeline,
+        &mut producer_builder,
+        &consumer_builders,
+        &cassandra_builder,
+    )?;
+    Ok(HandlerClientFixture {
+        client,
+        _cluster: cluster,
+    })
+}
+
+/// In the `Configured` state, `register` mints a capability handle.
+#[test]
+fn register_in_configured_state_binds() -> Result<()> {
+    let fixture = create_test_client("register-configured", None)?;
+    let registered =
+        TEST_RUNTIME.block_on(fixture.client.register(value_state::<JsonCodec>("cart")));
+    assert!(registered.is_ok(), "register must succeed while Configured");
+    Ok(())
+}
+
+/// After `subscribe`, the registry is frozen: `register` returns
+/// `AlreadySubscribed` rather than mutating a running consumer's collections.
+#[test]
+fn register_after_subscribe_is_rejected() -> Result<()> {
+    let fixture = create_handler_client("register-after-subscribe")?;
+    TEST_RUNTIME.block_on(async {
+        fixture.client.subscribe(NoOpHandler).await?;
+        let late = fixture
+            .client
+            .register(value_state::<JsonCodec>("late"))
+            .await;
+        // Shut the consumer down *before* asserting: a failed assertion must
+        // not leave rdkafka client threads alive and hang the test binary.
+        fixture.client.unsubscribe().await?;
+        assert!(
+            matches!(late, Err(HighLevelClientError::AlreadySubscribed)),
+            "register after subscribe must be AlreadySubscribed, got {late:?}"
+        );
+        Result::<()>::Ok(())
+    })
+}
+
+/// Registrations survive the re-subscribe cycle: `register → subscribe →
+/// unsubscribe → subscribe` works without re-registering (the config is
+/// cloned, never drained), and after `unsubscribe` more collections can be
+/// registered before re-subscribing.
+#[test]
+fn registrations_survive_resubscribe_cycle() -> Result<()> {
+    let fixture = create_handler_client("resubscribe-cycle")?;
+    TEST_RUNTIME.block_on(async {
+        // Register, then run the full bidirectional cycle without
+        // re-registering — a drained config would rebuild an empty registry,
+        // but the intact config is moved back to `Configured` on unsubscribe.
+        let _cart = fixture
+            .client
+            .register(value_state::<JsonCodec>("cart"))
+            .await?;
+        fixture.client.subscribe(NoOpHandler).await?;
+        fixture.client.unsubscribe().await?;
+        fixture.client.subscribe(NoOpHandler).await?;
+        fixture.client.unsubscribe().await?;
+
+        // After unsubscribe the client is `Configured` again: a fresh
+        // registration is accepted and a further subscribe succeeds.
+        let _wishlist = fixture
+            .client
+            .register(value_state::<JsonCodec>("wishlist"))
+            .await?;
+        fixture.client.subscribe(NoOpHandler).await?;
+        fixture.client.unsubscribe().await?;
+        Result::<()>::Ok(())
+    })
 }

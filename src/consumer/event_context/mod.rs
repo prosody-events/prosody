@@ -11,10 +11,13 @@
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
+use crate::codec::ErasedStateCodec;
+use crate::consumer::kafka_state::kafka_message_state;
+use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
-use crate::state::descriptor::{StateDescriptor, StructuralIdentity};
+use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity, value_state};
 use crate::state::session::{CellAccess, StateSession};
 use crate::state::value::ValueKind;
 use crate::timers::datetime::CompactDateTime;
@@ -213,8 +216,17 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// own `+ CellAccess<K>` here — a bounded, compiler-checked extension.
     type State: StateSession<Loader: MessageLoader<Payload = Self::Payload>> + CellAccess<ValueKind>;
 
-    /// Binds a keyed-state descriptor to this context's session, returning
-    /// its typed handle.
+    /// Binds a **registered** keyed-state descriptor to this context's
+    /// session, returning its typed handle.
+    ///
+    /// Takes a [`Registered<DESC>`] capability handle, not a raw descriptor:
+    /// the only mint is the consumer's registration mechanism, so a handler
+    /// can bind only collections it actually registered. Using a descriptor
+    /// that was never registered is therefore a compile error, not a runtime
+    /// one. (The access-time
+    /// [`verify_state_registration`](crate::state::session::StateSession::verify_state_registration)
+    /// check remains the universal backstop for late or foreign-config names
+    /// that slip past the type system — e.g. through the erased FFI seam.)
     ///
     /// Works in any handler with a plain `C: EventContext` bound — message
     /// and timer scopes alike. The handle owns a clone of the session
@@ -234,12 +246,23 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// registered with the consumer, or
     /// [`StateAccessError::IdentityMismatch`] when the registered identity
     /// differs from the descriptor's.
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
         DESC: StateDescriptor;
 
-    /// Return a boxed, type-erased event context
-    fn boxed(self) -> BoxEventContext<Self::Payload> {
+    /// Return a boxed, type-erased event context.
+    ///
+    /// The payload must map to a codec ([`ErasedStateCodec`]) because the
+    /// erased context exposes keyed-state value ops that recover the codec
+    /// from the payload; every FFI payload (`serde_json::Value`,
+    /// `BinaryPayload`) qualifies.
+    fn boxed(self) -> BoxEventContext<Self::Payload>
+    where
+        Self::Payload: ErasedStateCodec,
+    {
         Box::new(self)
     }
 }
@@ -419,7 +442,7 @@ where
     type Payload = <S::Loader as MessageLoader>::Payload;
     type State = S;
 
-    fn state<DESC>(&self, descriptor: DESC) -> Result<DESC::Handle<S>, StateAccessError>
+    fn state<DESC>(&self, registered: Registered<DESC>) -> Result<DESC::Handle<S>, StateAccessError>
     where
         DESC: StateDescriptor,
     {
@@ -430,7 +453,7 @@ where
         let Some(inner) = guard.as_ref() else {
             return Err(StateAccessError::Terminated);
         };
-        descriptor.bind(&inner.session)
+        registered.descriptor().bind(&inner.session)
     }
 
     fn should_cancel(&self) -> bool {
@@ -703,6 +726,70 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// Synchronously check if message cancellation has been requested (includes
     /// partition shutdown).
     fn should_cancel(&self) -> bool;
+
+    // Keyed-state ops — the FFI seam the bindings wrap. They reuse the *same*
+    // typed `state(...)` get/set path as the Rust API, with the codec recovered
+    // from the payload (value cells) or fixed by `KafkaRefCodec` (message
+    // refs). The blanket impl is bounded `Self::Payload: ErasedStateCodec`, so
+    // a `Box<dyn DynEventContext<Payload = P>>` exists only for the FFI
+    // payloads (`serde_json::Value`, `BinaryPayload`). Collection names are
+    // validated by the same `verify_state_registration` the typed bind uses;
+    // an unregistered or identity-mismatched name returns a Permanent error.
+
+    /// Reads the named value collection's cell, decoded with the recovered
+    /// consumer codec.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Permanent error for an unregistered or identity-mismatched
+    /// name, a codec error, or a store error.
+    async fn get_cell(&self, name: &str) -> Result<Option<Self::Payload>, BoxEventContextError>;
+
+    /// Buffers a write of `value` to the named value collection's cell.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Permanent error for an unregistered or identity-mismatched
+    /// name, a codec error, or a store error.
+    async fn set_cell(&self, name: &str, value: Self::Payload) -> Result<(), BoxEventContextError>;
+
+    /// Buffers a clear of the named value collection's cell.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Permanent error for an unregistered or identity-mismatched
+    /// name, or a store error.
+    async fn clear_cell(&self, name: &str) -> Result<(), BoxEventContextError>;
+
+    /// Records `message` as the named Kafka-message collection's durable
+    /// reference (topic/partition/offset).
+    ///
+    /// # Errors
+    ///
+    /// Returns a Permanent error for an unregistered or identity-mismatched
+    /// name, or a store error.
+    async fn record_message(
+        &self,
+        name: &str,
+        message: &ConsumerMessage<Self::Payload>,
+    ) -> Result<(), BoxEventContextError>;
+
+    /// Resolves the named Kafka-message collection's reference back to the
+    /// full message, loading through the consumer's message loader.
+    ///
+    /// Returns the same [`ConsumerMessage`] the typed
+    /// `KafkaMessageDescriptor::get` yields — topic, partition, offset, key,
+    /// timestamp, and payload — so a binding wraps it with the exact host
+    /// `Message` type it already builds in `on_message`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Permanent error for an unregistered or identity-mismatched
+    /// name, a loader miss, or a store error.
+    async fn get_message(
+        &self,
+        name: &str,
+    ) -> Result<Option<ConsumerMessage<Self::Payload>>, BoxEventContextError>;
 }
 
 dyn_clone::clone_trait_object!(<P> DynEventContext<Payload = P>);
@@ -712,6 +799,10 @@ impl<C> DynEventContext for C
 where
     C: EventContext + Send + Sync + 'static,
     C::Error: Error + Send + Sync + 'static,
+    // The keyed-state value ops recover the codec from the payload, so the
+    // erased seam exists only for payloads that map to one. Every FFI payload
+    // does; this is also why `EventContext::boxed` carries the same bound.
+    C::Payload: ErasedStateCodec,
 {
     type Payload = C::Payload;
 
@@ -766,6 +857,59 @@ where
 
     fn should_cancel(&self) -> bool {
         EventContext::should_cancel(self)
+    }
+
+    async fn get_cell(&self, name: &str) -> Result<Option<Self::Payload>, BoxEventContextError> {
+        let registered =
+            Registered::new(value_state::<<C::Payload as ErasedStateCodec>::Codec>(name));
+        self.state(registered)
+            .map_err(|e| Box::new(e) as BoxEventContextError)?
+            .get()
+            .await
+            .map_err(|e| Box::new(e) as BoxEventContextError)
+    }
+
+    async fn set_cell(&self, name: &str, value: Self::Payload) -> Result<(), BoxEventContextError> {
+        let registered =
+            Registered::new(value_state::<<C::Payload as ErasedStateCodec>::Codec>(name));
+        self.state(registered)
+            .map_err(|e| Box::new(e) as BoxEventContextError)?
+            .set(value)
+            .await
+            .map_err(|e| Box::new(e) as BoxEventContextError)
+    }
+
+    async fn clear_cell(&self, name: &str) -> Result<(), BoxEventContextError> {
+        let registered =
+            Registered::new(value_state::<<C::Payload as ErasedStateCodec>::Codec>(name));
+        self.state(registered)
+            .map_err(|e| Box::new(e) as BoxEventContextError)?
+            .clear()
+            .await
+            .map_err(|e| Box::new(e) as BoxEventContextError)
+    }
+
+    async fn record_message(
+        &self,
+        name: &str,
+        message: &ConsumerMessage<Self::Payload>,
+    ) -> Result<(), BoxEventContextError> {
+        self.state(Registered::new(kafka_message_state(name)))
+            .map_err(|e| Box::new(e) as BoxEventContextError)?
+            .set(message)
+            .await
+            .map_err(|e| Box::new(e) as BoxEventContextError)
+    }
+
+    async fn get_message(
+        &self,
+        name: &str,
+    ) -> Result<Option<ConsumerMessage<Self::Payload>>, BoxEventContextError> {
+        self.state(Registered::new(kafka_message_state(name)))
+            .map_err(|e| Box::new(e) as BoxEventContextError)?
+            .get()
+            .await
+            .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 }
 
@@ -867,3 +1011,6 @@ impl ClassifyError for StateAccessError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

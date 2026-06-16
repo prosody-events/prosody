@@ -253,7 +253,7 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
 #[test]
 fn state_unavailable_without_keyed_state() -> Result<()> {
     let ctx: MockEventContext = MockEventContext::new();
-    let Err(error) = ctx.state(cart()) else {
+    let Err(error) = ctx.state(Registered::new(cart())) else {
         return Err(eyre!("bind on a state-less context must fail"));
     };
     assert!(matches!(error, StateAccessError::Unavailable));
