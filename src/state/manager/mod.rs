@@ -27,8 +27,8 @@
 mod tests;
 
 use crate::consumer::event_context::BoxEventContextError;
-use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, DurableNames, acquire_descriptor_identities,
 };
@@ -45,9 +45,9 @@ use crate::state::{
     StateBackendFactory, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::{SegmentId, TriggerStore};
+use crate::timers::store::TriggerStore;
 use crate::timers::{TimerManager, TimerType};
-use crate::{Key, Partition, Topic};
+use crate::{Key, Partition, SegmentId, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::error::Error;
 use std::fmt;
@@ -266,11 +266,16 @@ impl<F, L> StateManagerProvider<F, L> {
     /// Creates the provider.
     ///
     /// `consumer_group` derives the partition's segment id for **state-cell
-    /// identity** (via [`compute_segment_id`]). This is independent of the
-    /// timer subsystem's own segment (`Segment::for_partition`) — the two use
-    /// different derivations and never need to match, because the commit
-    /// oracle resolves a timer `EventRef` by `(key, timer_type, time)` against
-    /// the per-partition trigger store, never by the state segment id.
+    /// identity** via the crate-internal
+    /// `segment::partition_segment_id` — the *same*
+    /// derivation the defer stores use, so a partition's defer and state rows
+    /// share one id for operational lookup. Timers currently derive their
+    /// segment id with a separate legacy formula
+    /// ([`Segment::for_partition`](crate::timers::store::Segment::for_partition),
+    /// `NAMESPACE_URL`) pending a follow-up migration onto this id.
+    /// The tables remain independent: the commit oracle resolves a timer
+    /// `EventRef` by `(key, timer_type, time)` against the per-partition
+    /// trigger store, never by the state segment id — don't join them in code.
     #[must_use]
     pub fn new(
         backend: F,
@@ -327,7 +332,7 @@ where
         topic: Topic,
         partition: Partition,
     ) -> Result<Self::Manager, Self::AcquireError> {
-        let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
+        let segment_id = partition_segment_id(topic, partition, &self.consumer_group);
         let backend = self
             .backend
             .for_partition(topic, partition)

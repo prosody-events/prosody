@@ -47,6 +47,7 @@ mod decode;
 #[cfg(test)]
 mod tests;
 
+use crate::SegmentId;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_KEYED_STATE_DESCRIPTOR, TABLE_KEYED_STATE_VALUE};
 use crate::cassandra_queries;
@@ -60,7 +61,6 @@ use crate::state::store::CellStore;
 use crate::state::value::ValueKind;
 use crate::state::{CollectionId, CollectionRef};
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::SegmentId;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::RawCellRow;

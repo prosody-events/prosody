@@ -245,6 +245,7 @@ pub mod otel;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
+mod segment;
 pub mod state;
 pub mod telemetry;
 pub mod timers;
@@ -326,6 +327,8 @@ pub type Topic = Intern<str>;
 
 /// A partition identifier within a Kafka topic.
 pub type Partition = i32;
+
+pub use segment::SegmentId;
 
 /// A compact string optimized for UUID-length keys.
 ///

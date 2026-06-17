@@ -6,7 +6,7 @@ use super::partition_store::CommittedCache;
 use super::store::CellStore;
 use super::value::ValueKind;
 use super::{CollectionId, CollectionRef, EventRef};
-use crate::timers::store::SegmentId;
+use crate::SegmentId;
 use ahash::RandomState;
 use bytes::Bytes;
 use futures::{Stream, stream};

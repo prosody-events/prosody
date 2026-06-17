@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lazy_segment_clone_shares_state() {
+    async fn test_lazy_segment_clone_shares_state() -> color_eyre::Result<()> {
         let store = MemorySegmentStore::new();
         let segment1 = LazySegment::new(
             store,
@@ -130,18 +130,19 @@ mod tests {
         let segment2 = segment1.clone();
 
         // Initialize via first clone
-        let seg1 = segment1.get().await.expect("should succeed");
+        let seg1 = segment1.get().await?;
 
         // Second clone sees initialized state
         assert!(segment2.is_initialized());
-        let seg2 = segment2.get().await.expect("should succeed");
+        let seg2 = segment2.get().await?;
 
         // Same segment
         assert_eq!(seg1.id(), seg2.id());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_lazy_segment_idempotent() {
+    async fn test_lazy_segment_idempotent() -> color_eyre::Result<()> {
         let store = MemorySegmentStore::new();
         let segment = LazySegment::new(
             store,
@@ -151,8 +152,9 @@ mod tests {
         );
 
         // Multiple calls return same segment
-        let seg1 = segment.get().await.expect("should succeed");
-        let seg2 = segment.get().await.expect("should succeed");
+        let seg1 = segment.get().await?;
+        let seg2 = segment.get().await?;
         assert_eq!(seg1.id(), seg2.id());
+        Ok(())
     }
 }

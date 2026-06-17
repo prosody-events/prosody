@@ -13,11 +13,11 @@
 //! identity** — acquisition fails before any session is minted for the
 //! partition.
 
+use crate::SegmentId;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{CollectionKindId, StateName, StateNameError};
-use crate::timers::store::SegmentId;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;

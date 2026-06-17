@@ -6,11 +6,10 @@
 //! [`CollectionRef`] pairs an identity with a per-write TTL; the TTL is a
 //! hint, not part of identity.
 
-use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::transaction::Read;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::SegmentId;
+use crate::{Key, SegmentId};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;

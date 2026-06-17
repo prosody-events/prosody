@@ -152,12 +152,12 @@ fn termination() -> TerminationWatch {
 }
 
 /// The `name` collection identity for `key` in the fixed test segment —
-/// re-derived through [`compute_segment_id`] so it matches what `acquire`
+/// re-derived through [`partition_segment_id`] so it matches what `acquire`
 /// wrote, exactly as recovery does.
 fn id_for(key: &Key, name: &str) -> Result<CollectionId<ValueKind>> {
     Ok(CollectionId::new(
         StateKey::new(
-            compute_segment_id(Topic::from("t"), 0, "test-group"),
+            partition_segment_id(Topic::from("t"), 0, "test-group"),
             key.clone(),
         ),
         StateType::Application,

@@ -1,7 +1,8 @@
 //! Cassandra-backed segment persistence.
 
+use super::Segment;
 use super::store::SegmentStore;
-use super::{Segment, SegmentId};
+use crate::SegmentId;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_DEFERRED_SEGMENTS};
 use crate::cassandra_queries;
