@@ -6,7 +6,7 @@
 //! [`CassandraValueStoreError::Encoding`],
 //! [`CassandraValueStoreError::CorruptCell`],
 //! [`CassandraValueStoreError::CorruptUdt`],
-//! [`CassandraValueStoreError::IdentityVersionMismatch`] — are all
+//! [`CassandraValueStoreError::VersionMismatch`] — are all
 //! permanent per-message data errors: retrying them indefinitely will not
 //! change the outcome.
 
@@ -39,11 +39,11 @@ pub enum CassandraValueStoreError {
     #[error("Cassandra event_ref UDT is corrupt: {0}")]
     CorruptUdt(#[from] CorruptUdtError),
 
-    /// The value row's `identity_version` stamp is not the version this
+    /// The value row's `version` stamp is not the version this
     /// build writes. Unreachable until identity migration ships; rejected
     /// defensively so a future-version cell is never misread.
     #[error("identity version mismatch: stored {stored}, expected {expected}")]
-    IdentityVersionMismatch {
+    VersionMismatch {
         /// Version stamped on the durable row.
         stored: i32,
 
@@ -59,7 +59,7 @@ impl ClassifyError for CassandraValueStoreError {
             Self::Encoding(_)
             | Self::CorruptCell { .. }
             | Self::CorruptUdt(_)
-            | Self::IdentityVersionMismatch { .. } => ErrorCategory::Permanent,
+            | Self::VersionMismatch { .. } => ErrorCategory::Permanent,
         }
     }
 }

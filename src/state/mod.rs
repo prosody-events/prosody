@@ -12,7 +12,7 @@
 //!   [`CollectionRef`], [`StateKey`], [`CollectionKind`], …).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
-//! * [`encoding`] — payload encoding selectors ([`PayloadEncoding`],
+//! * [`encoding`] — payload encoding selectors ([`Encoding`],
 //!   [`EncodingError`]).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
 //!   [`ProvisionalCell`], [`ProvisionalWrite`]).
@@ -67,7 +67,7 @@ pub mod value;
 pub(crate) mod tests;
 
 pub use dirty::DirtyValueStore;
-pub use encoding::{EncodingError, PayloadEncoding};
+pub use encoding::{Encoding, EncodingError};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,

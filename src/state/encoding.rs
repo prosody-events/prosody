@@ -1,7 +1,7 @@
 //! Payload-cell encoding for keyed-state collections.
 //!
 //! Value cells hold raw codec bytes and select an on-disk representation via
-//! [`PayloadEncoding`], which round-trips through `i16` so the durable
+//! [`Encoding`], which round-trips through `i16` so the durable
 //! Cassandra column maps cleanly onto it.
 
 use crate::error::{ClassifyError, ErrorCategory};
@@ -18,10 +18,10 @@ const ZSTD_LEVEL: i32 = 0;
 /// integer column without leaking the named enum representation.
 /// Discriminants `1`/`2` belonged to the retired `MsgPack`-wrapped cell
 /// encodings and are never reused — a stale cell carrying one fails
-/// loudly as [`EncodingError::UnknownPayloadEncoding`] (Permanent).
+/// loudly as [`EncodingError::UnknownEncoding`] (Permanent).
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum PayloadEncoding {
+pub enum Encoding {
     /// Raw codec bytes stored verbatim.
     RawV1 = 3,
 
@@ -29,20 +29,20 @@ pub enum PayloadEncoding {
     RawZstdV1 = 4,
 }
 
-impl From<PayloadEncoding> for i16 {
-    fn from(encoding: PayloadEncoding) -> Self {
+impl From<Encoding> for i16 {
+    fn from(encoding: Encoding) -> Self {
         encoding as i16
     }
 }
 
-impl TryFrom<i16> for PayloadEncoding {
+impl TryFrom<i16> for Encoding {
     type Error = EncodingError;
 
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
             3 => Ok(Self::RawV1),
             4 => Ok(Self::RawZstdV1),
-            _ => Err(EncodingError::UnknownPayloadEncoding(value)),
+            _ => Err(EncodingError::UnknownEncoding(value)),
         }
     }
 }
@@ -55,10 +55,10 @@ impl TryFrom<i16> for PayloadEncoding {
 /// # Errors
 ///
 /// Returns [`EncodingError`] when zstd compression fails.
-pub fn encode_payload(payload: &Bytes, encoding: PayloadEncoding) -> Result<Bytes, EncodingError> {
+pub fn encode_payload(payload: &Bytes, encoding: Encoding) -> Result<Bytes, EncodingError> {
     match encoding {
-        PayloadEncoding::RawV1 => Ok(payload.clone()),
-        PayloadEncoding::RawZstdV1 => compress(payload),
+        Encoding::RawV1 => Ok(payload.clone()),
+        Encoding::RawZstdV1 => compress(payload),
     }
 }
 
@@ -67,10 +67,10 @@ pub fn encode_payload(payload: &Bytes, encoding: PayloadEncoding) -> Result<Byte
 /// # Errors
 ///
 /// Returns [`EncodingError`] when zstd decompression fails.
-pub fn decode_payload(bytes: &[u8], encoding: PayloadEncoding) -> Result<Bytes, EncodingError> {
+pub fn decode_payload(bytes: &[u8], encoding: Encoding) -> Result<Bytes, EncodingError> {
     match encoding {
-        PayloadEncoding::RawV1 => Ok(Bytes::copy_from_slice(bytes)),
-        PayloadEncoding::RawZstdV1 => decompress(bytes).map(Bytes::from),
+        Encoding::RawV1 => Ok(Bytes::copy_from_slice(bytes)),
+        Encoding::RawZstdV1 => decompress(bytes).map(Bytes::from),
     }
 }
 
@@ -93,7 +93,7 @@ fn decompress(bytes: &[u8]) -> Result<Vec<u8>, EncodingError> {
 pub enum EncodingError {
     /// The durable column carried an unknown payload encoding.
     #[error("unknown payload encoding: {0}")]
-    UnknownPayloadEncoding(i16),
+    UnknownEncoding(i16),
 
     /// zstd compression or decompression failed.
     #[error("bad zstd: {0}")]

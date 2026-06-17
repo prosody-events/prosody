@@ -17,17 +17,17 @@ CREATE TYPE {{KEYSPACE}}.event_ref (
 );
 
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_VALUE}} (
-    segment_id       uuid,
-    key              text,
-    state_type       tinyint,
-    name             text,
+    segment_id uuid,
+    key        text,
+    state_type tinyint,
+    name       text,
 
-    data             blob,
-    prev_data        blob,
-    payload_encoding smallint,
-    identity_version int,
+    data       blob,
+    prev_data  blob,
+    encoding   smallint,
+    version    int,
 
-    event            frozen<event_ref>,
+    event      frozen<event_ref>,
 
     PRIMARY KEY ((segment_id, key, state_type, name))
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
@@ -41,7 +41,7 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_VALUE}} (
 -- string token (NULL for framework-defined cells). `version` is an
 -- append-only clustering column: only version 1 is written today; future
 -- identity migrations append new versions and stamp value rows
--- (`identity_version`) per key as they migrate.
+-- (`version`) per key as they migrate.
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_DESCRIPTOR}} (
     segment_id    uuid,
     name          text,

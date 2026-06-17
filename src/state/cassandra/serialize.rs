@@ -16,7 +16,7 @@
 //! `DeserializationError`, which would tear the partition down over one bad
 //! row.
 
-use crate::state::encoding::PayloadEncoding;
+use crate::state::encoding::Encoding;
 use crate::state::{CollectionKindId, StateType};
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
@@ -42,7 +42,7 @@ impl SerializeValue for CollectionKindId {
     }
 }
 
-impl SerializeValue for PayloadEncoding {
+impl SerializeValue for Encoding {
     fn serialize<'b>(
         &self,
         typ: &ColumnType,

@@ -196,7 +196,7 @@ async fn absent_row_and_provisional_cells_stream() -> Result<()> {
 #[tokio::test]
 async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     use crate::cassandra::TABLE_KEYED_STATE_VALUE;
-    use crate::state::encoding::{PayloadEncoding, decode_payload};
+    use crate::state::encoding::{Encoding, decode_payload};
 
     init_test_logging();
     let store = setup().await?;
@@ -233,7 +233,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         raw.len(),
         payload.len()
     );
-    let decoded = decode_payload(&raw, PayloadEncoding::RawZstdV1)?;
+    let decoded = decode_payload(&raw, Encoding::RawZstdV1)?;
     assert_eq!(
         decoded, payload,
         "zstd frame must decompress to the payload"

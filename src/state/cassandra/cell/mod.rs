@@ -11,14 +11,14 @@
 //! # Cell column shape
 //!
 //! Each value row is one cell over the columns `data | prev_data |
-//! payload_encoding | identity_version | event`. The three mutators write
+//! encoding | version | event`. The three mutators write
 //! exactly one shape each:
 //!
 //! * [`write_provisional`](CellStore::write_provisional) — *stage*: `data`,
-//!   `prev_data`, `event`, and the shared `payload_encoding`/`identity_version`
-//!   in one `UPDATE`. The encoding/version flags key on **either** blob being
-//!   present (a clear-over-present stages `data = null` with a non-null
-//!   `prev_data`, which still needs an encoding).
+//!   `prev_data`, `event`, and the shared `encoding`/`version` in one `UPDATE`.
+//!   The encoding/version flags key on **either** blob being present (a
+//!   clear-over-present stages `data = null` with a non-null `prev_data`, which
+//!   still needs an encoding).
 //! * [`write_resolved`](CellStore::write_resolved) — writes a committed value
 //!   with `prev_data`/`event` nulled in one `UPDATE` (the `ReadUncommitted`
 //!   direct write, the mid-handler flush, and rollback resolution).
@@ -28,8 +28,8 @@
 //! # Promote-of-clear residue
 //!
 //! Promoting a staged *clear* (`data = null`, `prev_data = Some`) nulls
-//! `prev_data`/`event` but leaves the row's `payload_encoding`/
-//! `identity_version` populated with `data` still null. That shape —
+//! `prev_data`/`event` but leaves the row's `encoding`/
+//! `version` populated with `data` still null. That shape —
 //! encoding/version present, both blobs null — is a legitimate
 //! `Resolved(Committed(None))`, **not** corruption. The decoder validates
 //! encoding/version per-blob (a blob present without an encoding is corrupt),
@@ -54,9 +54,9 @@ use crate::cassandra_queries;
 use crate::state::StateType;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor_identity::{
-    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_IDENTITY_VERSION,
+    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_VERSION,
 };
-use crate::state::encoding::{PayloadEncoding, encode_payload};
+use crate::state::encoding::{Encoding, encode_payload};
 use crate::state::store::CellStore;
 use crate::state::value::ValueKind;
 use crate::state::{CollectionId, CollectionRef};
@@ -75,7 +75,7 @@ pub use crate::state::cassandra::error::CassandraValueStoreError;
 pub use decode::CellCorruptReason;
 
 /// Payload encoding for cell blobs written by this build.
-const VALUE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::RawZstdV1;
+const VALUE_ENCODING: Encoding = Encoding::RawZstdV1;
 
 /// Cassandra-backed provisional-cell store for the Value kind.
 #[derive(Clone, Debug)]
@@ -166,7 +166,7 @@ impl CellStore<ValueKind> for CassandraCellStore {
                 data,
                 prev_data,
                 encoding,
-                identity_version,
+                version,
             } = encode_cell_blobs(write.data(), write.prev())?;
             let data = data.as_ref().map(Bytes::as_ref);
             let prev_data = prev_data.as_ref().map(Bytes::as_ref);
@@ -178,28 +178,13 @@ impl CellStore<ValueKind> for CassandraCellStore {
                     &self.queries.write_provisional_no_ttl,
                     |ttl| {
                         (
-                            ttl,
-                            data,
-                            prev_data,
-                            encoding,
-                            identity_version,
-                            event,
-                            segment_id,
-                            key,
-                            state_type,
-                            name,
+                            ttl, data, prev_data, encoding, version, event, segment_id, key,
+                            state_type, name,
                         )
                     },
                     || {
                         (
-                            data,
-                            prev_data,
-                            encoding,
-                            identity_version,
-                            event,
-                            segment_id,
-                            key,
-                            state_type,
+                            data, prev_data, encoding, version, event, segment_id, key, state_type,
                             name,
                         )
                     },
@@ -219,7 +204,7 @@ impl CellStore<ValueKind> for CassandraCellStore {
             let CellBlobs {
                 data,
                 encoding,
-                identity_version,
+                version,
                 ..
             } = encode_cell_blobs(data.as_ref(), None)?;
             let data = data.as_ref().map(Bytes::as_ref);
@@ -230,27 +215,10 @@ impl CellStore<ValueKind> for CassandraCellStore {
                     &self.queries.write_resolved_no_ttl,
                     |ttl| {
                         (
-                            ttl,
-                            data,
-                            encoding,
-                            identity_version,
-                            segment_id,
-                            key,
-                            state_type,
-                            name,
+                            ttl, data, encoding, version, segment_id, key, state_type, name,
                         )
                     },
-                    || {
-                        (
-                            data,
-                            encoding,
-                            identity_version,
-                            segment_id,
-                            key,
-                            state_type,
-                            name,
-                        )
-                    },
+                    || (data, encoding, version, segment_id, key, state_type, name),
                 )
                 .await?;
         }
@@ -331,15 +299,15 @@ impl DescriptorIdentityStore for CassandraCellStore {
 /// The cell column values bound by [`CellStore::write_provisional`] and
 /// [`CellStore::write_resolved`].
 ///
-/// `payload_encoding` and `identity_version` are shared by `data` and
+/// `encoding` and `version` are shared by `data` and
 /// `prev_data` and present iff **either** blob is present — a
 /// clear-over-present stage carries a null `data` with a non-null `prev_data`
 /// and still needs an encoding to decode the latter.
 struct CellBlobs {
     data: Option<Bytes>,
     prev_data: Option<Bytes>,
-    encoding: Option<PayloadEncoding>,
-    identity_version: Option<i32>,
+    encoding: Option<Encoding>,
+    version: Option<i32>,
 }
 
 /// Encodes a cell's `data`/`prev` payloads into their bound columns, computing
@@ -349,17 +317,17 @@ fn encode_cell_blobs(
     prev: Option<&Bytes>,
 ) -> Result<CellBlobs, CassandraValueStoreError> {
     let data = data
-        .map(|p| encode_payload(p, VALUE_PAYLOAD_ENCODING))
+        .map(|p| encode_payload(p, VALUE_ENCODING))
         .transpose()?;
     let prev_data = prev
-        .map(|p| encode_payload(p, VALUE_PAYLOAD_ENCODING))
+        .map(|p| encode_payload(p, VALUE_ENCODING))
         .transpose()?;
     let any = data.is_some() || prev_data.is_some();
     Ok(CellBlobs {
         data,
         prev_data,
-        encoding: any.then_some(VALUE_PAYLOAD_ENCODING),
-        identity_version: any.then_some(INITIAL_IDENTITY_VERSION),
+        encoding: any.then_some(VALUE_ENCODING),
+        version: any.then_some(INITIAL_VERSION),
     })
 }
 
@@ -388,7 +356,7 @@ cassandra_queries! {
     pub struct CellQueries {
         /// Reads the cell columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
-            "SELECT data, prev_data, payload_encoding, identity_version, event \
+            "SELECT data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
@@ -398,7 +366,7 @@ cassandra_queries! {
         /// event` shape plus the shared encoding/version columns).
         write_provisional: (
             "UPDATE $keyspace.{} USING TTL ? \
-             SET data = ?, prev_data = ?, payload_encoding = ?, identity_version = ?, event = ? \
+             SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -406,7 +374,7 @@ cassandra_queries! {
         /// Stages a provisional cell without TTL.
         write_provisional_no_ttl: (
             "UPDATE $keyspace.{} \
-             SET data = ?, prev_data = ?, payload_encoding = ?, identity_version = ?, event = ? \
+             SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -415,7 +383,7 @@ cassandra_queries! {
         /// encoding/version, nulling `prev_data` and `event`.
         write_resolved: (
             "UPDATE $keyspace.{} USING TTL ? \
-             SET data = ?, payload_encoding = ?, identity_version = ?, prev_data = null, event = null \
+             SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),
@@ -423,7 +391,7 @@ cassandra_queries! {
         /// Writes a resolved cell without TTL.
         write_resolved_no_ttl: (
             "UPDATE $keyspace.{} \
-             SET data = ?, payload_encoding = ?, identity_version = ?, prev_data = null, event = null \
+             SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_VALUE
         ),

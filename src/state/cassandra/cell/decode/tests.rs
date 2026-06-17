@@ -11,30 +11,26 @@ use crate::state::EventRef;
 use crate::state::cassandra::error::CassandraValueStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
-use crate::state::descriptor_identity::INITIAL_IDENTITY_VERSION;
-use crate::state::encoding::{PayloadEncoding, encode_payload};
+use crate::state::descriptor_identity::INITIAL_VERSION;
+use crate::state::encoding::{Encoding, encode_payload};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use uuid::Uuid;
 
 /// The shared encoding discriminator a present blob carries.
 fn enc() -> i16 {
-    i16::from(PayloadEncoding::RawZstdV1)
+    i16::from(Encoding::RawZstdV1)
 }
 
 /// The version stamp paired with present bytes.
 fn ver() -> i32 {
-    INITIAL_IDENTITY_VERSION
+    INITIAL_VERSION
 }
 
 /// Encodes a payload exactly as the cell store would, so the decoder's
 /// `decode_payload` round-trips it.
 fn blob(s: &str) -> Result<Vec<u8>> {
-    Ok(encode_payload(
-        &Bytes::copy_from_slice(s.as_bytes()),
-        PayloadEncoding::RawZstdV1,
-    )?
-    .to_vec())
+    Ok(encode_payload(&Bytes::copy_from_slice(s.as_bytes()), Encoding::RawZstdV1)?.to_vec())
 }
 
 fn message_event() -> EventRef {
@@ -60,7 +56,7 @@ fn resolved_present() -> Result<()> {
 }
 
 /// The promote-of-clear residue: `data`/`prev_data` both NULL but
-/// `payload_encoding`/`identity_version` still populated → `Resolved(None)`,
+/// `encoding`/`version` still populated → `Resolved(None)`,
 /// NOT corruption. This is the case the advisor flagged.
 #[test]
 fn resolved_clear_residue_is_not_corrupt() -> Result<()> {
@@ -186,15 +182,15 @@ fn blob_without_encoding_is_corrupt() -> Result<()> {
     Ok(())
 }
 
-/// An unknown `identity_version` stamp is rejected Permanent.
+/// An unknown `version` stamp is rejected Permanent.
 #[test]
-fn unknown_identity_version_is_rejected() -> Result<()> {
+fn unknown_version_is_rejected() -> Result<()> {
     let row: RawCellRow = (Some(blob("v")?), None, Some(enc()), Some(2_i32), None);
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraValueStoreError::IdentityVersionMismatch {
+        Err(CassandraValueStoreError::VersionMismatch {
             stored: 2_i32,
-            expected: INITIAL_IDENTITY_VERSION
+            expected: INITIAL_VERSION
         })
     ));
     Ok(())

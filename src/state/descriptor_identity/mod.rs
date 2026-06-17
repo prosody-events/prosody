@@ -32,7 +32,7 @@ use thiserror::Error;
 /// a different version is rejected at decode. Version resolution,
 /// bump-append, and per-key migration are future work — the schema is the
 /// hook they build on.
-pub const INITIAL_IDENTITY_VERSION: i32 = 1;
+pub const INITIAL_VERSION: i32 = 1;
 
 /// One durable identity row in wire form.
 ///
@@ -48,7 +48,7 @@ pub struct DurableDescriptorIdentity {
     pub name: String,
 
     /// Identity version (clustering column). Only
-    /// [`INITIAL_IDENTITY_VERSION`] exists until migration ships.
+    /// [`INITIAL_VERSION`] exists until migration ships.
     pub version: i32,
 
     /// [`CollectionKindId`] discriminator.
@@ -67,7 +67,7 @@ impl DurableDescriptorIdentity {
     pub(crate) fn from_identity(name: &StateName, identity: &StructuralIdentity) -> Self {
         Self {
             name: name.as_str().to_owned(),
-            version: INITIAL_IDENTITY_VERSION,
+            version: INITIAL_VERSION,
             kind: identity.kind.into(),
             cell_kind: identity.cell_kind.into(),
             codec_id: identity.codec_id.map(str::to_owned),

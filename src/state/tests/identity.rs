@@ -2,7 +2,7 @@
 //!
 //! [`CollectionKindId`] and [`StateType`] are stored beside durable keyed
 //! state as `i8` discriminators and validated back through `TryFrom` on the
-//! Cassandra decode skip-path, mirroring the `PayloadEncoding` peer in
+//! Cassandra decode skip-path, mirroring the `Encoding` peer in
 //! [`crate::state::encoding`]: every valid discriminator must round-trip
 //! through `i8`, and every other value must be rejected (the `TryFrom` error
 //! type is the only possible `Err`, so `is_err` is enough to prove the value
