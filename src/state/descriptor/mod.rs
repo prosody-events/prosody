@@ -28,21 +28,21 @@
 //! never names that machinery; it only sees the two generic strategies.
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
-//! `(kind, cell kind, codec id)` tuple. Identity is derived from the codec,
-//! never the resolver: the resolver is operational, not part of the durable
-//! contract. The identity is checked at registration (same
-//! name ⇒ same identity), at bind, and against the durable per-segment
-//! identity table on first use, so a process carrying an incompatible
-//! descriptor fails loudly instead of silently misreading cells.
+//! `(kind, codec id, resolver id)` tuple. Both the codec and the resolver are
+//! part of the durable contract: the codec types the stored cell, and the
+//! resolver maps it to and from the exposed value, so swapping either silently
+//! would change what a cell means. The identity is checked at registration
+//! (same `(state_type, name)` ⇒ same identity), at bind, and against the
+//! group-global durable identity table on first use, so a process carrying an
+//! incompatible descriptor fails loudly instead of silently misreading cells.
 
 use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::CollectionKindId;
 use crate::state::registry::CollectionDef;
 use crate::state::session::{CellAccess, StateSession};
 use crate::state::value::ValueKind;
-use crate::state::{CommitMode, StateName, StoreOutcome};
+use crate::state::{CollectionKindId, CommitMode, StateName, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
 use internment::Intern;
 use std::error::Error;
@@ -51,26 +51,23 @@ use std::future::Future;
 use std::marker::PhantomData;
 use thiserror::Error;
 
-/// Cell-format discriminator persisted in a collection's structural
-/// identity.
+/// A resolver's durable token, the resolver half of a collection's
+/// [`StructuralIdentity`].
 ///
-/// Values are frozen: new cell kinds get new discriminants, never
-/// repurposed ones.
-#[repr(i16)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum CellKind {
-    /// Raw bytes produced by a user-facing [`Codec`].
-    Codec = 1,
-}
-
-impl From<CellKind> for i16 {
-    fn from(cell_kind: CellKind) -> Self {
-        cell_kind as i16
-    }
+/// Session-agnostic by design — the token is a property of the resolver
+/// *strategy*, not of any session it runs against, so it is a plain associated
+/// const rather than a method on [`CellResolver`]. `None` is the passthrough
+/// resolver (the stored value *is* the exposed value); a `Some(token)` names a
+/// non-trivial mapping (for example the consumer's Kafka-message reference
+/// resolver). The token is frozen into the durable identity, so changing it
+/// once cells exist is an incompatible identity change.
+pub trait ResolverId {
+    /// The resolver's durable token, or `None` for passthrough.
+    const RESOLVER_ID: Option<&'static str>;
 }
 
 /// The frozen structural identity a descriptor asserts for its collection:
-/// collection kind, cell format, and codec token.
+/// collection kind, codec token, and resolver token.
 ///
 /// Operational settings (TTL, commit mode) are deliberately *not* part of
 /// the identity — they may change between deploys; the identity may not.
@@ -79,12 +76,12 @@ pub struct StructuralIdentity {
     /// Collection kind discriminator.
     pub kind: CollectionKindId,
 
-    /// Cell format discriminator.
-    pub cell_kind: CellKind,
+    /// Codec token ([`Codec::CODEC_ID`]). Always present — every cell is
+    /// codec-produced.
+    pub codec_id: &'static str,
 
-    /// Codec token ([`Codec::CODEC_ID`]; `None` for framework-defined
-    /// cells).
-    pub codec_id: Option<&'static str>,
+    /// Resolver token ([`ResolverId::RESOLVER_ID`]); `None` for passthrough.
+    pub resolver_id: Option<&'static str>,
 }
 
 /// Context-independent descriptor metadata: the name and frozen identity
@@ -95,6 +92,14 @@ pub struct StructuralIdentity {
 pub trait DescriptorIdentity {
     /// The collection name this descriptor binds to.
     fn name(&self) -> &'static str;
+
+    /// The state namespace this descriptor's collection lives in. Defaults to
+    /// [`StateType::Application`]; the name is unique only *within* a
+    /// `state_type`, so a framework collection can share a name with an
+    /// application one without colliding.
+    fn state_type(&self) -> StateType {
+        StateType::Application
+    }
 
     /// The structural identity this descriptor asserts.
     fn structural_identity(&self) -> StructuralIdentity;
@@ -182,9 +187,10 @@ where
 /// The resolver is a zero-sized *strategy*, never an instance: every method
 /// is static (no `&self`). Any runtime dependency it needs (for example a
 /// message loader) is read from the [`StateSession`] handed to
-/// [`Self::resolve`] — see the consumer layer's reference resolver. This is
-/// what keeps [`ValueDescriptor`]'s identity resolver-agnostic: a descriptor
-/// carries no resolver state.
+/// [`Self::resolve`] — see the consumer layer's reference resolver. A
+/// descriptor carries no resolver *state*; the resolver's durable *token*
+/// ([`ResolverId`]) is a separate, session-agnostic const that rides the
+/// [`StructuralIdentity`].
 pub trait CellResolver<S: StateSession> {
     /// The decoded cell type — pinned to the codec's payload by the handle.
     type Stored;
@@ -218,6 +224,11 @@ pub trait CellResolver<S: StateSession> {
 /// A zero-sized strategy; [`value_state`] pairs it with the codec so a plain
 /// value collection round-trips `C::Payload` with no extra layer.
 pub struct Passthrough<T>(PhantomData<fn() -> T>);
+
+impl<T> ResolverId for Passthrough<T> {
+    /// Passthrough adds no mapping, so it carries no resolver token.
+    const RESOLVER_ID: Option<&'static str> = None;
+}
 
 impl<S, T> CellResolver<S> for Passthrough<T>
 where
@@ -348,6 +359,7 @@ impl<C, R> ValueDescriptor<C, R> {
 impl<C, R> DescriptorIdentity for ValueDescriptor<C, R>
 where
     C: Codec,
+    R: ResolverId,
 {
     fn name(&self) -> &'static str {
         self.name
@@ -356,8 +368,8 @@ where
     fn structural_identity(&self) -> StructuralIdentity {
         StructuralIdentity {
             kind: CollectionKindId::Value,
-            cell_kind: CellKind::Codec,
-            codec_id: Some(C::CODEC_ID),
+            codec_id: C::CODEC_ID,
+            resolver_id: R::RESOLVER_ID,
         }
     }
 }
@@ -365,16 +377,22 @@ where
 impl<C, R> StateDescriptor for ValueDescriptor<C, R>
 where
     C: Codec,
+    R: ResolverId,
 {
     type Handle<S: StateSession> = StateHandle<S, C, R>;
 
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        // Bind is resolver-agnostic: identity is codec-derived, and the
-        // handle carries the resolver only as a marker. The
-        // `R: CellResolver<S>` requirement surfaces on `get`/`set`, not here,
-        // so this compiles through the shared `StateDescriptor` trait.
-        let name = session.verify_state_registration(self.name, &self.structural_identity())?;
-        Ok(StateHandle::new(session.clone(), name))
+        // The resolver token rides the identity (via `R: ResolverId`), but the
+        // operational `R: CellResolver<S>` requirement surfaces on `get`/`set`,
+        // not here, so this compiles through the shared `StateDescriptor` trait.
+        // The handle carries the binding descriptor's `state_type` so its cell
+        // ops address the right namespace.
+        let name = session.verify_state_registration(
+            self.name,
+            self.state_type(),
+            &self.structural_identity(),
+        )?;
+        Ok(StateHandle::new(session.clone(), self.state_type(), name))
     }
 
     fn collection_def(&self) -> CollectionDef {
@@ -393,17 +411,19 @@ where
 /// state machine.
 pub struct StateHandle<S, C, R> {
     session: S,
+    state_type: StateType,
     name: StateName,
     _marker: PhantomData<fn() -> (C, R)>,
 }
 
 impl<S, C, R> StateHandle<S, C, R> {
-    /// Wraps a verified session + canonical name. Resolver-agnostic so
-    /// [`StateDescriptor::bind`] can mint it without a [`CellResolver`]
-    /// bound.
-    fn new(session: S, name: StateName) -> Self {
+    /// Wraps a verified session, the binding descriptor's `state_type`, and the
+    /// canonical name. Resolver-agnostic so [`StateDescriptor::bind`] can mint
+    /// it without a [`CellResolver`] bound.
+    fn new(session: S, state_type: StateType, name: StateName) -> Self {
         Self {
             session,
+            state_type,
             name,
             _marker: PhantomData,
         }
@@ -414,6 +434,7 @@ impl<S: Clone, C, R> Clone for StateHandle<S, C, R> {
     fn clone(&self) -> Self {
         Self {
             session: self.session.clone(),
+            state_type: self.state_type,
             name: self.name.clone(),
             _marker: PhantomData,
         }
@@ -436,7 +457,11 @@ where
     pub async fn get(&self) -> Result<Option<R::Resolved>, ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
         // Value is the single-cell kind, so the address is the unit `()`.
-        let Some(cell) = self.session.read_cell(&self.name, &()).await? else {
+        let Some(cell) = self
+            .session
+            .read_cell(self.state_type, &self.name, &())
+            .await?
+        else {
             return Ok(None);
         };
         // `Codec::deserialize` parses in place (destructive). In production the
@@ -471,7 +496,10 @@ where
         let mut buf = SerializeBufGuard::acquire();
         C::with_cached_local(|codec| codec.serialize(stored, &mut buf))
             .map_err(ValueStateError::Codec)?;
-        Ok(self.session.set_cell(&self.name, &(), &buf).await?)
+        Ok(self
+            .session
+            .set_cell(self.state_type, &self.name, &(), &buf)
+            .await?)
     }
 
     /// Buffers a clear operation.
@@ -481,7 +509,10 @@ where
     /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
-        Ok(self.session.clear_cell(&self.name, &()).await?)
+        Ok(self
+            .session
+            .clear_cell(self.state_type, &self.name, &())
+            .await?)
     }
 
     /// Drains buffered ops directly to authoritative state and returns the
@@ -502,7 +533,10 @@ where
     /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
         ensure_live(&self.session)?;
-        Ok(self.session.flush_cell(&self.name, &()).await?)
+        Ok(self
+            .session
+            .flush_cell(self.state_type, &self.name, &())
+            .await?)
     }
 }
 

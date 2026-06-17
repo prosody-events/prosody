@@ -21,9 +21,9 @@ pub(crate) use serialize_buf::SerializeBufGuard;
 /// is stateful to allow implementations to reuse internal buffers across calls.
 pub trait Codec: Default + Send + Sync + 'static {
     /// Stable open-dispatch token persisted in keyed-state identity rows.
-    /// Never change it once cells exist: the durable per-segment identity
-    /// records the token, and a deploy whose codec asserts a different one
-    /// refuses to dispatch (Permanent).
+    /// Never change it once cells exist: the group-global descriptor-identity
+    /// table records the token, and a deploy whose codec asserts a different
+    /// one refuses to dispatch (Permanent).
     const CODEC_ID: &'static str;
 
     /// The deserialized payload type produced and consumed by this codec.

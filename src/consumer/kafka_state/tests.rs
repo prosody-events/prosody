@@ -29,6 +29,22 @@ fn last_seen() -> KafkaMessageDescriptor {
     kafka_message_state("last_seen")
 }
 
+/// Wire-format freeze: the Kafka-message collection's codec and resolver tokens
+/// are written into the durable `keyed_state_identity` row and compared on
+/// read. Changing either orphans every existing Kafka-message collection
+/// (mismatch ⇒ Permanent), so pin both literals — a rename fails loudly here.
+#[test]
+fn kafka_message_identity_tokens_are_frozen() {
+    use crate::codec::Codec;
+    use crate::state::descriptor::ResolverId;
+
+    assert_eq!(KafkaRefCodec::CODEC_ID, "kafka-message-ref");
+    assert_eq!(
+        <KafkaResolver as ResolverId>::RESOLVER_ID,
+        Some("kafka-message-ref")
+    );
+}
+
 #[derive(Clone, Debug)]
 struct ArbKafkaMessageRef(KafkaMessageRef);
 

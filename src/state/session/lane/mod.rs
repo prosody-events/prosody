@@ -322,8 +322,9 @@ where
     O: CommitOracle,
     C: CommittedCache<K>,
 {
-    let collection_ref = CollectionRef::new(id.clone(), registry.ttl_for(id.name()));
-    match registry.commit_mode_for(id.name()) {
+    let collection_ref =
+        CollectionRef::new(id.clone(), registry.ttl_for(id.state_type(), id.name()));
+    match registry.commit_mode_for(id.state_type(), id.name()) {
         CommitMode::ReadCommitted => {
             let mut writes = Vec::new();
             for (addr, op) in cells {

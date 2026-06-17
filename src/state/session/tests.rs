@@ -192,7 +192,8 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
     let (event, dedup_id) = message(1);
     let session = fx.session(event);
 
-    CellAccess::<ValueKind>::set_cell(&session, &fx.value_name, &(), b"v1").await?;
+    CellAccess::<ValueKind>::set_cell(&session, StateType::Application, &fx.value_name, &(), b"v1")
+        .await?;
     session.register_marker(dedup_id);
 
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
@@ -285,10 +286,23 @@ async fn run(trace: Trace) -> Result<bool> {
 
         match ev.mutation {
             ValueMut::Set(byte) => {
-                CellAccess::<ValueKind>::set_cell(&session, &fx.value_name, &(), &[byte]).await?;
+                CellAccess::<ValueKind>::set_cell(
+                    &session,
+                    StateType::Application,
+                    &fx.value_name,
+                    &(),
+                    &[byte],
+                )
+                .await?;
             }
             ValueMut::Clear => {
-                CellAccess::<ValueKind>::clear_cell(&session, &fx.value_name, &()).await?;
+                CellAccess::<ValueKind>::clear_cell(
+                    &session,
+                    StateType::Application,
+                    &fx.value_name,
+                    &(),
+                )
+                .await?;
             }
             ValueMut::Skip => {}
         }

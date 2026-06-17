@@ -3,10 +3,10 @@
 //! [`CassandraCellStore`] implements [`CellStore<ValueKind>`] over the
 //! `keyed_state_value` table provisioned by migration
 //! `20260522_create_keyed_state.cql`, and [`DescriptorIdentityStore`] over the
-//! `keyed_state_descriptor` table. It is the provisional-cell replacement for
-//! the write-ahead-log-era `CassandraValueStore`: every durable mutation
-//! writes one self-consistent column shape in a single statement, so the
-//! applied-triple desync class the WAL design fought is unwritable here.
+//! group-global `keyed_state_identity` table. It is the provisional-cell
+//! replacement for the write-ahead-log-era `CassandraValueStore`: every durable
+//! mutation writes one self-consistent column shape in a single statement, so
+//! the applied-triple desync class the WAL design fought is unwritable here.
 //!
 //! # Cell column shape
 //!
@@ -49,12 +49,12 @@ mod tests;
 
 use crate::SegmentId;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{CassandraStore, TABLE_KEYED_STATE_DESCRIPTOR, TABLE_KEYED_STATE_VALUE};
+use crate::cassandra::{CassandraStore, TABLE_KEYED_STATE_IDENTITY, TABLE_KEYED_STATE_VALUE};
 use crate::cassandra_queries;
 use crate::state::StateType;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor_identity::{
-    DescriptorIdentityStore, DurableDescriptorIdentity, INITIAL_VERSION,
+    DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
 use crate::state::encoding::{Encoding, encode_payload};
 use crate::state::store::CellStore;
@@ -64,11 +64,11 @@ use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::RawCellRow;
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
 use scylla::client::session::Session;
 use scylla::serialize::row::SerializeRow;
-use scylla::statement::batch::{Batch, BatchType};
 use scylla::statement::prepared::PreparedStatement;
+use scylla::value::{CqlValue, Row};
 use std::sync::Arc;
 
 pub use crate::state::cassandra::error::CassandraValueStoreError;
@@ -76,6 +76,14 @@ pub use decode::CellCorruptReason;
 
 /// Payload encoding for cell blobs written by this build.
 const VALUE_ENCODING: Encoding = Encoding::RawZstdV1;
+
+/// The only value-cell `version` stamp this build writes or accepts.
+///
+/// Every authoritative value cell stamps the version its bytes were written
+/// under; this build writes version 1 and rejects any other at decode
+/// ([`decode::validate_version`]). Per-key identity migration is future work —
+/// the stamp is the dormant hook it would build on.
+pub const INITIAL_VERSION: i32 = 1;
 
 /// Cassandra-backed provisional-cell store for the Value kind.
 #[derive(Clone, Debug)]
@@ -245,54 +253,155 @@ impl CellStore<ValueKind> for CassandraCellStore {
 impl DescriptorIdentityStore for CassandraCellStore {
     type Error = CassandraValueStoreError;
 
-    async fn read_descriptor_identities(
+    async fn read_identity(
         &self,
-        segment_id: SegmentId,
-    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
-        let rows = self
+        group_id: &str,
+        state_type: StateType,
+        name: &str,
+    ) -> Result<Option<DurableDescriptorIdentity>, Self::Error> {
+        let row = self
             .session()
-            .execute_iter(
-                self.queries.read_descriptor_identities.clone(),
-                (segment_id,),
+            .execute_unpaged(&self.queries.read_identity, (group_id, state_type, name))
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<IdentityColumns>()
+            .map_err(CassandraStoreError::from)?;
+        Ok(row.map(|cols| cols.into_identity(state_type, name)))
+    }
+
+    /// Registers the first-use identity row with `INSERT … IF NOT EXISTS`.
+    ///
+    /// **This is the one authorized lightweight transaction in keyed state.**
+    /// The general LWT ban (Paxos round-trips serialize a partition's writes)
+    /// holds for the hot path; first-use registration is off it — once per
+    /// collection per group, racing only across group members at first use —
+    /// and needs the atomic insert-if-absent that `IF NOT EXISTS` gives. A
+    /// failed conditional insert echoes the existing row, so the losing
+    /// registrant validates it in the same round-trip (no re-read), exactly
+    /// as the migration lock ([`crate::cassandra::migrator`]) parses its LWT.
+    async fn register_identity(
+        &self,
+        group_id: &str,
+        row: &DurableDescriptorIdentity,
+    ) -> Result<RegisterOutcome, Self::Error> {
+        let result = self
+            .session()
+            .execute_unpaged(
+                &self.queries.register_identity,
+                (
+                    group_id,
+                    row.state_type,
+                    row.name.as_str(),
+                    row.kind,
+                    row.resolver_id.as_deref(),
+                    row.codec_id.as_str(),
+                ),
             )
             .await
             .map_err(CassandraStoreError::from)?
-            .rows_stream::<DurableDescriptorIdentity>()
+            .into_rows_result()
             .map_err(CassandraStoreError::from)?;
-        futures::pin_mut!(rows);
-        let mut identities = Vec::new();
-        while let Some(row) = rows.try_next().await.map_err(CassandraStoreError::from)? {
-            identities.push(row);
+        // Read the `[applied]` flag and any echoed columns by name: the result
+        // column order is the driver's, not the schema's, so never positional.
+        let specs: Vec<String> = result
+            .column_specs()
+            .iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        let lwt = result
+            .maybe_first_row::<Row>()
+            .map_err(CassandraStoreError::from)?
+            .ok_or(CassandraValueStoreError::MalformedLwtResult)?;
+        if column_bool(&specs, &lwt, "[applied]")? {
+            Ok(RegisterOutcome::Applied)
+        } else {
+            Ok(RegisterOutcome::Conflict(conflict_identity(
+                &specs, &lwt, row,
+            )?))
         }
-        Ok(identities)
     }
+}
 
-    /// Inserts the first-use identity rows in one same-partition
-    /// `UNLOGGED BATCH` — every row shares the `segment_id` partition key,
-    /// so the batch is a single atomic mutation on the replica.
-    async fn write_descriptor_identities(
-        &self,
-        segment_id: SegmentId,
-        rows: Vec<DurableDescriptorIdentity>,
-    ) -> Result<(), Self::Error> {
-        let mut batch = Batch::new(BatchType::Unlogged);
-        let mut values = Vec::with_capacity(rows.len());
-        for row in rows {
-            batch.append_statement(self.queries.insert_descriptor_identity.clone());
-            values.push((
-                segment_id,
-                row.name,
-                row.version,
-                row.kind,
-                row.cell_kind,
-                row.codec_id,
-            ));
+/// Decodes the existing identity a failed `INSERT … IF NOT EXISTS` echoes.
+///
+/// `state_type` and `name` are the key we registered under (`asserted`), so the
+/// conflict shares them by construction — only the contested
+/// `kind`/`codec_id`/`resolver_id` are read from the echoed columns, by name
+/// (the result column order is the driver's, not the schema's).
+fn conflict_identity(
+    specs: &[String],
+    row: &Row,
+    asserted: &DurableDescriptorIdentity,
+) -> Result<DurableDescriptorIdentity, CassandraValueStoreError> {
+    Ok(DurableDescriptorIdentity {
+        state_type: asserted.state_type,
+        name: asserted.name.clone(),
+        kind: column_tinyint(specs, row, "kind")?,
+        resolver_id: column_text_opt(specs, row, "resolver_id"),
+        codec_id: column_text(specs, row, "codec_id")?,
+    })
+}
+
+/// The value of `name` in `row`, positioned via `specs` (name-matched), or
+/// `None` when the column is absent or NULL.
+fn column_value<'a>(specs: &[String], row: &'a Row, name: &str) -> Option<&'a CqlValue> {
+    let idx = specs.iter().position(|c| c == name)?;
+    row.columns.get(idx)?.as_ref()
+}
+
+fn column_bool(specs: &[String], row: &Row, name: &str) -> Result<bool, CassandraValueStoreError> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::Boolean(b)) => Ok(*b),
+        _ => Err(CassandraValueStoreError::MalformedLwtResult),
+    }
+}
+
+fn column_tinyint(specs: &[String], row: &Row, name: &str) -> Result<i8, CassandraValueStoreError> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::TinyInt(v)) => Ok(*v),
+        _ => Err(CassandraValueStoreError::MalformedLwtResult),
+    }
+}
+
+fn column_text(
+    specs: &[String],
+    row: &Row,
+    name: &str,
+) -> Result<String, CassandraValueStoreError> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::Text(s)) => Ok(s.clone()),
+        _ => Err(CassandraValueStoreError::MalformedLwtResult),
+    }
+}
+
+fn column_text_opt(specs: &[String], row: &Row, name: &str) -> Option<String> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::Text(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The non-key identity columns a [`CellQueries::read_identity`] point-read
+/// returns, deserialized as raw integers so an unknown future discriminant
+/// compares unequal rather than tearing the row down.
+#[derive(scylla::DeserializeRow)]
+struct IdentityColumns {
+    kind: i8,
+    resolver_id: Option<String>,
+    codec_id: String,
+}
+
+impl IdentityColumns {
+    fn into_identity(self, state_type: StateType, name: &str) -> DurableDescriptorIdentity {
+        DurableDescriptorIdentity {
+            state_type: state_type.into(),
+            name: name.to_owned(),
+            kind: self.kind,
+            resolver_id: self.resolver_id,
+            codec_id: self.codec_id,
         }
-        self.session()
-            .batch(&batch, values)
-            .await
-            .map_err(CassandraStoreError::from)?;
-        Ok(())
     }
 }
 
@@ -406,21 +515,23 @@ cassandra_queries! {
             TABLE_KEYED_STATE_VALUE
         ),
 
-        /// Reads every frozen descriptor-identity row for one segment
-        /// (single-partition query).
-        read_descriptor_identities: (
-            "SELECT name, version, kind, cell_kind, codec_id \
-             FROM $keyspace.{} WHERE segment_id = ?",
-            TABLE_KEYED_STATE_DESCRIPTOR
+        /// Point-reads the frozen identity row for one
+        /// `(group_id, state_type, name)` — the steady-state validation path.
+        read_identity: (
+            "SELECT kind, resolver_id, codec_id \
+             FROM $keyspace.{} WHERE group_id = ? AND state_type = ? AND name = ?",
+            TABLE_KEYED_STATE_IDENTITY
         ),
 
-        /// Inserts one frozen descriptor-identity row. Single owner per
-        /// segment, so a plain INSERT — never an LWT.
-        insert_descriptor_identity: (
+        /// Registers a first-use identity row. `IF NOT EXISTS` is the one
+        /// authorized keyed-state LWT (see [`DescriptorIdentityStore::register_identity`]):
+        /// a failed conditional insert echoes the existing row so the loser
+        /// validates without a re-read.
+        register_identity: (
             "INSERT INTO $keyspace.{} \
-             (segment_id, name, version, kind, cell_kind, codec_id) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-            TABLE_KEYED_STATE_DESCRIPTOR
+             (group_id, state_type, name, kind, resolver_id, codec_id) \
+             VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS",
+            TABLE_KEYED_STATE_IDENTITY
         ),
     }
 }

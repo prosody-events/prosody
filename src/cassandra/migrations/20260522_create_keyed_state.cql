@@ -1,7 +1,7 @@
 -- Migration: create_keyed_state
 -- Timestamp: 20260522
 -- Purpose: Provision the durable storage for keyed-state Value collections
---          plus the per-segment descriptor identity table. Each value row is
+--          plus the group-global descriptor identity table. Each value row is
 --          one provisional cell: `data` is the committed value once `event`
 --          is null, or the in-flight event's outcome while `event` is set,
 --          with `prev_data` carrying the committed value the event superseded.
@@ -33,24 +33,26 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_VALUE}} (
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };
 
--- Frozen structural identity per (segment, collection name). Written once
--- on first use by the partition's single owner (no LWT needed); a process
--- whose registered descriptor disagrees with the stored identity refuses
--- to dispatch (Permanent), so an incompatible deploy fails loudly instead
--- of silently misreading cells. `codec_id` is the codec's open-dispatch
--- string token (NULL for framework-defined cells). `version` is an
--- append-only clustering column: only version 1 is written today; future
--- identity migrations append new versions and stamp value rows
--- (`version`) per key as they migrate.
-CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_DESCRIPTOR}} (
-    segment_id    uuid,
-    name          text,
-    version       int,
+-- Frozen structural identity per (consumer group, state_type, collection name).
+-- This table exists solely to make a collection's identity immutable: once a
+-- collection has been used, its (kind, codec, resolver) can never silently
+-- change. Validated by point-read; registered on first use with
+-- `INSERT … IF NOT EXISTS` (the one authorized keyed-state LWT — once per
+-- collection per group, never on the hot path). A registered descriptor that
+-- disagrees with the stored row refuses to dispatch (Permanent), so an
+-- incompatible deploy fails loudly instead of silently misreading cells.
+-- `codec_id` is always present (every cell is codec-produced); `resolver_id`
+-- is NULL for the passthrough resolver, a token otherwise. `kind` is validated,
+-- not part of the key, so a name pins exactly one kind per state_type.
+CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_IDENTITY}} (
+    group_id    text,
+    state_type  tinyint,
+    name        text,
 
-    kind          tinyint,
-    cell_kind     smallint,
-    codec_id      text,
+    kind        tinyint,
+    resolver_id text,
+    codec_id    text,
 
-    PRIMARY KEY ((segment_id), name, version)
+    PRIMARY KEY ((group_id, state_type, name))
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };

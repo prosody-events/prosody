@@ -8,10 +8,10 @@
 
 use super::{CellCorruptReason, RawCellRow, try_decode_cell};
 use crate::state::EventRef;
+use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraValueStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
-use crate::state::descriptor_identity::INITIAL_VERSION;
 use crate::state::encoding::{Encoding, encode_payload};
 use bytes::Bytes;
 use color_eyre::eyre::Result;

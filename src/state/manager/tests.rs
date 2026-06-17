@@ -19,7 +19,9 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor::{ValueDescriptor, value_state};
-use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use crate::state::descriptor_identity::{
+    DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
+};
 use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellAccess;
@@ -215,8 +217,14 @@ async fn stage_under_timer(manager: &TestManager, key: &Key, value: u8) -> Resul
         trigger.tag,
     ));
     let session = manager.session(key.clone(), event, termination());
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("cart")?, &(), &bytes(value))
-        .await?;
+    CellAccess::<ValueKind>::set_cell(
+        &session,
+        StateType::Application,
+        &StateName::try_new("cart")?,
+        &(),
+        &bytes(value),
+    )
+    .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
     // `insert_async` returns `Err(key)` if already present — harmless; the
     // flag is idempotent.
@@ -314,12 +322,30 @@ fn timer_event(key: &Key) -> EventRef {
 async fn write_mixed(manager: &TestManager, key: &Key) -> Result<(TestSession, EventRef)> {
     let event = timer_event(key);
     let session = manager.session(key.clone(), event, termination());
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("cart")?, &(), &bytes(7))
-        .await?;
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("wishlist")?, &(), &bytes(13))
-        .await?;
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("last_seen")?, &(), &bytes(42))
-        .await?;
+    CellAccess::<ValueKind>::set_cell(
+        &session,
+        StateType::Application,
+        &StateName::try_new("cart")?,
+        &(),
+        &bytes(7),
+    )
+    .await?;
+    CellAccess::<ValueKind>::set_cell(
+        &session,
+        StateType::Application,
+        &StateName::try_new("wishlist")?,
+        &(),
+        &bytes(13),
+    )
+    .await?;
+    CellAccess::<ValueKind>::set_cell(
+        &session,
+        StateType::Application,
+        &StateName::try_new("last_seen")?,
+        &(),
+        &bytes(42),
+    )
+    .await?;
     Ok((session, event))
 }
 
@@ -506,23 +532,25 @@ impl CellStore<ValueKind> for PoisonPromoteCell {
 impl DescriptorIdentityStore for PoisonPromoteCell {
     type Error = PromotePoison;
 
-    async fn read_descriptor_identities(
+    async fn read_identity(
         &self,
-        segment_id: SegmentId,
-    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        group_id: &str,
+        state_type: StateType,
+        name: &str,
+    ) -> Result<Option<DurableDescriptorIdentity>, Self::Error> {
         self.inner
-            .read_descriptor_identities(segment_id)
+            .read_identity(group_id, state_type, name)
             .await
             .map_err(never)
     }
 
-    async fn write_descriptor_identities(
+    async fn register_identity(
         &self,
-        segment_id: SegmentId,
-        rows: Vec<DurableDescriptorIdentity>,
-    ) -> Result<(), Self::Error> {
+        group_id: &str,
+        row: &DurableDescriptorIdentity,
+    ) -> Result<RegisterOutcome, Self::Error> {
         self.inner
-            .write_descriptor_identities(segment_id, rows)
+            .register_identity(group_id, row)
             .await
             .map_err(never)
     }
@@ -573,10 +601,22 @@ async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
 
     let event = timer_event(&key);
     let session = manager.session(key.clone(), event, termination());
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("cart")?, &(), &bytes(7))
-        .await?;
-    CellAccess::<ValueKind>::set_cell(&session, &StateName::try_new("wishlist")?, &(), &bytes(13))
-        .await?;
+    CellAccess::<ValueKind>::set_cell(
+        &session,
+        StateType::Application,
+        &StateName::try_new("cart")?,
+        &(),
+        &bytes(7),
+    )
+    .await?;
+    CellAccess::<ValueKind>::set_cell(
+        &session,
+        StateType::Application,
+        &StateName::try_new("wishlist")?,
+        &(),
+        &bytes(13),
+    )
+    .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
 
     assert_eq!(

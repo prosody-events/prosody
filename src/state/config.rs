@@ -1,8 +1,8 @@
 //! User-facing configuration for the always-on keyed-state layer.
 
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
-use crate::state::StateName;
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
+use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
 use crate::util::from_env_with_fallback;
 use derive_builder::Builder;
@@ -71,7 +71,7 @@ pub struct KeyedStateConfiguration {
     pub recovery_delay: CompactDuration,
 
     #[builder(setter(skip), default)]
-    registrations: Vec<(&'static str, StructuralIdentity, CollectionDef)>,
+    registrations: Vec<(StateType, &'static str, StructuralIdentity, CollectionDef)>,
 }
 
 impl Default for KeyedStateConfiguration {
@@ -108,6 +108,7 @@ impl KeyedStateConfiguration {
         D: StateDescriptor,
     {
         self.registrations.push((
+            descriptor.state_type(),
             descriptor.name(),
             descriptor.structural_identity(),
             descriptor.collection_def(),
@@ -138,7 +139,7 @@ impl KeyedStateConfiguration {
     /// or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::new(self.default_ttl);
-        for (name, identity, def) in &self.registrations {
+        for (state_type, name, identity, def) in &self.registrations {
             if let Some(ttl) = def.ttl
                 && ttl.seconds() <= self.recovery_delay.seconds()
             {
@@ -148,7 +149,7 @@ impl KeyedStateConfiguration {
                     recovery_seconds: self.recovery_delay.seconds(),
                 });
             }
-            registry.register_identity(name, identity.clone(), *def)?;
+            registry.register_identity(*state_type, name, identity.clone(), *def)?;
         }
         Ok(registry)
     }

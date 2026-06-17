@@ -1,18 +1,22 @@
 //! In-memory keyed-state stores.
 
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
-use super::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
+use super::descriptor_identity::{
+    DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
+};
 use super::partition_store::CommittedCache;
 use super::store::CellStore;
 use super::value::ValueKind;
-use super::{CollectionId, CollectionRef, EventRef};
-use crate::SegmentId;
+use super::{CollectionId, CollectionRef, EventRef, StateType};
 use ahash::RandomState;
 use bytes::Bytes;
 use futures::{Stream, stream};
 use scc::hash_map::Entry;
 use std::convert::Infallible;
 use std::sync::Arc;
+
+/// Group-global identity key: `(group_id, state_type discriminator, name)`.
+type IdentityKey = (String, i8, String);
 
 /// In-memory [`CellStore`] for the Value kind.
 ///
@@ -124,41 +128,36 @@ impl CellStore<ValueKind> for MemoryCellStore {
 impl DescriptorIdentityStore for MemoryCellStore {
     type Error = Infallible;
 
-    async fn read_descriptor_identities(
+    async fn read_identity(
         &self,
-        segment_id: SegmentId,
-    ) -> Result<Vec<DurableDescriptorIdentity>, Self::Error> {
+        group_id: &str,
+        state_type: StateType,
+        name: &str,
+    ) -> Result<Option<DurableDescriptorIdentity>, Self::Error> {
+        let key = (group_id.to_owned(), state_type.into(), name.to_owned());
         Ok(self
             .inner
             .identities
-            .read_async(&segment_id, |_, rows| rows.clone())
-            .await
-            .unwrap_or_default())
+            .read_async(&key, |_, row| row.clone())
+            .await)
     }
 
-    async fn write_descriptor_identities(
+    async fn register_identity(
         &self,
-        segment_id: SegmentId,
-        rows: Vec<DurableDescriptorIdentity>,
-    ) -> Result<(), Self::Error> {
-        // Upsert by name, mirroring Cassandra's INSERT-overwrites-row
-        // semantics so the shared acquisition tests observe one row per
-        // collection on both backends.
-        let mut entry = self
-            .inner
-            .identities
-            .entry_async(segment_id)
-            .await
-            .or_default();
-        let segment = entry.get_mut();
-        for row in rows {
-            if let Some(existing) = segment.iter_mut().find(|r| r.name == row.name) {
-                *existing = row;
-            } else {
-                segment.push(row);
+        group_id: &str,
+        row: &DurableDescriptorIdentity,
+    ) -> Result<RegisterOutcome, Self::Error> {
+        // Atomic insert-if-absent, mirroring Cassandra's `INSERT … IF NOT
+        // EXISTS`: a present key yields `Conflict(existing)` so the caller
+        // validates without a re-read.
+        let key = (group_id.to_owned(), row.state_type, row.name.clone());
+        match self.inner.identities.entry_async(key).await {
+            Entry::Vacant(slot) => {
+                slot.insert_entry(row.clone());
+                Ok(RegisterOutcome::Applied)
             }
+            Entry::Occupied(existing) => Ok(RegisterOutcome::Conflict(existing.get().clone())),
         }
-        Ok(())
     }
 }
 
@@ -215,7 +214,7 @@ impl CommittedCache<ValueKind> for MemoryCommittedCache {
 #[derive(Debug, Default)]
 struct CellInner {
     cells: scc::HashMap<CollectionId<ValueKind>, StoredCell, RandomState>,
-    identities: scc::HashMap<SegmentId, Vec<DurableDescriptorIdentity>, RandomState>,
+    identities: scc::HashMap<IdentityKey, DurableDescriptorIdentity, RandomState>,
 }
 
 /// One stored cell in [`MemoryCellStore`].

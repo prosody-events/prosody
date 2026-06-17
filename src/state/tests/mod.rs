@@ -1,6 +1,7 @@
 pub(crate) mod cell_suite;
 pub(crate) mod dirty_value_suite;
 mod identity;
+pub(crate) mod identity_suite;
 pub(crate) mod value_suite;
 
 use self::cell_suite::{

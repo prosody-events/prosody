@@ -11,11 +11,12 @@
 //! [`PartitionStateStore`], so the status marks sessions set are visible to
 //! it.
 //!
-//! Acquisition is **eager**: descriptor identities are validated against
-//! the segment's durable rows before the manager exists, so no session can
-//! operate under an unvalidated identity. The partition loop retries
-//! failed acquisitions until shutdown, the same pattern as timer-manager
-//! initialization.
+//! Acquisition is **eager**: descriptor identities are validated against the
+//! group-global identity table before the manager exists, so no session can
+//! operate under an unvalidated identity. The validation is hoisted to a
+//! process-level latch (the identity table is group-global, so it runs once,
+//! not per partition). The partition loop retries failed acquisitions until
+//! shutdown, the same pattern as timer-manager initialization.
 //!
 //! State is **always wired** — there is no no-state mode. The manager is
 //! Kafka-agnostic: it mints a session for an already-resolved [`EventRef`],
@@ -30,7 +31,7 @@ use crate::consumer::event_context::BoxEventContextError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{
-    DescriptorIdentityError, DescriptorIdentityStore, DurableNames, acquire_descriptor_identities,
+    DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::{CommittedCache, PartitionStateStore, PartitionStoreError};
@@ -54,6 +55,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tokio::task::coop::cooperative;
 
 /// The Value lane's durable cell-store error of a [`StateBackend`] bundle.
@@ -114,7 +116,7 @@ pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
     type AcquireError: ClassifyError + Error + Send + Sync + 'static;
 
     /// Acquires the manager for `(topic, partition)`, eagerly validating
-    /// descriptor identities against the segment's durable rows.
+    /// descriptor identities against the group-global identity table.
     ///
     /// # Errors
     ///
@@ -136,15 +138,6 @@ where
     oracle: B::Oracle,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
-    /// Every collection name durable on the segment at acquisition time,
-    /// partitioned by kind — the union of the registered descriptors and any
-    /// stored identity row whose descriptor was since removed. The recovery
-    /// sweep enumerates each kind's bucket ([`DurableNames::names`]) against
-    /// *that kind's* lane so deregistered crash residue is still swept
-    /// (invariant 5), rather than the live registry alone. As kinds land, each
-    /// gets its bucket swept against its own lane and combined with logical-and
-    /// for the no-strand invariant — no change to this field.
-    names: DurableNames,
     segment_id: SegmentId,
     recovery_delay: CompactDuration,
     /// Keys with a standing `StateRecovery` backstop. Sessions read/set it to
@@ -223,15 +216,24 @@ where
         // refires, the next commit's re-arm (`clear_and_schedule`, a singleton
         // overwrite) simply replaces the refiring timer — still one backstop.
         self.inner.armed.remove_async(&key).await;
-        // Sweep each kind's name bucket against its own lane and AND the
-        // results: the single backstop unschedules only when every kind on the
-        // key resolved (the no-strand invariant). Value is the only production
-        // kind today, so this is a single-operand AND; a future kind adds
-        // `&& sweep_partition(map_store, names.names(MapKind::ID), …)` — keep the
-        // `all_resolved` binding as the AND accumulator so that growth is local.
+        // Sweep each kind's registered collections against its own lane and AND
+        // the results: the single backstop unschedules only when every kind on
+        // the key resolved (the no-strand invariant). Names come from the
+        // in-process registry (the authoritative declared set) — a collection
+        // whose descriptor was removed is dormant, not swept. Value is the only
+        // production kind today, so this is a single-operand AND; a future kind
+        // adds `&& sweep_partition(map_store,
+        // registry.collections_for_kind(MapKind::ID), …)` — keep the
+        // `all_resolved` binding as the AND accumulator so growth is local.
+        let value_collections: Vec<(StateType, StateName)> = self
+            .inner
+            .registry
+            .collections_for_kind(ValueKind::ID)
+            .map(|(state_type, name)| (state_type, name.clone()))
+            .collect();
         let value_resolved = sweep_partition(
             &self.inner.store,
-            self.inner.names.names(ValueKind::ID),
+            value_collections,
             &self.inner.registry,
             &state_key,
         )
@@ -260,6 +262,13 @@ pub struct StateManagerProvider<F, L> {
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     recovery_delay: CompactDuration,
+    /// Process-level latch for descriptor-identity validation. The identity
+    /// table is group-global, so validating the registry against it is a
+    /// once-per-process concern, not per-partition. Shared across provider
+    /// clones (an `Arc`), `get_or_try_init` runs the validation once on
+    /// success and re-runs on `Err` — preserving retry-until-shutdown while
+    /// the invariant *no state op runs under an unvalidated identity* holds.
+    validated: Arc<OnceCell<()>>,
 }
 
 impl<F, L> StateManagerProvider<F, L> {
@@ -269,7 +278,9 @@ impl<F, L> StateManagerProvider<F, L> {
     /// identity** via the crate-internal
     /// `segment::partition_segment_id` — the *same*
     /// derivation the defer stores use, so a partition's defer and state rows
-    /// share one id for operational lookup. Timers currently derive their
+    /// share one id for operational lookup. It is *also* the `group_id`
+    /// partition key of the group-global descriptor-identity table, validated
+    /// once per process at the first acquire. Timers currently derive their
     /// segment id with a separate legacy formula
     /// ([`Segment::for_partition`](crate::timers::store::Segment::for_partition),
     /// `NAMESPACE_URL`) pending a follow-up migration onto this id.
@@ -290,6 +301,7 @@ impl<F, L> StateManagerProvider<F, L> {
             registry,
             consumer_group,
             recovery_delay,
+            validated: Arc::new(OnceCell::new()),
         }
     }
 }
@@ -306,6 +318,7 @@ where
             registry: self.registry.clone(),
             consumer_group: self.consumer_group.clone(),
             recovery_delay: self.recovery_delay,
+            validated: self.validated.clone(),
         }
     }
 }
@@ -339,11 +352,17 @@ where
             .map_err(StateAcquireError::Factory)?;
         let oracle = backend.oracle();
         // Invariant: no state op executes under an unvalidated identity —
-        // the manager does not exist until the segment's durable identity
-        // rows match the registered descriptors. Identity lives on the shared
-        // control-plane store, decoupled from any kind's data store.
+        // the manager does not exist until the registered descriptors match
+        // the group's frozen identity rows. The identity table is group-global,
+        // so validation is a once-per-process latch (`get_or_try_init` coalesces
+        // concurrent first-acquires and re-runs on a transient `Err`); any
+        // partition's identity handle is equivalent. Identity lives on the
+        // shared control-plane store, decoupled from any kind's data store.
         let identity = backend.identity();
-        let names = acquire_descriptor_identities(&identity, &self.registry, segment_id)
+        self.validated
+            .get_or_try_init(|| {
+                acquire_descriptor_identities(&identity, &self.registry, &self.consumer_group)
+            })
             .await
             .map_err(StateAcquireError::Identity)?;
         let store = PartitionStateStore::new(
@@ -358,7 +377,6 @@ where
                 oracle,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
-                names,
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
@@ -367,15 +385,14 @@ where
     }
 }
 
-/// Sweeps every durable collection on `(segment, key)`, resolving any
+/// Sweeps the given registered collections on `(segment, key)`, resolving any
 /// provisional cell through the oracle.
 ///
-/// `names` is the segment's durable name set retained from acquisition (the
-/// union of registered descriptors and stored identity rows), so a
-/// deregistered collection's crash residue is still swept rather than
-/// stranded until its TTL (invariant 5, sweep-covers-everything). TTLs come
-/// from `registry`, which falls back to the middleware-wide default for a
-/// name no longer registered.
+/// `collections` is the kind's registered `(state_type, name)` set sourced from
+/// the in-process registry (the authoritative declared set). A collection whose
+/// descriptor was removed is **not** swept — its residue is dormant until the
+/// declaration returns and the key is accessed (an accepted non-concern). TTLs
+/// come from `registry`, falling back to the middleware-wide default.
 ///
 /// Returns `true` iff every collection ended fully resolved — the caller
 /// unschedules the backstop only then (the no-strand invariant). The status
@@ -392,7 +409,7 @@ where
 /// failure.
 pub(crate) async fn sweep_partition<K, S, O, C>(
     store: &PartitionStateStore<K, S, O, C>,
-    names: &[StateName],
+    collections: impl IntoIterator<Item = (StateType, StateName)>,
     registry: &CollectionDefRegistry,
     state_key: &StateKey,
 ) -> Result<bool, RecoveryError<S::Error, O::Error>>
@@ -409,11 +426,11 @@ where
     // inside `sweep_collection` (returning `false`). `cooperative` wraps each
     // sweep so the fan-out yields to the runtime every ~128 collections rather
     // than draining the whole batch in one poll.
-    let all_resolved = stream::iter(names.iter().cloned())
-        .map(|name| {
+    let all_resolved = stream::iter(collections)
+        .map(|(state_type, name)| {
             cooperative(async move {
-                let ttl = registry.ttl_for(&name);
-                let id = CollectionId::<K>::new(state_key.clone(), StateType::Application, name);
+                let ttl = registry.ttl_for(state_type, &name);
+                let id = CollectionId::<K>::new(state_key.clone(), state_type, name);
                 store.sweep_collection(&CollectionRef::new(id, ttl)).await
             })
         })

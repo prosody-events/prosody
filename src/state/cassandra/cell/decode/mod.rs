@@ -32,10 +32,10 @@
 //! the partition down).
 
 use crate::state::Encoding;
+use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraValueStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
-use crate::state::descriptor_identity::INITIAL_VERSION;
 use crate::state::encoding::decode_payload;
 use bytes::Bytes;
 use thiserror::Error;

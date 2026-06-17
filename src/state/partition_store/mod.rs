@@ -412,7 +412,10 @@ where
 
     /// Builds the per-collection [`CollectionRef`] with its registry TTL.
     fn collection_ref(&self, id: &CollectionId<K>) -> CollectionRef<K> {
-        CollectionRef::new(id.clone(), self.registry.ttl_for(id.name()))
+        CollectionRef::new(
+            id.clone(),
+            self.registry.ttl_for(id.state_type(), id.name()),
+        )
     }
 
     /// Patches the committed-value cache, logging and degrading on failure.

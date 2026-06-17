@@ -3,7 +3,7 @@
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
-use crate::state::{CommitMode, StateName, StateNameError};
+use crate::state::{CollectionKindId, CommitMode, StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -64,11 +64,18 @@ pub(crate) struct RegisteredCollection {
 }
 
 /// Registry of registered collections plus middleware-wide defaults for
-/// TTL / commit-mode lookups on names that are not registered (e.g.
-/// recovery-sweep entries whose descriptor was since removed).
+/// TTL / commit-mode lookups on names that are not registered.
+///
+/// Keyed by `(state_type, name)`: a collection's name is unique only *within*
+/// its [`StateType`] namespace, so the same name under two state types is two
+/// distinct entries and never an identity conflict. The recovery sweep
+/// enumerates the registered collections for a kind
+/// (`collections_for_kind`), the authoritative declared set — there is
+/// no durable-name union, so a collection whose descriptor was removed is
+/// simply dormant until it returns.
 #[derive(Clone, Debug)]
 pub struct CollectionDefRegistry {
-    defs: HashMap<StateName, RegisteredCollection>,
+    defs: HashMap<StateType, HashMap<StateName, RegisteredCollection>>,
     default_ttl: Option<CompactDuration>,
 }
 
@@ -110,13 +117,19 @@ impl CollectionDefRegistry {
     where
         D: DescriptorIdentity,
     {
-        self.register_identity(descriptor.name(), descriptor.structural_identity(), def)
+        self.register_identity(
+            descriptor.state_type(),
+            descriptor.name(),
+            descriptor.structural_identity(),
+            def,
+        )
     }
 
     /// Registration body over a pre-extracted identity, shared with the
     /// middleware builder (which stores registrations untyped).
     pub(crate) fn register_identity(
         &mut self,
+        state_type: StateType,
         name: &str,
         identity: StructuralIdentity,
         def: CollectionDef,
@@ -130,7 +143,8 @@ impl CollectionDefRegistry {
                 seconds: ttl.seconds(),
             });
         }
-        if let Some(existing) = self.defs.get(&name)
+        let namespace = self.defs.entry(state_type).or_default();
+        if let Some(existing) = namespace.get(&name)
             && existing.identity != identity
         {
             return Err(RegisterStateError::IdentityConflict {
@@ -139,35 +153,67 @@ impl CollectionDefRegistry {
                 requested: identity,
             });
         }
-        self.defs
-            .insert(name, RegisteredCollection { identity, def });
+        namespace.insert(name, RegisteredCollection { identity, def });
         Ok(())
     }
 
-    /// Looks up the registered collection for `name`, if any.
-    pub(crate) fn lookup(&self, name: &str) -> Option<(&StateName, &RegisteredCollection)> {
-        self.defs.get_key_value(name)
+    /// Looks up the registered collection for `(state_type, name)`, if any.
+    pub(crate) fn lookup(
+        &self,
+        state_type: StateType,
+        name: &str,
+    ) -> Option<(&StateName, &RegisteredCollection)> {
+        self.defs.get(&state_type)?.get_key_value(name)
     }
 
-    /// Returns every registered `(name, identity)` pair.
-    pub(crate) fn identities(&self) -> impl Iterator<Item = (&StateName, &StructuralIdentity)> {
-        self.defs.iter().map(|(name, c)| (name, &c.identity))
+    /// Returns every registered `(state_type, name, identity)` triple — the set
+    /// acquisition validates against the durable identity table.
+    pub(crate) fn identities(
+        &self,
+    ) -> impl Iterator<Item = (StateType, &StateName, &StructuralIdentity)> {
+        self.defs.iter().flat_map(|(state_type, namespace)| {
+            namespace
+                .iter()
+                .map(move |(name, c)| (*state_type, name, &c.identity))
+        })
     }
 
-    /// Returns the TTL bound to `name`, falling back to the
+    /// Returns the live `(state_type, name)` collections registered under
+    /// `kind` — the registry-sourced name set the recovery sweep enumerates for
+    /// that kind's lane.
+    pub(crate) fn collections_for_kind(
+        &self,
+        kind: CollectionKindId,
+    ) -> impl Iterator<Item = (StateType, &StateName)> {
+        self.defs.iter().flat_map(move |(state_type, namespace)| {
+            namespace.iter().filter_map(move |(name, c)| {
+                (c.identity.kind == kind).then_some((*state_type, name))
+            })
+        })
+    }
+
+    /// Returns the TTL bound to `(state_type, name)`, falling back to the
     /// middleware-wide default.
     #[must_use]
-    pub fn ttl_for(&self, name: &StateName) -> Option<CompactDuration> {
-        self.defs.get(name).map_or(self.default_ttl, |c| c.def.ttl)
+    pub fn ttl_for(&self, state_type: StateType, name: &StateName) -> Option<CompactDuration> {
+        self.lookup_collection(state_type, name)
+            .map_or(self.default_ttl, |c| c.def.ttl)
     }
 
-    /// Returns the commit mode bound to `name`, falling back to
+    /// Returns the commit mode bound to `(state_type, name)`, falling back to
     /// [`CommitMode::ReadCommitted`] for names not in the registry.
     #[must_use]
-    pub fn commit_mode_for(&self, name: &StateName) -> CommitMode {
-        self.defs
-            .get(name)
+    pub fn commit_mode_for(&self, state_type: StateType, name: &StateName) -> CommitMode {
+        self.lookup_collection(state_type, name)
             .map_or(CommitMode::ReadCommitted, |c| c.def.commit_mode)
+    }
+
+    fn lookup_collection(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Option<&RegisteredCollection> {
+        self.defs.get(&state_type)?.get(name)
     }
 }
 

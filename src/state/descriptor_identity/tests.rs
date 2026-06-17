@@ -1,140 +1,352 @@
-//! Descriptor-identity acquisition and kind-bucketing tests.
+//! Descriptor-identity validation tests.
 //!
-//! The acquisition-side coverage pins the broad invariant-5 union (stored rows
-//! plus registered descriptors). The bucketing property pins that
-//! [`DurableNames`](super::DurableNames) partitions names by their kind
-//! discriminator with no per-kind code — the kind-keyed map the recovery sweep
-//! enumerates per lane.
+//! The backend-generic store invariants (immutability, namespacing, concurrent
+//! convergence) run here over the memory store via the shared
+//! [`identity_suite`](crate::state::tests::identity_suite) runners, and again
+//! over Cassandra in `state::cassandra::tests`. The `acquire`-flow tests pin
+//! the orchestration on top: first-use registration, idempotent re-validation,
+//! and the seed-stale-state path where a frozen row disagrees with the
+//! registered descriptor (Permanent).
 
-use super::{DurableDescriptorIdentity, DurableNames, acquire_descriptor_identities};
+use super::{
+    DescriptorIdentityError, DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
+    acquire_descriptor_identities,
+};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::memory::MemoryCellStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::{CollectionKindId, StateName, descriptor_identity::DescriptorIdentityStore};
-use color_eyre::eyre::Result;
+use crate::state::tests::identity_suite::{
+    IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
+};
+use crate::state::{StateName, StateType};
+use color_eyre::eyre::{Result, eyre};
+use futures::executor::block_on;
 use quickcheck::{QuickCheck, TestResult};
-use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
-/// The durable name set returned by acquisition is the union of the
-/// stored rows and the registered descriptors — so a collection whose
-/// descriptor was since removed from the application (a stored row with
-/// no registry entry) is still enumerated for the recovery sweep
-/// (invariant 5). Regression: this fails if acquisition returns only the
-/// asserted (registered) names.
-#[tokio::test]
-async fn returns_stored_names_the_registry_no_longer_holds() -> Result<()> {
-    let store = MemoryCellStore::new();
-    let segment_id = Uuid::from_u128(0xABC);
-
-    // A prior deployment registered "wishlist" and wrote its identity row.
-    let wishlist: ValueDescriptor = value_state("wishlist");
-    let wishlist_name = StateName::try_new("wishlist")?;
-    store
-        .write_descriptor_identities(
-            segment_id,
-            vec![DurableDescriptorIdentity::from_identity(
-                &wishlist_name,
-                &wishlist.structural_identity(),
-            )],
-        )
-        .await?;
-
-    // The current deployment registers only "cart".
-    let mut registry = CollectionDefRegistry::default();
-    let cart: ValueDescriptor = value_state("cart");
-    registry.register(&cart, CollectionDef::new(None))?;
-
-    let names = acquire_descriptor_identities(&store, &registry, segment_id).await?;
-    let set: HashSet<&str> = names
-        .names(CollectionKindId::Value)
-        .iter()
-        .map(StateName::as_str)
-        .collect();
-
-    assert!(set.contains("cart"), "the registered name must be present");
-    assert!(
-        set.contains("wishlist"),
-        "the deregistered durable name must still be swept"
-    );
-    Ok(())
+fn cart() -> ValueDescriptor {
+    value_state("cart")
 }
 
-/// An empty registry does no identity I/O and returns no names — the
-/// inert state layer.
+/// A fresh group per call so concurrent test runs and quickcheck iterations
+/// never collide on the process-shared memory store.
+fn group() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// The backend-generic store contract (immutability, namespacing, idempotence)
+/// over the memory store. The Cassandra instantiation in
+/// `state::cassandra::tests` runs the same runner.
+#[test]
+fn prop_memory_identity_trace() {
+    fn prop(trace: IdentityTrace) -> TestResult {
+        let store = MemoryCellStore::new();
+        match block_on(run_identity_trace(&store, &group(), trace)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(IdentityTrace) -> TestResult);
+}
+
+/// N concurrent registrations of one identity converge on exactly one
+/// `Applied`, every other caller validating the winner.
+#[test]
+fn prop_memory_concurrent_identical_registration() {
+    fn prop(key_seed: u8, ident_seed: u8, n: u8) -> TestResult {
+        let store = MemoryCellStore::new();
+        let n = 1 + usize::from(n % 8);
+        match block_on(run_concurrent_identical(
+            &store,
+            &group(),
+            key_seed,
+            ident_seed,
+            n,
+        )) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::error("concurrent identical registration did not converge"),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(u8, u8, u8) -> TestResult);
+}
+
+/// Two concurrent registrations of differing identities: one wins, the loser
+/// sees the winner.
+#[test]
+fn prop_memory_concurrent_conflicting_registration() {
+    fn prop(key_seed: u8) -> TestResult {
+        let store = MemoryCellStore::new();
+        match block_on(run_concurrent_conflicting(&store, &group(), key_seed)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::error("conflicting registration did not converge on a winner"),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(u8) -> TestResult);
+}
+
+/// Wire-format freeze: the `keyed_state_identity` row's discriminants and the
+/// passthrough resolver token are a durable contract compared on every read, so
+/// changing any value silently bricks existing collections (a renamed variant
+/// still round-trips). Pin the literals so such a change fails loudly here, not
+/// in production. The codec tokens are frozen in their own codecs' tests; the
+/// Kafka resolver token in `consumer::kafka_state`.
+#[test]
+fn durable_identity_wire_contract_is_frozen() {
+    use crate::state::CollectionKindId;
+    use crate::state::descriptor::{Passthrough, ResolverId};
+
+    assert_eq!(i8::from(StateType::Application), 0);
+    assert_eq!(i8::from(CollectionKindId::Value), 1);
+    assert_eq!(<Passthrough<()> as ResolverId>::RESOLVER_ID, None);
+}
+
+/// An empty registry does no identity I/O and succeeds — the inert state layer.
 #[tokio::test]
-async fn empty_registry_returns_no_names() -> Result<()> {
+async fn empty_registry_does_no_io() -> Result<()> {
     let store = MemoryCellStore::new();
     let registry = CollectionDefRegistry::default();
-    let names = acquire_descriptor_identities(&store, &registry, Uuid::from_u128(1)).await?;
-    assert!(names.names(CollectionKindId::Value).is_empty());
+    acquire_descriptor_identities(&store, &registry, &group())
+        .await
+        .map_err(|e| eyre!("{e}"))?;
     Ok(())
 }
 
-/// Builds the bucketing inputs from generated `(name-seed, kind)` pairs: a
-/// small `c<n>` name pool (so collisions and cross-kind repeats occur) and
-/// the raw `i8` discriminant. Returns `None` if a name fails to construct,
-/// which `c<n>` never does — surfaced as a property error rather than a
-/// panic.
-fn build_pairs(seeds: Vec<(u8, i8)>) -> Option<Vec<(StateName, i8)>> {
-    seeds
-        .into_iter()
-        .map(|(seed, kind)| Some((StateName::try_new(format!("c{}", seed % 8)).ok()?, kind)))
-        .collect()
-}
+/// Acquisition registers a first-seen collection, then re-validates it
+/// idempotently against the now-present row — the steady-state path every
+/// later process takes.
+#[tokio::test]
+async fn acquire_registers_first_use_then_validates() -> Result<()> {
+    let store = MemoryCellStore::new();
+    let group = group();
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(&cart(), CollectionDef::new(None))?;
 
-/// Invariant: [`DurableNames`] buckets each name under its kind
-/// discriminator, drops names whose discriminator this build does not
-/// recognise (forward-compat), and [`DurableNames::names`] returns exactly
-/// the known-kind subset in arrival order — all generically, with no
-/// per-kind code.
-#[test]
-fn prop_durable_names_bucket_by_known_kind() {
-    fn prop(seeds: Vec<(u8, i8)>) -> TestResult {
-        let Some(pairs) = build_pairs(seeds) else {
-            return TestResult::error("c<n> name construction failed");
-        };
-        let mut durable = DurableNames::default();
-        // A plain model bucketing only the known discriminants.
-        let mut model: HashMap<CollectionKindId, Vec<StateName>> = HashMap::new();
-        for (name, kind) in &pairs {
-            durable.push(name.clone(), *kind);
-            if let Ok(known) = CollectionKindId::try_from(*kind) {
-                model.entry(known).or_default().push(name.clone());
-            }
-        }
-        // Every known kind's bucket matches the model exactly (order +
-        // duplicates), and an unknown-only run leaves every bucket empty.
-        for known in [CollectionKindId::Value, CollectionKindId::TestSecondary] {
-            let expected: &[StateName] = model.get(&known).map_or(&[], Vec::as_slice);
-            if durable.names(known) != expected {
-                return TestResult::error(format!("bucket {known:?} diverged from the model"));
-            }
-        }
-        TestResult::passed()
-    }
-    QuickCheck::new().quickcheck(prop as fn(Vec<(u8, i8)>) -> TestResult);
-}
-
-/// Frozen example: the Value discriminant (1) buckets under Value; an
-/// unknown discriminant (99) is dropped from every bucket.
-#[test]
-fn durable_names_buckets_value_and_drops_unknown() -> Result<()> {
-    let mut names = DurableNames::default();
-    names.push(
-        StateName::try_new("cart")?,
-        i8::from(CollectionKindId::Value),
+    // First acquire registers via the (memory) insert-if-absent.
+    acquire_descriptor_identities(&store, &registry, &group)
+        .await
+        .map_err(|e| eyre!("first acquire failed: {e}"))?;
+    let stored = store
+        .read_identity(&group, StateType::Application, "cart")
+        .await?;
+    assert_eq!(
+        stored,
+        Some(DurableDescriptorIdentity::from_identity(
+            StateType::Application,
+            "cart",
+            &cart().structural_identity(),
+        )),
+        "first acquire must freeze the registered identity",
     );
-    names.push(StateName::try_new("ghost")?, 99);
+
+    // Second acquire takes the read-and-match path; idempotent.
+    acquire_descriptor_identities(&store, &registry, &group)
+        .await
+        .map_err(|e| eyre!("second acquire failed: {e}"))?;
+    Ok(())
+}
+
+/// Seed-stale-state: a frozen row that disagrees with the registered
+/// descriptor (in any of `kind` / `codec_id` / `resolver_id`) makes acquisition
+/// fail `Permanent` — the row is written through the low-level store API, the
+/// way normal execution could not produce it. Property over the differing axis.
+#[test]
+fn prop_acquire_rejects_seeded_mismatch() {
+    fn prop(kind: i8, codec_sel: u8, resolver_sel: u8) -> TestResult {
+        // cart's real identity is kind=1 (Value), codec="json", resolver=None.
+        let codec_id = ["json", "binary", "legacy"][usize::from(codec_sel) % 3].to_owned();
+        let resolver_id = match resolver_sel % 3 {
+            0 => None,
+            1 => Some("kafka-message-ref".to_owned()),
+            _ => Some("other".to_owned()),
+        };
+        let stale = DurableDescriptorIdentity {
+            state_type: StateType::Application.into(),
+            name: "cart".to_owned(),
+            kind,
+            resolver_id,
+            codec_id,
+        };
+        // Skip the (rare) case where the generated row equals cart's identity:
+        // then there is no mismatch to detect.
+        let cart_identity = DurableDescriptorIdentity::from_identity(
+            StateType::Application,
+            "cart",
+            &cart().structural_identity(),
+        );
+        if stale == cart_identity {
+            return TestResult::discard();
+        }
+
+        let mut registry = CollectionDefRegistry::default();
+        if registry
+            .register(&cart(), CollectionDef::new(None))
+            .is_err()
+        {
+            return TestResult::error("cart registration failed");
+        }
+        let outcome = block_on(async {
+            let store = MemoryCellStore::new();
+            let g = group();
+            // Seed the stale row directly, then acquire with the real descriptor.
+            assert!(matches!(
+                store.register_identity(&g, &stale).await,
+                Ok(RegisterOutcome::Applied)
+            ));
+            acquire_descriptor_identities(&store, &registry, &g).await
+        });
+        match outcome {
+            Err(error @ DescriptorIdentityError::Mismatch { .. }) => {
+                if error.classify_error() == ErrorCategory::Permanent {
+                    TestResult::passed()
+                } else {
+                    TestResult::error("identity mismatch must classify Permanent")
+                }
+            }
+            Err(other) => TestResult::error(format!("expected Mismatch, got {other:?}")),
+            Ok(()) => TestResult::error("a stale identity row must fail acquisition"),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(i8, u8, u8) -> TestResult);
+}
+
+/// The headline cross-process safety property: two deploys registering the
+/// **same** collection with **different** identities race first-use
+/// registration against one group; exactly one acquires successfully and the
+/// other fails `Permanent`. This drives the register-`Conflict`→`validate`
+/// route directly (both start with the row absent, so both attempt the LWT —
+/// the loser validates the winner's echoed row), the cross-process race the
+/// seeded-mismatch property cannot reach via the read-present path.
+#[tokio::test]
+async fn concurrent_acquire_with_conflicting_identities_one_wins_one_permanent() -> Result<()> {
+    use crate::codec::{JsonBinaryCodec, JsonCodec};
+
+    let store = MemoryCellStore::new();
+    let group = group();
+
+    // Same name, different codec ("json" vs "binary") ⇒ different identity.
+    let mut json_registry = CollectionDefRegistry::default();
+    json_registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
+    let mut binary_registry = CollectionDefRegistry::default();
+    binary_registry.register(
+        &value_state::<JsonBinaryCodec>("cart"),
+        CollectionDef::new(None),
+    )?;
+
+    // Race both acquires against the shared store — concurrency by joining, no
+    // sleep. Whichever registers first wins; the loser reads its conflict.
+    let (json_result, binary_result) = futures::join!(
+        acquire_descriptor_identities(&store, &json_registry, &group),
+        acquire_descriptor_identities(&store, &binary_registry, &group),
+    );
+
+    let oks = [&json_result, &binary_result]
+        .into_iter()
+        .filter(|r| r.is_ok())
+        .count();
+    assert_eq!(oks, 1, "exactly one deploy may freeze the identity");
+
+    let loser = [json_result, binary_result]
+        .into_iter()
+        .find_map(Result::err)
+        .ok_or_else(|| eyre!("one deploy must lose"))?;
+    assert!(
+        matches!(loser, DescriptorIdentityError::Mismatch { .. }),
+        "the loser must see an identity mismatch, got {loser:?}",
+    );
+    assert_eq!(loser.classify_error(), ErrorCategory::Permanent);
+    Ok(())
+}
+
+/// Namespacing: the same name under two `state_type`s is two independent
+/// identity rows. Registering distinct identities under each both apply, and
+/// each reads back its own — neither overwrites the other.
+#[tokio::test]
+async fn state_type_namespaces_identity_rows() -> Result<()> {
+    let store = MemoryCellStore::new();
+    let group = group();
+    let application = DurableDescriptorIdentity {
+        state_type: StateType::Application.into(),
+        name: "cart".to_owned(),
+        kind: 1,
+        resolver_id: None,
+        codec_id: "json".to_owned(),
+    };
+    let framework = DurableDescriptorIdentity {
+        state_type: StateType::Framework.into(),
+        name: "cart".to_owned(),
+        kind: 1,
+        resolver_id: Some("kafka-message-ref".to_owned()),
+        codec_id: "binary".to_owned(),
+    };
 
     assert_eq!(
-        names.names(CollectionKindId::Value),
-        &[StateName::try_new("cart")?],
-        "the Value-discriminant name buckets under Value",
+        store.register_identity(&group, &application).await?,
+        RegisterOutcome::Applied
     );
-    assert!(
-        names.names(CollectionKindId::TestSecondary).is_empty(),
-        "an unknown discriminant lands in no bucket",
+    assert_eq!(
+        store.register_identity(&group, &framework).await?,
+        RegisterOutcome::Applied,
+        "the same name in a different namespace must not collide",
+    );
+    assert_eq!(
+        store
+            .read_identity(&group, StateType::Application, "cart")
+            .await?,
+        Some(application),
+    );
+    assert_eq!(
+        store
+            .read_identity(&group, StateType::Framework, "cart")
+            .await?,
+        Some(framework),
+    );
+    Ok(())
+}
+
+/// Namespacing extends to cells: a `(state_type, name)` change yields a
+/// distinct durable cell key, so an Application and a Framework collection
+/// sharing a name never read each other's value.
+#[tokio::test]
+async fn state_type_namespaces_cells() -> Result<()> {
+    use crate::state::cell::{Cell, Committed};
+    use crate::state::store::CellStore;
+    use crate::state::value::ValueKind;
+    use crate::state::{CollectionId, CollectionRef, StateKey};
+    use bytes::Bytes;
+
+    let store = MemoryCellStore::new();
+    let key: crate::Key = Arc::from("k");
+    let state_key = StateKey::new(Uuid::new_v4(), key);
+    let name = StateName::try_new("cart")?;
+    let app = CollectionRef::new(
+        CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name.clone()),
+        None,
+    );
+    let fw = CollectionRef::new(
+        CollectionId::<ValueKind>::new(state_key, StateType::Framework, name),
+        None,
+    );
+
+    store
+        .write_resolved(&app, &[((), Some(Bytes::from_static(b"app")))])
+        .await?;
+    store
+        .write_resolved(&fw, &[((), Some(Bytes::from_static(b"fw")))])
+        .await?;
+
+    assert_eq!(
+        store.read_cell(app.id(), &()).await?,
+        Cell::Resolved(Committed::new(Some(Bytes::from_static(b"app")))),
+    );
+    assert_eq!(
+        store.read_cell(fw.id(), &()).await?,
+        Cell::Resolved(Committed::new(Some(Bytes::from_static(b"fw")))),
+        "the framework-namespaced cell holds its own value",
     );
     Ok(())
 }

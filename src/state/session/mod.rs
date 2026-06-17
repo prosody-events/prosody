@@ -58,7 +58,7 @@ use crate::consumer::partition::ShutdownPhase;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::{
-    CellKind, DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
+    DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
 };
 use crate::state::identity::{CollectionId, CollectionKind, CollectionRef};
 use crate::state::oracle::CommitOracle;
@@ -120,9 +120,9 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Returns the session's capability slot for a resolver to read.
     fn loader(&self) -> &Self::Loader;
 
-    /// Validates that the named keyed-state collection is registered with
-    /// the asserted structural identity, returning the canonical
-    /// [`StateName`].
+    /// Validates that the keyed-state collection named `(state_type, name)` is
+    /// registered with the asserted structural identity, returning the
+    /// canonical [`StateName`].
     ///
     /// # Errors
     ///
@@ -133,6 +133,7 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
     fn verify_state_registration(
         &self,
         name: &'static str,
+        state_type: StateType,
         identity: &StructuralIdentity,
     ) -> Result<StateName, StateAccessError>;
 
@@ -169,6 +170,7 @@ where
     /// [`StateAccessError::Store`] when the underlying store fails.
     fn read_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &K::CellAddr,
     ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
@@ -181,6 +183,7 @@ where
     /// [`StateAccessError::Store`] when the underlying store fails.
     fn set_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &K::CellAddr,
         cell: &[u8],
@@ -194,6 +197,7 @@ where
     /// [`StateAccessError::Store`] when the underlying store fails.
     fn clear_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &K::CellAddr,
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
@@ -207,6 +211,7 @@ where
     /// [`StateAccessError::Store`] when the underlying store fails.
     fn flush_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &K::CellAddr,
     ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
@@ -517,19 +522,21 @@ where
         }
     }
 
-    /// The collection id for `name` under this session's key, for any kind
-    /// `K` (the kind is carried only at the type level, so no bound is needed).
-    fn id_for<K>(&self, name: &StateName) -> CollectionId<K> {
-        CollectionId::new(
-            self.inner.state_key.clone(),
-            StateType::Application,
-            name.clone(),
-        )
+    /// The collection id for `(state_type, name)` under this session's key, for
+    /// any kind `K` (the kind is carried only at the type level, so no bound is
+    /// needed). The `state_type` comes from the binding descriptor, threaded in
+    /// through the [`CellAccess`] ops, so a name is namespaced by its
+    /// `state_type`.
+    fn id_for<K>(&self, state_type: StateType, name: &StateName) -> CollectionId<K> {
+        CollectionId::new(self.inner.state_key.clone(), state_type, name.clone())
     }
 
-    /// The collection ref (id + registry TTL) for `name` under kind `K`.
-    fn ref_for<K>(&self, name: &StateName) -> CollectionRef<K> {
-        CollectionRef::new(self.id_for(name), self.inner.registry.ttl_for(name))
+    /// The collection ref (id + registry TTL) for `(state_type, name)` under
+    /// kind `K`.
+    fn ref_for<K>(&self, state_type: StateType, name: &StateName) -> CollectionRef<K> {
+        let id = self.id_for(state_type, name);
+        let ttl = self.inner.registry.ttl_for(state_type, name);
+        CollectionRef::new(id, ttl)
     }
 }
 
@@ -542,10 +549,11 @@ where
 {
     async fn read_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &(),
     ) -> Result<Option<Bytes>, StateAccessError> {
-        let id = self.id_for(name);
+        let id = self.id_for(state_type, name);
         self.inner
             .lanes
             .value
@@ -555,27 +563,34 @@ where
 
     async fn set_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &(),
         cell: &[u8],
     ) -> Result<(), StateAccessError> {
-        let id = self.id_for(name);
+        let id = self.id_for(state_type, name);
         self.inner.lanes.value.set_cell(&id, addr, cell).await;
         Ok(())
     }
 
-    async fn clear_cell(&self, name: &StateName, addr: &()) -> Result<(), StateAccessError> {
-        let id = self.id_for(name);
+    async fn clear_cell(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        addr: &(),
+    ) -> Result<(), StateAccessError> {
+        let id = self.id_for(state_type, name);
         self.inner.lanes.value.clear_cell(&id, addr).await;
         Ok(())
     }
 
     async fn flush_cell(
         &self,
+        state_type: StateType,
         name: &StateName,
         addr: &(),
     ) -> Result<StoreOutcome, StateAccessError> {
-        let collection_ref = self.ref_for(name);
+        let collection_ref = self.ref_for(state_type, name);
         self.inner
             .lanes
             .value
@@ -598,9 +613,10 @@ where
     fn verify_state_registration(
         &self,
         name: &'static str,
+        state_type: StateType,
         identity: &StructuralIdentity,
     ) -> Result<StateName, StateAccessError> {
-        let Some((state_name, registered)) = self.inner.registry.lookup(name) else {
+        let Some((state_name, registered)) = self.inner.registry.lookup(state_type, name) else {
             return Err(StateAccessError::Unregistered { name });
         };
         if registered.identity != *identity {
@@ -743,10 +759,13 @@ impl DescriptorIdentity for LifecycleAccess {
     }
 
     fn structural_identity(&self) -> StructuralIdentity {
+        // Never registered, never persisted, never validated: `bind` ignores
+        // this. It supplies a stable framework token (not reachable in the
+        // identity table) purely so `codec_id` can stay non-optional.
         StructuralIdentity {
             kind: CollectionKindId::Value,
-            cell_kind: CellKind::Codec,
-            codec_id: None,
+            codec_id: "\u{0}framework-lifecycle",
+            resolver_id: None,
         }
     }
 }
@@ -918,6 +937,7 @@ where
     fn verify_state_registration(
         &self,
         _name: &'static str,
+        _state_type: StateType,
         _identity: &StructuralIdentity,
     ) -> Result<StateName, StateAccessError> {
         Err(StateAccessError::Unavailable)
@@ -939,6 +959,7 @@ where
 {
     async fn read_cell(
         &self,
+        _state_type: StateType,
         _name: &StateName,
         _addr: &(),
     ) -> Result<Option<Bytes>, StateAccessError> {
@@ -947,6 +968,7 @@ where
 
     async fn set_cell(
         &self,
+        _state_type: StateType,
         _name: &StateName,
         _addr: &(),
         _cell: &[u8],
@@ -954,12 +976,18 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn clear_cell(&self, _name: &StateName, _addr: &()) -> Result<(), StateAccessError> {
+    async fn clear_cell(
+        &self,
+        _state_type: StateType,
+        _name: &StateName,
+        _addr: &(),
+    ) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
     async fn flush_cell(
         &self,
+        _state_type: StateType,
         _name: &StateName,
         _addr: &(),
     ) -> Result<StoreOutcome, StateAccessError> {

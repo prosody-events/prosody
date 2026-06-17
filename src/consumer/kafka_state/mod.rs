@@ -18,7 +18,7 @@ use crate::codec::Codec;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::loader::MessageLoader;
-use crate::state::descriptor::{CellResolver, ValueDescriptor, ValueStateError};
+use crate::state::descriptor::{CellResolver, ResolverId, ValueDescriptor, ValueStateError};
 use crate::state::session::StateSession;
 use crate::{Offset, Partition, Topic};
 use rmp_serde::decode::Error as MsgPackDecodeError;
@@ -89,6 +89,13 @@ impl Codec for KafkaRefCodec {
 /// A zero-sized strategy: it reads the loader from the session it is handed at
 /// [`CellResolver::resolve`] time, so the descriptor carries no resolver state.
 pub struct KafkaResolver;
+
+impl ResolverId for KafkaResolver {
+    /// Frozen into the durable structural identity; never change it once cells
+    /// exist. Shares the spelling of [`KafkaRefCodec`]'s codec id by
+    /// coincidence — the two tokens are independent identity columns.
+    const RESOLVER_ID: Option<&'static str> = Some("kafka-message-ref");
+}
 
 impl<S> CellResolver<S> for KafkaResolver
 where

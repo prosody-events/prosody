@@ -20,7 +20,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterState
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
     CommitDecision, CommitMode, EventRef, SharedStateBackend, StateBackendFactory, StateKey,
-    StateName,
+    StateName, StateType,
 };
 use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
@@ -235,7 +235,7 @@ impl Codec for CartCodec {
 #[tokio::test]
 async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
     let typed_cart: ValueDescriptor<CartCodec> = value_state("typed_cart");
-    assert_eq!(typed_cart.structural_identity().codec_id, Some("test-cart"));
+    assert_eq!(typed_cart.structural_identity().codec_id, "test-cart");
 
     let handle = bind_registered(typed_cart, MemoryLoader::new())?;
     let cart = Cart {
@@ -298,12 +298,10 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 /// N5: re-registering the same name with a *different* structural identity
 /// is rejected.
 ///
-/// Kept as a directed example rather than a generated property: a
-/// `StructuralIdentity` has only one field that can differ today
-/// (`codec_id`) — `CellKind` has one variant and `kind` is always `Value` —
-/// so a property over identity mismatches would add generation machinery
-/// without covering a case this example misses. Revisit when a second
-/// `CellKind`/kind exists.
+/// Kept as a directed example rather than a generated property: today only
+/// `codec_id` and `resolver_id` can differ (`kind` is always `Value`), so a
+/// property over identity mismatches would add generation machinery without
+/// covering a case this example misses. Revisit when a second `kind` exists.
 #[test]
 fn conflicting_registration_is_rejected() -> Result<()> {
     // The two descriptors share the cell kind (there is only one) but carry
@@ -330,8 +328,14 @@ fn reregistration_updates_operational_settings() -> Result<()> {
 
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(Some(initial_ttl)))?;
-    assert_eq!(registry.ttl_for(&name), Some(initial_ttl));
-    assert_eq!(registry.commit_mode_for(&name), CommitMode::ReadCommitted);
+    assert_eq!(
+        registry.ttl_for(StateType::Application, &name),
+        Some(initial_ttl)
+    );
+    assert_eq!(
+        registry.commit_mode_for(StateType::Application, &name),
+        CommitMode::ReadCommitted
+    );
 
     // Same name, same identity, different operational settings.
     registry.register(
@@ -339,12 +343,12 @@ fn reregistration_updates_operational_settings() -> Result<()> {
         CollectionDef::new(Some(updated_ttl)).with_commit_mode(CommitMode::ReadUncommitted),
     )?;
     assert_eq!(
-        registry.ttl_for(&name),
+        registry.ttl_for(StateType::Application, &name),
         Some(updated_ttl),
         "the re-registration's TTL must win"
     );
     assert_eq!(
-        registry.commit_mode_for(&name),
+        registry.commit_mode_for(StateType::Application, &name),
         CommitMode::ReadUncommitted,
         "the re-registration's commit mode must win"
     );

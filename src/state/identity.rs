@@ -159,6 +159,13 @@ impl StateKey {
 pub enum StateType {
     /// User application state.
     Application = 0,
+
+    /// Test-only fixture namespace used by the identity property tests to
+    /// prove a name is namespaced by `state_type` (a second namespace can
+    /// share a name with [`Self::Application`] without colliding) before a
+    /// second production namespace exists.
+    #[cfg(test)]
+    Framework = 1,
 }
 
 impl From<StateType> for i8 {
@@ -173,6 +180,8 @@ impl TryFrom<i8> for StateType {
     fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Application),
+            #[cfg(test)]
+            1 => Ok(Self::Framework),
             _ => Err(UnknownStateType(value)),
         }
     }
