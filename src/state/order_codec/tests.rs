@@ -6,9 +6,10 @@
 //! durable wire-format-freeze contract.
 
 use super::{
-    I64KeyCodec, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
+    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
     order_preserving_i64_decode,
 };
+use crate::error::{ClassifyError, ErrorCategory};
 use quickcheck::{QuickCheck, TestResult};
 
 /// Asserts the two halves of invariant 3 for one codec over a key pair:
@@ -54,10 +55,18 @@ fn u64_codec_is_monotone() {
     QuickCheck::new().quickcheck(prop as fn(u64, u64) -> TestResult);
 }
 
-/// A decode of the wrong byte width is rejected (a `Permanent` `BadLength`),
-/// never silently misread.
+/// A decode of the wrong byte width is rejected with a `BadLength` that reports
+/// the actual width and classifies `Permanent`, never silently misread.
 #[test]
 fn fixed_width_codecs_reject_bad_length() {
+    fn rejects_bad_length<C: OrderedKeyCodec>(bytes: &[u8]) -> bool {
+        matches!(
+            C::decode(bytes),
+            Err(error @ KeyCodecError::BadLength { expected: 8, actual })
+                if actual == bytes.len()
+                && error.classify_error() == ErrorCategory::Permanent
+        )
+    }
     fn prop(len: u8) -> TestResult {
         let len = usize::from(len) % 16;
         if len == 8 {
@@ -65,10 +74,23 @@ fn fixed_width_codecs_reject_bad_length() {
         }
         let bytes = vec![0u8; len];
         TestResult::from_bool(
-            I64KeyCodec::decode(&bytes).is_err() && U64KeyCodec::decode(&bytes).is_err(),
+            rejects_bad_length::<I64KeyCodec>(&bytes) && rejects_bad_length::<U64KeyCodec>(&bytes),
         )
     }
     QuickCheck::new().quickcheck(prop as fn(u8) -> TestResult);
+}
+
+/// A `Utf8KeyCodec` decode of non-UTF-8 bytes is rejected with an `InvalidUtf8`
+/// that classifies `Permanent` — the only `KeyCodecError` arm the fixed-width
+/// codecs cannot produce.
+#[test]
+fn utf8_codec_rejects_invalid_utf8() {
+    // 0xFF is never a valid UTF-8 byte (continuation/leading-byte rules forbid it).
+    let result = Utf8KeyCodec::decode(&[0xFF]);
+    assert!(matches!(result, Err(KeyCodecError::InvalidUtf8(_))));
+    if let Err(error) = result {
+        assert_eq!(error.classify_error(), ErrorCategory::Permanent);
+    }
 }
 
 /// Frozen-bytes golden for the Deque sign-flip index: these anchors are a
