@@ -2,59 +2,54 @@
 //!
 //! One Cassandra partition `(segment_id, key, state_type, name)` is one
 //! collection; each clustering row is one cell, addressed by a [`CellKey`] =
-//! [`Namespace`] + [`OrderKey`]. The namespace discriminates sub-structures
-//! (`Meta` bookkeeping vs `Entries` data); the order key orders cells within a
-//! namespace by **unsigned lexicographic byte order**, which is the
-//! order-preserving key codec's contract (see [`order_codec`]). A [`Scan`]
-//! addresses a contiguous single-namespace range.
+//! [`Section`] + [`OrderKey`]. The section groups a collection's cells into
+//! disjoint sub-structures (e.g. bookkeeping vs data); the order key orders
+//! cells within a section by **unsigned lexicographic byte order**, which is
+//! the order-preserving key codec's contract (see [`order_codec`]). A [`Scan`]
+//! addresses a contiguous single-section range.
 //!
-//! These types name no collection family — Value/Map/Deque never appear here —
-//! so the cell layer cannot dispatch on or escape its partition.
+//! Both components are **opaque to the cell layer** — it only stores them,
+//! sorts by them, and scopes scans to them; it never interprets their meaning.
+//! That meaning is owned by the collection layer: each collection defines its
+//! own section enum and order-key encoding and lowers them to the wire
+//! `i8`/bytes. So these types name no collection family — Value/Map/Deque never
+//! appear here — and the cell layer cannot dispatch on or escape its partition.
 //!
 //! [`order_codec`]: crate::state::order_codec
 
-use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
-use thiserror::Error;
 
-/// Structural sub-structure of a collection partition.
+/// Disjoint, orderable sub-grouping of one collection's cells.
 ///
-/// Not a collection type — Value/Map/Deque never appear here. `Meta` cells hold
-/// min/max bounds and bookkeeping; `Entries` cells hold the collection's data.
-///
-/// The wire discriminator persisted in the durable `namespace` column is the
-/// `i8` the [`From`]/[`TryFrom`] pair round-trips through, so a variant rename
-/// cannot drift the on-wire encoding from the type it encodes; an unknown
-/// discriminator decodes as [`UnknownNamespace`], which classifies `Permanent`.
-#[repr(i8)]
+/// The high-order component of a [`CellKey`], paired with the low-order
+/// [`OrderKey`]. **Opaque to the cell-store core**, which only stores it, sorts
+/// by it, and scopes single-section scans to it — it never interprets the
+/// meaning. Each collection owns the meaning of its sections (e.g. a Map's
+/// bound-bookkeeping section vs its entry section) and lowers its own section
+/// enum to the wire `i8` via the standard discriminator idiom
+/// (`Section::new(i8::from(my_section))`). The cell layer round-trips that `i8`
+/// without validating it, exactly as it treats [`OrderKey`] bytes — so an
+/// unknown discriminant is not an error *here*; it is the owning collection's
+/// `TryFrom` that classifies a bad section `Permanent`.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Namespace {
-    /// Bookkeeping cells (min/max bounds and similar).
-    Meta = 0,
+pub struct Section(i8);
 
-    /// The collection's data cells.
-    Entries = 1,
-}
-
-impl From<Namespace> for i8 {
-    fn from(namespace: Namespace) -> Self {
-        namespace as i8
+impl Section {
+    /// Wraps a collection-defined section discriminant. `const` so collections
+    /// can pin their section cells as constants.
+    #[must_use]
+    pub const fn new(discriminant: i8) -> Self {
+        Self(discriminant)
     }
 }
 
-impl TryFrom<i8> for Namespace {
-    type Error = UnknownNamespace;
-
-    fn try_from(value: i8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Meta),
-            1 => Ok(Self::Entries),
-            _ => Err(UnknownNamespace(value)),
-        }
+impl From<Section> for i8 {
+    fn from(section: Section) -> Self {
+        section.0
     }
 }
 
-/// Order-preserving cell key within a namespace.
+/// Order-preserving cell key within a section.
 ///
 /// Lexicographic (memcmp) byte order **is** the collection's logical order —
 /// the order-preserving key codec's contract. The bytes are opaque to the cell
@@ -83,13 +78,13 @@ impl OrderKey {
     }
 }
 
-/// Full intra-collection cell address. `Ord` is `(namespace, order_key)`.
+/// Full intra-collection cell address. `Ord` is `(section, order_key)`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CellKey {
-    /// The cell's sub-structure namespace.
-    pub namespace: Namespace,
+    /// The cell's sub-grouping section.
+    pub section: Section,
 
-    /// The cell's order-preserving key within the namespace.
+    /// The cell's order-preserving key within the section.
     pub order_key: OrderKey,
 }
 
@@ -103,13 +98,13 @@ pub enum Direction {
     Backward,
 }
 
-/// A single-namespace, start-anchored cell scan request.
+/// A single-section, start-anchored cell scan request.
 ///
-/// `start` is positional (non-`Option`) and `namespace` is required, so an
-/// unanchored or cross-namespace scan cannot be constructed.
+/// `start` is positional (non-`Option`) and `section` is required, so an
+/// unanchored or cross-section scan cannot be constructed.
 pub struct Scan<'a> {
-    /// The namespace whose cells the scan walks.
-    pub namespace: Namespace,
+    /// The section whose cells the scan walks.
+    pub section: Section,
 
     /// The inclusive anchor the scan starts from.
     pub start: &'a OrderKey,
@@ -122,17 +117,6 @@ pub struct Scan<'a> {
 
     /// The optional maximum number of cells to yield.
     pub limit: Option<usize>,
-}
-
-/// Error converting an `i8` that matches no [`Namespace`] variant.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("unknown namespace discriminator: {0}")]
-pub struct UnknownNamespace(i8);
-
-impl ClassifyError for UnknownNamespace {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
-    }
 }
 
 #[cfg(test)]

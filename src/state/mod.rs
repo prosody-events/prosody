@@ -68,7 +68,7 @@ pub mod value;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use cell_key::{CellKey, Direction, Namespace, OrderKey, Scan, UnknownNamespace};
+pub use cell_key::{CellKey, Direction, OrderKey, Scan, Section};
 pub use dirty::DirtyValueStore;
 pub use encoding::{Encoding, EncodingError};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
