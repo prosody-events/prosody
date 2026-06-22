@@ -12,7 +12,7 @@
 
 use crate::Key;
 use crate::codec::ErasedStateCodec;
-use crate::consumer::kafka_state::kafka_message_state;
+use crate::consumer::kafka_state::message_state;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -718,7 +718,7 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
 
     // Keyed-state ops — the FFI seam the bindings wrap. They reuse the *same*
     // typed `state(...)` path as the Rust API, recovering the codec from the
-    // payload via [`ErasedStateCodec`] (value cells) or `KafkaRefCodec`
+    // payload via [`ErasedStateCodec`] (value cells) or `MessageRefCodec`
     // (message refs); the blanket impl's `Self::Payload: ErasedStateCodec`
     // bound is what restricts a boxed context to the FFI payloads. See
     // [`ErasedStateCodec`] for the recovered-codec-matches-registration
@@ -766,7 +766,7 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// full message, loading through the consumer's message loader.
     ///
     /// Returns the same [`ConsumerMessage`] the typed
-    /// `KafkaMessageDescriptor::get` yields — topic, partition, offset, key,
+    /// `MessageDescriptor::get` yields — topic, partition, offset, key,
     /// timestamp, and payload — so a binding wraps it with the exact host
     /// `Message` type it already builds in `on_message`.
     ///
@@ -882,7 +882,7 @@ where
         name: &str,
         message: &ConsumerMessage<Self::Payload>,
     ) -> Result<(), BoxEventContextError> {
-        self.state(Registered::new(kafka_message_state(name)))
+        self.state(Registered::new(message_state(name)))
             .map_err(|e| Box::new(e) as BoxEventContextError)?
             .set(message)
             .await
@@ -893,7 +893,7 @@ where
         &self,
         name: &str,
     ) -> Result<Option<ConsumerMessage<Self::Payload>>, BoxEventContextError> {
-        self.state(Registered::new(kafka_message_state(name)))
+        self.state(Registered::new(message_state(name)))
             .map_err(|e| Box::new(e) as BoxEventContextError)?
             .get()
             .await

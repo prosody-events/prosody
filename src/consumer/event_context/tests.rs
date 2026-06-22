@@ -15,7 +15,7 @@
 //! unregistered-name classification are pinned by example.
 
 use super::{DynEventContext, EventContext};
-use crate::consumer::kafka_state::kafka_message_state;
+use crate::consumer::kafka_state::message_state;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::error::ErrorCategory;
@@ -179,7 +179,7 @@ fn prop_erased_value_parity() {
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
 
-/// The erased Kafka-message ops mirror the typed `KafkaMessageDescriptor`
+/// The erased Kafka-message ops mirror the typed `MessageDescriptor`
 /// path: `record_message` stores the message in hand, and `get_message`
 /// resolves it back to `(offset, payload)` through the loader — matching the
 /// typed handle's `set`/`get`.
@@ -194,7 +194,7 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
     loader.store_message(topic, partition, offset, key.clone(), payload.clone());
 
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&kafka_message_state("last_seen"), CollectionDef::new(None))?;
+    registry.register(&message_state("last_seen"), CollectionDef::new(None))?;
     let session = test_session(loader, registry);
     let ctx = MockEventContext::<Value>::new().with_session(session);
 
@@ -218,7 +218,7 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
 
     // Typed resolve over the same session must agree exactly.
     let typed = ctx
-        .state(Registered::new(kafka_message_state("last_seen")))
+        .state(Registered::new(message_state("last_seen")))
         .map_err(|e| eyre!("typed kafka bind: {e}"))?
         .get()
         .await

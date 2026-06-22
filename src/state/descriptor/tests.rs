@@ -9,7 +9,7 @@
 use super::*;
 use crate::codec::JsonCodecError;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::kafka_state::kafka_message_state;
+use crate::consumer::kafka_state::message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
@@ -309,7 +309,7 @@ fn conflicting_registration_is_rejected() -> Result<()> {
     // as a JSON value.
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(None))?;
-    let conflict = registry.register(&kafka_message_state("cart"), CollectionDef::new(None));
+    let conflict = registry.register(&message_state("cart"), CollectionDef::new(None));
     assert!(matches!(
         conflict,
         Err(RegisterStateError::IdentityConflict { .. })

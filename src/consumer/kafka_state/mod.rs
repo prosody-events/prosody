@@ -6,11 +6,11 @@
 //! meets Kafka. It composes the generic [`ValueDescriptor<C, R>`] over two
 //! strategies that live here, not in `src/state`:
 //!
-//! * [`KafkaRefCodec`] — the cell typing: `bytes ↔ KafkaMessageRef`, `MsgPack`.
-//! * [`KafkaResolver`] — the resolution strategy: `KafkaMessageRef → message`,
+//! * [`MessageRefCodec`] — the cell typing: `bytes ↔ MessageRef`, `MsgPack`.
+//! * [`MessageResolver`] — the resolution strategy: `MessageRef → message`,
 //!   loading through the session's loader.
 //!
-//! Handlers declare a collection via [`kafka_message_state`] and bind it
+//! Handlers declare a collection via [`message_state`] and bind it
 //! like any other descriptor; the handle's `get` returns the full
 //! [`ConsumerMessage`], and `set` takes the message in hand.
 
@@ -33,7 +33,7 @@ use thiserror::Error;
 /// Derived from the [`ConsumerMessage`] in hand at write time — the only
 /// production source of a ref.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KafkaMessageRef {
+pub struct MessageRef {
     /// Kafka topic.
     #[serde(with = "topic_serde")]
     pub topic: Topic,
@@ -45,7 +45,7 @@ pub struct KafkaMessageRef {
     pub offset: Offset,
 }
 
-impl<P> From<&ConsumerMessage<P>> for KafkaMessageRef {
+impl<P> From<&ConsumerMessage<P>> for MessageRef {
     fn from(message: &ConsumerMessage<P>) -> Self {
         Self {
             topic: message.topic(),
@@ -55,25 +55,25 @@ impl<P> From<&ConsumerMessage<P>> for KafkaMessageRef {
     }
 }
 
-/// `MsgPack` [`Codec`] for [`KafkaMessageRef`] cells.
+/// `MsgPack` [`Codec`] for [`MessageRef`] cells.
 ///
-/// Codec id `"kafka-message-ref"` is frozen into the durable structural
+/// Codec id `"message-ref"` is frozen into the durable structural
 /// identity; never change it once cells exist.
 #[derive(Default)]
-pub struct KafkaRefCodec;
+pub struct MessageRefCodec;
 
-impl Codec for KafkaRefCodec {
-    type Error = KafkaRefCodecError;
-    type Payload = KafkaMessageRef;
+impl Codec for MessageRefCodec {
+    type Error = MessageRefCodecError;
+    type Payload = MessageRef;
 
-    const CODEC_ID: &'static str = "kafka-message-ref";
+    const CODEC_ID: &'static str = "message-ref";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
-        rmp_serde::from_slice(buf).map_err(KafkaRefCodecError::Decode)
+        rmp_serde::from_slice(buf).map_err(MessageRefCodecError::Decode)
     }
 
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        write_named(buf, &payload).map_err(KafkaRefCodecError::Encode)
+        write_named(buf, &payload).map_err(MessageRefCodecError::Encode)
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
@@ -83,32 +83,29 @@ impl Codec for KafkaRefCodec {
     }
 }
 
-/// Resolution strategy that loads the full message a [`KafkaMessageRef`] points
+/// Resolution strategy that loads the full message a [`MessageRef`] points
 /// at, and lowers a message in hand back to its ref.
 ///
 /// A zero-sized strategy: it reads the loader from the session it is handed at
 /// [`CellResolver::resolve`] time, so the descriptor carries no resolver state.
-pub struct KafkaResolver;
+pub struct MessageResolver;
 
-impl ResolverId for KafkaResolver {
+impl ResolverId for MessageResolver {
     /// Frozen into the durable structural identity; never change it once cells
-    /// exist. Shares the spelling of [`KafkaRefCodec`]'s codec id by
+    /// exist. Shares the spelling of [`MessageRefCodec`]'s codec id by
     /// coincidence — the two tokens are independent identity columns.
-    const RESOLVER_ID: Option<&'static str> = Some("kafka-message-ref");
+    const RESOLVER_ID: Option<&'static str> = Some("message-ref");
 }
 
-impl<S> CellResolver<S> for KafkaResolver
+impl<S> CellResolver<S> for MessageResolver
 where
     S: StateSession<Loader: MessageLoader>,
 {
     type Resolved = ConsumerMessage<<S::Loader as MessageLoader>::Payload>;
-    type Stored = KafkaMessageRef;
+    type Stored = MessageRef;
     type Write<'a> = &'a ConsumerMessage<<S::Loader as MessageLoader>::Payload>;
 
-    async fn resolve(
-        session: &S,
-        stored: KafkaMessageRef,
-    ) -> Result<Self::Resolved, StateAccessError> {
+    async fn resolve(session: &S, stored: MessageRef) -> Result<Self::Resolved, StateAccessError> {
         session
             .loader()
             .load_message(stored.topic, stored.partition, stored.offset)
@@ -116,19 +113,19 @@ where
             .map_err(|error| StateAccessError::load(&error))
     }
 
-    fn stored_from(write: Self::Write<'_>) -> KafkaMessageRef {
-        KafkaMessageRef::from(write)
+    fn stored_from(write: Self::Write<'_>) -> MessageRef {
+        MessageRef::from(write)
     }
 }
 
 /// Descriptor for a collection whose cells reference Kafka message bodies.
 ///
-/// A [`ValueDescriptor`] over [`KafkaRefCodec`] + [`KafkaResolver`]; declare
-/// via [`kafka_message_state`].
-pub type KafkaMessageDescriptor = ValueDescriptor<KafkaRefCodec, KafkaResolver>;
+/// A [`ValueDescriptor`] over [`MessageRefCodec`] + [`MessageResolver`];
+/// declare via [`message_state`].
+pub type MessageDescriptor = ValueDescriptor<MessageRefCodec, MessageResolver>;
 
 /// Error returned by Kafka-message handle operations.
-pub type KafkaStateError = ValueStateError<KafkaRefCodecError>;
+pub type MessageStateError = ValueStateError<MessageRefCodecError>;
 
 /// Declares a Kafka-message collection named `name`.
 ///
@@ -137,7 +134,7 @@ pub type KafkaStateError = ValueStateError<KafkaRefCodecError>;
 /// validated here — an empty name fails loudly at registration, the
 /// fallible boundary.
 #[must_use]
-pub fn kafka_message_state(name: &str) -> KafkaMessageDescriptor {
+pub fn message_state(name: &str) -> MessageDescriptor {
     ValueDescriptor::new(name)
 }
 
@@ -161,13 +158,13 @@ mod topic_serde {
     }
 }
 
-/// Error from the [`KafkaRefCodec`] cell encode/decode.
+/// Error from the [`MessageRefCodec`] cell encode/decode.
 ///
 /// Both variants classify Permanent through [`ValueStateError`]'s codec arm: a
 /// cell that does not round-trip will not start to on retry.
 #[derive(Debug, Error)]
-pub enum KafkaRefCodecError {
-    /// The cell bytes did not decode as a [`KafkaMessageRef`].
+pub enum MessageRefCodecError {
+    /// The cell bytes did not decode as a [`MessageRef`].
     #[error("kafka message reference cell is corrupt")]
     Decode(#[source] MsgPackDecodeError),
 

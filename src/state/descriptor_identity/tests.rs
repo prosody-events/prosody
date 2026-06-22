@@ -161,7 +161,7 @@ fn prop_acquire_rejects_seeded_mismatch() {
         let codec_id = ["json", "binary", "legacy"][usize::from(codec_sel) % 3].to_owned();
         let resolver_id = match resolver_sel % 3 {
             0 => None,
-            1 => Some("kafka-message-ref".to_owned()),
+            1 => Some("message-ref".to_owned()),
             _ => Some("other".to_owned()),
         };
         let stale = DurableDescriptorIdentity {
@@ -280,7 +280,7 @@ async fn state_type_namespaces_identity_rows() -> Result<()> {
         state_type: StateType::Framework.into(),
         name: "cart".to_owned(),
         kind: 1,
-        resolver_id: Some("kafka-message-ref".to_owned()),
+        resolver_id: Some("message-ref".to_owned()),
         codec_id: "binary".to_owned(),
     };
 

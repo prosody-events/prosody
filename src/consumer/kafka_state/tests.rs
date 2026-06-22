@@ -1,4 +1,4 @@
-//! Kafka-message keyed-state tests: the [`KafkaMessageRef`] serde round-trip
+//! Kafka-message keyed-state tests: the [`MessageRef`] serde round-trip
 //! property and the end-to-end resolve-through-loader path.
 //!
 //! These bind through the *same* [`bind_registered`] machinery the JSON
@@ -25,8 +25,8 @@ const TOPIC_POOL: &[&str] = &[
     "shipments.outbound",
 ];
 
-fn last_seen() -> KafkaMessageDescriptor {
-    kafka_message_state("last_seen")
+fn last_seen() -> MessageDescriptor {
+    message_state("last_seen")
 }
 
 /// Wire-format freeze: the Kafka-message collection's codec and resolver tokens
@@ -38,20 +38,20 @@ fn kafka_message_identity_tokens_are_frozen() {
     use crate::codec::Codec;
     use crate::state::descriptor::ResolverId;
 
-    assert_eq!(KafkaRefCodec::CODEC_ID, "kafka-message-ref");
+    assert_eq!(MessageRefCodec::CODEC_ID, "message-ref");
     assert_eq!(
-        <KafkaResolver as ResolverId>::RESOLVER_ID,
-        Some("kafka-message-ref")
+        <MessageResolver as ResolverId>::RESOLVER_ID,
+        Some("message-ref")
     );
 }
 
 #[derive(Clone, Debug)]
-struct ArbKafkaMessageRef(KafkaMessageRef);
+struct ArbMessageRef(MessageRef);
 
-impl Arbitrary for ArbKafkaMessageRef {
+impl Arbitrary for ArbMessageRef {
     fn arbitrary(g: &mut Gen) -> Self {
         let topic_name = g.choose(TOPIC_POOL).copied().unwrap_or(TOPIC_POOL[0]);
-        Self(KafkaMessageRef {
+        Self(MessageRef {
             topic: Topic::from(topic_name),
             partition: i32::arbitrary(g),
             offset: i64::arbitrary(g),
@@ -69,18 +69,18 @@ fn message_for_testing(payload: Value) -> Result<ConsumerMessage<Value>> {
     ConsumerMessage::for_testing(topic, partition, offset, key, payload)
 }
 
-/// The `MsgPack` serde of [`KafkaMessageRef`] round-trips exactly — this is
-/// the [`KafkaRefCodec`] cell format.
+/// The `MsgPack` serde of [`MessageRef`] round-trips exactly — this is
+/// the [`MessageRefCodec`] cell format.
 #[test]
 fn prop_kafka_message_ref_msgpack_roundtrip() {
-    fn prop(message_ref: ArbKafkaMessageRef) -> bool {
-        let ArbKafkaMessageRef(message_ref) = message_ref;
+    fn prop(message_ref: ArbMessageRef) -> bool {
+        let ArbMessageRef(message_ref) = message_ref;
         let Ok(cell) = rmp_serde::to_vec_named(&message_ref) else {
             return false;
         };
-        rmp_serde::from_slice::<KafkaMessageRef>(&cell).is_ok_and(|decoded| decoded == message_ref)
+        rmp_serde::from_slice::<MessageRef>(&cell).is_ok_and(|decoded| decoded == message_ref)
     }
-    QuickCheck::new().quickcheck(prop as fn(ArbKafkaMessageRef) -> bool);
+    QuickCheck::new().quickcheck(prop as fn(ArbMessageRef) -> bool);
 }
 
 /// The ref derived from a message carries the message's exact Kafka
@@ -89,7 +89,7 @@ fn prop_kafka_message_ref_msgpack_roundtrip() {
 fn ref_from_message_carries_coordinates() -> Result<()> {
     let (topic, partition, offset) = coords();
     let message = message_for_testing(json!(1_i32))?;
-    let message_ref = KafkaMessageRef::from(&message);
+    let message_ref = MessageRef::from(&message);
     assert_eq!(message_ref.topic, topic);
     assert_eq!(message_ref.partition, partition);
     assert_eq!(message_ref.offset, offset);
@@ -139,7 +139,7 @@ async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
     };
     assert!(matches!(
         error,
-        KafkaStateError::Access(StateAccessError::Load { .. })
+        MessageStateError::Access(StateAccessError::Load { .. })
     ));
     assert_eq!(error.classify_error(), ErrorCategory::Permanent);
     Ok(())

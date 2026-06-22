@@ -21,9 +21,9 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonMiddlewareConfiguration, ConsumerConfiguration, DemandType, KafkaMessageDescriptor,
-    KafkaStateError, KeyedStateConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
-    kafka_message_state,
+    CommonMiddlewareConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
+    MessageDescriptor, MessageStateError, PipelineMiddlewareConfiguration, ProsodyConsumer,
+    message_state,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
@@ -55,8 +55,8 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-fn last_seen() -> KafkaMessageDescriptor {
-    kafka_message_state("last_seen")
+fn last_seen() -> MessageDescriptor {
+    message_state("last_seen")
 }
 
 /// What the handler saw, streamed to the test for content assertions.
@@ -84,7 +84,7 @@ struct CartHandler {
     /// can bind only collections it was handed a token for.
     cart: Registered<ValueDescriptor>,
     /// The registration handle for the `last_seen` Kafka-message collection.
-    last_seen: Registered<KafkaMessageDescriptor>,
+    last_seen: Registered<MessageDescriptor>,
 }
 
 impl CartHandler {
@@ -213,7 +213,7 @@ enum CartHandlerError {
 
     /// A Kafka-message-cell access or ref-codec failure.
     #[error(transparent)]
-    Kafka(#[from] KafkaStateError),
+    Kafka(#[from] MessageStateError),
 
     /// The cart cell held something other than an array.
     #[error("unexpected cart cell: {0}")]

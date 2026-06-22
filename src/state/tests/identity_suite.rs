@@ -50,10 +50,10 @@ fn key_for(seed: u8) -> (StateType, &'static str) {
 fn row_for(key_seed: u8, ident_seed: u8) -> DurableDescriptorIdentity {
     let (state_type, name) = key_for(key_seed);
     let kind = [1_i8, 2, 7][usize::from(ident_seed) % 3];
-    let codec_id = ["json", "binary", "kafka-message-ref"][usize::from(ident_seed >> 2_u8) % 3];
+    let codec_id = ["json", "binary", "message-ref"][usize::from(ident_seed >> 2_u8) % 3];
     let resolver_id = match (ident_seed >> 4_u8) % 3 {
         0 => None,
-        1 => Some("kafka-message-ref".to_owned()),
+        1 => Some("message-ref".to_owned()),
         _ => Some("other".to_owned()),
     };
     DurableDescriptorIdentity {

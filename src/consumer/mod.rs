@@ -129,8 +129,8 @@ pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::{PartitionProviders, new_context};
 pub use crate::consumer::kafka_state::{
-    KafkaMessageDescriptor, KafkaMessageRef, KafkaRefCodec, KafkaRefCodecError, KafkaResolver,
-    KafkaStateError, kafka_message_state,
+    MessageDescriptor, MessageRef, MessageRefCodec, MessageRefCodecError, MessageResolver,
+    MessageStateError, message_state,
 };
 pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
