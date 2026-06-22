@@ -82,6 +82,11 @@ pub struct StructuralIdentity {
 
     /// Resolver token ([`ResolverId::RESOLVER_ID`]); `None` for passthrough.
     pub resolver_id: Option<&'static str>,
+
+    /// Key-codec token for keyed kinds (Map); `None` for kinds without a key
+    /// codec (Value). Frozen into the durable identity the same way `codec_id`
+    /// is, so a keyed collection's key encoding can never silently change.
+    pub key_codec_id: Option<&'static str>,
 }
 
 /// Context-independent descriptor metadata: the name and frozen identity
@@ -370,6 +375,8 @@ where
             kind: CollectionKindId::Value,
             codec_id: C::CODEC_ID,
             resolver_id: R::RESOLVER_ID,
+            // Value is single-cell: no key codec. Map emits `Some(KC::KEY_CODEC_ID)`.
+            key_codec_id: None,
         }
     }
 }

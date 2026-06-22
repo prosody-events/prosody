@@ -93,6 +93,7 @@ impl DescriptorIdentityStore for CassandraDescriptorIdentityStore {
                     row.kind,
                     row.resolver_id.as_deref(),
                     row.codec_id.as_str(),
+                    row.key_codec_id.as_deref(),
                 ),
             )
             .await
@@ -137,6 +138,7 @@ fn conflict_identity(
         kind: column_tinyint(specs, row, "kind")?,
         resolver_id: column_text_opt(specs, row, "resolver_id"),
         codec_id: column_text(specs, row, "codec_id")?,
+        key_codec_id: column_text_opt(specs, row, "key_codec_id"),
     })
 }
 
@@ -195,6 +197,7 @@ struct IdentityColumns {
     kind: i8,
     resolver_id: Option<String>,
     codec_id: String,
+    key_codec_id: Option<String>,
 }
 
 impl IdentityColumns {
@@ -205,6 +208,7 @@ impl IdentityColumns {
             kind: self.kind,
             resolver_id: self.resolver_id,
             codec_id: self.codec_id,
+            key_codec_id: self.key_codec_id,
         }
     }
 }
@@ -216,7 +220,7 @@ cassandra_queries! {
         /// Point-reads the frozen identity row for one
         /// `(group_id, state_type, name)` — the steady-state validation path.
         read_identity: (
-            "SELECT kind, resolver_id, codec_id \
+            "SELECT kind, resolver_id, codec_id, key_codec_id \
              FROM $keyspace.{} WHERE group_id = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_IDENTITY
         ),
@@ -227,8 +231,8 @@ cassandra_queries! {
         /// validates without a re-read.
         register_identity: (
             "INSERT INTO $keyspace.{} \
-             (group_id, state_type, name, kind, resolver_id, codec_id) \
-             VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS",
+             (group_id, state_type, name, kind, resolver_id, codec_id, key_codec_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS",
             TABLE_KEYED_STATE_IDENTITY
         ),
     }

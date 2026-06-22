@@ -66,6 +66,10 @@ pub struct DurableDescriptorIdentity {
     /// Codec token ([`Codec::CODEC_ID`](crate::codec::Codec::CODEC_ID)) —
     /// always present, every cell is codec-produced.
     pub codec_id: String,
+
+    /// Key-codec token for keyed kinds (Map); `None` for kinds without a key
+    /// codec (Value).
+    pub key_codec_id: Option<String>,
 }
 
 impl DurableDescriptorIdentity {
@@ -81,6 +85,7 @@ impl DurableDescriptorIdentity {
             kind: identity.kind.into(),
             resolver_id: identity.resolver_id.map(str::to_owned),
             codec_id: identity.codec_id.to_owned(),
+            key_codec_id: identity.key_codec_id.map(str::to_owned),
         }
     }
 }

@@ -44,9 +44,10 @@ fn key_for(seed: u8) -> (StateType, &'static str) {
 }
 
 /// Builds the wire identity row a `(key, identity)` seed pair names. The
-/// `kind`/`codec_id`/`resolver_id` axes vary independently (including unknown
-/// discriminants and a present/absent resolver) so collisions on a key carry
-/// genuinely different identities.
+/// `kind`/`codec_id`/`resolver_id`/`key_codec_id` axes vary independently
+/// (including unknown discriminants and a present/absent resolver and key
+/// codec) so collisions on a key carry genuinely different identities — and the
+/// populated `key_codec_id` column path gets coverage over both backends.
 fn row_for(key_seed: u8, ident_seed: u8) -> DurableDescriptorIdentity {
     let (state_type, name) = key_for(key_seed);
     let kind = [1_i8, 2, 7][usize::from(ident_seed) % 3];
@@ -56,12 +57,16 @@ fn row_for(key_seed: u8, ident_seed: u8) -> DurableDescriptorIdentity {
         1 => Some("message-ref".to_owned()),
         _ => Some("other".to_owned()),
     };
+    // A spare seed bit toggles the key codec present/absent, so both backends
+    // exercise the populated and the NULL `key_codec_id` column.
+    let key_codec_id = ((ident_seed >> 6_u8) & 1 == 1).then(|| "key-json".to_owned());
     DurableDescriptorIdentity {
         state_type: state_type.into(),
         name: name.to_owned(),
         kind,
         resolver_id,
         codec_id: codec_id.to_owned(),
+        key_codec_id,
     }
 }
 

@@ -766,6 +766,7 @@ impl DescriptorIdentity for LifecycleAccess {
             kind: CollectionKindId::Value,
             codec_id: "\u{0}framework-lifecycle",
             resolver_id: None,
+            key_codec_id: None,
         }
     }
 }

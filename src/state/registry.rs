@@ -149,8 +149,8 @@ impl CollectionDefRegistry {
         {
             return Err(RegisterStateError::IdentityConflict {
                 name,
-                registered: existing.identity.clone(),
-                requested: identity,
+                registered: Box::new(existing.identity.clone()),
+                requested: Box::new(identity),
             });
         }
         namespace.insert(name, RegisteredCollection { identity, def });
@@ -274,10 +274,10 @@ pub enum RegisterStateError {
         name: StateName,
 
         /// Identity already held by the registry.
-        registered: StructuralIdentity,
+        registered: Box<StructuralIdentity>,
 
         /// Identity the new registration asserted.
-        requested: StructuralIdentity,
+        requested: Box<StructuralIdentity>,
     },
 }
 
