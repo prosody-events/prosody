@@ -41,6 +41,7 @@ use std::error::Error;
 
 pub mod cassandra;
 pub mod cell;
+pub mod cell_key;
 pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
@@ -52,6 +53,7 @@ pub mod identity;
 pub mod manager;
 pub mod memory;
 pub mod oracle;
+pub mod order_codec;
 pub mod partition_store;
 pub mod production;
 #[cfg(test)]
@@ -66,12 +68,17 @@ pub mod value;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub use cell_key::{CellKey, Direction, Namespace, OrderKey, Scan, UnknownNamespace};
 pub use dirty::DirtyValueStore;
 pub use encoding::{Encoding, EncodingError};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,
     StateNameError, StateType,
+};
+pub use order_codec::{
+    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
+    order_preserving_i64_decode,
 };
 pub use transaction::{CommitMode, Read};
 pub use value::{ValueKind, ValueOp};
