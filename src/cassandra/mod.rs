@@ -73,8 +73,8 @@ pub const TABLE_DEFERRED_TIMERS: &str = "deferred_timers";
 /// Table name for message deduplication records.
 pub const TABLE_DEDUPLICATION: &str = "deduplication";
 
-/// Table name for keyed-state Value collection partitions.
-pub const TABLE_KEYED_STATE_VALUE: &str = "keyed_state_value";
+/// Table name for keyed-state cell-store collection partitions.
+pub const TABLE_KEYED_STATE_CELL: &str = "keyed_state_cell";
 
 /// Table for the frozen group-global keyed-state descriptor identities.
 pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";

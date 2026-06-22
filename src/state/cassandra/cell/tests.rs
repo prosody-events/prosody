@@ -195,7 +195,7 @@ async fn absent_row_and_provisional_cells_stream() -> Result<()> {
 /// decompression cannot mask a regression to raw storage.
 #[tokio::test]
 async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
-    use crate::cassandra::TABLE_KEYED_STATE_VALUE;
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
     use crate::state::encoding::{Encoding, decode_payload};
 
     init_test_logging();
@@ -209,10 +209,10 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         .await?;
 
     let cql = format!(
-        "SELECT data FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} WHERE segment_id = ? AND key \
-         = ? AND state_type = ? AND name = ?"
+        "SELECT data FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? AND key = \
+         ? AND state_type = ? AND name = ?"
     );
-    let (segment_id, key, state_type, name) = super::primary_components(c.id());
+    let (segment_id, key, state_type, name, ..) = super::primary_components(c.id());
     let raw = store
         .session()
         .query_unpaged(cql, (segment_id, key, state_type, name))

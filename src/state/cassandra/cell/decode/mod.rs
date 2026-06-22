@@ -41,7 +41,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 /// Five-column shape produced by `SELECT data, prev_data, encoding,
-/// version, event` against `keyed_state_value`.
+/// version, event` against `keyed_state_cell`.
 ///
 /// Module-private — callers never observe the intermediate tuple.
 pub(super) type RawCellRow = (

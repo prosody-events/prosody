@@ -53,7 +53,7 @@ fn checksums_match_baseline() -> Result<()> {
         ),
         (
             "20260522_create_keyed_state.cql",
-            "8ba7426bed336d4ccd2f5427c9e1ec06ade540a1c494930b71a2292ee1099e7b",
+            "9bae7014461056da6668791e30552ef5fe2206d50f9fc313b72c48436c179905",
         ),
     ]
     .into();

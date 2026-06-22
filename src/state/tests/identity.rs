@@ -29,7 +29,11 @@ fn prop_collection_kind_id_discriminator_round_trip() {
 fn prop_state_type_discriminator_round_trip() {
     fn property(value: i8) -> bool {
         match value {
-            0 => StateType::try_from(value).is_ok_and(|state_type| i8::from(state_type) == value),
+            // `Application` (0) is the only production namespace; the `Framework`
+            // (1) fixture exists under `cfg(test)`. Both round-trip through `i8`.
+            0 | 1 => {
+                StateType::try_from(value).is_ok_and(|state_type| i8::from(state_type) == value)
+            }
             _ => StateType::try_from(value).is_err(),
         }
     }

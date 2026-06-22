@@ -1,7 +1,7 @@
 //! Cassandra-backed provisional-cell store.
 //!
 //! [`CassandraCellStore`] implements [`CellStore<ValueKind>`] over the
-//! `keyed_state_value` table provisioned by migration
+//! `keyed_state_cell` table provisioned by migration
 //! `20260522_create_keyed_state.cql`, and [`DescriptorIdentityStore`] over the
 //! group-global `keyed_state_identity` table. It is the provisional-cell
 //! replacement for the write-ahead-log-era `CassandraValueStore`: every durable
@@ -49,10 +49,11 @@ mod tests;
 
 use crate::SegmentId;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{CassandraStore, TABLE_KEYED_STATE_IDENTITY, TABLE_KEYED_STATE_VALUE};
+use crate::cassandra::{CassandraStore, TABLE_KEYED_STATE_CELL, TABLE_KEYED_STATE_IDENTITY};
 use crate::cassandra_queries;
 use crate::state::StateType;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
+use crate::state::cell_key::Namespace;
 use crate::state::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
@@ -119,10 +120,13 @@ impl CassandraCellStore {
         &self,
         id: &CollectionId<ValueKind>,
     ) -> Result<Option<RawCellRow>, CassandraValueStoreError> {
-        let (segment_id, key, state_type, name) = primary_components(id);
+        let (segment_id, key, state_type, name, namespace, order_key) = primary_components(id);
         let row = self
             .session()
-            .execute_unpaged(&self.queries.read_cell, (segment_id, key, state_type, name))
+            .execute_unpaged(
+                &self.queries.read_cell,
+                (segment_id, key, state_type, name, namespace, order_key),
+            )
             .await
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
@@ -168,7 +172,8 @@ impl CellStore<ValueKind> for CassandraCellStore {
         // Value is single-cell, so this slice is size-1: one `UPDATE`, exactly
         // as before. A multi-cell kind would group the per-row statements into
         // one same-partition `UNLOGGED BATCH`; that path lands with that kind.
-        let (segment_id, key, state_type, name) = primary_components(collection.id());
+        let (segment_id, key, state_type, name, namespace, order_key) =
+            primary_components(collection.id());
         for ((), write) in writes {
             let CellBlobs {
                 data,
@@ -187,13 +192,13 @@ impl CellStore<ValueKind> for CassandraCellStore {
                     |ttl| {
                         (
                             ttl, data, prev_data, encoding, version, event, segment_id, key,
-                            state_type, name,
+                            state_type, name, namespace, order_key,
                         )
                     },
                     || {
                         (
                             data, prev_data, encoding, version, event, segment_id, key, state_type,
-                            name,
+                            name, namespace, order_key,
                         )
                     },
                 )
@@ -207,7 +212,8 @@ impl CellStore<ValueKind> for CassandraCellStore {
         collection: &'a CollectionRef<ValueKind>,
         cells: &'a [((), Option<Bytes>)],
     ) -> Result<(), Self::Error> {
-        let (segment_id, key, state_type, name) = primary_components(collection.id());
+        let (segment_id, key, state_type, name, namespace, order_key) =
+            primary_components(collection.id());
         for ((), data) in cells {
             let CellBlobs {
                 data,
@@ -224,9 +230,15 @@ impl CellStore<ValueKind> for CassandraCellStore {
                     |ttl| {
                         (
                             ttl, data, encoding, version, segment_id, key, state_type, name,
+                            namespace, order_key,
                         )
                     },
-                    || (data, encoding, version, segment_id, key, state_type, name),
+                    || {
+                        (
+                            data, encoding, version, segment_id, key, state_type, name, namespace,
+                            order_key,
+                        )
+                    },
                 )
                 .await?;
         }
@@ -238,11 +250,12 @@ impl CellStore<ValueKind> for CassandraCellStore {
         collection: &'a CollectionRef<ValueKind>,
         addrs: &'a [()],
     ) -> Result<(), Self::Error> {
-        let (segment_id, key, state_type, name) = primary_components(collection.id());
+        let (segment_id, key, state_type, name, namespace, order_key) =
+            primary_components(collection.id());
         for () in addrs {
             self.execute_unpaged(
                 &self.queries.mark_resolved,
-                (segment_id, key, state_type, name),
+                (segment_id, key, state_type, name, namespace, order_key),
             )
             .await?;
         }
@@ -440,12 +453,29 @@ fn encode_cell_blobs(
     })
 }
 
-fn primary_components(id: &CollectionId<ValueKind>) -> (&SegmentId, &str, StateType, &str) {
+/// The partition-key columns plus the fixed Value cell's clustering key.
+///
+/// **Phase-1 shim.** Value is a one-cell collection at the fixed clustering key
+/// `(Namespace::Entries, OrderKey::empty())`, so this appends that constant
+/// address to every cell bind. Phase 3 threads the real [`CellKey`] through the
+/// store API and removes the shim.
+///
+/// [`CellKey`]: crate::state::cell_key::CellKey
+fn primary_components(
+    id: &CollectionId<ValueKind>,
+) -> (&SegmentId, &str, StateType, &str, i8, &'static [u8]) {
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
     let state_type = id.state_type();
     let name = id.name().as_str();
-    (segment_id, key, state_type, name)
+    (
+        segment_id,
+        key,
+        state_type,
+        name,
+        i8::from(Namespace::Entries),
+        &[],
+    )
 }
 
 /// Converts a per-write TTL to the `i32` the driver binds to `USING TTL ?`.
@@ -467,8 +497,9 @@ cassandra_queries! {
         read_cell: (
             "SELECT data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND namespace = ? AND order_key = ?",
+            TABLE_KEYED_STATE_CELL
         ),
 
         /// Stages a provisional cell with TTL (the full `data | prev_data |
@@ -476,16 +507,18 @@ cassandra_queries! {
         write_provisional: (
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND namespace = ? AND order_key = ?",
+            TABLE_KEYED_STATE_CELL
         ),
 
         /// Stages a provisional cell without TTL.
         write_provisional_no_ttl: (
             "UPDATE $keyspace.{} \
              SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND namespace = ? AND order_key = ?",
+            TABLE_KEYED_STATE_CELL
         ),
 
         /// Writes a resolved cell with TTL: the committed `data` plus its
@@ -493,16 +526,18 @@ cassandra_queries! {
         write_resolved: (
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND namespace = ? AND order_key = ?",
+            TABLE_KEYED_STATE_CELL
         ),
 
         /// Writes a resolved cell without TTL.
         write_resolved_no_ttl: (
             "UPDATE $keyspace.{} \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND namespace = ? AND order_key = ?",
+            TABLE_KEYED_STATE_CELL
         ),
 
         /// Promotes a provisional cell: nulls `prev_data` and `event`, keeping
@@ -511,8 +546,9 @@ cassandra_queries! {
         mark_resolved: (
             "UPDATE $keyspace.{} \
              SET prev_data = null, event = null \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-            TABLE_KEYED_STATE_VALUE
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND namespace = ? AND order_key = ?",
+            TABLE_KEYED_STATE_CELL
         ),
 
         /// Point-reads the frozen identity row for one
