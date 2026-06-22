@@ -3,7 +3,7 @@
 -- Purpose: Provision the durable storage for the uniform keyed-state CELL STORE
 --          plus the group-global descriptor identity table. One Cassandra
 --          partition (segment_id, key, state_type, name) is ONE collection; each
---          clustering row (section, order_key) is ONE cell. A cell is one
+--          clustering row (section, coordinate) is ONE cell. A cell is one
 --          provisional cell: `data` is the committed value once `event` is null,
 --          or the in-flight event's outcome while `event` is set, with
 --          `prev_data` carrying the committed value the event superseded. The
@@ -20,11 +20,11 @@ CREATE TYPE {{KEYSPACE}}.event_ref (
 
 -- One partition = one collection (one transactional cell store). Clustering
 -- columns address a cell within it: `section` groups a collection's cells into
--- disjoint sub-structures (bookkeeping vs data), `order_key` orders cells within
+-- disjoint sub-structures (bookkeeping vs data), `coordinate` orders cells within
 -- a section by unsigned lexicographic byte order (= the order-preserving codec's
 -- contract). Both are opaque to the cell store — the collection layer owns their
 -- meaning. A single-section forward scan is a contiguous clustering range:
---   WHERE <pk>=… AND section = ? AND order_key >= ?  (no ALLOW FILTERING).
+--   WHERE <pk>=… AND section = ? AND coordinate >= ?  (no ALLOW FILTERING).
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (
     segment_id uuid,
     key        text,
@@ -32,7 +32,7 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (
     name       text,
 
     section    tinyint,
-    order_key  blob,
+    coordinate blob,
 
     data       blob,
     prev_data  blob,
@@ -41,8 +41,8 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (
 
     event      frozen<event_ref>,
 
-    PRIMARY KEY ((segment_id, key, state_type, name), section, order_key)
-) WITH CLUSTERING ORDER BY (section ASC, order_key ASC)
+    PRIMARY KEY ((segment_id, key, state_type, name), section, coordinate)
+) WITH CLUSTERING ORDER BY (section ASC, coordinate ASC)
   AND compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };
 

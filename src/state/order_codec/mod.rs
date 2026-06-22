@@ -1,18 +1,18 @@
 //! Order-preserving key codecs.
 //!
 //! The load-bearing contract: **clustering byte-order == logical key order**.
-//! A codec maps a logical key to an [`OrderKey`] whose unsigned lexicographic
+//! A codec maps a logical key to a [`Coordinate`] whose unsigned lexicographic
 //! (memcmp) byte order matches the key's [`Ord`], so a forward clustering scan
 //! visits cells in ascending logical order without sorting in code. This is a
 //! *tested* contract (the per-codec monotonicity property), not a compiler
 //! proof: a non-monotone codec silently misorders scans.
 
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell_key::OrderKey;
+use crate::state::cell_key::Coordinate;
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
-/// Maps a logical key to an order-preserving [`OrderKey`] and back.
+/// Maps a logical key to an order-preserving [`Coordinate`] and back.
 ///
 /// The invariant every impl must satisfy (enforced by the per-codec
 /// monotonicity property test, not the type system):
@@ -27,7 +27,7 @@ pub trait OrderedKeyCodec {
     const KEY_CODEC_ID: &'static str;
 
     /// Encodes a key to its order-preserving bytes.
-    fn encode(key: &Self::Key) -> OrderKey;
+    fn encode(key: &Self::Key) -> Coordinate;
 
     /// Decodes order-preserving bytes back to the logical key.
     ///
@@ -64,8 +64,8 @@ impl OrderedKeyCodec for Utf8KeyCodec {
 
     const KEY_CODEC_ID: &'static str = "utf8.v1";
 
-    fn encode(key: &Self::Key) -> OrderKey {
-        OrderKey::from_bytes(key.clone().into_bytes())
+    fn encode(key: &Self::Key) -> Coordinate {
+        Coordinate::from_bytes(key.clone().into_bytes())
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
@@ -82,8 +82,8 @@ impl OrderedKeyCodec for I64KeyCodec {
 
     const KEY_CODEC_ID: &'static str = "i64.v1";
 
-    fn encode(key: &Self::Key) -> OrderKey {
-        OrderKey::from_bytes(order_preserving_i64(*key).to_vec())
+    fn encode(key: &Self::Key) -> Coordinate {
+        Coordinate::from_bytes(order_preserving_i64(*key).to_vec())
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
@@ -104,8 +104,8 @@ impl OrderedKeyCodec for U64KeyCodec {
 
     const KEY_CODEC_ID: &'static str = "u64.v1";
 
-    fn encode(key: &Self::Key) -> OrderKey {
-        OrderKey::from_bytes(key.to_be_bytes().to_vec())
+    fn encode(key: &Self::Key) -> Coordinate {
+        Coordinate::from_bytes(key.to_be_bytes().to_vec())
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {

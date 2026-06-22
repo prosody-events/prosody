@@ -120,12 +120,12 @@ impl CassandraCellStore {
         &self,
         id: &CollectionId<ValueKind>,
     ) -> Result<Option<RawCellRow>, CassandraValueStoreError> {
-        let (segment_id, key, state_type, name, section, order_key) = primary_components(id);
+        let (segment_id, key, state_type, name, section, coordinate) = primary_components(id);
         let row = self
             .session()
             .execute_unpaged(
                 &self.queries.read_cell,
-                (segment_id, key, state_type, name, section, order_key),
+                (segment_id, key, state_type, name, section, coordinate),
             )
             .await
             .map_err(CassandraStoreError::from)?
@@ -172,7 +172,7 @@ impl CellStore<ValueKind> for CassandraCellStore {
         // Value is single-cell, so this slice is size-1: one `UPDATE`, exactly
         // as before. A multi-cell kind would group the per-row statements into
         // one same-partition `UNLOGGED BATCH`; that path lands with that kind.
-        let (segment_id, key, state_type, name, section, order_key) =
+        let (segment_id, key, state_type, name, section, coordinate) =
             primary_components(collection.id());
         for ((), write) in writes {
             let CellBlobs {
@@ -192,13 +192,13 @@ impl CellStore<ValueKind> for CassandraCellStore {
                     |ttl| {
                         (
                             ttl, data, prev_data, encoding, version, event, segment_id, key,
-                            state_type, name, section, order_key,
+                            state_type, name, section, coordinate,
                         )
                     },
                     || {
                         (
                             data, prev_data, encoding, version, event, segment_id, key, state_type,
-                            name, section, order_key,
+                            name, section, coordinate,
                         )
                     },
                 )
@@ -212,7 +212,7 @@ impl CellStore<ValueKind> for CassandraCellStore {
         collection: &'a CollectionRef<ValueKind>,
         cells: &'a [((), Option<Bytes>)],
     ) -> Result<(), Self::Error> {
-        let (segment_id, key, state_type, name, section, order_key) =
+        let (segment_id, key, state_type, name, section, coordinate) =
             primary_components(collection.id());
         for ((), data) in cells {
             let CellBlobs {
@@ -230,13 +230,13 @@ impl CellStore<ValueKind> for CassandraCellStore {
                     |ttl| {
                         (
                             ttl, data, encoding, version, segment_id, key, state_type, name,
-                            section, order_key,
+                            section, coordinate,
                         )
                     },
                     || {
                         (
                             data, encoding, version, segment_id, key, state_type, name, section,
-                            order_key,
+                            coordinate,
                         )
                     },
                 )
@@ -250,12 +250,12 @@ impl CellStore<ValueKind> for CassandraCellStore {
         collection: &'a CollectionRef<ValueKind>,
         addrs: &'a [()],
     ) -> Result<(), Self::Error> {
-        let (segment_id, key, state_type, name, section, order_key) =
+        let (segment_id, key, state_type, name, section, coordinate) =
             primary_components(collection.id());
         for () in addrs {
             self.execute_unpaged(
                 &self.queries.mark_resolved,
-                (segment_id, key, state_type, name, section, order_key),
+                (segment_id, key, state_type, name, section, coordinate),
             )
             .await?;
         }
@@ -456,16 +456,16 @@ fn encode_cell_blobs(
 /// The fixed section of Value's single cell.
 ///
 /// **Phase-1 shim.** Value is a one-cell collection, so its cell lives at one
-/// constant clustering key `(VALUE_SECTION, empty order key)`. The discriminant
-/// is arbitrary while the section is opaque (no wire freeze until the
-/// collection layer); Phase 3/4 introduces a `ValueNs` section enum and removes
-/// this shim.
+/// constant clustering key `(VALUE_SECTION, empty coordinate)`. The
+/// discriminant is arbitrary while the section is opaque (no wire freeze until
+/// the collection layer); Phase 3/4 introduces a `ValueNs` section enum and
+/// removes this shim.
 const VALUE_SECTION: Section = Section::new(1);
 
 /// The partition-key columns plus the fixed Value cell's clustering key.
 ///
 /// **Phase-1 shim.** Appends Value's constant cell address
-/// `(VALUE_SECTION, empty order key)` to every cell bind. Phase 3 threads the
+/// `(VALUE_SECTION, empty coordinate)` to every cell bind. Phase 3 threads the
 /// real [`CellKey`] through the store API and removes the shim.
 ///
 /// [`CellKey`]: crate::state::cell_key::CellKey
@@ -506,7 +506,7 @@ cassandra_queries! {
             "SELECT data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND order_key = ?",
+             AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -516,7 +516,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND order_key = ?",
+             AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -525,7 +525,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} \
              SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND order_key = ?",
+             AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -535,7 +535,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND order_key = ?",
+             AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -544,7 +544,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND order_key = ?",
+             AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -555,7 +555,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} \
              SET prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND order_key = ?",
+             AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 

@@ -1,26 +1,26 @@
 //! Cell-addressing invariants.
 //!
-//! Covers the `CellKey` ordering contract `(section, order_key)` and
-//! `OrderKey`'s least-element/round-trip behaviour. The `Section` discriminant
-//! is **opaque** here — the cell layer never validates it — so the
+//! Covers the `CellKey` ordering contract `(section, coordinate)` and
+//! `Coordinate`'s least-element/round-trip behaviour. The `Section`
+//! discriminant is **opaque** here — the cell layer never validates it — so the
 //! per-collection discriminant freeze + unknown-rejection lives with the
 //! collection section enums (invariant 7), not in the cell core.
 
-use super::{CellKey, Direction, OrderKey, Scan, Section};
+use super::{CellKey, Coordinate, Direction, Scan, Section};
 use quickcheck::{QuickCheck, TestResult};
 
-/// [`CellKey`] orders by `(section, order_key)`: the section discriminant
-/// dominates, then the unsigned-lexicographic order-key bytes break ties.
+/// [`CellKey`] orders by `(section, coordinate)`: the section discriminant
+/// dominates, then the unsigned-lexicographic coordinate bytes break ties.
 #[test]
-fn cell_key_orders_by_section_then_order_key() {
+fn cell_key_orders_by_section_then_coordinate() {
     fn prop(a_sec: i8, a_key: Vec<u8>, b_sec: i8, b_key: Vec<u8>) -> TestResult {
         let a = CellKey {
             section: Section::new(a_sec),
-            order_key: OrderKey::from_bytes(a_key.clone()),
+            coordinate: Coordinate::from_bytes(a_key.clone()),
         };
         let b = CellKey {
             section: Section::new(b_sec),
-            order_key: OrderKey::from_bytes(b_key.clone()),
+            coordinate: Coordinate::from_bytes(b_key.clone()),
         };
         let expected = (a_sec, a_key).cmp(&(b_sec, b_key));
         TestResult::from_bool(a.cmp(&b) == expected)
@@ -39,11 +39,11 @@ fn section_round_trips_discriminant() {
     QuickCheck::new().quickcheck(prop as fn(i8) -> bool);
 }
 
-/// `OrderKey::empty()` is the least key and round-trips its bytes.
+/// `Coordinate::empty()` is the least coordinate and round-trips its bytes.
 #[test]
-fn order_key_empty_is_least() {
-    assert!(OrderKey::empty().as_bytes().is_empty());
-    assert!(OrderKey::empty() <= OrderKey::from_bytes(vec![0u8]));
+fn coordinate_empty_is_least() {
+    assert!(Coordinate::empty().as_bytes().is_empty());
+    assert!(Coordinate::empty() <= Coordinate::from_bytes(vec![0u8]));
 }
 
 /// Construction smoke for [`Scan`]: the required `section`/`start` fields and
@@ -51,7 +51,7 @@ fn order_key_empty_is_least() {
 /// `start`/`section` is enforced by the field types, not provable at runtime.)
 #[test]
 fn scan_construction_carries_section_and_start() {
-    let start = OrderKey::empty();
+    let start = Coordinate::empty();
     let scan = Scan {
         section: Section::new(1),
         start: &start,
