@@ -104,10 +104,10 @@ pub enum RegisterOutcome {
 
 /// Group-global control-plane store for frozen descriptor-identity rows.
 ///
-/// Implemented by every durable cell store (memory and Cassandra). Both
-/// methods are keyed by `group_id` plus the `(state_type, name)` collection
-/// key, so any partition's store handle is equivalent — identity is decoupled
-/// from any partition's cell data.
+/// Implemented by the dedicated memory and Cassandra identity stores —
+/// distinct from any kind's cell store. Both methods are keyed by `group_id`
+/// plus the `(state_type, name)` collection key, so any partition's store
+/// handle is equivalent — identity is decoupled from any partition's cell data.
 pub trait DescriptorIdentityStore: Send + Sync + 'static {
     /// Error type for identity reads and writes.
     type Error: ClassifyError + Error + Send + Sync + 'static;
