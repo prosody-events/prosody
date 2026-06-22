@@ -21,10 +21,9 @@ type IdentityKey = (String, i8, String);
 /// In-memory [`CellStore`] for the Value kind.
 ///
 /// The provisional-cell durable backend: one cell per collection (Value's
-/// `CellAddr` is `()`), each either resolved or provisional, plus the
-/// per-segment descriptor-identity rows. One instance is shared
-/// process-wide across partition reassignments (`Clone` shares the `Arc`),
-/// so committed state and identities survive a rebalance within the process.
+/// `CellAddr` is `()`), each either resolved or provisional. One instance is
+/// shared process-wide across partition reassignments (`Clone` shares the
+/// `Arc`), so committed state survives a rebalance within the process.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCellStore {
     inner: Arc<CellInner>,
@@ -125,7 +124,27 @@ impl CellStore<ValueKind> for MemoryCellStore {
     }
 }
 
-impl DescriptorIdentityStore for MemoryCellStore {
+/// In-memory group-global [`DescriptorIdentityStore`].
+///
+/// The control-plane half of in-memory keyed state, decoupled from any kind's
+/// cell data. One instance is shared process-wide across partition
+/// reassignments (`Clone` shares the `Arc`), so registered identities survive a
+/// rebalance within the process — the property `acquire_descriptor_identities`
+/// relies on to coalesce cross-partition first-acquires.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryDescriptorIdentityStore {
+    inner: Arc<scc::HashMap<IdentityKey, DurableDescriptorIdentity, RandomState>>,
+}
+
+impl MemoryDescriptorIdentityStore {
+    /// Creates an empty identity store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
     type Error = Infallible;
 
     async fn read_identity(
@@ -135,11 +154,7 @@ impl DescriptorIdentityStore for MemoryCellStore {
         name: &str,
     ) -> Result<Option<DurableDescriptorIdentity>, Self::Error> {
         let key = (group_id.to_owned(), state_type.into(), name.to_owned());
-        Ok(self
-            .inner
-            .identities
-            .read_async(&key, |_, row| row.clone())
-            .await)
+        Ok(self.inner.read_async(&key, |_, row| row.clone()).await)
     }
 
     async fn register_identity(
@@ -151,7 +166,7 @@ impl DescriptorIdentityStore for MemoryCellStore {
         // EXISTS`: a present key yields `Conflict(existing)` so the caller
         // validates without a re-read.
         let key = (group_id.to_owned(), row.state_type, row.name.clone());
-        match self.inner.identities.entry_async(key).await {
+        match self.inner.entry_async(key).await {
             Entry::Vacant(slot) => {
                 slot.insert_entry(row.clone());
                 Ok(RegisterOutcome::Applied)
@@ -214,7 +229,6 @@ impl CommittedCache<ValueKind> for MemoryCommittedCache {
 #[derive(Debug, Default)]
 struct CellInner {
     cells: scc::HashMap<CollectionId<ValueKind>, StoredCell, RandomState>,
-    identities: scc::HashMap<IdentityKey, DurableDescriptorIdentity, RandomState>,
 }
 
 /// One stored cell in [`MemoryCellStore`].

@@ -22,7 +22,9 @@ use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::state::cassandra::{CassandraCellStore, CellQueries};
+use crate::state::cassandra::{
+    CassandraCellStore, CassandraDescriptorIdentityStore, CellQueries, IdentityQueries,
+};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
@@ -163,6 +165,7 @@ impl StorageBackend {
 ///         timer_provider,
 ///         dedup_provider,
 ///         cell_store,
+///         identity_store,
 ///     } => {
 ///         // All are Cassandra
 ///     }
@@ -197,6 +200,8 @@ pub enum StorePair {
         dedup_provider: CassandraDeduplicationStoreProvider,
         /// Keyed-state cell store sharing the same session.
         cell_store: CassandraCellStore,
+        /// Keyed-state descriptor-identity store sharing the same session.
+        identity_store: CassandraDescriptorIdentityStore,
     },
 }
 
@@ -308,6 +313,10 @@ impl StorePair {
                 validate_keyed_state_ttl(keyed_state_ttl)?;
                 let cell_queries = Arc::new(CellQueries::new(store.session(), keyspace).await?);
                 let cell_store = CassandraCellStore::new(store.clone(), cell_queries);
+                let identity_queries =
+                    Arc::new(IdentityQueries::new(store.session(), keyspace).await?);
+                let identity_store =
+                    CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
 
                 Ok(Self::Cassandra {
                     trigger_provider,
@@ -315,6 +324,7 @@ impl StorePair {
                     timer_provider,
                     dedup_provider,
                     cell_store,
+                    identity_store,
                 })
             }
         }

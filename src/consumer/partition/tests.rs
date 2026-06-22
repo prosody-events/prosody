@@ -7,7 +7,7 @@ use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Uncommitte
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::loader::MemoryLoader;
 use crate::state::manager::StateManagerProvider;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{CommitDecision, EventRef, SharedStateBackend, StateKey};
@@ -67,7 +67,12 @@ impl CommitOracle for FixedOracle {
 /// tests: state is always wired, so even tests that never touch state mint a
 /// real (empty-registry) provider over the in-memory backend.
 type MemoryStateProvider = StateManagerProvider<
-    SharedStateBackend<MemoryCellStore, FixedOracle, MemoryCommittedCache>,
+    SharedStateBackend<
+        MemoryCellStore,
+        MemoryDescriptorIdentityStore,
+        FixedOracle,
+        MemoryCommittedCache,
+    >,
     MemoryLoader<serde_json::Value>,
 >;
 
@@ -76,6 +81,7 @@ fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider
     StateManagerProvider::new(
         SharedStateBackend::new(
             MemoryCellStore::new(),
+            MemoryDescriptorIdentityStore::new(),
             FixedOracle::committed(),
             MemoryCommittedCache::new(),
         ),

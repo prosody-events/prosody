@@ -14,7 +14,7 @@ use super::{
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
-use crate::state::memory::MemoryCellStore;
+use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
@@ -42,7 +42,7 @@ fn group() -> String {
 #[test]
 fn prop_memory_identity_trace() {
     fn prop(trace: IdentityTrace) -> TestResult {
-        let store = MemoryCellStore::new();
+        let store = MemoryDescriptorIdentityStore::new();
         match block_on(run_identity_trace(&store, &group(), trace)) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::failed(),
@@ -57,7 +57,7 @@ fn prop_memory_identity_trace() {
 #[test]
 fn prop_memory_concurrent_identical_registration() {
     fn prop(key_seed: u8, ident_seed: u8, n: u8) -> TestResult {
-        let store = MemoryCellStore::new();
+        let store = MemoryDescriptorIdentityStore::new();
         let n = 1 + usize::from(n % 8);
         match block_on(run_concurrent_identical(
             &store,
@@ -79,7 +79,7 @@ fn prop_memory_concurrent_identical_registration() {
 #[test]
 fn prop_memory_concurrent_conflicting_registration() {
     fn prop(key_seed: u8) -> TestResult {
-        let store = MemoryCellStore::new();
+        let store = MemoryDescriptorIdentityStore::new();
         match block_on(run_concurrent_conflicting(&store, &group(), key_seed)) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::error("conflicting registration did not converge on a winner"),
@@ -108,7 +108,7 @@ fn durable_identity_wire_contract_is_frozen() {
 /// An empty registry does no identity I/O and succeeds — the inert state layer.
 #[tokio::test]
 async fn empty_registry_does_no_io() -> Result<()> {
-    let store = MemoryCellStore::new();
+    let store = MemoryDescriptorIdentityStore::new();
     let registry = CollectionDefRegistry::default();
     acquire_descriptor_identities(&store, &registry, &group())
         .await
@@ -121,7 +121,7 @@ async fn empty_registry_does_no_io() -> Result<()> {
 /// later process takes.
 #[tokio::test]
 async fn acquire_registers_first_use_then_validates() -> Result<()> {
-    let store = MemoryCellStore::new();
+    let store = MemoryDescriptorIdentityStore::new();
     let group = group();
     let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
@@ -190,7 +190,7 @@ fn prop_acquire_rejects_seeded_mismatch() {
             return TestResult::error("cart registration failed");
         }
         let outcome = block_on(async {
-            let store = MemoryCellStore::new();
+            let store = MemoryDescriptorIdentityStore::new();
             let g = group();
             // Seed the stale row directly, then acquire with the real descriptor.
             assert!(matches!(
@@ -225,7 +225,7 @@ fn prop_acquire_rejects_seeded_mismatch() {
 async fn concurrent_acquire_with_conflicting_identities_one_wins_one_permanent() -> Result<()> {
     use crate::codec::{JsonBinaryCodec, JsonCodec};
 
-    let store = MemoryCellStore::new();
+    let store = MemoryDescriptorIdentityStore::new();
     let group = group();
 
     // Same name, different codec ("json" vs "binary") ⇒ different identity.
@@ -267,7 +267,7 @@ async fn concurrent_acquire_with_conflicting_identities_one_wins_one_permanent()
 /// each reads back its own — neither overwrites the other.
 #[tokio::test]
 async fn state_type_namespaces_identity_rows() -> Result<()> {
-    let store = MemoryCellStore::new();
+    let store = MemoryDescriptorIdentityStore::new();
     let group = group();
     let application = DurableDescriptorIdentity {
         state_type: StateType::Application.into(),

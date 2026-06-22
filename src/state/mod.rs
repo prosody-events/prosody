@@ -221,39 +221,42 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
 }
 
 /// Partition-agnostic [`StateBackendFactory`]: clones the same cell store,
-/// oracle, and cache for every partition.
+/// identity store, oracle, and cache for every partition.
 ///
 /// Suits compositions whose stores are not partition-scoped — memory-backed
 /// tests and bespoke wiring; production uses the partition-scoped factories
-/// in [`production`]. The cell store doubles as the shared
-/// [`DescriptorIdentityStore`].
+/// in [`production`]. The cell store (`S`) and the descriptor-identity store
+/// (`I`) are distinct, decoupled parts.
 #[derive(Clone, Debug)]
-pub struct SharedStateBackend<S, O, C> {
+pub struct SharedStateBackend<S, I, O, C> {
     cell: S,
+    identity: I,
     oracle: O,
     cache: C,
 }
 
-impl<S, O, C> SharedStateBackend<S, O, C> {
+impl<S, I, O, C> SharedStateBackend<S, I, O, C> {
     /// Creates a backend factory that hands out clones of the supplied
     /// parts.
     #[must_use]
-    pub fn new(cell: S, oracle: O, cache: C) -> Self {
+    pub fn new(cell: S, identity: I, oracle: O, cache: C) -> Self {
         Self {
             cell,
+            identity,
             oracle,
             cache,
         }
     }
 }
 
-impl<S, O, C> StateBackendFactory for SharedStateBackend<S, O, C>
+impl<S, I, O, C> StateBackendFactory for SharedStateBackend<S, I, O, C>
 where
-    S: CellStore<ValueKind> + DescriptorIdentityStore + Clone,
+    S: CellStore<ValueKind> + Clone,
+    I: DescriptorIdentityStore + Clone,
     O: CommitOracle,
     C: CommittedCache<ValueKind>,
 {
-    type Backend = PartitionBackend<O, S, S, C>;
+    type Backend = PartitionBackend<O, I, S, C>;
     type Error = Infallible;
 
     fn for_partition(
@@ -261,10 +264,9 @@ where
         _topic: Topic,
         _partition: Partition,
     ) -> Result<Self::Backend, Self::Error> {
-        // Identity store = the cell store (it also persists identity rows).
         Ok(PartitionBackend::new(
             self.oracle.clone(),
-            self.cell.clone(),
+            self.identity.clone(),
             self.cell.clone(),
             self.cache.clone(),
         ))

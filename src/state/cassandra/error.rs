@@ -50,12 +50,6 @@ pub enum CassandraValueStoreError {
         /// The only version this build accepts.
         expected: i32,
     },
-
-    /// An `INSERT … IF NOT EXISTS` identity registration returned a result
-    /// row without the expected `[applied]` flag or echoed columns. Only
-    /// reachable from a driver/cluster contract break, not application data.
-    #[error("descriptor identity registration returned a malformed LWT result")]
-    MalformedLwtResult,
 }
 
 impl ClassifyError for CassandraValueStoreError {
@@ -65,8 +59,7 @@ impl ClassifyError for CassandraValueStoreError {
             Self::Encoding(_)
             | Self::CorruptCell { .. }
             | Self::CorruptUdt(_)
-            | Self::VersionMismatch { .. }
-            | Self::MalformedLwtResult => ErrorCategory::Permanent,
+            | Self::VersionMismatch { .. } => ErrorCategory::Permanent,
         }
     }
 }

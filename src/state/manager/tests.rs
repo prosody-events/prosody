@@ -19,10 +19,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::descriptor::{ValueDescriptor, value_state};
-use crate::state::descriptor_identity::{
-    DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
-};
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellAccess;
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
@@ -79,7 +76,12 @@ impl CommitOracle for FixedOracle {
     }
 }
 
-type TestBackend = SharedStateBackend<MemoryCellStore, FixedOracle, MemoryCommittedCache>;
+type TestBackend = SharedStateBackend<
+    MemoryCellStore,
+    MemoryDescriptorIdentityStore,
+    FixedOracle,
+    MemoryCommittedCache,
+>;
 type TestProvider = StateManagerProvider<TestBackend, MemoryLoader<serde_json::Value>>;
 type TestManager =
     StateManager<<TestBackend as StateBackendFactory>::Backend, MemoryLoader<serde_json::Value>>;
@@ -127,7 +129,12 @@ fn provider_with(
     registry: Arc<CollectionDefRegistry>,
 ) -> TestProvider {
     StateManagerProvider::new(
-        SharedStateBackend::new(cell, oracle, MemoryCommittedCache::new()),
+        SharedStateBackend::new(
+            cell,
+            MemoryDescriptorIdentityStore::new(),
+            oracle,
+            MemoryCommittedCache::new(),
+        ),
         MemoryLoader::new(),
         registry,
         Arc::from("test-group"),
@@ -529,33 +536,6 @@ impl CellStore<ValueKind> for PoisonPromoteCell {
     }
 }
 
-impl DescriptorIdentityStore for PoisonPromoteCell {
-    type Error = PromotePoison;
-
-    async fn read_identity(
-        &self,
-        group_id: &str,
-        state_type: StateType,
-        name: &str,
-    ) -> Result<Option<DurableDescriptorIdentity>, Self::Error> {
-        self.inner
-            .read_identity(group_id, state_type, name)
-            .await
-            .map_err(never)
-    }
-
-    async fn register_identity(
-        &self,
-        group_id: &str,
-        row: &DurableDescriptorIdentity,
-    ) -> Result<RegisterOutcome, Self::Error> {
-        self.inner
-            .register_identity(group_id, row)
-            .await
-            .map_err(never)
-    }
-}
-
 /// Lifts the inner store's [`Infallible`] error into [`PromotePoison`]; never
 /// called, because [`Infallible`] is uninhabited.
 fn never(error: Infallible) -> PromotePoison {
@@ -563,7 +543,12 @@ fn never(error: Infallible) -> PromotePoison {
 }
 
 type PoisonProvider = StateManagerProvider<
-    SharedStateBackend<PoisonPromoteCell, FixedOracle, MemoryCommittedCache>,
+    SharedStateBackend<
+        PoisonPromoteCell,
+        MemoryDescriptorIdentityStore,
+        FixedOracle,
+        MemoryCommittedCache,
+    >,
     MemoryLoader<serde_json::Value>,
 >;
 
@@ -574,7 +559,12 @@ fn poison_provider(
     registry: Arc<CollectionDefRegistry>,
 ) -> PoisonProvider {
     StateManagerProvider::new(
-        SharedStateBackend::new(cell, FixedOracle::committed(), MemoryCommittedCache::new()),
+        SharedStateBackend::new(
+            cell,
+            MemoryDescriptorIdentityStore::new(),
+            FixedOracle::committed(),
+            MemoryCommittedCache::new(),
+        ),
         MemoryLoader::new(),
         registry,
         Arc::from("test-group"),

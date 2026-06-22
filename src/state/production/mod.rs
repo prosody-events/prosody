@@ -17,9 +17,9 @@
 use crate::ConsumerGroup;
 use crate::commit_manager::{CommitManager, StoreTagSource};
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
-use crate::state::cassandra::CassandraCellStore;
+use crate::state::cassandra::{CassandraCellStore, CassandraDescriptorIdentityStore};
 use crate::state::fjall::{AssignmentEpoch, FjallClient, FjallValueStore, FjallValueStoreError};
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
 use crate::state::{PartitionBackend, StateBackendFactory};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, TriggerStoreProvider};
@@ -43,15 +43,17 @@ pub type ProductionOracle<DP, TP> = CommitManager<
 /// [`StateBackendFactory`] for the Cassandra storage backend.
 ///
 /// Per partition it opens one fjall workspace (the committed-value cache),
-/// mints the segment-scoped commit oracle, and hands out a clone of the shared
-/// [`CassandraCellStore`] — so the sessions stage and the recovery sweep
-/// resolve through one oracle. The cache store owns the workspace, so the
-/// workspace's `Drop` (which deletes the fjall partition) fires only at
-/// partition revocation.
+/// mints the segment-scoped commit oracle, and hands out clones of the shared
+/// [`CassandraCellStore`] and [`CassandraDescriptorIdentityStore`] — so the
+/// sessions stage and the recovery sweep resolve through one oracle while
+/// identity validation runs against the one group-global identity store. The
+/// cache store owns the workspace, so the workspace's `Drop` (which deletes the
+/// fjall partition) fires only at partition revocation.
 #[derive(Clone)]
 pub struct CassandraStateBackendFactory<DP, TP> {
     client: Arc<FjallClient>,
     cell: CassandraCellStore,
+    identity: CassandraDescriptorIdentityStore,
     dedup: DP,
     triggers: TP,
     consumer_group: ConsumerGroup,
@@ -70,6 +72,7 @@ impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
     pub fn new(
         client: Arc<FjallClient>,
         cell: CassandraCellStore,
+        identity: CassandraDescriptorIdentityStore,
         dedup: DP,
         triggers: TP,
         consumer_group: ConsumerGroup,
@@ -78,6 +81,7 @@ impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
         Self {
             client,
             cell,
+            identity,
             dedup,
             triggers,
             consumer_group,
@@ -93,7 +97,7 @@ where
 {
     type Backend = PartitionBackend<
         ProductionOracle<DP, TP>,
-        CassandraCellStore,
+        CassandraDescriptorIdentityStore,
         CassandraCellStore,
         FjallValueStore,
     >;
@@ -118,10 +122,9 @@ where
             topic,
             partition,
         );
-        // The cell store doubles as the shared descriptor-identity store.
         Ok(PartitionBackend::new(
             oracle,
-            self.cell.clone(),
+            self.identity.clone(),
             self.cell.clone(),
             cache,
         ))
@@ -131,12 +134,14 @@ where
 /// [`StateBackendFactory`] for the in-memory storage backend (and mock
 /// mode).
 ///
-/// One process-wide [`MemoryCellStore`] is shared across partitions (state
-/// survives reassignment within the process); the committed-value cache and
-/// oracle are minted per partition, mirroring the Cassandra factory.
+/// One process-wide [`MemoryCellStore`] and one process-wide
+/// [`MemoryDescriptorIdentityStore`] are shared across partitions (state and
+/// identities survive reassignment within the process); the committed-value
+/// cache and oracle are minted per partition, mirroring the Cassandra factory.
 #[derive(Clone)]
 pub struct MemoryStateBackendFactory<DP, TP> {
     cell: MemoryCellStore,
+    identity: MemoryDescriptorIdentityStore,
     dedup: DP,
     triggers: TP,
     consumer_group: ConsumerGroup,
@@ -144,11 +149,12 @@ pub struct MemoryStateBackendFactory<DP, TP> {
 }
 
 impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
-    /// Creates the factory over a shared memory cell store. See
-    /// [`CassandraStateBackendFactory::new`] for the `dedup` contract.
+    /// Creates the factory over a shared memory cell store and identity store.
+    /// See [`CassandraStateBackendFactory::new`] for the `dedup` contract.
     #[must_use]
     pub fn new(
         cell: MemoryCellStore,
+        identity: MemoryDescriptorIdentityStore,
         dedup: DP,
         triggers: TP,
         consumer_group: ConsumerGroup,
@@ -156,6 +162,7 @@ impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
     ) -> Self {
         Self {
             cell,
+            identity,
             dedup,
             triggers,
             consumer_group,
@@ -171,7 +178,7 @@ where
 {
     type Backend = PartitionBackend<
         ProductionOracle<DP, TP>,
-        MemoryCellStore,
+        MemoryDescriptorIdentityStore,
         MemoryCellStore,
         MemoryCommittedCache,
     >;
@@ -190,10 +197,9 @@ where
             topic,
             partition,
         );
-        // The cell store doubles as the shared descriptor-identity store.
         Ok(PartitionBackend::new(
             oracle,
-            self.cell.clone(),
+            self.identity.clone(),
             self.cell.clone(),
             MemoryCommittedCache::new(),
         ))

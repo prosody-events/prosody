@@ -2,7 +2,7 @@
 //! suite.
 //!
 //! These run the same [`identity_suite`](crate::state::tests::identity_suite)
-//! runners as the memory suite against [`CassandraCellStore`]'s
+//! runners as the memory suite against [`CassandraDescriptorIdentityStore`]'s
 //! [`DescriptorIdentityStore`](crate::state::descriptor_identity::DescriptorIdentityStore)
 //! impl over the real `keyed_state_identity` table — so the production
 //! point-read, the `INSERT … IF NOT EXISTS` LWT, and the conflict-row
@@ -10,7 +10,7 @@
 //! Each iteration uses a fresh `group_id`, so the shared keyspace never
 //! collides across runs.
 
-use super::cell::{CassandraCellStore, CellQueries};
+use super::identity::{CassandraDescriptorIdentityStore, IdentityQueries};
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
@@ -35,7 +35,7 @@ fn get_test_count() -> u64 {
         .unwrap_or(25)
 }
 
-async fn setup() -> Result<CassandraCellStore> {
+async fn setup() -> Result<CassandraDescriptorIdentityStore> {
     let config = CassandraConfiguration {
         datacenter: None,
         rack: None,
@@ -46,8 +46,8 @@ async fn setup() -> Result<CassandraCellStore> {
         retention: Duration::from_mins(10),
     };
     let cassandra = CassandraStore::new(&config).await?;
-    let queries = Arc::new(CellQueries::new(cassandra.session(), &config.keyspace).await?);
-    Ok(CassandraCellStore::new(cassandra, queries))
+    let queries = Arc::new(IdentityQueries::new(cassandra.session(), &config.keyspace).await?);
+    Ok(CassandraDescriptorIdentityStore::new(cassandra, queries))
 }
 
 /// A fresh group per iteration so the shared keyspace never collides.

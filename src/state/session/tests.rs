@@ -22,7 +22,7 @@ use super::{ArmedKeys, CellAccess, KeyedStateSession, SessionParts, TerminationW
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::value_state;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -49,8 +49,12 @@ const VALUE_NAME: &str = "cart";
 /// The per-event session type the fixture mints (loader slot unused, so `()`).
 /// The backend bundle is projected from the [`SharedStateBackend`] factory, so
 /// the construction body names only the concrete stores it passes.
-type TestBackend =
-    <SharedStateBackend<MemoryCellStore, ScriptedOracle, MemoryCommittedCache> as StateBackendFactory>::Backend;
+type TestBackend = <SharedStateBackend<
+    MemoryCellStore,
+    MemoryDescriptorIdentityStore,
+    ScriptedOracle,
+    MemoryCommittedCache,
+> as StateBackendFactory>::Backend;
 type Session = KeyedStateSession<TestBackend, ()>;
 
 /// A committed-marker oracle: `record_message` writes the durable marker,

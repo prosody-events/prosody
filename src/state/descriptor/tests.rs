@@ -13,7 +13,7 @@ use crate::consumer::kafka_state::message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache};
+use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
@@ -73,7 +73,12 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
 }
 
 pub(crate) type TestSession = KeyedStateSession<
-    <SharedStateBackend<MemoryCellStore, FixedOracle, MemoryCommittedCache> as StateBackendFactory>::Backend,
+    <SharedStateBackend<
+        MemoryCellStore,
+        MemoryDescriptorIdentityStore,
+        FixedOracle,
+        MemoryCommittedCache,
+    > as StateBackendFactory>::Backend,
     MemoryLoader<Value>,
 >;
 

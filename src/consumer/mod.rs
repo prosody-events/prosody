@@ -170,11 +170,11 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader};
 pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
-use crate::state::cassandra::CassandraCellStore;
+use crate::state::cassandra::{CassandraCellStore, CassandraDescriptorIdentityStore};
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
-use crate::state::memory::MemoryCellStore;
+use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{CellAccess, StateSession};
@@ -1088,6 +1088,7 @@ where
 {
     let backend = MemoryStateBackendFactory::new(
         MemoryCellStore::new(),
+        MemoryDescriptorIdentityStore::new(),
         dedup_provider,
         trigger_provider.clone(),
         keyed_state.group.clone(),
@@ -1108,6 +1109,7 @@ fn cassandra_state_provider<C: Codec>(
     dedup_provider: CassandraDeduplicationStoreProvider,
     trigger_provider: &CassandraTriggerStoreProvider,
     cell_store: CassandraCellStore,
+    identity_store: CassandraDescriptorIdentityStore,
 ) -> Result<
     impl PartitionStateProvider<
         Manager: PartitionStateManager<
@@ -1132,6 +1134,7 @@ where
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
         cell_store,
+        identity_store,
         dedup_provider,
         trigger_provider.clone(),
         keyed_state.group.clone(),
@@ -1356,6 +1359,7 @@ where
                 let loader = MemoryLoader::<C::Payload>::new();
                 let backend = MemoryStateBackendFactory::new(
                     MemoryCellStore::new(),
+                    MemoryDescriptorIdentityStore::new(),
                     dedup_provider.clone(),
                     trigger_provider.clone(),
                     keyed_state.group.clone(),
@@ -1385,6 +1389,7 @@ where
                 timer_provider,
                 dedup_provider,
                 cell_store,
+                identity_store,
             } => {
                 // One Kafka loader per consumer: built once here and shared by
                 // cloning. A clone shares the channel, semaphore, cache, and the
@@ -1405,6 +1410,7 @@ where
                 let backend = CassandraStateBackendFactory::new(
                     fjall_client,
                     cell_store,
+                    identity_store,
                     dedup_provider.clone(),
                     trigger_provider.clone(),
                     keyed_state.group.clone(),
@@ -1514,6 +1520,7 @@ where
                 trigger_provider,
                 dedup_provider,
                 cell_store,
+                identity_store,
                 ..
             } => {
                 let state_provider = cassandra_state_provider::<C>(
@@ -1523,6 +1530,7 @@ where
                     dedup_provider.clone(),
                     &trigger_provider,
                     cell_store,
+                    identity_store,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1612,6 +1620,7 @@ where
                 trigger_provider,
                 dedup_provider,
                 cell_store,
+                identity_store,
                 ..
             } => {
                 let state_provider = cassandra_state_provider::<C>(
@@ -1621,6 +1630,7 @@ where
                     dedup_provider.clone(),
                     &trigger_provider,
                     cell_store,
+                    identity_store,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
