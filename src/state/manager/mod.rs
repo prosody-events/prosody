@@ -3,13 +3,13 @@
 //! The partition loop acquires one [`StateManager`] per assignment through
 //! a [`PartitionStateProvider`] (mirroring
 //! [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider)),
-//! then mints one [`StateSession`] per event from it. The manager owns the
-//! partition-lifetime pieces — the [`PartitionStateStore`] (cell store +
-//! oracle + committed-value cache + status map) and the message loader —
-//! while each session gets `Arc`-clones plus its own in-memory per-event
-//! dirty store. The recovery sweep shares the *same*
-//! [`PartitionStateStore`], so the status marks sessions set are visible to
-//! it.
+//! then mints one [`KeyedStateSession`] per event from it. The manager owns the
+//! partition-lifetime pieces — the uniform cell store
+//! ([`StateBackend::Cell`]), the commit oracle, the shared dirty workspace, and
+//! the message loader — while each session gets `Arc`-clones and wraps the cell
+//! store in its own per-event [`Overlay`](crate::state::overlay::Overlay). The
+//! recovery sweep resolves provisional cells through the *same* cell store and
+//! oracle.
 //!
 //! Acquisition is **eager**: descriptor identities are validated against the
 //! group-global identity table before the manager exists, so no session can
@@ -33,16 +33,16 @@ use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
+use crate::state::dirty::DirtyStore;
 use crate::state::oracle::CommitOracle;
-use crate::state::partition_store::{CommittedCache, PartitionStateStore, PartitionStoreError};
 use crate::state::registry::CollectionDefRegistry;
+use crate::state::resolve::{ResolveCellError, sweep_provisional};
 use crate::state::session::{
-    ArmedKeys, KeyedStateSession, SessionParts, StateSession, TerminationWatch,
+    ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
-use crate::state::value::ValueKind;
 use crate::state::{
-    CollectionId, CollectionKind, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
+    CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
     StateBackendFactory, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
@@ -58,8 +58,9 @@ use thiserror::Error;
 use tokio::sync::OnceCell;
 use tokio::task::coop::cooperative;
 
-/// The Value lane's durable cell-store error of a [`StateBackend`] bundle.
-type ValueCellErr<B> = <<B as StateBackend>::ValueCell as CellStore<ValueKind>>::Error;
+/// The uniform cell store's error of a [`StateBackend`] bundle (it already
+/// wraps oracle failures, since `get`/`scan` resolve inside the store).
+type CellErr<B> = <<B as StateBackend>::Cell as CellStore>::Error;
 
 /// The shared commit oracle's error of a [`StateBackend`] bundle.
 type OracleErr<B> = <<B as StateBackend>::Oracle as CommitOracle>::Error;
@@ -76,7 +77,7 @@ type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>
 /// job.
 pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
-    type Session: StateSession;
+    type Session: CellSession;
 
     /// Error raised by the recovery sweep. Classified so the partition loop
     /// can drop a permanently-failing trigger (committing it) rather than
@@ -134,7 +135,12 @@ struct StateManagerInner<B, L>
 where
     B: StateBackend,
 {
-    store: PartitionStateStore<ValueKind, B::ValueCell, B::Oracle, B::ValueCache>,
+    cell: B::Cell,
+    /// Per-partition shared dirty workspace; each session's [`Overlay`] shares
+    /// it and clears its own key's sub-range at settle.
+    ///
+    /// [`Overlay`]: crate::state::overlay::Overlay
+    dirty: Arc<DirtyStore>,
     oracle: B::Oracle,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
@@ -145,9 +151,9 @@ where
     armed: ArmedKeys,
 }
 
-/// The real per-partition state manager: owns the partition-lifetime
-/// [`PartitionStateStore`], oracle, and loader; mints per-event
-/// [`KeyedStateSession`]s sharing that store. Parameterized by the one
+/// The real per-partition state manager: owns the partition-lifetime cell
+/// store, oracle, dirty workspace, and loader; mints per-event
+/// [`KeyedStateSession`]s sharing them. Parameterized by the one
 /// [`StateBackend`] bundle `B` and the loader `L`.
 pub struct StateManager<B, L>
 where
@@ -183,12 +189,13 @@ where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
-    type RecoveryError = RecoveryError<ValueCellErr<B>, OracleErr<B>>;
+    type RecoveryError = RecoveryError<CellErr<B>, OracleErr<B>>;
     type Session = KeyedStateSession<B, L>;
 
     fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
         KeyedStateSession::new(SessionParts {
-            store: self.inner.store.clone(),
+            cell: self.inner.cell.clone(),
+            dirty: self.inner.dirty.clone(),
             oracle: self.inner.oracle.clone(),
             loader: self.inner.loader.clone(),
             registry: self.inner.registry.clone(),
@@ -216,29 +223,25 @@ where
         // refires, the next commit's re-arm (`clear_and_schedule`, a singleton
         // overwrite) simply replaces the refiring timer — still one backstop.
         self.inner.armed.remove_async(&key).await;
-        // Sweep each kind's registered collections against its own lane and AND
-        // the results: the single backstop unschedules only when every kind on
-        // the key resolved (the no-strand invariant). Names come from the
-        // in-process registry (the authoritative declared set) — a collection
-        // whose descriptor was removed is dormant, not swept. Value is the only
-        // production kind today, so this is a single-operand AND; a future kind
-        // adds `&& sweep_partition(map_store,
-        // registry.collections_for_kind(MapKind::ID), …)` — keep the
-        // `all_resolved` binding as the AND accumulator so growth is local.
-        let value_collections: Vec<(StateType, StateName)> = self
+        // Sweep every registered collection on the key through the one uniform
+        // cell store, ANDing the results: the single backstop unschedules only
+        // when every collection resolved (the no-strand invariant). Names come
+        // from the in-process registry (the authoritative declared set) — a
+        // collection whose descriptor was removed is dormant, not swept.
+        let collections: Vec<(StateType, StateName)> = self
             .inner
             .registry
-            .collections_for_kind(ValueKind::ID)
+            .collections()
             .map(|(state_type, name)| (state_type, name.clone()))
             .collect();
-        let value_resolved = sweep_partition(
-            &self.inner.store,
-            value_collections,
+        let all_resolved = sweep_partition(
+            &self.inner.cell,
+            &self.inner.oracle,
+            collections,
             &self.inner.registry,
             &state_key,
         )
         .await?;
-        let all_resolved = value_resolved;
         // Only clear the backstop when every cell ended resolved (the
         // no-strand invariant): a skipped Permanent cell leaves the timer
         // armed for first-touch / a later sweep.
@@ -253,9 +256,8 @@ where
 }
 
 /// Process-wide [`PartitionStateProvider`] over a
-/// [`StateBackendFactory`]: acquisition mints the partition's backend,
-/// eagerly validates descriptor identities, and composes the
-/// [`PartitionStateStore`].
+/// [`StateBackendFactory`]: acquisition mints the partition's backend and
+/// eagerly validates descriptor identities.
 pub struct StateManagerProvider<F, L> {
     backend: F,
     loader: L,
@@ -365,15 +367,10 @@ where
             })
             .await
             .map_err(StateAcquireError::Identity)?;
-        let store = PartitionStateStore::new(
-            backend.value_cell(),
-            oracle.clone(),
-            backend.value_cache(),
-            self.registry.clone(),
-        );
         Ok(StateManager {
             inner: Arc::new(StateManagerInner {
-                store,
+                cell: backend.cell(),
+                dirty: Arc::new(DirtyStore::new()),
                 oracle,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
@@ -395,11 +392,10 @@ where
 /// come from `registry`, falling back to the middleware-wide default.
 ///
 /// Returns `true` iff every collection ended fully resolved — the caller
-/// unschedules the backstop only then (the no-strand invariant). The status
-/// map inside the store lets a collection the eager promote already resolved
-/// skip its read; a never-touched name streams no provisional cell and
-/// resolves trivially. A per-cell Permanent failure is logged and skipped
-/// inside [`PartitionStateStore::sweep_collection`], leaving that collection
+/// unschedules the backstop only then (the no-strand invariant). A
+/// never-touched name streams no provisional cell and resolves trivially. A
+/// per-cell Permanent failure is logged and skipped inside
+/// [`sweep_provisional`](crate::state::resolve), leaving that collection
 /// unresolved (`false`) for first-touch or a later sweep; a transient/terminal
 /// failure propagates so the trigger aborts and the sweep refires.
 ///
@@ -407,31 +403,29 @@ where
 ///
 /// Returns [`RecoveryError`] on a transient/terminal backend or oracle
 /// failure.
-pub(crate) async fn sweep_partition<K, S, O, C>(
-    store: &PartitionStateStore<K, S, O, C>,
+pub(crate) async fn sweep_partition<S, O>(
+    cell: &S,
+    oracle: &O,
     collections: impl IntoIterator<Item = (StateType, StateName)>,
     registry: &CollectionDefRegistry,
     state_key: &StateKey,
-) -> Result<bool, RecoveryError<S::Error, O::Error>>
+) -> Result<bool, ResolveCellError<S::Error, O::Error>>
 where
-    K: CollectionKind,
-    S: CellStore<K>,
+    S: CellStore,
     O: CommitOracle,
-    C: CommittedCache<K>,
 {
     // Each name is its own Cassandra partition, so the per-collection sweeps
     // fan out concurrently. `try_fold` reduces to one `bool` and short-circuits
-    // on a transient/terminal error (propagated via `?`), exactly as the
-    // sequential `?` did; per-cell Permanent failures are logged and skipped
-    // inside `sweep_collection` (returning `false`). `cooperative` wraps each
-    // sweep so the fan-out yields to the runtime every ~128 collections rather
-    // than draining the whole batch in one poll.
+    // on a transient/terminal error (propagated via `?`); per-cell Permanent
+    // failures are logged and skipped inside `sweep_provisional` (returning
+    // `false`). `cooperative` wraps each sweep so the fan-out yields to the
+    // runtime every ~128 collections rather than draining in one poll.
     let all_resolved = stream::iter(collections)
         .map(|(state_type, name)| {
             cooperative(async move {
                 let ttl = registry.ttl_for(state_type, &name);
-                let id = CollectionId::<K>::new(state_key.clone(), state_type, name);
-                store.sweep_collection(&CollectionRef::new(id, ttl)).await
+                let id = CollectionId::new(state_key.clone(), state_type, name);
+                sweep_provisional(cell, oracle, &CollectionRef::new(id, ttl)).await
             })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)
@@ -518,16 +512,16 @@ where
     }
 }
 
-impl<StoreErr, OracleErr> From<PartitionStoreError<StoreErr, OracleErr>>
+impl<StoreErr, OracleErr> From<ResolveCellError<StoreErr, OracleErr>>
     for RecoveryError<StoreErr, OracleErr>
 where
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
     OracleErr: ClassifyError + Error + Send + Sync + 'static,
 {
-    fn from(error: PartitionStoreError<StoreErr, OracleErr>) -> Self {
+    fn from(error: ResolveCellError<StoreErr, OracleErr>) -> Self {
         match error {
-            PartitionStoreError::Store(e) => Self::Store(e),
-            PartitionStoreError::Oracle(e) => Self::Oracle(e),
+            ResolveCellError::Store(e) => Self::Store(e),
+            ResolveCellError::Oracle(e) => Self::Oracle(e),
         }
     }
 }

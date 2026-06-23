@@ -1,67 +1,120 @@
-//! Backend-generic property suite for the provisional-cell durability model,
-//! driven through [`PartitionStateStore`] over a real [`CellStore`] backend.
+//! Backend-generic property suite for the uniform cell store.
 //!
-//! The flagship is **crash-recovery equivalence**: a generated trace of events
-//! stages provisional writes and then resolves them one of five ways — clean
+//! Every runner is generic over the [`CellStore`] backend and takes a
+//! `make_store` closure (or a pre-built lower store) so memory
+//! ([`Overlay<MemoryCellStore>`]) and Cassandra
+//! ([`Overlay<Cached<CassandraStore>>`]) prove the *same* invariants from one
+//! body — backend parity by transitivity through a deliberately simple model.
+//!
+//! The flagship is **crash-recovery equivalence** (invariant 1): a generated
+//! trace stages provisional writes and resolves them one of five ways — clean
 //! promote, clean inline rollback, or a crash at one of three points followed
 //! by recovery through the sweep *or* first-touch. After every event the
-//! durable committed projection must equal a deliberately simple model,
-//! whichever resolution path ran. The companion runners pin the
-//! prev-is-committed / reader-projection invariant and sweep idempotence.
-//!
-//! The suite is generic over the [`CellStore`] backend (`run_*` take a cloned
-//! backing store that shares durable state), so memory and Cassandra prove the
-//! same invariants from one body — backend parity by transitivity through the
-//! model (each backend tracks the model op-for-op).
+//! committed projection must equal the model, whichever path ran. Companions
+//! pin implicit overwrite (resolution-on-read); the **unified overlay view**
+//! (`run_overlay_trace`), where point `get`s, range `scan`s, dirty buffering,
+//! and committed writes are **intermixed** in one trace so their interaction is
+//! exercised — dirty-wins, clear-hides, scan bounds / direction / limit /
+//! early-stop (invariants 3, 5); the bottom-store scan primitive; and sweep
+//! idempotence.
 //!
 //! Faithfulness to production:
 //!
-//! * **Crash = a cold store over warm durable state.** Recovery builds a
-//!   *fresh* [`PartitionStateStore`] over a clone of the same backing store, so
-//!   the committed-value cache and status map start empty — the durable backend
-//!   is the only thing that survives, exactly as after a process restart. We
-//!   never forget or leak a value to fake a crash (the CLAUDE.md memory rule).
-//! * **`prev` comes from `store.committed`**, never minted, so the staged
-//!   `prev` is always the resolved committed base — the same path `finalize`
-//!   uses (`session::KeyedStateSession::finalize`).
-//! * **A small key pool** so events repeatedly hit the same collections,
-//!   exercising overwrite of a just-resolved cell and the implicit
-//!   resolution-on-read inside `committed`.
+//! * **A "crash" is `make_store()` again over the same warm backing** — the
+//!   durable rows and the oracle's committed set survive; a fresh store starts
+//!   with a cold in-process cache, exactly as after a restart. Nothing is ever
+//!   leaked or forgotten to fake a crash (the CLAUDE.md memory rule).
+//! * **`get`/`scan` resolve in the backend, so they MUTATE a provisional
+//!   cell.** Provisional state is therefore observed only through
+//!   `provisional_cells`; committed seeds for the overlay/scan suites are
+//!   written **resolved** (`write_resolved`, no event) so reads stay pure
+//!   dirty-over-committed.
+//! * **`prev` always comes from `store.get`**, never minted — the staged `prev`
+//!   is the resolved committed base, the same path `finalize` uses.
 
-use super::super::cell::{Cell, ProvisionalCell, ProvisionalWrite};
-use super::super::memory::MemoryCommittedCache;
+use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use super::super::dirty::DirtyStore;
+use super::super::identity::{CollectionId, CollectionRef};
 use super::super::oracle::CommitOracle;
-use super::super::partition_store::PartitionStateStore;
-use super::super::registry::CollectionDefRegistry;
+use super::super::overlay::Overlay;
+use super::super::resolve::sweep_provisional;
 use super::super::store::CellStore;
-use super::super::value::ValueKind;
-use super::super::{
-    CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
-};
-use super::value_suite::{MAX_TRACE_OPS, bytes, capped_vec};
+use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
+use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::error::Error;
+use std::future::Future;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
-/// Distinct collections a trace cycles through. Small so events collide on the
-/// same cell and exercise overwrite + resolution-on-read.
+/// Distinct collections a crash/overwrite trace cycles through. Small so events
+/// collide on the same cell and exercise overwrite + resolution-on-read.
 const POOL: u8 = 3;
+
+/// Coordinate pool for the multi-cell overlay/scan suites — wide enough for
+/// real intervals (a Map entry set / Deque index window).
+const CELLS: u8 = 12;
+
+/// Value's single section (`ValueNs::Entries = 0`); the overlay/scan suites
+/// place every cell here and address by coordinate, mirroring a Map's entry
+/// section.
+const SECTION: Section = Section::new(0);
+
+/// Upper bound on generated trace lengths, keeping property runs bounded.
+pub(crate) const MAX_TRACE_OPS: usize = 40;
+
+/// Canonical single-byte payload (the cell content is opaque to the LWW state
+/// machine). Shared by every keyed-state test module.
+pub(crate) fn bytes(value: u8) -> Bytes {
+    Bytes::from(vec![value])
+}
+
+/// Generates an [`Arbitrary`] vector capped at `max` elements, keeping trace
+/// lengths bounded.
+pub(crate) fn capped_vec<T: Arbitrary>(g: &mut Gen, max: usize) -> Vec<T> {
+    Vec::<T>::arbitrary(g).into_iter().take(max).collect()
+}
+
+/// The single Value cell (`ValueNs::Entries`, empty coordinate).
+fn value_cell() -> CellKey {
+    CellKey {
+        section: SECTION,
+        coordinate: Coordinate::empty(),
+    }
+}
+
+/// The cell at coordinate `c` in the shared section (single byte, so byte order
+/// == numeric order — the in-memory oracle keys on `u8`).
+fn cell_at(c: u8) -> CellKey {
+    CellKey {
+        section: SECTION,
+        coordinate: Coordinate::from_bytes(vec![c]),
+    }
+}
+
+/// The first coordinate byte of a scanned cell (the suites use single-byte
+/// coordinates).
+fn coord_of(key: &CellKey) -> u8 {
+    key.coordinate.as_bytes()[0]
+}
 
 /// A committed-marker oracle backed by an in-memory set of dedup ids.
 ///
-/// Models the durable deduplication store: [`record_message`](Self) writes the
-/// marker (the durable "this event committed" fact), and `resolve` answers
-/// `Committed` iff the staged event's marker is present. The set is shared
-/// across clones, so it survives the simulated crash exactly as the durable
-/// dedup store does.
+/// Models the durable deduplication store: `record_message` writes the marker,
+/// and `resolve` answers `Committed` iff the staged event's marker is present.
+/// The set is shared across clones, so it survives the simulated crash exactly
+/// as the durable dedup store does.
 #[derive(Clone, Default)]
-struct ScriptedOracle {
+pub(crate) struct ScriptedOracle {
     committed: Arc<scc::HashSet<Uuid, RandomState>>,
 }
 
@@ -92,7 +145,8 @@ impl CommitOracle for ScriptedOracle {
     }
 }
 
-type Store<S> = PartitionStateStore<ValueKind, S, ScriptedOracle, MemoryCommittedCache>;
+// ─────────────────────────── crash-recovery equivalence
+// ───────────────────────
 
 /// One Value mutation staged by an event.
 #[derive(Clone, Copy, Debug)]
@@ -122,11 +176,6 @@ impl Arbitrary for Mutation {
 }
 
 /// How an event resolved — the five distinct cell outcomes.
-///
-/// `marker_flushed` is the single bit that decides committed-vs-rolled-back;
-/// the crash variants additionally defer resolution to recovery, and
-/// `CrashMidFanOut` stages only a prefix of the event's writes (the marker
-/// never flushes, so every staged cell rolls back and the rest are untouched).
 #[derive(Clone, Copy, Debug)]
 enum Outcome {
     /// Committed and promoted inline (the hot path).
@@ -149,6 +198,13 @@ impl Outcome {
     fn mid_fan_out(self) -> bool {
         matches!(self, Self::CrashMidFanOut)
     }
+
+    fn is_crash(self) -> bool {
+        matches!(
+            self,
+            Self::CrashAfterStage | Self::CrashAfterMarker | Self::CrashMidFanOut
+        )
+    }
 }
 
 impl Arbitrary for Outcome {
@@ -165,8 +221,8 @@ impl Arbitrary for Outcome {
     }
 }
 
-/// One event: a set of per-collection mutations, an outcome, and the recovery
-/// path to use when the outcome is a crash.
+/// One event: per-collection mutations, an outcome, and the recovery path to
+/// use when the outcome is a crash.
 #[derive(Clone, Debug)]
 struct TraceEvent {
     writes: Vec<(u8, Mutation)>,
@@ -202,21 +258,13 @@ impl Arbitrary for Trace {
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        // Shortening the trace is the highest-value reduction; quickcheck's
-        // Vec shrinker drops and halves the event list.
+        // Shortening the trace is the highest-value reduction.
         Box::new(self.events.shrink().map(|events| Self { events }))
     }
 }
 
-/// Drives `trace` through a fresh partition store over `backing`, asserting the
-/// committed projection equals the model after every event regardless of the
-/// resolution path. Returns `true` iff every assertion held.
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
-/// Collapses an event's writes to one per collection (an event stages a cell
-/// at most once), keeping the last mutation — last-writer-wins.
+/// Collapses an event's writes to one per collection (an event stages a cell at
+/// most once), keeping the last mutation — last-writer-wins.
 fn collapse_writes(writes: Vec<(u8, Mutation)>) -> Vec<(u8, Mutation)> {
     let mut out: Vec<(u8, Mutation)> = Vec::new();
     for (coll, mutation) in writes {
@@ -228,81 +276,91 @@ fn collapse_writes(writes: Vec<(u8, Mutation)>) -> Vec<(u8, Mutation)> {
     out
 }
 
-/// Asserts every pooled cell is resolved and projects its model value.
+/// The collection ids / refs / pool for a crash or overwrite trace.
+fn pooled_collections() -> Result<(Vec<CollectionId>, Vec<CollectionRef>)> {
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let ids: Vec<CollectionId> = (0..POOL)
+        .map(|c| {
+            Ok(CollectionId::new(
+                state_key.clone(),
+                StateType::Application,
+                StateName::try_new(format!("c{c}"))?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let refs = ids
+        .iter()
+        .map(|id| CollectionRef::new(id.clone(), None))
+        .collect();
+    Ok((ids, refs))
+}
+
+/// Asserts every pooled cell is fully resolved (no provisional lingers) and
+/// projects its model committed value.
 async fn assert_converged<S>(
-    store: &Store<S>,
-    ids: &[CollectionId<ValueKind>],
+    store: &S,
+    ids: &[CollectionId],
+    cell: &CellKey,
     model: &[Option<Bytes>],
 ) -> Result<bool>
 where
-    S: CellStore<ValueKind>,
+    S: CellStore,
 {
+    // A probe event distinct from every trace event so own-event never
+    // short-circuits.
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX / 2),
+    };
     for (id, expected) in ids.iter().zip(model) {
-        let cell = store.read_cell(id, &()).await?;
-        if !matches!(cell, Cell::Resolved(_)) || cell.project_committed().cloned() != *expected {
+        // Check raw provisional state FIRST — `get` would resolve a lingering
+        // provisional cell and mask a non-convergence.
+        if provisional_count(store, id).await? != 0 {
+            return Ok(false);
+        }
+        let committed = store.get(id, cell, probe).await?;
+        if committed.into_inner() != *expected {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Recovers a crashed event over `cold` (a store with a fresh cache + status
-/// map) via the sweep or first-touch. Returns the cold store, or `None` if a
-/// sweep reported an unresolved cell (a property failure).
-async fn recover_cold<S>(
-    cold: Store<S>,
-    refs: &[CollectionRef<ValueKind>],
-    ids: &[CollectionId<ValueKind>],
-    by_sweep: bool,
-    recovery_event: EventRef,
-) -> Result<Option<Store<S>>>
+/// The number of still-provisional cells in a collection (the public,
+/// non-resolving way to observe staged state).
+async fn provisional_count<S>(store: &S, id: &CollectionId) -> Result<usize>
 where
-    S: CellStore<ValueKind>,
+    S: CellStore,
 {
-    if by_sweep {
-        for r in refs {
-            if !cold.sweep_collection(r).await? {
-                return Ok(None);
-            }
-        }
-    } else {
-        // First-touch under a fresh event so own-event never short-circuits.
-        for id in ids {
-            cold.committed_value(id, &(), recovery_event).await?;
-        }
+    let stream = store.provisional_cells(id);
+    futures::pin_mut!(stream);
+    let mut count = 0usize;
+    while let Some(item) = stream.next().await {
+        item?;
+        count += 1;
     }
-    Ok(Some(cold))
+    Ok(count)
 }
 
-pub(crate) async fn run_crash_equivalence_trace<S>(backing: S, trace: Trace) -> Result<bool>
+/// Drives `trace` through stores built by `make_store`, asserting the committed
+/// projection equals the model after every event regardless of the resolution
+/// path. A crash rebuilds the store over the same warm backing the closure
+/// captures.
+///
+/// # Errors
+///
+/// Propagates backend / oracle errors raised during the run.
+pub(crate) async fn run_crash_equivalence_trace<S, F>(
+    make_store: F,
+    oracle: ScriptedOracle,
+    trace: Trace,
+) -> Result<bool>
 where
-    S: CellStore<ValueKind>,
+    S: CellStore,
+    F: Fn() -> Result<S>,
 {
-    let oracle = ScriptedOracle::default();
-    let registry = Arc::new(CollectionDefRegistry::default());
-    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let names: Vec<StateName> = (0..POOL)
-        .map(|c| StateName::try_new(format!("c{c}")))
-        .collect::<Result<_, _>>()?;
-    let ids: Vec<CollectionId<ValueKind>> = names
-        .iter()
-        .map(|n| CollectionId::new(state_key.clone(), StateType::Application, n.clone()))
-        .collect();
-    let refs: Vec<CollectionRef<ValueKind>> = ids
-        .iter()
-        .map(|id| CollectionRef::new(id.clone(), None))
-        .collect();
-    let make_store = |backing: &S| {
-        Store::new(
-            backing.clone(),
-            oracle.clone(),
-            MemoryCommittedCache::new(),
-            registry.clone(),
-        )
-    };
-
-    let mut store = make_store(&backing);
-    // The model committed value of every pooled collection.
+    let (ids, refs) = pooled_collections()?;
+    let cell = value_cell();
+    let mut store = make_store()?;
     let mut model: Vec<Option<Bytes>> = vec![None; POOL as usize];
 
     for (index, ev) in trace.events.into_iter().enumerate() {
@@ -317,11 +375,11 @@ where
         };
         let staged = &writes[..staged_count];
 
-        // Stage each cell over its committed base (the prev-is-committed
-        // invariant at stage time: no provisional cell lingers between events).
+        // Stage each cell over its committed base (prev-is-committed at stage
+        // time: no provisional cell lingers between events).
         let mut prevs: Vec<Option<Bytes>> = Vec::with_capacity(staged.len());
         for &(coll, mutation) in staged {
-            let prev = store.committed(&ids[coll as usize], &(), event).await?;
+            let prev = store.get(&ids[coll as usize], &cell, event).await?;
             let prev_value = prev.get().cloned();
             if prev_value != model[coll as usize] {
                 return Ok(false);
@@ -330,8 +388,10 @@ where
             store
                 .write_provisional(
                     &refs[coll as usize],
-                    &(),
-                    &ProvisionalWrite::new(mutation.value(), prev, event),
+                    &[(
+                        cell.clone(),
+                        ProvisionalWrite::new(mutation.value(), prev, event),
+                    )],
                 )
                 .await?;
         }
@@ -345,41 +405,41 @@ where
         }
 
         // Resolve along the outcome's path.
-        match ev.outcome {
-            Outcome::CleanCommitted => {
-                for &(coll, mutation) in staged {
-                    store
-                        .promote(&refs[coll as usize], &(), mutation.value().as_ref())
-                        .await?;
+        if ev.outcome.is_crash() {
+            // Crash = a cold store over the same warm backing.
+            store = make_store()?;
+            if ev.recover_by_sweep {
+                for r in &refs {
+                    if !sweep_provisional(&store, &oracle, r).await? {
+                        return Ok(false);
+                    }
                 }
-            }
-            Outcome::CleanRolledBack => {
-                for (&(coll, _), prev) in staged.iter().zip(&prevs) {
-                    store
-                        .rollback_provisional(&refs[coll as usize], &(), prev.as_ref())
-                        .await?;
-                }
-            }
-            _ => {
+            } else {
+                // First-touch under a fresh event so own-event never
+                // short-circuits; the read resolves the provisional cell.
                 let recovery_event = EventRef::Message {
                     dedup_id: Uuid::from_u128(u128::MAX - index as u128),
                 };
-                match recover_cold(
-                    make_store(&backing),
-                    &refs,
-                    &ids,
-                    ev.recover_by_sweep,
-                    recovery_event,
-                )
-                .await?
-                {
-                    Some(cold) => store = cold,
-                    None => return Ok(false),
+                for id in &ids {
+                    store.get(id, &cell, recovery_event).await?;
                 }
+            }
+        } else if matches!(ev.outcome, Outcome::CleanCommitted) {
+            for &(coll, _) in staged {
+                store
+                    .mark_resolved(&refs[coll as usize], slice::from_ref(&cell))
+                    .await?;
+            }
+        } else {
+            // The only remaining non-crash outcome: clean inline rollback.
+            for (&(coll, _), prev) in staged.iter().zip(&prevs) {
+                store
+                    .write_resolved(&refs[coll as usize], &[(cell.clone(), prev.clone())])
+                    .await?;
             }
         }
 
-        if !assert_converged(&store, &ids, &model).await? {
+        if !assert_converged(&store, &ids, &cell, &model).await? {
             return Ok(false);
         }
     }
@@ -387,165 +447,11 @@ where
     Ok(true)
 }
 
-/// One projection-trace step: stage a cell (when it is resolved) or resolve the
-/// in-flight one (when it is provisional). The interpretation makes every step
-/// valid regardless of generation, so traces never desync from the model.
-#[derive(Clone, Copy, Debug)]
-struct ProjOp {
-    coll: u8,
-    mutation: Mutation,
-    commit: bool,
-}
-
-impl Arbitrary for ProjOp {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            coll: u8::arbitrary(g) % POOL,
-            mutation: Mutation::arbitrary(g),
-            commit: bool::arbitrary(g),
-        }
-    }
-}
-
-/// A shrinkable projection trace.
-#[derive(Clone, Debug)]
-pub(crate) struct ProjTrace {
-    ops: Vec<ProjOp>,
-}
-
-impl Arbitrary for ProjTrace {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            ops: capped_vec(g, MAX_TRACE_OPS),
-        }
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        Box::new(self.ops.shrink().map(|ops| Self { ops }))
-    }
-}
-
-/// In-flight provisional state of one cell in a projection trace: the staged
-/// data, the committed base it superseded, and whether the event committed.
-type Pending = Option<(Option<Bytes>, Option<Bytes>, bool)>;
-
-/// Drives staged / resolved transitions and asserts the **pure projection** is
-/// sound at every point: a provisional cell projects its `prev` (the committed
-/// value before the in-flight event — stale by exactly that event, the
-/// external `StateReader` contract), a resolved cell projects the committed
-/// value, and a provisional cell's `prev` always equals the model committed
-/// base (prev-is-committed).
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
-pub(crate) async fn run_projection_trace<S>(backing: S, trace: ProjTrace) -> Result<bool>
-where
-    S: CellStore<ValueKind>,
-{
-    let oracle = ScriptedOracle::default();
-    let registry = Arc::new(CollectionDefRegistry::default());
-    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let names: Vec<StateName> = (0..POOL)
-        .map(|c| StateName::try_new(format!("c{c}")))
-        .collect::<Result<_, _>>()?;
-    let store = Store::new(
-        backing,
-        oracle.clone(),
-        MemoryCommittedCache::new(),
-        registry,
-    );
-    let id_of = |coll: u8| {
-        CollectionId::new(
-            state_key.clone(),
-            StateType::Application,
-            names[coll as usize].clone(),
-        )
-    };
-    let ref_of = |coll: u8| CollectionRef::new(id_of(coll), None);
-
-    // Per cell: the committed value, and (when in flight) the staged data, the
-    // committed base it superseded, and whether that event committed.
-    let mut committed: Vec<Option<Bytes>> = vec![None; POOL as usize];
-    let mut pending: Vec<Pending> = vec![None; POOL as usize];
-
-    for (index, op) in trace.ops.into_iter().enumerate() {
-        let coll = op.coll;
-        let slot = coll as usize;
-        match pending[slot].take() {
-            None => {
-                // Resolved cell → stage a provisional write over the committed base.
-                let event = EventRef::Message {
-                    dedup_id: Uuid::from_u128(index as u128),
-                };
-                let prev = store.committed(&id_of(coll), &(), event).await?;
-                let prev_value = prev.get().cloned();
-                // prev-is-committed at stage time.
-                if prev_value != committed[slot] {
-                    return Ok(false);
-                }
-                let data = op.mutation.value();
-                store
-                    .write_provisional(
-                        &ref_of(coll),
-                        &(),
-                        &ProvisionalWrite::new(data.clone(), prev, event),
-                    )
-                    .await?;
-                pending[slot] = Some((data, prev_value, op.commit));
-            }
-            Some((data, prev, commit)) => {
-                // Provisional cell → resolve durably: promote a committed event,
-                // roll a non-committed one back to its base. (A warm-cache
-                // `committed_value` would short-circuit without touching the
-                // durable cell — promote/rollback are the durable arms.)
-                if commit {
-                    store.promote(&ref_of(coll), &(), data.as_ref()).await?;
-                    committed[slot] = data;
-                } else {
-                    store
-                        .rollback_provisional(&ref_of(coll), &(), prev.as_ref())
-                        .await?;
-                    committed[slot] = prev;
-                }
-            }
-        }
-
-        // Projection soundness for every cell after the step.
-        for probe in 0..POOL {
-            let probe_slot = probe as usize;
-            let read = store.read_cell(&id_of(probe), &()).await?;
-            match &pending[probe_slot] {
-                Some((..)) => {
-                    // In flight: provisional, projecting the committed base, and
-                    // carrying that base as `prev`.
-                    let Cell::Provisional(p) = &read else {
-                        return Ok(false);
-                    };
-                    if read.project_committed().cloned() != committed[probe_slot]
-                        || p.prev().cloned() != committed[probe_slot]
-                    {
-                        return Ok(false);
-                    }
-                }
-                None => {
-                    if !matches!(read, Cell::Resolved(_))
-                        || read.project_committed().cloned() != committed[probe_slot]
-                    {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(true)
-}
+// ─────────────────────────── implicit overwrite
+// ───────────────────────────────
 
 /// One overwrite-trace step: a mutation on a pooled collection, and whether the
-/// event commits. A non-committing event's provisional cell must roll back to
-/// its committed base when its successor overwrites it; a committing one's must
-/// promote to its data.
+/// event commits.
 #[derive(Clone, Copy, Debug)]
 struct OverwriteOp {
     coll: u8,
@@ -581,98 +487,488 @@ impl Arbitrary for OverwriteTrace {
     }
 }
 
-/// Drives a sequence of events that NEVER promote or roll back explicitly: each
-/// event reads its committed base through a **cold** store (fresh cache), so a
+/// Drives events that NEVER promote or roll back explicitly: each event reads
+/// its committed base through a **cold** store (`make_store`), so a
 /// predecessor's still-provisional cell is resolved through the oracle on read
-/// — the implicit-overwrite / first-touch path. After every step the staged
-/// `prev` must equal the model committed base (prev-is-committed across the
-/// overwrite), and at the end every cell, resolved purely by the next read,
-/// must equal the model. Both oracle arms run: a committing predecessor
-/// promotes to its `data`, a non-committing one rolls back to its `prev`.
-///
-/// This generalizes the `foreign_committed` / `foreign_uncommitted` example
-/// tests into a property over random overwrite sequences, and — unlike the
-/// crash-equivalence runner, which resolves each event explicitly — exercises
-/// resolution *only* implicitly, as the side effect of the successor's read.
+/// — the implicit-overwrite / first-touch path. The staged `prev` must equal
+/// the model committed base, and at the end every cell, resolved only by the
+/// next read, must equal the model. Both oracle arms run: a committing
+/// predecessor promotes to its `data`, a non-committing one rolls back to its
+/// `prev`.
 ///
 /// # Errors
 ///
 /// Propagates backend / oracle errors raised during the run.
-pub(crate) async fn run_overwrite_trace<S>(backing: S, trace: OverwriteTrace) -> Result<bool>
+pub(crate) async fn run_overwrite_trace<S, F>(
+    make_store: F,
+    oracle: ScriptedOracle,
+    trace: OverwriteTrace,
+) -> Result<bool>
 where
-    S: CellStore<ValueKind>,
+    S: CellStore,
+    F: Fn() -> Result<S>,
 {
-    let oracle = ScriptedOracle::default();
-    let registry = Arc::new(CollectionDefRegistry::default());
-    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let ids: Vec<CollectionId<ValueKind>> = (0..POOL)
-        .map(|c| {
-            Ok(CollectionId::new(
-                state_key.clone(),
-                StateType::Application,
-                StateName::try_new(format!("c{c}"))?,
-            ))
-        })
-        .collect::<Result<_>>()?;
-    let refs: Vec<CollectionRef<ValueKind>> = ids
-        .iter()
-        .map(|id| CollectionRef::new(id.clone(), None))
-        .collect();
-    // A fresh cold store over the shared backing: reads never hit a warm cache,
-    // so every overwrite resolves its predecessor's provisional cell durably.
-    let fresh = || {
-        Store::new(
-            backing.clone(),
-            oracle.clone(),
-            MemoryCommittedCache::new(),
-            registry.clone(),
-        )
-    };
-
+    let (ids, refs) = pooled_collections()?;
+    let cell = value_cell();
     let mut model: Vec<Option<Bytes>> = vec![None; POOL as usize];
+
     for (index, op) in trace.ops.into_iter().enumerate() {
-        let coll = op.coll as usize;
+        let slot = op.coll as usize;
         let dedup_id = Uuid::from_u128(index as u128);
         let event = EventRef::Message { dedup_id };
-        let store = fresh();
+        // A fresh cold store: reads never hit a warm in-process cache, so every
+        // overwrite resolves its predecessor's provisional cell durably.
+        let store = make_store()?;
 
-        // Reading the committed base resolves any still-provisional predecessor
-        // through the oracle (implicit overwrite). It must equal the model.
-        let prev = store.committed(&ids[coll], &(), event).await?;
-        if prev.get().cloned() != model[coll] {
+        let prev = store.get(&ids[slot], &cell, event).await?;
+        if prev.get().cloned() != model[slot] {
             return Ok(false);
         }
         store
             .write_provisional(
-                &refs[coll],
-                &(),
-                &ProvisionalWrite::new(op.mutation.value(), prev, event),
+                &refs[slot],
+                &[(
+                    cell.clone(),
+                    ProvisionalWrite::new(op.mutation.value(), prev, event),
+                )],
             )
             .await?;
         if op.commit {
             oracle.record_message(dedup_id).await?;
-            model[coll] = op.mutation.value();
+            model[slot] = op.mutation.value();
         }
     }
 
-    // Every last provisional cell, resolved only by this final read, converges
-    // to the model.
-    let store = fresh();
+    // Every last provisional cell, resolved only by this final read, converges.
+    let store = make_store()?;
     for (i, id) in ids.iter().enumerate() {
         let final_event = EventRef::Message {
             dedup_id: Uuid::from_u128(u128::MAX - i as u128),
         };
-        if store.committed_value(id, &(), final_event).await? != model[i] {
+        if store.get(id, &cell, final_event).await?.into_inner() != model[i] {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// A [`CellStore`] decorator that counts every durable operation, for the
-/// op-budget and sweep-idempotence pins. It delegates to `inner` and shares
-/// durable state through its `Clone` (the counters ride an `Arc`).
-#[derive(Clone, Default)]
+// ─────────────────────────── overlay point merge
+// ──────────────────────────────
+
+/// One op on a multi-cell collection view, intermixing point reads, range
+/// scans, dirty buffering, and committed writes so the property exercises their
+/// interaction — a `scan` between a `buffer_set` and a `clear`, a `get` after a
+/// dropped scan, and so on (TESTING.md "interleaved operations").
+#[derive(Clone, Copy, Debug)]
+enum OverlayOp {
+    /// Buffer a set into the dirty leg.
+    BufferSet(u8, u8),
+    /// Buffer a clear into the dirty leg.
+    BufferClear(u8),
+    /// Commit a present value to the committed lower store (resolved).
+    CommitSet(u8, u8),
+    /// Commit a known-absent value to the lower store (resolved).
+    CommitClear(u8),
+    /// Run a range scan and assert it against the oracle (the range leg,
+    /// intermixed with the point reads asserted after every op).
+    Scan(ScanReq),
+}
+
+impl Arbitrary for OverlayOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let c = u8::arbitrary(g) % CELLS;
+        match u8::arbitrary(g) % 5 {
+            0 => Self::BufferSet(c, u8::arbitrary(g)),
+            1 => Self::BufferClear(c),
+            2 => Self::CommitSet(c, u8::arbitrary(g)),
+            3 => Self::CommitClear(c),
+            _ => Self::Scan(ScanReq::arbitrary(g)),
+        }
+    }
+}
+
+/// A shrinkable overlay trace.
+#[derive(Clone, Debug)]
+pub(crate) struct OverlayTrace {
+    ops: Vec<OverlayOp>,
+}
+
+impl Arbitrary for OverlayTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            ops: capped_vec(g, MAX_TRACE_OPS),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.ops.shrink().map(|ops| Self { ops }))
+    }
+}
+
+/// The visible-value model: dirty wins (`Set`→present, `Cleared`→absent), else
+/// the committed value (present or absent).
+#[derive(Default)]
+struct CellModel {
+    committed: BTreeMap<u8, Option<Bytes>>,
+    dirty: BTreeMap<u8, Option<Bytes>>,
+}
+
+impl CellModel {
+    /// The visible committed bytes for coordinate `c`.
+    fn visible(&self, c: u8) -> Option<Bytes> {
+        match self.dirty.get(&c) {
+            Some(value) => value.clone(),
+            None => self.committed.get(&c).cloned().flatten(),
+        }
+    }
+
+    /// The visible cells in coordinate order (only present values).
+    fn visible_ordered(&self) -> Vec<(u8, Bytes)> {
+        let mut coords: Vec<u8> = self
+            .committed
+            .keys()
+            .chain(self.dirty.keys())
+            .copied()
+            .collect();
+        coords.sort_unstable();
+        coords.dedup();
+        coords
+            .into_iter()
+            .filter_map(|c| self.visible(c).map(|b| (c, b)))
+            .collect()
+    }
+}
+
+/// Drives random ops over an [`Overlay`] of a multi-cell collection — dirty
+/// buffering, committed writes, and range scans **intermixed** — asserting both
+/// the range leg (each `Scan` op vs the sorted-map oracle, incl. early-stop)
+/// and the point leg (`get` per cell vs the dirty-over-committed oracle, after
+/// **every** op). This is the unified view property: point reads, range reads,
+/// and writes interleave so their interaction is exercised, not just each in
+/// isolation (dirty-wins, clear-hides, bounds, direction, limit — invariants 3,
+/// 5; DT7).
+///
+/// # Errors
+///
+/// Propagates backend errors raised during the run.
+pub(crate) async fn run_overlay_trace<S>(lower: S, trace: OverlayTrace) -> Result<bool>
+where
+    S: CellStore,
+{
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let id = CollectionId::new(
+        state_key,
+        StateType::Application,
+        StateName::try_new("entries")?,
+    );
+    let collection_ref = CollectionRef::new(id.clone(), None);
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower, own);
+    let mut model = CellModel::default();
+
+    for op in trace.ops {
+        match op {
+            OverlayOp::BufferSet(c, b) => {
+                overlay.buffer_set(&id, &cell_at(c), &bytes(b));
+                model.dirty.insert(c, Some(bytes(b)));
+            }
+            OverlayOp::BufferClear(c) => {
+                overlay.buffer_clear(&id, &cell_at(c));
+                model.dirty.insert(c, None);
+            }
+            OverlayOp::CommitSet(c, b) => {
+                // Committed seeds are written resolved (no event) so reads stay
+                // pure dirty-over-committed.
+                overlay
+                    .lower()
+                    .write_resolved(&collection_ref, &[(cell_at(c), Some(bytes(b)))])
+                    .await?;
+                model.committed.insert(c, Some(bytes(b)));
+            }
+            OverlayOp::CommitClear(c) => {
+                overlay
+                    .lower()
+                    .write_resolved(&collection_ref, &[(cell_at(c), None)])
+                    .await?;
+                model.committed.insert(c, None);
+            }
+            OverlayOp::Scan(req) => {
+                let expected = scan_oracle(&model, req);
+                if let Some(k) = req.partial {
+                    // Early stop: the k-prefix matches the oracle prefix, then a
+                    // follow-up full scan still yields the complete result
+                    // (dropping a scan mid-stream corrupts nothing).
+                    let k = (k as usize).min(expected.len());
+                    if collect_scan_prefix(&overlay, &id, &req, own, k).await? != expected[..k] {
+                        return Ok(false);
+                    }
+                }
+                if collect_scan(&overlay, &id, &req, own).await? != expected {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Point leg: after every op (mutation OR scan), every cell's `get`
+        // matches the model — so point reads interleave with the scans above.
+        for c in 0..CELLS {
+            if overlay.get(&id, &cell_at(c), own).await?.into_inner() != model.visible(c) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+// ─────────────────────────── scan merge
+// ───────────────────────────────────────
+
+/// One scan-trace step: seed the model/store, or run a scan and assert it.
+#[derive(Clone, Copy, Debug)]
+enum ScanStep {
+    Seed(SeedOp),
+    Scan(ScanReq),
+}
+
+impl Arbitrary for ScanStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            Self::Seed(SeedOp::arbitrary(g))
+        } else {
+            Self::Scan(ScanReq::arbitrary(g))
+        }
+    }
+}
+
+/// A seed mutation interleaving committed and dirty cells at overlapping and
+/// disjoint coordinates.
+#[derive(Clone, Copy, Debug)]
+enum SeedOp {
+    CommitSet(u8, u8),
+    CommitClear(u8),
+    DirtySet(u8, u8),
+    DirtyClear(u8),
+}
+
+impl Arbitrary for SeedOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let c = u8::arbitrary(g) % CELLS;
+        match u8::arbitrary(g) % 4 {
+            0 => Self::CommitSet(c, u8::arbitrary(g)),
+            1 => Self::CommitClear(c),
+            2 => Self::DirtySet(c, u8::arbitrary(g)),
+            _ => Self::DirtyClear(c),
+        }
+    }
+}
+
+/// A scan request with random anchor, direction, optional end and limit, and an
+/// optional early-stop prefix length.
+#[derive(Clone, Copy, Debug)]
+struct ScanReq {
+    start: u8,
+    forward: bool,
+    end: Option<u8>,
+    limit: Option<u8>,
+    partial: Option<u8>,
+}
+
+impl Arbitrary for ScanReq {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // Anchors range over `0..=CELLS` so they fall between cells and below /
+        // above every cell.
+        Self {
+            start: u8::arbitrary(g) % (CELLS + 1),
+            forward: bool::arbitrary(g),
+            end: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
+            // Includes 0 and values > the cell count.
+            limit: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 4)),
+            partial: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
+        }
+    }
+}
+
+/// A shrinkable scan trace.
+#[derive(Clone, Debug)]
+pub(crate) struct ScanTrace {
+    steps: Vec<ScanStep>,
+}
+
+impl Arbitrary for ScanTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            steps: capped_vec(g, MAX_TRACE_OPS),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.steps.shrink().map(|steps| Self { steps }))
+    }
+}
+
+/// The oracle scan result: `model`'s visible cells filtered to the request's
+/// range, ordered in the scan direction, truncated to the limit.
+fn scan_oracle(model: &CellModel, req: ScanReq) -> Vec<(u8, Bytes)> {
+    let mut cells: Vec<(u8, Bytes)> = model
+        .visible_ordered()
+        .into_iter()
+        .filter(|(c, _)| in_scan_range(req, *c))
+        .collect();
+    if !req.forward {
+        cells.reverse();
+    }
+    if let Some(limit) = req.limit {
+        cells.truncate(limit as usize);
+    }
+    cells
+}
+
+/// Whether coordinate `c` lies in the scan request's inclusive range, matching
+/// the backend `in_range` semantics (forward `>= start [.. <= end]`, backward
+/// `<= start [.. >= end]`).
+fn in_scan_range(req: ScanReq, c: u8) -> bool {
+    if req.forward {
+        c >= req.start && req.end.is_none_or(|end| c <= end)
+    } else {
+        c <= req.start && req.end.is_none_or(|end| c >= end)
+    }
+}
+
+/// Builds the [`Scan`] request from a [`ScanReq`] and owned anchor coordinates.
+fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: Option<&'a Coordinate>) -> Scan<'a> {
+    Scan {
+        section: SECTION,
+        start,
+        dir: if req.forward {
+            Direction::Forward
+        } else {
+            Direction::Backward
+        },
+        end,
+        limit: req.limit.map(usize::from),
+    }
+}
+
+/// Collects an overlay scan, mapping each cell to `(coordinate byte, bytes)`.
+async fn collect_scan<S>(
+    overlay: &Overlay<S>,
+    id: &CollectionId,
+    req: &ScanReq,
+    own: EventRef,
+) -> Result<Vec<(u8, Bytes)>>
+where
+    S: CellStore,
+{
+    let start = Coordinate::from_bytes(vec![req.start]);
+    let end = req.end.map(|e| Coordinate::from_bytes(vec![e]));
+    let stream = overlay.scan_cells(id, scan_of(*req, &start, end.as_ref()), own);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        let (key, value) = item?;
+        out.push((coord_of(&key), value));
+    }
+    Ok(out)
+}
+
+/// Collects only the first `k` items of an overlay scan, then drops the stream.
+async fn collect_scan_prefix<S>(
+    overlay: &Overlay<S>,
+    id: &CollectionId,
+    req: &ScanReq,
+    own: EventRef,
+    k: usize,
+) -> Result<Vec<(u8, Bytes)>>
+where
+    S: CellStore,
+{
+    let start = Coordinate::from_bytes(vec![req.start]);
+    let end = req.end.map(|e| Coordinate::from_bytes(vec![e]));
+    let stream = overlay.scan_cells(id, scan_of(*req, &start, end.as_ref()), own);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while out.len() < k {
+        let Some(item) = stream.next().await else {
+            break;
+        };
+        let (key, value) = item?;
+        out.push((coord_of(&key), value));
+    }
+    // Stream dropped here — dropping mid-scan must corrupt nothing.
+    Ok(out)
+}
+
+/// Drives interleaved committed seeds and scans **directly over a bottom
+/// store's `scan_cells`** (no overlay), pinning the backend's own ordering,
+/// clustering-range bounds, and limit handling — the Cassandra `ORDER BY
+/// ASC/DESC` + `coordinate` range the overlay merge delegates to and the
+/// limit/end the overlay strips before delegating. Every seed is committed
+/// (`write_resolved`), so the oracle is committed-only.
+///
+/// # Errors
+///
+/// Propagates backend errors raised during the run.
+pub(crate) async fn run_bottom_scan_trace<S>(store: S, trace: ScanTrace) -> Result<bool>
+where
+    S: CellStore,
+{
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let id = CollectionId::new(
+        state_key,
+        StateType::Application,
+        StateName::try_new("entries")?,
+    );
+    let collection_ref = CollectionRef::new(id.clone(), None);
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let mut model = CellModel::default();
+
+    for step in trace.steps {
+        match step {
+            // Every seed lands in committed state; a "dirty" seed becomes a
+            // committed set/clear so the bottom store alone holds the data.
+            ScanStep::Seed(SeedOp::CommitSet(c, b) | SeedOp::DirtySet(c, b)) => {
+                store
+                    .write_resolved(&collection_ref, &[(cell_at(c), Some(bytes(b)))])
+                    .await?;
+                model.committed.insert(c, Some(bytes(b)));
+            }
+            ScanStep::Seed(SeedOp::CommitClear(c) | SeedOp::DirtyClear(c)) => {
+                store
+                    .write_resolved(&collection_ref, &[(cell_at(c), None)])
+                    .await?;
+                model.committed.insert(c, None);
+            }
+            ScanStep::Scan(req) => {
+                let expected = scan_oracle(&model, req);
+                let start = Coordinate::from_bytes(vec![req.start]);
+                let end = req.end.map(|e| Coordinate::from_bytes(vec![e]));
+                let stream = store.scan_cells(&id, scan_of(req, &start, end.as_ref()), own);
+                futures::pin_mut!(stream);
+                let mut got = Vec::new();
+                while let Some(item) = stream.next().await {
+                    let (key, value) = item?;
+                    got.push((coord_of(&key), value));
+                }
+                if got != expected {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+// ─────────────────────────── sweep idempotence
+// ────────────────────────────────
+
+/// A [`CellStore`] decorator counting every durable mutation, for the
+/// sweep-idempotence pin. Delegates to `inner`; the counters ride an `Arc` so
+/// `Clone` shares them.
+#[derive(Clone)]
 pub(crate) struct CountingCellStore<S> {
     inner: S,
     counts: Arc<OpCounts>,
@@ -680,78 +976,70 @@ pub(crate) struct CountingCellStore<S> {
 
 #[derive(Default)]
 struct OpCounts {
-    read_cell: AtomicUsize,
     write_provisional: AtomicUsize,
     write_resolved: AtomicUsize,
     mark_resolved: AtomicUsize,
 }
 
 impl<S> CountingCellStore<S> {
-    fn new(inner: S) -> Self {
+    pub(crate) fn new(inner: S) -> Self {
         Self {
             inner,
             counts: Arc::new(OpCounts::default()),
         }
     }
 
-    fn read_cells(&self) -> usize {
-        self.counts.read_cell.load(Ordering::Relaxed)
-    }
-
-    fn provisional_writes(&self) -> usize {
-        self.counts.write_provisional.load(Ordering::Relaxed)
-    }
-
-    fn resolved_writes(&self) -> usize {
-        self.counts.write_resolved.load(Ordering::Relaxed)
-    }
-
-    fn promotes(&self) -> usize {
-        self.counts.mark_resolved.load(Ordering::Relaxed)
-    }
-
     /// Total durable mutations (excludes reads).
-    fn durable_writes(&self) -> usize {
-        self.provisional_writes() + self.resolved_writes() + self.promotes()
+    pub(crate) fn durable_writes(&self) -> usize {
+        self.counts.write_provisional.load(Ordering::Relaxed)
+            + self.counts.write_resolved.load(Ordering::Relaxed)
+            + self.counts.mark_resolved.load(Ordering::Relaxed)
     }
 
-    fn reset(&self) {
-        self.counts.read_cell.store(0, Ordering::Relaxed);
+    pub(crate) fn reset(&self) {
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
     }
 }
 
-impl<S> CellStore<ValueKind> for CountingCellStore<S>
+impl<S> CellStore for CountingCellStore<S>
 where
-    S: CellStore<ValueKind>,
+    S: CellStore,
 {
     type Error = S::Error;
 
-    async fn read_cell<'a>(
+    fn get<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
-        addr: &'a (),
-    ) -> Result<Cell, Self::Error> {
-        self.counts.read_cell.fetch_add(1, Ordering::Relaxed);
-        self.inner.read_cell(collection, addr).await
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
+        self.inner.get(collection, cell, own)
+    }
+
+    fn scan_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        self.inner.scan_cells(collection, scan, own)
     }
 
     fn provisional_cells<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> impl Stream<Item = Result<((), ProvisionalCell), Self::Error>> + Send + 'a {
+        collection: &'a CollectionId,
+    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         self.inner.provisional_cells(collection)
     }
 
     async fn write_provisional<'a>(
         &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        writes: &'a [((), ProvisionalWrite)],
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        // One increment per collection-grain batch call, so the bulk-apply pins
-        // assert "one batched call per collection", not one per cell.
+        // One increment per collection-grain batch call (not one per cell).
         self.counts
             .write_provisional
             .fetch_add(1, Ordering::Relaxed);
@@ -760,8 +1048,8 @@ where
 
     async fn write_resolved<'a>(
         &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        cells: &'a [((), Option<Bytes>)],
+        collection: &'a CollectionRef,
+        cells: &'a [(CellKey, Option<Bytes>)],
     ) -> Result<(), Self::Error> {
         self.counts.write_resolved.fetch_add(1, Ordering::Relaxed);
         self.inner.write_resolved(collection, cells).await
@@ -769,139 +1057,188 @@ where
 
     async fn mark_resolved<'a>(
         &'a self,
-        collection: &'a CollectionRef<ValueKind>,
-        addrs: &'a [()],
+        collection: &'a CollectionRef,
+        cells: &'a [CellKey],
     ) -> Result<(), Self::Error> {
         self.counts.mark_resolved.fetch_add(1, Ordering::Relaxed);
-        self.inner.mark_resolved(collection, addrs).await
+        self.inner.mark_resolved(collection, cells).await
+    }
+}
+
+/// A [`CellStore`] wrapper whose `mark_resolved` fails **permanently** for one
+/// named collection, delegating everything else to `inner`. Drives the
+/// session's best-effort `commit_apply` (one poisoned cell yields `Incomplete`
+/// without cancelling siblings) and the manager's no-strand recovery (a failed
+/// resolution leaves the backstop armed).
+#[derive(Clone)]
+pub(crate) struct FailingCellStore<S> {
+    inner: S,
+    poison: StateName,
+}
+
+impl<S> FailingCellStore<S> {
+    /// Wraps `inner`, poisoning `mark_resolved` for the `poison` collection.
+    pub(crate) fn new(inner: S, poison: StateName) -> Self {
+        Self { inner, poison }
+    }
+}
+
+/// Error of a [`FailingCellStore`]: the poison, or a delegated inner error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FailCellError<E>
+where
+    E: Error + 'static,
+{
+    /// The poisoned collection's `mark_resolved` was called.
+    #[error("permanent promote poison")]
+    Poison,
+
+    /// A delegated inner-store error.
+    #[error(transparent)]
+    Inner(#[from] E),
+}
+
+impl<E> ClassifyError for FailCellError<E>
+where
+    E: ClassifyError + Error + 'static,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Poison => ErrorCategory::Permanent,
+            Self::Inner(e) => e.classify_error(),
+        }
+    }
+}
+
+impl<S> CellStore for FailingCellStore<S>
+where
+    S: CellStore,
+{
+    type Error = FailCellError<S::Error>;
+
+    async fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> Result<Committed, Self::Error> {
+        self.inner
+            .get(collection, cell, own)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    fn scan_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        self.inner
+            .scan_cells(collection, scan, own)
+            .map(|item| item.map_err(FailCellError::Inner))
+    }
+
+    fn provisional_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
+        self.inner
+            .provisional_cells(collection)
+            .map(|item| item.map_err(FailCellError::Inner))
+    }
+
+    async fn write_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write_provisional(collection, writes)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    async fn write_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [(CellKey, Option<Bytes>)],
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write_resolved(collection, cells)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    async fn mark_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [CellKey],
+    ) -> Result<(), Self::Error> {
+        if *collection.id().name() == self.poison {
+            return Err(FailCellError::Poison);
+        }
+        self.inner
+            .mark_resolved(collection, cells)
+            .await
+            .map_err(FailCellError::Inner)
     }
 }
 
 #[cfg(test)]
-mod op_budget {
-    use super::super::super::memory::MemoryCellStore;
+mod sweep {
+    use super::super::super::memory::{MemoryCellStore, MemoryCells};
+    use super::super::super::registry::CollectionDefRegistry;
     use super::*;
 
-    type Backing = CountingCellStore<MemoryCellStore>;
-
-    struct Fixture {
-        store: Store<Backing>,
-        counts: Backing,
-        oracle: ScriptedOracle,
-        refs: Vec<CollectionRef<ValueKind>>,
-    }
-
-    fn setup() -> Result<Fixture> {
-        let counts = CountingCellStore::new(MemoryCellStore::new());
-        let oracle = ScriptedOracle::default();
-        let store = Store::new(
-            counts.clone(),
-            oracle.clone(),
-            MemoryCommittedCache::new(),
-            Arc::new(CollectionDefRegistry::default()),
-        );
-        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-        let refs = (0..POOL)
-            .map(|c| {
-                let id = CollectionId::new(
-                    state_key.clone(),
-                    StateType::Application,
-                    StateName::try_new(format!("c{c}"))?,
-                );
-                Ok(CollectionRef::new(id, None))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Fixture {
-            store,
-            counts,
-            oracle,
-            refs,
-        })
-    }
-
-    /// The hot path for one event over `POOL` warm collections costs exactly
-    /// one provisional stage and one promote per cell, and **zero reads** —
-    /// the committed base is served from the cache. No pending index, no
-    /// read-back.
+    /// The first sweep over staged provisional cells resolves them; a second
+    /// sweep performs **zero durable writes** — `provisional_cells` yields
+    /// nothing once every cell is resolved, so `sweep_provisional`
+    /// short-circuits before touching the backend (sweep idempotence).
     #[tokio::test]
-    async fn warm_event_budget_is_one_stage_and_one_promote_per_cell() -> Result<()> {
-        let Fixture {
-            store,
-            counts,
-            refs,
-            ..
-        } = setup()?;
+    async fn second_sweep_is_a_no_op() -> Result<()> {
+        let oracle = ScriptedOracle::default();
+        let registry = Arc::new(CollectionDefRegistry::default());
+        let store = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            registry,
+        ));
+        let (ids, refs) = pooled_collections()?;
+        let cell = value_cell();
 
-        // Warm the cache with a committed value for every collection.
-        for r in &refs {
-            store.write_resolved(r, &(), Some(&bytes(0))).await?;
-        }
-        counts.reset();
-
-        // One event stages and promotes each cell, reading prev from the cache.
-        let event = EventRef::Message {
-            dedup_id: Uuid::from_u128(1),
-        };
-        for r in &refs {
-            let prev = store.committed(r.id(), &(), event).await?;
-            let data = bytes(1);
+        // Stage a committed provisional cell on every collection.
+        for (i, (id, r)) in ids.iter().zip(&refs).enumerate() {
+            let dedup_id = Uuid::from_u128(i as u128);
+            let event = EventRef::Message { dedup_id };
+            let prev = store.get(id, &cell, event).await?;
             store
                 .write_provisional(
                     r,
-                    &(),
-                    &ProvisionalWrite::new(Some(data.clone()), prev, event),
+                    &[(
+                        cell.clone(),
+                        ProvisionalWrite::new(Some(bytes(7)), prev, event),
+                    )],
                 )
                 .await?;
-            store.promote(r, &(), Some(&data)).await?;
-        }
-
-        assert_eq!(counts.read_cells(), 0, "warm reads must hit the cache");
-        assert_eq!(counts.provisional_writes(), POOL as usize);
-        assert_eq!(counts.promotes(), POOL as usize);
-        assert_eq!(counts.resolved_writes(), 0);
-        Ok(())
-    }
-
-    /// The first sweep over provisional cells resolves them; a second sweep
-    /// performs **zero durable writes** — the status map records every cell
-    /// resolved and short-circuits before touching the backend.
-    #[tokio::test]
-    async fn second_sweep_is_a_no_op() -> Result<()> {
-        let Fixture {
-            store,
-            counts,
-            oracle,
-            refs,
-        } = setup()?;
-
-        // Stage a committed provisional cell on every collection.
-        for (i, r) in refs.iter().enumerate() {
-            let dedup_id = Uuid::from_u128(i as u128);
-            let event = EventRef::Message { dedup_id };
-            let prev = store.committed(r.id(), &(), event).await?;
-            store
-                .write_provisional(r, &(), &ProvisionalWrite::new(Some(bytes(7)), prev, event))
-                .await?;
-            // Record the marker so the oracle promotes on sweep.
             oracle.record_message(dedup_id).await?;
         }
 
         // First sweep resolves every cell.
         for r in &refs {
-            assert!(store.sweep_collection(r).await?);
+            assert!(sweep_provisional(&store, &oracle, r).await?);
         }
         assert!(
-            counts.durable_writes() > 0,
+            store.durable_writes() > 0,
             "first sweep must resolve provisional cells"
         );
 
-        // Second sweep is a no-op: status says resolved, nothing touched.
-        counts.reset();
+        // Second sweep is a no-op: no provisional cell remains to resolve.
+        store.reset();
         for r in &refs {
-            assert!(store.sweep_collection(r).await?);
+            assert!(sweep_provisional(&store, &oracle, r).await?);
         }
-        assert_eq!(counts.durable_writes(), 0);
-        assert_eq!(counts.read_cells(), 0);
+        assert_eq!(store.durable_writes(), 0);
         Ok(())
     }
 }

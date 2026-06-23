@@ -1,35 +1,34 @@
 //! Per-event keyed-state sessions.
 //!
-//! A [`StateSession`] is the per-event view over a partition's keyed-state
-//! stores: byte-cell reads and writes buffer in per-event dirty workspaces, and
-//! the framework drives the stage/promote lifecycle through a sealed supertrait
+//! A session is the per-event view over a partition's keyed-state cell store:
+//! byte-cell reads and writes buffer in a per-event dirty overlay, and the
+//! framework drives the stage/promote lifecycle through a sealed supertrait
 //! that downstream crates can neither implement nor call.
 //!
 //! [`KeyedStateSession`] is the sole implementation — the real session, minted
-//! per event by the partition's state manager. It composes **one `Lane` per
-//! collection kind** (`Lanes`): each lane owns that kind's
-//! partition-lifetime [`PartitionStateStore`] plus a per-event dirty workspace,
-//! and the session owns the cross-kind **singletons** (the commit oracle, the
+//! per event by the partition's state manager. It holds **one uniform
+//! [`Overlay`]** (the per-event [`DirtyStore`] over the partition's committed
+//! cell store) plus the cross-event singletons (the commit oracle, the
 //! registered marker, the armed backstop, the event, the registry, …). Clones
 //! share the per-event state, so repeated descriptor binds of one collection
-//! accumulate into one write. Keyed state is always wired, so there is no
-//! stateless stub outside tests.
+//! accumulate into one write.
 //!
-//! # The kind seam
+//! # The read / mutate / lifecycle split
 //!
-//! [`StateSession`] is the **kind-agnostic** core (registration, loader,
-//! termination, the sealed lifecycle). The only per-kind surface is
-//! [`CellAccess<K>`], implemented once per lane: every kind's handle — Value's
-//! `StateHandle`, future Map/Deque handles — bounds its op methods on
-//! `CellAccess<K>` for its own `K` (Value's `CellAddr` is `()`). Adding a kind
-//! is therefore additive: a new lane field (which fails every exhaustive
-//! lifecycle destructure until wired), a `CellAccess<K>` impl, a `+
-//! CellAccess<K>` bound on `EventContext::State`, and a sweep name set — the
-//! marker, backstop, and `settle`/`abandon` machinery are untouched. The
-//! generic `Lane` body is exercised on a non-Value kind by the direct
-//! `Lane<CounterKind>` property test in the `lane` module's test submodule, so
-//! the machinery the Value lane shares stays covered without a test kind in
-//! production types.
+//! The session surface is three traits, so a read-only consumer (a cross-group
+//! reader) is structurally non-mutating:
+//!
+//! - [`CellRead`] — the read-only half: `get`/`scan` +
+//!   `loader`/`is_terminated`/ `verify_state_registration`. Crate-sealed via
+//!   `sealed::ReadSessionMarker`.
+//! - [`CellSession`] (`= CellRead + StateLifecycle`) — adds the buffering
+//!   mutators `set`/`clear`/`flush`. [`EventContext::State`] bounds this.
+//! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
+//!   (`finalize`/`commit_apply`/`rollback_aborted`/marker/reset).
+//!
+//! Collection handles gate their methods by the session bound: reads need only
+//! `CellRead`, mutators need `CellSession`, so a handle minted over a
+//! `CellRead`-only session *cannot name* a mutator.
 //!
 //! # Lifecycle
 //!
@@ -37,52 +36,56 @@
 //! (`crate::consumer::middleware`'s blanket `EventHandler` impl) in
 //! straight-line code:
 //!
-//! 1. Handler ops buffer into each kind's dirty scope through the cell methods;
-//!    the deduplication middleware buffers the message's commit marker via
-//!    `register_marker` during unwind.
-//! 2. On the final handler success, `finalize` stages **every** lane (awaiting
-//!    all via `try_join!`, so a lane error returns before the marker flush) —
-//!    `ReadCommitted` collections stage provisional cells, `ReadUncommitted`
-//!    ones write resolved values.
+//! 1. Handler ops buffer into the dirty overlay; the deduplication middleware
+//!    buffers the message's commit marker via `register_marker` during unwind.
+//! 2. On the final handler success, `finalize` groups the one dirty map by
+//!    collection and stages each in one same-partition batch — `ReadCommitted`
+//!    collections stage provisional cells, `ReadUncommitted` ones write
+//!    resolved values.
 //! 3. Strictly after the stage, `flush_marker` writes the registered dedup
 //!    marker through the commit oracle. After the offset/trigger commit,
-//!    `commit_apply` promotes every lane's staged cells; `rollback_aborted`
-//!    rolls them back. Both drive **all** lanes to completion (`join!`, not
-//!    `try_join!`), so a failure in one kind never strands another.
-//! 4. At attempt boundaries (retry, defer), `reset` discards every lane's dirty
-//!    scope and staged set plus the registered marker.
+//!    `commit_apply` promotes the staged cells; `rollback_aborted` rolls them
+//!    back.
+//! 4. At attempt boundaries (retry, defer), `reset` discards the dirty overlay
+//!    and staged set plus the registered marker.
 
 use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError};
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::ClassifyError;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
+use crate::state::cell::ProvisionalWrite;
+use crate::state::cell_key::{CellKey, Coordinate, Scan};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
 };
-use crate::state::identity::{CollectionId, CollectionKind, CollectionRef};
+use crate::state::dirty::{DirtyStore, DirtyVal};
+use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::oracle::CommitOracle;
-use crate::state::partition_store::PartitionStateStore;
+use crate::state::overlay::Overlay;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::value::ValueKind;
+use crate::state::store::CellStore;
 use crate::state::{
-    CollectionKindId, EventRef, StateBackend, StateKey, StateName, StateType, StoreOutcome,
+    CollectionKindId, CommitMode, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend, StateKey,
+    StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
+use async_stream::try_stream;
 use bytes::Bytes;
-use lane::{Lane, Resolve};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
 use scc::HashSet as ConcurrentHashSet;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
+use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tokio::{join, try_join};
+use tokio::task::coop::cooperative;
+use tracing::warn;
 use uuid::Uuid;
-
-mod lane;
 
 #[cfg(test)]
 mod tests;
@@ -95,30 +98,39 @@ mod tests;
 /// keys.
 pub(crate) type ArmedKeys = Arc<ConcurrentHashSet<Key, RandomState>>;
 
-/// Per-event keyed-state session: typed descriptor handles operate over its
-/// byte cells, the framework drives its (crate-sealed) lifecycle.
+/// The provisional cells `finalize` staged, grouped by collection (its ref
+/// carries the TTL). Only `ReadCommitted` collections appear; `ReadUncommitted`
+/// writes resolve at stage time with nothing to settle. Each `(cell, write)`'s
+/// `data` is the value to promote to, `prev` the committed base to roll back
+/// to.
+type StagedSet = Vec<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>;
+
+/// The read-only half of a per-event session: visible committed-value reads
+/// (`get`/`scan`), the loader slot, the termination flag, and the registration
+/// check. The only surface a cross-group reader implements, so a reader-minted
+/// collection handle carries no mutator (the `ReadOnlyHandleCannotMutate`
+/// invariant, enforced at the handle's method-impl bound).
 ///
-/// Sessions are cheap `Arc`-backed clones; every clone shares the same
-/// per-event lanes and singletons, so repeated descriptor binds of one
-/// collection accumulate into one write. The trait is sealed — downstream
-/// crates name it in bounds but cannot implement it or call the lifecycle
-/// methods.
-///
-/// This is the **kind-agnostic** core: registration, the loader slot,
-/// termination, and the sealed lifecycle. Per-kind cell access — the only
-/// per-kind surface — lives on [`CellAccess<K>`], one impl per lane, so adding
-/// a kind never touches this trait.
-pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
+/// `get`/`scan` describe the session's **visible committed bytes** for a cell —
+/// the writer's [`KeyedStateSession`] realises that through the dirty overlay +
+/// oracle resolution; a reader realises the same contract through a pure
+/// committed projection. Neither realisation leaks into this contract.
+pub trait CellRead: sealed::ReadSessionMarker + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
     /// [`CellResolver`](crate::state::descriptor::CellResolver)
-    /// living *outside* `src/state` reads it from the session at resolve time
-    /// (the consumer pins it to its message loader). Kept fully opaque here so
-    /// nothing in `src/state` couples to how cells are resolved.
+    /// living outside `src/state` reads it from the session at resolve time.
     type Loader: Clone + Send + Sync + 'static;
+
+    /// Error a `scan` stream may yield (the cell store's error).
+    type ScanError: ClassifyError + Error + Send + Sync + 'static;
 
     /// Returns the session's capability slot for a resolver to read.
     fn loader(&self) -> &Self::Loader;
+
+    /// Returns `true` once the partition is shutting down or the event has been
+    /// cancelled. Descriptor handles guard every operation on this.
+    fn is_terminated(&self) -> bool;
 
     /// Validates that the keyed-state collection named `(state_type, name)` is
     /// registered with the asserted structural identity, returning the
@@ -137,56 +149,47 @@ pub trait StateSession: StateLifecycle + Clone + Send + Sync + 'static {
         identity: &StructuralIdentity,
     ) -> Result<StateName, StateAccessError>;
 
-    /// Returns `true` once the partition is shutting down or the event has
-    /// been cancelled. Descriptor handles guard every operation on this.
-    fn is_terminated(&self) -> bool;
-}
-
-/// The uniform **addressed** point-cell access surface for one collection kind.
-///
-/// A handle for kind `K` (Value, Map, Deque, a sketch) bounds its op methods on
-/// `S: CellAccess<K>` — exactly as [`StateHandle::get`] surfaces
-/// `R: CellResolver<S>` — and translates its operations (`push`, `get_entry`,
-/// `increment`, …) into these point-cell ops over the kind's
-/// [`CellAddr`](CollectionKind::CellAddr) plus any header-cell maintenance. The
-/// session impls one per lane, forwarding to that lane; the kind semantics
-/// ([`combine`](CollectionKind::combine)/[`apply`](CollectionKind::apply)) live
-/// in the kind, not here.
-///
-/// Multi-cell **scans** (Map `iterate`, Deque `range`) are deliberately *not*
-/// expressible here — a future bulk-read surface adds them when scannable kinds
-/// land.
-///
-/// [`StateHandle::get`]: crate::state::descriptor::StateHandle::get
-pub trait CellAccess<K>: StateSession
-where
-    K: CollectionKind,
-{
-    /// Reads the cell's current visible value within this event's transaction.
+    /// Reads a cell's currently visible committed value within this event's
+    /// transaction (cleared/absent → `None`).
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
     /// [`StateAccessError::Store`] when the underlying store fails.
-    fn read_cell(
+    fn get(
         &self,
         state_type: StateType,
         name: &StateName,
-        addr: &K::CellAddr,
+        cell: &CellKey,
     ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
 
+    /// The single-section, start-anchored, bidirectional range primitive: a
+    /// lazy stream of the visible committed cells in `coordinate` byte order.
+    fn scan<'a>(
+        &'a self,
+        state_type: StateType,
+        name: &'a StateName,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a;
+}
+
+/// The read/buffer/mutate session collections write through. Adds the buffering
+/// mutators to [`CellRead`]; the framework reaches the lifecycle through the
+/// sealed `StateLifecycle` supertrait. Everything readable is inherited from
+/// [`CellRead`].
+pub trait CellSession: CellRead + StateLifecycle {
     /// Buffers a set of the cell's bytes.
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
     /// [`StateAccessError::Store`] when the underlying store fails.
-    fn set_cell(
+    fn set(
         &self,
         state_type: StateType,
         name: &StateName,
-        addr: &K::CellAddr,
-        cell: &[u8],
+        cell: &CellKey,
+        value: &[u8],
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
     /// Buffers a clear of the cell.
@@ -195,47 +198,54 @@ where
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
     /// [`StateAccessError::Store`] when the underlying store fails.
-    fn clear_cell(
+    fn clear(
         &self,
         state_type: StateType,
         name: &StateName,
-        addr: &K::CellAddr,
+        cell: &CellKey,
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-    /// Writes the cell's buffered op straight to committed state — the
+    /// Writes the cell's buffered outcome straight to committed state — the
     /// mid-handler write-through escape hatch.
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
     /// [`StateAccessError::Store`] when the underlying store fails.
-    fn flush_cell(
+    fn flush(
         &self,
         state_type: StateType,
         name: &StateName,
-        addr: &K::CellAddr,
+        cell: &CellKey,
     ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
 }
 
-/// Crate-sealed lifecycle half of [`StateSession`].
+/// Crate-sealed lifecycle half of [`CellSession`].
 ///
-/// The module is `pub(crate)`, so downstream crates can name
-/// [`StateSession`] in bounds but can neither implement it nor reach the
-/// lifecycle: staging, promoting, and resetting are framework-only moves.
+/// The module is `pub(crate)`, so downstream crates can name [`CellSession`] in
+/// bounds but can neither implement it nor reach the lifecycle: staging,
+/// promoting, and resetting are framework-only moves.
 pub(crate) mod sealed {
     use super::{CompactDuration, Future, StateAccessError, Uuid};
+
+    /// Crate-private marker keeping [`super::CellRead`] consistent with the
+    /// framework's seal-everything hygiene: only the in-crate
+    /// [`KeyedStateSession`](super::KeyedStateSession) (and the future reader
+    /// session) implement it, so `CellRead` cannot be implemented downstream.
+    /// Hygiene, not correctness — a downstream `CellRead` impl could reach no
+    /// mutator anyway (those need the sealed [`StateLifecycle`]).
+    pub trait ReadSessionMarker {}
 
     /// Whether `finalize` staged any provisional cells.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum FinalizeOutcome {
         /// At least one `ReadCommitted` collection staged a provisional cell;
-        /// the caller must arm the `StateRecovery` backstop timer and promote
-        /// after the commit.
+        /// the caller must arm the `StateRecovery` backstop and promote after
+        /// the commit.
         Staged,
 
-        /// Nothing staged: no collection was dirtied, or every dirty
-        /// collection was `ReadUncommitted` and written resolved during
-        /// `finalize`.
+        /// Nothing staged: no collection was dirtied, or every dirty collection
+        /// was `ReadUncommitted` and written resolved during `finalize`.
         Clean,
     }
 
@@ -246,108 +256,77 @@ pub(crate) mod sealed {
         /// No staged set was recorded for this event — nothing to resolve.
         NothingStaged,
 
-        /// Every staged cell resolved (promoted to committed, or rolled back
-        /// to its committed base).
+        /// Every staged cell resolved (promoted, or rolled back to its base).
         Resolved,
 
-        /// At least one resolution failed; the per-key `StateRecovery`
-        /// backstop (always left armed by the durability boundary) lets the
-        /// sweep retry. The boundary logs this outcome.
+        /// At least one resolution failed; the per-key `StateRecovery` backstop
+        /// (always left armed by the durability boundary) lets the sweep retry.
         Incomplete,
     }
 
     /// Framework-only lifecycle over a per-event session.
     pub trait StateLifecycle {
-        /// Resolves every touched collection across every kind by its commit
-        /// mode: `ReadCommitted` collections stage a provisional cell (the
-        /// staged set is recorded per lane), `ReadUncommitted` collections
-        /// write a resolved value. Awaits **all** lanes before returning, so a
-        /// lane error returns before the textually-later marker flush.
+        /// Resolves every touched collection by its commit mode:
+        /// `ReadCommitted` collections stage a provisional cell (the
+        /// staged set is recorded), `ReadUncommitted` collections write
+        /// a resolved value. Stages all collections before returning,
+        /// so a stage error returns before the textually-later marker
+        /// flush.
         ///
         /// # Errors
         ///
-        /// Returns a type-erased store error when staging or writing fails;
-        /// nothing is recorded for the failing lane in that case.
+        /// Returns a type-erased store error when staging fails; nothing is
+        /// recorded in that case.
         fn finalize(
             &self,
         ) -> impl Future<Output = Result<FinalizeOutcome, StateAccessError>> + Send;
 
-        /// Promotes every lane's recorded staged set after the event committed.
-        /// Best-effort across lanes: individual failures are logged and folded
-        /// into [`ApplyOutcome::Incomplete`], never cancelling a sibling lane.
+        /// Promotes the recorded staged set after the event committed.
+        /// Best-effort: individual failures are logged and folded into
+        /// [`ApplyOutcome::Incomplete`].
         fn commit_apply(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
-        /// Rolls every lane's recorded staged set back after the event aborted.
+        /// Rolls the recorded staged set back after the event aborted.
         /// Best-effort, symmetric with [`Self::commit_apply`].
         fn rollback_aborted(&self) -> impl Future<Output = ApplyOutcome> + Send;
 
         /// Buffers the message commit marker (`dedup_id`) for this event.
         ///
-        /// Infallible and last-wins: the deduplication middleware calls it
-        /// during unwind on a handler `Ok` or permanent error. The marker
-        /// rides the session — not derived from the session's `EventRef` —
-        /// because on a deferred-message reload the marker is the reloaded
-        /// *message's* dedup id while the session stages under the *timer's*
-        /// `EventRef`. The boundary flushes it strictly after the stage;
-        /// [`Self::reset`] discards it at attempt boundaries.
+        /// Infallible and last-wins. The marker rides the session — not derived
+        /// from the session's `EventRef` — because on a deferred-message reload
+        /// the marker is the reloaded *message's* dedup id while the session
+        /// stages under the *timer's* `EventRef`. The boundary flushes it
+        /// strictly after the stage; [`Self::reset`] discards it.
         fn register_marker(&self, dedup_id: Uuid);
 
-        /// Writes the registered marker through the commit oracle, clearing
-        /// the slot only on success so the boundary can retry a transient
-        /// failure. A no-op when no marker is registered (returns `Ok`).
+        /// Writes the registered marker through the commit oracle, clearing the
+        /// slot only on success so the boundary can retry a transient failure.
+        /// A no-op when no marker is registered (returns `Ok`).
         ///
         /// # Errors
         ///
-        /// Returns a type-erased store error (carrying its classification)
-        /// when the oracle write fails.
+        /// Returns a type-erased store error when the oracle write fails.
         fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Discards every lane's per-event dirty scope and staged set, plus the
+        /// Discards the per-event dirty overlay and staged set, plus the
         /// registered marker, so the next attempt starts clean.
-        /// Called at attempt boundaries (retry, defer-swallow).
         fn reset(&self);
 
-        /// Delay between staging and the `StateRecovery` sweep, used by
-        /// the durability boundary to arm the backstop timer.
+        /// Delay between staging and the `StateRecovery` sweep.
         fn recovery_fire_delay(&self) -> CompactDuration;
 
         /// Whether a `StateRecovery` backstop is already standing for this
-        /// session's key (a not-yet-fired timer the durability boundary armed
-        /// for an earlier commit).
-        ///
-        /// When `true`, the boundary skips re-arming: the standing timer
-        /// already covers this commit's staged cells, so rapid commits issue
-        /// at most one timer write per backstop generation. Per-key
-        /// serialization (one handler or sweep per key at a time) makes this
-        /// race-free — the sweep that consumes the backstop cannot run while a
-        /// commit is deciding whether to re-arm.
+        /// session's key.
         fn backstop_armed(&self) -> impl Future<Output = bool> + Send;
 
         /// Records that a `StateRecovery` backstop is now standing for this
-        /// session's key. Called by the boundary strictly after a successful
-        /// arm; cleared when the sweep fires (the manager's `recover`).
+        /// session's key.
         fn mark_backstop_armed(&self) -> impl Future<Output = ()> + Send;
     }
 }
 
-/// Folds the per-lane [`ApplyOutcome`]s of `commit_apply`/`rollback_aborted`
-/// into one: `Incomplete` dominates (so the single backstop stays armed if any
-/// kind failed), then `Resolved`, then `NothingStaged`.
-fn merge_apply(outcomes: impl IntoIterator<Item = ApplyOutcome>) -> ApplyOutcome {
-    outcomes
-        .into_iter()
-        .fold(ApplyOutcome::NothingStaged, |acc, next| match (acc, next) {
-            (ApplyOutcome::Incomplete, _) | (_, ApplyOutcome::Incomplete) => {
-                ApplyOutcome::Incomplete
-            }
-            (ApplyOutcome::Resolved, _) | (_, ApplyOutcome::Resolved) => ApplyOutcome::Resolved,
-            _ => ApplyOutcome::NothingStaged,
-        })
-}
-
-/// Clones of the partition's termination signals, captured when a session
-/// is minted so descriptor handles can guard operations without holding a
-/// context.
+/// Clones of the partition's termination signals, captured when a session is
+/// minted so descriptor handles can guard operations without holding a context.
 #[derive(Clone, Debug)]
 pub struct TerminationWatch {
     shutdown: watch::Receiver<ShutdownPhase>,
@@ -362,29 +341,24 @@ impl TerminationWatch {
         Self { shutdown, cancel }
     }
 
-    /// `true` once the partition is `Cancelling` (or later) or the event
-    /// has been cancelled.
+    /// `true` once the partition is `Cancelling` (or later) or the event has
+    /// been cancelled.
     #[must_use]
     pub fn is_terminated(&self) -> bool {
         *self.shutdown.borrow() >= ShutdownPhase::Cancelling || *self.cancel.borrow()
     }
 }
 
-/// The session's per-kind lanes, projected from the one backend bundle `B`. The
-/// destructure at every lifecycle fan-out site is **exhaustive** (no `..`), so
-/// adding a kind's lane fails to compile until it is wired into
-/// `finalize`/`commit_apply`/`rollback_aborted`/`reset` —
-/// invalid-states-unrepresentable applied to the composition itself.
-///
-/// Today only the Value lane exists, so the fan-out sites are single-element
-/// `try_join!`/`merge_apply([…])`; that shape is preserved deliberately (with a
-/// comment at each site) so a future kind ANDs its lane in alongside Value
-/// rather than a reader collapsing the array-of-one back to a scalar.
-struct Lanes<B>
-where
-    B: StateBackend,
-{
-    value: Lane<ValueKind, B::ValueCell, B::Oracle, B::ValueCache>,
+/// How `resolve_staged` settles a staged set once the event's outcome is known.
+#[derive(Clone, Copy, Debug)]
+enum Resolve {
+    /// The event committed: each staged cell's `data` becomes committed, via an
+    /// O(1) promote that nulls `event`/`prev`.
+    Promote,
+
+    /// The event aborted: each cell's committed base `prev` is written back as
+    /// the resolved value.
+    Rollback,
 }
 
 /// Construction parameters for [`KeyedStateSession`], bundled so the
@@ -393,15 +367,20 @@ pub struct SessionParts<B, L>
 where
     B: StateBackend,
 {
-    /// Partition-lifetime Value cell store + oracle + cache + status map.
-    pub store: PartitionStateStore<ValueKind, B::ValueCell, B::Oracle, B::ValueCache>,
+    /// The partition's uniform committed cell store (the session wraps it in a
+    /// per-event [`Overlay`]).
+    pub cell: B::Cell,
 
-    /// Partition-lifetime commit oracle; the marker flush writes the
-    /// message commit row through it. Same instance baked into `store`.
+    /// Per-partition shared dirty workspace; this event's `key` sub-range is
+    /// cleared at each attempt/settle boundary.
+    pub dirty: Arc<DirtyStore>,
+
+    /// Partition-lifetime commit oracle; the marker flush writes the message
+    /// commit row through it. The same instance is baked into `cell`.
     pub oracle: B::Oracle,
 
-    /// Opaque per-session capability slot a [`CellResolver`] reads at
-    /// resolve time (the consumer pins it to its message loader).
+    /// Opaque per-session capability slot a [`CellResolver`] reads at resolve
+    /// time.
     ///
     /// [`CellResolver`]: crate::state::descriptor::CellResolver
     pub loader: L,
@@ -418,9 +397,7 @@ where
     /// Delay between staging and the `StateRecovery` sweep.
     pub recovery_delay: CompactDuration,
 
-    /// Per-partition set of keys with a standing `StateRecovery` backstop,
-    /// shared with the manager's `recover` so a fired sweep clears the flag.
-    /// Lets the durability boundary skip re-arming while a backstop stands.
+    /// Per-partition set of keys with a standing `StateRecovery` backstop.
     pub armed: ArmedKeys,
 
     /// Termination signals captured at mint.
@@ -431,31 +408,28 @@ struct SessionInner<B, L>
 where
     B: StateBackend,
 {
-    lanes: Lanes<B>,
+    overlay: Overlay<B::Cell>,
     oracle: B::Oracle,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
     recovery_delay: CompactDuration,
-    /// Shared per-partition set of keys with a standing `StateRecovery`
-    /// backstop. Read/written for this session's own key only; the manager's
-    /// `recover` removes the key when the sweep fires.
     armed: ArmedKeys,
     termination: TerminationWatch,
+    /// The recorded staged set the lifecycle promotes or rolls back. `None`
+    /// until `finalize` stages a `ReadCommitted` collection.
+    staged: SyncMutex<Option<StagedSet>>,
     /// The registered message commit marker, flushed strictly after the stage
-    /// and cleared by `reset`. A session-level singleton (never per lane), so
-    /// "one marker, after every stage" is structural. `None` until the
-    /// deduplication middleware registers it (or always, on the timer arm).
+    /// and cleared by `reset`.
     marker: SyncMutex<Option<Uuid>>,
 }
 
-/// The real per-event session over a partition's cell stores.
+/// The real per-event session over a partition's cell store.
 ///
 /// One session is minted per event by the partition's state manager; clones
-/// share the per-event lanes and singletons. `B` is the per-partition
-/// [`StateBackend`] bundle (every lane's cell store + cache and the one shared
-/// oracle, projected behind the single parameter); `L` is the message loader.
+/// share the per-event overlay and singletons. `B` is the per-partition
+/// [`StateBackend`] bundle; `L` is the message loader.
 pub struct KeyedStateSession<B, L>
 where
     B: StateBackend,
@@ -490,11 +464,13 @@ impl<B, L> KeyedStateSession<B, L>
 where
     B: StateBackend,
 {
-    /// Creates a session for one event, opening a fresh dirty scope per lane.
+    /// Creates a session for one event, wrapping the partition's cell store in
+    /// a per-event [`Overlay`] over the shared dirty workspace.
     #[must_use]
     pub fn new(parts: SessionParts<B, L>) -> Self {
         let SessionParts {
-            store,
+            cell,
+            dirty,
             oracle,
             loader,
             registry,
@@ -506,9 +482,7 @@ where
         } = parts;
         Self {
             inner: Arc::new(SessionInner {
-                lanes: Lanes {
-                    value: Lane::new(store),
-                },
+                overlay: Overlay::new(dirty, cell, event),
                 oracle,
                 loader,
                 registry,
@@ -517,97 +491,90 @@ where
                 recovery_delay,
                 armed,
                 termination,
+                staged: SyncMutex::new(None),
                 marker: SyncMutex::new(None),
             }),
         }
     }
 
-    /// The collection id for `(state_type, name)` under this session's key, for
-    /// any kind `K` (the kind is carried only at the type level, so no bound is
-    /// needed). The `state_type` comes from the binding descriptor, threaded in
-    /// through the [`CellAccess`] ops, so a name is namespaced by its
-    /// `state_type`.
-    fn id_for<K>(&self, state_type: StateType, name: &StateName) -> CollectionId<K> {
+    /// The collection id for `(state_type, name)` under this session's key.
+    fn id_for(&self, state_type: StateType, name: &StateName) -> CollectionId {
         CollectionId::new(self.inner.state_key.clone(), state_type, name.clone())
     }
 
-    /// The collection ref (id + registry TTL) for `(state_type, name)` under
-    /// kind `K`.
-    fn ref_for<K>(&self, state_type: StateType, name: &StateName) -> CollectionRef<K> {
+    /// The collection ref (id + registry TTL) for `(state_type, name)`.
+    fn ref_for(&self, state_type: StateType, name: &StateName) -> CollectionRef {
         let id = self.id_for(state_type, name);
         let ttl = self.inner.registry.ttl_for(state_type, name);
         CollectionRef::new(id, ttl)
     }
-}
 
-/// Value access surface (`CellAddr = ()`), forwarding to the value lane — the
-/// "one `CellAccess<K>` impl per lane" pattern, here for the Value lane.
-impl<B, L> CellAccess<ValueKind> for KeyedStateSession<B, L>
-where
-    B: StateBackend,
-    L: Clone + Send + Sync + 'static,
-{
-    async fn read_cell(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        addr: &(),
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        let id = self.id_for(state_type, name);
-        self.inner
-            .lanes
-            .value
-            .read_cell(&id, addr, self.inner.event)
-            .await
-    }
-
-    async fn set_cell(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        addr: &(),
-        cell: &[u8],
-    ) -> Result<(), StateAccessError> {
-        let id = self.id_for(state_type, name);
-        self.inner.lanes.value.set_cell(&id, addr, cell).await;
-        Ok(())
-    }
-
-    async fn clear_cell(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        addr: &(),
-    ) -> Result<(), StateAccessError> {
-        let id = self.id_for(state_type, name);
-        self.inner.lanes.value.clear_cell(&id, addr).await;
-        Ok(())
-    }
-
-    async fn flush_cell(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        addr: &(),
-    ) -> Result<StoreOutcome, StateAccessError> {
-        let collection_ref = self.ref_for(state_type, name);
-        self.inner
-            .lanes
-            .value
-            .flush_cell(&collection_ref, addr)
-            .await
+    /// Resolves the recorded staged set after the event's outcome is known —
+    /// [`Resolve::Promote`] on commit, [`Resolve::Rollback`] on abort.
+    /// Best-effort: drives every per-collection resolution to completion
+    /// regardless of siblings, reporting [`ApplyOutcome::Incomplete`] if any
+    /// failed (the backstop, always left armed, lets the sweep retry).
+    async fn resolve_staged(&self, how: Resolve) -> ApplyOutcome
+    where
+        L: Send + Sync + 'static,
+    {
+        let Some(set) = self.inner.staged.lock().take() else {
+            return ApplyOutcome::NothingStaged;
+        };
+        let lower = self.inner.overlay.lower();
+        let all_resolved = stream::iter(set)
+            .map(|(collection_ref, writes)| {
+                cooperative(async move {
+                    let result = match how {
+                        Resolve::Promote => {
+                            let keys: Vec<CellKey> =
+                                writes.iter().map(|(cell, _)| cell.clone()).collect();
+                            lower.mark_resolved(&collection_ref, &keys).await
+                        }
+                        Resolve::Rollback => {
+                            let cells: Vec<(CellKey, Option<Bytes>)> = writes
+                                .iter()
+                                .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
+                                .collect();
+                            lower.write_resolved(&collection_ref, &cells).await
+                        }
+                    };
+                    match result {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!(error = ?error, "cell resolution failed; leaving provisional for the sweep");
+                            false
+                        }
+                    }
+                })
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .fold(true, |all, ok| async move { all && ok })
+            .await;
+        if all_resolved {
+            ApplyOutcome::Resolved
+        } else {
+            ApplyOutcome::Incomplete
+        }
     }
 }
 
-impl<B, L> StateSession for KeyedStateSession<B, L>
+impl<B, L> sealed::ReadSessionMarker for KeyedStateSession<B, L> where B: StateBackend {}
+
+impl<B, L> CellRead for KeyedStateSession<B, L>
 where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
     type Loader = L;
+    type ScanError = <B::Cell as CellStore>::Error;
 
     fn loader(&self) -> &L {
         &self.inner.loader
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.inner.termination.is_terminated()
     }
 
     fn verify_state_registration(
@@ -628,65 +595,141 @@ where
         Ok(state_name.clone())
     }
 
-    fn is_terminated(&self) -> bool {
-        self.inner.termination.is_terminated()
+    async fn get(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        let id = self.id_for(state_type, name);
+        let committed = self
+            .inner
+            .overlay
+            .get(&id, cell, self.inner.event)
+            .await
+            .map_err(|e| StateAccessError::store(&e))?;
+        Ok(committed.into_inner())
+    }
+
+    fn scan<'a>(
+        &'a self,
+        state_type: StateType,
+        name: &'a StateName,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
+        let id = self.id_for(state_type, name);
+        let event = self.inner.event;
+        // Own the scan's coordinates so the stream borrows nothing from the
+        // caller's `Scan<'_>`.
+        let section = scan.section;
+        let start = scan.start.clone();
+        let end: Option<Coordinate> = scan.end.cloned();
+        let dir = scan.dir;
+        let limit = scan.limit;
+        let overlay = self.inner.overlay.clone();
+        try_stream! {
+            let scan = Scan { section, start: &start, dir, end: end.as_ref(), limit };
+            let inner = overlay.scan_cells(&id, scan, event);
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item?;
+            }
+        }
     }
 }
 
-impl<B, L> KeyedStateSession<B, L>
+impl<B, L> CellSession for KeyedStateSession<B, L>
 where
     B: StateBackend,
-    L: Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
-    /// Resolves every lane's staged set the same way and folds the per-lane
-    /// outcomes — the shared body of `commit_apply`/`rollback_aborted`.
-    ///
-    /// `join!` (not `try_join!`): best-effort, drive every lane to completion,
-    /// never cancel a sibling and strand its cells. `merge_apply` folds the
-    /// outcomes so `Incomplete` dominates and the one backstop stays armed if
-    /// any kind failed. The destructure is exhaustive (no `..`), so a new lane
-    /// must be wired here too.
-    async fn apply_all(&self, how: Resolve) -> ApplyOutcome {
-        let Lanes { value } = &self.inner.lanes;
-        // Single-element `join!`/array kept deliberately: a future kind adds its
-        // `resolve` to the `join!` and its outcome to the array, and
-        // `merge_apply` folds them. Do not collapse `[v]`/`join!` to a scalar.
-        let (v,) = join!(value.resolve(how));
-        merge_apply([v])
+    async fn set(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+        value: &[u8],
+    ) -> Result<(), StateAccessError> {
+        let id = self.id_for(state_type, name);
+        self.inner.overlay.buffer_set(&id, cell, value);
+        Ok(())
+    }
+
+    async fn clear(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+    ) -> Result<(), StateAccessError> {
+        let id = self.id_for(state_type, name);
+        self.inner.overlay.buffer_clear(&id, cell);
+        Ok(())
+    }
+
+    async fn flush(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+    ) -> Result<StoreOutcome, StateAccessError> {
+        let id = self.id_for(state_type, name);
+        let Some(value) = self.inner.overlay.dirty().lookup(&id, cell) else {
+            return Ok(StoreOutcome::NoOp);
+        };
+        let collection_ref = self.ref_for(state_type, name);
+        let data = dirty_data(value);
+        self.inner
+            .overlay
+            .lower()
+            .write_resolved(&collection_ref, &[(cell.clone(), data)])
+            .await
+            .map_err(|e| StateAccessError::store(&e))?;
+        self.inner.overlay.dirty().remove(&id, cell);
+        Ok(StoreOutcome::Applied)
     }
 }
 
 impl<B, L> StateLifecycle for KeyedStateSession<B, L>
 where
     B: StateBackend,
-    L: Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        // Exhaustive destructure (no `..`): a new lane field fails to compile
-        // here until wired. `try_join!` awaits *all* lanes and returns a lane
-        // error via `?` — before the marker flush in `settle` — so "every kind
-        // staged" strictly precedes the single marker (invariant 1).
-        let Lanes { value } = &self.inner.lanes;
+        let touched = self
+            .inner
+            .overlay
+            .dirty()
+            .touched(&self.inner.state_key.key);
         let event = self.inner.event;
         let registry = &self.inner.registry;
-        // Single-element `try_join!`/tuple kept deliberately: a future kind adds
-        // its `stage` to the `try_join!` and `|| kind_staged` to the fold below.
-        // Do not collapse the tuple to a bare `await`.
-        let (value_staged,) = try_join!(value.stage(event, registry))?;
-        let staged = value_staged;
-        Ok(if staged {
-            FinalizeOutcome::Staged
+        let lower = self.inner.overlay.lower();
+        let state_key = &self.inner.state_key;
+        let staged: StagedSet = stream::iter(touched)
+            .map(|((state_type, name), cells)| {
+                let id = CollectionId::new(state_key.clone(), state_type, name);
+                // `cooperative` adds a per-collection coop-budget checkpoint so a
+                // key touching many collections does not drain the batch in one
+                // poll; `buffer_unordered` keeps full concurrency.
+                cooperative(stage_collection(lower, registry, event, id, cells))
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_filter_map(|opt| async move { Ok(opt) })
+            .try_collect()
+            .await?;
+        if staged.is_empty() {
+            Ok(FinalizeOutcome::Clean)
         } else {
-            FinalizeOutcome::Clean
-        })
+            *self.inner.staged.lock() = Some(staged);
+            Ok(FinalizeOutcome::Staged)
+        }
     }
 
     async fn commit_apply(&self) -> ApplyOutcome {
-        self.apply_all(Resolve::Promote).await
+        self.resolve_staged(Resolve::Promote).await
     }
 
     async fn rollback_aborted(&self) -> ApplyOutcome {
-        self.apply_all(Resolve::Rollback).await
+        self.resolve_staged(Resolve::Rollback).await
     }
 
     fn register_marker(&self, dedup_id: Uuid) {
@@ -694,9 +737,6 @@ where
     }
 
     async fn flush_marker(&self) -> Result<(), StateAccessError> {
-        // Read without taking: the slot clears only after the oracle write
-        // succeeds, so a transient failure leaves the marker for the boundary
-        // to retry.
         let Some(dedup_id) = *self.inner.marker.lock() else {
             return Ok(());
         };
@@ -710,11 +750,12 @@ where
     }
 
     fn reset(&self) {
-        // Per-key serialization means no handler op is in flight here, so there
-        // is no racing observer to guard against. Exhaustive destructure (no
-        // `..`) kept deliberately: a future kind's lane must `reset()` here too.
-        let Lanes { value } = &self.inner.lanes;
-        value.reset();
+        // Per-key serialization means no handler op is in flight here.
+        self.inner
+            .overlay
+            .dirty()
+            .clear_event(&self.inner.state_key.key);
+        *self.inner.staged.lock() = None;
         *self.inner.marker.lock() = None;
     }
 
@@ -730,8 +771,6 @@ where
     }
 
     async fn mark_backstop_armed(&self) {
-        // `insert_async` returns `Err(key)` if already present — harmless; the
-        // flag is idempotent.
         let _ = self
             .inner
             .armed
@@ -740,13 +779,66 @@ where
     }
 }
 
-/// Crate-private descriptor the framework uses to reach a session's
-/// staged lifecycle through the one public [`EventContext::state`] method.
-///
-/// `bind` skips registration (the lifecycle is registration-independent)
-/// and returns a [`LifecycleView`] unconditionally. Downstream crates can
-/// name neither this type nor the view, so the lifecycle stays
-/// framework-only even though it travels through a public method.
+/// Stages one collection's touched cells in a single batch, returning the
+/// staged writes for the lifecycle to promote / roll back (or `None` for a
+/// `ReadUncommitted` collection, which resolves at stage time). Free function
+/// so no `self` borrow crosses the concurrent fan-out.
+async fn stage_collection<S>(
+    lower: &S,
+    registry: &CollectionDefRegistry,
+    event: EventRef,
+    id: CollectionId,
+    cells: impl IntoIterator<Item = (CellKey, DirtyVal)>,
+) -> Result<Option<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>, StateAccessError>
+where
+    S: CellStore,
+{
+    let collection_ref =
+        CollectionRef::new(id.clone(), registry.ttl_for(id.state_type(), id.name()));
+    match registry.commit_mode_for(id.state_type(), id.name()) {
+        CommitMode::ReadCommitted => {
+            let mut writes = Vec::new();
+            for (cell, value) in cells {
+                // The own-event committed read returns this event's `prev` while
+                // its provisional cell stands, so a retry re-stages over the
+                // same base (idempotent).
+                let prev = lower
+                    .get(&id, &cell, event)
+                    .await
+                    .map_err(|e| StateAccessError::store(&e))?;
+                writes.push((cell, ProvisionalWrite::new(dirty_data(value), prev, event)));
+            }
+            lower
+                .write_provisional(&collection_ref, &writes)
+                .await
+                .map_err(|e| StateAccessError::store(&e))?;
+            Ok(Some((collection_ref, writes)))
+        }
+        CommitMode::ReadUncommitted => {
+            let resolved: Vec<(CellKey, Option<Bytes>)> = cells
+                .into_iter()
+                .map(|(cell, value)| (cell, dirty_data(value)))
+                .collect();
+            lower
+                .write_resolved(&collection_ref, &resolved)
+                .await
+                .map_err(|e| StateAccessError::store(&e))?;
+            Ok(None)
+        }
+    }
+}
+
+/// The committed bytes a buffered outcome stages to (`Set` → its bytes,
+/// `Cleared` → absence).
+fn dirty_data(value: DirtyVal) -> Option<Bytes> {
+    match value {
+        DirtyVal::Set(bytes) => Some(bytes),
+        DirtyVal::Cleared => None,
+    }
+}
+
+/// Crate-private descriptor the framework uses to reach a session's staged
+/// lifecycle through the one public [`EventContext::state`] method.
 ///
 /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
 #[derive(Clone, Copy, Debug)]
@@ -754,14 +846,10 @@ pub(crate) struct LifecycleAccess;
 
 impl DescriptorIdentity for LifecycleAccess {
     fn name(&self) -> &'static str {
-        // Never registered, never persisted: `bind` ignores the identity.
         "\u{0}lifecycle"
     }
 
     fn structural_identity(&self) -> StructuralIdentity {
-        // Never registered, never persisted, never validated: `bind` ignores
-        // this. It supplies a stable framework token (not reachable in the
-        // identity table) purely so `codec_id` can stay non-optional.
         StructuralIdentity {
             kind: CollectionKindId::Value,
             codec_id: "\u{0}framework-lifecycle",
@@ -772,24 +860,25 @@ impl DescriptorIdentity for LifecycleAccess {
 }
 
 impl StateDescriptor for LifecycleAccess {
-    type Handle<S: StateSession> = LifecycleView<S>;
+    type Handle<S: CellRead> = LifecycleView<S>;
 
-    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
         Ok(LifecycleView {
             session: session.clone(),
         })
     }
 }
 
-/// Crate-private view over a session's staged lifecycle, returned by
-/// binding [`LifecycleAccess`].
+/// Crate-private view over a session's staged lifecycle, returned by binding
+/// [`LifecycleAccess`]. Its methods are gated on [`CellSession`] (the writer
+/// session), so relaxing `bind` to [`CellRead`] does not leak the lifecycle.
 pub(crate) struct LifecycleView<S> {
     session: S,
 }
 
 impl<S> LifecycleView<S>
 where
-    S: StateSession,
+    S: CellSession,
 {
     /// See [`StateLifecycle::finalize`].
     ///
@@ -845,14 +934,9 @@ where
     }
 }
 
-/// Crate-private extension giving every [`EventContext`] one-call access to
-/// its session's staged lifecycle through the public [`EventContext::state`]
+/// Crate-private extension giving every [`EventContext`] one-call access to its
+/// session's staged lifecycle through the public [`EventContext::state`]
 /// method.
-///
-/// It hides the one [`Registered::new`] outside the registration mechanism:
-/// the framework-only [`LifecycleAccess`] descriptor binds unconditionally
-/// (registration-independent), so minting its capability handle here is sound
-/// and keeps every other `Registered` strictly registration-derived.
 pub(crate) trait LifecycleAccessExt: EventContext {
     /// Binds the session's lifecycle view.
     ///
@@ -867,23 +951,12 @@ pub(crate) trait LifecycleAccessExt: EventContext {
 
 impl<C: EventContext> LifecycleAccessExt for C {}
 
-/// Test-only stateless [`StateSession`]: every state op reports
+/// Test-only stateless session: every state op reports
 /// [`StateAccessError::Unavailable`] and the lifecycle is inert.
-///
-/// Production always wires real keyed state, so this stub exists only for
-/// tests — middleware and handler contexts that never touch state, and the
-/// descriptor-bind error-surface tests. Its loader slot is a never-consulted
-/// [`MemoryLoader`] purely so the session satisfies the consumer's loader
-/// context bound; no op ever reaches it.
-///
-/// [`MemoryLoader`]: crate::loader::MemoryLoader
 #[cfg(test)]
 #[derive(Clone)]
 pub struct UnavailableState<P> {
     loader: MemoryLoader<P>,
-    /// Records every `register_marker` call so tests can prove the boundary
-    /// routes the marker through the session even on a stateless stub. The
-    /// stub's `flush_marker` stays inert (no oracle), returning `Ok`.
     markers: Arc<SyncMutex<Vec<Uuid>>>,
 }
 
@@ -925,14 +998,22 @@ impl<P> fmt::Debug for UnavailableState<P> {
 }
 
 #[cfg(test)]
-impl<P> StateSession for UnavailableState<P>
+impl<P> sealed::ReadSessionMarker for UnavailableState<P> {}
+
+#[cfg(test)]
+impl<P> CellRead for UnavailableState<P>
 where
     P: Clone + Send + Sync + 'static,
 {
     type Loader = MemoryLoader<P>;
+    type ScanError = StateAccessError;
 
     fn loader(&self) -> &Self::Loader {
         &self.loader
+    }
+
+    fn is_terminated(&self) -> bool {
+        true
     }
 
     fn verify_state_registration(
@@ -944,53 +1025,54 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    fn is_terminated(&self) -> bool {
-        true
-    }
-}
-
-/// The stub refuses Value cell access too, so a context carrying it satisfies
-/// the `CellAccess<ValueKind>` bound on `EventContext::State` while every op
-/// still reports [`StateAccessError::Unavailable`]. (`bind` fails earlier at
-/// `verify_state_registration`, so these are belt-and-suspenders.)
-#[cfg(test)]
-impl<P> CellAccess<ValueKind> for UnavailableState<P>
-where
-    P: Clone + Send + Sync + 'static,
-{
-    async fn read_cell(
+    async fn get(
         &self,
         _state_type: StateType,
         _name: &StateName,
-        _addr: &(),
+        _cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn set_cell(
+    fn scan<'a>(
+        &'a self,
+        _state_type: StateType,
+        _name: &'a StateName,
+        _scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
+        stream::once(async { Err(StateAccessError::Unavailable) })
+    }
+}
+
+#[cfg(test)]
+impl<P> CellSession for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    async fn set(
         &self,
         _state_type: StateType,
         _name: &StateName,
-        _addr: &(),
-        _cell: &[u8],
+        _cell: &CellKey,
+        _value: &[u8],
     ) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn clear_cell(
+    async fn clear(
         &self,
         _state_type: StateType,
         _name: &StateName,
-        _addr: &(),
+        _cell: &CellKey,
     ) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn flush_cell(
+    async fn flush(
         &self,
         _state_type: StateType,
         _name: &StateName,
-        _addr: &(),
+        _cell: &CellKey,
     ) -> Result<StoreOutcome, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }

@@ -1,60 +1,34 @@
 pub(crate) mod cell_suite;
-pub(crate) mod dirty_value_suite;
 mod identity;
 pub(crate) mod identity_suite;
-pub(crate) mod value_suite;
 
 use self::cell_suite::{
-    OverwriteTrace, ProjTrace, Trace, run_crash_equivalence_trace, run_overwrite_trace,
-    run_projection_trace,
+    OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
+    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
-use self::dirty_value_suite::DirtyTrace;
-use self::value_suite::{bytes, collection_id};
-use super::dirty::DirtyValueStore;
-use super::memory::MemoryCellStore;
-use super::value::ValueOp;
-use super::{CollectionKind, CollectionKindId, CollectionRef, ValueKind};
+use super::memory::{MemoryCellStore, MemoryCells};
+use super::registry::CollectionDefRegistry;
+use super::{CollectionId, CollectionRef, StateKey, StateName, StateType};
 use color_eyre::eyre::Result;
 use futures::executor;
 use quickcheck::QuickCheck;
+use std::sync::Arc;
+use uuid::Uuid;
 
-/// Value's per-kind hooks are last-writer-wins: `combine` keeps the newest op
-/// (arrival order), and `apply` ignores the committed base — the op alone is
-/// the outcome. This is the production fold the dirty store and `Lane::stage`
-/// run, replacing the old multi-op value-op fold helper.
-#[test]
-fn value_combine_is_last_writer_wins() {
-    // combine folds left-to-right in arrival order, keeping the newest op.
-    let combined = ValueKind::combine(
-        ValueKind::combine(ValueOp::Set { payload: bytes(2) }, ValueOp::Clear),
-        ValueOp::Set { payload: bytes(3) },
-    );
-    assert_eq!(combined, ValueOp::Set { payload: bytes(3) });
-
-    // apply ignores the committed base.
-    assert_eq!(ValueKind::apply(Some(bytes(1)), &combined), Some(bytes(3)));
-    assert_eq!(
-        ValueKind::apply(Some(bytes(1)), &ValueKind::clear_op()),
-        None
-    );
-    assert_eq!(
-        ValueKind::apply(None, &ValueKind::set_op(&[9])),
-        Some(bytes(9))
-    );
+/// A fresh-segment Value collection identity for the named collection.
+fn collection_id(name: &str) -> Result<CollectionId> {
+    Ok(CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+        StateType::Application,
+        StateName::try_new(name)?,
+    ))
 }
 
-#[test]
-fn collection_identity_carries_value_kind() -> Result<()> {
-    let collection = collection_id("profile")?;
-    assert_eq!(collection.kind(), CollectionKindId::Value);
-    Ok(())
-}
-
-/// `CollectionRef` equality and hashing key on the inner `CollectionId`
-/// only — the TTL is a per-write hint, not part of identity. Two refs to the
-/// same collection with different TTLs must compare equal and hash equal, so
-/// a `CollectionRef` used as a `HashSet`/`HashMap` key is not split by an
-/// incidental TTL difference.
+/// `CollectionRef` equality and hashing key on the inner `CollectionId` only —
+/// the TTL is a per-write hint, not part of identity. Two refs to the same
+/// collection with different TTLs must compare and hash equal, so a
+/// `CollectionRef` used as a map key is not split by an incidental TTL
+/// difference.
 #[test]
 fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     use crate::timers::duration::CompactDuration;
@@ -69,7 +43,7 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     assert_eq!(with_ttl, without_ttl);
     assert_eq!(with_ttl, other_ttl);
 
-    let hash = |r: &CollectionRef<ValueKind>| {
+    let hash = |r: &CollectionRef| {
         let mut h = DefaultHasher::new();
         r.hash(&mut h);
         h.finish()
@@ -79,40 +53,23 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn prop_dirty_store_satisfies_invariants() {
-    fn property(trace: DirtyTrace) -> Result<bool> {
-        executor::block_on(dirty_value_suite::run_dirty_trace(
-            DirtyValueStore::new(),
-            trace,
-        ))
-    }
-
-    QuickCheck::new().quickcheck(property as fn(DirtyTrace) -> Result<bool>);
+/// A fresh memory cell store over shared cells, resolving through `oracle`.
+fn memory_store(cells: MemoryCells, oracle: ScriptedOracle) -> MemoryCellStore<ScriptedOracle> {
+    MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()))
 }
 
-/// Crash-recovery equivalence over the memory cell store: every resolution
-/// path (clean promote, inline rollback, crash → sweep / first-touch recovery)
-/// converges each cell's committed projection to the model.
+/// Crash-recovery equivalence over the memory cell store: every resolution path
+/// (clean promote, inline rollback, crash → sweep / first-touch) converges each
+/// cell's committed projection to the model (invariants 1, 5).
 #[test]
 fn prop_memory_cell_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
-        executor::block_on(run_crash_equivalence_trace(MemoryCellStore::new(), trace))
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let make = || Ok(memory_store(cells.clone(), oracle.clone()));
+        executor::block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
     }
-
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
-}
-
-/// Reader-projection soundness over the memory cell store: a provisional cell
-/// always projects its committed `prev` (stale by the in-flight event), a
-/// resolved cell projects the committed value, and prev-is-committed holds.
-#[test]
-fn prop_memory_cell_projection_is_sound() {
-    fn property(trace: ProjTrace) -> Result<bool> {
-        executor::block_on(run_projection_trace(MemoryCellStore::new(), trace))
-    }
-
-    QuickCheck::new().quickcheck(property as fn(ProjTrace) -> Result<bool>);
 }
 
 /// Implicit-overwrite soundness over the memory cell store: a sequence of
@@ -122,8 +79,38 @@ fn prop_memory_cell_projection_is_sound() {
 #[test]
 fn prop_memory_cell_implicit_overwrite() {
     fn property(trace: OverwriteTrace) -> Result<bool> {
-        executor::block_on(run_overwrite_trace(MemoryCellStore::new(), trace))
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let make = || Ok(memory_store(cells.clone(), oracle.clone()));
+        executor::block_on(run_overwrite_trace(make, oracle.clone(), trace))
     }
-
     QuickCheck::new().quickcheck(property as fn(OverwriteTrace) -> Result<bool>);
+}
+
+/// Unified view soundness over `Overlay<MemoryCellStore>`: point `get`s, range
+/// `scan`s (bounded, bidirectional, limited, early-stopped), dirty buffering,
+/// and committed writes **intermixed** in one trace all match the
+/// dirty-over-committed oracle — dirty-wins, clear-hides, the dirty leg bounded
+/// to the scan range, the limit applied to the merge (invariants 3, 5; DT7).
+#[test]
+fn prop_memory_overlay_view() {
+    fn property(trace: OverlayTrace) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let lower = memory_store(MemoryCells::new(), oracle);
+        executor::block_on(run_overlay_trace(lower, trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
+}
+
+/// Scan correctness directly over `MemoryCellStore::scan_cells` (no overlay):
+/// the backend's own ordering, range bounds, and limit handling match the
+/// committed-only oracle.
+#[test]
+fn prop_memory_bottom_scan() {
+    fn property(trace: ScanTrace) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let store = memory_store(MemoryCells::new(), oracle);
+        executor::block_on(run_bottom_scan_trace(store, trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }

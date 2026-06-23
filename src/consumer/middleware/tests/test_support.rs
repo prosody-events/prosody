@@ -18,8 +18,7 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::descriptor::{Registered, StateDescriptor};
-use crate::state::session::{CellAccess, StateSession, UnavailableState};
-use crate::state::value::ValueKind;
+use crate::state::session::{CellSession, UnavailableState};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
@@ -274,7 +273,7 @@ impl<P, S> TerminationSignals for MockEventContext<P, S> {
 impl<P, S> EventContext for MockEventContext<P, S>
 where
     P: Send + Sync + 'static,
-    S: StateSession<Loader: MessageLoader<Payload = P>> + CellAccess<ValueKind>,
+    S: CellSession<Loader: MessageLoader<Payload = P>>,
 {
     type Error = MockTimerError;
     type Payload = P;

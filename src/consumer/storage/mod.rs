@@ -23,7 +23,7 @@ use crate::consumer::middleware::defer::timer::store::{
 };
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::state::cassandra::{
-    CassandraCellStore, CassandraDescriptorIdentityStore, CellQueries, IdentityQueries,
+    CassandraCellResources, CassandraDescriptorIdentityStore, CellQueries, IdentityQueries,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
@@ -198,8 +198,9 @@ pub enum StorePair {
         /// Deduplication store provider (Cassandra) — the mandatory commit
         /// oracle; `DeduplicationQueries` are always prepared.
         dedup_provider: CassandraDeduplicationStoreProvider,
-        /// Keyed-state cell store sharing the same session.
-        cell_store: CassandraCellStore,
+        /// Keyed-state cell-store resources (session + prepared statements)
+        /// sharing the same session.
+        cell_store: CassandraCellResources,
         /// Keyed-state descriptor-identity store sharing the same session.
         identity_store: CassandraDescriptorIdentityStore,
     },
@@ -312,7 +313,7 @@ impl StorePair {
 
                 validate_keyed_state_ttl(keyed_state_ttl)?;
                 let cell_queries = Arc::new(CellQueries::new(store.session(), keyspace).await?);
-                let cell_store = CassandraCellStore::new(store.clone(), cell_queries);
+                let cell_store = CassandraCellResources::new(store.clone(), cell_queries);
                 let identity_queries =
                     Arc::new(IdentityQueries::new(store.session(), keyspace).await?);
                 let identity_store =

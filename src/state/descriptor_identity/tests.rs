@@ -376,39 +376,53 @@ async fn state_type_namespaces_identity_rows() -> Result<()> {
 /// sharing a name never read each other's value.
 #[tokio::test]
 async fn state_type_namespaces_cells() -> Result<()> {
-    use crate::state::cell::{Cell, Committed};
+    use crate::state::cell::Committed;
+    use crate::state::cell_key::{CellKey, Coordinate, Section};
+    use crate::state::memory::MemoryCells;
     use crate::state::store::CellStore;
-    use crate::state::value::ValueKind;
-    use crate::state::{CollectionId, CollectionRef, StateKey};
+    use crate::state::tests::cell_suite::ScriptedOracle;
+    use crate::state::{CollectionId, CollectionRef, EventRef, StateKey};
     use bytes::Bytes;
 
-    let store = MemoryCellStore::new();
+    let store = MemoryCellStore::new(
+        MemoryCells::new(),
+        ScriptedOracle::default(),
+        Arc::new(CollectionDefRegistry::default()),
+    );
     let key: crate::Key = Arc::from("k");
     let state_key = StateKey::new(Uuid::new_v4(), key);
     let name = StateName::try_new("cart")?;
+    let cell = CellKey {
+        section: Section::new(0),
+        coordinate: Coordinate::empty(),
+    };
     let app = CollectionRef::new(
-        CollectionId::<ValueKind>::new(state_key.clone(), StateType::Application, name.clone()),
+        CollectionId::new(state_key.clone(), StateType::Application, name.clone()),
         None,
     );
     let fw = CollectionRef::new(
-        CollectionId::<ValueKind>::new(state_key, StateType::Framework, name),
+        CollectionId::new(state_key, StateType::Framework, name),
         None,
     );
 
     store
-        .write_resolved(&app, &[((), Some(Bytes::from_static(b"app")))])
+        .write_resolved(&app, &[(cell.clone(), Some(Bytes::from_static(b"app")))])
         .await?;
     store
-        .write_resolved(&fw, &[((), Some(Bytes::from_static(b"fw")))])
+        .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))])
         .await?;
 
+    // A resolved cell never consults the oracle, so the probe event is inert.
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(0),
+    };
     assert_eq!(
-        store.read_cell(app.id(), &()).await?,
-        Cell::Resolved(Committed::new(Some(Bytes::from_static(b"app")))),
+        store.get(app.id(), &cell, probe).await?,
+        Committed::new(Some(Bytes::from_static(b"app"))),
     );
     assert_eq!(
-        store.read_cell(fw.id(), &()).await?,
-        Cell::Resolved(Committed::new(Some(Bytes::from_static(b"fw")))),
+        store.get(fw.id(), &cell, probe).await?,
+        Committed::new(Some(Bytes::from_static(b"fw"))),
         "the framework-namespaced cell holds its own value",
     );
     Ok(())

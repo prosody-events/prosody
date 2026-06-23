@@ -1,6 +1,6 @@
 use super::{collection_prefix, decode_cell, encode_absent_cell, encode_present_cell};
 use crate::Key;
-use crate::state::{CollectionId, CollectionKind, Read, StateKey, StateName, StateType, ValueKind};
+use crate::state::{CollectionId, Read, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
@@ -12,7 +12,7 @@ fn key(value: &str) -> Key {
     Arc::from(value)
 }
 
-fn collection(name: &str) -> Result<CollectionId<ValueKind>> {
+fn collection(name: &str) -> Result<CollectionId> {
     Ok(CollectionId::new(
         StateKey::new(Uuid::from_u128(0xA1B2_C3D4), key("user-1")),
         StateType::Application,
@@ -136,7 +136,7 @@ fn null_prone_string(g: &mut Gen, non_empty: bool) -> String {
         .collect()
 }
 
-fn id_from(fields: PrefixFields) -> Result<CollectionId<ValueKind>> {
+fn id_from(fields: PrefixFields) -> Result<CollectionId> {
     Ok(CollectionId::new(
         StateKey::new(
             Uuid::from_u128(fields.segment),
@@ -155,10 +155,7 @@ fn prefix_for(fields: PrefixFields) -> Result<[u8; 16]> {
 /// `collection_prefix` allocated and hashes it in one shot. The streamed
 /// implementation must produce byte-identical hasher input, so this and
 /// `collection_prefix` agree.
-fn prefix_via_buffer<K>(id: &CollectionId<K>) -> [u8; 16]
-where
-    K: CollectionKind,
-{
+fn prefix_via_buffer(id: &CollectionId) -> [u8; 16] {
     let segment_bytes = id.state_key().segment_id.as_bytes();
     let key_bytes = id.state_key().key.as_bytes();
     let state_type_byte = i8::from(id.state_type()).cast_unsigned();

@@ -63,7 +63,7 @@ impl Coordinate {
     /// The empty coordinate, addressing the single cell of a one-cell
     /// collection (Value).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self(Bytes::new())
     }
 

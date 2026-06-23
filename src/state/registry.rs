@@ -3,7 +3,7 @@
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
-use crate::state::{CollectionKindId, CommitMode, StateName, StateNameError, StateType};
+use crate::state::{CommitMode, StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -178,17 +178,13 @@ impl CollectionDefRegistry {
         })
     }
 
-    /// Returns the live `(state_type, name)` collections registered under
-    /// `kind` — the registry-sourced name set the recovery sweep enumerates for
-    /// that kind's lane.
-    pub(crate) fn collections_for_kind(
-        &self,
-        kind: CollectionKindId,
-    ) -> impl Iterator<Item = (StateType, &StateName)> {
-        self.defs.iter().flat_map(move |(state_type, namespace)| {
-            namespace.iter().filter_map(move |(name, c)| {
-                (c.identity.kind == kind).then_some((*state_type, name))
-            })
+    /// Returns every live `(state_type, name)` collection — the
+    /// registry-sourced name set the recovery sweep enumerates (the
+    /// authoritative declared set; a collection whose descriptor was
+    /// removed is dormant, not swept).
+    pub(crate) fn collections(&self) -> impl Iterator<Item = (StateType, &StateName)> {
+        self.defs.iter().flat_map(|(state_type, namespace)| {
+            namespace.keys().map(move |name| (*state_type, name))
         })
     }
 

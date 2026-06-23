@@ -6,9 +6,8 @@
 //! durability boundary (the marker flush, strictly after the provisional
 //! stage); [`CommitOracle::resolve`] reads it back during recovery, bridging
 //! the existing [`crate::commit_manager::CommitManager`] bool API into an
-//! [`EventRef`]-shaped [`CommitDecision`] consumed by
-//! [`resolve_cell`](crate::state::resolve) and the
-//! [`PartitionStateStore`](crate::state::partition_store::PartitionStateStore).
+//! [`EventRef`]-shaped [`CommitDecision`] consumed by the cell store's
+//! resolution path ([`resolve_cell`](crate::state::resolve)).
 //!
 //! The resolve half is intentionally kind-agnostic at the callsite — the
 //! [`StateKey`] supplies the application [`Key`] the timer

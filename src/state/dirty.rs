@@ -1,147 +1,276 @@
-//! In-memory dirty cell workspace.
+//! The per-partition dirty cell workspace.
 //!
-//! [`DirtyStore`] is the per-event write buffer: handler `set`/`clear` ops land
-//! here, and the durability boundary reads them back when it stages provisional
-//! cells. There is exactly one dirty store per event (per kind), owned uniquely
-//! by the session's lane — never shared, never cloned — so it is a bare
-//! lock-free [`scc::HashMap`], not an `Arc<Mutex<…>>`.
+//! [`DirtyStore`] is the in-memory write buffer the [`Overlay`] reads and
+//! writes: handler `set`/`clear` ops land here as the latest staged outcome per
+//! cell, and `finalize` reads them back when it stages provisional cells. It
+//! holds, per cell, just [`DirtyVal::Set`]`(bytes)` or [`DirtyVal::Cleared`] —
+//! single-writer-per-key makes every cell last-writer-wins, so there is no op
+//! algebra and no compaction fold.
 //!
-//! It holds **one combined op per cell**, keyed by `(collection, cell address)`
-//! ([`CollectionKind::CellAddr`]). A `set`/`clear` folds the new op into the
-//! cell's existing op via [`CollectionKind::combine`] in arrival order, so a
-//! hot write-loop on one cell stays O(1) — the op never grows into an unbounded
-//! vector. Value collections are single-cell (`CellAddr = ()`) and
-//! last-writer-wins, so the combined op is just the latest `Set`/`Clear`,
-//! exactly as the original Value-only dirty store compacted.
+//! # One shared structure, per-key sub-ranges
 //!
-//! A cell absent from the map is untouched: its read returns
-//! [`Read::Unknown`](crate::state::Read) and higher layers fall through to the
-//! committed value.
+//! The store is **one per-partition shared** [`scc::TreeIndex`] keyed by
+//! `DirtyKey` = `(key, state_type, name, cell)`, ordered so a single event's
+//! cells (one Kafka `key`) form a contiguous sub-range. Single-writer-per-key
+//! makes one key's sub-range exclusively owned during its event, so
+//! [`DirtyStore::clear_event`] (a [`scc::TreeIndex::remove_range_sync`] over
+//! that key's sub-range) is race-free and allocates nothing per event — no
+//! `Mutex`, no per-event map. The full `(state_type, name)` in the key prevents
+//! same-key / different-collection collisions in the shared tree.
 //!
-//! The dirty store is volatile and rebuilt per event — it is never a durability
-//! or recovery source. Crash recovery runs off the Cassandra provisional cells
-//! and the commit oracle.
+//! The dirty store is volatile and discarded at each settle/attempt boundary —
+//! it is **never** a durability or recovery source. Crash recovery runs off the
+//! Cassandra provisional cells and the commit oracle.
+//!
+//! [`Overlay`]: crate::state::overlay::Overlay
 
-use super::identity::{CollectionId, CollectionKind};
-use super::value::ValueKind;
-use ahash::RandomState;
+use super::cell_key::CellKey;
+use super::identity::{CollectionId, StateName, StateType};
+use crate::Key;
+use bytes::Bytes;
+use scc::Guard;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
-/// Inline capacity of the `finalize` work-list: the touched-collection count
-/// most events stay at or below, so the keyset never spills to the heap.
-const TOUCHED_INLINE: usize = 4;
+/// Inline capacity of one collection's snapshotted cell set; small
+/// Maps/Deques and every Value stay inline.
+const CELLS_INLINE: usize = 8;
 
-/// Inline capacity of one collection's touched cell-set: a Value collection
-/// has one cell; small Maps/Deques stay inline.
-const CELLS_INLINE: usize = 4;
+/// One collection-section's snapshotted cells (`(cell, outcome)`), owned and
+/// coordinate-ordered.
+pub type CellSnapshot = SmallVec<[(CellKey, DirtyVal); CELLS_INLINE]>;
 
-/// The map key: one cell, identified by its collection and address.
-type CellKey<K> = (CollectionId<K>, <K as CollectionKind>::CellAddr);
+/// One event's touched cells grouped by collection: `(state_type, name)` and
+/// its [`CellSnapshot`].
+pub type TouchedCollection = ((StateType, StateName), CellSnapshot);
 
-/// One collection's touched cells (`(addr, op)`), grouped for batch staging.
-type CellGroup<K> =
-    SmallVec<[(<K as CollectionKind>::CellAddr, <K as CollectionKind>::Op); CELLS_INLINE]>;
-
-/// One collection's id paired with its touched cells.
-pub(crate) type TouchedCollection<K> = (CollectionId<K>, CellGroup<K>);
-
-/// Back-compat alias for the Value-kind dirty store. Value is the only kind
-/// wired in production today; the type stays generic so a future kind reuses
-/// the same compact-on-write buffer.
-pub type DirtyValueStore = DirtyStore<ValueKind>;
-
-/// In-memory dirty cell store: one compacted [`CollectionKind::Op`] per touched
-/// cell, keyed by `(collection, address)`.
-#[derive(Debug)]
-pub struct DirtyStore<K>
-where
-    K: CollectionKind,
-{
-    entries: scc::HashMap<CellKey<K>, K::Op, RandomState>,
+/// One dirty cell's address in the shared tree: the event's Kafka `key`, the
+/// collection (`state_type`, `name`), and the intra-collection [`CellKey`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DirtyKey {
+    key: Key,
+    state_type: StateType,
+    name: StateName,
+    cell: CellKey,
 }
 
-impl<K> Default for DirtyStore<K>
-where
-    K: CollectionKind,
-{
-    fn default() -> Self {
-        Self {
-            entries: scc::HashMap::default(),
-        }
-    }
+/// The latest staged outcome for a dirty cell (last-writer-wins).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirtyVal {
+    /// The cell was set to these bytes.
+    Set(Bytes),
+
+    /// The cell was cleared (set-to-absent).
+    Cleared,
 }
 
-impl<K> DirtyStore<K>
-where
-    K: CollectionKind,
-{
+/// In-memory dirty cell store: the latest [`DirtyVal`] per touched cell, keyed
+/// by `DirtyKey`, shared per partition.
+#[derive(Debug, Default)]
+pub struct DirtyStore {
+    entries: scc::TreeIndex<DirtyKey, DirtyVal>,
+}
+
+impl DirtyStore {
     /// Creates an empty dirty store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Discards every buffered op in place, reusing the allocation. The lane
-    /// calls this from `reset` at an attempt boundary; per-key serialization
-    /// guarantees no handler op is in flight when it runs.
-    pub(crate) fn clear_all(&self) {
-        self.entries.clear_sync();
+    /// Buffers a set of one cell's bytes (last-writer-wins).
+    pub fn set(&self, collection: &CollectionId, cell: &CellKey, bytes: &[u8]) {
+        self.entries.upsert_sync(
+            dirty_key(collection, cell),
+            DirtyVal::Set(Bytes::copy_from_slice(bytes)),
+        );
     }
 
-    /// Buffers a set of one cell's bytes, folding it into the cell's existing
-    /// op via [`CollectionKind::combine`] (arrival order).
-    pub(crate) async fn set(&self, collection: &CollectionId<K>, addr: &K::CellAddr, cell: &[u8]) {
-        self.combine_in(collection, addr, K::set_op(cell)).await;
+    /// Buffers a clear of one cell (last-writer-wins).
+    pub fn clear(&self, collection: &CollectionId, cell: &CellKey) {
+        self.entries
+            .upsert_sync(dirty_key(collection, cell), DirtyVal::Cleared);
     }
 
-    /// Buffers a clear of one cell, folding it into the cell's existing op.
-    pub(crate) async fn clear(&self, collection: &CollectionId<K>, addr: &K::CellAddr) {
-        self.combine_in(collection, addr, K::clear_op()).await;
+    /// Removes one cell's buffered outcome (after a mid-handler flush, which
+    /// writes it through directly).
+    pub fn remove(&self, collection: &CollectionId, cell: &CellKey) {
+        self.entries.remove_sync(&dirty_key(collection, cell));
     }
 
-    /// Folds `newest` into the cell's buffered op (or inserts it).
-    async fn combine_in(&self, collection: &CollectionId<K>, addr: &K::CellAddr, newest: K::Op) {
-        let key = (collection.clone(), addr.clone());
-        let entry = self.entries.entry_async(key).await;
-        entry
-            .and_modify(|existing| *existing = K::combine(existing.clone(), newest.clone()))
-            .or_insert(newest);
-    }
-
-    /// The cell's buffered combined op, if any.
-    pub(crate) fn pending_op(
-        &self,
-        collection: &CollectionId<K>,
-        addr: &K::CellAddr,
-    ) -> Option<K::Op> {
-        let key = (collection.clone(), addr.clone());
-        self.entries.read_sync(&key, |_, op| op.clone())
-    }
-
-    /// Removes one cell's buffered op (after a mid-handler flush).
-    pub(crate) fn clear_cell(&self, collection: &CollectionId<K>, addr: &K::CellAddr) {
-        let key = (collection.clone(), addr.clone());
-        self.entries.remove_sync(&key);
-    }
-
-    /// Groups every touched cell by its collection — the `finalize` work-list,
-    /// shaped for per-collection batch staging.
+    /// The cell's buffered outcome, if any — the [`Overlay`] point lookup.
     ///
-    /// Each entry pairs a collection with the `(address, op)` set touched this
-    /// event. scc exposes no borrowing iterator, and the work-list must outlive
-    /// `finalize`'s async fan-out, so it is materialized here. Distinct
-    /// collections are distinct durable partitions, so the lane fans out across
-    /// the outer `Vec`; cells within one collection batch into one mutation.
-    pub(crate) fn touched_cells(&self) -> SmallVec<[TouchedCollection<K>; TOUCHED_INLINE]> {
-        let mut grouped: HashMap<CollectionId<K>, CellGroup<K>> = HashMap::new();
-        self.entries.iter_sync(|(id, addr), op| {
-            grouped
-                .entry(id.clone())
-                .or_default()
-                .push((addr.clone(), op.clone()));
-            true
-        });
-        grouped.into_iter().collect()
+    /// Uses the lock-free [`scc::TreeIndex::peek_with`], not `read_sync`: a
+    /// [`DirtyVal`] is replaced wholesale by [`Self::set`]/[`Self::clear`]
+    /// (never interior-mutated), so the lock-free snapshot read is exactly
+    /// right — and it avoids `read_sync`'s lock-retry loop, which spins
+    /// forever on a key that was just `remove`d in the same
+    /// (single-threaded) event (the flush → re-read path).
+    ///
+    /// [`Overlay`]: crate::state::overlay::Overlay
+    #[must_use]
+    pub fn lookup(&self, collection: &CollectionId, cell: &CellKey) -> Option<DirtyVal> {
+        self.entries
+            .peek_with(&dirty_key(collection, cell), |_, value| value.clone())
+    }
+
+    /// An owned, coordinate-ordered snapshot of one collection-section's dirty
+    /// cells — the [`Overlay`] scan's dirty leg.
+    ///
+    /// Copies the narrow `(key, state_type, name, section)` sub-range into an
+    /// owned `SmallVec` and drops the `!Send` [`Guard`] before returning, so
+    /// the overlay merge holds nothing `!Send` across an `.await` (the `+
+    /// Send` requirement on the scan stream — see [`Overlay`]'s `scan_cells`).
+    ///
+    /// [`Overlay`]: crate::state::overlay::Overlay
+    #[must_use]
+    pub fn section_snapshot(
+        &self,
+        collection: &CollectionId,
+        section: super::cell_key::Section,
+    ) -> CellSnapshot {
+        let scope = SectionScope {
+            key: collection.state_key().key.clone(),
+            state_type: collection.state_type(),
+            name: collection.name().clone(),
+            section,
+        };
+        let guard = Guard::new();
+        self.entries
+            .range(scope.clone()..=scope, &guard)
+            .map(|(k, v)| (k.cell.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Groups this event's (one `key`) dirty cells by collection — the
+    /// `finalize` work-list. Each entry pairs a `(state_type, name)` with its
+    /// touched `(cell, outcome)` set; the caller rebuilds the [`CollectionId`]
+    /// from its own state key.
+    #[must_use]
+    pub fn touched(&self, key: &Key) -> Vec<TouchedCollection> {
+        let scope = KeyScope(key.clone());
+        let guard = Guard::new();
+        let mut grouped: Vec<TouchedCollection> = Vec::new();
+        for (dirty_key, value) in self.entries.range(scope.clone()..=scope, &guard) {
+            let collection = (dirty_key.state_type, dirty_key.name.clone());
+            let entry = (dirty_key.cell.clone(), value.clone());
+            match grouped.iter_mut().find(|(c, _)| *c == collection) {
+                Some((_, cells)) => cells.push(entry),
+                None => grouped.push((collection, SmallVec::from_iter([entry]))),
+            }
+        }
+        grouped
+    }
+
+    /// Discards every cell buffered for one event's `key` — the clear-at-settle
+    /// / reset move. Race-free: single-writer-per-key makes this key's
+    /// sub-range exclusively owned during its event.
+    pub fn clear_event(&self, key: &Key) {
+        let scope = KeyScope(key.clone());
+        self.entries.remove_range_sync(scope.clone()..=scope);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::cell_key::{Coordinate, Section};
+    use crate::state::identity::StateKey;
+    use color_eyre::eyre::Result;
+
+    fn collection() -> Result<CollectionId> {
+        Ok(CollectionId::new(
+            StateKey::new(uuid::Uuid::from_u128(1), Key::from("k")),
+            StateType::Application,
+            StateName::try_new("c")?,
+        ))
+    }
+
+    /// Regression: a `lookup` after a same-cell `remove` must return `None`
+    /// promptly, never hang. `remove` is the mid-handler flush path
+    /// (`Overlay`/`flush` removes the buffered cell after writing it through);
+    /// a subsequent `get` re-reads the dirty leg via `lookup`. The lock-free
+    /// `peek_with` read makes this terminate — the lock-based `read_sync` spins
+    /// forever here under single-threaded execution (scc 3.7.0).
+    #[test]
+    fn lookup_after_remove_returns_none_without_spinning() -> Result<()> {
+        let store = DirtyStore::new();
+        let c = collection()?;
+        let cell = CellKey {
+            section: Section::new(0),
+            coordinate: Coordinate::empty(),
+        };
+        store.set(&c, &cell, b"x");
+        assert!(store.lookup(&c, &cell).is_some());
+        store.remove(&c, &cell);
+        assert!(store.lookup(&c, &cell).is_none());
+        // Re-set after remove must be visible again (no stale tombstone).
+        store.set(&c, &cell, b"y");
+        assert_eq!(
+            store.lookup(&c, &cell),
+            Some(DirtyVal::Set(Bytes::from_static(b"y")))
+        );
+        Ok(())
+    }
+}
+
+/// Builds the tree key for one cell of a collection.
+fn dirty_key(collection: &CollectionId, cell: &CellKey) -> DirtyKey {
+    DirtyKey {
+        key: collection.state_key().key.clone(),
+        state_type: collection.state_type(),
+        name: collection.name().clone(),
+        cell: cell.clone(),
+    }
+}
+
+/// Query matching every [`DirtyKey`] sharing one Kafka `key` — the whole-event
+/// sub-range, for [`DirtyStore::touched`] and [`DirtyStore::clear_event`].
+#[derive(Clone, PartialEq, Eq)]
+struct KeyScope(Key);
+
+impl scc::Equivalent<DirtyKey> for KeyScope {
+    fn equivalent(&self, key: &DirtyKey) -> bool {
+        self.0 == key.key
+    }
+}
+
+impl scc::Comparable<DirtyKey> for KeyScope {
+    fn compare(&self, key: &DirtyKey) -> Ordering {
+        self.0.cmp(&key.key)
+    }
+}
+
+/// Query matching every [`DirtyKey`] in one collection-section — the scan leg
+/// sub-range, for [`DirtyStore::section_snapshot`]. Compares on
+/// `(key, state_type, name, section)`, ignoring the coordinate, so the
+/// inclusive range spans exactly that section's cells in coordinate order.
+#[derive(Clone, PartialEq, Eq)]
+struct SectionScope {
+    key: Key,
+    state_type: StateType,
+    name: StateName,
+    section: super::cell_key::Section,
+}
+
+impl SectionScope {
+    fn cmp_key(&self, key: &DirtyKey) -> Ordering {
+        self.key
+            .cmp(&key.key)
+            .then(self.state_type.cmp(&key.state_type))
+            .then(self.name.cmp(&key.name))
+            .then(self.section.cmp(&key.cell.section))
+    }
+}
+
+impl scc::Equivalent<DirtyKey> for SectionScope {
+    fn equivalent(&self, key: &DirtyKey) -> bool {
+        self.cmp_key(key) == Ordering::Equal
+    }
+}
+
+impl scc::Comparable<DirtyKey> for SectionScope {
+    fn compare(&self, key: &DirtyKey) -> Ordering {
+        self.cmp_key(key)
     }
 }

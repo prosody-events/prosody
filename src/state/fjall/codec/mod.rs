@@ -35,7 +35,8 @@
 //! fjall keyspace.
 
 use super::error::FjallValueStoreError;
-use crate::state::{CollectionId, CollectionKind, Read};
+use crate::state::cell_key::CellKey;
+use crate::state::{CollectionId, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -45,14 +46,27 @@ const CACHE_TAG_ABSENT: u8 = 0x00;
 /// Tag byte for "known present" entries.
 const CACHE_TAG_PRESENT: u8 = 0x01;
 
-/// Returns the 16-byte collection prefix for a typed collection identity.
+/// Returns the full fjall key for one cell: the 16-byte collection prefix
+/// followed by the cell's `section` byte and order-preserving `coordinate`
+/// bytes. The prefix groups a collection's cells contiguously; the section +
+/// coordinate suffix orders them, so a Map/Deque prefix range is a contiguous
+/// fjall range that preserves user order.
+#[must_use]
+pub(super) fn cell_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
+    let prefix = collection_prefix(id);
+    let coordinate = cell.coordinate.as_bytes();
+    let mut key = Vec::with_capacity(prefix.len() + 1 + coordinate.len());
+    key.extend_from_slice(&prefix);
+    key.push(i8::from(cell.section).cast_unsigned());
+    key.extend_from_slice(coordinate);
+    key
+}
+
+/// Returns the 16-byte collection prefix for a collection identity.
 ///
 /// See module docs for the field layout and rationale.
 #[must_use]
-pub(super) fn collection_prefix<K>(id: &CollectionId<K>) -> [u8; 16]
-where
-    K: CollectionKind,
-{
+pub(super) fn collection_prefix(id: &CollectionId) -> [u8; 16] {
     let segment_bytes = id.state_key().segment_id.as_bytes();
     let key_bytes = id.state_key().key.as_bytes();
     let state_type_byte = i8::from(id.state_type()).cast_unsigned();

@@ -24,8 +24,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
-use crate::state::session::{CellAccess, StateSession, TerminationWatch};
-use crate::state::value::ValueKind;
+use crate::state::session::{CellSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
@@ -245,7 +244,7 @@ impl<P: Send + 'static> PartitionManager<P> {
         S: TriggerStoreProvider,
         SP: PartitionStateProvider,
         <SP::Manager as PartitionStateManager>::Session:
-            StateSession<Loader: MessageLoader<Payload = P>> + CellAccess<ValueKind>,
+            CellSession<Loader: MessageLoader<Payload = P>>,
         P: Sync + EventType + EventIdentity,
     {
         // Initialize offset tracker to manage offset state
@@ -529,7 +528,7 @@ async fn handle_messages<T, S, SP, P>(
     S: TriggerStoreProvider,
     SP: PartitionStateProvider,
     <SP::Manager as PartitionStateManager>::Session:
-        StateSession<Loader: MessageLoader<Payload = P>> + CellAccess<ValueKind>,
+        CellSession<Loader: MessageLoader<Payload = P>>,
     P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionConfiguration {
@@ -598,9 +597,7 @@ async fn run_partition<T, S, M, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
-    M: PartitionStateManager<
-        Session: StateSession<Loader: MessageLoader<Payload = P>> + CellAccess<ValueKind>,
-    >,
+    M: PartitionStateManager<Session: CellSession<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionParams {
@@ -706,9 +703,7 @@ async fn process_event<T, S, M, P>(
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
-    M: PartitionStateManager<
-        Session: StateSession<Loader: MessageLoader<Payload = P>> + CellAccess<ValueKind>,
-    >,
+    M: PartitionStateManager<Session: CellSession<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static + EventIdentity,
 {
     match event {

@@ -1174,9 +1174,9 @@ pub(crate) async fn abandon<T, C, G>(
 ///
 /// Cost and healing: at most one `clear_and_schedule` per backstop generation,
 /// and the sweep fires `delay` after the first commit of a generation (on a
-/// sustained hot key, periodically; the status map keeps each such sweep
-/// cheap). Any read of a provisional collection heals it immediately via
-/// first-touch (`PartitionStateStore::committed`). Accepted residual: an
+/// sustained hot key, periodically). Any read of a provisional collection heals
+/// it immediately via first-touch (the cell store's resolving `get`). Accepted
+/// residual: an
 /// `Incomplete` leftover on a hot key whose collection is never read again
 /// waits for the next sweep to resolve it — bounded by first-touch on any
 /// access and by the cell's TTL.

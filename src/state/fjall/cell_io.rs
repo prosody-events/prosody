@@ -1,6 +1,6 @@
 //! Shared async wrappers over fjall's synchronous per-cell I/O.
 //!
-//! The cache ([`FjallValueStore`](super::FjallValueStore)) stores one tagged
+//! The cache ([`FjallCellCache`](super::FjallCellCache)) stores one tagged
 //! cell per key in a fjall [`PartitionHandle`]. fjall's API is synchronous, so
 //! each call clones the cheap `Arc`-backed handle and dispatches the blocking
 //! get/insert through [`tokio::task::spawn_blocking`]. The key is generic over

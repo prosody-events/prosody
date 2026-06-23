@@ -13,9 +13,9 @@ use crate::consumer::kafka_state::message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
+use crate::state::dirty::DirtyStore;
+use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
-use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
@@ -72,15 +72,15 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
     }
 }
 
-pub(crate) type TestSession = KeyedStateSession<
-    <SharedStateBackend<
-        MemoryCellStore,
-        MemoryDescriptorIdentityStore,
-        FixedOracle,
-        MemoryCommittedCache,
-    > as StateBackendFactory>::Backend,
-    MemoryLoader<Value>,
->;
+pub(crate) type TestSession =
+    KeyedStateSession<
+        <SharedStateBackend<
+            MemoryCellStore<FixedOracle>,
+            MemoryDescriptorIdentityStore,
+            FixedOracle,
+        > as StateBackendFactory>::Backend,
+        MemoryLoader<Value>,
+    >;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
@@ -122,7 +122,7 @@ pub(crate) fn test_session_parts(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-) -> (TestSession, MemoryCellStore) {
+) -> (TestSession, MemoryCellStore<FixedOracle>) {
     test_session_with_armed(loader, registry, state_key, Arc::default())
 }
 
@@ -134,19 +134,18 @@ pub(crate) fn test_session_with_armed(
     registry: CollectionDefRegistry,
     state_key: StateKey,
     armed: ArmedKeys,
-) -> (TestSession, MemoryCellStore) {
+) -> (TestSession, MemoryCellStore<FixedOracle>) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let registry = Arc::new(registry);
-    let cell_store = MemoryCellStore::new();
-    let store = PartitionStateStore::new(
-        cell_store.clone(),
+    let cell_store = MemoryCellStore::new(
+        MemoryCells::new(),
         FixedOracle::committed(),
-        MemoryCommittedCache::new(),
         registry.clone(),
     );
     let session = KeyedStateSession::new(SessionParts {
-        store,
+        cell: cell_store.clone(),
+        dirty: Arc::new(DirtyStore::new()),
         oracle: FixedOracle::committed(),
         loader,
         registry,
@@ -398,4 +397,197 @@ fn prop_descriptors_from_equal_strings_are_interchangeable() {
         )
     }
     QuickCheck::new().quickcheck(prop as fn(String) -> TestResult);
+}
+
+/// Behavioral arms of the scope-containment (inv 6) and read-only-handle (inv
+/// 8) invariants. The *discriminating* proofs are the trybuild compile-fail
+/// goldens (`tests/compile_fail/`); these pin the runtime behavior the
+/// type-level proofs pair with.
+mod scope_and_parity {
+    use super::*;
+    use crate::state::cell::Committed;
+    use crate::state::cell_key::{CellKey, Coordinate, Scan};
+    use crate::state::session::{CellRead, sealed::ReadSessionMarker};
+    use crate::state::store::CellStore;
+    use crate::state::{CollectionId, EventRef};
+    use bytes::Bytes;
+    use futures::{Stream, StreamExt};
+
+    fn wishlist() -> ValueDescriptor {
+        value_state("wishlist")
+    }
+
+    /// A registry with both sibling Value collections registered.
+    fn registry_with_siblings() -> Result<CollectionDefRegistry> {
+        let mut registry = CollectionDefRegistry::new(None);
+        registry.register(&cart(), CollectionDef::new(None))?;
+        registry.register(&wishlist(), CollectionDef::new(None))?;
+        Ok(registry)
+    }
+
+    /// Inv 6 (behavioral): two sibling descriptors bound against one session
+    /// address disjoint cells — a write to one never leaks into the other's
+    /// read. `CellView` pins `(state_type, name)`, so the two handles cannot
+    /// collide even sharing a session, a key, and the empty Value coordinate.
+    #[test]
+    fn prop_sibling_descriptors_do_not_leak() {
+        async fn check(a: Value, b: Value) -> Result<bool> {
+            let session = test_session(MemoryLoader::new(), registry_with_siblings()?);
+            let cart = cart().bind(&session).map_err(|e| eyre!("bind cart: {e}"))?;
+            let wishlist = wishlist()
+                .bind(&session)
+                .map_err(|e| eyre!("bind wishlist: {e}"))?;
+            cart.set(a.clone()).await?;
+            wishlist.set(b.clone()).await?;
+            // Each handle reads only its own collection's cell.
+            Ok(cart.get().await? == Some(a) && wishlist.get().await? == Some(b))
+        }
+        fn prop(a: ArbJson, b: ArbJson) -> TestResult {
+            let input = format!("a={:#?} b={:#?}", a.0, b.0);
+            finish_trace(
+                executor::block_on(check(a.0, b.0)),
+                "sibling leakage",
+                &input,
+            )
+        }
+        QuickCheck::new().quickcheck(prop as fn(ArbJson, ArbJson) -> TestResult);
+    }
+
+    /// A read-only session: implements [`CellRead`] (so descriptors bind and
+    /// handles read) but **not** `CellSession`/`StateLifecycle`, so a handle
+    /// minted over it exposes `get` and cannot name a mutator (inv 8). Reads
+    /// delegate to the shared committed cell store — sound on the quiescent
+    /// committed state this test scopes to.
+    #[derive(Clone)]
+    struct ReaderSession {
+        store: MemoryCellStore<FixedOracle>,
+        registry: Arc<CollectionDefRegistry>,
+        loader: MemoryLoader<Value>,
+        state_key: StateKey,
+    }
+
+    impl ReadSessionMarker for ReaderSession {}
+
+    impl CellRead for ReaderSession {
+        type Loader = MemoryLoader<Value>;
+        type ScanError = <MemoryCellStore<FixedOracle> as CellStore>::Error;
+
+        fn loader(&self) -> &Self::Loader {
+            &self.loader
+        }
+
+        fn is_terminated(&self) -> bool {
+            false
+        }
+
+        fn verify_state_registration(
+            &self,
+            name: &'static str,
+            state_type: StateType,
+            identity: &StructuralIdentity,
+        ) -> Result<StateName, StateAccessError> {
+            let Some((state_name, registered)) = self.registry.lookup(state_type, name) else {
+                return Err(StateAccessError::Unregistered { name });
+            };
+            if registered.identity != *identity {
+                return Err(StateAccessError::IdentityMismatch {
+                    stored: registered.identity.clone(),
+                    asserted: identity.clone(),
+                });
+            }
+            Ok(state_name.clone())
+        }
+
+        async fn get(
+            &self,
+            state_type: StateType,
+            name: &StateName,
+            cell: &CellKey,
+        ) -> Result<Option<Bytes>, StateAccessError> {
+            // Quiescent committed state, so the resolving read is a pure
+            // committed projection (no provisional cell to resolve).
+            let id = CollectionId::new(self.state_key.clone(), state_type, name.clone());
+            let probe = EventRef::Message {
+                dedup_id: Uuid::from_u128(0),
+            };
+            self.store
+                .get(&id, cell, probe)
+                .await
+                .map(Committed::into_inner)
+                .map_err(|e| StateAccessError::store(&e))
+        }
+
+        fn scan<'a>(
+            &'a self,
+            state_type: StateType,
+            name: &'a StateName,
+            scan: Scan<'a>,
+        ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
+            let id = CollectionId::new(self.state_key.clone(), state_type, name.clone());
+            let store = self.store.clone();
+            let probe = EventRef::Message {
+                dedup_id: Uuid::from_u128(0),
+            };
+            // Own the scan coordinates so the stream borrows nothing from the
+            // caller's `Scan<'_>` (mirrors `KeyedStateSession::scan`).
+            let section = scan.section;
+            let start = scan.start.clone();
+            let end: Option<Coordinate> = scan.end.cloned();
+            let dir = scan.dir;
+            let limit = scan.limit;
+            async_stream::try_stream! {
+                let scan = Scan { section, start: &start, dir, end: end.as_ref(), limit };
+                let inner = store.scan_cells(&id, scan, probe);
+                futures::pin_mut!(inner);
+                while let Some(item) = inner.next().await {
+                    yield item?;
+                }
+            }
+        }
+    }
+
+    /// Inv 8 (behavioral): over quiescent committed state, a `CellRead`-only
+    /// handle's `get` agrees with the full writer handle's `get`. The writer
+    /// flushes a value to committed state, then both read it identically.
+    #[test]
+    fn prop_reader_get_matches_writer() {
+        async fn check(value: Value) -> Result<bool> {
+            let state_key = StateKey::new(Uuid::new_v4(), Arc::from("user-1"));
+            let mut registry = CollectionDefRegistry::new(None);
+            registry.register(&cart(), CollectionDef::new(None))?;
+            let registry = Arc::new(registry);
+            let (writer, cell_store) =
+                test_session_parts(MemoryLoader::new(), (*registry).clone(), state_key.clone());
+
+            let writer_handle = cart()
+                .bind(&writer)
+                .map_err(|e| eyre!("bind writer: {e}"))?;
+            // Flush a value straight to committed state (write-through), leaving
+            // no dirty overlay or provisional cell — quiescent committed state.
+            writer_handle.set(value.clone()).await?;
+            writer_handle.flush().await?;
+
+            let reader = ReaderSession {
+                store: cell_store,
+                registry,
+                loader: MemoryLoader::new(),
+                state_key,
+            };
+            let reader_handle = cart()
+                .bind(&reader)
+                .map_err(|e| eyre!("bind reader: {e}"))?;
+
+            Ok(reader_handle.get().await? == writer_handle.get().await?
+                && reader_handle.get().await? == Some(value))
+        }
+        fn prop(value: ArbJson) -> TestResult {
+            let input = format!("{:#?}", value.0);
+            finish_trace(
+                executor::block_on(check(value.0)),
+                "reader/writer parity",
+                &input,
+            )
+        }
+        QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
+    }
 }

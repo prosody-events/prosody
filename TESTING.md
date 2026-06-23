@@ -30,10 +30,10 @@ shapes and where to see them proven:
 | Invariant shape | Property | Exemplar |
 | --- | --- | --- |
 | Round-trip | `decode(encode(x)) == x` | `src/state/tests/encoding.rs` |
-| Oracle correctness | Real impl tracks a simple model op-for-op | `src/state/tests/value_suite.rs` |
+| Oracle correctness | Real impl tracks a simple model op-for-op | `CellModel` + the `run_*_trace` runners in `src/state/tests/cell_suite.rs` |
 | Parity | Two implementations answer identically | `src/consumer/middleware/deduplication/tests/prop_dedup_store.rs` |
-| Idempotence | Re-applying a resolution is a `NoOp` | `run_idempotence_trace` in `src/state/tests/value_suite.rs` |
-| Crash-recovery equivalence | Recovery converges to committed-or-rolled-back, never half-applied | `TraceOp::Crash` + `OraclePolicy` in `src/state/tests/value_suite.rs` |
+| Idempotence | A second sweep issues zero durable writes | `second_sweep_is_a_no_op` in `src/state/tests/cell_suite.rs` |
+| Crash-recovery equivalence | Recovery converges to committed-or-rolled-back, never half-applied | `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs` |
 | Monotonicity | Watermarks never move backwards | `src/consumer/partition/offsets/test.rs` |
 
 A property over toy inputs is just a slow example test. Generators must
@@ -58,8 +58,8 @@ together, and assert equivalence **after every operation**, not just at
 the end. The model uses plain `HashMap`/`BTreeSet`/`Option` — it must be
 obviously correct, never a re-implementation of the production code.
 
-Exemplars: `Trace`/`TraceOp` and the `Model` in
-`src/state/tests/value_suite.rs`; `DeferModel` in
+Exemplars: `Trace`/`Outcome` and the `CellModel` in
+`src/state/tests/cell_suite.rs`; `DeferModel` in
 `src/consumer/middleware/defer/message/store/tests/prop_defer_store.rs`;
 `HighLevelOperation` in `src/timers/store/tests/prop_high_level.rs`.
 
@@ -85,7 +85,7 @@ so failures reduce to minimal reproductions. Without shrinking, a failing
 50-op trace is nearly undebuggable. Avoid wall-clock or RNG-seeded values
 inside generators — deterministic ranges keep failures reproducible.
 
-Exemplars: `src/state/tests/value_suite.rs` (`Trace`),
+Exemplars: `src/state/tests/cell_suite.rs` (`Trace`/`OverlayTrace`/`ScanTrace`),
 `src/state/tests/encoding.rs` (`Arb*` wrappers around enums), and the
 durability-sequence properties in
 `src/consumer/middleware/tests/durability_boundary.rs`.
@@ -93,13 +93,15 @@ durability-sequence properties in
 ### Backend-generic suite runners
 
 Write the property once as a generic runner, then instantiate it from each
-backend's test module. `run_trace` / `run_trace_with_policy` /
-`run_idempotence_trace` in `src/state/tests/value_suite.rs` are generic
-over store bundles and run unchanged against memory, Cassandra, and Fjall
+backend's test module. `run_crash_equivalence_trace` / `run_overwrite_trace`
+/ `run_overlay_trace` / `run_scan_trace` in `src/state/tests/cell_suite.rs`
+are generic over the `CellStore` backend and run unchanged against memory
+(`Overlay<MemoryCellStore>`) and Cassandra (`Overlay<Cached<CassandraStore>>`)
 — every backend must satisfy the same invariants. New backends get the
 whole suite for the cost of one instantiation.
 
-Instantiations: `src/state/fjall/tests.rs`, `src/state/cassandra/tests.rs`.
+Instantiations: `src/state/tests/mod.rs` (memory),
+`src/state/cassandra/cell/tests.rs` (live Cassandra).
 
 ### Differential (parity) testing
 
@@ -107,19 +109,20 @@ When a simple reference implementation exists, run the subject and the
 reference through identical operations and assert every query answers
 identically. This is oracle testing where the model is itself a real
 implementation — e.g. any dedup store vs. `MemoryDeduplicationStore` in
-`src/consumer/middleware/deduplication/tests/prop_dedup_store.rs`, or
-`LayeredValueStore` vs. its bare backing store.
+`src/consumer/middleware/deduplication/tests/prop_dedup_store.rs`.
 
 ### Crash-recovery simulation
 
-Traces include a `Crash` operation that captures the sealed-but-unresolved
-state; the next iteration drives recovery under an explicit
-`OraclePolicy` (`AlwaysCommitted` / `AlwaysNotCommitted`) so both the
-apply and rollback arms are exercised deterministically. **Never simulate
-a crash by leaking or forgetting a value** — reproduce the on-disk /
-on-wire state directly (see the Memory rule in CLAUDE.md).
+A "crash" is modeled by rebuilding the store (`make_store()`) over the same
+warm durable backing — the durable rows and the commit oracle's committed set
+survive, while the fresh store starts with a cold in-process cache, exactly as
+after a restart. Recovery then runs through the sweep or first-touch; the
+`ScriptedOracle`'s recorded markers decide commit-vs-rollback so both arms are
+exercised. **Never simulate a crash by leaking or forgetting a value** —
+reproduce the on-disk / on-wire state directly (see the Memory rule in
+CLAUDE.md).
 
-Exemplar: `TraceOp::Crash` handling in `src/state/tests/value_suite.rs`.
+Exemplar: `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs`.
 
 ### Seeding stale state directly
 
@@ -129,8 +132,9 @@ through the store's low-level API — bypassing the type whose lifecycle
 would normally prevent the state — then assert the sweep/recovery path
 cleans it up.
 
-Exemplar: `run_stale_pending_index` in `src/state/tests/value_suite.rs`,
-run from both the memory and Cassandra suites.
+Exemplar: the seed-stale-identity acquire path in
+`src/state/descriptor_identity/tests.rs` (a frozen identity row written
+directly, then validated against a disagreeing descriptor).
 
 ### Runtime errors are errors, not property failures
 
@@ -141,7 +145,8 @@ with `?` and convert at the boundary) with enough context to identify the
 failing operation index. Never swallow them into a `false` property
 result.
 
-Exemplar: `finish_trace` in `src/state/tests/value_suite.rs`.
+Exemplar: `finish_trace` in `src/state/descriptor/tests.rs`; the `finish`
+helper + `TestResult::error` in `src/state/cassandra/cell/tests.rs`.
 
 ### Deterministic time: per-iteration runtimes
 

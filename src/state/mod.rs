@@ -1,24 +1,27 @@
 //! Keyed application state protocol types.
 //!
-//! This module defines the shared typed identity and transaction state shapes
-//! used by keyed state stores. The first implemented collection kind is
-//! [`ValueKind`], but collection identities carry the kind both statically and
-//! at runtime so future collection families cannot share state by accident.
+//! This module defines the shared collection identity and transaction state
+//! shapes used by the keyed-state cell store. The cell layer is **uniform and
+//! untyped** — it addresses cells by [`CellKey`] and names no collection
+//! family; typed collection handles (Value, and future Map/Deque) are built
+//! atop it in [`descriptor`].
 //!
 //! The shapes themselves live in leaf-to-root submodules and are
 //! re-exported flat below, so consumers keep importing `crate::state::X`:
 //!
-//! * [`identity`] — typed collection identity ([`CollectionId`],
-//!   [`CollectionRef`], [`StateKey`], [`CollectionKind`], …).
+//! * [`identity`] — collection identity ([`CollectionId`], [`CollectionRef`],
+//!   [`StateKey`], [`CollectionKindId`], …).
+//! * [`cell_key`] — intra-collection cell addressing ([`CellKey`], [`Section`],
+//!   [`Coordinate`], [`Scan`]).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
 //! * [`encoding`] — payload encoding selectors ([`Encoding`],
 //!   [`EncodingError`]).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
 //!   [`ProvisionalCell`], [`ProvisionalWrite`]).
-//! * [`value`] — the Value collection kind ([`ValueKind`], [`ValueOp`], …).
-//! * [`descriptor`] — typed descriptors and handles bound over the raw byte
-//!   cells the stores persist.
+//! * [`store`] — the uniform [`CellStore`] backend trait.
+//! * [`descriptor`] — typed collection handles bound over the raw byte cells
+//!   the stores persist.
 //! * [`transaction`] — transaction-side state ([`CommitMode`], [`Read`], …).
 //!
 //! The cross-cutting backend abstraction — the [`StateBackend`] bundle trait,
@@ -33,12 +36,12 @@
 use crate::error::ClassifyError;
 use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::oracle::CommitOracle;
-use crate::state::partition_store::CommittedCache;
 use crate::state::store::CellStore;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
 
+pub mod cached;
 pub mod cassandra;
 pub mod cell;
 pub mod cell_key;
@@ -54,127 +57,101 @@ pub mod manager;
 pub mod memory;
 pub mod oracle;
 pub mod order_codec;
-pub mod partition_store;
+pub mod overlay;
 pub mod production;
-#[cfg(test)]
-pub(crate) mod proof_kind;
 pub mod registry;
 pub mod resolve;
 pub mod session;
 pub mod store;
 pub mod transaction;
-pub mod value;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 pub use cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-pub use dirty::DirtyValueStore;
 pub use encoding::{Encoding, EncodingError};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
-    CollectionId, CollectionKind, CollectionKindId, CollectionRef, StateKey, StateName,
-    StateNameError, StateType,
+    CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,
 };
 pub use order_codec::{
     I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
     order_preserving_i64_decode,
 };
 pub use transaction::{CommitMode, Read};
-pub use value::{ValueKind, ValueOp};
 
 /// Maximum concurrent per-collection durable operations in the keyed-state
 /// Value lifecycle (finalize stage, commit promote, rollback, recovery sweep).
 /// Each collection is its own Cassandra partition, so the fan-out is safe.
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
-/// The per-partition backend bundle: every kind's durable cell store + cache,
-/// the one shared commit oracle, and the shared descriptor-identity store —
-/// behind one type parameter so the session and manager name only `B`.
+/// The per-partition backend bundle: the one uniform durable cell store, the
+/// shared commit oracle, and the shared descriptor-identity store — behind one
+/// type parameter so the session and manager name only `B`.
 ///
 /// Minted as one unit by [`StateBackendFactory::for_partition`] so the oracle
-/// the sessions stage against and the oracle the recovery sweep resolves
-/// through are the *same* instance, and the fjall workspace backing the
-/// committed-value cache is opened once. The per-event dirty workspace is not
-/// part of the backend — it is a single in-memory [`DirtyValueStore`] the
-/// session owns and rebuilds per event, never a durability or recovery source.
-///
-/// Adding a kind grows this trait by two associated types + two accessors (a
-/// `KindCell: CellStore<KindKind>` and a `KindCache:
-/// CommittedCache<KindKind>`); no session or manager signature changes, because
-/// they project these types behind the one `B`. The accessors return cheap
-/// `Arc`-clones.
+/// the sessions stage against (for the dedup marker) and the oracle the cell
+/// store resolves provisional cells through are the *same* instance, and the
+/// fjall workspace backing the committed-value cache is opened once. The
+/// per-event dirty workspace is not part of the backend — it is the in-memory
+/// [`DirtyStore`](dirty::DirtyStore) the session's
+/// [`Overlay`](overlay::Overlay) owns and clears per event, never a durability
+/// or recovery source.
 pub trait StateBackend: Send + Sync + 'static {
-    /// The one commit oracle, shared by every lane, so a provisional cell of
-    /// any kind resolves against the exact commit record the one marker
-    /// certifies.
+    /// The commit oracle, shared with the cell store, so a provisional cell
+    /// resolves against the exact commit record the one marker certifies.
     type Oracle: CommitOracle;
 
     /// The shared descriptor-identity control-plane store, validated eagerly
-    /// at acquisition. It is decoupled from any kind's data store — a kind's
-    /// [`CellStore<K>`] does **not** implement [`DescriptorIdentityStore`], so
-    /// "which kind owns identity?" is un-askable.
+    /// at acquisition. It is decoupled from the cell data store — the cell
+    /// store does **not** implement [`DescriptorIdentityStore`].
     type Identity: DescriptorIdentityStore;
 
-    /// Durable cell store for the [`ValueKind`] lane.
-    type ValueCell: CellStore<ValueKind>;
+    /// The one uniform durable cell store (`Overlay<Cached<CassandraStore>>` in
+    /// production, `Overlay<MemoryCellStore>` in tests).
+    type Cell: CellStore;
 
-    /// Committed-value cache for the [`ValueKind`] lane.
-    type ValueCache: CommittedCache<ValueKind>;
-    // Adding Map: `type MapCell: CellStore<MapKind>; type MapCache:
-    // CommittedCache<MapKind>;`
-
-    /// The shared commit oracle.
+    /// The shared commit oracle (the marker flush writes through it).
     fn oracle(&self) -> Self::Oracle;
 
     /// The shared descriptor-identity store.
     fn identity(&self) -> Self::Identity;
 
-    /// The Value lane's durable cell store.
-    fn value_cell(&self) -> Self::ValueCell;
-
-    /// The Value lane's committed-value cache.
-    fn value_cache(&self) -> Self::ValueCache;
+    /// The uniform durable cell store.
+    fn cell(&self) -> Self::Cell;
 }
 
 /// The one concrete backend every factory mints; [`StateBackend`] projects its
-/// per-kind store types so callers name only `B`. Type-param growth is confined
-/// to this struct and the factory's
-/// [`for_partition`](StateBackendFactory::for_partition) — never the session or
-/// manager.
+/// store type so callers name only `B`.
 #[derive(Clone, Debug)]
-pub struct PartitionBackend<O, I, VCell, VCache> {
+pub struct PartitionBackend<O, I, C> {
     oracle: O,
     identity: I,
-    value_cell: VCell,
-    value_cache: VCache,
+    cell: C,
 }
 
-impl<O, I, VCell, VCache> PartitionBackend<O, I, VCell, VCache> {
+impl<O, I, C> PartitionBackend<O, I, C> {
     /// Bundles the per-partition backend parts: the shared oracle, the shared
-    /// descriptor-identity store, and the Value lane's cell store and cache.
+    /// descriptor-identity store, and the uniform cell store.
     #[must_use]
-    pub fn new(oracle: O, identity: I, value_cell: VCell, value_cache: VCache) -> Self {
+    pub fn new(oracle: O, identity: I, cell: C) -> Self {
         Self {
             oracle,
             identity,
-            value_cell,
-            value_cache,
+            cell,
         }
     }
 }
 
-impl<O, I, VCell, VCache> StateBackend for PartitionBackend<O, I, VCell, VCache>
+impl<O, I, C> StateBackend for PartitionBackend<O, I, C>
 where
     O: CommitOracle,
     I: DescriptorIdentityStore + Clone,
-    VCell: CellStore<ValueKind>,
-    VCache: CommittedCache<ValueKind>,
+    C: CellStore,
 {
+    type Cell = C;
     type Identity = I;
     type Oracle = O;
-    type ValueCache = VCache;
-    type ValueCell = VCell;
 
     fn oracle(&self) -> O {
         self.oracle.clone()
@@ -184,12 +161,8 @@ where
         self.identity.clone()
     }
 
-    fn value_cell(&self) -> VCell {
-        self.value_cell.clone()
-    }
-
-    fn value_cache(&self) -> VCache {
-        self.value_cache.clone()
+    fn cell(&self) -> C {
+        self.cell.clone()
     }
 }
 
@@ -221,42 +194,38 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
 }
 
 /// Partition-agnostic [`StateBackendFactory`]: clones the same cell store,
-/// identity store, oracle, and cache for every partition.
+/// identity store, and oracle for every partition.
 ///
 /// Suits compositions whose stores are not partition-scoped — memory-backed
-/// tests and bespoke wiring; production uses the partition-scoped factories
-/// in [`production`]. The cell store (`S`) and the descriptor-identity store
-/// (`I`) are distinct, decoupled parts.
+/// tests and bespoke wiring; production uses the partition-scoped factories in
+/// [`production`]. The supplied `cell` must already embed `oracle` (it resolves
+/// provisional cells through it), so the two are the same instance.
 #[derive(Clone, Debug)]
-pub struct SharedStateBackend<S, I, O, C> {
+pub struct SharedStateBackend<S, I, O> {
     cell: S,
     identity: I,
     oracle: O,
-    cache: C,
 }
 
-impl<S, I, O, C> SharedStateBackend<S, I, O, C> {
-    /// Creates a backend factory that hands out clones of the supplied
-    /// parts.
+impl<S, I, O> SharedStateBackend<S, I, O> {
+    /// Creates a backend factory that hands out clones of the supplied parts.
     #[must_use]
-    pub fn new(cell: S, identity: I, oracle: O, cache: C) -> Self {
+    pub fn new(cell: S, identity: I, oracle: O) -> Self {
         Self {
             cell,
             identity,
             oracle,
-            cache,
         }
     }
 }
 
-impl<S, I, O, C> StateBackendFactory for SharedStateBackend<S, I, O, C>
+impl<S, I, O> StateBackendFactory for SharedStateBackend<S, I, O>
 where
-    S: CellStore<ValueKind> + Clone,
+    S: CellStore + Clone,
     I: DescriptorIdentityStore + Clone,
     O: CommitOracle,
-    C: CommittedCache<ValueKind>,
 {
-    type Backend = PartitionBackend<O, I, S, C>;
+    type Backend = PartitionBackend<O, I, S>;
     type Error = Infallible;
 
     fn for_partition(
@@ -268,7 +237,6 @@ where
             self.oracle.clone(),
             self.identity.clone(),
             self.cell.clone(),
-            self.cache.clone(),
         ))
     }
 }

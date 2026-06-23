@@ -524,19 +524,30 @@ mod rollback_safety {
     use super::*;
     use crate::consumer::Uncommitted;
     use crate::loader::MemoryLoader;
-    use crate::state::cell::Cell;
-    use crate::state::descriptor::tests::{TestSession, test_session_parts};
+    use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
     use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::FinalizeOutcome;
     use crate::state::store::CellStore;
-    use crate::state::value::ValueKind;
     use crate::state::{CollectionId, StateKey, StateName, StateType};
     use color_eyre::eyre::{Result, eyre};
+    use futures::StreamExt;
     use serde_json::json;
     use uuid::Uuid;
+
+    /// Whether the durable cell at `id` is still provisional — the public,
+    /// non-resolving way to distinguish a staged cell from a resolved one (the
+    /// resolving `get` would mutate a provisional cell).
+    async fn is_provisional(
+        cell_store: &MemoryCellStore<FixedOracle>,
+        id: &CollectionId,
+    ) -> Result<bool> {
+        let stream = cell_store.provisional_cells(id);
+        futures::pin_mut!(stream);
+        Ok(stream.next().await.transpose()?.is_some())
+    }
 
     /// A commit guard that records nothing — `abandon` only `abort`s it.
     struct NoopGuard;
@@ -575,7 +586,9 @@ mod rollback_safety {
     /// the context (ready to abandon / settle), the durable store, and the cell
     /// id. When `arm_failure` is set the context fails every timer schedule
     /// permanently, so the backstop arm resolves to `Skip`.
-    async fn staged(arm_failure: bool) -> Result<(Ctx, MemoryCellStore, CollectionId<ValueKind>)> {
+    async fn staged(
+        arm_failure: bool,
+    ) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&cart(), CollectionDef::new(None))?;
         let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
@@ -606,10 +619,7 @@ mod rollback_safety {
             StateName::try_new("cart")?,
         );
         assert!(
-            matches!(
-                cell_store.read_cell(&cart_id, &()).await?,
-                Cell::Provisional(_)
-            ),
+            is_provisional(&cell_store, &cart_id).await?,
             "the cell must be provisional after staging"
         );
         Ok((context, cell_store, cart_id))
@@ -632,10 +642,7 @@ mod rollback_safety {
         .await;
 
         assert!(
-            matches!(
-                cell_store.read_cell(&cart_id, &()).await?,
-                Cell::Provisional(_)
-            ),
+            is_provisional(&cell_store, &cart_id).await?,
             "AfterMarkerFlush must leave the staged cell provisional",
         );
         Ok(())
@@ -658,10 +665,7 @@ mod rollback_safety {
         .await;
 
         assert!(
-            matches!(
-                cell_store.read_cell(&cart_id, &()).await?,
-                Cell::Resolved(_)
-            ),
+            !is_provisional(&cell_store, &cart_id).await?,
             "BeforeMarkerFlush must roll the staged cell back to resolved",
         );
         Ok(())
@@ -694,10 +698,7 @@ mod rollback_safety {
         );
         assert_eq!(aborted.load(Ordering::SeqCst), 1, "offset must abort");
         assert!(
-            matches!(
-                cell_store.read_cell(&cart_id, &()).await?,
-                Cell::Resolved(_)
-            ),
+            !is_provisional(&cell_store, &cart_id).await?,
             "a skipped arm must roll the staged cell back (no marker-uncertified provisional left \
              to TTL out)",
         );

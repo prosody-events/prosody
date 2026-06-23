@@ -1,0 +1,10 @@
+error[E0624]: method `session` is private
+  --> tests/compile_fail/cellview_scope_is_pinned.rs:13:10
+   |
+13 |     view.session()
+   |          ^^^^^^^ private method
+   |
+  ::: src/state/descriptor/mod.rs
+   |
+   |     pub(in crate::state) fn session(&self) -> &S {
+   |     -------------------------------------------- private method defined here

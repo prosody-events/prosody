@@ -36,6 +36,7 @@ use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraValueStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
+use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::encoding::decode_payload;
 use bytes::Bytes;
 use thiserror::Error;
@@ -51,6 +52,37 @@ pub(super) type RawCellRow = (
     Option<i32>,         // version (shared by data + prev_data)
     Option<RawEventRef>, // event (validated into EventRef during decode)
 );
+
+/// Seven-column shape produced by `SELECT section, coordinate, data,
+/// prev_data, encoding, version, event` — a [`RawCellRow`] prefixed with the
+/// clustering columns, for scans and the recovery sweep that must reconstruct
+/// each cell's [`CellKey`].
+pub(super) type KeyedCellRow = (
+    i8,      // section
+    Vec<u8>, // coordinate
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+);
+
+/// Decodes a keyed cell row into its [`CellKey`] and [`Cell`].
+///
+/// # Errors
+///
+/// Returns the same corruption errors as [`try_decode_cell`].
+pub(super) fn try_decode_keyed_cell(
+    row: KeyedCellRow,
+) -> Result<(CellKey, Cell), CassandraValueStoreError> {
+    let (section, coordinate, data, prev_data, encoding, version, event) = row;
+    let key = CellKey {
+        section: Section::new(section),
+        coordinate: Coordinate::from_bytes(coordinate),
+    };
+    let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
+    Ok((key, cell))
+}
 
 /// Decodes a cell row into a [`Cell`].
 ///

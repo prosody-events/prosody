@@ -170,15 +170,16 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader};
 pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
-use crate::state::cassandra::{CassandraCellStore, CassandraDescriptorIdentityStore};
+use crate::state::cassandra::{CassandraCellResources, CassandraDescriptorIdentityStore};
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
-use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
-use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
+use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::production::{
+    CassandraStateBackendFactory, MemoryStateBackendFactory, OracleProviders,
+};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
-use crate::state::session::{CellAccess, StateSession};
-use crate::state::value::ValueKind;
+use crate::state::session::CellSession;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
@@ -841,7 +842,7 @@ impl PipelineMiddlewareStack {
         PP: TriggerStoreProvider,
         SP: PartitionStateProvider,
         <SP::Manager as PartitionStateManager>::Session:
-            StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
+            CellSession<Loader: MessageLoader<Payload = C::Payload>>,
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
@@ -1080,19 +1081,22 @@ fn memory_state_provider<C: Codec>(
     trigger_provider: &InMemoryTriggerStoreProvider,
 ) -> impl PartitionStateProvider<
     Manager: PartitionStateManager<
-        Session: StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
+        Session: CellSession<Loader: MessageLoader<Payload = C::Payload>>,
     >,
 >
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
     let backend = MemoryStateBackendFactory::new(
-        MemoryCellStore::new(),
+        MemoryCells::new(),
         MemoryDescriptorIdentityStore::new(),
-        dedup_provider,
-        trigger_provider.clone(),
-        keyed_state.group.clone(),
-        keyed_state.timer_slab_size,
+        keyed_state.registry.clone(),
+        OracleProviders {
+            dedup: dedup_provider,
+            triggers: trigger_provider.clone(),
+            consumer_group: keyed_state.group.clone(),
+            timer_slab_size: keyed_state.timer_slab_size,
+        },
     );
     keyed_state.provider(backend, MemoryLoader::<C::Payload>::new())
 }
@@ -1108,13 +1112,12 @@ fn cassandra_state_provider<C: Codec>(
     heartbeats: &HeartbeatRegistry,
     dedup_provider: CassandraDeduplicationStoreProvider,
     trigger_provider: &CassandraTriggerStoreProvider,
-    cell_store: CassandraCellStore,
+    cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
 ) -> Result<
     impl PartitionStateProvider<
         Manager: PartitionStateManager<
-            Session: StateSession<Loader: MessageLoader<Payload = C::Payload>>
-                         + CellAccess<ValueKind>,
+            Session: CellSession<Loader: MessageLoader<Payload = C::Payload>>,
         >,
     >,
     ConsumerError,
@@ -1135,10 +1138,13 @@ where
         fjall_client,
         cell_store,
         identity_store,
-        dedup_provider,
-        trigger_provider.clone(),
-        keyed_state.group.clone(),
-        keyed_state.timer_slab_size,
+        keyed_state.registry.clone(),
+        OracleProviders {
+            dedup: dedup_provider,
+            triggers: trigger_provider.clone(),
+            consumer_group: keyed_state.group.clone(),
+            timer_slab_size: keyed_state.timer_slab_size,
+        },
     );
     Ok(keyed_state.provider(backend, loader))
 }
@@ -1161,7 +1167,7 @@ where
     S: TriggerStoreProvider,
     SP: PartitionStateProvider,
     <SP::Manager as PartitionStateManager>::Session:
-        StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
+        CellSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
 {
@@ -1358,12 +1364,15 @@ where
                 // message defer and the keyed-state Kafka-message handles.
                 let loader = MemoryLoader::<C::Payload>::new();
                 let backend = MemoryStateBackendFactory::new(
-                    MemoryCellStore::new(),
+                    MemoryCells::new(),
                     MemoryDescriptorIdentityStore::new(),
-                    dedup_provider.clone(),
-                    trigger_provider.clone(),
-                    keyed_state.group.clone(),
-                    keyed_state.timer_slab_size,
+                    keyed_state.registry.clone(),
+                    OracleProviders {
+                        dedup: dedup_provider.clone(),
+                        triggers: trigger_provider.clone(),
+                        consumer_group: keyed_state.group.clone(),
+                        timer_slab_size: keyed_state.timer_slab_size,
+                    },
                 );
                 let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
@@ -1411,10 +1420,13 @@ where
                     fjall_client,
                     cell_store,
                     identity_store,
-                    dedup_provider.clone(),
-                    trigger_provider.clone(),
-                    keyed_state.group.clone(),
-                    keyed_state.timer_slab_size,
+                    keyed_state.registry.clone(),
+                    OracleProviders {
+                        dedup: dedup_provider.clone(),
+                        triggers: trigger_provider.clone(),
+                        consumer_group: keyed_state.group.clone(),
+                        timer_slab_size: keyed_state.timer_slab_size,
+                    },
                 );
                 let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
@@ -1804,7 +1816,7 @@ where
     P: TriggerStoreProvider,
     SP: PartitionStateProvider,
     <SP::Manager as PartitionStateManager>::Session:
-        StateSession<Loader: MessageLoader<Payload = C::Payload>> + CellAccess<ValueKind>,
+        CellSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: Clone + EventType + EventIdentity,
 {

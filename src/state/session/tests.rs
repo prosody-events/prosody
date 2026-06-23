@@ -1,33 +1,25 @@
-//! Session lifecycle property + the `merge_apply` fold.
+//! Session lifecycle property + the marker-ordering pin.
 //!
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of
 //! mutate/commit/abort/reset events through the **real** production session
-//! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset` over the
-//! exhaustive `Lanes` fan-out) and asserts the Value lane's committed
-//! projection tracks a plain `Option<Bytes>` model after every event — the
-//! session-grain analog of the store-grain trace in `value_suite`. One focused
-//! example pins the ordering a trace cannot observe: the single marker flushes
-//! **exactly once, strictly after the stage** (the [`ScriptedOracle`]
-//! `record_message` counter).
-//!
-//! [`prop_merge_apply_dominance`] pins [`merge_apply`](super::merge_apply):
-//! once production has a single lane, the dominance fold has no end-to-end
-//! coverage until a second kind lands, so it is exercised here directly — the
-//! result is the dominance-max of its inputs (`Incomplete` > `Resolved` >
-//! `NothingStaged`) and is order-independent.
+//! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`) and asserts
+//! the committed projection (read through the cell store) tracks a plain
+//! `Option<Bytes>` model after every event. One focused example pins the
+//! ordering a trace cannot observe: the single marker flushes **exactly once,
+//! strictly after the stage** (the [`ScriptedOracle`] `record_message`
+//! counter).
 
-use super::merge_apply;
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use super::{ArmedKeys, CellAccess, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
+use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::value_state;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
+use crate::state::dirty::DirtyStore;
+use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
-use crate::state::partition_store::PartitionStateStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
-use crate::state::value::ValueKind;
 use crate::state::{
     CollectionId, CommitDecision, EventRef, SharedStateBackend, StateBackendFactory, StateKey,
     StateName, StateType,
@@ -39,7 +31,6 @@ use color_eyre::eyre::Result;
 use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::convert::Infallible;
-use std::iter;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -47,15 +38,20 @@ use uuid::Uuid;
 const VALUE_NAME: &str = "cart";
 
 /// The per-event session type the fixture mints (loader slot unused, so `()`).
-/// The backend bundle is projected from the [`SharedStateBackend`] factory, so
-/// the construction body names only the concrete stores it passes.
 type TestBackend = <SharedStateBackend<
-    MemoryCellStore,
+    MemoryCellStore<ScriptedOracle>,
     MemoryDescriptorIdentityStore,
     ScriptedOracle,
-    MemoryCommittedCache,
 > as StateBackendFactory>::Backend;
 type Session = KeyedStateSession<TestBackend, ()>;
+
+/// The single Value cell (`ValueNs::Entries`, empty coordinate).
+fn value_cell() -> CellKey {
+    CellKey {
+        section: Section::new(0),
+        coordinate: Coordinate::empty(),
+    }
+}
 
 /// A committed-marker oracle: `record_message` writes the durable marker,
 /// `resolve` answers `Committed` for a recorded event. Shared across the
@@ -101,10 +97,10 @@ impl CommitOracle for ScriptedOracle {
     }
 }
 
-/// Fixture sharing the partition-lifetime store across the per-event sessions
-/// it mints, so a second event reads the first's committed values.
+/// Fixture sharing the partition-lifetime cell store across the per-event
+/// sessions it mints, so a second event reads the first's committed values.
 struct Fixture {
-    value_store: MemoryCellStore,
+    cells: MemoryCells,
     oracle: ScriptedOracle,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
@@ -127,7 +123,7 @@ impl Fixture {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         Ok(Self {
-            value_store: MemoryCellStore::new(),
+            cells: MemoryCells::new(),
             oracle: ScriptedOracle::default(),
             registry: Arc::new(registry),
             state_key: StateKey::new(Uuid::from_u128(0x00C0_FFEE), Arc::from("key")),
@@ -140,16 +136,20 @@ impl Fixture {
         })
     }
 
+    /// The partition-lifetime cell store (a clone sharing the durable cells).
+    fn cell_store(&self) -> MemoryCellStore<ScriptedOracle> {
+        MemoryCellStore::new(
+            self.cells.clone(),
+            self.oracle.clone(),
+            self.registry.clone(),
+        )
+    }
+
     /// Mints a session for `event` over clones of the shared store and oracle.
     fn session(&self, event: EventRef) -> Session {
-        let store = PartitionStateStore::new(
-            self.value_store.clone(),
-            self.oracle.clone(),
-            MemoryCommittedCache::new(),
-            self.registry.clone(),
-        );
         KeyedStateSession::new(SessionParts {
-            store,
+            cell: self.cell_store(),
+            dirty: Arc::new(DirtyStore::new()),
             oracle: self.oracle.clone(),
             loader: (),
             registry: self.registry.clone(),
@@ -161,7 +161,7 @@ impl Fixture {
         })
     }
 
-    fn value_id(&self) -> CollectionId<ValueKind> {
+    fn value_id(&self) -> CollectionId {
         CollectionId::new(
             self.state_key.clone(),
             StateType::Application,
@@ -169,15 +169,20 @@ impl Fixture {
         )
     }
 
-    /// The durable committed Value bytes (the external committed-only
-    /// projection: `prev` while a provisional cell stands).
+    /// The durable committed Value bytes. A fresh probe event so own-event
+    /// never short-circuits; on quiescent state the resolving read is the
+    /// committed projection (a still-provisional cell resolves to its
+    /// `prev`, which is the committed value the in-flight event
+    /// superseded).
     async fn committed_value(&self) -> Result<Option<Bytes>> {
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX),
+        };
         Ok(self
-            .value_store
-            .read_cell(&self.value_id(), &())
+            .cell_store()
+            .get(&self.value_id(), &value_cell(), probe)
             .await?
-            .project_committed()
-            .cloned())
+            .into_inner())
     }
 }
 
@@ -196,7 +201,8 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
     let (event, dedup_id) = message(1);
     let session = fx.session(event);
 
-    CellAccess::<ValueKind>::set_cell(&session, StateType::Application, &fx.value_name, &(), b"v1")
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
         .await?;
     session.register_marker(dedup_id);
 
@@ -277,9 +283,8 @@ impl Arbitrary for Trace {
     }
 }
 
-/// Drives the trace through the real session lifecycle, asserting the Value
-/// lane's committed projection equals a plain `Option<Bytes>` model after every
-/// event.
+/// Drives the trace through the real session lifecycle, asserting the committed
+/// projection equals a plain `Option<Bytes>` model after every event.
 async fn run(trace: Trace) -> Result<bool> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
@@ -290,23 +295,19 @@ async fn run(trace: Trace) -> Result<bool> {
 
         match ev.mutation {
             ValueMut::Set(byte) => {
-                CellAccess::<ValueKind>::set_cell(
-                    &session,
-                    StateType::Application,
-                    &fx.value_name,
-                    &(),
-                    &[byte],
-                )
-                .await?;
+                session
+                    .set(
+                        StateType::Application,
+                        &fx.value_name,
+                        &value_cell(),
+                        &[byte],
+                    )
+                    .await?;
             }
             ValueMut::Clear => {
-                CellAccess::<ValueKind>::clear_cell(
-                    &session,
-                    StateType::Application,
-                    &fx.value_name,
-                    &(),
-                )
-                .await?;
+                session
+                    .clear(StateType::Application, &fx.value_name, &value_cell())
+                    .await?;
             }
             ValueMut::Skip => {}
         }
@@ -355,61 +356,63 @@ fn prop_value_lifecycle_equivalence() {
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
 
-impl Arbitrary for ApplyOutcome {
-    fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 3 {
-            0 => ApplyOutcome::NothingStaged,
-            1 => ApplyOutcome::Resolved,
-            _ => ApplyOutcome::Incomplete,
-        }
-    }
-}
+/// `commit_apply` is best-effort: with two staged collections, a permanent
+/// `mark_resolved` failure on one leaves it provisional (`Incomplete`) while
+/// the healthy sibling still promotes — pinning the `fold`-not-`try_fold`
+/// reduction and the `Incomplete`-dominance of the staged-set resolution.
+#[tokio::test]
+async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
+    use crate::state::PartitionBackend;
+    use crate::state::tests::cell_suite::FailingCellStore;
 
-/// Dominance rank: `Incomplete` (2) > `Resolved` (1) > `NothingStaged` (0).
-fn rank(outcome: ApplyOutcome) -> u8 {
-    match outcome {
-        ApplyOutcome::NothingStaged => 0,
-        ApplyOutcome::Resolved => 1,
-        ApplyOutcome::Incomplete => 2,
-    }
-}
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
+    registry.register(
+        &value_state::<JsonCodec>("wishlist"),
+        CollectionDef::new(None),
+    )?;
+    let registry = Arc::new(registry);
+    let oracle = ScriptedOracle::default();
+    let inner = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let cell = FailingCellStore::new(inner, StateName::try_new("wishlist")?);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let state_key = StateKey::new(Uuid::from_u128(7), Arc::from("key"));
+    let (event, _dedup) = message(1);
+    let session: KeyedStateSession<
+        PartitionBackend<
+            ScriptedOracle,
+            MemoryDescriptorIdentityStore,
+            FailingCellStore<MemoryCellStore<ScriptedOracle>>,
+        >,
+        (),
+    > = KeyedStateSession::new(SessionParts {
+        cell,
+        dirty: Arc::new(DirtyStore::new()),
+        oracle,
+        loader: (),
+        registry,
+        state_key,
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    });
 
-/// Invariant: `merge_apply` is the dominance-max of its inputs and is
-/// order-independent — folding any permutation agrees. This is the only
-/// coverage of the per-lane fold while production has a single lane, so it must
-/// stand on its own (the advisor's load-bearing point) rather than lean on a
-/// session test.
-#[test]
-fn prop_merge_apply_dominance() {
-    fn prop(outcomes: Vec<ApplyOutcome>) -> TestResult {
-        // Dominance-max: empty folds to `NothingStaged` (rank 0).
-        let expected_rank = outcomes.iter().map(|o| rank(*o)).max().unwrap_or(0);
-        // Snapshot the reversed input before the fold consumes `outcomes`.
-        let reversed: Vec<ApplyOutcome> = outcomes.iter().rev().copied().collect();
-        let folded = merge_apply(outcomes);
-        if rank(folded) != expected_rank {
-            return TestResult::error("merge_apply is not the dominance-max of its inputs");
-        }
-        // Order-independent: the reversed fold agrees.
-        if folded != merge_apply(reversed) {
-            return TestResult::error("merge_apply depends on input order");
-        }
-        TestResult::passed()
-    }
-    QuickCheck::new().quickcheck(prop as fn(Vec<ApplyOutcome>) -> TestResult);
-}
+    let cart = StateName::try_new("cart")?;
+    let wishlist = StateName::try_new("wishlist")?;
+    session
+        .set(StateType::Application, &cart, &value_cell(), b"a")
+        .await?;
+    session
+        .set(StateType::Application, &wishlist, &value_cell(), b"b")
+        .await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
 
-/// Frozen examples for the two-plus-element dominance the property generates:
-/// any `Incomplete` dominates, else any `Resolved`, else `NothingStaged`.
-#[test]
-fn merge_apply_fixed_vectors() {
-    use ApplyOutcome::{Incomplete, NothingStaged, Resolved};
-    assert_eq!(merge_apply([Resolved, Incomplete]), Incomplete);
-    assert_eq!(merge_apply([Resolved, NothingStaged]), Resolved);
-    assert_eq!(merge_apply([NothingStaged, NothingStaged]), NothingStaged);
     assert_eq!(
-        merge_apply([Resolved, Incomplete, NothingStaged]),
-        Incomplete,
+        session.commit_apply().await,
+        ApplyOutcome::Incomplete,
+        "a failed promote yields Incomplete so the boundary leaves the backstop armed",
     );
-    assert_eq!(merge_apply(iter::empty()), NothingStaged);
+    Ok(())
 }

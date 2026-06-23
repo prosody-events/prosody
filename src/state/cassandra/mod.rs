@@ -1,7 +1,7 @@
 //! Cassandra-backed durable keyed-state stores.
 //!
-//! [`CassandraCellStore`] implements
-//! [`CellStore<ValueKind>`](crate::state::store::CellStore) over the
+//! [`CassandraStore`] implements
+//! [`CellStore`](crate::state::store::CellStore) over the
 //! `keyed_state_cell` table, and [`CassandraDescriptorIdentityStore`]
 //! implements
 //! [`DescriptorIdentityStore`](crate::state::descriptor_identity::DescriptorIdentityStore)
@@ -21,7 +21,9 @@ mod serialize;
 mod tests;
 mod udt;
 
-pub use cell::{CassandraCellStore, CellCorruptReason, CellQueries};
+pub use cell::{
+    CassandraCellResources, CassandraStore, CellCorruptReason, CellQueries, CellStoreError,
+};
 pub use error::{CassandraValueStoreError, CorruptUdtError};
 pub use identity::{
     CassandraDescriptorIdentityError, CassandraDescriptorIdentityStore, IdentityQueries,

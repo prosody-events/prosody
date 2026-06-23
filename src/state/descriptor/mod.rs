@@ -39,17 +39,33 @@
 use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::registry::CollectionDef;
-use crate::state::session::{CellAccess, StateSession};
-use crate::state::value::ValueKind;
+use crate::state::session::{CellRead, CellSession};
 use crate::state::{CollectionKindId, CommitMode, StateName, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
+use bytes::Bytes;
+use futures::Stream;
 use internment::Intern;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use thiserror::Error;
+
+/// Value's own section enum, lowered to the opaque [`Section`]. Value is a
+/// one-cell collection, so it has exactly one section and addresses its single
+/// cell at the empty coordinate.
+#[repr(i8)]
+enum ValueNs {
+    Entries = 0,
+}
+
+/// The single cell of a Value collection.
+const VALUE_CELL: CellKey = CellKey {
+    section: Section::new(ValueNs::Entries as i8),
+    coordinate: Coordinate::empty(),
+};
 
 /// A resolver's durable token, the resolver half of a collection's
 /// [`StructuralIdentity`].
@@ -111,7 +127,7 @@ pub trait DescriptorIdentity {
 }
 
 /// A typed view over one keyed-state collection, bindable to any
-/// [`StateSession`].
+/// [`CellRead`] session.
 ///
 /// Handlers reach this through
 /// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
@@ -120,11 +136,13 @@ pub trait DescriptorIdentity {
 /// [`verify_state_registration`] and returns an owned, `Clone` handle that
 /// wraps the session's byte cells with the descriptor's typing.
 ///
-/// [`verify_state_registration`]: StateSession::verify_state_registration
+/// [`verify_state_registration`]: CellRead::verify_state_registration
 pub trait StateDescriptor: DescriptorIdentity + Copy {
-    /// Typed handle returned by [`Self::bind`]; owns a clone of the
-    /// binding session.
-    type Handle<S: StateSession>;
+    /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
+    /// session. Bound on [`CellRead`] (binding only reads), so a cross-group
+    /// reader session can bind every descriptor; the handle's *mutators* still
+    /// require [`CellSession`].
+    type Handle<S: CellRead>;
 
     /// Validates registration + structural identity and returns the typed
     /// handle.
@@ -140,7 +158,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     /// collection is unregistered, or
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
-    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
+    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings (TTL, commit mode) this descriptor carries
     /// into registration, set via its fluent methods (see
@@ -191,12 +209,12 @@ where
 ///
 /// The resolver is a zero-sized *strategy*, never an instance: every method
 /// is static (no `&self`). Any runtime dependency it needs (for example a
-/// message loader) is read from the [`StateSession`] handed to
+/// message loader) is read from the [`CellRead`] session handed to
 /// [`Self::resolve`] — see the consumer layer's reference resolver. A
 /// descriptor carries no resolver *state*; the resolver's durable *token*
 /// ([`ResolverId`]) is a separate, session-agnostic const that rides the
 /// [`StructuralIdentity`].
-pub trait CellResolver<S: StateSession> {
+pub trait CellResolver<S: CellRead> {
     /// The decoded cell type — pinned to the codec's payload by the handle.
     type Stored;
 
@@ -237,7 +255,7 @@ impl<T> ResolverId for Passthrough<T> {
 
 impl<S, T> CellResolver<S> for Passthrough<T>
 where
-    S: StateSession,
+    S: CellRead,
     T: Send + 'static,
 {
     type Resolved = T;
@@ -386,9 +404,9 @@ where
     C: Codec,
     R: ResolverId,
 {
-    type Handle<S: StateSession> = StateHandle<S, C, R>;
+    type Handle<S: CellRead> = StateHandle<S, C, R>;
 
-    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
         // The resolver token rides the identity (via `R: ResolverId`), but the
         // operational `R: CellResolver<S>` requirement surfaces on `get`/`set`,
         // not here, so this compiles through the shared `StateDescriptor` trait.
@@ -407,19 +425,92 @@ where
     }
 }
 
-/// Typed, owned handle over a codec-backed value collection.
+/// A cell store scoped to ONE collection partition (the unit of atomicity).
 ///
-/// Owns a clone of the binding session (`Clone + Send + Sync + 'static` —
-/// an FFI requirement); the codec runs only at the edges (`get` decodes,
-/// `set` encodes) over the session's byte cells, and the resolver maps the
-/// decoded cell to/from the exposed value. Every operation first guards on
-/// session termination ([`StateAccessError::Terminated`]); stale
-/// post-dispatch use additionally fails through the per-event transaction
-/// state machine.
-pub struct StateHandle<S, C, R> {
+/// Pins the collection's `(state_type, name)` once at bind and forwards by
+/// [`CellKey`], so a collection handle addresses only cells within its own
+/// partition and **cannot escape it** (the `CollectionScopeContainment`
+/// invariant — the segment/key are injected by the session, the wrapped
+/// session is private). Cheap `Clone`. Read forwarders need only [`CellRead`];
+/// mutators need [`CellSession`], so a view over a `CellRead`-only session
+/// exposes `get`/`scan` but has no `set`/`clear`/`flush` to forward.
+#[derive(Clone)]
+pub struct CellView<S> {
     session: S,
     state_type: StateType,
     name: StateName,
+}
+
+impl<S: CellRead> CellView<S> {
+    /// The bound session, for a [`CellResolver`] to read its loader from.
+    pub(in crate::state) fn session(&self) -> &S {
+        &self.session
+    }
+
+    /// Reads one cell's visible committed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError`] when the session refuses or the store
+    /// fails.
+    pub async fn get(&self, cell: &CellKey) -> Result<Option<Bytes>, StateAccessError> {
+        self.session.get(self.state_type, &self.name, cell).await
+    }
+
+    /// Scans this collection's cells in `coordinate` order.
+    pub fn scan<'a>(
+        &'a self,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), S::ScanError>> + Send + 'a {
+        self.session.scan(self.state_type, &self.name, scan)
+    }
+}
+
+impl<S: CellSession> CellView<S> {
+    /// Buffers a set of one cell's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError`] when the session refuses or the store
+    /// fails.
+    pub async fn set(&self, cell: &CellKey, value: &[u8]) -> Result<(), StateAccessError> {
+        self.session
+            .set(self.state_type, &self.name, cell, value)
+            .await
+    }
+
+    /// Buffers a clear of one cell.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError`] when the session refuses or the store
+    /// fails.
+    pub async fn clear(&self, cell: &CellKey) -> Result<(), StateAccessError> {
+        self.session.clear(self.state_type, &self.name, cell).await
+    }
+
+    /// Writes one cell's buffered outcome straight through to committed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError`] when the session refuses or the store
+    /// fails.
+    pub async fn flush(&self, cell: &CellKey) -> Result<StoreOutcome, StateAccessError> {
+        self.session.flush(self.state_type, &self.name, cell).await
+    }
+}
+
+/// Typed, owned handle over a codec-backed value collection — a thin newtype
+/// over a [`CellView`] addressing the single Value cell.
+///
+/// Owns a clone of the binding session (`Clone + Send + Sync + 'static` — an
+/// FFI requirement); the codec runs only at the edges (`get` decodes, `set`
+/// encodes) over the cell's bytes, and the resolver maps the decoded cell
+/// to/from the exposed value. Reads need only [`CellRead`]; mutators need
+/// [`CellSession`], so a reader-minted handle exposes `get` and **cannot name**
+/// `set`/`clear`/`flush`. Every operation guards on session termination.
+pub struct StateHandle<S, C, R> {
+    view: CellView<S>,
     _marker: PhantomData<fn() -> (C, R)>,
 }
 
@@ -429,9 +520,11 @@ impl<S, C, R> StateHandle<S, C, R> {
     /// it without a [`CellResolver`] bound.
     fn new(session: S, state_type: StateType, name: StateName) -> Self {
         Self {
-            session,
-            state_type,
-            name,
+            view: CellView {
+                session,
+                state_type,
+                name,
+            },
             _marker: PhantomData,
         }
     }
@@ -440,9 +533,7 @@ impl<S, C, R> StateHandle<S, C, R> {
 impl<S: Clone, C, R> Clone for StateHandle<S, C, R> {
     fn clone(&self) -> Self {
         Self {
-            session: self.session.clone(),
-            state_type: self.state_type,
-            name: self.name.clone(),
+            view: self.view.clone(),
             _marker: PhantomData,
         }
     }
@@ -450,7 +541,7 @@ impl<S: Clone, C, R> Clone for StateHandle<S, C, R> {
 
 impl<S, C, R> StateHandle<S, C, R>
 where
-    S: CellAccess<ValueKind>,
+    S: CellRead,
     C: Codec,
     R: CellResolver<S, Stored = C::Payload>,
 {
@@ -462,13 +553,8 @@ where
     /// when the cell bytes do not decode as `C::Payload`, or a resolution
     /// error from the resolver.
     pub async fn get(&self) -> Result<Option<R::Resolved>, ValueStateError<C::Error>> {
-        ensure_live(&self.session)?;
-        // Value is the single-cell kind, so the address is the unit `()`.
-        let Some(cell) = self
-            .session
-            .read_cell(self.state_type, &self.name, &())
-            .await?
-        else {
+        ensure_live(self.view.session())?;
+        let Some(cell) = self.view.get(&VALUE_CELL).await? else {
             return Ok(None);
         };
         // `Codec::deserialize` parses in place (destructive). In production the
@@ -484,9 +570,16 @@ where
             }
         }
         .map_err(ValueStateError::Codec)?;
-        Ok(Some(R::resolve(&self.session, stored).await?))
+        Ok(Some(R::resolve(self.view.session(), stored).await?))
     }
+}
 
+impl<S, C, R> StateHandle<S, C, R>
+where
+    S: CellSession,
+    C: Codec,
+    R: CellResolver<S, Stored = C::Payload>,
+{
     /// Lowers `value` through the resolver, encodes it, and buffers a set.
     ///
     /// # Errors
@@ -494,7 +587,7 @@ where
     /// Returns a codec error (Permanent) when the cell fails to encode, or
     /// an access error from the session.
     pub async fn set(&self, value: R::Write<'_>) -> Result<(), ValueStateError<C::Error>> {
-        ensure_live(&self.session)?;
+        ensure_live(self.view.session())?;
         let stored = R::stored_from(value);
         // Serialize into a pooled, reusable buffer. The guard owns its buffer
         // (moved out of thread-local storage), so it is `Send` and rides the
@@ -503,10 +596,7 @@ where
         let mut buf = SerializeBufGuard::acquire();
         C::with_cached_local(|codec| codec.serialize(stored, &mut buf))
             .map_err(ValueStateError::Codec)?;
-        Ok(self
-            .session
-            .set_cell(self.state_type, &self.name, &(), &buf)
-            .await?)
+        Ok(self.view.set(&VALUE_CELL, &buf).await?)
     }
 
     /// Buffers a clear operation.
@@ -515,35 +605,26 @@ where
     ///
     /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), ValueStateError<C::Error>> {
-        ensure_live(&self.session)?;
-        Ok(self
-            .session
-            .clear_cell(self.state_type, &self.name, &())
-            .await?)
+        ensure_live(self.view.session())?;
+        Ok(self.view.clear(&VALUE_CELL).await?)
     }
 
-    /// Drains buffered ops directly to authoritative state and returns the
-    /// transaction to `Clean` — a mid-handler write-through, valid in
-    /// **either** commit mode.
+    /// Drains the buffered op directly to authoritative state — a mid-handler
+    /// write-through, valid in **either** commit mode.
     ///
     /// The contract is **at-least-once**: a flushed write is durable
-    /// immediately, *not* atomically with the event's commit marker. A
-    /// handler that fails after flushing re-runs against the
-    /// already-applied state on retry or redelivery, so flushed writes
-    /// must be idempotent (or the handler must tolerate re-execution).
-    /// Ops buffered *after* the flush still ride the collection's normal
-    /// commit path. Reads already see buffered writes without flushing —
-    /// flush is for making them durable early, not for read-your-writes.
+    /// immediately, *not* atomically with the event's commit marker. A handler
+    /// that fails after flushing re-runs against the already-applied state on
+    /// retry or redelivery, so flushed writes must be idempotent. Ops buffered
+    /// *after* the flush still ride the collection's normal commit path. Reads
+    /// already see buffered writes without flushing.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
-        ensure_live(&self.session)?;
-        Ok(self
-            .session
-            .flush_cell(self.state_type, &self.name, &())
-            .await?)
+        ensure_live(self.view.session())?;
+        Ok(self.view.flush(&VALUE_CELL).await?)
     }
 }
 
@@ -561,7 +642,7 @@ fn intern_descriptor_str(s: &str) -> &'static str {
 /// [`StateAccessError::Terminated`].
 fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
 where
-    S: StateSession,
+    S: CellRead,
 {
     if session.is_terminated() {
         return Err(StateAccessError::Terminated);

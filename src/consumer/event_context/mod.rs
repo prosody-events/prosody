@@ -18,8 +18,7 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity, value_state};
-use crate::state::session::{CellAccess, StateSession};
-use crate::state::value::ValueKind;
+use crate::state::session::CellSession;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
@@ -207,21 +206,24 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// event; wrapper contexts forward their inner context's session type
     /// (`type State = C::State`). State itself is Kafka-agnostic, so the
     /// payload tie lives here: the session's loader yields `Self::Payload`,
-    /// which keeps Kafka-message handles fully typed inside generic
-    /// handlers without `StateSession` ever naming a payload.
+    /// which keeps Kafka-message handles fully typed inside generic handlers
+    /// without [`CellRead`](crate::state::session::CellRead) ever naming a
+    /// payload.
     ///
-    /// The `+ CellAccess<ValueKind>` bound is what lets a generic handler call
-    /// a Value descriptor's `get`/`set` (those op methods require it), without
-    /// `state` itself naming any kind. Each addressed kind that lands adds its
-    /// own `+ CellAccess<K>` here — a bounded, compiler-checked extension.
-    type State: StateSession<Loader: MessageLoader<Payload = Self::Payload>> + CellAccess<ValueKind>;
+    /// The bound is the full [`CellSession`] (handlers mutate): it adds
+    /// `set`/`clear`/`flush` and the sealed lifecycle to the read-only
+    /// [`CellRead`](crate::state::session::CellRead), whose inherited `Loader`
+    /// is pinned to the message loader here. A collection handle's mutators
+    /// require `CellSession`, so a read-only consumer (bound on `CellRead`)
+    /// structurally cannot mutate.
+    type State: CellSession<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a registered keyed-state collection, returning its typed handle.
     ///
     /// Takes a [`Registered<DESC>`] capability handle, not a raw descriptor, so
     /// a handler can bind only collections it registered — binding an
     /// unregistered one is a compile error, not a runtime one. (The access-time
-    /// [`verify_state_registration`](crate::state::session::StateSession::verify_state_registration)
+    /// [`verify_state_registration`](crate::state::session::CellRead::verify_state_registration)
     /// check is the backstop for names that slip past the type system, e.g.
     /// through the erased FFI seam.)
     ///
@@ -310,7 +312,7 @@ pub trait TerminationSignals {
 /// # Type Parameters
 ///
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
-/// * `S`: The per-event [`StateSession`]; its payload pins
+/// * `S`: The per-event [`CellSession`]; its payload pins
 ///   [`EventContext::Payload`].
 #[derive(Educe)]
 #[educe(Clone(bound()), Debug(bound = ""))]
@@ -425,7 +427,7 @@ where
 impl<T, S> EventContext for PartitionEventContext<T, S>
 where
     T: TriggerStore,
-    S: StateSession<Loader: MessageLoader> + CellAccess<ValueKind>,
+    S: CellSession<Loader: MessageLoader>,
 {
     type Error = TimerManagerError<T::Error>;
     type Payload = <S::Loader as MessageLoader>::Payload;

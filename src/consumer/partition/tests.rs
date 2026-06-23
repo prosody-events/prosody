@@ -7,7 +7,7 @@ use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Uncommitte
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::loader::MemoryLoader;
 use crate::state::manager::StateManagerProvider;
-use crate::state::memory::{MemoryCellStore, MemoryCommittedCache, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{CommitDecision, EventRef, SharedStateBackend, StateKey};
@@ -67,26 +67,25 @@ impl CommitOracle for FixedOracle {
 /// tests: state is always wired, so even tests that never touch state mint a
 /// real (empty-registry) provider over the in-memory backend.
 type MemoryStateProvider = StateManagerProvider<
-    SharedStateBackend<
-        MemoryCellStore,
-        MemoryDescriptorIdentityStore,
-        FixedOracle,
-        MemoryCommittedCache,
-    >,
+    SharedStateBackend<MemoryCellStore<FixedOracle>, MemoryDescriptorIdentityStore, FixedOracle>,
     MemoryLoader<serde_json::Value>,
 >;
 
 /// Builds a [`MemoryStateProvider`] with the given collection registry.
 fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider {
+    let registry = Arc::new(registry);
     StateManagerProvider::new(
         SharedStateBackend::new(
-            MemoryCellStore::new(),
+            MemoryCellStore::new(
+                MemoryCells::new(),
+                FixedOracle::committed(),
+                registry.clone(),
+            ),
             MemoryDescriptorIdentityStore::new(),
             FixedOracle::committed(),
-            MemoryCommittedCache::new(),
         ),
         MemoryLoader::new(),
-        Arc::new(registry),
+        registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
     )
