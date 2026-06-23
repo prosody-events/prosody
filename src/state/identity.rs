@@ -31,6 +31,12 @@ use thiserror::Error;
 pub enum CollectionKindId {
     /// A single optional byte payload.
     Value = 1,
+
+    /// An ordered key→value map.
+    Map = 2,
+
+    /// An index-addressed double-ended queue.
+    Deque = 3,
 }
 
 impl From<CollectionKindId> for i8 {
@@ -45,6 +51,8 @@ impl TryFrom<i8> for CollectionKindId {
     fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Value),
+            2 => Ok(Self::Map),
+            3 => Ok(Self::Deque),
             _ => Err(UnknownCollectionKindId(value)),
         }
     }

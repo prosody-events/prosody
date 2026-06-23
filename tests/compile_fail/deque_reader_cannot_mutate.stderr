@@ -1,0 +1,8 @@
+error[E0599]: the method `push_back` exists for struct `DequeHandle<S, JsonCodec>`, but its trait bounds were not satisfied
+  --> tests/compile_fail/deque_reader_cannot_mutate.rs:16:20
+   |
+16 |     let _ = handle.push_back(Value::Null).await;
+   |                    ^^^^^^^^^ method cannot be called on `DequeHandle<S, JsonCodec>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `S: CellSession`

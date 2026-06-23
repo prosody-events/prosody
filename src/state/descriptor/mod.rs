@@ -53,6 +53,12 @@ use std::future::Future;
 use std::marker::PhantomData;
 use thiserror::Error;
 
+pub mod deque;
+pub mod map;
+
+pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
+pub use map::{MapDescriptor, MapEntry, MapHandle, MapStateError, map_state};
+
 /// Value's own section enum, lowered to the opaque [`Section`]. Value is a
 /// one-cell collection, so it has exactly one section and addresses its single
 /// cell at the empty coordinate.
@@ -441,6 +447,24 @@ pub struct CellView<S> {
     name: StateName,
 }
 
+impl<S> CellView<S> {
+    /// Binds a view to one collection partition. The binding session injects
+    /// `(state_type, name)`; every cell op forwards under them, so a handle
+    /// built on this view cannot address another collection's cells
+    /// (`CollectionScopeContainment`). Bound-free — construction reads nothing.
+    pub(in crate::state::descriptor) fn new(
+        session: S,
+        state_type: StateType,
+        name: StateName,
+    ) -> Self {
+        Self {
+            session,
+            state_type,
+            name,
+        }
+    }
+}
+
 impl<S: CellRead> CellView<S> {
     /// The bound session, for a [`CellResolver`] to read its loader from.
     pub(in crate::state) fn session(&self) -> &S {
@@ -520,11 +544,7 @@ impl<S, C, R> StateHandle<S, C, R> {
     /// it without a [`CellResolver`] bound.
     fn new(session: S, state_type: StateType, name: StateName) -> Self {
         Self {
-            view: CellView {
-                session,
-                state_type,
-                name,
-            },
+            view: CellView::new(session, state_type, name),
             _marker: PhantomData,
         }
     }
@@ -557,19 +577,7 @@ where
         let Some(cell) = self.view.get(&VALUE_CELL).await? else {
             return Ok(None);
         };
-        // `Codec::deserialize` parses in place (destructive). In production the
-        // cell `Bytes` is uniquely owned (every backend decode mints a fresh
-        // `Bytes`), so reclaim it as a mutable buffer with zero copy and parse
-        // in place. Only the shared-clone case (the in-memory test backend)
-        // copies, exactly as before — no worse than the status quo.
-        let stored = match cell.try_into_mut() {
-            Ok(mut buf) => C::with_cached_local(|codec| codec.deserialize(&mut buf)),
-            Err(cell) => {
-                let mut buf = cell.to_vec();
-                C::with_cached_local(|codec| codec.deserialize(&mut buf))
-            }
-        }
-        .map_err(ValueStateError::Codec)?;
+        let stored = decode_cell::<C>(cell).map_err(ValueStateError::Codec)?;
         Ok(Some(R::resolve(self.view.session(), stored).await?))
     }
 }
@@ -589,13 +597,7 @@ where
     pub async fn set(&self, value: R::Write<'_>) -> Result<(), ValueStateError<C::Error>> {
         ensure_live(self.view.session())?;
         let stored = R::stored_from(value);
-        // Serialize into a pooled, reusable buffer. The guard owns its buffer
-        // (moved out of thread-local storage), so it is `Send` and rides the
-        // cell write across the await; on drop it returns the buffer to the
-        // pool for the next `set`.
-        let mut buf = SerializeBufGuard::acquire();
-        C::with_cached_local(|codec| codec.serialize(stored, &mut buf))
-            .map_err(ValueStateError::Codec)?;
+        let buf = encode_cell::<C>(stored).map_err(ValueStateError::Codec)?;
         Ok(self.view.set(&VALUE_CELL, &buf).await?)
     }
 
@@ -626,6 +628,32 @@ where
         ensure_live(self.view.session())?;
         Ok(self.view.flush(&VALUE_CELL).await?)
     }
+}
+
+/// Decodes a cell's bytes as `C::Payload`. Parses in place when the `Bytes` is
+/// uniquely owned (zero-copy, the production path — every backend decode mints
+/// a fresh `Bytes`); falls back to a copy for a shared clone (the in-memory
+/// test backend). The single decode path every codec-backed collection handle
+/// shares.
+fn decode_cell<C: Codec>(cell: Bytes) -> Result<C::Payload, C::Error> {
+    match cell.try_into_mut() {
+        Ok(mut buf) => C::with_cached_local(|codec| codec.deserialize(&mut buf)),
+        Err(cell) => {
+            let mut buf = cell.to_vec();
+            C::with_cached_local(|codec| codec.deserialize(&mut buf))
+        }
+    }
+}
+
+/// Encodes `payload` into the pooled, reusable serialize buffer, returning the
+/// guard so the caller hands its bytes to a cell `set` before the guard drops
+/// (returning the buffer to the pool). The guard owns its buffer, so it is
+/// `Send` and rides the write across an await. The single encode path every
+/// codec-backed collection handle shares.
+fn encode_cell<C: Codec>(payload: C::Payload) -> Result<SerializeBufGuard, C::Error> {
+    let mut buf = SerializeBufGuard::acquire();
+    C::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
+    Ok(buf)
 }
 
 /// Interns a descriptor string, returning the pool's canonical

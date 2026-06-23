@@ -1,4 +1,5 @@
 pub(crate) mod cell_suite;
+mod collection_suite;
 mod identity;
 pub(crate) mod identity_suite;
 
@@ -6,6 +7,7 @@ use self::cell_suite::{
     OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
     run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
+use self::collection_suite::{DequeTrace, MapTrace, run_deque_trace, run_map_trace};
 use super::memory::{MemoryCellStore, MemoryCells};
 use super::registry::CollectionDefRegistry;
 use super::{CollectionId, CollectionRef, StateKey, StateName, StateType};
@@ -113,4 +115,29 @@ fn prop_memory_bottom_scan() {
         executor::block_on(run_bottom_scan_trace(store, trace))
     }
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
+}
+
+/// Deque collection soundness over the real session lifecycle: random
+/// push/pop traces with commit/abort/crash outcomes keep the handle's
+/// `len`/`stream`/`get` and every `pop` return value in step with a `VecDeque`
+/// oracle — the dense-window invariant and the bounds+entries crash atomicity
+/// (invariants 1, 4).
+#[test]
+fn prop_deque_collection_lifecycle() {
+    fn property(trace: DequeTrace) -> Result<bool> {
+        executor::block_on(run_deque_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
+}
+
+/// Map collection soundness over the real session lifecycle: random
+/// set/remove/get traces with commit/abort/crash outcomes keep the handle's
+/// `get` and key-ordered `stream` in step with a `BTreeMap` oracle — the
+/// loose-superset bounds and crash atomicity (invariants 1, 4).
+#[test]
+fn prop_map_collection_lifecycle() {
+    fn property(trace: MapTrace) -> Result<bool> {
+        executor::block_on(run_map_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }

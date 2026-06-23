@@ -15,9 +15,9 @@ use quickcheck::QuickCheck;
 fn prop_collection_kind_id_discriminator_round_trip() {
     fn property(value: i8) -> bool {
         match value {
-            // `Value` (1) is the only collection kind; it round-trips through
-            // `i8`, and every other discriminant is rejected.
-            1 => CollectionKindId::try_from(value).is_ok_and(|kind| i8::from(kind) == value),
+            // The three collection kinds round-trip through `i8`; every other
+            // discriminant is rejected (never silently coerced to a variant).
+            1..=3 => CollectionKindId::try_from(value).is_ok_and(|kind| i8::from(kind) == value),
             _ => CollectionKindId::try_from(value).is_err(),
         }
     }

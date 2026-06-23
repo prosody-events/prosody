@@ -111,6 +111,29 @@ fn deque_index_anchors_are_frozen() {
     assert_eq!(order_preserving_i64(i64::MAX), [0xFF; 8]);
 }
 
+/// Frozen-bytes goldens for the other Map key codecs — durable wire contracts
+/// for the entry coordinate (and the bytes a Map `META_MIN`/`META_MAX` stores).
+/// `Utf8KeyCodec` is the raw UTF-8 bytes; `U64KeyCodec` is plain big-endian
+/// (unsigned, so no sign flip — `0` is all-zero, unlike the signed `i64`
+/// codec).
+#[test]
+fn map_key_coordinate_bytes_are_frozen() {
+    assert_eq!(Utf8KeyCodec::encode(&"cart".to_owned()).as_bytes(), b"cart");
+    assert_eq!(Utf8KeyCodec::encode(&String::new()).as_bytes(), b"");
+    assert_eq!(
+        U64KeyCodec::encode(&0).as_bytes(),
+        &[0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        U64KeyCodec::encode(&258).as_bytes(),
+        &[0, 0, 0, 0, 0, 0, 1, 2]
+    );
+    assert_eq!(
+        U64KeyCodec::encode(&u64::MAX).as_bytes(),
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    );
+}
+
 /// The sign-flip encoding round-trips over every `i64`.
 #[test]
 fn deque_index_round_trips() {

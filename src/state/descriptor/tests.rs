@@ -16,6 +16,7 @@ use crate::loader::MemoryLoader;
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
+use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
@@ -300,24 +301,51 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 }
 
 /// N5: re-registering the same name with a *different* structural identity
-/// is rejected.
-///
-/// Kept as a directed example rather than a generated property: today only
-/// `codec_id` and `resolver_id` can differ (`kind` is always `Value`), so a
-/// property over identity mismatches would add generation machinery without
-/// covering a case this example misses. Revisit when a second `kind` exists.
+/// is rejected — both for a differing `codec_id` (a Kafka descriptor over a
+/// name registered as a JSON value) and for a differing collection `kind` (a
+/// Map, then a Deque, over a name registered as a Value).
 #[test]
 fn conflicting_registration_is_rejected() -> Result<()> {
-    // The two descriptors share the cell kind (there is only one) but carry
-    // different codec ids: a Kafka descriptor under a name already registered
-    // as a JSON value.
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(None))?;
-    let conflict = registry.register(&message_state("cart"), CollectionDef::new(None));
+
+    // Same kind, different codec id.
     assert!(matches!(
-        conflict,
+        registry.register(&message_state("cart"), CollectionDef::new(None)),
         Err(RegisterStateError::IdentityConflict { .. })
     ));
+    // Different kind (Map / Deque) under the Value's name.
+    let map: MapDescriptor<Utf8KeyCodec> = map_state("cart");
+    assert!(matches!(
+        registry.register(&map, CollectionDef::new(None)),
+        Err(RegisterStateError::IdentityConflict { .. })
+    ));
+    let deque: DequeDescriptor = deque_state("cart");
+    assert!(matches!(
+        registry.register(&deque, CollectionDef::new(None)),
+        Err(RegisterStateError::IdentityConflict { .. })
+    ));
+    Ok(())
+}
+
+/// N5: binding a descriptor of one kind where a different kind was registered
+/// under the same name fails with a Permanent
+/// [`StateAccessError::IdentityMismatch`] — the kind is part of the frozen
+/// structural identity.
+#[tokio::test]
+async fn bind_with_mismatched_kind_errors() -> Result<()> {
+    let map: MapDescriptor<Utf8KeyCodec> = map_state("cart");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&map, CollectionDef::new(None))?;
+    let session = test_session(MemoryLoader::new(), registry);
+
+    // A Deque descriptor asserting a different `kind` for the same name.
+    let deque: DequeDescriptor = deque_state("cart");
+    let Err(error) = deque.bind(&session) else {
+        return Err(eyre!("mismatched-kind bind must fail"));
+    };
+    assert!(matches!(error, StateAccessError::IdentityMismatch { .. }));
+    assert_eq!(error.classify_error(), ErrorCategory::Permanent);
     Ok(())
 }
 
@@ -407,7 +435,8 @@ mod scope_and_parity {
     use super::*;
     use crate::state::cell::Committed;
     use crate::state::cell_key::{CellKey, Coordinate, Scan};
-    use crate::state::session::{CellRead, sealed::ReadSessionMarker};
+    use crate::state::order_codec::Utf8KeyCodec;
+    use crate::state::session::{CellRead, sealed::ReadSessionMarker, sealed::StateLifecycle};
     use crate::state::store::CellStore;
     use crate::state::{CollectionId, EventRef};
     use bytes::Bytes;
@@ -417,18 +446,30 @@ mod scope_and_parity {
         value_state("wishlist")
     }
 
-    /// A registry with both sibling Value collections registered.
+    fn counts() -> MapDescriptor<Utf8KeyCodec> {
+        map_state("counts")
+    }
+
+    fn log() -> DequeDescriptor {
+        deque_state("log")
+    }
+
+    /// A registry with sibling collections of every kind registered.
     fn registry_with_siblings() -> Result<CollectionDefRegistry> {
         let mut registry = CollectionDefRegistry::new(None);
         registry.register(&cart(), CollectionDef::new(None))?;
         registry.register(&wishlist(), CollectionDef::new(None))?;
+        registry.register(&counts(), CollectionDef::new(None))?;
+        registry.register(&log(), CollectionDef::new(None))?;
         Ok(registry)
     }
 
-    /// Inv 6 (behavioral): two sibling descriptors bound against one session
-    /// address disjoint cells — a write to one never leaks into the other's
-    /// read. `CellView` pins `(state_type, name)`, so the two handles cannot
-    /// collide even sharing a session, a key, and the empty Value coordinate.
+    /// Inv 6 (behavioral): sibling descriptors of every kind bound against one
+    /// session address disjoint cells — a write to one never leaks into
+    /// another's read, even though Value/Map/Deque reuse the same section
+    /// discriminants (`0`/`1`) and coordinate spaces. `CellView` pins
+    /// `(state_type, name)`, so the handles cannot collide sharing a session
+    /// and a key.
     #[test]
     fn prop_sibling_descriptors_do_not_leak() {
         async fn check(a: Value, b: Value) -> Result<bool> {
@@ -437,10 +478,25 @@ mod scope_and_parity {
             let wishlist = wishlist()
                 .bind(&session)
                 .map_err(|e| eyre!("bind wishlist: {e}"))?;
+            let counts = counts()
+                .bind(&session)
+                .map_err(|e| eyre!("bind counts: {e}"))?;
+            let log = log().bind(&session).map_err(|e| eyre!("bind log: {e}"))?;
+
+            // Distinct writes to each sibling, interleaved.
             cart.set(a.clone()).await?;
             wishlist.set(b.clone()).await?;
-            // Each handle reads only its own collection's cell.
-            Ok(cart.get().await? == Some(a) && wishlist.get().await? == Some(b))
+            counts.set(&"qty".to_owned(), b.clone()).await?;
+            log.push_back(a.clone()).await?;
+
+            // Each handle reads back exactly its own collection's data — no
+            // cross-collection or cross-section bleed.
+            Ok(cart.get().await? == Some(a.clone())
+                && wishlist.get().await? == Some(b.clone())
+                && counts.get(&"qty".to_owned()).await? == Some(b)
+                && counts.get(&"missing".to_owned()).await?.is_none()
+                && log.get(0).await? == Some(a)
+                && log.len().await? == 1)
         }
         fn prop(a: ArbJson, b: ArbJson) -> TestResult {
             let input = format!("a={:#?} b={:#?}", a.0, b.0);
@@ -589,5 +645,79 @@ mod scope_and_parity {
             )
         }
         QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
+    }
+
+    /// Inv 8 (behavioral, Map/Deque): a reader-minted Map/Deque handle's
+    /// `get`/`stream`/`len` agree with the writer handle on quiescent committed
+    /// state. The writer commits through the real lifecycle (`finalize` then
+    /// `commit_apply` — `FixedOracle` resolves `Committed`); the
+    /// `CellRead`-only reader then reads the promoted cells.
+    #[test]
+    fn reader_collections_match_writer() -> Result<()> {
+        executor::block_on(async {
+            let state_key = StateKey::new(Uuid::new_v4(), Arc::from("user-1"));
+            let registry = Arc::new(registry_with_siblings()?);
+            let (writer, cell_store) =
+                test_session_parts(MemoryLoader::new(), (*registry).clone(), state_key.clone());
+
+            let w_counts = counts().bind(&writer).map_err(|e| eyre!("bind: {e}"))?;
+            let w_log = log().bind(&writer).map_err(|e| eyre!("bind: {e}"))?;
+            w_counts.set(&"a".to_owned(), json!(1_i32)).await?;
+            w_counts.set(&"b".to_owned(), json!(2_i32)).await?;
+            w_log.push_back(json!("x")).await?;
+            w_log.push_front(json!("w")).await?;
+
+            // Promote the staged writes to committed state.
+            writer.finalize().await?;
+            writer.commit_apply().await;
+
+            let reader = ReaderSession {
+                store: cell_store,
+                registry,
+                loader: MemoryLoader::new(),
+                state_key,
+            };
+            let r_counts = counts().bind(&reader).map_err(|e| eyre!("bind: {e}"))?;
+            let r_log = log().bind(&reader).map_err(|e| eyre!("bind: {e}"))?;
+
+            // Map: point reads and the ordered stream agree.
+            for key in ["a", "b", "absent"] {
+                let key = key.to_owned();
+                assert_eq!(r_counts.get(&key).await?, w_counts.get(&key).await?);
+            }
+            assert_eq!(collect_map(&r_counts).await?, collect_map(&w_counts).await?);
+
+            // Deque: len, positional reads, and the ordered stream agree.
+            assert_eq!(r_log.len().await?, w_log.len().await?);
+            for index in 0..=r_log.len().await? {
+                assert_eq!(r_log.get(index).await?, w_log.get(index).await?);
+            }
+            assert_eq!(collect_deque(&r_log).await?, collect_deque(&w_log).await?);
+            Ok(())
+        })
+    }
+
+    /// Collects a Map handle's stream into an ordered `(key, value)` vector.
+    async fn collect_map<S: CellRead>(
+        handle: &MapHandle<S, Utf8KeyCodec, JsonCodec>,
+    ) -> Result<Vec<(String, Value)>> {
+        let stream = handle.stream();
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Collects a Deque handle's stream into an ordered vector.
+    async fn collect_deque<S: CellRead>(handle: &DequeHandle<S, JsonCodec>) -> Result<Vec<Value>> {
+        let stream = handle.stream();
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item?);
+        }
+        Ok(out)
     }
 }
