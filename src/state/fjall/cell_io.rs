@@ -6,7 +6,7 @@
 //! get/insert through [`tokio::task::spawn_blocking`]. The key is generic over
 //! its byte width.
 
-use super::error::FjallValueStoreError;
+use super::error::FjallCellCacheError;
 use bytes::Bytes;
 use fjall::{PartitionHandle, Slice};
 use tokio::task::spawn_blocking;
@@ -15,7 +15,7 @@ use tokio::task::spawn_blocking;
 pub(super) async fn read_cell<K>(
     partition: &PartitionHandle,
     key: K,
-) -> Result<Option<Slice>, FjallValueStoreError>
+) -> Result<Option<Slice>, FjallCellCacheError>
 where
     K: AsRef<[u8]> + Send + 'static,
 {
@@ -28,7 +28,7 @@ pub(super) async fn write_cell<K>(
     partition: &PartitionHandle,
     key: K,
     cell: Bytes,
-) -> Result<(), FjallValueStoreError>
+) -> Result<(), FjallCellCacheError>
 where
     K: AsRef<[u8]> + Send + 'static,
 {
@@ -46,7 +46,7 @@ where
 pub(super) async fn remove_cell<K>(
     partition: &PartitionHandle,
     key: K,
-) -> Result<(), FjallValueStoreError>
+) -> Result<(), FjallCellCacheError>
 where
     K: AsRef<[u8]> + Send + 'static,
 {

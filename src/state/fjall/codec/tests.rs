@@ -91,7 +91,7 @@ fn unknown_tag_byte_is_rejected() {
     assert!(
         matches!(
             result,
-            Err(super::FjallValueStoreError::UnknownCacheTag(0xFE))
+            Err(super::FjallCellCacheError::UnknownCacheTag(0xFE))
         ),
         "expected UnknownCacheTag, got {result:?}"
     );

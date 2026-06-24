@@ -1,8 +1,8 @@
-//! Configuration for the fjall-backed Value cache.
+//! Configuration for the fjall-backed cell cache.
 
 use std::path::PathBuf;
 
-/// Configuration for the fjall-backed Value cache.
+/// Configuration for the fjall-backed cell cache.
 ///
 /// Carries only the already-resolved on-disk root. The authoritative
 /// `cache_dir` resolution — environment variable, default, and validation —

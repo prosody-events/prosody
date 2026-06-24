@@ -30,7 +30,7 @@
 //! §"Process restart": "Delete old workspaces; Cassandra recovers truth."
 
 use super::config::FjallConfiguration;
-use super::error::FjallValueStoreError;
+use super::error::FjallCellCacheError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::{Partition, Topic};
 use educe::Educe;
@@ -119,14 +119,14 @@ impl FjallClient {
     ///
     /// # Errors
     ///
-    /// Returns [`FjallValueStoreError::Engine`] when the partition cannot
+    /// Returns [`FjallCellCacheError::Engine`] when the partition cannot
     /// be opened.
     pub fn workspace(
         self: &Arc<Self>,
         topic: Topic,
         partition: Partition,
         epoch: AssignmentEpoch,
-    ) -> Result<FjallWorkspace, FjallValueStoreError> {
+    ) -> Result<FjallWorkspace, FjallCellCacheError> {
         let cache_name = partition_name(CACHE_ROLE, topic, partition, epoch);
 
         let cache = self

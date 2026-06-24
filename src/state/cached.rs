@@ -136,6 +136,6 @@ where
 }
 
 /// Logs a degraded fjall cache operation (the cache is a hint).
-fn warn_skip(op: &str, error: &super::fjall::FjallValueStoreError) {
+fn warn_skip(op: &str, error: &super::fjall::FjallCellCacheError) {
     warn!(error = %error, "committed-value cache {op} failed; degrading");
 }

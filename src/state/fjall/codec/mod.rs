@@ -1,4 +1,4 @@
-//! Cache key + cell codec for the fjall Value store.
+//! Cache key + cell codec for the fjall cell cache.
 //!
 //! Two requirements drive the cache key shape:
 //!
@@ -34,7 +34,7 @@
 //! `hash(X)`. "Drop all cache state on partition revocation" = drop the
 //! fjall keyspace.
 
-use super::error::FjallValueStoreError;
+use super::error::FjallCellCacheError;
 use crate::state::cell_key::CellKey;
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
@@ -130,14 +130,14 @@ pub fn encode_present_cell(payload: &[u8]) -> Bytes {
 ///
 /// # Errors
 ///
-/// Returns a [`FjallValueStoreError`] when the cell is malformed.
-pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<Bytes>, FjallValueStoreError> {
+/// Returns a [`FjallCellCacheError`] when the cell is malformed.
+pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<Bytes>, FjallCellCacheError> {
     let Some(bytes) = bytes else {
         return Ok(Read::Unknown);
     };
     let (tag, rest) = bytes
         .split_first()
-        .ok_or(FjallValueStoreError::EmptyCacheCell)?;
+        .ok_or(FjallCellCacheError::EmptyCacheCell)?;
     match *tag {
         CACHE_TAG_ABSENT => Ok(Read::Absent),
         // An empty tail is valid: a `Set` of empty bytes frames as `[0x01]`,
@@ -145,7 +145,7 @@ pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<Bytes>, FjallValueStoreE
         // safe only because zstd padded empty payloads into a non-empty frame;
         // raw framing has no such padding.)
         CACHE_TAG_PRESENT => Ok(Read::Present(Bytes::copy_from_slice(rest))),
-        other => Err(FjallValueStoreError::UnknownCacheTag(other)),
+        other => Err(FjallCellCacheError::UnknownCacheTag(other)),
     }
 }
 

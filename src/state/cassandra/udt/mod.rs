@@ -42,7 +42,7 @@ use uuid::Uuid;
 /// On-wire representation of the `event_ref` UDT.
 ///
 /// Bridge between [`EventRef`] and the scylla derive macros. Crate-internal
-/// to the Cassandra Value store so the row decoder can validate it into an
+/// to the Cassandra cell store so the row decoder can validate it into an
 /// [`EventRef`] after scylla has done the structural deserialization.
 #[derive(Clone, Debug, scylla::DeserializeValue, scylla::SerializeValue)]
 pub(in crate::state::cassandra) struct RawEventRef {

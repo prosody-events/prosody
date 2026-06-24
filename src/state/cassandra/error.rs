@@ -3,10 +3,10 @@
 //! Most failures are wrapped Cassandra driver errors (network, timeout,
 //! schema mismatch) whose `ClassifyError` impl already returns the right
 //! retry category. The keyed-state-specific errors —
-//! [`CassandraValueStoreError::Encoding`],
-//! [`CassandraValueStoreError::CorruptCell`],
-//! [`CassandraValueStoreError::CorruptUdt`],
-//! [`CassandraValueStoreError::VersionMismatch`] — are all
+//! [`CassandraCellStoreError::Encoding`],
+//! [`CassandraCellStoreError::CorruptCell`],
+//! [`CassandraCellStoreError::CorruptUdt`],
+//! [`CassandraCellStoreError::VersionMismatch`] — are all
 //! permanent per-message data errors: retrying them indefinitely will not
 //! change the outcome.
 
@@ -16,9 +16,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::encoding::EncodingError;
 use thiserror::Error;
 
-/// Errors that can occur during Cassandra Value store operations.
+/// Errors that can occur during Cassandra cell store operations.
 #[derive(Debug, Error)]
-pub enum CassandraValueStoreError {
+pub enum CassandraCellStoreError {
     /// Wrapped Cassandra driver error.
     #[error("database error: {0:#}")]
     Database(#[from] CassandraStoreError),
@@ -52,7 +52,7 @@ pub enum CassandraValueStoreError {
     },
 }
 
-impl ClassifyError for CassandraValueStoreError {
+impl ClassifyError for CassandraCellStoreError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Database(e) => e.classify_error(),

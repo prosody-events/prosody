@@ -1,4 +1,4 @@
-//! Boundary tests for the fjall Value cache decode path.
+//! Boundary tests for the fjall cell cache decode path.
 //!
 //! The flagship is the **read-path uniqueness invariant**: a present cell read
 //! back from the fjall decode path is uniquely owned

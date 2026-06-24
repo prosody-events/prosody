@@ -22,7 +22,7 @@ use crate::state::cached::Cached;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore, CellQueries,
 };
-use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallClient, FjallValueStoreError};
+use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallCellCacheError, FjallClient};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{PartitionBackend, StateBackendFactory};
@@ -131,7 +131,7 @@ where
         CassandraDescriptorIdentityStore,
         Cached<CassandraStore<ProductionOracle<DP, TP>>>,
     >;
-    type Error = FjallValueStoreError;
+    type Error = FjallCellCacheError;
 
     fn for_partition(
         &self,

@@ -33,7 +33,7 @@
 
 use crate::state::Encoding;
 use crate::state::cassandra::cell::INITIAL_VERSION;
-use crate::state::cassandra::error::CassandraValueStoreError;
+use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -74,7 +74,7 @@ pub(super) type KeyedCellRow = (
 /// Returns the same corruption errors as [`try_decode_cell`].
 pub(super) fn try_decode_keyed_cell(
     row: KeyedCellRow,
-) -> Result<(CellKey, Cell), CassandraValueStoreError> {
+) -> Result<(CellKey, Cell), CassandraCellStoreError> {
     let (section, coordinate, data, prev_data, encoding, version, event) = row;
     let key = CellKey {
         section: Section::new(section),
@@ -88,12 +88,12 @@ pub(super) fn try_decode_keyed_cell(
 ///
 /// # Errors
 ///
-/// Returns [`CassandraValueStoreError::CorruptCell`] for a forbidden column
-/// shape, [`CassandraValueStoreError::CorruptUdt`] for a bad `event` UDT,
-/// [`CassandraValueStoreError::VersionMismatch`] for an unknown
-/// version stamp, or [`CassandraValueStoreError::Encoding`] when a blob fails
+/// Returns [`CassandraCellStoreError::CorruptCell`] for a forbidden column
+/// shape, [`CassandraCellStoreError::CorruptUdt`] for a bad `event` UDT,
+/// [`CassandraCellStoreError::VersionMismatch`] for an unknown
+/// version stamp, or [`CassandraCellStoreError::Encoding`] when a blob fails
 /// to deserialize.
-pub(super) fn try_decode_cell(row: RawCellRow) -> Result<Cell, CassandraValueStoreError> {
+pub(super) fn try_decode_cell(row: RawCellRow) -> Result<Cell, CassandraCellStoreError> {
     let (data, prev_data, encoding, version, event) = row;
     validate_version(version)?;
 
@@ -120,7 +120,7 @@ pub(super) fn try_decode_cell(row: RawCellRow) -> Result<Cell, CassandraValueSto
 fn decode_blob(
     blob: Option<Vec<u8>>,
     encoding: Option<i16>,
-) -> Result<Option<Bytes>, CassandraValueStoreError> {
+) -> Result<Option<Bytes>, CassandraCellStoreError> {
     match (blob, encoding) {
         (None, _) => Ok(None),
         (Some(bytes), Some(encoding)) => {
@@ -136,10 +136,10 @@ fn decode_blob(
 /// non-[`INITIAL_VERSION`] stamp is unreachable until identity
 /// migration ships and is rejected Permanent so a future-version cell is never
 /// misread.
-fn validate_version(version: Option<i32>) -> Result<(), CassandraValueStoreError> {
+fn validate_version(version: Option<i32>) -> Result<(), CassandraCellStoreError> {
     match version {
         None | Some(INITIAL_VERSION) => Ok(()),
-        Some(stored) => Err(CassandraValueStoreError::VersionMismatch {
+        Some(stored) => Err(CassandraCellStoreError::VersionMismatch {
             stored,
             expected: INITIAL_VERSION,
         }),

@@ -73,7 +73,7 @@ use scylla::statement::prepared::PreparedStatement;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
-pub use crate::state::cassandra::error::CassandraValueStoreError;
+pub use crate::state::cassandra::error::CassandraCellStoreError;
 pub use decode::CellCorruptReason;
 
 /// Payload encoding for cell blobs written by this build.
@@ -89,7 +89,7 @@ pub const INITIAL_VERSION: i32 = 1;
 
 /// The bottom store's resolving read/sweep error: a raw store failure or an
 /// oracle consult failure.
-pub type CellStoreError<OracleErr> = ResolveCellError<CassandraValueStoreError, OracleErr>;
+pub type CellStoreError<OracleErr> = ResolveCellError<CassandraCellStoreError, OracleErr>;
 
 /// The session + prepared statements a [`CassandraStore`] is built from, shared
 /// across partitions. The per-partition oracle and registry are supplied at
@@ -145,7 +145,7 @@ impl<O> CassandraStore<O> {
         &self,
         statement: &PreparedStatement,
         params: impl SerializeRow,
-    ) -> Result<(), CassandraValueStoreError> {
+    ) -> Result<(), CassandraCellStoreError> {
         self.session
             .execute_unpaged_discard(statement, params)
             .await?;
@@ -156,7 +156,7 @@ impl<O> CassandraStore<O> {
         &self,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<RawCellRow>, CassandraValueStoreError> {
+    ) -> Result<Option<RawCellRow>, CassandraCellStoreError> {
         let pk = Pk::of(id);
         let row = self
             .cql()
@@ -184,7 +184,7 @@ impl<O> CassandraStore<O> {
         &self,
         collection: &CollectionRef,
         writes: &[(CellKey, ProvisionalWrite)],
-    ) -> Result<(), CassandraValueStoreError> {
+    ) -> Result<(), CassandraCellStoreError> {
         // Value is single-cell, so this slice is size-1: one `UPDATE`. The
         // multi-cell same-partition `UNLOGGED BATCH` lands with Map/Deque.
         let pk = Pk::of(collection.id());
@@ -246,7 +246,7 @@ impl<O> CassandraStore<O> {
         &self,
         collection: &CollectionRef,
         cells: &[(CellKey, Option<Bytes>)],
-    ) -> Result<(), CassandraValueStoreError> {
+    ) -> Result<(), CassandraCellStoreError> {
         let pk = Pk::of(collection.id());
         for (cell, data) in cells {
             let CellBlobs {
@@ -300,7 +300,7 @@ impl<O> CassandraStore<O> {
         &self,
         collection: &CollectionRef,
         cells: &[CellKey],
-    ) -> Result<(), CassandraValueStoreError> {
+    ) -> Result<(), CassandraCellStoreError> {
         let pk = Pk::of(collection.id());
         for cell in cells {
             self.execute_unpaged(
@@ -534,7 +534,7 @@ fn into_store_err<O>(error: CassandraStoreError) -> CellStoreError<O::Error>
 where
     O: CommitOracle,
 {
-    ResolveCellError::Store(CassandraValueStoreError::from(error))
+    ResolveCellError::Store(CassandraCellStoreError::from(error))
 }
 
 /// Whether `key` has walked past `end` for the scan direction (the in-code end
@@ -552,7 +552,7 @@ fn past_end(dir: Direction, key: &CellKey, end: Option<&[u8]>) -> bool {
 fn encode_cell_blobs(
     data: Option<&Bytes>,
     prev: Option<&Bytes>,
-) -> Result<CellBlobs, CassandraValueStoreError> {
+) -> Result<CellBlobs, CassandraCellStoreError> {
     let data = data
         .map(|p| encode_payload(p, VALUE_ENCODING))
         .transpose()?;

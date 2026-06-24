@@ -1,13 +1,13 @@
-//! Errors for the fjall-backed Value cache.
+//! Errors for the fjall-backed cell cache.
 
 use crate::error::{ClassifyError, ErrorCategory};
 use fjall::Error as FjallEngineError;
 use thiserror::Error;
 use tokio::task::JoinError;
 
-/// Errors that can occur while using the fjall Value cache.
+/// Errors that can occur while using the fjall cell cache.
 #[derive(Debug, Error)]
-pub enum FjallValueStoreError {
+pub enum FjallCellCacheError {
     /// Underlying fjall engine error.
     #[error("fjall engine error: {0}")]
     Engine(#[from] FjallEngineError),
@@ -25,7 +25,7 @@ pub enum FjallValueStoreError {
     BlockingTaskJoin(#[from] JoinError),
 }
 
-impl ClassifyError for FjallValueStoreError {
+impl ClassifyError for FjallCellCacheError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             // Engine errors include I/O on local disk: treat as transient

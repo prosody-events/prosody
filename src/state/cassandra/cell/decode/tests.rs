@@ -9,7 +9,7 @@
 use super::{CellCorruptReason, RawCellRow, try_decode_cell};
 use crate::state::EventRef;
 use crate::state::cassandra::cell::INITIAL_VERSION;
-use crate::state::cassandra::error::CassandraValueStoreError;
+use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
 use crate::state::encoding::{Encoding, encode_payload};
@@ -162,7 +162,7 @@ fn prev_without_event_is_corrupt() -> Result<()> {
     let row: RawCellRow = (None, Some(blob("old")?), Some(enc()), Some(ver()), None);
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraValueStoreError::CorruptCell {
+        Err(CassandraCellStoreError::CorruptCell {
             reason: CellCorruptReason::PrevWithoutEvent
         })
     ));
@@ -175,7 +175,7 @@ fn blob_without_encoding_is_corrupt() -> Result<()> {
     let row: RawCellRow = (Some(blob("v")?), None, None, Some(ver()), None);
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraValueStoreError::CorruptCell {
+        Err(CassandraCellStoreError::CorruptCell {
             reason: CellCorruptReason::BlobWithoutEncoding
         })
     ));
@@ -188,7 +188,7 @@ fn unknown_version_is_rejected() -> Result<()> {
     let row: RawCellRow = (Some(blob("v")?), None, Some(enc()), Some(2_i32), None);
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraValueStoreError::VersionMismatch {
+        Err(CassandraCellStoreError::VersionMismatch {
             stored: 2_i32,
             expected: INITIAL_VERSION
         })
@@ -210,7 +210,7 @@ fn corrupt_event_udt_is_rejected() -> Result<()> {
     let row: RawCellRow = (Some(blob("v")?), None, Some(enc()), Some(ver()), Some(bad));
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraValueStoreError::CorruptUdt(_))
+        Err(CassandraCellStoreError::CorruptUdt(_))
     ));
     Ok(())
 }

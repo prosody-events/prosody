@@ -45,7 +45,7 @@ mod workspace;
 mod tests;
 
 pub use config::FjallConfiguration;
-pub use error::FjallValueStoreError;
+pub use error::FjallCellCacheError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
 use crate::state::CollectionId;
@@ -117,13 +117,13 @@ impl FjallCellCache {
     ///
     /// # Errors
     ///
-    /// Returns [`FjallValueStoreError`] when the cache read or cell decode
+    /// Returns [`FjallCellCacheError`] when the cache read or cell decode
     /// fails.
     pub async fn get(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<Committed>, FjallValueStoreError> {
+    ) -> Result<Option<Committed>, FjallCellCacheError> {
         let raw =
             cell_io::read_cell(self.inner.partition(), codec::cell_key(collection, cell)).await?;
         Ok(match codec::decode_cell(raw.as_deref())? {
@@ -139,13 +139,13 @@ impl FjallCellCache {
     ///
     /// # Errors
     ///
-    /// Returns [`FjallValueStoreError`] when the cache write fails.
+    /// Returns [`FjallCellCacheError`] when the cache write fails.
     pub async fn put(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
         value: &Committed,
-    ) -> Result<(), FjallValueStoreError> {
+    ) -> Result<(), FjallCellCacheError> {
         let frame = match value.get() {
             Some(payload) => codec::encode_present_cell(payload),
             None => codec::encode_absent_cell(),
@@ -164,12 +164,12 @@ impl FjallCellCache {
     ///
     /// # Errors
     ///
-    /// Returns [`FjallValueStoreError`] when the cache remove fails.
+    /// Returns [`FjallCellCacheError`] when the cache remove fails.
     pub async fn invalidate(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
-    ) -> Result<(), FjallValueStoreError> {
+    ) -> Result<(), FjallCellCacheError> {
         cell_io::remove_cell(self.inner.partition(), codec::cell_key(collection, cell)).await
     }
 }
