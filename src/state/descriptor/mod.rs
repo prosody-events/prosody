@@ -45,10 +45,10 @@ use crate::state::session::{CellRead, CellSession};
 use crate::state::{CollectionKindId, CommitMode, StateName, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
+use educe::Educe;
 use futures::Stream;
 use internment::Intern;
 use std::error::Error;
-use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -167,13 +167,53 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings (TTL, commit mode) this descriptor carries
-    /// into registration, set via its fluent methods (see
-    /// [`ValueDescriptor::ttl`]).
+    /// into registration, set via its fluent methods (see [`Self::ttl`]).
     ///
     /// Defaults to [`CollectionDef::new`] with `None` (indefinite retention,
     /// read-committed) so framework-internal descriptors need not carry one.
     fn collection_def(&self) -> CollectionDef {
         CollectionDef::new(None)
+    }
+
+    /// Returns a copy of this descriptor with `def` replacing its operational
+    /// settings — the single hook the fluent config defaults build on.
+    #[must_use]
+    fn with_collection_def(self, def: CollectionDef) -> Self;
+
+    /// Sets the collection's TTL (the per-write Cassandra `USING TTL`),
+    /// validated against the ceiling and the recovery delay at registration.
+    #[must_use]
+    fn ttl(self, ttl: CompactDuration) -> Self {
+        let mut def = self.collection_def();
+        def.ttl = Some(ttl);
+        self.with_collection_def(def)
+    }
+
+    /// Clears the collection's TTL, selecting indefinite retention (the
+    /// default).
+    #[must_use]
+    fn no_ttl(self) -> Self {
+        let mut def = self.collection_def();
+        def.ttl = None;
+        self.with_collection_def(def)
+    }
+
+    /// Selects [`CommitMode::ReadCommitted`] (the default): writes stage
+    /// provisionally and promote after the event commit.
+    #[must_use]
+    fn read_committed(self) -> Self {
+        let mut def = self.collection_def();
+        def.commit_mode = CommitMode::ReadCommitted;
+        self.with_collection_def(def)
+    }
+
+    /// Selects [`CommitMode::ReadUncommitted`]: writes apply to committed
+    /// state on handler success, with at-least-once semantics.
+    #[must_use]
+    fn read_uncommitted(self) -> Self {
+        let mut def = self.collection_def();
+        def.commit_mode = CommitMode::ReadUncommitted;
+        self.with_collection_def(def)
     }
 }
 
@@ -287,27 +327,13 @@ where
 /// runtime string (it is interned, so descriptors stay `Copy`); for a
 /// typed cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and
 /// annotate the binding `ValueDescriptor<CartCodec>`.
+#[derive(Educe)]
+#[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
 pub struct ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> {
     name: &'static str,
     def: CollectionDef,
+    #[educe(Debug(ignore))]
     _marker: PhantomData<fn() -> (C, R)>,
-}
-
-impl<C, R> Clone for ValueDescriptor<C, R> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<C, R> Copy for ValueDescriptor<C, R> {}
-
-impl<C, R> fmt::Debug for ValueDescriptor<C, R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ValueDescriptor")
-            .field("name", &self.name)
-            .field("def", &self.def)
-            .finish()
-    }
 }
 
 /// Declares a codec-backed value collection named `name` (JSON by
@@ -350,38 +376,6 @@ impl<C, R> ValueDescriptor<C, R> {
             def: CollectionDef::new(None),
             _marker: PhantomData,
         }
-    }
-
-    /// Sets the collection's TTL (the per-write Cassandra `USING TTL`),
-    /// validated against the ceiling and the recovery delay at registration.
-    #[must_use]
-    pub fn ttl(mut self, ttl: CompactDuration) -> Self {
-        self.def.ttl = Some(ttl);
-        self
-    }
-
-    /// Clears the collection's TTL, selecting indefinite retention (the
-    /// default).
-    #[must_use]
-    pub fn no_ttl(mut self) -> Self {
-        self.def.ttl = None;
-        self
-    }
-
-    /// Selects [`CommitMode::ReadCommitted`] (the default): writes stage
-    /// provisionally and promote after the event commit.
-    #[must_use]
-    pub fn read_committed(mut self) -> Self {
-        self.def.commit_mode = CommitMode::ReadCommitted;
-        self
-    }
-
-    /// Selects [`CommitMode::ReadUncommitted`]: writes apply to committed
-    /// state on handler success, with at-least-once semantics.
-    #[must_use]
-    pub fn read_uncommitted(mut self) -> Self {
-        self.def.commit_mode = CommitMode::ReadUncommitted;
-        self
     }
 }
 
@@ -428,6 +422,11 @@ where
 
     fn collection_def(&self) -> CollectionDef {
         self.def
+    }
+
+    fn with_collection_def(mut self, def: CollectionDef) -> Self {
+        self.def = def;
+        self
     }
 }
 
@@ -533,6 +532,8 @@ impl<S: CellSession> CellView<S> {
 /// to/from the exposed value. Reads need only [`CellRead`]; mutators need
 /// [`CellSession`], so a reader-minted handle exposes `get` and **cannot name**
 /// `set`/`clear`/`flush`. Every operation guards on session termination.
+#[derive(Educe)]
+#[educe(Clone(bound = "S: Clone"))]
 pub struct StateHandle<S, C, R> {
     view: CellView<S>,
     _marker: PhantomData<fn() -> (C, R)>,
@@ -545,15 +546,6 @@ impl<S, C, R> StateHandle<S, C, R> {
     fn new(session: S, state_type: StateType, name: StateName) -> Self {
         Self {
             view: CellView::new(session, state_type, name),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<S: Clone, C, R> Clone for StateHandle<S, C, R> {
-    fn clone(&self) -> Self {
-        Self {
-            view: self.view.clone(),
             _marker: PhantomData,
         }
     }

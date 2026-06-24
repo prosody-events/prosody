@@ -64,7 +64,7 @@ use crate::state::dirty::{DirtyStore, DirtyVal};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
-use crate::state::registry::CollectionDefRegistry;
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend, StateKey,
@@ -866,6 +866,13 @@ impl StateDescriptor for LifecycleAccess {
         Ok(LifecycleView {
             session: session.clone(),
         })
+    }
+
+    /// No-op: the lifecycle handle carries no operational settings, so it
+    /// keeps the default [`collection_def`](StateDescriptor::collection_def)
+    /// and the inherited fluent setters are unreachable no-ops.
+    fn with_collection_def(self, _def: CollectionDef) -> Self {
+        self
     }
 }
 

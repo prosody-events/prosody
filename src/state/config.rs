@@ -172,7 +172,7 @@ fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
 mod tests {
     use super::KeyedStateConfiguration;
     use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
-    use crate::state::descriptor::{ValueDescriptor, value_state};
+    use crate::state::descriptor::{StateDescriptor, ValueDescriptor, value_state};
     use crate::state::registry::RegisterStateError;
     use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::Result;

@@ -43,12 +43,11 @@ use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec};
 use crate::state::registry::CollectionDef;
 use crate::state::session::{CellRead, CellSession};
-use crate::state::{CollectionKindId, CommitMode, StateName, StateType};
-use crate::timers::duration::CompactDuration;
+use crate::state::{CollectionKindId, StateName, StateType};
 use async_stream::try_stream;
+use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
-use std::fmt;
 use std::marker::PhantomData;
 use thiserror::Error;
 
@@ -101,27 +100,13 @@ pub type MapEntry<KC, VC> = Result<
 /// [`OrderedKeyCodec`] (the key encoding, frozen into the identity) and a value
 /// [`Codec`] (JSON by default). There is no resolver. Declare via
 /// [`map_state`].
+#[derive(Educe)]
+#[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
 pub struct MapDescriptor<KC, VC = JsonCodec> {
     name: &'static str,
     def: CollectionDef,
+    #[educe(Debug(ignore))]
     _marker: PhantomData<fn() -> (KC, VC)>,
-}
-
-impl<KC, VC> Clone for MapDescriptor<KC, VC> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<KC, VC> Copy for MapDescriptor<KC, VC> {}
-
-impl<KC, VC> fmt::Debug for MapDescriptor<KC, VC> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MapDescriptor")
-            .field("name", &self.name)
-            .field("def", &self.def)
-            .finish()
-    }
 }
 
 impl<KC, VC> MapDescriptor<KC, VC> {
@@ -135,35 +120,6 @@ impl<KC, VC> MapDescriptor<KC, VC> {
             def: CollectionDef::new(None),
             _marker: PhantomData,
         }
-    }
-
-    /// Sets the collection's per-write TTL, validated at registration.
-    #[must_use]
-    pub fn ttl(mut self, ttl: CompactDuration) -> Self {
-        self.def.ttl = Some(ttl);
-        self
-    }
-
-    /// Clears the collection's TTL, selecting indefinite retention (the
-    /// default).
-    #[must_use]
-    pub fn no_ttl(mut self) -> Self {
-        self.def.ttl = None;
-        self
-    }
-
-    /// Selects [`CommitMode::ReadCommitted`] (the default).
-    #[must_use]
-    pub fn read_committed(mut self) -> Self {
-        self.def.commit_mode = CommitMode::ReadCommitted;
-        self
-    }
-
-    /// Selects [`CommitMode::ReadUncommitted`].
-    #[must_use]
-    pub fn read_uncommitted(mut self) -> Self {
-        self.def.commit_mode = CommitMode::ReadUncommitted;
-        self
     }
 }
 
@@ -205,6 +161,11 @@ where
     fn collection_def(&self) -> CollectionDef {
         self.def
     }
+
+    fn with_collection_def(mut self, def: CollectionDef) -> Self {
+        self.def = def;
+        self
+    }
 }
 
 /// Typed, owned handle over a codec-backed ordered map — a thin composition
@@ -212,6 +173,8 @@ where
 /// mutators (`set`/`remove`) need [`CellSession`], so a reader-minted handle
 /// has the readers but **cannot name** a mutator (the read-only-handle
 /// invariant). Every operation guards on session termination.
+#[derive(Educe)]
+#[educe(Clone(bound = "S: Clone"))]
 pub struct MapHandle<S, KC, VC> {
     view: CellView<S>,
     _marker: PhantomData<fn() -> (KC, VC)>,
@@ -224,15 +187,6 @@ impl<S, KC, VC> MapHandle<S, KC, VC> {
     fn new(session: S, state_type: StateType, name: StateName) -> Self {
         Self {
             view: CellView::new(session, state_type, name),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<S: Clone, KC, VC> Clone for MapHandle<S, KC, VC> {
-    fn clone(&self) -> Self {
-        Self {
-            view: self.view.clone(),
             _marker: PhantomData,
         }
     }
