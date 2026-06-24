@@ -179,8 +179,9 @@ pub struct DeduplicationHandler<T, S: DeduplicationStore> {
 ///
 /// Length-prefixes each field before hashing so that adjacent fields cannot
 /// be confused — the prefix is load-bearing for canonical equality. Both
-/// the deduplication middleware and any future state-middleware WAL writer
-/// must call this function with the same arguments to produce the same UUID.
+/// the deduplication middleware and any other source of the dedup UUID
+/// (today, the commit oracle) must call this function with the same arguments
+/// to produce the same UUID.
 #[must_use]
 pub fn dedup_uuid(
     version: &str,

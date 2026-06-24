@@ -224,11 +224,11 @@ after the stack returns, owned by the `settle` boundary (the blanket
 `FallibleEventHandler → EventHandler` impl in `consumer::middleware`; `retry`
 routes its final outcome through the same `settle`/`abandon`). State is one
 **provisional cell** per value (`data | prev_data | event`); there is no WAL.
-Handler writes buffer in a single **in-memory** `DirtyValueStore` the session
+Handler writes buffer in a single **in-memory** `DirtyStore` the session
 owns and rebuilds (clears in place) per event — it is **never** a durability or
 recovery source (recovery is Cassandra provisional cells + the commit oracle),
 so do not re-add a disk-backed dirty store. Fjall is retained **only** as the
-committed-value write-through cache (`FjallValueStore`, which owns its
+committed-value write-through cache (`FjallCellCache`, which owns its
 workspace).
 `settle` does, in straight-line code: stage provisional cells / write resolved
 (`finalize`, retrying transient failures in place) → arm `StateRecovery` if
