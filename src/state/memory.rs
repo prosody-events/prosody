@@ -122,8 +122,7 @@ where
         // iterator across an await), then resolve each lazily.
         let mut raw: Vec<(CellKey, Cell)> = Vec::new();
         self.map().iter_sync(|(id, cell), stored| {
-            if id == collection && cell.section == scan.section && in_range(&scan, &cell.coordinate)
-            {
+            if id == collection && cell.section == scan.section && scan.contains(&cell.coordinate) {
                 raw.push((cell.clone(), stored.to_cell()));
             }
             true
@@ -309,20 +308,6 @@ impl StoredCell {
             Self::Provisional { data, prev, event } => {
                 Cell::Provisional(ProvisionalCell::new(data.clone(), prev.clone(), *event))
             }
-        }
-    }
-}
-
-/// Whether `coordinate` lies in `scan`'s inclusive range, accounting for
-/// direction: forward walks `>= start` (`<= end`), backward `<= start`
-/// (`>= end`).
-fn in_range(scan: &Scan<'_>, coordinate: &super::cell_key::Coordinate) -> bool {
-    match scan.dir {
-        Direction::Forward => {
-            coordinate >= scan.start && scan.end.is_none_or(|end| coordinate <= end)
-        }
-        Direction::Backward => {
-            coordinate <= scan.start && scan.end.is_none_or(|end| coordinate >= end)
         }
     }
 }

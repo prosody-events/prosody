@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::convert::Infallible;
+use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -587,12 +588,18 @@ mod scope_and_parity {
             // Own the scan coordinates so the stream borrows nothing from the
             // caller's `Scan<'_>` (mirrors `KeyedStateSession::scan`).
             let section = scan.section;
-            let start = scan.start.clone();
-            let end: Option<Coordinate> = scan.end.cloned();
+            let start: Bound<Coordinate> = scan.start.cloned();
+            let end: Bound<Coordinate> = scan.end.cloned();
             let dir = scan.dir;
             let limit = scan.limit;
             async_stream::try_stream! {
-                let scan = Scan { section, start: &start, dir, end: end.as_ref(), limit };
+                let scan = Scan {
+                    section,
+                    start: start.as_ref(),
+                    dir,
+                    end: end.as_ref(),
+                    limit,
+                };
                 let inner = store.scan_cells(&id, scan, probe);
                 futures::pin_mut!(inner);
                 while let Some(item) = inner.next().await {

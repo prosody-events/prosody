@@ -70,6 +70,7 @@ use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
+use std::ops::Bound;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
@@ -361,23 +362,52 @@ where
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         let pk = Pk::of(collection).owned();
         let section = i8::from(scan.section);
-        let start = scan.start.as_bytes().to_vec();
-        let end = scan.end.map(|c| c.as_bytes().to_vec());
         let dir = scan.dir;
         let limit = scan.limit;
-        let statement = match dir {
-            Direction::Forward => self.queries.scan_forward.clone(),
-            Direction::Backward => self.queries.scan_backward.clone(),
+        // The start bound goes into CQL (the comparator is chosen by selecting
+        // one of the per-bound prepared statements; an unbounded start binds no
+        // coordinate at all). The end bound is enforced in-code by `past_end`,
+        // so it needs no statement variant — only an owned copy to compare
+        // against each streamed coordinate.
+        let statement = match (dir, &scan.start) {
+            (Direction::Forward, Bound::Unbounded) => self.queries.scan_forward_all.clone(),
+            (Direction::Forward, Bound::Included(_)) => self.queries.scan_forward_incl.clone(),
+            (Direction::Forward, Bound::Excluded(_)) => self.queries.scan_forward_excl.clone(),
+            (Direction::Backward, Bound::Unbounded) => self.queries.scan_backward_all.clone(),
+            (Direction::Backward, Bound::Included(_)) => self.queries.scan_backward_incl.clone(),
+            (Direction::Backward, Bound::Excluded(_)) => self.queries.scan_backward_excl.clone(),
+        };
+        let start_coord: Option<Vec<u8>> = match scan.start {
+            Bound::Unbounded => None,
+            Bound::Included(c) | Bound::Excluded(c) => Some(c.as_bytes().to_vec()),
+        };
+        let end: Bound<Vec<u8>> = match scan.end {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(c) => Bound::Included(c.as_bytes().to_vec()),
+            Bound::Excluded(c) => Bound::Excluded(c.as_bytes().to_vec()),
         };
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
-            let stream = self
-                .cql()
-                .execute_iter(
-                    statement,
-                    (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), section, start),
-                )
-                .await
+            // Both arms yield the same `QueryPager`; the bounded arm binds the
+            // start coordinate, the unbounded arm omits it (its statement has no
+            // coordinate marker).
+            let pager = match &start_coord {
+                Some(coord) => self
+                    .cql()
+                    .execute_iter(
+                        statement,
+                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), section, coord.as_slice()),
+                    )
+                    .await,
+                None => self
+                    .cql()
+                    .execute_iter(
+                        statement,
+                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), section),
+                    )
+                    .await,
+            };
+            let stream = pager
                 .map_err(CassandraStoreError::from)
                 .map_err(into_store_err::<O>)?
                 .rows_stream::<KeyedCellRow>()
@@ -399,7 +429,7 @@ where
                 }
                 let (key, raw) =
                     decode::try_decode_keyed_cell(row).map_err(ResolveCellError::Store)?;
-                if past_end(dir, &key, end.as_deref()) {
+                if past_end(dir, &key, end.as_ref().map(Vec::as_slice)) {
                     break;
                 }
                 let committed =
@@ -537,13 +567,17 @@ where
     ResolveCellError::Store(CassandraCellStoreError::from(error))
 }
 
-/// Whether `key` has walked past `end` for the scan direction (the in-code end
-/// bound; `None` means unbounded).
-fn past_end(dir: Direction, key: &CellKey, end: Option<&[u8]>) -> bool {
+/// Whether `key` has walked past the in-code `end` bound for the scan
+/// direction. `Unbounded` never stops; an `Excluded` bound also stops *on* the
+/// endpoint (the exclusive variant for coverage gap fall-through).
+fn past_end(dir: Direction, key: &CellKey, end: Bound<&[u8]>) -> bool {
+    let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
-        (_, None) => false,
-        (Direction::Forward, Some(end)) => key.coordinate.as_bytes() > end,
-        (Direction::Backward, Some(end)) => key.coordinate.as_bytes() < end,
+        (_, Bound::Unbounded) => false,
+        (Direction::Forward, Bound::Included(end)) => coordinate > end,
+        (Direction::Forward, Bound::Excluded(end)) => coordinate >= end,
+        (Direction::Backward, Bound::Included(end)) => coordinate < end,
+        (Direction::Backward, Bound::Excluded(end)) => coordinate <= end,
     }
 }
 
@@ -581,9 +615,14 @@ cassandra_queries! {
     /// Each point mutation is a single `UPDATE` — Cassandra's row atomicity
     /// covers a multi-column write of one row, so no batch is needed. TTL/no-TTL
     /// pairs exist because Cassandra cannot bind `NULL` to `USING TTL ?`. The
-    /// two scans are single-section clustering ranges (forward/backward — the
-    /// `ORDER BY` direction cannot be bound) plus a whole-partition recovery
-    /// scan; none use `ALLOW FILTERING`.
+    /// scans are single-section clustering ranges: the `ORDER BY` direction
+    /// cannot be bound (forward/backward), and the **start-side comparator**
+    /// cannot be bound either, so each direction carries three start variants —
+    /// inclusive (`>=`/`<=`), exclusive (`>`/`<`, for coverage gap
+    /// fall-through), and unbounded (no coordinate clause). The end bound is
+    /// enforced in code (`past_end`), so it needs no statement variant. A
+    /// whole-partition recovery scan completes the set; none use `ALLOW
+    /// FILTERING`.
     pub struct CellQueries {
         /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
@@ -595,7 +634,7 @@ cassandra_queries! {
         ),
 
         /// Forward single-section scan from an inclusive `coordinate` anchor.
-        scan_forward: (
+        scan_forward_incl: (
             "SELECT section, coordinate, data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
@@ -604,12 +643,53 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
+        /// Forward single-section scan from an exclusive `coordinate` anchor.
+        scan_forward_excl: (
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND section = ? AND coordinate > ? \
+             ORDER BY coordinate ASC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Forward single-section scan over the whole section (unbounded start).
+        scan_forward_all: (
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND section = ? \
+             ORDER BY coordinate ASC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
         /// Backward single-section scan from an inclusive `coordinate` anchor.
-        scan_backward: (
+        scan_backward_incl: (
             "SELECT section, coordinate, data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? AND coordinate <= ? \
+             ORDER BY coordinate DESC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Backward single-section scan from an exclusive `coordinate` anchor.
+        scan_backward_excl: (
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND section = ? AND coordinate < ? \
+             ORDER BY coordinate DESC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Backward single-section scan over the whole section (unbounded
+        /// start).
+        scan_backward_all: (
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND section = ? \
              ORDER BY coordinate DESC",
             TABLE_KEYED_STATE_CELL
         ),

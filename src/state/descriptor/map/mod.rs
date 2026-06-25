@@ -49,6 +49,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
+use std::ops::Bound;
 use thiserror::Error;
 
 /// The `Meta` section, holding the two bound cells.
@@ -231,9 +232,9 @@ where
                 .unwrap_or_else(Coordinate::empty);
             let scan = Scan {
                 section: ENTRY_SECTION,
-                start: &start,
+                start: Bound::Included(&start),
                 dir: Direction::Forward,
-                end: None,
+                end: Bound::Unbounded,
                 limit: None,
             };
             let inner = self.view.scan(scan);

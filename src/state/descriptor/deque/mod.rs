@@ -48,6 +48,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
+use std::ops::Bound;
 use thiserror::Error;
 
 /// Width of the [`META_BOUNDS`] payload: `head: i64 ‖ tail: i64`, big-endian.
@@ -259,9 +260,9 @@ where
             let start = index_coordinate(head);
             let scan = Scan {
                 section: ENTRY_SECTION,
-                start: &start,
+                start: Bound::Included(&start),
                 dir: Direction::Forward,
-                end: None,
+                end: Bound::Unbounded,
                 limit: Some(len),
             };
             let inner = self.view.scan(scan);

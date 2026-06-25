@@ -35,7 +35,7 @@
 //! fjall keyspace.
 
 use super::error::FjallCellCacheError;
-use crate::state::cell_key::CellKey;
+use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3;
@@ -45,6 +45,12 @@ const CACHE_TAG_ABSENT: u8 = 0x00;
 
 /// Tag byte for "known present" entries.
 const CACHE_TAG_PRESENT: u8 = 0x01;
+
+/// Length of the fixed key prefix shared by every cell of one collection
+/// section: the 16-byte collection hash plus the 1-byte section discriminant.
+/// A range scan over `[section_prefix, …]` stays within one section of one
+/// collection; the order-preserving coordinate bytes follow.
+pub(super) const SECTION_PREFIX_LEN: usize = 17;
 
 /// Returns the full fjall key for one cell: the 16-byte collection prefix
 /// followed by the cell's `section` byte and order-preserving `coordinate`
@@ -60,6 +66,27 @@ pub(super) fn cell_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
     key.push(i8::from(cell.section).cast_unsigned());
     key.extend_from_slice(coordinate);
     key
+}
+
+/// Returns the [`SECTION_PREFIX_LEN`]-byte prefix shared by every cell of one
+/// `(collection, section)`: the 16-byte collection hash followed by the
+/// section's `i8` discriminant. Range scans build their byte bounds by
+/// appending coordinate bytes to this prefix.
+#[must_use]
+pub(super) fn section_prefix(id: &CollectionId, section: Section) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(SECTION_PREFIX_LEN);
+    prefix.extend_from_slice(&collection_prefix(id));
+    prefix.push(i8::from(section).cast_unsigned());
+    prefix
+}
+
+/// Reconstructs a cell's [`Coordinate`] from a full fjall key by dropping the
+/// [`SECTION_PREFIX_LEN`]-byte section prefix. The caller already knows the
+/// section (it scoped the scan to it), so only the coordinate tail is
+/// recovered.
+#[must_use]
+pub(super) fn coordinate_of(key: &[u8]) -> Coordinate {
+    Coordinate::from_bytes(key[SECTION_PREFIX_LEN..].to_vec())
 }
 
 /// Returns the 16-byte collection prefix for a collection identity.

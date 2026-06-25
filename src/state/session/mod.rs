@@ -81,6 +81,7 @@ use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
@@ -622,13 +623,19 @@ where
         // Own the scan's coordinates so the stream borrows nothing from the
         // caller's `Scan<'_>`.
         let section = scan.section;
-        let start = scan.start.clone();
-        let end: Option<Coordinate> = scan.end.cloned();
+        let start: Bound<Coordinate> = scan.start.cloned();
+        let end: Bound<Coordinate> = scan.end.cloned();
         let dir = scan.dir;
         let limit = scan.limit;
         let overlay = self.inner.overlay.clone();
         try_stream! {
-            let scan = Scan { section, start: &start, dir, end: end.as_ref(), limit };
+            let scan = Scan {
+                section,
+                start: start.as_ref(),
+                dir,
+                end: end.as_ref(),
+                limit,
+            };
             let inner = overlay.scan_cells(&id, scan, event);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {

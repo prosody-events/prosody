@@ -1,0 +1,11 @@
+error[E0603]: module `coverage` is private
+ --> tests/compile_fail/cover_is_sealed.rs:8:29
+  |
+8 | use prosody::state::cached::coverage::IntervalSet;
+  |                             ^^^^^^^^ private module
+  |
+note: the module `coverage` is defined here
+ --> src/state/cached/mod.rs
+  |
+  | mod coverage;
+  | ^^^^^^^^^^^^

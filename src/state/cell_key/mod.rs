@@ -18,6 +18,7 @@
 //! [`order_codec`]: crate::state::order_codec
 
 use bytes::Bytes;
+use std::ops::Bound;
 
 /// Disjoint, orderable sub-grouping of one collection's cells.
 ///
@@ -100,25 +101,67 @@ pub enum Direction {
     Backward,
 }
 
-/// A single-section, start-anchored cell scan request.
+/// A single-section cell scan request over a half-open / closed coordinate
+/// range.
 ///
-/// `start` is positional (non-`Option`) and `section` is required, so an
-/// unanchored or cross-section scan cannot be constructed.
+/// `section` is required, so a cross-section scan cannot be constructed. The
+/// `start`/`end` [`Bound`]s are **direction-relative**: forward walks from
+/// `start` (the low side) toward `end` (the high side); backward walks from
+/// `start` (the high side) toward `end` (the low side). `Unbounded` on either
+/// side runs to the section edge in that direction.
+///
+/// The exclusive bounds exist for the coverage cache's gap fall-through: the
+/// open `(p, q)` interval between two separately-covered sub-ranges (whose
+/// endpoints `p`/`q` are already covered) is exactly an `Excluded`/`Excluded`
+/// scan, and a punched singleton `{X}` is `Included(X)`/`Included(X)`.
 pub struct Scan<'a> {
     /// The section whose cells the scan walks.
     pub section: Section,
 
-    /// The inclusive anchor the scan starts from.
-    pub start: &'a Coordinate,
+    /// The bound the scan starts walking from (low side forward, high side
+    /// backward).
+    pub start: Bound<&'a Coordinate>,
 
     /// The direction the scan walks from `start`.
     pub dir: Direction,
 
-    /// The optional inclusive bound the scan stops at.
-    pub end: Option<&'a Coordinate>,
+    /// The bound the scan stops at (high side forward, low side backward).
+    pub end: Bound<&'a Coordinate>,
 
     /// The optional maximum number of cells to yield.
     pub limit: Option<usize>,
+}
+
+impl Scan<'_> {
+    /// Whether `coordinate` lies within the scan's coordinate range, accounting
+    /// for direction and bound exclusivity. The single definition every backend
+    /// range predicate defers to, so the in-memory and Cassandra legs agree.
+    #[must_use]
+    pub fn contains(&self, coordinate: &Coordinate) -> bool {
+        let (low, high) = match self.dir {
+            Direction::Forward => (self.start, self.end),
+            Direction::Backward => (self.end, self.start),
+        };
+        above_low(coordinate, low) && below_high(coordinate, high)
+    }
+}
+
+/// Whether `coordinate` is at or above the low `bound`.
+fn above_low(coordinate: &Coordinate, bound: Bound<&Coordinate>) -> bool {
+    match bound {
+        Bound::Unbounded => true,
+        Bound::Included(lo) => coordinate >= lo,
+        Bound::Excluded(lo) => coordinate > lo,
+    }
+}
+
+/// Whether `coordinate` is at or below the high `bound`.
+fn below_high(coordinate: &Coordinate, bound: Bound<&Coordinate>) -> bool {
+    match bound {
+        Bound::Unbounded => true,
+        Bound::Included(hi) => coordinate <= hi,
+        Bound::Excluded(hi) => coordinate < hi,
+    }
 }
 
 #[cfg(test)]

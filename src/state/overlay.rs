@@ -113,11 +113,11 @@ where
         let dir = scan.dir;
         let limit = scan.limit;
         let mut top = self.dirty.section_snapshot(collection, scan.section);
-        // Bound the dirty leg to the scan's `[start, end]` in `dir` before
-        // merging: `section_snapshot` yields the whole section, so without this
-        // a dirty cell outside the range (or on the wrong side of `start`) would
-        // leak into a bounded scan. The lower leg is already range-bounded.
-        top.retain(|(key, _)| in_range(dir, &key.coordinate, scan.start, scan.end));
+        // Bound the dirty leg to the scan's range in `dir` before merging:
+        // `section_snapshot` yields the whole section, so without this a dirty
+        // cell outside the range (or on the wrong side of `start`) would leak
+        // into a bounded scan. The lower leg is already range-bounded.
+        top.retain(|(key, _)| scan.contains(&key.coordinate));
         // The snapshot is ascending; the lower leg is in `dir` order, so align.
         if dir == Direction::Backward {
             top.reverse();
@@ -219,22 +219,6 @@ where
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         self.lower.mark_resolved(collection, cells)
-    }
-}
-
-/// Whether `coordinate` lies in a scan's inclusive range, accounting for
-/// direction: forward walks `>= start` (`<= end`), backward `<= start`
-/// (`>= end`). Matches the bottom stores' own range predicate, so the bounded
-/// dirty leg and the bounded lower leg agree.
-fn in_range(
-    dir: Direction,
-    coordinate: &Coordinate,
-    start: &Coordinate,
-    end: Option<&Coordinate>,
-) -> bool {
-    match dir {
-        Direction::Forward => coordinate >= start && end.is_none_or(|e| coordinate <= e),
-        Direction::Backward => coordinate <= start && end.is_none_or(|e| coordinate >= e),
     }
 }
 

@@ -141,8 +141,9 @@ fn stored_cells_are_raw_tagged_payload() -> Result<()> {
 /// `new` (bare handle, no workspace) and `for_workspace` return `Self`, so a
 /// `for_workspace` rewritten to `Self::new(ws.cache_handle().clone())` compiles
 /// — and silently deletes the cache partition the moment the dropped
-/// workspace's `Drop` runs. The cache is a read-through optimization, so that
-/// degrades every op to a backing read with no other test failing. We move the
+/// workspace's `Drop` runs. The cache is a hint over the durable lower store,
+/// so that degrades every op to a backing read with no other test failing. We
+/// move the
 /// workspace in with no other binding to it and confirm — through the keyspace,
 /// the only channel a `Drop` side-effect is observable on — that the partition
 /// is still live after construction. A discarding `for_workspace` would show

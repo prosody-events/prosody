@@ -51,6 +51,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
+use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -764,12 +765,14 @@ impl Arbitrary for SeedOp {
     }
 }
 
-/// A scan request with random anchor, direction, optional end and limit, and an
-/// optional early-stop prefix length.
+/// A scan request with random anchor, direction, bound exclusivity, optional
+/// end and limit, and an optional early-stop prefix length.
 #[derive(Clone, Copy, Debug)]
 struct ScanReq {
     start: u8,
     forward: bool,
+    start_excl: bool,
+    end_excl: bool,
     end: Option<u8>,
     limit: Option<u8>,
     partial: Option<u8>,
@@ -782,6 +785,10 @@ impl Arbitrary for ScanReq {
         Self {
             start: u8::arbitrary(g) % (CELLS + 1),
             forward: bool::arbitrary(g),
+            // Exclusive bounds exercise the gap-fall-through statement variants
+            // and the open `(p, q)` intervals coverage stitching produces.
+            start_excl: bool::arbitrary(g),
+            end_excl: bool::arbitrary(g),
             end: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
             // Includes 0 and values > the cell count.
             limit: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 4)),
@@ -825,19 +832,41 @@ fn scan_oracle(model: &CellModel, req: ScanReq) -> Vec<(u8, Bytes)> {
     cells
 }
 
-/// Whether coordinate `c` lies in the scan request's inclusive range, matching
-/// the backend `in_range` semantics (forward `>= start [.. <= end]`, backward
-/// `<= start [.. >= end]`).
+/// Whether coordinate `c` lies in the scan request's range, mirroring
+/// [`Scan::contains`]: `start`/`end` are direction-relative (forward: `start`
+/// low, `end` high; backward inverted) and each bound's exclusivity drops its
+/// endpoint.
 fn in_scan_range(req: ScanReq, c: u8) -> bool {
-    if req.forward {
-        c >= req.start && req.end.is_none_or(|end| c <= end)
-    } else {
-        c <= req.start && req.end.is_none_or(|end| c >= end)
-    }
+    // `start` is the low side forward, the high side backward; `end` inverts.
+    let on_start_side = match (req.forward, req.start_excl) {
+        (true, false) => c >= req.start,
+        (true, true) => c > req.start,
+        (false, false) => c <= req.start,
+        (false, true) => c < req.start,
+    };
+    let within_end = req.end.is_none_or(|end| match (req.forward, req.end_excl) {
+        (true, false) => c <= end,
+        (true, true) => c < end,
+        (false, false) => c >= end,
+        (false, true) => c > end,
+    });
+    on_start_side && within_end
 }
 
 /// Builds the [`Scan`] request from a [`ScanReq`] and owned anchor coordinates.
+/// `req.start_excl`/`req.end_excl` choose the bound exclusivity; an absent
+/// `end` is `Unbounded`.
 fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: Option<&'a Coordinate>) -> Scan<'a> {
+    let start = if req.start_excl {
+        Bound::Excluded(start)
+    } else {
+        Bound::Included(start)
+    };
+    let end = match end {
+        Some(end) if req.end_excl => Bound::Excluded(end),
+        Some(end) => Bound::Included(end),
+        None => Bound::Unbounded,
+    };
     Scan {
         section: SECTION,
         start,
@@ -979,6 +1008,8 @@ struct OpCounts {
     write_provisional: AtomicUsize,
     write_resolved: AtomicUsize,
     mark_resolved: AtomicUsize,
+    get: AtomicUsize,
+    scan_cells: AtomicUsize,
 }
 
 impl<S> CountingCellStore<S> {
@@ -996,10 +1027,25 @@ impl<S> CountingCellStore<S> {
             + self.counts.mark_resolved.load(Ordering::Relaxed)
     }
 
+    /// Point reads issued to the lower store — zero on a covered-negative
+    /// `Cached::get`.
+    pub(crate) fn lower_reads(&self) -> usize {
+        self.counts.get.load(Ordering::Relaxed)
+    }
+
+    /// Range scans issued to the lower store — one per coverage gap query, so
+    /// the op-budget property can pin "N covered ranges ⇒ exactly the gap
+    /// queries, never a section-wide re-scan".
+    pub(crate) fn lower_scans(&self) -> usize {
+        self.counts.scan_cells.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
+        self.counts.get.store(0, Ordering::Relaxed);
+        self.counts.scan_cells.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1015,6 +1061,7 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
+        self.counts.get.fetch_add(1, Ordering::Relaxed);
         self.inner.get(collection, cell, own)
     }
 
@@ -1024,6 +1071,8 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        // One increment per scan *request* (a gap query), not per yielded cell.
+        self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
         self.inner.scan_cells(collection, scan, own)
     }
 
