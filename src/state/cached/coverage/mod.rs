@@ -2,35 +2,49 @@
 //!
 //! Coverage answers one question per `(CollectionId, Section)`: *which
 //! coordinate sub-ranges has fjall already mirrored from the durable store?* A
-//! scan over a covered sub-range is served entirely from fjall; the gaps fall
-//! through to the lower store and are covered as their cells are consumed. A
-//! write **punches** only the coordinates it touches, so a single Map-entry
-//! write evicts one coordinate and the next `iter()` re-reads only that point —
-//! never the whole section.
+//! `get`/`scan` over a covered coordinate/sub-range is served entirely from
+//! fjall; gaps fall through to the lower store and are covered as their cells
+//! are consumed. Because the cache is **write-through**, a write covers the
+//! coordinate it touched with the new committed projection — coverage *grows*
+//! on both reads and writes. The only `punch` (uncover) is a failed
+//! `fjall.put`, so a coordinate whose publish failed falls through on the next
+//! read and self-heals.
 //!
 //! # Soundness invariants (the cache serves committed projections only)
 //!
-//! The committed value of a staged coordinate flips `prev → data` at
-//! marker-flush, which happens in `settle` **off-cache, with no [`Cached`]
-//! hook** ([`Cached`](super::Cached)). Coverage is sound only because of:
-//!
-//! - **Cov1 — covered ⇒ fjall value is current.** Every committed-value change
-//!   to a covered coordinate routes through a [`Cached`](super::Cached)
-//!   mutator, and every mutator punches its touched coordinates *before* the
-//!   lower write. So no covered coordinate's committed value ever changes
-//!   without a punch.
-//! - **Cov2 — covered ⇒ resolved-in-lower (never provisional).** A coordinate
-//!   goes provisional only via `write_provisional`, which punches it. So a
-//!   covered hit is always a prior-committed projection: the covered serve
-//!   skips the oracle and ignores `own`, and resolution-on-read fires only in
-//!   gaps.
-//! - **`CovBuild` — resolved-by-construction.** [`IntervalSet::cover`] is
-//!   `pub(in crate::state::cached)` with its sole call site the scan-drain,
-//!   *after* `lower.scan_cells` has oracle-resolved the gap. A covered interval
-//!   cannot be minted from provisional data.
+//! - **Cov1 — covered ⇒ fjall holds the current committed projection (and is
+//!   unexpired).** Every committed-value change to a covered coordinate routes
+//!   through a [`Cached`](super::Cached) mutator, which publishes the new
+//!   projection on success or punches the coordinate on a `fjall.put` failure.
+//!   TTL is mirrored: an expired covered entry reads as a miss and the covered
+//!   serve falls through (floor rounding can expire a fjall entry just before
+//!   its durable row, so an expired covered coordinate is a gap, not absence).
+//! - **Cov2 — covered ⇒ fjall = oracle(lower row).** A covered point may have a
+//!   provisional lower row during `[stage, commit]`, but fjall holds `prev`
+//!   (the committed projection) across it: `write_provisional` publishes
+//!   `prev`, and `commit_provisional`/`abort_provisional` republish
+//!   `data`/`prev`. The covered serve skips the oracle and ignores `own`;
+//!   resolution-on-read fires only in gaps.
+//! - **Cov3 — establish-then-publish.** `lower.write` precedes
+//!   [`IntervalSet::cover`]; the only mutator `punch` is on a `fjall.put`
+//!   failure. Publishing before lower confirmation is forbidden.
+//! - **`CovBuild` — born resolved.** [`IntervalSet::cover`] is `pub(in
+//!   crate::state::cached)`; its call sites — the scan-drain, the mutator
+//!   publishes, and cover-on-get — carry committed projections only (the
+//!   scan-drain after `lower.scan_for_cache` oracle-resolved the gap; the
+//!   mutators after the lower write established the committed value). A covered
+//!   interval cannot be minted from provisional data.
 //! - **`CovVolatile`.** Coverage is in-memory (dropped when
 //!   [`Cached`](super::Cached) drops at partition revocation), never persisted,
-//!   so "stale coverage survives a crash" is unrepresentable.
+//!   so "stale coverage survives a crash" is unrepresentable; a cold restart
+//!   trusts nothing uncovered.
+//! - **`GetNeverReadsOwnStaged`.** Cover-on-get reads the lower store on an
+//!   uncovered (or expired-covered) `get` and publishes the result. It is sound
+//!   because `get` is never called on a cell the current event already staged
+//!   (staging is at `finalize`/`settle`, which resolves via
+//!   `commit_provisional`/`abort_provisional`, not `get`; `finalize`'s
+//!   prev-read precedes the stage), so the lower read always returns a settled
+//!   committed projection.
 //!
 //! # The interval model
 //!
@@ -89,9 +103,9 @@ impl Coverage {
         })
     }
 
-    /// Covers `interval` in the section (union/merge). Born resolved: the sole
-    /// caller is the scan-drain, after the gap was oracle-resolved by the lower
-    /// store (`CovBuild`).
+    /// Covers `interval` in the section (union/merge). Born resolved
+    /// (`CovBuild`): the callers — the scan-drain, the write-through mutator
+    /// publishes, and cover-on-get — all carry committed projections only.
     pub(in crate::state::cached) async fn cover(
         &self,
         collection: &CollectionId,
@@ -107,7 +121,9 @@ impl Coverage {
     }
 
     /// Whether `coordinate`'s committed value is already covered — a covered
-    /// fjall miss then means genuine absence (Cov2), with no lower read.
+    /// fjall hit serves with no lower read (Cov1/Cov2). A covered fjall *miss*
+    /// means the entry expired (write-through always leaves an entry), so the
+    /// caller falls through and re-publishes.
     pub async fn covers(
         &self,
         collection: &CollectionId,

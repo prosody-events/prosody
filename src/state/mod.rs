@@ -3,7 +3,7 @@
 //! This module defines the shared collection identity and transaction state
 //! shapes used by the keyed-state cell store. The cell layer is **uniform and
 //! untyped** — it addresses cells by [`CellKey`] and names no collection
-//! family; typed collection handles (Value, and future Map/Deque) are built
+//! family; typed collection handles (Value, Map, Deque) are built
 //! atop it in [`descriptor`].
 //!
 //! The shapes themselves live in leaf-to-root submodules and are
@@ -81,7 +81,7 @@ pub use order_codec::{
 pub use transaction::{CommitMode, Read};
 
 /// Maximum concurrent per-collection durable operations in the keyed-state
-/// Value lifecycle (finalize stage, commit promote, rollback, recovery sweep).
+/// lifecycle (finalize stage, commit promote, rollback, recovery sweep).
 /// Each collection is its own Cassandra partition, so the fan-out is safe.
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 

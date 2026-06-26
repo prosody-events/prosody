@@ -220,6 +220,22 @@ where
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         self.lower.mark_resolved(collection, cells)
     }
+
+    fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.lower.commit_provisional(collection, writes)
+    }
+
+    fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.lower.abort_provisional(collection, writes)
+    }
 }
 
 /// Ordering of two coordinates in the scan direction: the one that should be

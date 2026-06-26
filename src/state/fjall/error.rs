@@ -23,6 +23,12 @@ pub enum FjallCellCacheError {
     /// The blocking task that ran a fjall call failed (panic or cancel).
     #[error("fjall blocking task failed: {0}")]
     BlockingTaskJoin(#[from] JoinError),
+
+    /// Test-only injected fault, for the publish-failure (uncover-on-put-error)
+    /// regression.
+    #[cfg(test)]
+    #[error("injected cache fault")]
+    Injected,
 }
 
 impl ClassifyError for FjallCellCacheError {
@@ -31,9 +37,11 @@ impl ClassifyError for FjallCellCacheError {
             // Engine errors include I/O on local disk: treat as transient
             // so callers can retry once before falling through to backing.
             Self::Engine(_) | Self::BlockingTaskJoin(_) => ErrorCategory::Transient,
+            #[cfg(test)]
+            Self::Injected => ErrorCategory::Transient,
             // A corrupt stored cell is permanent for that cell: re-reading the
-            // same bytes cannot succeed. The cache combinator invalidates and
-            // re-populates from the authoritative cell store.
+            // same bytes cannot succeed. The covered serve falls through to the
+            // authoritative cell store and re-publishes a fresh entry.
             Self::UnknownCacheTag(_) | Self::EmptyCacheCell => ErrorCategory::Permanent,
         }
     }

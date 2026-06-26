@@ -53,10 +53,12 @@ pub(super) type RawCellRow = (
     Option<RawEventRef>, // event (validated into EventRef during decode)
 );
 
-/// Seven-column shape produced by `SELECT section, coordinate, data,
-/// prev_data, encoding, version, event` — a [`RawCellRow`] prefixed with the
-/// clustering columns, for scans and the recovery sweep that must reconstruct
-/// each cell's [`CellKey`].
+/// Eight-column shape produced by `SELECT section, coordinate, data,
+/// prev_data, encoding, version, event, TTL(data)` — a [`RawCellRow`] prefixed
+/// with the clustering columns and suffixed with the durable row's remaining
+/// `data` TTL (NULL when the row has no expiry, or `data` is NULL). Used by
+/// scans, the recovery sweep, and the cache-fill scan; the resolving paths
+/// discard the trailing TTL, the cache-fill path keeps it.
 pub(super) type KeyedCellRow = (
     i8,      // section
     Vec<u8>, // coordinate
@@ -65,9 +67,23 @@ pub(super) type KeyedCellRow = (
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
+    Option<i32>, // TTL(data) in whole seconds
 );
 
-/// Decodes a keyed cell row into its [`CellKey`] and [`Cell`].
+/// Six-column shape produced by `SELECT data, prev_data, encoding, version,
+/// event, TTL(data)` — a [`RawCellRow`] suffixed with the row's remaining
+/// `data` TTL, for the cache-fill point read.
+pub(super) type CellTtlRow = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+    Option<i32>, // TTL(data) in whole seconds
+);
+
+/// Decodes a keyed cell row into its [`CellKey`] and [`Cell`], discarding the
+/// trailing TTL (the resolving scan/sweep paths do not need it).
 ///
 /// # Errors
 ///
@@ -75,13 +91,39 @@ pub(super) type KeyedCellRow = (
 pub(super) fn try_decode_keyed_cell(
     row: KeyedCellRow,
 ) -> Result<(CellKey, Cell), CassandraCellStoreError> {
-    let (section, coordinate, data, prev_data, encoding, version, event) = row;
+    let (key, cell, _ttl) = try_decode_keyed_cell_ttl(row)?;
+    Ok((key, cell))
+}
+
+/// Decodes a keyed cell row into its [`CellKey`], [`Cell`], and remaining
+/// `data` TTL (whole seconds), for the cache-fill scan.
+///
+/// # Errors
+///
+/// Returns the same corruption errors as [`try_decode_cell`].
+pub(super) fn try_decode_keyed_cell_ttl(
+    row: KeyedCellRow,
+) -> Result<(CellKey, Cell, Option<i32>), CassandraCellStoreError> {
+    let (section, coordinate, data, prev_data, encoding, version, event, ttl) = row;
     let key = CellKey {
         section: Section::new(section),
         coordinate: Coordinate::from_bytes(coordinate),
     };
     let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
-    Ok((key, cell))
+    Ok((key, cell, ttl))
+}
+
+/// Decodes a cache-fill point row into its [`Cell`] and remaining `data` TTL.
+///
+/// # Errors
+///
+/// Returns the same corruption errors as [`try_decode_cell`].
+pub(super) fn try_decode_cell_ttl(
+    row: CellTtlRow,
+) -> Result<(Cell, Option<i32>), CassandraCellStoreError> {
+    let (data, prev_data, encoding, version, event, ttl) = row;
+    let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
+    Ok((cell, ttl))
 }
 
 /// Decodes a cell row into a [`Cell`].

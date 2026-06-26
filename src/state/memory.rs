@@ -17,6 +17,7 @@ use futures::Stream;
 use scc::hash_map::Entry;
 use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::task::coop::cooperative;
 
 /// Group-global identity key: `(group_id, state_type discriminator, name)`.
 type IdentityKey = (String, i8, String);
@@ -137,15 +138,25 @@ where
             // The limit bounds *yielded* (present) cells, not raw rows: a cleared
             // or rolled-back-to-absent cell in range is skipped without consuming
             // a limit slot (matching the Cassandra scan's `yielded` counter).
+            //
+            // The resolved fast path touches no tokio leaf, so a large in-memory
+            // scan would drain in one poll; a per-item `cooperative` checkpoint
+            // yields every ~128 items.
             let mut yielded = 0usize;
             for (cell, stored) in raw {
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let committed =
-                    resolve_read(self, self.resolver.oracle(), &collection_ref, &cell, own, stored)
-                        .await
-                        .map_err(flatten_resolve)?;
+                let committed = cooperative(resolve_read(
+                    self,
+                    self.resolver.oracle(),
+                    &collection_ref,
+                    &cell,
+                    own,
+                    stored,
+                ))
+                .await
+                .map_err(flatten_resolve)?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (cell, bytes);
                     yielded += 1;
@@ -171,8 +182,11 @@ where
             true
         });
         try_stream! {
+            // The snapshot is in-memory (no tokio leaf), so a per-item
+            // `cooperative` checkpoint yields a large recovery drain to the
+            // runtime every ~128 items.
             for item in provisional {
-                yield item;
+                yield cooperative(async move { item }).await;
             }
         }
     }

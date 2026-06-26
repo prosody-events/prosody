@@ -29,7 +29,7 @@ shapes and where to see them proven:
 
 | Invariant shape | Property | Exemplar |
 | --- | --- | --- |
-| Round-trip | `decode(encode(x)) == x` | `src/state/tests/encoding.rs` |
+| Round-trip | `decode(encode(x)) == x` | `present_round_trip` in `src/state/fjall/codec/tests.rs` |
 | Oracle correctness | Real impl tracks a simple model op-for-op | `CellModel` + the `run_*_trace` runners in `src/state/tests/cell_suite.rs` |
 | Parity | Two implementations answer identically | `src/consumer/middleware/deduplication/tests/prop_dedup_store.rs` |
 | Idempotence | A second sweep issues zero durable writes | `second_sweep_is_a_no_op` in `src/state/tests/cell_suite.rs` |
@@ -45,8 +45,9 @@ wire-format freezing. `decode(encode(x)) == x` survives a variant rename
 because encoder and decoder move together inside one binary. **Policy: any
 encoding persisted beyond process lifetime gets a frozen-bytes test** — an
 example test asserting the exact encoded bytes of a deterministic value
-(exemplar: `wal_golden_bytes_freeze_durable_format` in
-`src/state/tests/encoding.rs`).
+(exemplar: `present_cell_is_raw_tagged_payload_with_expiry` in
+`src/state/fjall/codec/tests.rs`, which freezes the `[tag][expiry][payload]`
+cell frame).
 
 ## Idiom catalog
 
@@ -85,9 +86,9 @@ so failures reduce to minimal reproductions. Without shrinking, a failing
 50-op trace is nearly undebuggable. Avoid wall-clock or RNG-seeded values
 inside generators — deterministic ranges keep failures reproducible.
 
-Exemplars: `src/state/tests/cell_suite.rs` (`Trace`/`OverlayTrace`/`ScanTrace`),
-`src/state/tests/encoding.rs` (`Arb*` wrappers around enums), and the
-durability-sequence properties in
+Exemplars: `src/state/tests/cell_suite.rs` (`Trace`/`OverlayTrace`/`ScanTrace`
+and their `Arbitrary` impls), `src/state/fjall/codec/tests.rs` (`PrefixFields`
+generator over a null-prone alphabet), and the durability-sequence properties in
 `src/consumer/middleware/tests/durability_boundary.rs`.
 
 ### Backend-generic suite runners

@@ -20,63 +20,70 @@ fn collection(name: &str) -> Result<CollectionId> {
     ))
 }
 
+/// An arbitrary non-`never` expiry, exercising the header round-trip.
+const EXPIRY: u64 = 1_700_000_000_000;
+
 #[test]
 fn absent_round_trip() -> Result<()> {
-    let cell = encode_absent_cell();
-    assert_eq!(decode_cell(Some(cell.as_ref()))?, Read::Absent);
+    let cell = encode_absent_cell(EXPIRY);
+    assert_eq!(decode_cell(Some(cell.as_ref()))?, (EXPIRY, Read::Absent));
     Ok(())
 }
 
-/// Any payload round-trips through `encode_present_cell` → `decode_cell` as
-/// `Read::Present` with identical bytes — the cache codec is lossless over the
-/// whole byte space, including the empty payload a `Set` of empty bytes
-/// produces, not just one fixed example.
+/// Any payload + expiry round-trips through `encode_present_cell` →
+/// `decode_cell` as `(expiry, Read::Present)` with identical bytes — the cache
+/// codec is lossless over the whole byte space and the expiry header, including
+/// the empty payload a `Set` of empty bytes produces, not just one fixed
+/// example.
 #[test]
 fn present_round_trip() {
-    fn prop(payload: Vec<u8>) -> TestResult {
+    fn prop(payload: Vec<u8>, expiry: u64) -> TestResult {
         let payload = Bytes::from(payload);
-        let cell = encode_present_cell(&payload);
+        let cell = encode_present_cell(&payload, expiry);
         match decode_cell(Some(cell.as_ref())) {
-            Ok(Read::Present(decoded)) => TestResult::from_bool(decoded == payload),
+            Ok((e, Read::Present(decoded))) => {
+                TestResult::from_bool(e == expiry && decoded == payload)
+            }
             Ok(other) => TestResult::error(format!("round-trip produced {other:?}, not Present")),
             Err(e) => TestResult::error(format!("decode_cell failed: {e}")),
         }
     }
 
-    QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, u64) -> TestResult);
 }
 
-/// A present cell is framed `[0x01] ++ raw payload` — byte-for-byte, no
-/// app-level compression. This pins Change 1: the fjall codec stores the
-/// payload verbatim (fjall block-compresses on disk via LZ4), so the cell is
-/// not a zstd frame. A zstd frame would begin with the magic `0x28` and differ
-/// from the raw tail for any payload, so the equality check is discriminating.
+/// A present cell is framed `[0x01][expiry: u64 BE][raw payload]` —
+/// byte-for-byte, no app-level compression. This pins the frame layout: the
+/// fjall codec stores the payload verbatim after the tag + expiry header (fjall
+/// block-compresses on disk via LZ4), so the cell is not a zstd frame.
 #[test]
-fn present_cell_is_raw_tagged_payload() {
+fn present_cell_is_raw_tagged_payload_with_expiry() {
     let payload = b"profile-payload-not-compressed".as_slice();
-    let cell = encode_present_cell(payload);
+    let cell = encode_present_cell(payload, EXPIRY);
     let mut expected = vec![0x01_u8];
+    expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
     assert_eq!(cell.as_ref(), expected.as_slice());
 }
 
 /// A `Set` of empty bytes is a present cell distinct from `Absent`, and must
-/// round-trip as `Present(empty)`. Raw framing has no compression frame to pad
-/// an empty tail (zstd used to), so this pins the empty case deterministically
-/// rather than leaving it to the property test's dice.
+/// round-trip as `Present(empty)` with its expiry. Raw framing has no
+/// compression frame to pad an empty tail (zstd used to), so this pins the
+/// empty case deterministically rather than leaving it to the property test's
+/// dice.
 #[test]
 fn empty_payload_round_trips_as_present() -> Result<()> {
-    let cell = encode_present_cell(&[]);
+    let cell = encode_present_cell(&[], 0);
     assert_eq!(
         decode_cell(Some(cell.as_ref()))?,
-        Read::Present(Bytes::new())
+        (0, Read::Present(Bytes::new()))
     );
     Ok(())
 }
 
 #[test]
 fn missing_entry_decodes_as_unknown() -> Result<()> {
-    assert_eq!(decode_cell(None)?, Read::Unknown);
+    assert_eq!(decode_cell(None)?, (0, Read::Unknown));
     Ok(())
 }
 
@@ -85,9 +92,19 @@ fn empty_cell_is_rejected() {
     assert!(decode_cell(Some(&[])).is_err());
 }
 
+/// A frame with a tag but a truncated expiry header (fewer than 8 bytes) is
+/// rejected — the decoder needs the whole header before the payload.
+#[test]
+fn truncated_expiry_header_is_rejected() {
+    assert!(decode_cell(Some(&[0x01, 0x00, 0x00])).is_err());
+}
+
 #[test]
 fn unknown_tag_byte_is_rejected() {
-    let result = decode_cell(Some(&[0xFE]));
+    // A full 9-byte frame (tag + expiry) with an unknown tag.
+    let mut frame = vec![0xFE_u8];
+    frame.extend_from_slice(&0u64.to_be_bytes());
+    let result = decode_cell(Some(&frame));
     assert!(
         matches!(
             result,

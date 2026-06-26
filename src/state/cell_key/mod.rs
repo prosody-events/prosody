@@ -114,6 +114,7 @@ pub enum Direction {
 /// open `(p, q)` interval between two separately-covered sub-ranges (whose
 /// endpoints `p`/`q` are already covered) is exactly an `Excluded`/`Excluded`
 /// scan, and a punched singleton `{X}` is `Included(X)`/`Included(X)`.
+#[derive(Clone, Copy)]
 pub struct Scan<'a> {
     /// The section whose cells the scan walks.
     pub section: Section,

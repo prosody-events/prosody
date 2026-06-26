@@ -65,7 +65,7 @@ use crate::state::{CollectionId, CollectionRef, StateType};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{KeyedCellRow, RawCellRow};
+use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
 use scylla::serialize::row::SerializeRow;
@@ -177,6 +177,34 @@ impl<O> CassandraStore<O> {
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
             .maybe_first_row::<RawCellRow>()
+            .map_err(CassandraStoreError::from)?;
+        Ok(row)
+    }
+
+    async fn read_raw_ttl(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<CellTtlRow>, CassandraCellStoreError> {
+        let pk = Pk::of(id);
+        let row = self
+            .cql()
+            .execute_unpaged(
+                &self.queries.read_cell_ttl,
+                (
+                    pk.segment_id,
+                    pk.key,
+                    pk.state_type,
+                    pk.name,
+                    i8::from(cell.section),
+                    cell.coordinate.as_bytes(),
+                ),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<CellTtlRow>()
             .map_err(CassandraStoreError::from)?;
         Ok(row)
     }
@@ -321,45 +349,23 @@ impl<O> CassandraStore<O> {
     }
 }
 
-impl<O> CellStore for CassandraStore<O>
+impl<O> CassandraStore<O>
 where
     O: CommitOracle,
 {
-    type Error = CellStoreError<O::Error>;
-
-    async fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-        own: EventRef,
-    ) -> Result<Committed, Self::Error> {
-        let raw = match self
-            .read_raw(collection, cell)
-            .await
-            .map_err(ResolveCellError::Store)?
-        {
-            Some(row) => decode::try_decode_cell(row).map_err(ResolveCellError::Store)?,
-            None => Cell::Resolved(Committed::new(None)),
-        };
-        let collection_ref = self.resolver.collection_ref(collection);
-        resolve_read(
-            self,
-            self.resolver.oracle(),
-            &collection_ref,
-            cell,
-            own,
-            raw,
-        )
-        .await
-        .map_err(flatten_resolve)
-    }
-
-    fn scan_cells<'a>(
+    /// The single resolving section scan, yielding each present cell's
+    /// committed bytes **and** its remaining `data` TTL.
+    /// [`scan_cells`](CellStore::scan_cells) drops the TTL;
+    /// [`scan_for_cache`](CellStore::scan_for_cache) keeps it.
+    fn scan_inner<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+    ) -> impl Stream<
+        Item = Result<(CellKey, Bytes, Option<CompactDuration>), CellStoreError<O::Error>>,
+    > + Send
+    + 'a {
         let pk = Pk::of(collection).owned();
         let section = i8::from(scan.section);
         let dir = scan.dir;
@@ -427,8 +433,8 @@ where
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let (key, raw) =
-                    decode::try_decode_keyed_cell(row).map_err(ResolveCellError::Store)?;
+                let (key, raw, ttl) =
+                    decode::try_decode_keyed_cell_ttl(row).map_err(ResolveCellError::Store)?;
                 if past_end(dir, &key, end.as_ref().map(Vec::as_slice)) {
                     break;
                 }
@@ -437,11 +443,98 @@ where
                         .await
                         .map_err(flatten_resolve)?;
                 if let Some(bytes) = committed.into_inner() {
-                    yield (key, bytes);
+                    yield (key, bytes, ttl_seconds_to_duration(ttl));
                     yielded += 1;
                 }
             }
         }
+    }
+}
+
+impl<O> CellStore for CassandraStore<O>
+where
+    O: CommitOracle,
+{
+    type Error = CellStoreError<O::Error>;
+
+    async fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> Result<Committed, Self::Error> {
+        let raw = match self
+            .read_raw(collection, cell)
+            .await
+            .map_err(ResolveCellError::Store)?
+        {
+            Some(row) => decode::try_decode_cell(row).map_err(ResolveCellError::Store)?,
+            None => Cell::Resolved(Committed::new(None)),
+        };
+        let collection_ref = self.resolver.collection_ref(collection);
+        resolve_read(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            cell,
+            own,
+            raw,
+        )
+        .await
+        .map_err(flatten_resolve)
+    }
+
+    async fn get_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
+        let (raw, ttl) = match self
+            .read_raw_ttl(collection, cell)
+            .await
+            .map_err(ResolveCellError::Store)?
+        {
+            Some(row) => {
+                let (cell, ttl) =
+                    decode::try_decode_cell_ttl(row).map_err(ResolveCellError::Store)?;
+                (cell, ttl)
+            }
+            None => (Cell::Resolved(Committed::new(None)), None),
+        };
+        let collection_ref = self.resolver.collection_ref(collection);
+        let committed = resolve_read(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            cell,
+            own,
+            raw,
+        )
+        .await
+        .map_err(flatten_resolve)?;
+        Ok((committed, ttl_seconds_to_duration(ttl)))
+    }
+
+    fn scan_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        self.scan_inner(collection, scan, own)
+    }
+
+    fn scan_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        // Same scan, dropping the per-cell TTL the cache-fill variant keeps.
+        self.scan_inner(collection, scan, own)
+            .map_ok(|(key, bytes, _ttl)| (key, bytes))
     }
 
     fn provisional_cells<'a>(
@@ -609,6 +702,18 @@ fn ttl_to_i32(ttl: CompactDuration) -> i32 {
     ttl.seconds().try_into().unwrap_or(i32::MAX)
 }
 
+/// Converts a `TTL(data)` read into the cache-fill remaining duration. A NULL
+/// (`None`) means the cell has no TTL — it never expires. A present value is
+/// the whole remaining seconds (a FLOOR), so a fjall entry stamped
+/// `now + remaining` never outlives the durable row — including `0`, which
+/// means *sub-second remaining* and must stamp an (almost) immediate expiry,
+/// never "never" (a negative is treated the same, defensively). Collapsing `0`
+/// into `None` would let the fjall entry outlive a durable row that dies within
+/// the second.
+fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuration> {
+    ttl.map(|s| CompactDuration::new(u32::try_from(s).unwrap_or(0)))
+}
+
 cassandra_queries! {
     /// Container for the prepared CQL statements used by [`CassandraStore`].
     ///
@@ -633,9 +738,20 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
+        /// Reads one cell's columns plus the row's remaining `data` TTL, for the
+        /// cache-fill point read. `TTL(data)` is a read function (no schema
+        /// change); it returns NULL when `data` is NULL or the row has no TTL.
+        read_cell_ttl: (
+            "SELECT data, prev_data, encoding, version, event, TTL(data) \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
         /// Forward single-section scan from an inclusive `coordinate` anchor.
         scan_forward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? AND coordinate >= ? \
@@ -645,7 +761,7 @@ cassandra_queries! {
 
         /// Forward single-section scan from an exclusive `coordinate` anchor.
         scan_forward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? AND coordinate > ? \
@@ -655,7 +771,7 @@ cassandra_queries! {
 
         /// Forward single-section scan over the whole section (unbounded start).
         scan_forward_all: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? \
@@ -665,7 +781,7 @@ cassandra_queries! {
 
         /// Backward single-section scan from an inclusive `coordinate` anchor.
         scan_backward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? AND coordinate <= ? \
@@ -675,7 +791,7 @@ cassandra_queries! {
 
         /// Backward single-section scan from an exclusive `coordinate` anchor.
         scan_backward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? AND coordinate < ? \
@@ -686,7 +802,7 @@ cassandra_queries! {
         /// Backward single-section scan over the whole section (unbounded
         /// start).
         scan_backward_all: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND section = ? \
@@ -697,7 +813,7 @@ cassandra_queries! {
         /// Whole-partition (all sections) provisional scan for recovery. Yields
         /// every clustering row; resolved rows are filtered in code.
         scan_partition: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_CELL

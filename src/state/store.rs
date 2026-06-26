@@ -31,8 +31,9 @@ use super::cell_key::{CellKey, Scan};
 use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
 use crate::error::ClassifyError;
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use std::error::Error;
 use std::future::Future;
 
@@ -80,6 +81,45 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
 
+    /// Cache-fill point read: the committed value **plus** the durable cell's
+    /// remaining TTL, for the [`Cached`](super::cached::Cached) write-through
+    /// cache to mirror with a co-expiring fjall entry. `None` TTL means the
+    /// durable row has no expiry (the fjall entry is stamped "never expires").
+    ///
+    /// Backends with no per-write TTL inherit the default: the committed value
+    /// from [`Self::get`] with a `None` TTL. Only the Cassandra store overrides
+    /// it (selecting `TTL(data)`); the TTL is a best-effort hint, so a wrong or
+    /// missing value only makes the cache fall through early, never stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on any failure [`Self::get`] would.
+    fn get_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        async move { Ok((self.get(collection, cell, own).await?, None)) }
+    }
+
+    /// Cache-fill scan: each present cell's committed bytes **plus** its
+    /// remaining TTL, for the [`Cached`](super::cached::Cached) cache to mirror
+    /// a covered gap with co-expiring fjall entries. The default delegates
+    /// to [`Self::scan_cells`] with a `None` TTL per cell; only the
+    /// Cassandra store overrides it (selecting `TTL(data)`).
+    fn scan_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        self.scan_cells(collection, scan, own)
+            .map(|item| item.map(|(cell, bytes)| (cell, bytes, None)))
+    }
+
     /// Streams the whole partition's provisional cells (all sections) for the
     /// recovery sweep, filtering resolved rows in code.
     fn provisional_cells<'a>(
@@ -124,4 +164,48 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    /// Settles a staged set as **committed**: each cell's provisional `data`
+    /// becomes the committed value. The default is the O(1) promote
+    /// ([`Self::mark_resolved`] over the keys); the
+    /// [`Cached`](super::cached::Cached) cache overrides it to also publish the
+    /// committed `data` projection into fjall, returning the **lower** result
+    /// verbatim so a cache-publish failure never gates promotion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on a store failure.
+    fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        async move {
+            let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
+            self.mark_resolved(collection, &keys).await
+        }
+    }
+
+    /// Settles a staged set as **aborted**: each cell's committed base `prev`
+    /// is written back as the resolved value. The default is
+    /// [`Self::write_resolved`] over the `prev`s; the
+    /// [`Cached`](super::cached::Cached) cache overrides it to also publish the
+    /// `prev` projection into fjall, returning the **lower** result verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on a store failure.
+    fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        async move {
+            let cells: Vec<(CellKey, Option<Bytes>)> = writes
+                .iter()
+                .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
+                .collect();
+            self.write_resolved(collection, &cells).await
+        }
+    }
 }

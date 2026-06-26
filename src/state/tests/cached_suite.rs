@@ -18,22 +18,28 @@
 //! counts.
 
 use super::super::cached::Cached;
+use super::super::cell::{Committed, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use super::super::fjall::FjallCellCache;
+use super::super::fjall::{Clock, FjallCellCache};
 use super::super::memory::{MemoryCellStore, MemoryCells};
+use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::store::CellStore;
 use super::super::{CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType};
 use super::cell_suite::{
-    CountingCellStore, OverlayTrace, ScriptedOracle, bytes, run_overlay_trace,
+    CountingCellStore, OverlayTrace, ScriptedOracle, Trace, bytes, run_crash_equivalence_trace,
+    run_overlay_trace,
 };
 use crate::test_util::TEST_RUNTIME;
-use color_eyre::eyre::Result;
+use crate::timers::duration::CompactDuration;
+use color_eyre::eyre::{Result, eyre};
 use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions};
 use futures::StreamExt;
-use quickcheck::QuickCheck;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -141,10 +147,11 @@ where
     Ok(out)
 }
 
-/// Coverage op budget: a covered-negative `get` reads nothing from the lower
-/// store, a single-cell write punches only its coordinate (so a re-scan
-/// re-reads just the one-cell gap, not the section), and three separately
-/// covered ranges leave exactly the two gap queries between them.
+/// Coverage op budget under write-through: a covered re-scan issues zero lower
+/// scans, a covered-negative `get` reads nothing, and — the write-through win —
+/// a write inside a covered range publishes+re-covers, so a re-scan after the
+/// write still issues **zero** lower reads (no read-after-write to the durable
+/// store).
 #[test]
 fn coverage_op_budget() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -161,15 +168,16 @@ fn coverage_op_budget() -> Result<()> {
         let id = collection("budget")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        // Seed present cells at 0, 2, 4, 6, 8 (resolved, committed).
+        // Seed present cells at 0, 2, 4, 6, 8 (resolved, committed). Each
+        // write-through publishes+covers its point.
         for c in [0u8, 2, 4, 6, 8] {
             cached
                 .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
                 .await?;
         }
 
-        // Warm the whole section with one unbounded scan, then verify a covered
-        // re-scan issues ZERO lower scans (served entirely from fjall).
+        // Warm the whole section with one unbounded scan (covering the gaps),
+        // then verify a covered re-scan issues ZERO lower scans.
         let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
         assert_eq!(warm, vec![0, 2, 4, 6, 8]);
         counting.reset();
@@ -181,7 +189,7 @@ fn coverage_op_budget() -> Result<()> {
             "a fully covered scan reads no gap"
         );
 
-        // Covered-negative get: coordinate 3 is covered (in range, no cell) →
+        // Covered-negative get: coordinate 3 is a gap inside the covered range →
         // genuine absence with zero lower reads.
         counting.reset();
         assert!(
@@ -198,9 +206,10 @@ fn coverage_op_budget() -> Result<()> {
             "covered-negative get reads nothing"
         );
 
-        // A single-cell write punches only coordinate 4. The re-scan then
-        // re-reads exactly the one punched-out gap — one bounded gap query, not
-        // a section-wide scan.
+        // The write-through win: a single-cell write inside the covered range
+        // publishes the new value into fjall and re-covers the coordinate, so a
+        // re-scan serves entirely from the cache — ZERO lower reads after the
+        // write (no read-after-write to the durable store).
         cached
             .write_resolved(&cref, &[(cell_at(4), Some(bytes(40)))])
             .await?;
@@ -209,27 +218,41 @@ fn coverage_op_budget() -> Result<()> {
         assert_eq!(after, vec![0, 2, 4, 6, 8]);
         assert_eq!(
             counting.lower_scans(),
-            1,
-            "a one-cell write evicts one coordinate, so the re-scan reads one gap"
+            0,
+            "a write-through write keeps the range covered, so the re-scan reads nothing"
         );
 
-        // The re-scan above re-covered the whole section. Now punch *two*
-        // coordinates with no healing scan between them, splitting coverage into
-        // three covered ranges with two gaps — a full re-scan then issues
-        // exactly two bounded gap queries (never a section scan).
-        cached
-            .write_resolved(&cref, &[(cell_at(2), Some(bytes(20)))])
-            .await?;
-        cached
-            .write_resolved(&cref, &[(cell_at(6), Some(bytes(60)))])
-            .await?;
+        // The re-scan must reflect the written value, served from fjall.
         counting.reset();
-        let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
-        assert_eq!(after, vec![0, 2, 4, 6, 8]);
+        assert_eq!(
+            cached.get(&id, &cell_at(4), probe(2)).await?.get(),
+            Some(&bytes(40)),
+            "the covered get serves the written-through value"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "a covered get after a write-through write reads nothing"
+        );
+
+        // A scan over a genuinely-uncovered collection falls through exactly
+        // once: a fresh collection was never scanned or written, so a bounded
+        // scan issues one gap query, then a covered re-scan issues zero.
+        let other = collection("budget-cold")?;
+        counting.reset();
+        let uncovered = scan_forward(&cached, &other, 0, Bound::Included(20)).await?;
+        assert!(uncovered.is_empty());
         assert_eq!(
             counting.lower_scans(),
-            2,
-            "three covered ranges leave exactly the two gap queries between them"
+            1,
+            "a never-covered range falls through once"
+        );
+        counting.reset();
+        let _ = scan_forward(&cached, &other, 0, Bound::Included(20)).await?;
+        assert_eq!(
+            counting.lower_scans(),
+            0,
+            "the re-scan of the now-covered range reads nothing"
         );
 
         Ok(())
@@ -316,6 +339,532 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
         let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
         assert_eq!(covered.len(), usize::from(N));
         assert!(covered.iter().copied().eq(0..N));
+        Ok(())
+    })
+}
+
+/// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>`: each
+/// resolution arm drives `commit_provisional`/`abort_provisional` (the
+/// publish-on-settle path), and a "crash" rebuilds the cache cold over the same
+/// warm memory cells (a fresh fjall partition — `CovVolatile`). The committed
+/// projection must converge to the model on every path, with the write-through
+/// publish and the dropped-coverage cold restart both exercised.
+#[test]
+fn prop_memory_cached_crash_equivalence() {
+    fn property(trace: Trace) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, keyspace) = open_keyspace()?;
+        // Each `make` opens a fresh cache partition (cold cache) over the same
+        // warm memory cells + oracle, so a crash drops coverage but not durable
+        // state. An atomic counter keeps the closure `Fn` (the runner calls it
+        // repeatedly).
+        let counter = AtomicU32::new(0);
+        let make = || {
+            let n = counter.fetch_add(1, Ordering::Relaxed);
+            let handle = keyspace.open_partition(&format!("crash-{n}"), partition_options())?;
+            let lower = MemoryCellStore::new(
+                cells.clone(),
+                oracle.clone(),
+                Arc::new(CollectionDefRegistry::default()),
+            );
+            Ok(Cached::new(FjallCellCache::new(handle), lower))
+        };
+        TEST_RUNTIME.block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
+}
+
+/// TTL co-expiry over the real `Cached<MemoryCellStore>` with a pinned
+/// [`Clock`]: a value written through a short-TTL collection is served from
+/// fjall while live, then — after the clock advances past its floor expiry — a
+/// covered `get`/`scan` **falls through** to the lower store and yields the
+/// oracle's current answer (absent if the durable row is gone, fresh if
+/// rewritten). No sleep; the clock is advanced directly.
+#[test]
+fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+
+    TEST_RUNTIME.block_on(async {
+        let now = Arc::new(AtomicU64::new(1_000));
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, keyspace) = open_keyspace()?;
+        let handle = keyspace.open_partition("ttl", partition_options())?;
+        let lower = CountingCellStore::new(MemoryCellStore::new(
+            cells,
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(
+            FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
+            lower.clone(),
+        );
+        let id = collection("ttl")?;
+        // A 5-second TTL: write-through stamps `now + 5s`.
+        let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(5)));
+
+        // Write through coordinate 7; it is now covered and served from fjall.
+        cached
+            .write_resolved(&cref, &[(cell_at(7), Some(bytes(7)))])
+            .await?;
+        lower.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(7), probe(1)).await?.get(),
+            Some(&bytes(7)),
+            "a live covered value serves from fjall"
+        );
+        assert_eq!(lower.lower_reads(), 0, "a live covered get reads nothing");
+
+        // Advance the clock past the floor expiry (1_000 + 5_000 = 6_000ms).
+        now.store(6_000, Ordering::Relaxed);
+        // Rewrite the durable value WITHOUT going through the cache, so fjall
+        // still holds the stale (now-expired) `7` while the lower store holds
+        // `70`. The expired covered get must fall through and yield `70`.
+        lower
+            .write_resolved(&cref, &[(cell_at(7), Some(bytes(70)))])
+            .await?;
+        lower.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(7), probe(2)).await?.get(),
+            Some(&bytes(70)),
+            "an expired covered get falls through to the fresh durable value"
+        );
+        assert!(
+            lower.lower_reads() > 0,
+            "the expired covered get must read the lower store"
+        );
+
+        // The fall-through re-published a fresh entry; a covered get now serves
+        // `70` from fjall again.
+        lower.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(7), probe(3)).await?.get(),
+            Some(&bytes(70)),
+            "the re-published value serves from fjall"
+        );
+        assert_eq!(lower.lower_reads(), 0, "the re-published get reads nothing");
+        Ok(())
+    })
+}
+
+/// `CovVolatile`: dropping the coverage (a cold restart) makes a covered serve
+/// untrustworthy, so the next read falls through to the lower store. Modelled
+/// by rebuilding `Cached` over the same fjall partition + memory cells: the new
+/// `Cached` has empty coverage, so even though the stale fjall entry is still
+/// present, the uncovered `get` re-reads the (changed) lower truth.
+#[test]
+fn cov_volatile_cold_restart_falls_through() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, keyspace) = open_keyspace()?;
+        let handle = keyspace.open_partition("volatile", partition_options())?;
+        let lower = MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let id = collection("volatile")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        let cached = Cached::new(FjallCellCache::new(handle.clone()), lower.clone());
+        cached
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .await?;
+        assert_eq!(
+            cached.get(&id, &cell_at(1), probe(1)).await?.get(),
+            Some(&bytes(1))
+        );
+
+        // Change the durable value out-of-band, leaving the stale fjall `1`.
+        lower
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))])
+            .await?;
+
+        // Cold restart: a fresh `Cached` over the SAME fjall partition but EMPTY
+        // coverage. The stale fjall entry exists, but the coordinate is
+        // uncovered, so the get falls through and self-heals to `99`.
+        let restarted = Cached::new(FjallCellCache::new(handle), lower.clone());
+        assert_eq!(
+            restarted.get(&id, &cell_at(1), probe(2)).await?.get(),
+            Some(&bytes(99)),
+            "a cold restart trusts nothing uncovered and re-reads the durable truth"
+        );
+        Ok(())
+    })
+}
+
+/// The MAJOR audit-hole regression: a committed change whose fjall publish
+/// **fails** must leave the coordinate **uncovered**, so the next read falls
+/// through and self-heals — never serving the stale fjall entry forever. Uses
+/// the [`FjallCellCache`] put-fault seam to force the publish failure.
+#[test]
+fn failed_publish_uncovers_and_self_heals() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, keyspace) = open_keyspace()?;
+        let handle = keyspace.open_partition("fault", partition_options())?;
+        let fjall = FjallCellCache::new(handle);
+        let fail = fjall.fail_puts();
+        let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
+        let cached = Cached::new(fjall, lower);
+        let id = collection("fault")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // First write publishes cleanly and covers `1`.
+        cached
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .await?;
+        assert_eq!(
+            cached.get(&id, &cell_at(1), probe(1)).await?.get(),
+            Some(&bytes(1))
+        );
+
+        // Now force every publish to fail. The lower write still succeeds
+        // (durable truth is `2`), but the fjall publish fails → the coordinate
+        // is punched out of coverage.
+        fail.store(true, Ordering::Relaxed);
+        cached
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))])
+            .await?;
+
+        // Heal the cache fault; the next get is now uncovered, so it falls
+        // through to the durable `2` and re-publishes — never serving the stale
+        // fjall `1`.
+        fail.store(false, Ordering::Relaxed);
+        assert_eq!(
+            cached.get(&id, &cell_at(1), probe(2)).await?.get(),
+            Some(&bytes(2)),
+            "a failed publish uncovers the coordinate, so the next read self-heals"
+        );
+        Ok(())
+    })
+}
+
+/// The Incomplete trap: a fjall publish failure inside `commit_provisional`
+/// must NOT turn the settle into an error — the lower promote succeeded, so the
+/// committed value is correct and the method returns `Ok` verbatim (otherwise a
+/// healthy store would arm `StateRecovery` forever). Stages a provisional cell,
+/// then commits it with the publish forced to fail.
+#[test]
+fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, keyspace) = open_keyspace()?;
+        let handle = keyspace.open_partition("incomplete", partition_options())?;
+        let fjall = FjallCellCache::new(handle);
+        let fail = fjall.fail_puts();
+        let lower = MemoryCellStore::new(
+            cells,
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let cached = Cached::new(fjall, lower);
+        let id = collection("incomplete")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        // Stage a provisional cell (lower write succeeds; the publish of `prev`
+        // may fail or not — irrelevant to this test).
+        let prev = cached.get(&id, &cell_at(0), event).await?;
+        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        cached
+            .write_provisional(&cref, &[(cell_at(0), write.clone())])
+            .await?;
+        // `probe(1)` is a message event with dedup id `1`; record it committed
+        // so the promote arm resolves to `data`.
+        oracle.record_message(Uuid::from_u128(1)).await?;
+
+        // Commit with the publish forced to fail: the result MUST be Ok (the
+        // lower promote succeeded), never folded into an error.
+        fail.store(true, Ordering::Relaxed);
+        let result = cached
+            .commit_provisional(&cref, &[(cell_at(0), write)])
+            .await;
+        assert!(
+            result.is_ok(),
+            "commit_provisional must swallow a fjall publish failure and return the lower Ok"
+        );
+
+        // The committed value is correct regardless of the cache failure: heal
+        // the cache and read `5`.
+        fail.store(false, Ordering::Relaxed);
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            Some(&bytes(5)),
+            "the promoted value is durable despite the publish failure"
+        );
+        Ok(())
+    })
+}
+
+/// One mutation in a co-expiry-anchor trace. The clock advances explicitly via
+/// [`Advance`](TtlMut::Advance), so a stage→commit gap is part of the input
+/// space rather than a single fixed scenario.
+#[derive(Clone, Debug)]
+enum TtlMut {
+    /// `write_resolved` — re-stamps the row's TTL at the current clock.
+    Set(u8, u8),
+    /// `write_provisional` — stages `data`+`prev`, re-stamping at the clock.
+    Stage(u8, u8),
+    /// `commit_provisional` — promotes; `mark_resolved` keeps the stage TTL.
+    Commit(u8),
+    /// `abort_provisional` — rolls back to `prev`, re-stamping at the clock.
+    Abort(u8),
+    /// Advance the pinned clock by N seconds.
+    Advance(u8),
+}
+
+/// A random mutator trace with a per-trace collection TTL. Generated with a
+/// clean per-key lifecycle (a key is idle or staged; `Commit`/`Abort` target
+/// only staged keys, `Set`/`Stage` only idle ones), so any prefix is itself
+/// valid — which is how `shrink` minimises.
+#[derive(Clone, Debug)]
+struct TtlMutTrace {
+    ttl: Option<u32>,
+    ops: Vec<TtlMut>,
+}
+
+/// The keys a co-expiry trace addresses.
+const TTL_KEYS: u8 = 5;
+
+impl Arbitrary for TtlMutTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let ttl = if bool::arbitrary(g) {
+            None
+        } else {
+            Some(1 + u32::from(u8::arbitrary(g) % 8))
+        };
+        let len = usize::arbitrary(g) % 24;
+        let mut staged: HashSet<u8> = HashSet::new();
+        let mut ops = Vec::with_capacity(len);
+        for _ in 0..len {
+            // A quarter of ops advance the clock; the rest mutate one key.
+            if u8::arbitrary(g) % 4 == 0 {
+                ops.push(TtlMut::Advance(u8::arbitrary(g) % 13));
+                continue;
+            }
+            let key = u8::arbitrary(g) % TTL_KEYS;
+            let value = u8::arbitrary(g);
+            if staged.remove(&key) {
+                ops.push(if bool::arbitrary(g) {
+                    TtlMut::Commit(key)
+                } else {
+                    TtlMut::Abort(key)
+                });
+            } else if bool::arbitrary(g) {
+                ops.push(TtlMut::Set(key, value));
+            } else {
+                staged.insert(key);
+                ops.push(TtlMut::Stage(key, value));
+            }
+        }
+        Self { ttl, ops }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let ttl = self.ttl;
+        let ops = self.ops.clone();
+        // A prefix of a clean-lifecycle trace is itself clean, so truncation is a
+        // safe shrink; also try dropping the TTL entirely.
+        let prefixes = (0..ops.len()).map(move |n| Self {
+            ttl,
+            ops: ops[..n].to_vec(),
+        });
+        let drop_ttl = self
+            .ttl
+            .map(|_| Self {
+                ttl: None,
+                ops: self.ops.clone(),
+            })
+            .into_iter();
+        Box::new(drop_ttl.chain(prefixes))
+    }
+}
+
+/// **Cov1 co-expiry anchor (the generalising property).** For any TTL, any
+/// interleaving of the four write paths, and any clock movement, the expiry
+/// stamped on each cell's fjall entry must equal its durable row's death:
+/// `Set`/`Stage`/`Abort` re-stamp at the write clock, while `Commit`
+/// (`mark_resolved` keeps the stage TTL) must REUSE the stage-time stamp —
+/// never a fresh `commit + ttl`, which would let the entry outlive the row (the
+/// blocker this fix closes). Asserted after **every** op against a `now + ttl`
+/// model (`0` = never). Subsumes the commit-overhang example: that is one
+/// shrunk trace of this property.
+#[test]
+fn prop_cached_ttl_expiry_matches_durable_death() {
+    fn property(trace: TtlMutTrace) -> Result<bool> {
+        TEST_RUNTIME.block_on(async move {
+            use std::sync::atomic::AtomicU64;
+
+            const START: u64 = 1_000;
+            let now = Arc::new(AtomicU64::new(START));
+            let oracle = ScriptedOracle::default();
+            let cells = MemoryCells::new();
+            let (_dir, keyspace) = open_keyspace()?;
+            let handle = keyspace.open_partition("ttl-anchor", partition_options())?;
+            let lower =
+                MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
+            let cached = Cached::new(
+                FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
+                lower,
+            );
+            let id = collection("ttl-anchor")?;
+            let cref = CollectionRef::new(id.clone(), trace.ttl.map(CompactDuration::new));
+            let ttl_ms = trace.ttl.map(|s| u64::from(s) * 1_000);
+            // The durable death stamped by a write at `clock` (`0` = never).
+            let death_at = |clock: u64| ttl_ms.map_or(0, |ttl| clock + ttl);
+
+            // Model: the death stamped on each present key's fjall entry.
+            let mut death: HashMap<u8, u64> = HashMap::new();
+            let mut committed: HashMap<u8, Committed> = HashMap::new();
+            let mut staged: HashMap<u8, u8> = HashMap::new();
+            let mut clock = START;
+            let event = probe(1);
+            let prev_of = |committed: &HashMap<u8, Committed>, key: u8| {
+                committed
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Committed::new(None))
+            };
+
+            for (index, op) in trace.ops.iter().enumerate() {
+                match *op {
+                    TtlMut::Set(key, value) => {
+                        cached
+                            .write_resolved(&cref, &[(cell_at(key), Some(bytes(value)))])
+                            .await?;
+                        committed.insert(key, Committed::new(Some(bytes(value))));
+                        death.insert(key, death_at(clock));
+                    }
+                    TtlMut::Stage(key, value) => {
+                        let write = ProvisionalWrite::new(
+                            Some(bytes(value)),
+                            prev_of(&committed, key),
+                            event,
+                        );
+                        cached
+                            .write_provisional(&cref, &[(cell_at(key), write)])
+                            .await?;
+                        staged.insert(key, value);
+                        death.insert(key, death_at(clock));
+                    }
+                    TtlMut::Commit(key) => {
+                        let Some(value) = staged.remove(&key) else {
+                            return Err(eyre!("op {index}: commit without a prior stage"));
+                        };
+                        let write = ProvisionalWrite::new(
+                            Some(bytes(value)),
+                            prev_of(&committed, key),
+                            event,
+                        );
+                        cached
+                            .commit_provisional(&cref, &[(cell_at(key), write)])
+                            .await?;
+                        committed.insert(key, Committed::new(Some(bytes(value))));
+                        // `mark_resolved` keeps the stage TTL → death
+                        // unchanged.
+                    }
+                    TtlMut::Abort(key) => {
+                        let Some(value) = staged.remove(&key) else {
+                            return Err(eyre!("op {index}: abort without a prior stage"));
+                        };
+                        let write = ProvisionalWrite::new(
+                            Some(bytes(value)),
+                            prev_of(&committed, key),
+                            event,
+                        );
+                        cached
+                            .abort_provisional(&cref, &[(cell_at(key), write)])
+                            .await?;
+                        death.insert(key, death_at(clock));
+                    }
+                    TtlMut::Advance(secs) => {
+                        clock += u64::from(secs) * 1_000;
+                        now.store(clock, Ordering::Relaxed);
+                    }
+                }
+
+                // After every op: each touched cell's stamp equals its modeled
+                // death; an untouched key has no entry.
+                for key in 0..TTL_KEYS {
+                    let got = cached.stored_expiry(&id, &cell_at(key)).await?;
+                    let want = death.get(&key).copied();
+                    if got != want {
+                        return Err(eyre!(
+                            "op {index} ({op:?}): key {key} fjall expiry {got:?} != modeled \
+                             durable death {want:?}"
+                        ));
+                    }
+                }
+            }
+            Ok(true)
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(TtlMutTrace) -> Result<bool>);
+}
+
+/// The covered-SCAN expired-refill path (the plan's critical adversarial
+/// finding, previously unproven): under FLOOR rounding a fjall entry expires
+/// slightly before its durable row, so a covered scan that meets an expired
+/// entry must REFILL that sub-range from the lower store — never read the
+/// expired coordinate as absent. Warms a covered scan, advances the clock past
+/// the floor expiry, and asserts the re-scan still yields every coordinate and
+/// falls through to the lower store.
+#[test]
+fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+
+    TEST_RUNTIME.block_on(async {
+        let now = Arc::new(AtomicU64::new(1_000));
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, keyspace) = open_keyspace()?;
+        let handle = keyspace.open_partition("scan-ttl", partition_options())?;
+        let lower = CountingCellStore::new(MemoryCellStore::new(
+            cells,
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(
+            FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
+            lower.clone(),
+        );
+        let id = collection("scan-ttl")?;
+        let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(5)));
+
+        // Write through 3, 5, 7 (each covered, expiry 1_000 + 5_000 = 6_000), then
+        // warm the whole section with one scan so the gaps cover too.
+        for c in [3u8, 5, 7] {
+            cached
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .await?;
+        }
+        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        assert_eq!(warm, vec![3, 5, 7]);
+        lower.reset();
+        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        assert_eq!(covered, vec![3, 5, 7]);
+        assert_eq!(lower.lower_scans(), 0, "a live covered scan reads nothing");
+
+        // Advance past the floor expiry. The covered scan must fall through for
+        // the expired cells and still yield all three — never reading an expired
+        // coordinate as absent (Cov1).
+        now.store(7_000, Ordering::Relaxed);
+        lower.reset();
+        let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        assert_eq!(
+            after,
+            vec![3, 5, 7],
+            "an expired covered scan refills from the lower store, never dropping cells"
+        );
+        assert!(
+            lower.lower_scans() > 0,
+            "the expired covered scan must fall through to the lower store"
+        );
         Ok(())
     })
 }

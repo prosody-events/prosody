@@ -350,18 +350,6 @@ impl TerminationWatch {
     }
 }
 
-/// How `resolve_staged` settles a staged set once the event's outcome is known.
-#[derive(Clone, Copy, Debug)]
-enum Resolve {
-    /// The event committed: each staged cell's `data` becomes committed, via an
-    /// O(1) promote that nulls `event`/`prev`.
-    Promote,
-
-    /// The event aborted: each cell's committed base `prev` is written back as
-    /// the resolved value.
-    Rollback,
-}
-
 /// Construction parameters for [`KeyedStateSession`], bundled so the
 /// constructor stays readable.
 pub struct SessionParts<B, L>
@@ -510,12 +498,18 @@ where
         CollectionRef::new(id, ttl)
     }
 
-    /// Resolves the recorded staged set after the event's outcome is known —
-    /// [`Resolve::Promote`] on commit, [`Resolve::Rollback`] on abort.
+    /// Resolves the recorded staged set after the event's outcome is known:
+    /// `committed` ⇒ promote each cell's `data`, otherwise roll each back to
+    /// its `prev`. The cell store's
+    /// [`commit_provisional`](CellStore::commit_provisional) /
+    /// [`abort_provisional`](CellStore::abort_provisional) carry the projection
+    /// (so the write-through cache can publish it); the default impls degrade
+    /// to the raw promote / `write_resolved(prev)`.
+    ///
     /// Best-effort: drives every per-collection resolution to completion
     /// regardless of siblings, reporting [`ApplyOutcome::Incomplete`] if any
     /// failed (the backstop, always left armed, lets the sweep retry).
-    async fn resolve_staged(&self, how: Resolve) -> ApplyOutcome
+    async fn resolve_staged(&self, committed: bool) -> ApplyOutcome
     where
         L: Send + Sync + 'static,
     {
@@ -526,19 +520,10 @@ where
         let all_resolved = stream::iter(set)
             .map(|(collection_ref, writes)| {
                 cooperative(async move {
-                    let result = match how {
-                        Resolve::Promote => {
-                            let keys: Vec<CellKey> =
-                                writes.iter().map(|(cell, _)| cell.clone()).collect();
-                            lower.mark_resolved(&collection_ref, &keys).await
-                        }
-                        Resolve::Rollback => {
-                            let cells: Vec<(CellKey, Option<Bytes>)> = writes
-                                .iter()
-                                .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
-                                .collect();
-                            lower.write_resolved(&collection_ref, &cells).await
-                        }
+                    let result = if committed {
+                        lower.commit_provisional(&collection_ref, &writes).await
+                    } else {
+                        lower.abort_provisional(&collection_ref, &writes).await
                     };
                     match result {
                         Ok(()) => true,
@@ -732,11 +717,11 @@ where
     }
 
     async fn commit_apply(&self) -> ApplyOutcome {
-        self.resolve_staged(Resolve::Promote).await
+        self.resolve_staged(true).await
     }
 
     async fn rollback_aborted(&self) -> ApplyOutcome {
-        self.resolve_staged(Resolve::Rollback).await
+        self.resolve_staged(false).await
     }
 
     fn register_marker(&self, dedup_id: Uuid) {

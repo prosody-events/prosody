@@ -36,21 +36,3 @@ where
     spawn_blocking(move || partition.insert(key.as_ref(), cell.as_ref())).await??;
     Ok(())
 }
-
-/// Removes the cell at `key`, so a later read finds the key absent.
-///
-/// Distinct from writing an `Absent` tag cell: a removed key decodes as
-/// [`Read::Unknown`](crate::state::Read::Unknown) — "this layer holds no
-/// answer" — while an `Absent` cell is an authoritative "the value is
-/// cleared".
-pub(super) async fn remove_cell<K>(
-    partition: &PartitionHandle,
-    key: K,
-) -> Result<(), FjallCellCacheError>
-where
-    K: AsRef<[u8]> + Send + 'static,
-{
-    let partition = partition.clone();
-    spawn_blocking(move || partition.remove(key.as_ref())).await??;
-    Ok(())
-}

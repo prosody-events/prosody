@@ -9,7 +9,7 @@
 //! the copying fallback.
 
 use super::codec::cell_key;
-use super::{AssignmentEpoch, FjallCellCache, FjallClient, FjallConfiguration};
+use super::{AssignmentEpoch, CacheRead, FjallCellCache, FjallClient, FjallConfiguration};
 use crate::state::cell::Committed;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::{CollectionId, StateKey, StateName, StateType};
@@ -75,9 +75,9 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
         let c = collection("uniq")?;
         let cell = value_cell();
         store
-            .put(&c, &cell, &Committed::new(Some(Bytes::from(payload))))
+            .put(&c, &cell, &Committed::new(Some(Bytes::from(payload))), 0)
             .await?;
-        let Some(committed) = store.get(&c, &cell).await? else {
+        let CacheRead::Hit(committed) = store.get(&c, &cell).await? else {
             return Err(eyre!("expected a cache hit"));
         };
         let Some(bytes) = committed.into_inner() else {
@@ -100,16 +100,18 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
-/// Change 1, end-to-end through the cache store: a present cell written via the
-/// committed cache is stored `[0x01] ++ raw payload` byte-for-byte.
+/// End-to-end through the cache store: a present cell written via the committed
+/// cache is stored `[0x01][expiry: u64 BE][raw payload]` byte-for-byte.
 /// `partition.get` returns the logical value (fjall decompresses any on-disk
 /// LZ4 transparently), so an equal-to-raw result proves the app layer dropped
 /// its zstd frame — a zstd frame would differ from the raw tail for any
-/// payload.
+/// payload — and pins the expiry header position.
 #[test]
-fn stored_cells_are_raw_tagged_payload() -> Result<()> {
+fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
+    const EXPIRY: u64 = 1_700_000_000_000;
     let payload = b"a raw, uncompressed keyed-state payload".as_slice();
     let mut expected = vec![0x01_u8];
+    expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
 
     let (_dir, _keyspace, cache_partition) = open("value_cache")?;
@@ -121,6 +123,7 @@ fn stored_cells_are_raw_tagged_payload() -> Result<()> {
         &c,
         &cell,
         &Committed::new(Some(Bytes::copy_from_slice(payload))),
+        EXPIRY,
     ))?;
     let cache_raw = cache_partition
         .get(cell_key(&c, &cell))?
@@ -131,6 +134,50 @@ fn stored_cells_are_raw_tagged_payload() -> Result<()> {
         "cache cell not raw"
     );
 
+    Ok(())
+}
+
+/// An expired present entry reads back as a miss (`None`) under a clock
+/// advanced past its stamped expiry; the same entry with a `0`-never expiry, or
+/// read at a time before expiry, stays a hit. Drives the read-side TTL check
+/// with a deterministic [`Clock::Fixed`], no sleep.
+#[test]
+fn expired_entry_reads_as_miss() -> Result<()> {
+    use super::Clock;
+    use color_eyre::eyre::Report;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let now = Arc::new(AtomicU64::new(1_000));
+    let (_dir, _keyspace, partition) = open("ttl_value")?;
+    let cache = FjallCellCache::with_clock(partition, Clock::Fixed(now.clone()));
+    let c = collection("ttl")?;
+    let cell = value_cell();
+    let payload = Committed::new(Some(Bytes::from_static(b"v")));
+
+    TEST_RUNTIME.block_on(async {
+        // Stamp an entry that expires at 2_000ms.
+        cache.put(&c, &cell, &payload, 2_000).await?;
+        // Before expiry: a hit.
+        assert!(
+            matches!(cache.get(&c, &cell).await?, CacheRead::Hit(_)),
+            "live entry must hit"
+        );
+        // At/after expiry: reported Expired (an entry exists, floor-expired).
+        now.store(2_000, Ordering::Relaxed);
+        assert!(
+            matches!(cache.get(&c, &cell).await?, CacheRead::Expired),
+            "expired entry must read as Expired"
+        );
+        // A `never` (0) expiry never expires, even far in the future.
+        cache.put(&c, &cell, &payload, 0).await?;
+        now.store(u64::MAX, Ordering::Relaxed);
+        assert!(
+            matches!(cache.get(&c, &cell).await?, CacheRead::Hit(_)),
+            "a never-expiry entry must always hit"
+        );
+        Ok::<_, Report>(())
+    })?;
     Ok(())
 }
 

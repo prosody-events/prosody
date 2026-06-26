@@ -377,24 +377,22 @@ where
         let staged = &writes[..staged_count];
 
         // Stage each cell over its committed base (prev-is-committed at stage
-        // time: no provisional cell lingers between events).
-        let mut prevs: Vec<Option<Bytes>> = Vec::with_capacity(staged.len());
+        // time: no provisional cell lingers between events). Keep the staged
+        // `ProvisionalWrite` per collection so the clean arms can settle through
+        // `commit_provisional` / `abort_provisional` (carrying the projection
+        // the write-through cache publishes).
+        let mut writes: Vec<(u8, ProvisionalWrite)> = Vec::with_capacity(staged.len());
         for &(coll, mutation) in staged {
             let prev = store.get(&ids[coll as usize], &cell, event).await?;
             let prev_value = prev.get().cloned();
             if prev_value != model[coll as usize] {
                 return Ok(false);
             }
-            prevs.push(prev_value);
+            let write = ProvisionalWrite::new(mutation.value(), prev, event);
             store
-                .write_provisional(
-                    &refs[coll as usize],
-                    &[(
-                        cell.clone(),
-                        ProvisionalWrite::new(mutation.value(), prev, event),
-                    )],
-                )
+                .write_provisional(&refs[coll as usize], &[(cell.clone(), write.clone())])
                 .await?;
+            writes.push((coll, write));
         }
 
         // Marker strictly after staging; advance the model for committed cells.
@@ -426,16 +424,24 @@ where
                 }
             }
         } else if matches!(ev.outcome, Outcome::CleanCommitted) {
-            for &(coll, _) in staged {
+            // Promote through the lifecycle settle path (publishes `data`).
+            for (coll, write) in &writes {
                 store
-                    .mark_resolved(&refs[coll as usize], slice::from_ref(&cell))
+                    .commit_provisional(
+                        &refs[*coll as usize],
+                        slice::from_ref(&(cell.clone(), write.clone())),
+                    )
                     .await?;
             }
         } else {
-            // The only remaining non-crash outcome: clean inline rollback.
-            for (&(coll, _), prev) in staged.iter().zip(&prevs) {
+            // The only remaining non-crash outcome: clean inline rollback
+            // through the settle path (publishes `prev`).
+            for (coll, write) in &writes {
                 store
-                    .write_resolved(&refs[coll as usize], &[(cell.clone(), prev.clone())])
+                    .abort_provisional(
+                        &refs[*coll as usize],
+                        slice::from_ref(&(cell.clone(), write.clone())),
+                    )
                     .await?;
             }
         }

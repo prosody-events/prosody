@@ -488,3 +488,31 @@ fn prop_cassandra_bottom_scan() {
             as fn(ScanTrace) -> quickcheck::TestResult,
     );
 }
+
+/// `TTL(data)` surfacing for the co-expiry stamp (no cluster needed — pure
+/// boundary cases). A NULL means the cell has no TTL → never expires (`None`).
+/// A present value is the whole remaining seconds and must round-trip —
+/// crucially `0` (sub-second remaining) maps to an *immediate* expiry, never
+/// `None`, or a fjall entry would outlive a durable row that dies within the
+/// second.
+#[test]
+fn ttl_seconds_surfacing_distinguishes_no_ttl_from_sub_second() {
+    use super::ttl_seconds_to_duration;
+    use crate::timers::duration::CompactDuration;
+
+    assert_eq!(ttl_seconds_to_duration(None), None, "NULL ⇒ no TTL (never)");
+    assert_eq!(
+        ttl_seconds_to_duration(Some(0_i32)),
+        Some(CompactDuration::new(0)),
+        "0 ⇒ sub-second remaining, an immediate expiry — never None"
+    );
+    assert_eq!(
+        ttl_seconds_to_duration(Some(42_i32)),
+        Some(CompactDuration::new(42))
+    );
+    assert_eq!(
+        ttl_seconds_to_duration(Some(-1_i32)),
+        Some(CompactDuration::new(0)),
+        "a defensive negative also stamps an immediate expiry, not never"
+    );
+}
