@@ -37,16 +37,17 @@
 //! # TTL co-expiry
 //!
 //! Cassandra cells expire (`USING TTL`); fjall has no native per-entry TTL, so
-//! the cache mirrors the expiry. Each path stamps so the entry **floors** under
-//! the durable row's death — never outliving it:
+//! the cache mirrors the expiry. Cassandra anchors a row's death on the
+//! **coordinator wall clock at whole-second resolution** and ignores the write
+//! timestamp for TTL, so each path floors its anchor DOWN to the second to
+//! match that resolution — shedding the sub-second remainder that would
+//! otherwise deterministically overhang the row:
 //!
 //! * A direct write ([`write_resolved`](CellStore::write_resolved) /
 //!   [`write_provisional`](CellStore::write_provisional) /
 //!   [`abort_provisional`](CellStore::abort_provisional)) anchors on a clock
-//!   read taken **before** the lower write and stamps `stamped_at + ttl`
-//!   ([`CollectionRef::ttl`]). The client-side monotonic timestamp generator
-//!   dates the durable write at-or-after `stamped_at`, so the stamp cannot
-//!   overhang the row.
+//!   read taken **before** the lower write and stamps `floor(stamped_at) + ttl`
+//!   ([`CollectionRef::ttl`]).
 //! * The promote ([`commit_provisional`](CellStore::commit_provisional))
 //!   **reuses** the stage-anchored expiry already on the cell's fjall entry —
 //!   `mark_resolved` does not re-stamp the durable TTL, so `data` keeps the
@@ -54,13 +55,17 @@
 //!   whole stage→commit gap.
 //! * A scan-fill / cover-on-get reads each cell's *remaining* TTL from the
 //!   lower store ([`CellStore::get_for_cache`] / [`CellStore::scan_for_cache`],
-//!   which the Cassandra store backs with `TTL(data)`) → stamps `now +
-//!   remaining` (whole seconds, so it floors).
+//!   which the Cassandra store backs with `TTL(data)`) → stamps `floor(now) +
+//!   remaining` (whole seconds).
 //!
-//! Because floor makes an entry expire slightly *early*, an expired entry on a
-//! covered coordinate is treated as a **gap, not absence**: a covered `get` on
-//! an expiry-miss falls through and re-publishes, and a covered scan refills
-//! the expired sub-range (see the `coverage` module, Cov1).
+//! We do **not** synchronize the client and coordinator clocks; any residual
+//! difference after flooring is clock skew, which no client-side arithmetic can
+//! remove. Cov1 is therefore best-effort co-expiry — floor-to-second plus
+//! self-heal — not an absolute cross-node guarantee. Because flooring makes an
+//! entry expire slightly *early*, an expired entry on a covered coordinate is
+//! treated as a **gap, not absence**: a covered `get` on an expiry-miss falls
+//! through and re-publishes, and a covered scan refills the expired sub-range
+//! (see the `coverage` module, Cov1).
 //!
 //! The cache is a **hint**: every fjall failure is logged and degraded (a miss,
 //! a skipped publish leaving the coordinate uncovered, a fall-through scan),
@@ -110,9 +115,10 @@ impl<L> Cached<L> {
 
     /// The fjall expiry for a cell **read back** from the lower store now: the
     /// clock is read at fill time and `remaining` is the already-decremented
-    /// `TTL(data)`, so `now + remaining` floors under the durable death (Cov1).
-    /// The write-through paths instead anchor on a pre-write clock — see
-    /// [`expiry_at`].
+    /// `TTL(data)`, so [`expiry_at`] stamps `floor(now) + remaining` — flooring
+    /// the anchor to the second to match Cassandra's whole-second TTL
+    /// resolution (Cov1). The write-through paths instead anchor on a
+    /// pre-write clock.
     fn expiry_for(&self, remaining: Option<CompactDuration>) -> u64 {
         expiry_at(self.fjall.clock().now_ms(), remaining)
     }
@@ -171,12 +177,13 @@ where
 {
     /// Publishes each touched cell's `projection` after a successful
     /// `lower.write` (Cov3). `stamped_at` is a clock reading taken **before**
-    /// the lower write: the client-side monotonic generator timestamps the
-    /// durable write at-or-after that instant, so the co-expiry stamp
-    /// `stamped_at + ttl` cannot exceed the durable row's death — flooring
-    /// under it (Cov1). The collection's write TTL is the full TTL (the
-    /// value was just written). `project` computes each cell's committed
-    /// projection from its batch entry.
+    /// the lower write; [`expiry_at`] floors it DOWN to the second to match
+    /// Cassandra's whole-second TTL resolution, so the co-expiry stamp sheds
+    /// the sub-second remainder that would otherwise overhang the row
+    /// (Cov1; residual clock skew self-heals via fall-through). The
+    /// collection's write TTL is the full TTL (the value was just written).
+    /// `project` computes each cell's committed projection from its batch
+    /// entry.
     async fn publish_written<'a, T, P>(
         &self,
         collection: &'a CollectionRef,
@@ -449,11 +456,11 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        // Anchor the co-expiry on a clock read taken BEFORE the lower write: the
-        // client-side monotonic generator timestamps the durable write at-or-
-        // after this instant, so `stamped_at + ttl` never overhangs the row
-        // (Cov1/FLOOR). Establish first (Cov3): a failed lower write leaves
-        // coverage untouched.
+        // Anchor the co-expiry on a clock read taken BEFORE the lower write;
+        // `expiry_at` floors it to the second to match Cassandra's whole-second
+        // TTL resolution, so the stamp sheds the sub-second remainder that would
+        // overhang the row (Cov1/FLOOR). Establish first (Cov3): a failed lower
+        // write leaves coverage untouched.
         let stamped_at = self.fjall.clock().now_ms();
         self.lower.write_provisional(collection, writes).await?;
         // The committed value stays `prev` while the cell is provisional (commit
@@ -578,14 +585,23 @@ where
 
 /// The absolute fjall expiry (millis; `0` = never) for a cell whose durable row
 /// was (or is about to be) written at `stamped_at` with `remaining` whole
-/// seconds of TTL. The stamp adds only whole seconds, so when `stamped_at` ≤
-/// the durable write timestamp the entry never outlives its row (FLOOR; Cov1).
-/// A `None` TTL means the durable row never expires, so the entry never does
-/// either.
+/// seconds of TTL. A `None` TTL means the durable row never expires, so the
+/// entry never does either.
+///
+/// Cassandra anchors a row's death on the **coordinator wall clock at
+/// whole-second resolution** and ignores the write timestamp for TTL. We floor
+/// `stamped_at` DOWN to the same second resolution so the mirrored fjall stamp
+/// sheds the 0–999 ms sub-second remainder that would otherwise
+/// deterministically overhang the row (rounding to *nearest* would round up
+/// half the time and still overhang by ≤500 ms). Flooring is the safe direction
+/// — an early fjall expiry falls through and self-heals. Any residual is
+/// cross-node clock skew, which no client-side arithmetic can remove; it too is
+/// absorbed by the self-healing fall-through (Cov1).
 fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
     match remaining {
         Some(remaining) => {
-            stamped_at.saturating_add(u64::from(remaining.seconds()).saturating_mul(1_000))
+            let anchor = stamped_at - stamped_at % 1_000;
+            anchor.saturating_add(u64::from(remaining.seconds()).saturating_mul(1_000))
         }
         None => 0,
     }

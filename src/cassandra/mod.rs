@@ -273,6 +273,11 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
         .known_nodes(&config.nodes)
         .compression(Some(Compression::Lz4))
         .default_execution_profile_handle(profile.into_handle())
+        // Client-side monotonic timestamps: one handler per key and one
+        // PartitionManager per partition route every write to a partition
+        // through this single session, so these timestamps increase in issue
+        // order and make last-write-wins lost-write-free. Never override a
+        // write timestamp by hand (`USING TIMESTAMP`) — it bypasses this.
         .timestamp_generator(Arc::new(MonotonicTimestampGenerator::new()));
 
     if let Some(user) = &config.user {

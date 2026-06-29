@@ -18,7 +18,7 @@
 //! counts.
 
 use super::super::cached::Cached;
-use super::super::cell::{Committed, ProvisionalWrite};
+use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::super::fjall::{Clock, FjallCellCache};
 use super::super::memory::{MemoryCellStore, MemoryCells};
@@ -32,11 +32,13 @@ use super::cell_suite::{
 };
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
+use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -98,6 +100,136 @@ fn collection(name: &str) -> Result<CollectionId> {
 fn probe(n: u128) -> EventRef {
     EventRef::Message {
         dedup_id: Uuid::from_u128(n),
+    }
+}
+
+/// A memory-backed [`CellStore`] that surfaces each present row's remaining TTL
+/// the way Cassandra's `TTL(data)` does — whole seconds, FLOORED, computed
+/// against the shared fixed [`Clock`] from one absolute `death` — so the
+/// cache's read-fill re-stamp (`expiry_for`) is reachable over memory. The
+/// plain memory store reports `None`, which makes that arithmetic structurally
+/// unreachable. Every other operation delegates to an inner
+/// [`CountingCellStore`], preserving its read/scan counters.
+#[derive(Clone)]
+struct TtlAwareCellStore<S> {
+    inner: CountingCellStore<S>,
+    clock: Clock,
+    death: u64,
+}
+
+impl<S> TtlAwareCellStore<S> {
+    fn new(inner: CountingCellStore<S>, clock: Clock, death: u64) -> Self {
+        Self {
+            inner,
+            clock,
+            death,
+        }
+    }
+
+    fn lower_reads(&self) -> usize {
+        self.inner.lower_reads()
+    }
+
+    fn lower_scans(&self) -> usize {
+        self.inner.lower_scans()
+    }
+
+    fn reset(&self) {
+        self.inner.reset();
+    }
+
+    /// The whole remaining seconds against the fixed clock — the FLOOR
+    /// `TTL(data)` reports for a live row, `None` once `death` has passed.
+    fn remaining(&self) -> Option<CompactDuration> {
+        let now = self.clock.now_ms();
+        (now < self.death).then(|| {
+            CompactDuration::new(u32::try_from((self.death - now) / 1_000).unwrap_or(u32::MAX))
+        })
+    }
+}
+
+impl<S> CellStore for TtlAwareCellStore<S>
+where
+    S: CellStore,
+{
+    type Error = S::Error;
+
+    fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
+        self.inner.get(collection, cell, own)
+    }
+
+    fn scan_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        self.inner.scan_cells(collection, scan, own)
+    }
+
+    async fn get_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
+        let (committed, _) = self.inner.get_for_cache(collection, cell, own).await?;
+        // A present row carries a live remaining TTL; an absent row has none.
+        let remaining = committed
+            .get()
+            .is_some()
+            .then(|| self.remaining())
+            .flatten();
+        Ok((committed, remaining))
+    }
+
+    fn scan_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        let remaining = self.remaining();
+        self.inner
+            .scan_for_cache(collection, scan, own)
+            .map(move |item| item.map(|(cell, bytes, _)| (cell, bytes, remaining)))
+    }
+
+    fn provisional_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
+        self.inner.provisional_cells(collection)
+    }
+
+    fn write_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.write_provisional(collection, writes)
+    }
+
+    fn write_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [(CellKey, Option<Bytes>)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.write_resolved(collection, cells)
+    }
+
+    fn mark_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [CellKey],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.mark_resolved(collection, cells)
     }
 }
 
@@ -375,15 +507,22 @@ fn prop_memory_cached_crash_equivalence() {
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
 
-/// TTL co-expiry over the real `Cached<MemoryCellStore>` with a pinned
-/// [`Clock`]: a value written through a short-TTL collection is served from
-/// fjall while live, then — after the clock advances past its floor expiry — a
-/// covered `get`/`scan` **falls through** to the lower store and yields the
-/// oracle's current answer (absent if the durable row is gone, fresh if
-/// rewritten). No sleep; the clock is advanced directly.
+/// TTL co-expiry over the real `Cached` with a pinned [`Clock`]: a value
+/// written through a short-TTL collection is served from fjall while live, then
+/// — after the clock advances **past its floor expiry to a sub-second instant**
+/// — a covered `get` **falls through** to the lower store, yields its current
+/// answer, and **re-stamps the fjall entry to `floor(now) + remaining`**
+/// (Cov1). The lower store reports a live `TTL(data)`-style remaining
+/// ([`TtlAwareCellStore`]), so the floored re-stamp is exercised and asserted
+/// `≤` the row's death. No sleep; the clock is advanced directly.
 #[test]
 fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
     use std::sync::atomic::AtomicU64;
+
+    // A sub-second instant past the floor expiry (6_000), so the re-stamp's floor
+    // sheds the 500 ms remainder; the lower row dies at 30_000 (`TTL(data)`).
+    const NOW_EXPIRED: u64 = 6_500;
+    const ROW_DEATH: u64 = 30_000;
 
     TEST_RUNTIME.block_on(async {
         let now = Arc::new(AtomicU64::new(1_000));
@@ -391,17 +530,21 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         let cells = MemoryCells::new();
         let (_dir, keyspace) = open_keyspace()?;
         let handle = keyspace.open_partition("ttl", partition_options())?;
-        let lower = CountingCellStore::new(MemoryCellStore::new(
-            cells,
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let lower = TtlAwareCellStore::new(
+            CountingCellStore::new(MemoryCellStore::new(
+                cells,
+                oracle,
+                Arc::new(CollectionDefRegistry::default()),
+            )),
+            Clock::Fixed(now.clone()),
+            ROW_DEATH,
+        );
         let cached = Cached::new(
             FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
             lower.clone(),
         );
         let id = collection("ttl")?;
-        // A 5-second TTL: write-through stamps `now + 5s`.
+        // A 5-second TTL: write-through stamps `floor(now) + 5s`.
         let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(5)));
 
         // Write through coordinate 7; it is now covered and served from fjall.
@@ -417,7 +560,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         assert_eq!(lower.lower_reads(), 0, "a live covered get reads nothing");
 
         // Advance the clock past the floor expiry (1_000 + 5_000 = 6_000ms).
-        now.store(6_000, Ordering::Relaxed);
+        now.store(NOW_EXPIRED, Ordering::Relaxed);
         // Rewrite the durable value WITHOUT going through the cache, so fjall
         // still holds the stale (now-expired) `7` while the lower store holds
         // `70`. The expired covered get must fall through and yield `70`.
@@ -433,6 +576,21 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         assert!(
             lower.lower_reads() > 0,
             "the expired covered get must read the lower store"
+        );
+
+        // The fall-through re-stamped the fjall entry to `floor(now) + remaining`,
+        // flooring the sub-second remainder so it never overhangs the row death.
+        let remaining_ms = ((ROW_DEATH - NOW_EXPIRED) / 1_000) * 1_000;
+        let want_expiry = NOW_EXPIRED - NOW_EXPIRED % 1_000 + remaining_ms;
+        let stamped = cached.stored_expiry(&id, &cell_at(7)).await?;
+        assert_eq!(
+            stamped,
+            Some(want_expiry),
+            "the re-stamped fjall expiry must be floor(now) + remaining"
+        );
+        assert!(
+            stamped.is_some_and(|e| e <= ROW_DEATH),
+            "Cov1: the re-stamped expiry must not overhang the durable row death"
         );
 
         // The fall-through re-published a fresh entry; a covered get now serves
@@ -614,8 +772,10 @@ enum TtlMut {
     Commit(u8),
     /// `abort_provisional` — rolls back to `prev`, re-stamping at the clock.
     Abort(u8),
-    /// Advance the pinned clock by N seconds.
-    Advance(u8),
+    /// Advance the pinned clock by N **milliseconds** — deliberately sub-second
+    /// so the floor in `expiry_at` is exercised across the full 0–999 ms
+    /// remainder, not just second-aligned instants.
+    Advance(u16),
 }
 
 /// A random mutator trace with a per-trace collection TTL. Generated with a
@@ -644,7 +804,9 @@ impl Arbitrary for TtlMutTrace {
         for _ in 0..len {
             // A quarter of ops advance the clock; the rest mutate one key.
             if u8::arbitrary(g) % 4 == 0 {
-                ops.push(TtlMut::Advance(u8::arbitrary(g) % 13));
+                // Arbitrary millisecond advances (0–~12 s) cover both sub-second
+                // remainders and multi-second gaps relative to the 1–8 s TTL.
+                ops.push(TtlMut::Advance(u16::arbitrary(g) % 12_000));
                 continue;
             }
             let key = u8::arbitrary(g) % TTL_KEYS;
@@ -686,14 +848,16 @@ impl Arbitrary for TtlMutTrace {
 }
 
 /// **Cov1 co-expiry anchor (the generalising property).** For any TTL, any
-/// interleaving of the four write paths, and any clock movement, the expiry
-/// stamped on each cell's fjall entry must equal its durable row's death:
-/// `Set`/`Stage`/`Abort` re-stamp at the write clock, while `Commit`
-/// (`mark_resolved` keeps the stage TTL) must REUSE the stage-time stamp —
-/// never a fresh `commit + ttl`, which would let the entry outlive the row (the
-/// blocker this fix closes). Asserted after **every** op against a `now + ttl`
-/// model (`0` = never). Subsumes the commit-overhang example: that is one
-/// shrunk trace of this property.
+/// interleaving of the four write paths, and any **sub-second** clock movement,
+/// the expiry stamped on each cell's fjall entry must equal its durable row's
+/// modeled death — `floor(write_clock) + ttl`, mirroring Cassandra's
+/// whole-second TTL resolution: `Set`/`Stage`/`Abort` re-stamp at the floored
+/// write clock, while `Commit` (`mark_resolved` keeps the stage TTL) must REUSE
+/// the stage-time stamp — never a fresh `commit + ttl`, which would let the
+/// entry outlive the row. Because the clock advances by arbitrary milliseconds,
+/// the model's floor discriminates the sub-second overhang across the full
+/// 0–999 ms remainder. Asserted after **every** op (`0` = never). Subsumes the
+/// commit-overhang example: that is one shrunk trace of this property.
 #[test]
 fn prop_cached_ttl_expiry_matches_durable_death() {
     fn property(trace: TtlMutTrace) -> Result<bool> {
@@ -716,7 +880,10 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
             let cref = CollectionRef::new(id.clone(), trace.ttl.map(CompactDuration::new));
             let ttl_ms = trace.ttl.map(|s| u64::from(s) * 1_000);
             // The durable death stamped by a write at `clock` (`0` = never).
-            let death_at = |clock: u64| ttl_ms.map_or(0, |ttl| clock + ttl);
+            // Cassandra anchors at whole-second resolution, so the fjall stamp
+            // floors `clock` DOWN to the second before adding the TTL — this is
+            // what discriminates the sub-second overhang.
+            let death_at = |clock: u64| ttl_ms.map_or(0, |ttl| (clock - clock % 1_000) + ttl);
 
             // Model: the death stamped on each present key's fjall entry.
             let mut death: HashMap<u8, u64> = HashMap::new();
@@ -782,8 +949,8 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             .await?;
                         death.insert(key, death_at(clock));
                     }
-                    TtlMut::Advance(secs) => {
-                        clock += u64::from(secs) * 1_000;
+                    TtlMut::Advance(ms) => {
+                        clock += u64::from(ms);
                         now.store(clock, Ordering::Relaxed);
                     }
                 }
@@ -812,11 +979,18 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
 /// slightly before its durable row, so a covered scan that meets an expired
 /// entry must REFILL that sub-range from the lower store — never read the
 /// expired coordinate as absent. Warms a covered scan, advances the clock past
-/// the floor expiry, and asserts the re-scan still yields every coordinate and
-/// falls through to the lower store.
+/// the floor expiry to a **sub-second** instant, asserts the re-scan still
+/// yields every coordinate and falls through, and asserts each refilled cell is
+/// re-stamped to `floor(now) + remaining` (`≤` the row death; Cov1) — the lower
+/// store reports a live `TTL(data)`-style remaining ([`TtlAwareCellStore`]).
 #[test]
 fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
     use std::sync::atomic::AtomicU64;
+
+    // A sub-second instant past the floor expiry (6_000), so the refill's floor
+    // sheds the 500 ms remainder; the lower rows die at 30_000 (`TTL(data)`).
+    const NOW_EXPIRED: u64 = 7_500;
+    const ROW_DEATH: u64 = 30_000;
 
     TEST_RUNTIME.block_on(async {
         let now = Arc::new(AtomicU64::new(1_000));
@@ -824,11 +998,15 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         let cells = MemoryCells::new();
         let (_dir, keyspace) = open_keyspace()?;
         let handle = keyspace.open_partition("scan-ttl", partition_options())?;
-        let lower = CountingCellStore::new(MemoryCellStore::new(
-            cells,
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let lower = TtlAwareCellStore::new(
+            CountingCellStore::new(MemoryCellStore::new(
+                cells,
+                oracle,
+                Arc::new(CollectionDefRegistry::default()),
+            )),
+            Clock::Fixed(now.clone()),
+            ROW_DEATH,
+        );
         let cached = Cached::new(
             FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
             lower.clone(),
@@ -853,7 +1031,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         // Advance past the floor expiry. The covered scan must fall through for
         // the expired cells and still yield all three — never reading an expired
         // coordinate as absent (Cov1).
-        now.store(7_000, Ordering::Relaxed);
+        now.store(NOW_EXPIRED, Ordering::Relaxed);
         lower.reset();
         let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
         assert_eq!(
@@ -865,6 +1043,23 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
             lower.lower_scans() > 0,
             "the expired covered scan must fall through to the lower store"
         );
+
+        // Each refilled cell is re-stamped to `floor(now) + remaining`, flooring
+        // the sub-second remainder so it never overhangs the row death.
+        let remaining_ms = ((ROW_DEATH - NOW_EXPIRED) / 1_000) * 1_000;
+        let want_expiry = NOW_EXPIRED - NOW_EXPIRED % 1_000 + remaining_ms;
+        for c in [3u8, 5, 7] {
+            let stamped = cached.stored_expiry(&id, &cell_at(c)).await?;
+            assert_eq!(
+                stamped,
+                Some(want_expiry),
+                "cell {c} must be re-stamped to floor(now) + remaining"
+            );
+            assert!(
+                stamped.is_some_and(|e| e <= ROW_DEATH),
+                "Cov1: cell {c}'s re-stamped expiry must not overhang the row death"
+            );
+        }
         Ok(())
     })
 }

@@ -277,6 +277,7 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 2. **Secondary Indices** - Coordinator bottlenecks
 3. **Materialized Views** - Breaks under write load
 4. **LWTs (Lightweight Transactions / `IF [NOT] EXISTS` / `IF <cond>`)** - Paxos round-trips serialize all writes to a partition; latency and contention scale catastrophically
+5. **`USING TIMESTAMP` / manually-set write timestamps** - The session installs a `MonotonicTimestampGenerator` (`cassandra/mod.rs`), so the **driver** stamps every write client-side. Because one handler per key and one `PartitionManager` per partition mean all writes to a partition flow through that single session, those timestamps increase monotonically in issue order — which is exactly what makes last-write-wins lost-write-free. Setting the timestamp by hand (`USING TIMESTAMP`, a per-statement timestamp override, any client-supplied value) bypasses the generator and lets a later write silently lose to an earlier one — a lost write with no error. Never set it; let the generator stamp every write.
 
 **Instead:** Proper partition keys, clustering columns for ranges, `Option<T>` for NULLs (filter in code). For "insert-if-new" semantics, prefer idempotent writes or app-level coordination over LWTs.
 
