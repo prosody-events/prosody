@@ -5,6 +5,7 @@ mod ttl_drift;
 
 use super::*;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::test_util::TEST_KEYSPACE;
 use crate::{ConsumerGroup, Partition, Topic};
 use chrono::Utc;
 
@@ -24,12 +25,12 @@ fn future_time(offset_secs: u32) -> CompactDateTime {
 pub(super) async fn build_test_store() -> color_eyre::Result<CassandraTimerDeferStore> {
     let config = CassandraConfiguration::builder()
         .nodes(vec!["localhost:9042".to_owned()])
-        .keyspace("prosody_test".to_owned())
+        .keyspace(TEST_KEYSPACE.to_owned())
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
     let cassandra_store = CassandraStore::new(&config).await?;
-    let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
-    let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
+    let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), TEST_KEYSPACE).await?;
+    let queries = Arc::new(Queries::new(cassandra_store.session(), TEST_KEYSPACE).await?);
     let segment = LazySegment::new(
         segment_store,
         Topic::from("test-topic"),

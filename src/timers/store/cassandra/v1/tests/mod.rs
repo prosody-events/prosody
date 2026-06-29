@@ -15,6 +15,7 @@ pub mod prop_slab_triggers;
 mod test_runner {
     use super::super::V1Operations;
     use crate::cassandra::CassandraConfiguration;
+    use crate::test_util::TEST_KEYSPACE;
     use crate::timers::store::cassandra::queries::Queries;
     use crate::tracing::init_test_logging;
     use quickcheck::{QuickCheck, TestResult};
@@ -39,7 +40,7 @@ mod test_runner {
     async fn create_v1_operations() -> color_eyre::Result<V1Operations> {
         use crate::cassandra::CassandraStore;
 
-        let config = test_cassandra_config("prosody_test");
+        let config = test_cassandra_config(TEST_KEYSPACE);
         let store = CassandraStore::new(&config).await?;
         let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 

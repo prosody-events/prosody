@@ -49,6 +49,13 @@ use tokio::time::sleep;
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
+/// The shared, pre-migrated keyspace every integration test runs against.
+///
+/// Tests never create per-test keyspaces — minting one per test leaks schema
+/// (orphaned keyspaces bloat the cluster and eventually time out migration
+/// tests). Isolation comes from per-test topics and consumer groups instead.
+pub const TEST_KEYSPACE: &str = "prosody_test";
+
 /// Shared multi-threaded runtime for all integration tests.
 ///
 /// # Rationale for `expect`
@@ -426,7 +433,7 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
         datacenter: None,
         rack: None,
         nodes: vec!["localhost:9042".to_owned()],
-        keyspace: "prosody_test".to_owned(),
+        keyspace: TEST_KEYSPACE.to_owned(),
         user: None,
         password: None,
         retention: StdDuration::from_mins(10),

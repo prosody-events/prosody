@@ -9,17 +9,18 @@ mod tombstone_reverse_scan;
 use super::*;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::defer_store_tests;
+use crate::test_util::TEST_KEYSPACE;
 use crate::{ConsumerGroup, Partition, Topic};
 
 pub(super) async fn build_store() -> color_eyre::Result<CassandraMessageDeferStore> {
     let config = CassandraConfiguration::builder()
         .nodes(vec!["localhost:9042".to_owned()])
-        .keyspace("prosody_test".to_owned())
+        .keyspace(TEST_KEYSPACE.to_owned())
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
     let cassandra_store = CassandraStore::new(&config).await?;
-    let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
-    let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
+    let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), TEST_KEYSPACE).await?;
+    let queries = Arc::new(Queries::new(cassandra_store.session(), TEST_KEYSPACE).await?);
     let segment = LazySegment::new(
         segment_store,
         Topic::from("test-topic"),

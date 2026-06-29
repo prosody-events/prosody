@@ -15,15 +15,13 @@ use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
-use crate::test_util::TEST_RUNTIME;
+use crate::test_util::{TEST_KEYSPACE, TEST_RUNTIME};
 use crate::tracing::init_test_logging;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
-
-const TEST_KEYSPACE: &str = "prosody_test";
 
 /// Property-test iteration count for live-backend runs (default 25), from
 /// `INTEGRATION_TESTS`.

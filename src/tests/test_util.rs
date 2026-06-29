@@ -3,6 +3,14 @@ use serde_json::{Map, Value};
 use std::sync::LazyLock;
 use tokio::runtime::{Builder, Runtime};
 
+/// The shared, pre-migrated keyspace every Cassandra-backed test runs against.
+///
+/// Tests never create per-test keyspaces — minting one per test leaks schema
+/// (orphaned keyspaces bloat the cluster and eventually time out migration
+/// tests). Isolation comes from fresh per-test identifiers (segment ids,
+/// group ids, topics) instead.
+pub const TEST_KEYSPACE: &str = "prosody_test";
+
 /// Shared multi-threaded runtime for all unit tests in the crate.
 #[expect(
     clippy::expect_used,

@@ -14,6 +14,7 @@ use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::otel::SpanRelation;
+use crate::test_util::TEST_KEYSPACE;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -78,7 +79,7 @@ async fn setup_test_store_with_version(
         slab_size,
         version,
     };
-    let config = test_cassandra_config("prosody_test");
+    let config = test_cassandra_config(TEST_KEYSPACE);
     let cassandra_store = CassandraStore::new(&config).await?;
     let store = CassandraTriggerStore::with_store(
         cassandra_store,
@@ -97,7 +98,7 @@ async fn setup_test_store_with_version(
 trigger_store_tests!(
     CassandraTriggerStore,
     |slab_size| async move {
-        let config = test_cassandra_config("prosody_test");
+        let config = test_cassandra_config(TEST_KEYSPACE);
         let store = CassandraStore::new(&config).await?;
         let segment = Segment {
             id: Uuid::new_v4(),
@@ -110,7 +111,7 @@ trigger_store_tests!(
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
-        let config = test_cassandra_config("prosody_test");
+        let config = test_cassandra_config(TEST_KEYSPACE);
         let segment = Segment {
             id: Uuid::new_v4(),
             name: String::new(),
@@ -1152,7 +1153,7 @@ fn test_prop_timer_state_invariant() {
         let slab_size = input.slab_size;
         let store = match runtime.block_on(
             async {
-                let config = test_cassandra_config("prosody_test");
+                let config = test_cassandra_config(TEST_KEYSPACE);
                 let store = CassandraStore::new(&config).await?;
                 let segment = Segment {
                     id: Uuid::new_v4(),
@@ -1209,7 +1210,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
         slab_size,
         version: SegmentVersion::V3,
     };
-    let config = test_cassandra_config("prosody_test");
+    let config = test_cassandra_config(TEST_KEYSPACE);
 
     // Build store A with the chosen segment.
     let base_a = CassandraStore::new(&config).await?;

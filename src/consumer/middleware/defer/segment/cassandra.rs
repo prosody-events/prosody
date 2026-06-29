@@ -119,17 +119,18 @@ impl ClassifyError for CassandraSegmentStoreError {
 mod tests {
     use super::*;
     use crate::cassandra::CassandraConfiguration;
+    use crate::test_util::TEST_KEYSPACE;
 
     #[tokio::test]
     async fn test_cassandra_get_or_create_segment() -> color_eyre::Result<()> {
         let config = CassandraConfiguration::builder()
             .nodes(vec!["localhost:9042".to_owned()])
-            .keyspace("prosody_test".to_owned())
+            .keyspace(TEST_KEYSPACE.to_owned())
             .build()
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let cassandra_store = CassandraStore::new(&config).await?;
-        let segment_store = CassandraSegmentStore::new(cassandra_store, "prosody_test").await?;
+        let segment_store = CassandraSegmentStore::new(cassandra_store, TEST_KEYSPACE).await?;
 
         let segment = Segment::new(
             Topic::from("test-topic"),

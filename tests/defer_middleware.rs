@@ -259,8 +259,10 @@ impl DeferTestEnvironment {
             .probe_port(None) // Disable probe server to allow parallel test execution
             .build()?;
 
-        // Use unique keyspace per test to avoid interference
-        let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
+        // Share the migrated keyspace like every other integration test;
+        // isolation comes from the per-test topic and consumer group, so no
+        // per-test keyspace is created (or left to leak).
+        let keyspace = common::TEST_KEYSPACE.to_owned();
         let cassandra_config = CassandraConfiguration::builder()
             .nodes(vec!["localhost:9042".to_owned()])
             .keyspace(keyspace.clone())
@@ -351,8 +353,10 @@ impl DeferTestEnvironment {
             .probe_port(None) // Disable probe server to allow parallel test execution
             .build()?;
 
-        // Use unique keyspace per test
-        let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
+        // Share the migrated keyspace like every other integration test;
+        // isolation comes from the per-test topic and consumer group, so no
+        // per-test keyspace is created (or left to leak).
+        let keyspace = common::TEST_KEYSPACE.to_owned();
         let cassandra_config = CassandraConfiguration::builder()
             .nodes(vec!["localhost:9042".to_owned()])
             .keyspace(keyspace.clone())
