@@ -313,6 +313,20 @@ pub(crate) mod sealed {
         /// registered marker, so the next attempt starts clean.
         fn reset(&self);
 
+        /// Discards just this event's buffered dirty cells — the per-event
+        /// lifecycle clear that
+        /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
+        /// runs on every exit path.
+        ///
+        /// The dirty workspace is partition-lifetime (manager-owned, shared by
+        /// every session clone), so it must be cleared explicitly per event;
+        /// the staged set and marker live on the per-event session and die with
+        /// it, so they are not cleared here. Safe to run after dispatch
+        /// returns: promote (`commit_apply` → `resolve_staged`) reads
+        /// the recorded staged set, never dirty, so the buffer is dead
+        /// once `finalize` has run.
+        fn discard_dirty(&self);
+
         /// Delay between staging and the `StateRecovery` sweep.
         fn recovery_fire_delay(&self) -> CompactDuration;
 
@@ -741,12 +755,16 @@ where
         Ok(())
     }
 
-    fn reset(&self) {
+    fn discard_dirty(&self) {
         // Per-key serialization means no handler op is in flight here.
         self.inner
             .overlay
             .dirty()
             .clear_event(&self.inner.state_key.key);
+    }
+
+    fn reset(&self) {
+        self.discard_dirty();
         *self.inner.staged.lock() = None;
         *self.inner.marker.lock() = None;
     }
@@ -1101,6 +1119,8 @@ where
     async fn flush_marker(&self) -> Result<(), StateAccessError> {
         Ok(())
     }
+
+    fn discard_dirty(&self) {}
 
     fn reset(&self) {
         self.markers.lock().clear();

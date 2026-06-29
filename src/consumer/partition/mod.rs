@@ -716,7 +716,12 @@ async fn process_event<T, S, M, P>(
             // resolves a message by the exact id that writer produced.
             let msg = message.message();
             let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
-            let session = state_manager.session(
+            // The scope owns the event's state lifetime; its `Drop` clears the
+            // dirty buffer. Keep it bound (never `let _`) through dispatch and
+            // `invalidate` so it drops last — per-key serialization keeps the
+            // key busy until this future completes, so no next same-key event
+            // sees stale dirty in the drop window.
+            let scope = state_manager.session(
                 msg.key().clone(),
                 EventRef::Message { dedup_id },
                 TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
@@ -726,7 +731,7 @@ async fn process_event<T, S, M, P>(
                 shutdown_rx.clone(),
                 (cancel_tx, cancel_rx),
                 timer_manager.clone(),
-                session,
+                scope.handle(),
             );
             let cloned_context = context.clone();
             let _guard = message.process_scope();
@@ -785,7 +790,9 @@ async fn process_event<T, S, M, P>(
                     trigger.time,
                     trigger.tag,
                 ));
-                let session = state_manager.session(
+                // Kept bound through dispatch + `invalidate` so its `Drop`
+                // clears the dirty buffer last (see the message arm above).
+                let scope = state_manager.session(
                     firing.key().clone(),
                     event,
                     TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
@@ -795,7 +802,7 @@ async fn process_event<T, S, M, P>(
                     shutdown_rx.clone(),
                     (cancel_tx, cancel_rx),
                     timer_manager.clone(),
-                    session,
+                    scope.handle(),
                 );
                 let cloned_context = context.clone();
                 let _guard = firing.process_scope();

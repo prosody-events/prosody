@@ -68,6 +68,65 @@ type OracleErr<B> = <<B as StateBackend>::Oracle as CommitOracle>::Error;
 /// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
 
+/// The owned, per-event lifetime of a keyed-state session.
+///
+/// `PartitionStateManager::session` mints exactly one of these per event. It
+/// is the single owner of the event's state lifetime: non-`Clone` and
+/// `#[must_use]`, so a mint site cannot drop it on the floor, and its `Drop`
+/// clears the event's buffered dirty cells on **every** exit path — success,
+/// error, abandon, or panic unwind. That makes "clear the buffer when the
+/// event ends" structural rather than a scattered manual call a new code path
+/// could forget.
+///
+/// The session itself stays a freely-cloned `Arc`-backed handle
+/// ([`CellSession`]): the
+/// [`EventContext`](crate::consumer::event_context::EventContext),
+/// the descriptor handles held across `.await`, and the `'static` FFI erasure
+/// all require `Clone + 'static`. So this scope owns one
+/// [`handle`](Self::handle) the rest of the framework shares; the runtime
+/// `invalidate` / per-op termination guards on that handle remain the
+/// stand-in for the compile-time "no write after the event ends" guarantee a
+/// full borrowed-handle refactor would give — they are load-bearing for the
+/// `Clone + 'static` surface and stay.
+///
+/// # Residual (honest boundary)
+///
+/// `#[must_use]` + non-`Clone` + `Drop` guarantee the clear on every exit from
+/// a held scope. They do **not** prevent a deliberate `let _ = session(...)`
+/// or moving a `'static` handle into a task that outlives the scope; either
+/// degrades to a one-event forward-leak of buffered cells (not corruption),
+/// guarded by `#[must_use]`, the `let _guard = …` convention, and the session
+/// lifecycle property test.
+#[must_use]
+pub struct EventStateScope<S>(S)
+where
+    S: CellSession;
+
+impl<S> EventStateScope<S>
+where
+    S: CellSession,
+{
+    /// Wraps the minted session as the event's owned scope.
+    pub fn new(session: S) -> Self {
+        Self(session)
+    }
+
+    /// A cheap (`Arc`) clone of the session handle for the context and handlers
+    /// to share. The scope keeps owning the lifetime; this hands out a view.
+    pub fn handle(&self) -> S {
+        self.0.clone()
+    }
+}
+
+impl<S> Drop for EventStateScope<S>
+where
+    S: CellSession,
+{
+    fn drop(&mut self) {
+        self.0.discard_dirty();
+    }
+}
+
 /// Per-partition keyed-state manager minted by a
 /// [`PartitionStateProvider`].
 ///
@@ -85,8 +144,19 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// staged cell.
     type RecoveryError: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Mints the session for `event` on `key`.
-    fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session;
+    /// Mints the per-event session scope for `event` on `key`.
+    ///
+    /// Returns an [`EventStateScope`]: the single owned, non-`Clone` value
+    /// whose lifetime models the event's. Build the context from its
+    /// [`handle`](EventStateScope::handle) and keep the scope on the stack
+    /// through dispatch; its `Drop` clears the event's dirty buffer on every
+    /// exit path.
+    fn session(
+        &self,
+        key: Key,
+        event: EventRef,
+        termination: TerminationWatch,
+    ) -> EventStateScope<Self::Session>;
 
     /// Runs the `StateRecovery` sweep for `key` and clears the
     /// `StateRecovery` timer once every provisional cell on the key resolves.
@@ -192,8 +262,13 @@ where
     type RecoveryError = RecoveryError<CellErr<B>, OracleErr<B>>;
     type Session = KeyedStateSession<B, L>;
 
-    fn session(&self, key: Key, event: EventRef, termination: TerminationWatch) -> Self::Session {
-        KeyedStateSession::new(SessionParts {
+    fn session(
+        &self,
+        key: Key,
+        event: EventRef,
+        termination: TerminationWatch,
+    ) -> EventStateScope<Self::Session> {
+        EventStateScope::new(KeyedStateSession::new(SessionParts {
             cell: self.inner.cell.clone(),
             dirty: self.inner.dirty.clone(),
             oracle: self.inner.oracle.clone(),
@@ -204,7 +279,7 @@ where
             recovery_delay: self.inner.recovery_delay,
             armed: self.inner.armed.clone(),
             termination,
-        })
+        }))
     }
 
     async fn recover<T>(

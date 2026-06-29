@@ -1,21 +1,27 @@
 //! Session lifecycle property + the marker-ordering pin.
 //!
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of
-//! mutate/commit/abort/reset events through the **real** production session
-//! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`) and asserts
-//! the committed projection (read through the cell store) tracks a plain
-//! `Option<Bytes>` model after every event. One focused example pins the
+//! mutate/commit/abort/reset/fail events through the **real** production
+//! session lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`)
+//! over **one partition-shared [`DirtyStore`]**, minting each event's session
+//! as an [`EventStateScope`] that drops at event-end (the production
+//! lifecycle). It asserts, after every event, that a plain `Option<Bytes>`
+//! model equals both the committed projection and a fresh **overlay read** (the
+//! dirty short-circuit a `committed_value` probe bypasses), and that the shared
+//! dirty buffer is empty for the key — so a failed event's buffered write can
+//! neither linger nor be read as uncommitted. One focused example pins the
 //! ordering a trace cannot observe: the single marker flushes **exactly once,
 //! strictly after the stage** (the [`ScriptedOracle`] `record_message`
 //! counter).
 
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{ArmedKeys, CellRead, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
+use crate::state::manager::EventStateScope;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -105,6 +111,10 @@ struct Fixture {
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     value_name: StateName,
+    /// The one partition-shared dirty workspace every minted session writes
+    /// into — exactly the per-partition store whose missing per-event clear is
+    /// the bug under test.
+    dirty: Arc<DirtyStore>,
     shutdown_rx: watch::Receiver<ShutdownPhase>,
     cancel_rx: watch::Receiver<bool>,
     armed: ArmedKeys,
@@ -128,6 +138,7 @@ impl Fixture {
             registry: Arc::new(registry),
             state_key: StateKey::new(Uuid::from_u128(0x00C0_FFEE), Arc::from("key")),
             value_name: StateName::try_new(VALUE_NAME)?,
+            dirty: Arc::new(DirtyStore::new()),
             shutdown_rx,
             cancel_rx,
             armed: Arc::default(),
@@ -145,11 +156,12 @@ impl Fixture {
         )
     }
 
-    /// Mints a session for `event` over clones of the shared store and oracle.
-    fn session(&self, event: EventRef) -> Session {
-        KeyedStateSession::new(SessionParts {
+    /// Mints the per-event scope for `event` over clones of the shared store,
+    /// oracle, and the one partition-shared dirty workspace.
+    fn session(&self, event: EventRef) -> EventStateScope<Session> {
+        EventStateScope::new(KeyedStateSession::new(SessionParts {
             cell: self.cell_store(),
-            dirty: Arc::new(DirtyStore::new()),
+            dirty: self.dirty.clone(),
             oracle: self.oracle.clone(),
             loader: (),
             registry: self.registry.clone(),
@@ -158,7 +170,24 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), self.cancel_rx.clone()),
-        })
+        }))
+    }
+
+    /// The Value bytes a fresh session reads **through its overlay** — the
+    /// dirty short-circuit then the committed fall-through — minted over the
+    /// shared dirty workspace. Unlike
+    /// [`committed_value`](Self::committed_value), a dirty cell left behind
+    /// by a prior event surfaces here, so this is what catches the
+    /// read-of-uncommitted corruption.
+    async fn overlay_value(&self) -> Result<Option<Bytes>> {
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX - 1),
+        };
+        let scope = self.session(probe);
+        Ok(scope
+            .handle()
+            .get(StateType::Application, &self.value_name, &value_cell())
+            .await?)
     }
 
     fn value_id(&self) -> CollectionId {
@@ -199,7 +228,7 @@ fn message(n: u128) -> (EventRef, Uuid) {
 async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
     let fx = Fixture::new()?;
     let (event, dedup_id) = message(1);
-    let session = fx.session(event);
+    let session = fx.session(event).handle();
 
     session
         .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
@@ -244,6 +273,10 @@ enum Outcome {
     Commit,
     Abort,
     Reset,
+    /// The final-error path: the event ends with no `finalize` and no `reset`
+    /// (settle's error arms never finalize). The buffered write must neither
+    /// commit nor linger — only the scope's `Drop` clears it.
+    Failed,
 }
 
 impl Arbitrary for ValueEvent {
@@ -253,9 +286,10 @@ impl Arbitrary for ValueEvent {
             1 => ValueMut::Clear,
             _ => ValueMut::Skip,
         };
-        let outcome = match u8::arbitrary(g) % 4 {
+        let outcome = match u8::arbitrary(g) % 5 {
             0 => Outcome::Reset,
             1 => Outcome::Abort,
+            2 => Outcome::Failed,
             _ => Outcome::Commit,
         };
         Self { mutation, outcome }
@@ -288,53 +322,75 @@ impl Arbitrary for Trace {
 async fn run(trace: Trace) -> Result<bool> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
+    let key = fx.state_key.key.clone();
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let (event, dedup_id) = message(index as u128 + 1);
-        let session = fx.session(event);
+        // The scope drops at the end of this block — the production per-event
+        // lifetime that clears the shared dirty buffer.
+        {
+            let scope = fx.session(event);
+            let session = scope.handle();
 
-        match ev.mutation {
-            ValueMut::Set(byte) => {
-                session
-                    .set(
-                        StateType::Application,
-                        &fx.value_name,
-                        &value_cell(),
-                        &[byte],
-                    )
-                    .await?;
-            }
-            ValueMut::Clear => {
-                session
-                    .clear(StateType::Application, &fx.value_name, &value_cell())
-                    .await?;
-            }
-            ValueMut::Skip => {}
-        }
-
-        session.finalize().await?;
-        match ev.outcome {
-            Outcome::Commit => {
-                session.register_marker(dedup_id);
-                session.flush_marker().await?;
-                session.commit_apply().await;
-                // Commit advances the model (last-writer-wins).
-                match ev.mutation {
-                    ValueMut::Set(byte) => model = Some(Bytes::copy_from_slice(&[byte])),
-                    ValueMut::Clear => model = None,
-                    ValueMut::Skip => {}
+            match ev.mutation {
+                ValueMut::Set(byte) => {
+                    session
+                        .set(
+                            StateType::Application,
+                            &fx.value_name,
+                            &value_cell(),
+                            &[byte],
+                        )
+                        .await?;
                 }
+                ValueMut::Clear => {
+                    session
+                        .clear(StateType::Application, &fx.value_name, &value_cell())
+                        .await?;
+                }
+                ValueMut::Skip => {}
             }
-            Outcome::Abort => {
-                session.rollback_aborted().await;
-            }
-            Outcome::Reset => {
-                // Discards dirty + staged; any provisional written by `finalize`
-                // lingers but projects its `prev` (the unchanged committed base).
-                session.reset();
+
+            match ev.outcome {
+                Outcome::Commit => {
+                    session.finalize().await?;
+                    session.register_marker(dedup_id);
+                    session.flush_marker().await?;
+                    session.commit_apply().await;
+                    // Commit advances the model (last-writer-wins).
+                    match ev.mutation {
+                        ValueMut::Set(byte) => model = Some(Bytes::copy_from_slice(&[byte])),
+                        ValueMut::Clear => model = None,
+                        ValueMut::Skip => {}
+                    }
+                }
+                Outcome::Abort => {
+                    session.finalize().await?;
+                    session.rollback_aborted().await;
+                }
+                Outcome::Reset => {
+                    session.finalize().await?;
+                    // Discards dirty + staged; any provisional written by
+                    // `finalize` lingers but projects its `prev` (the unchanged
+                    // committed base).
+                    session.reset();
+                }
+                // Final-error path: no `finalize`, no `reset`. Only the scope's
+                // `Drop` clears the buffered write.
+                Outcome::Failed => {}
             }
         }
 
+        // The shared dirty buffer is empty for the key — no per-event leak.
+        if !fx.dirty.touched(&key).is_empty() {
+            return Ok(false);
+        }
+        // A fresh overlay read (the dirty short-circuit path) tracks the model:
+        // a leaked dirty cell would surface here as a read of uncommitted state.
+        if fx.overlay_value().await? != model {
+            return Ok(false);
+        }
+        // The committed projection still tracks the model.
         if fx.committed_value().await? != model {
             return Ok(false);
         }

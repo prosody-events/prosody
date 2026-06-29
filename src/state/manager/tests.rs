@@ -303,7 +303,9 @@ async fn recover_promotes_committed_cell_clears_armed_and_timer() -> Result<()> 
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     let key: Key = Arc::from("k");
 
-    let session = manager.session(key.clone(), timer_event(&key), termination());
+    let session = manager
+        .session(key.clone(), timer_event(&key), termination())
+        .handle();
     stage_under_timer(session, &manager, &key, 7).await?;
     let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
     timers
@@ -350,7 +352,9 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     let key: Key = Arc::from("k");
 
-    let session = manager.session(key.clone(), timer_event(&key), termination());
+    let session = manager
+        .session(key.clone(), timer_event(&key), termination())
+        .handle();
     stage_under_timer(session, &manager, &key, 99).await?;
 
     manager
@@ -382,7 +386,9 @@ async fn recover_leaves_backstop_when_resolution_fails() -> Result<()> {
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     let key: Key = Arc::from("k");
 
-    let session = manager.session(key.clone(), timer_event(&key), termination());
+    let session = manager
+        .session(key.clone(), timer_event(&key), termination())
+        .handle();
     session
         .set(
             StateType::Application,
@@ -423,7 +429,7 @@ async fn recover_leaves_backstop_when_resolution_fails() -> Result<()> {
 /// one `ReadUncommitted` collection (`last_seen`) through one session.
 async fn write_mixed(manager: &TestManager, key: &Key) -> Result<(TestSession, EventRef)> {
     let event = timer_event(key);
-    let session = manager.session(key.clone(), event, termination());
+    let session = manager.session(key.clone(), event, termination()).handle();
     session
         .set(
             StateType::Application,
@@ -553,7 +559,7 @@ async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
     let key: Key = Arc::from("k");
 
     let event = timer_event(&key);
-    let session = manager.session(key.clone(), event, termination());
+    let session = manager.session(key.clone(), event, termination()).handle();
     session
         .set(
             StateType::Application,
