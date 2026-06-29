@@ -71,6 +71,10 @@ pub enum CorruptUdtError {
     #[error("unknown event_ref kind discriminator: {0}")]
     UnknownKind(i8),
 
+    /// `kind == 1` (Timer) but `timer_type` was not a known discriminant.
+    #[error("unknown event_ref timer_type discriminator: {0}")]
+    UnknownTimerType(i8),
+
     /// `kind == 0` (Message) but `msg_dedup_id` was NULL.
     #[error("event_ref Message variant is missing msg_dedup_id")]
     MessageMissingDedupId,

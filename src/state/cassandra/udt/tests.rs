@@ -13,10 +13,11 @@ struct ArbEventRef(EventRef);
 
 impl Arbitrary for ArbEventRef {
     fn arbitrary(g: &mut Gen) -> Self {
-        const TIMER_TYPES: [TimerType; 3] = [
+        const TIMER_TYPES: [TimerType; 4] = [
             TimerType::Application,
             TimerType::DeferredMessage,
             TimerType::DeferredTimer,
+            TimerType::StateRecovery,
         ];
         let event = if bool::arbitrary(g) {
             EventRef::Message {
@@ -72,6 +73,21 @@ fn udt_unknown_kind_rejected() -> Result<()> {
 }
 
 #[test]
+fn udt_unknown_timer_type_rejected() -> Result<()> {
+    let raw = RawEventRef {
+        kind: EventRef::TIMER_KIND,
+        msg_dedup_id: None,
+        timer_type: Some(99),
+        time: Some(CompactDateTime::from(0_u32)),
+        tag: Some(0_i32),
+    };
+    match raw.try_into_event() {
+        Err(CorruptUdtError::UnknownTimerType(99)) => Ok(()),
+        other => Err(eyre::eyre!("expected UnknownTimerType(99), got {other:?}")),
+    }
+}
+
+#[test]
 fn udt_message_missing_dedup_id_rejected() -> Result<()> {
     let raw = RawEventRef {
         kind: EventRef::MESSAGE_KIND,
@@ -91,7 +107,7 @@ fn udt_message_with_timer_fields_rejected() -> Result<()> {
     let raw = RawEventRef {
         kind: EventRef::MESSAGE_KIND,
         msg_dedup_id: Some(Uuid::from_u128(1)),
-        timer_type: Some(TimerType::Application),
+        timer_type: Some(0_i8),
         time: None,
         tag: None,
     };
@@ -106,7 +122,7 @@ fn udt_timer_with_dedup_id_rejected() -> Result<()> {
     let raw = RawEventRef {
         kind: EventRef::TIMER_KIND,
         msg_dedup_id: Some(Uuid::from_u128(1)),
-        timer_type: Some(TimerType::Application),
+        timer_type: Some(0_i8),
         time: Some(CompactDateTime::from(0_u32)),
         tag: Some(0_i32),
     };
@@ -121,7 +137,7 @@ fn udt_timer_missing_field_rejected() -> Result<()> {
     let raw = RawEventRef {
         kind: EventRef::TIMER_KIND,
         msg_dedup_id: None,
-        timer_type: Some(TimerType::Application),
+        timer_type: Some(0_i8),
         time: None,
         tag: Some(0_i32),
     };

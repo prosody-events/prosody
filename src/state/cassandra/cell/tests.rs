@@ -24,6 +24,7 @@ use crate::state::tests::cell_suite::{
     run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
 use crate::state::{CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType};
+use crate::test_util::TEST_KEYSPACE;
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
@@ -32,8 +33,6 @@ use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
-
-const TEST_KEYSPACE: &str = "prosody_test";
 
 /// The production committed bottom assembly: fjall write-through over the
 /// resolving Cassandra cell store.
@@ -308,6 +307,70 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         decode_payload(&raw, Encoding::RawZstdV1)?,
         payload,
         "zstd frame must decompress to the payload"
+    );
+    Ok(())
+}
+
+/// A cell whose `event_ref` UDT carries a `timer_type` outside `{0,1,2,3}`
+/// (external CQL corruption, or a forward-compat cross-version writer) must
+/// reject the **one row** as `CorruptUdt`/`Permanent`, not tear the partition
+/// down with scylla's `Terminal` `DeserializationError`. Injects via raw CQL so
+/// the bad byte travels the real wire/materialization path — the unit test
+/// cannot, since it bypasses scylla deserialization — and reads through the
+/// **bare** `bottom_store` so no fjall cache hit serves the read without
+/// decoding the row.
+#[tokio::test]
+async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::error::{ClassifyError, ErrorCategory};
+    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::resolve::ResolveCellError;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("corrupt-timer")?;
+    let id = c.id();
+
+    // `event` non-NULL alone reaches the validator: with data/prev/encoding/
+    // version all NULL the decoder skips straight to `try_into_event`, where
+    // the Timer arm rejects the unknown `timer_type`.
+    let cql = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         section, coordinate, event) VALUES (?, ?, ?, ?, ?, ?, {{kind: 1, msg_dedup_id: null, \
+         timer_type: 99, time: 0, tag: 0}})"
+    );
+    fx.cassandra
+        .session()
+        .query_unpaged(
+            cql,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                0_i8,
+                b"" as &[u8],
+            ),
+        )
+        .await?;
+
+    let stream = store.provisional_cells(id);
+    futures::pin_mut!(stream);
+    let err = loop {
+        match stream.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => break e,
+            None => return Err(eyre!("expected a CorruptUdt error, got a clean scan")),
+        }
+    };
+    assert_eq!(err.classify_error(), ErrorCategory::Permanent);
+    assert!(
+        matches!(
+            err,
+            ResolveCellError::Store(CassandraCellStoreError::CorruptUdt(_))
+        ),
+        "expected Store(CorruptUdt), got {err:?}"
     );
     Ok(())
 }
