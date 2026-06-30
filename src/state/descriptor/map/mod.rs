@@ -298,8 +298,7 @@ where
         let coordinate = KC::encode(key);
         let buf = encode_cell::<VC>(value).map_err(MapStateError::Codec)?;
         self.view.set(&entry_cell(&coordinate), &buf).await?;
-        self.ratchet_min(&coordinate).await?;
-        self.ratchet_max(&coordinate).await?;
+        self.ratchet_bounds(&coordinate).await?;
         Ok(())
     }
 
@@ -316,27 +315,20 @@ where
         Ok(())
     }
 
-    /// Lowers `META_MIN` to `coordinate` when it is a new minimum (or absent).
-    async fn ratchet_min(&self, coordinate: &Coordinate) -> Result<(), MapStateError<VC::Error>> {
-        let min_cell = meta_min_cell();
-        let extend = self
-            .read_bound(&min_cell)
-            .await?
-            .is_none_or(|min| coordinate.as_bytes() < min.as_bytes());
-        if extend {
+    /// Ratchets `META_MIN`/`META_MAX` outward to `coordinate`. Reads both bound
+    /// cells concurrently (they are independent), then extends each that
+    /// `coordinate` exceeds — the conditional sets stay sequential (cheap
+    /// in-memory buffering, nothing to overlap).
+    async fn ratchet_bounds(
+        &self,
+        coordinate: &Coordinate,
+    ) -> Result<(), MapStateError<VC::Error>> {
+        let (min_cell, max_cell) = (meta_min_cell(), meta_max_cell());
+        let (min, max) = tokio::try_join!(self.read_bound(&min_cell), self.read_bound(&max_cell))?;
+        if min.is_none_or(|min| coordinate.as_bytes() < min.as_bytes()) {
             self.view.set(&min_cell, coordinate.as_bytes()).await?;
         }
-        Ok(())
-    }
-
-    /// Raises `META_MAX` to `coordinate` when it is a new maximum (or absent).
-    async fn ratchet_max(&self, coordinate: &Coordinate) -> Result<(), MapStateError<VC::Error>> {
-        let max_cell = meta_max_cell();
-        let extend = self
-            .read_bound(&max_cell)
-            .await?
-            .is_none_or(|max| coordinate.as_bytes() > max.as_bytes());
-        if extend {
+        if max.is_none_or(|max| coordinate.as_bytes() > max.as_bytes()) {
             self.view.set(&max_cell, coordinate.as_bytes()).await?;
         }
         Ok(())

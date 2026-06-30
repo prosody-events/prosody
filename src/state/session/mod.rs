@@ -807,17 +807,28 @@ where
         CollectionRef::new(id.clone(), registry.ttl_for(id.state_type(), id.name()));
     match registry.commit_mode_for(id.state_type(), id.name()) {
         CommitMode::ReadCommitted => {
-            let mut writes = Vec::new();
-            for (cell, value) in cells {
-                // The own-event committed read returns this event's `prev` while
-                // its provisional cell stands, so a retry re-stages over the
-                // same base (idempotent).
-                let prev = lower
-                    .get(&id, &cell, event)
-                    .await
-                    .map_err(|e| StateAccessError::store(&e))?;
-                writes.push((cell, ProvisionalWrite::new(dirty_data(value), prev, event)));
-            }
+            let id = &id;
+            // Read each touched cell's committed base concurrently: the
+            // own-event committed read returns this event's `prev` while its
+            // provisional cell stands, so a retry re-stages over the same base
+            // (idempotent). `cooperative` adds a per-cell coop-budget
+            // checkpoint; `buffer_unordered` keeps full concurrency. Reordering
+            // is irrelevant — the cells are distinct coordinates landing in one
+            // same-partition batch.
+            let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(cells)
+                .map(|(cell, value)| {
+                    let data = dirty_data(value);
+                    cooperative(async move {
+                        let prev = lower
+                            .get(id, &cell, event)
+                            .await
+                            .map_err(|e| StateAccessError::store(&e))?;
+                        Ok((cell, ProvisionalWrite::new(data, prev, event)))
+                    })
+                })
+                .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+                .try_collect()
+                .await?;
             lower
                 .write_provisional(&collection_ref, &writes)
                 .await
