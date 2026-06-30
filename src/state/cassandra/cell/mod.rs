@@ -454,6 +454,15 @@ where
             pin_mut!(stream);
 
             let mut yielded = 0usize;
+            // Deliberately sequential, not an oversight: the common `resolve_read`
+            // is a free no-op (own-event provisional / already-resolved cells
+            // consult no oracle and write nothing), so steady-state scans gain
+            // nothing from fan-out; the only payoff is mid-recovery across many
+            // foreign provisional cells. And because `limit` counts *present*
+            // yields — knowable only post-resolve — a buffered pipeline would
+            // resolve up to N−1 foreign-provisional cells past the boundary, each
+            // a durable write-back: read-path write amplification we won't pay for
+            // a recovery-only win on a hot read path.
             while let Some(row) = cooperative(stream.try_next())
                 .await
                 .map_err(CassandraStoreError::from)

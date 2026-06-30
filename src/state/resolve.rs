@@ -14,6 +14,7 @@
 //! gates its `unschedule_all` on.
 
 use super::CommitDecision;
+use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Cell, Committed, ProvisionalCell};
 use super::cell_key::CellKey;
 use super::event_ref::EventRef;
@@ -22,7 +23,7 @@ use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::store::CellStore;
 use crate::error::{ClassifyError, ErrorCategory};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use std::error::Error;
 use std::fmt;
 use std::slice;
@@ -195,25 +196,32 @@ where
     S: CellStore,
     O: CommitOracle,
 {
-    let stream = store.provisional_cells(collection.id());
-    futures::pin_mut!(stream);
-    let mut all_resolved = true;
-    while let Some(item) = stream.next().await {
-        let (cell, provisional) = item.map_err(ResolveCellError::Store)?;
-        match resolve_cell(store, oracle, collection, &cell, provisional).await {
-            Ok(_) => {}
-            Err(error) if error.classify_error() == ErrorCategory::Permanent => {
-                error!(
-                    name = collection.id().name().as_str(),
-                    "skipping permanently-failing provisional cell; first-touch or the cell TTL \
-                     must resolve it: {error:#}"
-                );
-                all_resolved = false;
+    // Resolutions of distinct cells are independent and commutative (each cell
+    // is promoted/rolled-back once), so pipeline them on the partition's shard:
+    // `try_fold` ANDs the per-cell Permanent-skip flags and short-circuits on a
+    // propagating error — the same outcome as the sequential loop, order-free.
+    // Cassandra/oracle I/O leaves drive the coop budget, so no `cooperative`.
+    store
+        .provisional_cells(collection.id())
+        .map_err(ResolveCellError::Store)
+        .map(|item| async move {
+            let (cell, provisional) = item?;
+            match resolve_cell(store, oracle, collection, &cell, provisional).await {
+                Ok(_) => Ok(true),
+                Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+                    error!(
+                        name = collection.id().name().as_str(),
+                        "skipping permanently-failing provisional cell; first-touch or the cell \
+                         TTL must resolve it: {error:#}"
+                    );
+                    Ok(false)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(all_resolved)
+        })
+        .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
+        .try_fold(true, |all, ok| async move { Ok(all && ok) })
+        .await
 }
 
 /// Error raised by cell resolution: the bottom stores' resolving `get`/

@@ -67,8 +67,8 @@ use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::{
-    CollectionKindId, CommitMode, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend, StateKey,
-    StateName, StateType, StoreOutcome,
+    CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
+    StateBackend, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -814,7 +814,9 @@ where
             // (idempotent). `cooperative` adds a per-cell coop-budget
             // checkpoint; `buffer_unordered` keeps full concurrency. Reordering
             // is irrelevant — the cells are distinct coordinates landing in one
-            // same-partition batch.
+            // same-partition batch. These reads are all within this one
+            // collection (one shard), so they fan out under the within-partition
+            // `SHARD_FANOUT_CONCURRENCY`, not the cross-partition bound.
             let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(cells)
                 .map(|(cell, value)| {
                     let data = dirty_data(value);
@@ -826,7 +828,7 @@ where
                         Ok((cell, ProvisionalWrite::new(data, prev, event)))
                     })
                 })
-                .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+                .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
                 .try_collect()
                 .await?;
             lower

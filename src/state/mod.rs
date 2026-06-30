@@ -85,6 +85,15 @@ pub use transaction::{CommitMode, Read};
 /// Each collection is its own Cassandra partition, so the fan-out is safe.
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
+/// Maximum concurrent in-flight requests within a *single* collection
+/// (one Cassandra partition → one Scylla shard): the batch-chunk submission
+/// of one durable write, the recovery sweep's per-cell resolution, and a
+/// stage's committed-base reads. Same shard, so this bounds round-trip /
+/// oracle-consult *overlap* (latency), not throughput; kept modest because it
+/// nests inside the per-collection `STATE_FANOUT_CONCURRENCY` fan-out, so the
+/// product is the per-shard in-flight depth.
+pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
+
 /// The per-partition backend bundle: the one uniform durable cell store, the
 /// shared commit oracle, and the shared descriptor-identity store — behind one
 /// type parameter so the session and manager name only `B`.

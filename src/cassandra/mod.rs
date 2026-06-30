@@ -5,10 +5,12 @@
 //! a single session and unified migration system.
 
 use crate::propagator::new_propagator;
+use crate::state::SHARD_FANOUT_CONCURRENCY;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentVersion;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::client::Compression;
@@ -28,6 +30,7 @@ use scylla::serialize::writers::RowWriter;
 use scylla::statement::Consistency;
 use scylla::statement::batch::{Batch, BatchStatement, BatchType};
 use scylla::statement::prepared::PreparedStatement;
+use smallvec::SmallVec;
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
@@ -302,29 +305,41 @@ impl CassandraStore {
         max_count: usize,
     ) -> Result<(), CassandraStoreError>
     where
-        P: SerializeRow,
+        P: SerializeRow + Sync,
     {
-        // `Weighed::weight` is a *function item*, not a closure: it is inherently
-        // higher-ranked over the borrow lifetime in `P`, so the boundary iterator
-        // it feeds can be held across the loop's awaits. A `|r| r.weight` closure
-        // here trips "implementation of FnOnce is not general enough".
-        for range in chunk_boundaries(rows.iter().map(Weighed::weight), max_bytes, max_count) {
-            let count = range.end - range.start;
-            // One shallow (Arc) clone of the shared prepared statement per row;
-            // the slice `&rows[range]` is itself the `BatchValues` (no per-chunk
-            // value allocation).
-            let statements: Vec<BatchStatement> =
-                iter::repeat_with(|| BatchStatement::from(statement.clone()))
-                    .take(count)
-                    .collect();
-            let mut batch = Batch::new_with_statements(BatchType::Unlogged, statements);
-            batch.set_is_idempotent(true);
-            self.session()
-                .batch(&batch, &rows[range])
-                .await
-                .map_err(CassandraStoreError::from)?;
-        }
-        Ok(())
+        // Collect the chunk ranges eagerly: `Weighed::weight` is a *function
+        // item*, not a closure, so the boundary iterator is higher-ranked over
+        // `P`'s borrow, but draining it into a `SmallVec` up front (heap-free in
+        // the common single-chunk case) lets each chunk's future own its `range`
+        // without holding the lazy iterator across an await — sidestepping the
+        // "implementation of FnOnce is not general enough" the original `for`
+        // loop was shaped to avoid. The chunks partition this collection's cells
+        // into disjoint sub-slices, so concurrent batches never touch the same
+        // cell; `MonotonicTimestampGenerator` keeps last-write-wins correct
+        // regardless of submission order. `session.batch().await` is a tokio I/O
+        // leaf, so the coop budget decrements naturally — no `cooperative` wrap.
+        let ranges: SmallVec<[Range<usize>; 1]> =
+            chunk_boundaries(rows.iter().map(Weighed::weight), max_bytes, max_count).collect();
+        stream::iter(ranges)
+            .map(|range| async move {
+                // One shallow (Arc) clone of the shared prepared statement per
+                // row; the slice `&rows[range]` is itself the `BatchValues` (no
+                // per-chunk value allocation).
+                let statements: Vec<BatchStatement> =
+                    iter::repeat_with(|| BatchStatement::from(statement.clone()))
+                        .take(range.len())
+                        .collect();
+                let mut batch = Batch::new_with_statements(BatchType::Unlogged, statements);
+                batch.set_is_idempotent(true);
+                self.session()
+                    .batch(&batch, &rows[range])
+                    .await
+                    .map(drop)
+                    .map_err(CassandraStoreError::from)
+            })
+            .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
+            .try_collect::<()>()
+            .await
     }
 }
 

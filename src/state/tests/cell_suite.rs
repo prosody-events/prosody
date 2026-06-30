@@ -1171,33 +1171,71 @@ where
     }
 }
 
-/// A [`CellStore`] wrapper whose `mark_resolved` fails **permanently** for one
-/// named collection, delegating everything else to `inner`. Drives the
-/// session's best-effort `commit_apply` (one poisoned cell yields `Incomplete`
-/// without cancelling siblings) and the manager's no-strand recovery (a failed
-/// resolution leaves the backstop armed).
+/// Where a [`FailingCellStore`] injects its `mark_resolved` failure.
+#[derive(Clone)]
+enum Poison {
+    /// Every cell of one named collection fails `Permanent` — the session's
+    /// best-effort `commit_apply` and the manager's no-strand recovery.
+    Collection(StateName),
+    /// Chosen single-byte coordinates each fail with a fixed category — a mixed
+    /// per-cell sweep where unpoisoned siblings must still resolve.
+    Cells(BTreeMap<u8, ErrorCategory>),
+}
+
+/// A [`CellStore`] wrapper whose `mark_resolved` fails for a chosen target,
+/// delegating everything else to `inner`. Drives the session's best-effort
+/// `commit_apply` (one poisoned cell yields `Incomplete` without cancelling
+/// siblings), the manager's no-strand recovery (a failed resolution leaves the
+/// backstop armed), and the sweep's per-cell `try_fold` failure arm.
 #[derive(Clone)]
 pub(crate) struct FailingCellStore<S> {
     inner: S,
-    poison: StateName,
+    poison: Poison,
 }
 
 impl<S> FailingCellStore<S> {
-    /// Wraps `inner`, poisoning `mark_resolved` for the `poison` collection.
+    /// Wraps `inner`, poisoning `mark_resolved` `Permanent` for every cell of
+    /// the `poison` collection.
     pub(crate) fn new(inner: S, poison: StateName) -> Self {
-        Self { inner, poison }
+        Self {
+            inner,
+            poison: Poison::Collection(poison),
+        }
+    }
+
+    /// Wraps `inner`, poisoning `mark_resolved` for each single-byte coordinate
+    /// in `cells` with its mapped category (others resolve normally).
+    pub(crate) fn with_cells(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
+        Self {
+            inner,
+            poison: Poison::Cells(cells),
+        }
+    }
+
+    /// The category to inject when `mark_resolved` touches `cells`, or `None`.
+    fn injected(&self, collection: &CollectionRef, cells: &[CellKey]) -> Option<ErrorCategory> {
+        match &self.poison {
+            Poison::Collection(name) => {
+                (*collection.id().name() == *name).then_some(ErrorCategory::Permanent)
+            }
+            Poison::Cells(targets) => cells
+                .iter()
+                .find_map(|c| targets.get(&coord_of(c)).copied()),
+        }
     }
 }
 
-/// Error of a [`FailingCellStore`]: the poison, or a delegated inner error.
+/// Error of a [`FailingCellStore`]: the injected poison (with its category), or
+/// a delegated inner error.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FailCellError<E>
 where
     E: Error + 'static,
 {
-    /// The poisoned collection's `mark_resolved` was called.
-    #[error("permanent promote poison")]
-    Poison,
+    /// `mark_resolved` touched a poisoned cell; the category is what the
+    /// wrapper was asked to inject.
+    #[error("promote poison ({0:?})")]
+    Poison(ErrorCategory),
 
     /// A delegated inner-store error.
     #[error(transparent)]
@@ -1210,7 +1248,7 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Poison => ErrorCategory::Permanent,
+            Self::Poison(category) => *category,
             Self::Inner(e) => e.classify_error(),
         }
     }
@@ -1281,8 +1319,8 @@ where
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
     ) -> Result<(), Self::Error> {
-        if *collection.id().name() == self.poison {
-            return Err(FailCellError::Poison);
+        if let Some(category) = self.injected(collection, cells) {
+            return Err(FailCellError::Poison(category));
         }
         self.inner
             .mark_resolved(collection, cells)
@@ -1296,6 +1334,127 @@ mod sweep {
     use super::super::super::memory::{MemoryCellStore, MemoryCells};
     use super::super::super::registry::CollectionDefRegistry;
     use super::*;
+    use futures::executor;
+    use quickcheck::QuickCheck;
+
+    /// A staged cell's promote outcome, assigned at random by the sweep
+    /// failure-arm property: resolve cleanly, fail `Permanent` (skipped by the
+    /// sweep), or fail transiently (aborts the sweep).
+    #[derive(Clone, Copy, Debug)]
+    enum Promote {
+        Resolve,
+        SkipPermanent,
+        FailTransient,
+    }
+
+    impl Promote {
+        /// The failure category injected for this cell's `mark_resolved`, or
+        /// `None` to let it resolve.
+        fn category(self) -> Option<ErrorCategory> {
+            match self {
+                Self::Resolve => None,
+                Self::SkipPermanent => Some(ErrorCategory::Permanent),
+                Self::FailTransient => Some(ErrorCategory::Transient),
+            }
+        }
+    }
+
+    impl Arbitrary for Promote {
+        fn arbitrary(g: &mut Gen) -> Self {
+            match u8::arbitrary(g) % 3 {
+                0 => Self::SkipPermanent,
+                1 => Self::FailTransient,
+                _ => Self::Resolve,
+            }
+        }
+    }
+
+    /// A random per-cell outcome assignment, capped so coordinates stay
+    /// distinct single bytes and traces stay small.
+    #[derive(Clone, Debug)]
+    struct SweepOutcomes(Vec<Promote>);
+
+    impl Arbitrary for SweepOutcomes {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self(capped_vec(g, 16))
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            Box::new(self.0.shrink().map(Self))
+        }
+    }
+
+    /// Drives one random outcome assignment through `sweep_provisional` and
+    /// checks its contract. Stages one committed provisional cell per outcome
+    /// in a single collection (so all resolutions share one sweep), poisons
+    /// the chosen cells, then asserts the sweep's return matches the
+    /// assignment.
+    async fn run_sweep_failure(SweepOutcomes(outcomes): SweepOutcomes) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let registry = Arc::new(CollectionDefRegistry::default());
+        let inner = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry);
+        let collection = CollectionRef::new(
+            CollectionId::new(
+                StateKey::new(Uuid::new_v4(), Arc::from("k")),
+                StateType::Application,
+                StateName::try_new("sweep-fail")?,
+            ),
+            None,
+        );
+
+        // One committed provisional cell per outcome, at distinct coordinates.
+        for c in 0..outcomes.len() as u8 {
+            let dedup_id = Uuid::from_u128(u128::from(c));
+            let event = EventRef::Message { dedup_id };
+            let cell = cell_at(c);
+            let prev = inner.get(collection.id(), &cell, event).await?;
+            inner
+                .write_provisional(
+                    &collection,
+                    &[(cell, ProvisionalWrite::new(Some(bytes(c)), prev, event))],
+                )
+                .await?;
+            oracle.record_message(dedup_id).await?;
+        }
+
+        let poison: BTreeMap<u8, ErrorCategory> = outcomes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, outcome)| outcome.category().map(|category| (i as u8, category)))
+            .collect();
+        let permanent = poison
+            .values()
+            .filter(|&&category| category == ErrorCategory::Permanent)
+            .count();
+        let has_transient = poison.values().any(|&c| c == ErrorCategory::Transient);
+
+        let store = FailingCellStore::with_cells(inner, poison);
+        match sweep_provisional(&store, &oracle, &collection).await {
+            // A transient failure must surface as an error; nothing else may.
+            Err(_) => Ok(has_transient),
+            // No transient: the sweep reports all-resolved iff nothing was
+            // skipped, and exactly the Permanent-skipped cells linger — every
+            // sibling resolved regardless of submission order.
+            Ok(all_resolved) => {
+                let lingering = provisional_count(&store, collection.id()).await?;
+                Ok(!has_transient && all_resolved == (permanent == 0) && lingering == permanent)
+            }
+        }
+    }
+
+    /// `sweep_provisional`'s failure-arm contract, the invariant the `try_fold`
+    /// rewrite must preserve over the old sequential loop: a `Permanent` cell
+    /// is skipped (the sweep still resolves its siblings and reports
+    /// `false`), while any transient cell aborts the whole sweep.
+    /// Order-independent, so the concurrent `buffer_unordered` pipeline
+    /// answers exactly as the loop did.
+    #[test]
+    fn prop_sweep_failure_arm() {
+        fn property(outcomes: SweepOutcomes) -> Result<bool> {
+            executor::block_on(run_sweep_failure(outcomes))
+        }
+        QuickCheck::new().quickcheck(property as fn(SweepOutcomes) -> Result<bool>);
+    }
 
     /// The first sweep over staged provisional cells resolves them; a second
     /// sweep performs **zero durable writes** — `provisional_cells` yields
