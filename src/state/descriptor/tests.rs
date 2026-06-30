@@ -20,8 +20,8 @@ use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
-    CommitDecision, CommitMode, EventRef, SharedStateBackend, StateBackendFactory, StateKey,
-    StateName, StateType,
+    CommitDecision, CommitMode, Direction, EventRef, SharedStateBackend, StateBackendFactory,
+    StateKey, StateName, StateType,
 };
 use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
@@ -704,11 +704,12 @@ mod scope_and_parity {
         })
     }
 
-    /// Collects a Map handle's stream into an ordered `(key, value)` vector.
+    /// Collects a Map handle's forward stream into an ordered `(key, value)`
+    /// vector.
     async fn collect_map<S: CellRead>(
         handle: &MapHandle<S, Utf8KeyCodec, JsonCodec>,
     ) -> Result<Vec<(String, Value)>> {
-        let stream = handle.stream();
+        let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
@@ -717,9 +718,9 @@ mod scope_and_parity {
         Ok(out)
     }
 
-    /// Collects a Deque handle's stream into an ordered vector.
+    /// Collects a Deque handle's forward stream into an ordered vector.
     async fn collect_deque<S: CellRead>(handle: &DequeHandle<S, JsonCodec>) -> Result<Vec<Value>> {
-        let stream = handle.stream();
+        let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {

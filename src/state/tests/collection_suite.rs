@@ -33,7 +33,8 @@ use crate::state::session::{
 };
 use crate::state::store::CellStore;
 use crate::state::{
-    CollectionId, CollectionRef, EventRef, PartitionBackend, StateKey, StateName, StateType,
+    CollectionId, CollectionRef, Direction, EventRef, PartitionBackend, StateKey, StateName,
+    StateType,
 };
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
@@ -492,8 +493,9 @@ async fn assert_map_bounds(
     Ok(true)
 }
 
-/// Asserts a deque handle equals the model: `len`, `is_empty`, the ordered
-/// `stream`, and `get` at every position (including out of range → `None`).
+/// Asserts a deque handle equals the model: `len`, `is_empty`, both stream
+/// directions (front-to-back for `Forward`, back-to-front for `Backward`), and
+/// `get` at every position (including out of range → `None`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
     S: CellRead,
@@ -502,13 +504,12 @@ where
     if handle.len().await? != model.len() || handle.is_empty().await? != model.is_empty() {
         return Ok(false);
     }
-    let mut streamed = Vec::new();
-    let stream = handle.stream();
-    futures::pin_mut!(stream);
-    while let Some(item) = stream.next().await {
-        streamed.push(item?);
+    let forward: Vec<Value> = model.iter().cloned().collect();
+    if collect_deque(handle, Direction::Forward).await? != forward {
+        return Ok(false);
     }
-    if streamed != model.iter().cloned().collect::<Vec<_>>() {
+    let backward: Vec<Value> = model.iter().rev().cloned().collect();
+    if collect_deque(handle, Direction::Backward).await? != backward {
         return Ok(false);
     }
     for index in 0..model.len() + 2 {
@@ -519,8 +520,24 @@ where
     Ok(true)
 }
 
-/// Asserts a map handle equals the model: `get` over the whole key pool and the
-/// key-ordered `stream`.
+/// Collects a deque handle's `stream(dir)` into a vector.
+async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
+where
+    S: CellRead,
+    C: Codec<Payload = Value>,
+{
+    let mut out = Vec::new();
+    let stream = handle.stream(dir);
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+/// Asserts a map handle equals the model: `get` over the whole key pool and
+/// both stream directions (ascending for `Forward`, descending for
+/// `Backward`).
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
@@ -533,14 +550,29 @@ where
             return Ok(false);
         }
     }
-    let mut streamed = Vec::new();
-    let stream = handle.stream();
+    let ascending: Vec<(i64, Value)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
+    if collect_map(handle, Direction::Forward).await? != ascending {
+        return Ok(false);
+    }
+    let descending: Vec<(i64, Value)> = model.iter().rev().map(|(k, v)| (*k, v.clone())).collect();
+    Ok(collect_map(handle, Direction::Backward).await? == descending)
+}
+
+/// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
+async fn collect_map<S>(
+    handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
+    dir: Direction,
+) -> Result<Vec<(i64, Value)>>
+where
+    S: CellRead,
+{
+    let mut out = Vec::new();
+    let stream = handle.stream(dir);
     futures::pin_mut!(stream);
     while let Some(item) = stream.next().await {
-        streamed.push(item?);
+        out.push(item?);
     }
-    let expected: Vec<(i64, Value)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
-    Ok(streamed == expected)
+    Ok(out)
 }
 
 /// Inv 4 (missing-bound fallback): with live entries committed but **no**
@@ -584,6 +616,59 @@ fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
         .collect();
     if !block_on(assert_map(&handle, &model))? {
         return Err(eyre!("missing-bound fallback dropped a live entry"));
+    }
+    Ok(())
+}
+
+/// Inv 4 (backward missing-bound fallback): with live entries and `META_MIN`
+/// committed but **no** `META_MAX` (the post-TTL-expiry state of just the high
+/// bound, seeded directly), `stream(Direction::Backward)` falls back to an
+/// `Unbounded` high anchor and still yields every live entry descending. The
+/// symmetric counterpart of [`map_missing_min_bound_falls_back_to_full_scan`],
+/// isolating the backward path while the forward bound stands.
+#[test]
+fn map_missing_max_bound_falls_back_to_full_scan() -> Result<()> {
+    use crate::state::descriptor::map::{bound_cells, entry_cell_for};
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) = registry_and_ref(&descriptor, "mp", &state_key)?;
+
+    // Seed entries plus only META_MIN, leaving META_MAX expired/absent.
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let seeded = [(-1_i64, 9_u8), (3, 4), (7, 1)];
+    for (key, value) in seeded {
+        let cell = entry_cell_for(&I64KeyCodec::encode(&key));
+        let bytes = Bytes::from(serde_json::to_vec(&Value::from(value))?);
+        block_on(store.write_resolved(&collection_ref, &[(cell, Some(bytes))]))?;
+    }
+    let (min_cell, _) = bound_cells();
+    let min_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&-1).as_bytes());
+    block_on(store.write_resolved(&collection_ref, &[(min_cell, Some(min_bytes))]))?;
+
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let model: BTreeMap<i64, Value> = seeded
+        .into_iter()
+        .map(|(key, value)| (key, Value::from(value)))
+        .collect();
+    let descending: Vec<(i64, Value)> = model.iter().rev().map(|(k, v)| (*k, v.clone())).collect();
+    if block_on(collect_map(&handle, Direction::Backward))? != descending {
+        return Err(eyre!(
+            "backward missing-max fallback dropped or misordered a live entry"
+        ));
     }
     Ok(())
 }

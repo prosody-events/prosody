@@ -245,11 +245,22 @@ where
         self.read_entry(absolute).await
     }
 
-    /// Streams the live elements front to back, in index order.
+    /// Streams the live elements in index order — front to back for
+    /// [`Direction::Forward`], back to front for [`Direction::Backward`].
     ///
-    /// Anchors at `head` and stops after `len` cells, so popped tombstones
-    /// (below `head` or at/above `tail`) are never yielded.
-    pub fn stream(&self) -> impl Stream<Item = Result<C::Payload, DequeStateError<C::Error>>> + '_ {
+    /// # Invariant
+    ///
+    /// The scan yields the dense `[head, tail)` window (see the type's
+    /// dense-window invariant) in `dir` order. It anchors at that window's
+    /// leading edge — `head` for `Forward`, `tail − 1` for `Backward` — and
+    /// stops after `len` cells, so popped tombstones (below `head` or at/above
+    /// `tail`) are never yielded. [`order_preserving_i64`] makes byte order the
+    /// signed-index order, so the backward scan walks back-to-front across the
+    /// sign boundary correctly.
+    pub fn stream(
+        &self,
+        dir: Direction,
+    ) -> impl Stream<Item = Result<C::Payload, DequeStateError<C::Error>>> + '_ {
         try_stream! {
             ensure_live(self.view.session())?;
             let (head, tail) = self.bounds().await?;
@@ -257,11 +268,17 @@ where
             if len == 0 {
                 return;
             }
-            let start = index_coordinate(head);
+            // The leading-edge index: `head` forward, the last live index
+            // `tail − 1` backward (`len > 0` proves it does not underflow).
+            let anchor = match dir {
+                Direction::Forward => head,
+                Direction::Backward => tail.checked_sub(1).ok_or(MetaDecodeError::IndexOverflow)?,
+            };
+            let start = index_coordinate(anchor);
             let scan = Scan {
                 section: ENTRY_SECTION,
                 start: Bound::Included(&start),
-                dir: Direction::Forward,
+                dir,
                 end: Bound::Unbounded,
                 limit: Some(len),
             };

@@ -23,14 +23,16 @@
 //! `set` ratchets `META_MIN`/`META_MAX` **outward only** and never reads the
 //! entry being written, so a blind last-writer-wins entry write is preserved
 //! and the bounds may point at a key that was since removed — a *superset* of
-//! the live key range, never a subset. `stream` anchors its forward scan at
-//! `META_MIN` (falling back to the empty coordinate when the bound is missing
-//! or expired) and relies on the store hiding cleared cells, so it yields
-//! exactly the live entries in key order regardless of stale bounds: a
-//! below-min residue is never reached, a live key can never sit above max, and
-//! the missing-bound fallback scans from the start. The bounds are therefore
-//! self-healing — never an exact count, by design (a count would force a
-//! read-before-write on every mutation).
+//! the live key range, never a subset. `stream` anchors its scan at the bound
+//! on its leading edge — `META_MIN` for a forward (ascending) scan, `META_MAX`
+//! for a backward (descending) one — each falling back to the section edge
+//! (`Unbounded`) when its bound is missing or expired, and relies on the store
+//! hiding cleared cells, so it yields exactly the live entries in key order
+//! regardless of stale bounds: a residue beyond the live range is never
+//! reached, a live key can never sit outside its bound, and the missing-bound
+//! fallback scans from the edge. The bounds are therefore self-healing — never
+//! an exact count, by design (a count would force a read-before-write on every
+//! mutation).
 
 use super::{
     CellView, DescriptorIdentity, StateDescriptor, StructuralIdentity, decode_cell, encode_cell,
@@ -218,22 +220,37 @@ where
             .transpose()
     }
 
-    /// Streams the live entries in key order.
+    /// Streams the live entries in key order — ascending for
+    /// [`Direction::Forward`], descending for [`Direction::Backward`].
     ///
-    /// Anchors the scan at `META_MIN` (falling back to the empty coordinate
-    /// when the bound is missing) and skips cleared cells, so a stale bound
-    /// never drops a live entry (the loose-superset invariant).
-    pub fn stream(&self) -> impl Stream<Item = MapEntry<KC, VC>> + '_ {
+    /// # Invariant
+    ///
+    /// The scan yields exactly the live entries in key order for `dir`. It
+    /// anchors at the bound on its leading edge — `META_MIN` for `Forward`,
+    /// `META_MAX` for `Backward` — falling back to the section edge
+    /// (`Unbounded`) when that bound is missing or expired, and skips cleared
+    /// cells. So a stale bound never drops a live entry (the loose-superset
+    /// invariant): a live key can never sit beyond its bound, a residue past a
+    /// since-removed extreme is hidden by the store, and the missing-bound
+    /// fallback scans from the edge.
+    pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapEntry<KC, VC>> + '_ {
         try_stream! {
             ensure_live(self.view.session())?;
-            let start = self
-                .read_bound(&meta_min_cell())
-                .await?
-                .unwrap_or_else(Coordinate::empty);
+            // Anchor at the leading-edge bound; the symmetric fallback is the
+            // empty coordinate (the low edge) for forward, `Unbounded` (the
+            // high edge) for backward.
+            let anchor = match dir {
+                Direction::Forward => Some(
+                    self.read_bound(&meta_min_cell())
+                        .await?
+                        .unwrap_or_else(Coordinate::empty),
+                ),
+                Direction::Backward => self.read_bound(&meta_max_cell()).await?,
+            };
             let scan = Scan {
                 section: ENTRY_SECTION,
-                start: Bound::Included(&start),
-                dir: Direction::Forward,
+                start: anchor.as_ref().map_or(Bound::Unbounded, Bound::Included),
+                dir,
                 end: Bound::Unbounded,
                 limit: None,
             };
