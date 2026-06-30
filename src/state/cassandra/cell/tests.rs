@@ -415,6 +415,170 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         .quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
+/// Co-anchoring regression-prover for defect (a): every cell of one multi-cell
+/// write under a collection TTL must share a single write timestamp **and**
+/// TTL. One same-partition `UNLOGGED BATCH` carries one batch write timestamp
+/// and one coordinator TTL anchor, so `WRITETIME(data)` and `TTL(data)` are
+/// identical across the cells; the old per-cell `execute()` loop stamped each
+/// statement with a *distinct* monotonic client timestamp, so this fails
+/// **deterministically** against it — the discriminator is the timestamp, not
+/// wall-clock TTL drift, so there is no second-boundary flakiness. Run over
+/// multi-cell writes of varying cardinality and payload sizes.
+#[test]
+fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::state::cell_key::Coordinate;
+    use crate::test_util::TEST_RUNTIME;
+    use crate::timers::duration::CompactDuration;
+    use quickcheck::{QuickCheck, TestResult};
+
+    async fn check(payloads: Vec<Vec<u8>>) -> Result<bool> {
+        let fx = fixture().await?;
+        let store = fx.bottom_store(ScriptedOracle::default());
+        let id = CollectionId::new(
+            StateKey::new(Uuid::new_v4(), Arc::from("k")),
+            StateType::Application,
+            StateName::try_new("co-anchor")?,
+        );
+        // A collection TTL so the `USING TTL` path is exercised; the batch must
+        // apply one coordinator anchor across every cell.
+        let c = CollectionRef::new(id.clone(), Some(CompactDuration::new(3_600)));
+        let cells: Vec<(CellKey, Option<Bytes>)> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let cell = CellKey {
+                    section: Section::new(0),
+                    coordinate: Coordinate::from_bytes(vec![i as u8]),
+                };
+                (cell, Some(Bytes::from(p.clone())))
+            })
+            .collect();
+        store.write_resolved(&c, &cells).await?;
+
+        // `WRITETIME`/`TTL` are read functions (no schema change); both are
+        // non-null because every cell wrote a present `data`.
+        let cql = format!(
+            "SELECT WRITETIME(data), TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND section = ?"
+        );
+        let result = fx
+            .cassandra
+            .session()
+            .query_unpaged(
+                cql,
+                (
+                    id.state_key().segment_id,
+                    id.state_key().key.as_ref(),
+                    i8::from(id.state_type()),
+                    id.name().as_str(),
+                    0_i8,
+                ),
+            )
+            .await?
+            .into_rows_result()?;
+        let mut writetimes: Vec<Option<i64>> = Vec::new();
+        let mut ttls: Vec<Option<i32>> = Vec::new();
+        for row in result.rows::<(Option<i64>, Option<i32>)>()? {
+            let (writetime, ttl) = row?;
+            writetimes.push(writetime);
+            ttls.push(ttl);
+        }
+        // One batch ⇒ every cell shares the batch timestamp and the TTL anchor.
+        let writetime_equal = writetimes.windows(2).all(|w| w[0] == w[1]);
+        let ttl_equal = ttls.windows(2).all(|w| w[0] == w[1]);
+        Ok(writetime_equal && ttl_equal)
+    }
+
+    fn prop(payloads: Vec<Vec<u8>>) -> TestResult {
+        // ≥2 cells for "equal across cells" to discriminate; ≤256 so the
+        // index-as-coordinate-byte stays unique.
+        if payloads.len() < 2 || payloads.len() > 256 {
+            return TestResult::discard();
+        }
+        match TEST_RUNTIME.block_on(check(payloads)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::error(
+                "cells of one multi-cell write had differing WRITETIME/TTL — not one batch",
+            ),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+
+    init_test_logging();
+    QuickCheck::new()
+        .tests(get_test_count())
+        .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
+}
+
+/// Multi-chunk execute smoke: with a deliberately tiny statement-count limit, a
+/// write of five cells splits into three `UNLOGGED BATCH`es (2 + 2 + 1), so the
+/// later chunks bind `&rows[range]` at a **non-zero start offset** — the one
+/// path the `chunk_boundaries` property (offline) and the single-chunk live
+/// batch tests don't compose. Every row must land. The small limit is passed as
+/// an argument precisely so this needs no multi-MiB fixture.
+#[tokio::test]
+async fn execute_unlogged_batches_splits_into_chunks_and_all_rows_land() -> Result<()> {
+    use crate::cassandra::Weighed;
+    use crate::state::cell_key::Coordinate;
+    use crate::state::encoding::{Encoding, encode_payload};
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let id = CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("k")),
+        StateType::Application,
+        StateName::try_new("multi-chunk")?,
+    );
+
+    // Five distinct cells; owned coordinate/blob Vecs the bound rows borrow into.
+    let payloads: Vec<Bytes> = (0..5_u8).map(|i| Bytes::from(vec![i; 8])).collect();
+    let blobs: Vec<Bytes> = payloads
+        .iter()
+        .map(|p| encode_payload(p, Encoding::RawZstdV1))
+        .collect::<Result<_, _>>()?;
+    let coords: Vec<[u8; 1]> = (0..5_u8).map(|i| [i]).collect();
+    let rows: Vec<Weighed<_>> = blobs
+        .iter()
+        .zip(&coords)
+        .map(|(blob, coord)| {
+            Weighed::new(
+                blob.len() as u64,
+                (
+                    Some(blob.as_ref()),
+                    Some(Encoding::RawZstdV1),
+                    Some(1_i32),
+                    id.state_key().segment_id,
+                    id.state_key().key.as_ref(),
+                    i8::from(id.state_type()),
+                    id.name().as_str(),
+                    0_i8,
+                    coord.as_slice(),
+                ),
+            )
+        })
+        .collect();
+
+    // Large byte budget, count budget of 2 ⇒ chunks [0,1], [2,3], [4].
+    fx.cassandra
+        .execute_unlogged_batches(&fx.queries.write_resolved_no_ttl, &rows, 1 << 20, 2)
+        .await?;
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let cell = CellKey {
+            section: Section::new(0),
+            coordinate: Coordinate::from_bytes(vec![i as u8]),
+        };
+        assert_eq!(
+            store.get(&id, &cell, event(1)).await?.into_inner().as_ref(),
+            Some(payload),
+            "cell {i} must land across the multi-chunk batch"
+        );
+    }
+    Ok(())
+}
+
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing the
 /// error on failure (a store/setup error is a broken environment, not a
 /// shrinkable property failure).

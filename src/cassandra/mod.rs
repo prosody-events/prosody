@@ -22,16 +22,23 @@ use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::policies::timestamp_generator::MonotonicTimestampGenerator;
 use scylla::serialize::SerializationError;
-use scylla::serialize::row::SerializeRow;
+use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::value::SerializeValue;
+use scylla::serialize::writers::RowWriter;
 use scylla::statement::Consistency;
+use scylla::statement::batch::{Batch, BatchStatement, BatchType};
 use scylla::statement::prepared::PreparedStatement;
+use std::iter;
+use std::ops::Range;
 use std::sync::Arc;
 
 pub mod config;
 pub mod errors;
 pub mod macros;
 pub mod migrator;
+
+#[cfg(test)]
+mod tests;
 
 pub use config::CassandraConfiguration;
 use errors::CassandraStoreError;
@@ -81,6 +88,25 @@ pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
+
+/// Soft byte ceiling for one same-partition `UNLOGGED BATCH`.
+///
+/// A single-partition batch is one replica mutation, bounded by Cassandra's
+/// `max_mutation_size` — half of `commitlog_segment_size` (16 MiB at the 5.0
+/// default 32 MiB segment). 5 MiB keeps a generous margin even if an operator
+/// halves the commitlog to an 8 MiB ceiling; promote to
+/// [`CassandraConfiguration`] only for a deployment with a tighter commitlog.
+pub(crate) const MAX_BATCH_BYTES: u64 = 5 * 1_024 * 1_024;
+
+/// Soft statement-count ceiling for one batch — far under the protocol u16 max
+/// the driver enforces client-side, so the byte budget dominates for any
+/// non-trivial value.
+pub(crate) const MAX_BATCH_STATEMENTS: usize = 4_096;
+
+/// Per-statement size the row weight adds on top of its blob bytes, covering
+/// the partition/clustering key, the `event` UDT, and column metadata the blob
+/// count omits — so the estimate over-counts rather than under-counts.
+pub(crate) const PER_STATEMENT_OVERHEAD: u64 = 512;
 
 /// Unified Cassandra store providing session and infrastructure for all
 /// components.
@@ -248,6 +274,133 @@ impl CassandraStore {
             }
         }
     }
+
+    /// Executes `rows` as the **fewest** same-partition `UNLOGGED BATCH`es that
+    /// fit the backend budget, every statement being the one prepared
+    /// `statement`.
+    ///
+    /// Each row carries its own size estimate ([`Weighed`]);
+    /// [`chunk_boundaries`] greedily packs contiguous rows into chunks
+    /// within `max_bytes` and `max_count` (a row heavier than `max_bytes`
+    /// takes its own chunk). Callers pass the cells of **one collection**,
+    /// which share a partition key, so each batch is a single atomic
+    /// replica mutation. An empty `rows` is a no-op.
+    ///
+    /// The batch is marked idempotent — these are last-write-wins full-column
+    /// `UPDATE`s, and batch idempotency does **not** inherit from the member
+    /// statements — so the `DefaultRetryPolicy` may retry it on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraStoreError`] when the driver fails to execute a
+    /// batch.
+    pub(crate) async fn execute_unlogged_batches<P>(
+        &self,
+        statement: &PreparedStatement,
+        rows: &[Weighed<P>],
+        max_bytes: u64,
+        max_count: usize,
+    ) -> Result<(), CassandraStoreError>
+    where
+        P: SerializeRow,
+    {
+        // `Weighed::weight` is a *function item*, not a closure: it is inherently
+        // higher-ranked over the borrow lifetime in `P`, so the boundary iterator
+        // it feeds can be held across the loop's awaits. A `|r| r.weight` closure
+        // here trips "implementation of FnOnce is not general enough".
+        for range in chunk_boundaries(rows.iter().map(Weighed::weight), max_bytes, max_count) {
+            let count = range.end - range.start;
+            // One shallow (Arc) clone of the shared prepared statement per row;
+            // the slice `&rows[range]` is itself the `BatchValues` (no per-chunk
+            // value allocation).
+            let statements: Vec<BatchStatement> =
+                iter::repeat_with(|| BatchStatement::from(statement.clone()))
+                    .take(count)
+                    .collect();
+            let mut batch = Batch::new_with_statements(BatchType::Unlogged, statements);
+            batch.set_is_idempotent(true);
+            self.session()
+                .batch(&batch, &rows[range])
+                .await
+                .map_err(CassandraStoreError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// A bind-row tagged with its estimated serialized size, for
+/// [`chunk_boundaries`] packing. The weight is packing metadata only:
+/// [`SerializeRow`] delegates wholly to `row`, so it is never bound or sent.
+pub(crate) struct Weighed<P> {
+    weight: u64,
+    row: P,
+}
+
+impl<P> Weighed<P> {
+    /// Tags `row` with its estimated serialized `weight` (blob bytes plus
+    /// [`PER_STATEMENT_OVERHEAD`]).
+    pub(crate) fn new(weight: u64, row: P) -> Self {
+        Self { weight, row }
+    }
+
+    /// The packing weight. A function item (not a closure), so
+    /// `rows.iter().map(Weighed::weight)` stays higher-ranked over `P`'s
+    /// borrow.
+    fn weight(&self) -> u64 {
+        self.weight
+    }
+}
+
+impl<P: SerializeRow> SerializeRow for Weighed<P> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        self.row.serialize(ctx, writer)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.row.is_empty()
+    }
+}
+
+/// Greedy next-fit packing of weighed rows into the **fewest contiguous**
+/// chunks whose rows stay within `max_bytes` and `max_count`. A row heavier
+/// than `max_bytes` takes its own chunk (the unavoidable break).
+/// Order-preserving and allocation-free (lazy [`std::iter::from_fn`]); pure
+/// over the weights, so it tests with plain numbers and no cluster.
+///
+/// Because cells keep their order (the partition is partitioned contiguously),
+/// greedily extending each chunk to a limit yields the provably minimal chunk
+/// count: no contiguous partition into fewer parts can exist.
+fn chunk_boundaries(
+    weights: impl Iterator<Item = u64>,
+    max_bytes: u64,
+    max_count: usize,
+) -> impl Iterator<Item = Range<usize>> {
+    let mut weights = weights.peekable();
+    let mut start = 0_usize;
+    iter::from_fn(move || {
+        // The first row always joins the chunk, even if it alone exceeds
+        // `max_bytes` — the unavoidable oversized-row break.
+        let first = weights.next()?;
+        let mut end = start + 1;
+        let mut acc = first;
+        while end - start < max_count {
+            let Some(&next) = weights.peek() else { break };
+            let combined = acc.saturating_add(next);
+            if combined > max_bytes {
+                break;
+            }
+            acc = combined;
+            weights.next();
+            end += 1;
+        }
+        let range = start..end;
+        start = end;
+        Some(range)
+    })
 }
 
 /// Creates and configures a Cassandra session with the given configuration.

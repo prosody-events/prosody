@@ -16,15 +16,35 @@
 //! provisional cell without an oracle consult (the own-event-base-is-prev
 //! invariant); the per-event session injects it, so collections never pass it.
 //!
-//! # Collection-grain batches
+//! # Collection-grain atomicity invariant
 //!
 //! The three mutators work at **collection grain**: each takes the touched
-//! cells of one collection as a slice, so a collection with many cells (a Map
-//! entry set, a Deque slot range and its bounds) stages or promotes them in
-//! **one same-partition `UNLOGGED BATCH`** rather than one round-trip per cell.
-//! A collection's cells share its row key, so the batch is a single atomic
-//! mutation on the replica. Value is single-cell, so every slice is size-1 and
-//! the batch degenerates to one statement.
+//! cells of one collection as a slice. The invariant every backend upholds is
+//! **atomic multi-cell commit** — a single `write_provisional` /
+//! `write_resolved` / `mark_resolved` call (hence `commit_provisional` /
+//! `abort_provisional`, which delegate to them) applies *all* its cells
+//! together, so no reader and no crash-recovery ever observes a torn subset
+//! (some cells written, others not), and on the Cassandra backend every cell
+//! shares one write timestamp and one TTL anchor (bounds and entries
+//! co-expire).
+//!
+//! * **Cassandra** packs the cells into **one same-partition `UNLOGGED
+//!   BATCH`**: a collection's cells share its row key, so the batch is a single
+//!   atomic replica mutation — one round-trip, not one per cell. The **sole**
+//!   split is the over-budget fallback: a collection whose cells exceed the
+//!   backend batch budget is divided into the *fewest* atomic batches that fit.
+//!   The accepted consequence is narrow — an **over-budget** `ReadUncommitted`
+//!   multi-cell *resolved* write (which arms no recovery backstop) can crash
+//!   between chunks, leaving a torn committed write recovery cannot
+//!   reconstruct; within budget that window does not exist, and a staged
+//!   (`write_provisional`) write is always recoverable regardless of chunking.
+//! * **Memory** loops its writes cell by cell. It needs no batch: one handler
+//!   per key system-wide means no observer can witness a partial multi-cell
+//!   write, and an in-memory loop never crashes mid-write — atomicity holds by
+//!   serialization, not by a transaction.
+//!
+//! Value is single-cell, so every slice is size-1 and the Cassandra batch
+//! degenerates to one statement.
 
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Scan};

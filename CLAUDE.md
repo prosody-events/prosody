@@ -45,6 +45,29 @@ If you can't name the invariant, you don't yet understand the code well enough t
   underlying store and seed it without going through the type whose Drop
   would clean up. Forgetting is never the shortcut.
 
+**Allocation (tiger style / data-oriented — https://tigerstyle.dev/):**
+
+- **No hot-path allocation that isn't upfront and bounded.** A steady-state
+  path (per message, per timer fire, per event, per cell) must not allocate a
+  buffer whose size is discovered at runtime and grown to "whatever's needed."
+  Bound it, size it once to its known cardinality (`Vec::with_capacity`,
+  `smallvec`), and never let it reallocate.
+- **Never add a *gratuitous* allocation to satisfy the borrow checker or the
+  compiler.** When a `.map(|x| ...)` closure trips a higher-ranked-lifetime
+  error, reach for a **function item** (`.map(Type::method)`), an index, or a
+  borrow before you reach for a scratch `Vec`. (See `Weighed::weight`, mapped as
+  a fn item so the batch-packing boundary iterator needs **no** `Vec<u64>`
+  scratch.)
+- **No amortized / cached resize buffers** ("allowed to grow to the max size
+  ever seen") on the hot path. If a reusable scratch buffer is truly
+  unavoidable, allocate it once at construction with a fixed bound and reuse it
+  — never amortize-grow it per call.
+- **Simplicity is not sacrificed for this.** The design principles above still
+  win: prefer the reading that's clearest. Zero-alloc and simple are usually
+  *not* in conflict — the fn-item fix above removed an allocation *and* a line.
+  When they genuinely do conflict, keep it simple and leave a comment naming the
+  allocation; do not contort the code to shave a bounded, upfront `Vec`.
+
 **Code Quality:**
 
 - Clippy must pass for code and tests - zero warnings tolerated

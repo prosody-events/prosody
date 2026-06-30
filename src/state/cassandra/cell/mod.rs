@@ -52,6 +52,7 @@ mod tests;
 use crate::cassandra::CassandraStore as CassandraSession;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::cassandra::{MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, PER_STATEMENT_OVERHEAD, Weighed};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Direction, Scan};
@@ -68,8 +69,6 @@ use bytes::Bytes;
 use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
-use scylla::serialize::row::SerializeRow;
-use scylla::statement::prepared::PreparedStatement;
 use std::ops::Bound;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
@@ -142,17 +141,6 @@ impl<O> CassandraStore<O> {
         self.session.session()
     }
 
-    async fn execute_unpaged(
-        &self,
-        statement: &PreparedStatement,
-        params: impl SerializeRow,
-    ) -> Result<(), CassandraCellStoreError> {
-        self.session
-            .execute_unpaged_discard(statement, params)
-            .await?;
-        Ok(())
-    }
-
     async fn read_raw(
         &self,
         id: &CollectionId,
@@ -214,57 +202,74 @@ impl<O> CassandraStore<O> {
         collection: &CollectionRef,
         writes: &[(CellKey, ProvisionalWrite)],
     ) -> Result<(), CassandraCellStoreError> {
-        // Value is single-cell, so this slice is size-1: one `UPDATE`. The
-        // multi-cell same-partition `UNLOGGED BATCH` lands with Map/Deque.
         let pk = Pk::of(collection.id());
-        for (cell, write) in writes {
-            let CellBlobs {
-                data,
-                prev_data,
-                encoding,
-                version,
-            } = encode_cell_blobs(write.data(), write.prev())?;
-            let data = data.as_ref().map(Bytes::as_ref);
-            let prev_data = prev_data.as_ref().map(Bytes::as_ref);
-            let event = write.event();
-            let section = i8::from(cell.section);
-            let coordinate = cell.coordinate.as_bytes();
+        // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
+        // bound rows borrow into it and into each input cell's coordinate slice,
+        // so the whole batch is one `rows` allocation with no per-cell tuple
+        // copy. Both Vecs outlive the awaited batch.
+        let mut blobs = Vec::with_capacity(writes.len());
+        for (_, write) in writes {
+            blobs.push(encode_cell_blobs(write.data(), write.prev())?);
+        }
+
+        // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
+        // hence the bound param shape — is made once for the whole batch, never
+        // per cell.
+        if let Some(ttl) = collection.ttl().map(ttl_to_i32) {
+            let mut rows = Vec::with_capacity(writes.len());
+            for (blob, (cell, write)) in blobs.iter().zip(writes) {
+                rows.push(Weighed::new(
+                    blob_weight(blob),
+                    (
+                        ttl,
+                        blob.data.as_deref(),
+                        blob.prev_data.as_deref(),
+                        blob.encoding,
+                        blob.version,
+                        write.event(),
+                        pk.segment_id,
+                        pk.key,
+                        pk.state_type,
+                        pk.name,
+                        i8::from(cell.section),
+                        cell.coordinate.as_bytes(),
+                    ),
+                ));
+            }
             self.session
-                .execute_with_optional_ttl(
-                    collection.ttl().map(ttl_to_i32),
+                .execute_unlogged_batches(
                     &self.queries.write_provisional,
+                    &rows,
+                    MAX_BATCH_BYTES,
+                    MAX_BATCH_STATEMENTS,
+                )
+                .await?;
+        } else {
+            let mut rows = Vec::with_capacity(writes.len());
+            for (blob, (cell, write)) in blobs.iter().zip(writes) {
+                rows.push(Weighed::new(
+                    blob_weight(blob),
+                    (
+                        blob.data.as_deref(),
+                        blob.prev_data.as_deref(),
+                        blob.encoding,
+                        blob.version,
+                        write.event(),
+                        pk.segment_id,
+                        pk.key,
+                        pk.state_type,
+                        pk.name,
+                        i8::from(cell.section),
+                        cell.coordinate.as_bytes(),
+                    ),
+                ));
+            }
+            self.session
+                .execute_unlogged_batches(
                     &self.queries.write_provisional_no_ttl,
-                    |ttl| {
-                        (
-                            ttl,
-                            data,
-                            prev_data,
-                            encoding,
-                            version,
-                            event,
-                            pk.segment_id,
-                            pk.key,
-                            pk.state_type,
-                            pk.name,
-                            section,
-                            coordinate,
-                        )
-                    },
-                    || {
-                        (
-                            data,
-                            prev_data,
-                            encoding,
-                            version,
-                            event,
-                            pk.segment_id,
-                            pk.key,
-                            pk.state_type,
-                            pk.name,
-                            section,
-                            coordinate,
-                        )
-                    },
+                    &rows,
+                    MAX_BATCH_BYTES,
+                    MAX_BATCH_STATEMENTS,
                 )
                 .await?;
         }
@@ -277,48 +282,64 @@ impl<O> CassandraStore<O> {
         cells: &[(CellKey, Option<Bytes>)],
     ) -> Result<(), CassandraCellStoreError> {
         let pk = Pk::of(collection.id());
-        for (cell, data) in cells {
-            let CellBlobs {
-                data,
-                encoding,
-                version,
-                ..
-            } = encode_cell_blobs(data.as_ref(), None)?;
-            let data = data.as_ref().map(Bytes::as_ref);
-            let section = i8::from(cell.section);
-            let coordinate = cell.coordinate.as_bytes();
+        // Encode each cell's committed `data` up front (owns the `Bytes`); no
+        // `prev`, so the blobs carry only `data` + its encoding/version.
+        let mut blobs = Vec::with_capacity(cells.len());
+        for (_, data) in cells {
+            blobs.push(encode_cell_blobs(data.as_ref(), None)?);
+        }
+
+        if let Some(ttl) = collection.ttl().map(ttl_to_i32) {
+            let mut rows = Vec::with_capacity(cells.len());
+            for (blob, (cell, _)) in blobs.iter().zip(cells) {
+                rows.push(Weighed::new(
+                    blob_weight(blob),
+                    (
+                        ttl,
+                        blob.data.as_deref(),
+                        blob.encoding,
+                        blob.version,
+                        pk.segment_id,
+                        pk.key,
+                        pk.state_type,
+                        pk.name,
+                        i8::from(cell.section),
+                        cell.coordinate.as_bytes(),
+                    ),
+                ));
+            }
             self.session
-                .execute_with_optional_ttl(
-                    collection.ttl().map(ttl_to_i32),
+                .execute_unlogged_batches(
                     &self.queries.write_resolved,
+                    &rows,
+                    MAX_BATCH_BYTES,
+                    MAX_BATCH_STATEMENTS,
+                )
+                .await?;
+        } else {
+            let mut rows = Vec::with_capacity(cells.len());
+            for (blob, (cell, _)) in blobs.iter().zip(cells) {
+                rows.push(Weighed::new(
+                    blob_weight(blob),
+                    (
+                        blob.data.as_deref(),
+                        blob.encoding,
+                        blob.version,
+                        pk.segment_id,
+                        pk.key,
+                        pk.state_type,
+                        pk.name,
+                        i8::from(cell.section),
+                        cell.coordinate.as_bytes(),
+                    ),
+                ));
+            }
+            self.session
+                .execute_unlogged_batches(
                     &self.queries.write_resolved_no_ttl,
-                    |ttl| {
-                        (
-                            ttl,
-                            data,
-                            encoding,
-                            version,
-                            pk.segment_id,
-                            pk.key,
-                            pk.state_type,
-                            pk.name,
-                            section,
-                            coordinate,
-                        )
-                    },
-                    || {
-                        (
-                            data,
-                            encoding,
-                            version,
-                            pk.segment_id,
-                            pk.key,
-                            pk.state_type,
-                            pk.name,
-                            section,
-                            coordinate,
-                        )
-                    },
+                    &rows,
+                    MAX_BATCH_BYTES,
+                    MAX_BATCH_STATEMENTS,
                 )
                 .await?;
         }
@@ -331,9 +352,13 @@ impl<O> CassandraStore<O> {
         cells: &[CellKey],
     ) -> Result<(), CassandraCellStoreError> {
         let pk = Pk::of(collection.id());
+        // Promotes carry no blob — only the key columns — so every row weighs the
+        // fixed per-statement overhead and the byte budget never bites; the count
+        // budget alone splits an enormous promote set.
+        let mut rows = Vec::with_capacity(cells.len());
         for cell in cells {
-            self.execute_unpaged(
-                &self.queries.mark_resolved,
+            rows.push(Weighed::new(
+                PER_STATEMENT_OVERHEAD,
                 (
                     pk.segment_id,
                     pk.key,
@@ -342,9 +367,16 @@ impl<O> CassandraStore<O> {
                     i8::from(cell.section),
                     cell.coordinate.as_bytes(),
                 ),
+            ));
+        }
+        self.session
+            .execute_unlogged_batches(
+                &self.queries.mark_resolved,
+                &rows,
+                MAX_BATCH_BYTES,
+                MAX_BATCH_STATEMENTS,
             )
             .await?;
-        }
         Ok(())
     }
 }
@@ -695,6 +727,15 @@ fn encode_cell_blobs(
     })
 }
 
+/// The batch-packing weight of a cell row: its blob bytes plus the fixed
+/// [`PER_STATEMENT_OVERHEAD`]. Over-counts rather than under-counts, so a
+/// packed batch never exceeds the byte budget it was sized against.
+fn blob_weight(blob: &CellBlobs) -> u64 {
+    let blob_bytes = blob.data.as_ref().map_or(0_u64, |b| b.len() as u64)
+        + blob.prev_data.as_ref().map_or(0_u64, |b| b.len() as u64);
+    PER_STATEMENT_OVERHEAD + blob_bytes
+}
+
 /// Converts a per-write TTL to the `i32` the driver binds to `USING TTL ?`.
 /// The input is pre-validated against Cassandra's ceiling at registration, so
 /// the saturating conversion is only a defensive floor.
@@ -717,8 +758,10 @@ fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuration> {
 cassandra_queries! {
     /// Container for the prepared CQL statements used by [`CassandraStore`].
     ///
-    /// Each point mutation is a single `UPDATE` — Cassandra's row atomicity
-    /// covers a multi-column write of one row, so no batch is needed. TTL/no-TTL
+    /// Each mutation is one `UPDATE` of one row; a multi-cell collection write
+    /// binds the same prepared statement once per cell into one same-partition
+    /// `UNLOGGED BATCH` (via `execute_unlogged_batches`), so all its cells share
+    /// one write timestamp and TTL anchor. TTL/no-TTL
     /// pairs exist because Cassandra cannot bind `NULL` to `USING TTL ?`. The
     /// scans are single-section clustering ranges: the `ORDER BY` direction
     /// cannot be bound (forward/backward), and the **start-side comparator**

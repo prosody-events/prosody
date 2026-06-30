@@ -52,7 +52,6 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
 use std::ops::Bound;
-use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
@@ -60,6 +59,11 @@ use uuid::Uuid;
 /// Distinct collections a crash/overwrite trace cycles through. Small so events
 /// collide on the same cell and exercise overwrite + resolution-on-read.
 const POOL: u8 = 3;
+
+/// Cells per collection a crash/overwrite event may stage in **one**
+/// `write_provisional` call — the multi-cell same-partition batch. Small so
+/// events collide on the same `(collection, cell)`.
+const CRASH_CELLS: u8 = 3;
 
 /// Coordinate pool for the multi-cell overlay/scan suites — wide enough for
 /// real intervals (a Map entry set / Deque index window).
@@ -222,20 +226,23 @@ impl Arbitrary for Outcome {
     }
 }
 
-/// One event: per-collection mutations, an outcome, and the recovery path to
-/// use when the outcome is a crash.
+/// One event: a flat list of `(collection, cell, mutation)` writes, an outcome,
+/// and the recovery path to use when the outcome is a crash. The flat list is
+/// grouped by collection ([`collapse_writes`]) so each touched collection
+/// stages **all** its cells in one `write_provisional` call (the multi-cell
+/// batch).
 #[derive(Clone, Debug)]
 struct TraceEvent {
-    writes: Vec<(u8, Mutation)>,
+    writes: Vec<(u8, u8, Mutation)>,
     outcome: Outcome,
     recover_by_sweep: bool,
 }
 
 impl Arbitrary for TraceEvent {
     fn arbitrary(g: &mut Gen) -> Self {
-        let writes = capped_vec::<(u8, Mutation)>(g, POOL as usize)
+        let writes = capped_vec::<(u8, u8, Mutation)>(g, (POOL * CRASH_CELLS) as usize)
             .into_iter()
-            .map(|(coll, m)| (coll % POOL, m))
+            .map(|(coll, cell, m)| (coll % POOL, cell % CRASH_CELLS, m))
             .collect();
         Self {
             writes,
@@ -264,15 +271,37 @@ impl Arbitrary for Trace {
     }
 }
 
-/// Collapses an event's writes to one per collection (an event stages a cell at
-/// most once), keeping the last mutation — last-writer-wins.
-fn collapse_writes(writes: Vec<(u8, Mutation)>) -> Vec<(u8, Mutation)> {
-    let mut out: Vec<(u8, Mutation)> = Vec::new();
-    for (coll, mutation) in writes {
-        match out.iter_mut().find(|(c, _)| *c == coll) {
-            Some(slot) => slot.1 = mutation,
-            None => out.push((coll, mutation)),
+/// Groups an event's flat `(collection, cell, mutation)` writes by collection,
+/// preserving first-seen collection order, and within each collection collapses
+/// repeats of a cell to the last mutation (last-writer-wins). The result is the
+/// per-collection cell set each `write_provisional` call stages atomically.
+fn collapse_writes(writes: Vec<(u8, u8, Mutation)>) -> Vec<(u8, Vec<(u8, Mutation)>)> {
+    let mut out: Vec<(u8, Vec<(u8, Mutation)>)> = Vec::new();
+    for (coll, cell, mutation) in writes {
+        if let Some((_, cells)) = out.iter_mut().find(|(c, _)| *c == coll) {
+            collapse_cell_into(cells, cell, mutation);
+        } else {
+            out.push((coll, vec![(cell, mutation)]));
         }
+    }
+    out
+}
+
+/// Inserts `(cell, mutation)` into a collection's cell set, overwriting any
+/// existing mutation for that cell (last-writer-wins) and preserving order.
+fn collapse_cell_into(cells: &mut Vec<(u8, Mutation)>, cell: u8, mutation: Mutation) {
+    match cells.iter_mut().find(|(c, _)| *c == cell) {
+        Some(slot) => slot.1 = mutation,
+        None => cells.push((cell, mutation)),
+    }
+}
+
+/// Collapses one collection's cell writes to last-writer-wins per cell,
+/// preserving first-seen order (an event stages each cell at most once).
+fn collapse_cells(cells: Vec<(u8, Mutation)>) -> Vec<(u8, Mutation)> {
+    let mut out: Vec<(u8, Mutation)> = Vec::new();
+    for (cell, mutation) in cells {
+        collapse_cell_into(&mut out, cell, mutation);
     }
     out
 }
@@ -296,13 +325,12 @@ fn pooled_collections() -> Result<(Vec<CollectionId>, Vec<CollectionRef>)> {
     Ok((ids, refs))
 }
 
-/// Asserts every pooled cell is fully resolved (no provisional lingers) and
-/// projects its model committed value.
+/// Asserts every pooled collection is fully resolved (no provisional lingers)
+/// and each modelled cell projects its committed value.
 async fn assert_converged<S>(
     store: &S,
     ids: &[CollectionId],
-    cell: &CellKey,
-    model: &[Option<Bytes>],
+    model: &[BTreeMap<u8, Option<Bytes>>],
 ) -> Result<bool>
 where
     S: CellStore,
@@ -318,9 +346,11 @@ where
         if provisional_count(store, id).await? != 0 {
             return Ok(false);
         }
-        let committed = store.get(id, cell, probe).await?;
-        if committed.into_inner() != *expected {
-            return Ok(false);
+        for (&coord, value) in expected {
+            let committed = store.get(id, &cell_at(coord), probe).await?;
+            if committed.into_inner() != *value {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -360,15 +390,17 @@ where
     F: Fn() -> Result<S>,
 {
     let (ids, refs) = pooled_collections()?;
-    let cell = value_cell();
     let mut store = make_store()?;
-    let mut model: Vec<Option<Bytes>> = vec![None; POOL as usize];
+    let mut model: Vec<BTreeMap<u8, Option<Bytes>>> = vec![BTreeMap::new(); POOL as usize];
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let dedup_id = Uuid::from_u128(index as u128);
         let event = EventRef::Message { dedup_id };
 
         let writes = collapse_writes(ev.writes);
+        // Mid-fan-out crashes after a prefix of the *collections* stage — a
+        // collection's own cells are atomic (one batch), so the tear is across
+        // collections, never within one.
         let staged_count = if ev.outcome.mid_fan_out() {
             writes.len().saturating_sub(1)
         } else {
@@ -376,30 +408,38 @@ where
         };
         let staged = &writes[..staged_count];
 
-        // Stage each cell over its committed base (prev-is-committed at stage
-        // time: no provisional cell lingers between events). Keep the staged
-        // `ProvisionalWrite` per collection so the clean arms can settle through
-        // `commit_provisional` / `abort_provisional` (carrying the projection
-        // the write-through cache publishes).
-        let mut writes: Vec<(u8, ProvisionalWrite)> = Vec::with_capacity(staged.len());
-        for &(coll, mutation) in staged {
-            let prev = store.get(&ids[coll as usize], &cell, event).await?;
-            let prev_value = prev.get().cloned();
-            if prev_value != model[coll as usize] {
-                return Ok(false);
+        // Stage each collection's whole cell set in ONE `write_provisional` call
+        // over its committed base (prev-is-committed at stage time: no
+        // provisional cell lingers between events). Keep the staged
+        // `(cell, ProvisionalWrite)` set per collection so the clean arms settle
+        // through `commit_provisional` / `abort_provisional` in one call too
+        // (carrying the projection the write-through cache publishes).
+        let mut staged_writes: Vec<(u8, Vec<(CellKey, ProvisionalWrite)>)> =
+            Vec::with_capacity(staged.len());
+        for (coll, cells) in staged {
+            let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
+            for &(coord, mutation) in cells {
+                let key = cell_at(coord);
+                let prev = store.get(&ids[*coll as usize], &key, event).await?;
+                let prev_value = prev.get().cloned();
+                if prev_value != model[*coll as usize].get(&coord).cloned().flatten() {
+                    return Ok(false);
+                }
+                cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
             }
-            let write = ProvisionalWrite::new(mutation.value(), prev, event);
             store
-                .write_provisional(&refs[coll as usize], &[(cell.clone(), write.clone())])
+                .write_provisional(&refs[*coll as usize], &cell_writes)
                 .await?;
-            writes.push((coll, write));
+            staged_writes.push((*coll, cell_writes));
         }
 
         // Marker strictly after staging; advance the model for committed cells.
         if ev.outcome.marker_flushed() {
             oracle.record_message(dedup_id).await?;
-            for &(coll, mutation) in staged {
-                model[coll as usize] = mutation.value();
+            for (coll, cells) in staged {
+                for &(coord, mutation) in cells {
+                    model[*coll as usize].insert(coord, mutation.value());
+                }
             }
         }
 
@@ -415,38 +455,36 @@ where
                 }
             } else {
                 // First-touch under a fresh event so own-event never
-                // short-circuits; the read resolves the provisional cell.
+                // short-circuits; the read resolves each staged provisional cell.
                 let recovery_event = EventRef::Message {
                     dedup_id: Uuid::from_u128(u128::MAX - index as u128),
                 };
-                for id in &ids {
-                    store.get(id, &cell, recovery_event).await?;
+                for (coll, cells) in staged {
+                    for &(coord, _) in cells {
+                        store
+                            .get(&ids[*coll as usize], &cell_at(coord), recovery_event)
+                            .await?;
+                    }
                 }
             }
         } else if matches!(ev.outcome, Outcome::CleanCommitted) {
             // Promote through the lifecycle settle path (publishes `data`).
-            for (coll, write) in &writes {
+            for (coll, cell_writes) in &staged_writes {
                 store
-                    .commit_provisional(
-                        &refs[*coll as usize],
-                        slice::from_ref(&(cell.clone(), write.clone())),
-                    )
+                    .commit_provisional(&refs[*coll as usize], cell_writes)
                     .await?;
             }
         } else {
             // The only remaining non-crash outcome: clean inline rollback
             // through the settle path (publishes `prev`).
-            for (coll, write) in &writes {
+            for (coll, cell_writes) in &staged_writes {
                 store
-                    .abort_provisional(
-                        &refs[*coll as usize],
-                        slice::from_ref(&(cell.clone(), write.clone())),
-                    )
+                    .abort_provisional(&refs[*coll as usize], cell_writes)
                     .await?;
             }
         }
 
-        if !assert_converged(&store, &ids, &cell, &model).await? {
+        if !assert_converged(&store, &ids, &model).await? {
             return Ok(false);
         }
     }
@@ -457,20 +495,25 @@ where
 // ─────────────────────────── implicit overwrite
 // ───────────────────────────────
 
-/// One overwrite-trace step: a mutation on a pooled collection, and whether the
-/// event commits.
-#[derive(Clone, Copy, Debug)]
+/// One overwrite-trace step: a multi-cell write to a pooled collection (all
+/// cells staged in one `write_provisional` call), and whether the event
+/// commits. An empty cell set exercises the empty-batch no-op boundary.
+#[derive(Clone, Debug)]
 struct OverwriteOp {
     coll: u8,
-    mutation: Mutation,
+    cells: Vec<(u8, Mutation)>,
     commit: bool,
 }
 
 impl Arbitrary for OverwriteOp {
     fn arbitrary(g: &mut Gen) -> Self {
+        let cells = capped_vec::<(u8, Mutation)>(g, CRASH_CELLS as usize)
+            .into_iter()
+            .map(|(cell, m)| (cell % CRASH_CELLS, m))
+            .collect();
         Self {
             coll: u8::arbitrary(g) % POOL,
-            mutation: Mutation::arbitrary(g),
+            cells,
             commit: bool::arbitrary(g),
         }
     }
@@ -516,8 +559,7 @@ where
     F: Fn() -> Result<S>,
 {
     let (ids, refs) = pooled_collections()?;
-    let cell = value_cell();
-    let mut model: Vec<Option<Bytes>> = vec![None; POOL as usize];
+    let mut model: Vec<BTreeMap<u8, Option<Bytes>>> = vec![BTreeMap::new(); POOL as usize];
 
     for (index, op) in trace.ops.into_iter().enumerate() {
         let slot = op.coll as usize;
@@ -527,22 +569,24 @@ where
         // overwrite resolves its predecessor's provisional cell durably.
         let store = make_store()?;
 
-        let prev = store.get(&ids[slot], &cell, event).await?;
-        if prev.get().cloned() != model[slot] {
-            return Ok(false);
+        // The whole cell set stages in one `write_provisional`; each cell's
+        // staged `prev` must equal its committed base.
+        let cells = collapse_cells(op.cells);
+        let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
+        for &(coord, mutation) in &cells {
+            let key = cell_at(coord);
+            let prev = store.get(&ids[slot], &key, event).await?;
+            if prev.get().cloned() != model[slot].get(&coord).cloned().flatten() {
+                return Ok(false);
+            }
+            cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
         }
-        store
-            .write_provisional(
-                &refs[slot],
-                &[(
-                    cell.clone(),
-                    ProvisionalWrite::new(op.mutation.value(), prev, event),
-                )],
-            )
-            .await?;
+        store.write_provisional(&refs[slot], &cell_writes).await?;
         if op.commit {
             oracle.record_message(dedup_id).await?;
-            model[slot] = op.mutation.value();
+            for &(coord, mutation) in &cells {
+                model[slot].insert(coord, mutation.value());
+            }
         }
     }
 
@@ -552,8 +596,15 @@ where
         let final_event = EventRef::Message {
             dedup_id: Uuid::from_u128(u128::MAX - i as u128),
         };
-        if store.get(id, &cell, final_event).await?.into_inner() != model[i] {
-            return Ok(false);
+        for (&coord, value) in &model[i] {
+            if store
+                .get(id, &cell_at(coord), final_event)
+                .await?
+                .into_inner()
+                != *value
+            {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
