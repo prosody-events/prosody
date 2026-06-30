@@ -117,15 +117,19 @@ impl Arbitrary for Script {
 /// Whether the set's intervals stay sorted by low bound, pairwise non-touching
 /// (a real hole between each), and individually non-empty.
 fn set_well_formed(set: &IntervalSet) -> bool {
-    set.intervals.iter().all(|iv| is_nonempty(&iv.lo, &iv.hi))
-        && set.intervals.windows(2).all(|w| {
-            cmp_low(&w[0].lo, &w[1].lo) == Ordering::Less && !high_ge_low(&w[0].hi, &w[1].lo)
-        })
+    set.intervals.iter().all(|(lo, hi)| is_nonempty(&lo.0, hi))
+        && set.intervals.iter().zip(set.intervals.iter().skip(1)).all(
+            |((lo_a, hi_a), (lo_b, _))| {
+                cmp_low(&lo_a.0, &lo_b.0) == Ordering::Less && !high_ge_low(hi_a, &lo_b.0)
+            },
+        )
 }
 
 /// Whether `coordinate` is covered by some interval in the set.
 fn set_covers(set: &IntervalSet, coordinate: &Coordinate) -> bool {
-    set.intervals.iter().any(|iv| iv.contains(coordinate))
+    set.intervals
+        .iter()
+        .any(|(lo, hi)| interval(lo, hi).contains(coordinate))
 }
 
 /// Asserts `query(request)` returns ordered, disjoint pieces that exactly tile

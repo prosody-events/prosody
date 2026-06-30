@@ -65,6 +65,7 @@ use ahash::RandomState;
 use scc::hash_map::Entry;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 
 /// Per-partition scan coverage, keyed by `(CollectionId, Section)`.
@@ -208,58 +209,124 @@ pub enum Piece {
     Gap(Interval),
 }
 
+/// The low bound of a stored interval — the [`BTreeMap`] key in an
+/// [`IntervalSet`], ordered by [`cmp_low`].
+///
+/// **Consistency invariant (the `BTreeMap` correctness prerequisite):**
+/// `cmp_low` returns `Equal` iff the two bounds are structurally equal — both
+/// `Unbounded`, or the same variant with equal coordinates. The cross-polarity
+/// arms (`Included`/`Excluded` at the same coordinate) end in
+/// `.then(Less/Greater)`, never `Equal`, so `a.cmp(b) == Equal ⇔ a == b`. That
+/// is what keeps distinct keys from collapsing or mis-ordering.
+/// `PartialEq`/`Eq` stay derived so they can never drift from `cmp_low`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LowBound(Bound<Coordinate>);
+
+impl Ord for LowBound {
+    fn cmp(&self, other: &Self) -> Ordering {
+        cmp_low(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for LowBound {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A sorted, pairwise-disjoint set of covered [`Interval`]s for one
 /// `(collection, section)`.
 ///
-/// The `intervals` vector is the load-bearing structure; it is **private** and
-/// every mutation preserves the sorted-and-disjoint invariant.
+/// Stored as a [`BTreeMap`] from each interval's [`LowBound`] to its high
+/// bound: the key *is* the sorted-by-low invariant (an out-of-order entry is
+/// unrepresentable), and the low is recovered from the key, so it is the single
+/// source of truth and cannot drift from a duplicated copy. Every mutation
+/// preserves pairwise-disjointness and non-emptiness.
 #[derive(Debug, Default)]
 pub struct IntervalSet {
-    intervals: Vec<Interval>,
+    intervals: BTreeMap<LowBound, Bound<Coordinate>>,
 }
 
 impl IntervalSet {
     /// Unions `interval` into the set, merging any intervals it touches or
     /// overlaps (complementary endpoints rejoin; real holes never merge).
     pub(in crate::state::cached) fn cover(&mut self, interval: Interval) {
-        self.intervals.push(interval);
-        self.intervals.sort_by(|a, b| cmp_low(&a.lo, &b.lo));
-        let mut merged: Vec<Interval> = Vec::with_capacity(self.intervals.len());
-        for iv in self.intervals.drain(..) {
-            match merged.last_mut() {
-                // Sorted by low, so `prev.lo <= iv.lo`; merge when `prev`'s high
-                // reaches `iv`'s low with no hole, extending the high outward.
-                Some(prev) if high_ge_low(&prev.hi, &iv.lo) => {
-                    if cmp_high(&iv.hi, &prev.hi) == Ordering::Greater {
-                        prev.hi = iv.hi;
-                    }
-                }
-                _ => merged.push(iv),
+        let Interval { mut lo, mut hi } = interval;
+
+        // Left-merge: at most one predecessor can reach `lo`, since
+        // disjointness puts every earlier interval's high strictly below the
+        // predecessor's low. The `.map(clone)` releases the `&self` range borrow
+        // before `remove`/`insert`; the clones are cheap `Bound`/Arc-`Bytes`
+        // refcount bumps, not a scratch buffer.
+        if let Some((key, prev_hi)) = self
+            .intervals
+            .range(..=LowBound(lo.clone()))
+            .next_back()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(_, prev_hi)| high_ge_low(prev_hi, &lo))
+        {
+            self.intervals.remove(&key);
+            lo = key.0;
+            if cmp_high(&prev_hi, &hi) == Ordering::Greater {
+                hi = prev_hi;
             }
         }
-        self.intervals = merged;
+
+        // Right-cascade: absorb every following interval the running `hi`
+        // reaches, re-seeking against the extended `hi` so a cover bridging
+        // several runs coalesces transitively. Monotone — `hi` only grows and
+        // each step removes one entry — so it terminates.
+        while let Some((key, next_hi)) = self
+            .intervals
+            .range(LowBound(lo.clone())..)
+            .next()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(next, _)| high_ge_low(&hi, &next.0))
+        {
+            if cmp_high(&next_hi, &hi) == Ordering::Greater {
+                hi = next_hi;
+            }
+            self.intervals.remove(&key);
+        }
+
+        self.intervals.insert(LowBound(lo), hi);
     }
 
     /// Whether `coordinate` is covered by some interval in the set.
     fn covers(&self, coordinate: &Coordinate) -> bool {
-        self.intervals.iter().any(|iv| iv.contains(coordinate))
+        // The only candidate is the interval with the greatest low `<=` the
+        // coordinate; an `Excluded(c)` low sorts after `Included(c)` and is
+        // correctly excluded.
+        self.intervals
+            .range(..=LowBound(Bound::Included(coordinate.clone())))
+            .next_back()
+            .is_some_and(|(key, hi)| interval(key, hi).contains(coordinate))
     }
 
     /// Splits the interval containing `coordinate` into `[lo, Excluded(X))` and
     /// `(Excluded(X), hi]`, dropping either empty half. A no-op when the
     /// coordinate is not covered.
     fn punch(&mut self, coordinate: &Coordinate) {
-        let Some(pos) = self.intervals.iter().position(|iv| iv.contains(coordinate)) else {
+        let Some((key, hi)) = self
+            .intervals
+            .range(..=LowBound(Bound::Included(coordinate.clone())))
+            .next_back()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(key, hi)| interval(key, hi).contains(coordinate))
+        else {
             return;
         };
-        let iv = self.intervals.remove(pos);
+        self.intervals.remove(&key);
+        // The left half re-inserts at the same key; the right half is a new key
+        // after it. `Interval::new` drops either empty half.
         let halves = [
-            Interval::new(iv.lo, Bound::Excluded(coordinate.clone())),
-            Interval::new(Bound::Excluded(coordinate.clone()), iv.hi),
+            Interval::new(key.0, Bound::Excluded(coordinate.clone())),
+            Interval::new(Bound::Excluded(coordinate.clone()), hi),
         ]
         .into_iter()
         .flatten();
-        self.intervals.splice(pos..pos, halves);
+        self.intervals
+            .extend(halves.map(|iv| (LowBound(iv.lo), iv.hi)));
     }
 
     /// Partitions `request` into ordered, disjoint covered/gap pieces that
@@ -268,7 +335,19 @@ impl IntervalSet {
         let mut pieces = SmallVec::new();
         // The low bound of the next piece still to emit; advances rightward.
         let mut cursor = request.lo.clone();
-        for iv in &self.intervals {
+        // Seek the one straddling predecessor (low strictly below the request,
+        // high possibly reaching in) then every interval from the request's low
+        // forward. The predecessor range is exclusive and the forward range
+        // inclusive so a key exactly at `request.lo` is visited once, not twice.
+        // Omitting the predecessor seek would silently drop coverage of a
+        // request whose low falls mid-interval.
+        let predecessor = self
+            .intervals
+            .range(..LowBound(request.lo.clone()))
+            .next_back();
+        let forward = self.intervals.range(LowBound(request.lo.clone())..);
+        for (key, hi) in predecessor.into_iter().chain(forward) {
+            let iv = interval(key, hi);
             // Skip intervals ending before the cursor and stop once one starts
             // past the request's high bound.
             if !high_ge_low(&iv.hi, &cursor) {
@@ -303,6 +382,17 @@ impl IntervalSet {
             pieces.push(Piece::Gap(gap));
         }
         pieces
+    }
+}
+
+/// Reconstructs the [`Interval`] held by a `(key, hi)` map entry. Every stored
+/// entry is non-empty — inputs arrive as non-empty [`Interval`]s, merges only
+/// widen, and `punch` re-inserts halves only through [`Interval::new`] — so
+/// bypassing the `Interval::new` empty-check here is sound.
+fn interval(key: &LowBound, hi: &Bound<Coordinate>) -> Interval {
+    Interval {
+        lo: key.0.clone(),
+        hi: hi.clone(),
     }
 }
 
