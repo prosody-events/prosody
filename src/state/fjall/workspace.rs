@@ -2,31 +2,31 @@
 //!
 //! `FjallClient` and `FjallWorkspace` are the local workspace described by
 //! `docs/keyed-state/design-summary.md`. One
-//! `FjallClient` owns a shared `fjall::Keyspace` rooted at the configured
+//! `FjallClient` owns a shared `fjall::Database` rooted at the configured
 //! `cache_dir`; per Kafka partition assignment the client mints a
-//! `FjallWorkspace` carrying one named Fjall partition (`cache`) tagged with
+//! `FjallWorkspace` carrying one named Fjall keyspace (`cache`) tagged with
 //! an `AssignmentEpoch` so a fast assign→revoke→assign cycle cannot collide
-//! even if `delete_partition` is delayed.
+//! even if `delete_keyspace` is delayed.
 //!
-//! # Partition naming
+//! # Keyspace naming
 //!
-//! Fjall partition names are restricted to `[A-Za-z0-9_#$-]`, so Kafka
+//! Fjall keyspace names are restricted to `[A-Za-z0-9_#$-]`, so Kafka
 //! topic names (which may contain `.`) cannot be embedded verbatim. The
 //! workspace hashes `(role, topic, partition, epoch)` with `xxh3_128`
 //! and hex-encodes the result. The `value_<role>_` prefix lets the
-//! startup sweep find and reap all `value_*` partitions regardless of
+//! startup sweep find and reap all `value_*` keyspaces regardless of
 //! topic name.
 //!
 //! # Lifecycle
 //!
 //! On revocation, the workspace's `Drop` impl deletes its named
-//! partition. The keyspace stays open for other Kafka partitions still
-//! owned by the process. `PartitionHandle` is internally an `Arc`, so
-//! cloning a handle into `delete_partition` is cheap and lets the Drop
+//! keyspace. The database stays open for other Kafka partitions still
+//! owned by the process. `Keyspace` is internally an `Arc`, so
+//! cloning a handle into `delete_keyspace` is cheap and lets the Drop
 //! impl read fields by reference.
 //!
 //! On process startup, `FjallClient::open` walks every existing
-//! `value_*` partition and deletes them — design §"Local Workspace"
+//! `value_*` keyspace and deletes them — design §"Local Workspace"
 //! §"Process restart": "Delete old workspaces; Cassandra recovers truth."
 
 use super::config::FjallConfiguration;
@@ -34,7 +34,8 @@ use super::error::FjallCellCacheError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::{Partition, Topic};
 use educe::Educe;
-use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -52,8 +53,8 @@ const CACHE_ROLE: &str = "cache";
 /// A process-monotonic counter, minted by [`Self::mint`] from a global
 /// [`AtomicU64`]. Tagging each workspace with a strictly increasing value
 /// guarantees that a fast `assign → revoke → assign` cycle on the same Kafka
-/// `(topic, partition)` produces *distinct* fjall partition names even when
-/// the prior `delete_partition` has not yet landed on disk — so the new
+/// `(topic, partition)` produces *distinct* fjall keyspace names even when
+/// the prior `delete_keyspace` has not yet landed on disk — so the new
 /// workspace never aliases the live handle of the one being torn down.
 ///
 /// Wall-clock granularity (the previous, one-second design) could not make
@@ -61,8 +62,8 @@ const CACHE_ROLE: &str = "cache";
 /// also deterministic, so the collision-avoidance invariant is testable.
 ///
 /// Cross-restart collisions are irrelevant: the counter resets to `0` each
-/// process, but [`FjallClient::open`] sweeps *every* `value_*` partition at
-/// startup, so no stale partition from a prior process survives to alias a
+/// process, but [`FjallClient::open`] sweeps *every* `value_*` keyspace at
+/// startup, so no stale keyspace from a prior process survives to alias a
 /// fresh epoch.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct AssignmentEpoch(u64);
@@ -78,17 +79,17 @@ impl AssignmentEpoch {
 /// Process-wide Fjall instance.
 ///
 /// One `FjallClient` per consumer process. It owns the shared
-/// `fjall::Keyspace` at `cache_dir` and is responsible for sweeping
-/// crash-leftover partitions at startup.
+/// `fjall::Database` at `cache_dir` and is responsible for sweeping
+/// crash-leftover keyspaces at startup.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct FjallClient {
     #[educe(Debug(ignore))]
-    keyspace: Arc<Keyspace>,
+    database: Database,
 }
 
 impl FjallClient {
-    /// Opens the shared keyspace and wipes any `value_*` partitions left
+    /// Opens the shared database and wipes any `value_*` keyspaces left
     /// over from a prior process.
     ///
     /// Design §"Local Workspace" §"Process restart": "Delete old
@@ -96,30 +97,30 @@ impl FjallClient {
     ///
     /// # Errors
     ///
-    /// Returns [`FjallClientError::Engine`] when the keyspace cannot be
-    /// opened or stale partitions cannot be swept.
+    /// Returns [`FjallClientError::Engine`] when the database cannot be
+    /// opened or stale keyspaces cannot be swept.
     pub fn open(config: &FjallConfiguration) -> Result<Arc<Self>, FjallClientError> {
-        let keyspace = Arc::new(Config::new(&config.cache_dir).open()?);
-        sweep_orphaned(&keyspace)?;
-        Ok(Arc::new(Self { keyspace }))
+        let database = Database::builder(&config.cache_dir).open()?;
+        sweep_orphaned(&database)?;
+        Ok(Arc::new(Self { database }))
     }
 
-    /// Returns the shared keyspace.
+    /// Returns the shared database.
     #[must_use]
-    pub fn keyspace(&self) -> &Arc<Keyspace> {
-        &self.keyspace
+    pub fn database(&self) -> &Database {
+        &self.database
     }
 
     /// Mints a fresh per-Kafka-partition workspace tagged with `epoch`.
     ///
-    /// Opens one named Fjall partition (`cache`) named via
+    /// Opens one named Fjall keyspace (`cache`) named via
     /// `xxh3_128(role, topic, partition, epoch)` so concurrent assign/revoke
     /// cycles cannot collide and arbitrary topic names cannot violate
-    /// fjall's partition-name charset.
+    /// fjall's keyspace-name charset.
     ///
     /// # Errors
     ///
-    /// Returns [`FjallCellCacheError::Engine`] when the partition cannot
+    /// Returns [`FjallCellCacheError::Engine`] when the keyspace cannot
     /// be opened.
     pub fn workspace(
         self: &Arc<Self>,
@@ -129,9 +130,7 @@ impl FjallClient {
     ) -> Result<FjallWorkspace, FjallCellCacheError> {
         let cache_name = partition_name(CACHE_ROLE, topic, partition, epoch);
 
-        let cache = self
-            .keyspace
-            .open_partition(&cache_name, partition_options())?;
+        let cache = self.database.keyspace(&cache_name, keyspace_options)?;
 
         Ok(FjallWorkspace {
             client: Arc::clone(self),
@@ -145,7 +144,7 @@ impl FjallClient {
 
 /// Per-Kafka-partition workspace.
 ///
-/// Owns the named Fjall cache partition for one `(topic, partition,
+/// Owns the named Fjall cache keyspace for one `(topic, partition,
 /// epoch)`. Drop deletes it; if delete fails it logs and continues
 /// — the next process startup will reap the leftover via
 /// [`FjallClient::open`].
@@ -158,59 +157,59 @@ pub struct FjallWorkspace {
     topic: Topic,
     partition: Partition,
     #[educe(Debug(ignore))]
-    cache: PartitionHandle,
+    cache: Keyspace,
 }
 
 impl FjallWorkspace {
-    /// Returns the shared keyspace.
+    /// Returns the shared database.
     #[must_use]
-    pub fn keyspace(&self) -> &Arc<Keyspace> {
-        self.client.keyspace()
+    pub fn database(&self) -> &Database {
+        self.client.database()
     }
 
-    /// Returns the cache partition handle.
+    /// Returns the cache keyspace handle.
     #[must_use]
-    pub fn cache_handle(&self) -> &PartitionHandle {
+    pub fn cache_handle(&self) -> &Keyspace {
         &self.cache
     }
 }
 
 impl Drop for FjallWorkspace {
     fn drop(&mut self) {
-        // `PartitionHandle` wraps an `Arc`, so cloning here is cheap and
-        // matches fjall's expected ownership for `delete_partition`.
-        if let Err(err) = self.client.keyspace.delete_partition(self.cache.clone()) {
+        // `Keyspace` wraps an `Arc`, so cloning here is cheap and
+        // matches fjall's expected ownership for `delete_keyspace`.
+        if let Err(err) = self.client.database.delete_keyspace(self.cache.clone()) {
             warn!(
                 role = CACHE_ROLE,
                 topic = ?self.topic,
                 partition = self.partition,
                 epoch = ?self.epoch,
                 error = ?err,
-                "delete_partition failed on workspace drop; \
-                 stale partition will be reaped on next startup"
+                "delete_keyspace failed on workspace drop; \
+                 stale keyspace will be reaped on next startup"
             );
         }
     }
 }
 
-/// Deletes every `value_*` partition currently in the keyspace.
+/// Deletes every `value_*` keyspace currently in the database.
 ///
-/// Called by [`FjallClient::open`] to clear crash-leftover partitions at
-/// process startup. Operating directly on the keyspace via
-/// `open_partition` + `delete_partition` because fjall has no
+/// Called by [`FjallClient::open`] to clear crash-leftover keyspaces at
+/// process startup. Operating directly on the database via
+/// `keyspace` + `delete_keyspace` because fjall has no
 /// "delete by name" shortcut.
-fn sweep_orphaned(keyspace: &Arc<Keyspace>) -> Result<(), FjallClientError> {
-    let names = keyspace.list_partitions();
+fn sweep_orphaned(database: &Database) -> Result<(), FjallClientError> {
+    let names = database.list_keyspace_names();
     for name in names {
         if !name.starts_with(PARTITION_NAME_PREFIX) {
             continue;
         }
-        let handle = keyspace.open_partition(&name, partition_options())?;
-        if let Err(err) = keyspace.delete_partition(handle) {
+        let handle = database.keyspace(&name, keyspace_options)?;
+        if let Err(err) = database.delete_keyspace(handle) {
             warn!(
-                partition = %name,
+                keyspace = %name,
                 error = ?err,
-                "sweep_orphaned failed to delete stale workspace partition; \
+                "sweep_orphaned failed to delete stale workspace keyspace; \
                  continuing — fjall is best-effort here"
             );
         }
@@ -218,14 +217,17 @@ fn sweep_orphaned(keyspace: &Arc<Keyspace>) -> Result<(), FjallClientError> {
     Ok(())
 }
 
-/// Creation options shared by every keyed-state fjall partition (the `cache`
-/// partition and the startup sweep's reopen).
+/// Creation options shared by every keyed-state fjall keyspace (the `cache`
+/// keyspace and the startup sweep's reopen).
 ///
 /// Cells are stored raw; fjall compresses data blocks at flush/compaction.
-/// LZ4 is already fjall's default — pinning it documents that intent and
-/// guards against a future change to fjall's default.
-fn partition_options() -> PartitionCreateOptions {
-    PartitionCreateOptions::default().compression(CompressionType::Lz4)
+/// fjall 3.x configures compression with a per-level [`CompressionPolicy`]
+/// rather than a single type; pinning every level to LZ4 preserves the prior
+/// behavior, documents the intent, and guards against a future change to
+/// fjall's default policy.
+fn keyspace_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
 fn partition_name(

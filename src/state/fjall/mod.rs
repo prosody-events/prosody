@@ -1,7 +1,7 @@
 //! Fjall-backed cell cache.
 //!
 //! [`FjallCellCache`] stores one tagged cell per [`CellKey`] in a fjall
-//! partition. It is the committed-value cache the
+//! keyspace. It is the committed-value cache the
 //! [`Cached`](crate::state::cached::Cached) coverage combinator serves from:
 //! point [`get`](FjallCellCache::get)s and, over a covered scan sub-range,
 //! ordered [`scan_present`](FjallCellCache::scan_present) range reads. It does
@@ -14,7 +14,7 @@
 //!
 //! In production the cache **owns** its [`FjallWorkspace`] (built via
 //! [`FjallCellCache::for_workspace`]). The workspace's `Drop` deletes the fjall
-//! partition, so the cache must hold it alive for the whole partition
+//! keyspace, so the cache must hold it alive for the whole partition
 //! assignment — it lives in the partition's state manager and drops only at
 //! revocation. Test caches built from a bare handle ([`FjallCellCache::new`])
 //! own no workspace.
@@ -24,7 +24,7 @@
 //! Unlike the durable stores (Memory/Cassandra) whose `get` returns only
 //! `Present`/`Absent`, the cache observes a third state: an entry that
 //! has never been populated. That state is encoded as the **absence of an
-//! entry** in the fjall partition, and decodes as
+//! entry** in the fjall keyspace, and decodes as
 //! [`Read::Unknown`]. Tag byte `0x00` is
 //! `Absent` (known cleared); tag byte `0x01` is `Present`. Each frame carries
 //! an absolute expiry header (`[tag][expiry: u64 BE millis][payload]`, `0` =
@@ -55,12 +55,12 @@ pub use error::FjallCellCacheError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
 use crate::state::CollectionId;
-use crate::state::cell::Committed;
+use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Section};
 use crate::state::transaction::Read;
 use bytes::Bytes;
 use educe::Educe;
-use fjall::PartitionHandle;
+use fjall::{Database, Keyspace, OwnedWriteBatch};
 use futures::{Stream, StreamExt, stream};
 use std::iter;
 use std::ops::Bound;
@@ -71,6 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::coop::cooperative;
 use tokio::task::spawn_blocking;
+use tracing::warn;
 
 /// The cache's `now` source for TTL co-expiry, in milliseconds since the Unix
 /// epoch.
@@ -119,51 +120,66 @@ pub struct FjallCellCache {
     fail_puts: Arc<AtomicBool>,
 }
 
-/// Backing for a [`FjallCellCache`]: either a bare cache handle (tests) or an
-/// owned per-partition workspace whose cache handle the cache operates and
-/// whose `Drop` deletes the partition at revocation (production).
+/// Backing for a [`FjallCellCache`]: either a bare cache handle plus its
+/// owning database (tests) or an owned per-partition workspace whose cache
+/// handle the cache operates and whose `Drop` deletes the keyspace at
+/// revocation (production).
+///
+/// The [`Database`] is held in both arms because batch writes are issued
+/// through [`Database::batch`], not the keyspace handle.
 enum Inner {
-    Bare(PartitionHandle),
+    Bare { database: Database, cache: Keyspace },
     Owned(FjallWorkspace),
 }
 
 impl Inner {
-    /// The cache partition handle this cache operates.
-    fn partition(&self) -> &PartitionHandle {
+    /// The cache keyspace handle this cache operates.
+    fn handle(&self) -> &Keyspace {
         match self {
-            Self::Bare(partition) => partition,
+            Self::Bare { cache, .. } => cache,
             Self::Owned(workspace) => workspace.cache_handle(),
+        }
+    }
+
+    /// The database the cache keyspace belongs to — the owner of [`batch`]
+    /// writes.
+    ///
+    /// [`batch`]: Database::batch
+    fn database(&self) -> &Database {
+        match self {
+            Self::Bare { database, .. } => database,
+            Self::Owned(workspace) => workspace.database(),
         }
     }
 }
 
 impl FjallCellCache {
-    /// Builds a cache over an opened cache `PartitionHandle`, owning no
-    /// workspace.
+    /// Builds a cache over an opened cache `Keyspace` and its owning
+    /// `Database`, owning no workspace.
     ///
-    /// The caller owns the keyspace the handle belongs to and is responsible
-    /// for keeping it (and the partition) alive for the cache's lifetime. Used
+    /// The caller owns the database the handle belongs to and is responsible
+    /// for keeping it (and the keyspace) alive for the cache's lifetime. Used
     /// by tests; production uses [`Self::for_workspace`], which owns the
     /// workspace.
     #[must_use]
-    pub fn new(partition: PartitionHandle) -> Self {
-        Self::from_parts(Inner::Bare(partition), Clock::Wall)
+    pub fn new(database: Database, cache: Keyspace) -> Self {
+        Self::from_parts(Inner::Bare { database, cache }, Clock::Wall)
     }
 
-    /// Builds a bare cache over `partition` driven by a test-controlled
-    /// [`Clock`], so a TTL-expiry property can advance time past a stamped
-    /// expiry deterministically.
+    /// Builds a bare cache over `cache` driven by a test-controlled [`Clock`],
+    /// so a TTL-expiry property can advance time past a stamped expiry
+    /// deterministically.
     #[cfg(test)]
     #[must_use]
-    pub fn with_clock(partition: PartitionHandle, clock: Clock) -> Self {
-        Self::from_parts(Inner::Bare(partition), clock)
+    pub fn with_clock(database: Database, cache: Keyspace, clock: Clock) -> Self {
+        Self::from_parts(Inner::Bare { database, cache }, clock)
     }
 
     /// Builds the production cache, taking ownership of the per-partition
     /// [`FjallWorkspace`].
     ///
     /// The cache operates the workspace's cache handle and holds the workspace
-    /// alive, so the workspace's `Drop` — which deletes the fjall partition —
+    /// alive, so the workspace's `Drop` — which deletes the fjall keyspace —
     /// fires only when the cache (and thus the partition's state manager) is
     /// dropped at revocation.
     #[must_use]
@@ -219,7 +235,7 @@ impl FjallCellCache {
         cell: &CellKey,
     ) -> Result<CacheRead, FjallCellCacheError> {
         let raw =
-            cell_io::read_cell(self.inner.partition(), codec::cell_key(collection, cell)).await?;
+            cell_io::read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
         let (expiry, read) = codec::decode_cell(raw.as_deref())?;
         Ok(match read {
             Read::Unknown => CacheRead::Miss,
@@ -248,7 +264,7 @@ impl FjallCellCache {
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
         let raw =
-            cell_io::read_cell(self.inner.partition(), codec::cell_key(collection, cell)).await?;
+            cell_io::read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
         let (expiry, read) = codec::decode_cell(raw.as_deref())?;
         Ok(match read {
             Read::Unknown => None,
@@ -281,11 +297,119 @@ impl FjallCellCache {
             None => codec::encode_absent_cell(expiry),
         };
         cell_io::write_cell(
-            self.inner.partition(),
+            self.inner.handle(),
             codec::cell_key(collection, cell),
             frame,
         )
         .await
+    }
+
+    /// Write-through publish of a *batch* of committed cell projections in a
+    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`].
+    ///
+    /// Each `(cell, projection, expiry)` is encoded to a frame and inserted;
+    /// `commit` lands the whole set as one fjall mutation, so a multi-cell
+    /// cache update is never torn (mirroring the same-partition `UNLOGGED
+    /// BATCH` the Cassandra side uses). This collapses the per-cell settle
+    /// writes from N blocking thread-hops to one. The single-cell write-through
+    /// paths keep [`put`](Self::put).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FjallCellCacheError`] when the batch commit fails; the caller
+    /// then uncovers every coordinate (Cov3).
+    pub async fn put_batch(
+        &self,
+        collection: &CollectionId,
+        cells: &[(CellKey, Committed, u64)],
+    ) -> Result<(), FjallCellCacheError> {
+        #[cfg(test)]
+        if self.fail_puts.load(Ordering::Relaxed) {
+            return Err(FjallCellCacheError::Injected);
+        }
+        // Encode every frame up front (bounded, sized once) so the blocking
+        // closure only touches fjall; the owned key/frame pairs move into it.
+        let mut framed: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(cells.len());
+        for (cell, value, expiry) in cells {
+            let frame = match value.get() {
+                Some(payload) => codec::encode_present_cell(payload, *expiry),
+                None => codec::encode_absent_cell(*expiry),
+            };
+            framed.push((codec::cell_key(collection, cell), frame));
+        }
+        let database = self.inner.database().clone();
+        let handle = self.inner.handle().clone();
+        spawn_blocking(move || {
+            let mut batch = OwnedWriteBatch::with_capacity(database, framed.len());
+            for (key, frame) in &framed {
+                batch.insert(&handle, key.as_slice(), frame.as_ref());
+            }
+            batch.commit()
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Promotes a batch of staged cells into committed cache entries in a
+    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`]: for
+    /// each write it reads the cell's stage-anchored expiry back from fjall and
+    /// re-publishes `data` at that **same** expiry, then commits the whole set
+    /// at once. Reusing the stage expiry is load-bearing — the lower promote
+    /// keeps `data`'s death set at stage time, so a fresh `now + ttl` would
+    /// overhang it (Cov1).
+    ///
+    /// Returns one [`CoverDecision`] per write, aligned to `writes` order:
+    /// [`Cover`](CoverDecision::Cover) when the cell was re-published,
+    /// [`Punch`](CoverDecision::Punch) when its stage entry was missing or
+    /// unreadable, or — for **every** write — when the batch commit failed.
+    /// Best-effort: it never returns an error, so the caller can return the
+    /// lower promote's `Result` verbatim (the Incomplete trap).
+    pub async fn commit_batch(
+        &self,
+        collection: &CollectionId,
+        writes: &[(CellKey, ProvisionalWrite)],
+    ) -> Vec<CoverDecision> {
+        #[cfg(test)]
+        if self.fail_puts.load(Ordering::Relaxed) {
+            return vec![CoverDecision::Punch; writes.len()];
+        }
+        // Owned closure inputs, bounded and sized once: the cell key plus the
+        // committed `data` to re-publish at its read-back stage expiry.
+        let mut inputs: Vec<(Vec<u8>, Option<Bytes>)> = Vec::with_capacity(writes.len());
+        for (cell, write) in writes {
+            inputs.push((codec::cell_key(collection, cell), write.data().cloned()));
+        }
+        let database = self.inner.database().clone();
+        let handle = self.inner.handle().clone();
+        spawn_blocking(move || {
+            let mut batch = OwnedWriteBatch::with_capacity(database, inputs.len());
+            let mut decisions = Vec::with_capacity(inputs.len());
+            for (key, data) in &inputs {
+                match stage_expiry(&handle, key) {
+                    Some(expiry) => {
+                        let frame = match data {
+                            Some(payload) => codec::encode_present_cell(payload, expiry),
+                            None => codec::encode_absent_cell(expiry),
+                        };
+                        batch.insert(&handle, key.as_slice(), frame.as_ref());
+                        decisions.push(CoverDecision::Cover);
+                    }
+                    None => decisions.push(CoverDecision::Punch),
+                }
+            }
+            // A commit failure means none of the inserts landed, so uncover
+            // every coordinate (not just the ones marked Cover).
+            if batch.commit().is_ok() {
+                decisions
+            } else {
+                vec![CoverDecision::Punch; inputs.len()]
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "committed-value cache commit batch task failed; uncovering");
+            vec![CoverDecision::Punch; writes.len()]
+        })
     }
 
     /// Streams the committed cells of one `(collection, section)` whose
@@ -304,7 +428,7 @@ impl FjallCellCache {
     /// across an `.await`); each yielded item is then coop-wrapped
     /// so a large covered drain yields to the runtime.
     ///
-    /// The fjall partition is shared across **all** collections, so the scan is
+    /// The fjall keyspace is shared across **all** collections, so the scan is
     /// bounded to the `(collection, section)` byte prefix on both ends — an
     /// unbounded `hi` stops at the section's upper boundary, never bleeding
     /// into the next section or another collection. A per-item prefix check
@@ -317,7 +441,7 @@ impl FjallCellCache {
         hi: Bound<&'a Coordinate>,
         dir: Direction,
     ) -> impl Stream<Item = Result<ScanHit, FjallCellCacheError>> + Send + 'a {
-        let partition = self.inner.partition().clone();
+        let handle = self.inner.handle().clone();
         let section_prefix = codec::section_prefix(collection, section);
         let lo_bound = byte_low_bound(&section_prefix, lo);
         let hi_bound = byte_high_bound(&section_prefix, hi);
@@ -326,8 +450,8 @@ impl FjallCellCache {
         let collected = async move {
             spawn_blocking(move || {
                 let mut window: Vec<ScanHit> = Vec::new();
-                for kv in partition.range((lo_bound, hi_bound)) {
-                    let (key, value) = kv?;
+                for guard in handle.range((lo_bound, hi_bound)) {
+                    let (key, value) = guard.into_inner()?;
                     // Defensive: the byte bounds already confine the scan to the
                     // section, so this never trips — but it guarantees no other
                     // collection's cell can be served even if a bound is wrong.
@@ -393,9 +517,46 @@ pub enum ScanHit {
     Expired(CellKey),
 }
 
+/// The per-cell outcome [`FjallCellCache::commit_batch`] reports: whether the
+/// re-published committed value now **covers** the coordinate, or the
+/// coordinate must be **uncovered** (its stage entry was missing/unreadable,
+/// or the atomic batch commit failed) so the next read falls through and
+/// self-heals.
+#[derive(Clone, Copy, Debug)]
+pub enum CoverDecision {
+    /// The committed value was re-published; cover the coordinate.
+    Cover,
+    /// Uncover the coordinate; the next read re-publishes from the lower store.
+    Punch,
+}
+
 /// Whether an absolute `expiry` (millis; `0` = never) has passed at `now`.
 fn expired(expiry: u64, now: u64) -> bool {
     expiry != codec::NEVER_EXPIRES && now >= expiry
+}
+
+/// Reads the absolute stage expiry stamped on the cell at `key` back from the
+/// cache keyspace, or `None` when no entry exists or the read/decode fails (a
+/// failure logs and degrades — the caller then uncovers the coordinate so the
+/// next read self-heals). Runs inside
+/// [`commit_batch`](FjallCellCache::commit_batch)'s blocking closure, so it
+/// uses the synchronous keyspace `get` directly.
+fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
+    let raw = match handle.get(key) {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!(%error, "committed-value cache commit expiry read failed; degrading");
+            return None;
+        }
+    };
+    match codec::decode_cell(raw.as_deref()) {
+        Ok((_, Read::Unknown)) => None,
+        Ok((expiry, _)) => Some(expiry),
+        Err(error) => {
+            warn!(%error, "committed-value cache commit expiry decode failed; degrading");
+            None
+        }
+    }
 }
 
 /// The fjall byte key bound opening a covered scan's low side. `Unbounded`

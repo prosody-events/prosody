@@ -78,7 +78,7 @@ use self::coverage::{Coverage, Interval, Piece};
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::event_ref::EventRef;
-use super::fjall::{CacheRead, FjallCellCache, ScanHit};
+use super::fjall::{CacheRead, CoverDecision, FjallCellCache, ScanHit};
 use super::identity::{CollectionId, CollectionRef};
 use super::store::CellStore;
 use crate::timers::duration::CompactDuration;
@@ -153,20 +153,24 @@ impl<L> Cached<L> {
         L: CellStore,
     {
         match self.fjall.put(collection, cell, projection, expiry).await {
-            Ok(()) => {
-                if let Some(point) = Interval::new(
-                    Bound::Included(cell.coordinate.clone()),
-                    Bound::Included(cell.coordinate.clone()),
-                ) {
-                    self.coverage.cover(collection, cell.section, point).await;
-                }
-            }
+            Ok(()) => self.cover_point(collection, cell).await,
             Err(error) => {
                 warn_skip("publish", &error);
                 self.coverage
                     .punch(collection, cell.section, &cell.coordinate)
                     .await;
             }
+        }
+    }
+
+    /// Covers a single coordinate (the point interval `[X, X]`) after a
+    /// successful publish.
+    async fn cover_point(&self, collection: &CollectionId, cell: &CellKey) {
+        if let Some(point) = Interval::new(
+            Bound::Included(cell.coordinate.clone()),
+            Bound::Included(cell.coordinate.clone()),
+        ) {
+            self.coverage.cover(collection, cell.section, point).await;
         }
     }
 }
@@ -176,27 +180,46 @@ where
     L: CellStore,
 {
     /// Publishes each touched cell's `projection` after a successful
-    /// `lower.write` (Cov3). `stamped_at` is a clock reading taken **before**
-    /// the lower write; [`expiry_at`] floors it DOWN to the second to match
-    /// Cassandra's whole-second TTL resolution, so the co-expiry stamp sheds
-    /// the sub-second remainder that would otherwise overhang the row
-    /// (Cov1; residual clock skew self-heals via fall-through). The
-    /// collection's write TTL is the full TTL (the value was just written).
-    /// `project` computes each cell's committed projection from its batch
-    /// entry.
-    async fn publish_written<'a, T, P>(
+    /// `lower.write` (Cov3) in **one** atomic fjall batch
+    /// ([`FjallCellCache::put_batch`]), then covers every coordinate (or
+    /// uncovers them all if the batch failed). `stamped_at` is a clock reading
+    /// taken **before** the lower write; [`expiry_at`] floors it DOWN to the
+    /// second to match Cassandra's whole-second TTL resolution, so the
+    /// co-expiry stamp sheds the sub-second remainder that would otherwise
+    /// overhang the row (Cov1; residual clock skew self-heals via
+    /// fall-through). The collection's write TTL is the full TTL (the value was
+    /// just written). `project` computes each cell's committed projection from
+    /// its batch entry.
+    async fn publish_written<T>(
         &self,
-        collection: &'a CollectionRef,
-        cells: &'a [(CellKey, T)],
+        collection: &CollectionRef,
+        cells: &[(CellKey, T)],
         stamped_at: u64,
-        project: P,
-    ) where
-        P: Fn(&T) -> Committed,
-    {
+        project: impl Fn(&T) -> Committed,
+    ) {
         let expiry = expiry_at(stamped_at, collection.ttl());
+        // Build the bounded batch input once, then publish atomically: a
+        // multi-cell update is never torn, and the whole settle is one blocking
+        // thread-hop instead of N. The coverage updates below are in-memory
+        // `scc` ops, so a serial loop is correct and cheap.
+        let mut batch: Vec<(CellKey, Committed, u64)> = Vec::with_capacity(cells.len());
         for (cell, value) in cells {
-            self.publish(collection.id(), cell, &project(value), expiry)
-                .await;
+            batch.push((cell.clone(), project(value), expiry));
+        }
+        match self.fjall.put_batch(collection.id(), &batch).await {
+            Ok(()) => {
+                for (cell, ..) in &batch {
+                    self.cover_point(collection.id(), cell).await;
+                }
+            }
+            Err(error) => {
+                warn_skip("publish", &error);
+                for (cell, ..) in &batch {
+                    self.coverage
+                        .punch(collection.id(), cell.section, &cell.coordinate)
+                        .await;
+                }
+            }
         }
     }
 
@@ -522,7 +545,8 @@ where
         // returned VERBATIM below; the fjall publish is best-effort so a cache
         // failure never folds into `ApplyOutcome::Incomplete` (the Incomplete
         // trap).
-        let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
+        let mut keys: Vec<CellKey> = Vec::with_capacity(writes.len());
+        keys.extend(writes.iter().map(|(cell, _)| cell.clone()));
         let result = self.lower.mark_resolved(collection, &keys).await;
         if result.is_ok() {
             // The provisional `data` is now the committed value; re-publish it.
@@ -530,25 +554,22 @@ where
             // the death set by `write_provisional` at stage time — so the
             // co-expiry must REUSE the stage-anchored expiry already on the
             // cell's fjall entry, never a fresh `now + ttl` (which would overhang
-            // the durable death by the whole stage→commit gap; Cov1). If the
-            // stage publish never landed (no entry) or is unreadable, punch the
-            // coordinate so the next covered read re-publishes via the floored
-            // read-back path.
-            for (cell, write) in writes {
-                let stage_expiry = match self.fjall.stored_expiry(collection.id(), cell).await {
-                    Ok(expiry) => expiry,
-                    Err(error) => {
-                        warn_skip("commit expiry", &error);
-                        None
-                    }
-                };
-                match stage_expiry {
-                    Some(expiry) => {
-                        let projection = Committed::new(write.data().cloned());
-                        self.publish(collection.id(), cell, &projection, expiry)
-                            .await;
-                    }
-                    None => {
+            // the durable death by the whole stage→commit gap; Cov1). The
+            // combined read-expiry → re-publish runs as one atomic batch in a
+            // single blocking thread-hop ([`commit_batch`]); it returns a
+            // [`CoverDecision`] per write — `Cover` when re-published, `Punch`
+            // when the stage entry was missing/unreadable or the batch failed
+            // (the next covered read then re-publishes via the floored read-back
+            // path). The lower promote above stays a single batched call before
+            // the cache work, and `result` is returned verbatim so the
+            // best-effort republish never folds into `ApplyOutcome::Incomplete`
+            // (the Incomplete trap). The coverage updates are in-memory `scc`
+            // ops, so a serial loop is correct and cheap.
+            let decisions = self.fjall.commit_batch(collection.id(), writes).await;
+            for ((cell, _), decision) in writes.iter().zip(decisions) {
+                match decision {
+                    CoverDecision::Cover => self.cover_point(collection.id(), cell).await,
+                    CoverDecision::Punch => {
                         self.coverage
                             .punch(collection.id(), cell.section, &cell.coordinate)
                             .await;

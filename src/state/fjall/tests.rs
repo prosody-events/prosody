@@ -17,7 +17,8 @@ use crate::test_util::TEST_RUNTIME;
 use crate::{Key, Topic};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
 use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -32,28 +33,28 @@ fn value_cell() -> CellKey {
 }
 
 /// LZ4 block compression, matching the production workspace's
-/// `partition_options`.
-fn partition_options() -> PartitionCreateOptions {
-    PartitionCreateOptions::default().compression(CompressionType::Lz4)
+/// `keyspace_options`.
+fn keyspace_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
-/// Opens a fresh tempdir-backed keyspace and one named partition under it. The
-/// returned `TempDir` keeps the backing directory alive; the `PartitionHandle`
-/// (and any handle cloned from it) is what operates the store, so the
-/// `Keyspace` itself need not outlive the handles in-process.
-fn open(name: &str) -> Result<(TempDir, Keyspace, PartitionHandle)> {
+/// Opens a fresh tempdir-backed database and one named cache keyspace under
+/// it. The returned `TempDir` keeps the backing directory alive; the
+/// [`Database`] owns batch writes, so the caller keeps it alongside the
+/// [`Keyspace`] handle.
+fn open(name: &str) -> Result<(TempDir, Database, Keyspace)> {
     let dir = tempfile::tempdir()?;
-    let keyspace = Config::new(dir.path()).open()?;
-    let partition = keyspace.open_partition(name, partition_options())?;
-    Ok((dir, keyspace, partition))
+    let database = Database::builder(dir.path()).open()?;
+    let cache = database.keyspace(name, keyspace_options)?;
+    Ok((dir, database, cache))
 }
 
-/// Opens a fresh tempdir-backed cache partition and wraps it in a store. The
-/// returned `TempDir` keeps the backing directory alive; the store operates
-/// through the `PartitionHandle`, so the intermediate `Keyspace` is dropped.
+/// Opens a fresh tempdir-backed cache keyspace and wraps it in a store. The
+/// returned `TempDir` keeps the backing directory alive.
 fn setup() -> Result<(TempDir, FjallCellCache)> {
-    let (dir, _keyspace, partition) = open("value_cache")?;
-    Ok((dir, FjallCellCache::new(partition)))
+    let (dir, database, cache) = open("value_cache")?;
+    Ok((dir, FjallCellCache::new(database, cache)))
 }
 
 fn collection(name: &str) -> Result<CollectionId> {
@@ -114,11 +115,11 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
 
-    let (_dir, _keyspace, cache_partition) = open("value_cache")?;
+    let (_dir, database, cache_partition) = open("value_cache")?;
     let c = collection("raw")?;
     let cell = value_cell();
 
-    let cache = FjallCellCache::new(cache_partition.clone());
+    let cache = FjallCellCache::new(database, cache_partition.clone());
     TEST_RUNTIME.block_on(cache.put(
         &c,
         &cell,
@@ -149,8 +150,8 @@ fn expired_entry_reads_as_miss() -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let now = Arc::new(AtomicU64::new(1_000));
-    let (_dir, _keyspace, partition) = open("ttl_value")?;
-    let cache = FjallCellCache::with_clock(partition, Clock::Fixed(now.clone()));
+    let (_dir, database, partition) = open("ttl_value")?;
+    let cache = FjallCellCache::with_clock(database, partition, Clock::Fixed(now.clone()));
     let c = collection("ttl")?;
     let cell = value_cell();
     let payload = Committed::new(Some(Bytes::from_static(b"v")));
@@ -201,10 +202,10 @@ fn for_workspace_retains_the_workspace() -> Result<()> {
     let client = FjallClient::open(&FjallConfiguration {
         cache_dir: dir.path().to_path_buf(),
     })?;
-    let keyspace = client.keyspace().clone();
+    let database = client.database().clone();
     let live_cache_partitions = || {
-        keyspace
-            .list_partitions()
+        database
+            .list_keyspace_names()
             .iter()
             .filter(|name| name.starts_with("value_cache_"))
             .count()

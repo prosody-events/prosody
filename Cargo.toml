@@ -31,9 +31,10 @@ derive_builder = "0.20"
 dyn-clone = "1.0"
 educe = "0.6"
 fixedstr = { version = "0.5", features = ["flex-str"] }
-# fjall 2.x: stable `Keyspace` / `PartitionHandle` API with synchronous
-# `insert`/`get`/`remove`, wrapped in `spawn_blocking` at each call site.
-fjall = "2.11"
+# fjall 3.x: a `Database` holds many `Keyspace`s (each its own LSM-tree), with
+# synchronous `insert`/`get`/`range` wrapped in `spawn_blocking` at each call
+# site and multi-cell settle writes batched through one atomic `OwnedWriteBatch`.
+fjall = "3.1"
 futures = "0.3"
 humantime = "2.3"
 internment = { version = "0.8", features = ["serde"] }

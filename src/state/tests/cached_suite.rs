@@ -34,7 +34,8 @@ use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use fjall::{CompressionType, Config, Keyspace, PartitionCreateOptions};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, Database, KeyspaceCreateOptions};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
@@ -49,34 +50,38 @@ use uuid::Uuid;
 const SECTION: Section = Section::new(0);
 
 /// LZ4 block compression, matching the production workspace.
-fn partition_options() -> PartitionCreateOptions {
-    PartitionCreateOptions::default().compression(CompressionType::Lz4)
+fn keyspace_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
-/// A fresh tempdir-backed keyspace; every `Cached` opens its cache partition
-/// under it, so a "crash" (a new partition) starts cold while the keyspace —
+/// A fresh tempdir-backed database; every `Cached` opens its cache keyspace
+/// under it, so a "crash" (a new keyspace) starts cold while the database —
 /// and the warm `MemoryCells` — outlives the run.
-fn open_keyspace() -> Result<(TempDir, Keyspace)> {
+fn open_database() -> Result<(TempDir, Database)> {
     let dir = tempfile::tempdir()?;
-    let keyspace = Config::new(dir.path()).open()?;
-    Ok((dir, keyspace))
+    let database = Database::builder(dir.path()).open()?;
+    Ok((dir, database))
 }
 
-/// Builds a production-shaped `Cached` over a fresh fjall partition and the
+/// Builds a production-shaped `Cached` over a fresh fjall keyspace and the
 /// shared memory cells.
 fn cached_over(
-    keyspace: &Keyspace,
+    database: &Database,
     cells: &MemoryCells,
     oracle: &ScriptedOracle,
     name: &str,
 ) -> Result<Cached<MemoryCellStore<ScriptedOracle>>> {
-    let handle = keyspace.open_partition(name, partition_options())?;
+    let handle = database.keyspace(name, keyspace_options)?;
     let lower = MemoryCellStore::new(
         cells.clone(),
         oracle.clone(),
         Arc::new(CollectionDefRegistry::default()),
     );
-    Ok(Cached::new(FjallCellCache::new(handle), lower))
+    Ok(Cached::new(
+        FjallCellCache::new(database.clone(), handle),
+        lower,
+    ))
 }
 
 /// The cell at coordinate `c` in the shared section (single byte, so byte order
@@ -243,8 +248,8 @@ fn prop_memory_cached_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let lower = cached_over(&keyspace, &cells, &oracle, "overlay")?;
+        let (_dir, database) = open_database()?;
+        let lower = cached_over(&database, &cells, &oracle, "overlay")?;
         TEST_RUNTIME.block_on(run_overlay_trace(lower, trace))
     }
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
@@ -289,14 +294,17 @@ fn coverage_op_budget() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
+        let (_dir, database) = open_database()?;
         let counting = CountingCellStore::new(MemoryCellStore::new(
             cells,
             oracle,
             Arc::new(CollectionDefRegistry::default()),
         ));
-        let handle = keyspace.open_partition("budget", partition_options())?;
-        let cached = Cached::new(FjallCellCache::new(handle), counting.clone());
+        let handle = database.keyspace("budget", keyspace_options)?;
+        let cached = Cached::new(
+            FjallCellCache::new(database.clone(), handle),
+            counting.clone(),
+        );
         let id = collection("budget")?;
         let cref = CollectionRef::new(id.clone(), None);
 
@@ -399,8 +407,8 @@ fn coverage_scan_isolation() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let cached = cached_over(&keyspace, &cells, &oracle, "isolation")?;
+        let (_dir, database) = open_database()?;
+        let cached = cached_over(&database, &cells, &oracle, "isolation")?;
 
         let a = collection("alpha")?;
         let b = collection("beta")?;
@@ -454,8 +462,8 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
         const N: u8 = 200;
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let cached = cached_over(&keyspace, &cells, &oracle, "wide")?;
+        let (_dir, database) = open_database()?;
+        let cached = cached_over(&database, &cells, &oracle, "wide")?;
         let id = collection("wide")?;
         let cref = CollectionRef::new(id.clone(), None);
 
@@ -486,21 +494,24 @@ fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        // Each `make` opens a fresh cache partition (cold cache) over the same
+        let (_dir, database) = open_database()?;
+        // Each `make` opens a fresh cache keyspace (cold cache) over the same
         // warm memory cells + oracle, so a crash drops coverage but not durable
         // state. An atomic counter keeps the closure `Fn` (the runner calls it
         // repeatedly).
         let counter = AtomicU32::new(0);
         let make = || {
             let n = counter.fetch_add(1, Ordering::Relaxed);
-            let handle = keyspace.open_partition(&format!("crash-{n}"), partition_options())?;
+            let handle = database.keyspace(&format!("crash-{n}"), keyspace_options)?;
             let lower = MemoryCellStore::new(
                 cells.clone(),
                 oracle.clone(),
                 Arc::new(CollectionDefRegistry::default()),
             );
-            Ok(Cached::new(FjallCellCache::new(handle), lower))
+            Ok(Cached::new(
+                FjallCellCache::new(database.clone(), handle),
+                lower,
+            ))
         };
         TEST_RUNTIME.block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
     }
@@ -528,8 +539,8 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         let now = Arc::new(AtomicU64::new(1_000));
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let handle = keyspace.open_partition("ttl", partition_options())?;
+        let (_dir, database) = open_database()?;
+        let handle = database.keyspace("ttl", keyspace_options)?;
         let lower = TtlAwareCellStore::new(
             CountingCellStore::new(MemoryCellStore::new(
                 cells,
@@ -540,7 +551,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
             ROW_DEATH,
         );
         let cached = Cached::new(
-            FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
+            FjallCellCache::with_clock(database.clone(), handle, Clock::Fixed(now.clone())),
             lower.clone(),
         );
         let id = collection("ttl")?;
@@ -616,8 +627,8 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let handle = keyspace.open_partition("volatile", partition_options())?;
+        let (_dir, database) = open_database()?;
+        let handle = database.keyspace("volatile", keyspace_options)?;
         let lower = MemoryCellStore::new(
             cells.clone(),
             oracle.clone(),
@@ -626,7 +637,10 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
         let id = collection("volatile")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        let cached = Cached::new(FjallCellCache::new(handle.clone()), lower.clone());
+        let cached = Cached::new(
+            FjallCellCache::new(database.clone(), handle.clone()),
+            lower.clone(),
+        );
         cached
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
             .await?;
@@ -640,10 +654,10 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))])
             .await?;
 
-        // Cold restart: a fresh `Cached` over the SAME fjall partition but EMPTY
+        // Cold restart: a fresh `Cached` over the SAME fjall keyspace but EMPTY
         // coverage. The stale fjall entry exists, but the coordinate is
         // uncovered, so the get falls through and self-heals to `99`.
-        let restarted = Cached::new(FjallCellCache::new(handle), lower.clone());
+        let restarted = Cached::new(FjallCellCache::new(database.clone(), handle), lower.clone());
         assert_eq!(
             restarted.get(&id, &cell_at(1), probe(2)).await?.get(),
             Some(&bytes(99)),
@@ -662,9 +676,9 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let handle = keyspace.open_partition("fault", partition_options())?;
-        let fjall = FjallCellCache::new(handle);
+        let (_dir, database) = open_database()?;
+        let handle = database.keyspace("fault", keyspace_options)?;
+        let fjall = FjallCellCache::new(database.clone(), handle);
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
         let cached = Cached::new(fjall, lower);
@@ -701,6 +715,63 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
     })
 }
 
+/// Atomic-batch guard: a *multi-cell* write-through whose fjall batch commit
+/// **fails** must leave **every** coordinate in the batch uncovered — not just
+/// some — so each one falls through and self-heals. The batch is atomic, so a
+/// commit failure lands nothing; the single-cell `failed_publish_uncovers...`
+/// regression cannot observe this all-or-nothing uncovering.
+#[test]
+fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, database) = open_database()?;
+        let handle = database.keyspace("batch-fault", keyspace_options)?;
+        let fjall = FjallCellCache::new(database.clone(), handle);
+        let fail = fjall.fail_puts();
+        let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
+        let cached = Cached::new(fjall, lower);
+        let id = collection("batch-fault")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        let seed = [(cell_at(1), Some(bytes(1))), (cell_at(2), Some(bytes(2)))];
+        let update = [(cell_at(1), Some(bytes(11))), (cell_at(2), Some(bytes(22)))];
+
+        // One multi-cell write-through publishes cleanly and covers both cells.
+        cached.write_resolved(&cref, &seed).await?;
+        for (c, v) in [(1u8, 1u8), (2, 2)] {
+            assert_eq!(
+                cached
+                    .get(&id, &cell_at(c), probe(u128::from(c)))
+                    .await?
+                    .get(),
+                Some(&bytes(v))
+            );
+        }
+
+        // Force the batch commit to fail. The lower write still succeeds
+        // (durable truth is `11`/`22`), but the atomic batch lands nothing → all
+        // coordinates in the batch are punched out of coverage.
+        fail.store(true, Ordering::Relaxed);
+        cached.write_resolved(&cref, &update).await?;
+
+        // Heal the fault; both gets are now uncovered, so each falls through to
+        // its fresh durable value — never serving the stale batch.
+        fail.store(false, Ordering::Relaxed);
+        for (c, v) in [(1u8, 11u8), (2, 22)] {
+            assert_eq!(
+                cached
+                    .get(&id, &cell_at(c), probe(u128::from(c) + 100))
+                    .await?
+                    .get(),
+                Some(&bytes(v)),
+                "a failed batch uncovers every coordinate, so each read self-heals"
+            );
+        }
+        Ok(())
+    })
+}
+
 /// The Incomplete trap: a fjall publish failure inside `commit_provisional`
 /// must NOT turn the settle into an error — the lower promote succeeded, so the
 /// committed value is correct and the method returns `Ok` verbatim (otherwise a
@@ -711,9 +782,9 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let handle = keyspace.open_partition("incomplete", partition_options())?;
-        let fjall = FjallCellCache::new(handle);
+        let (_dir, database) = open_database()?;
+        let handle = database.keyspace("incomplete", keyspace_options)?;
+        let fjall = FjallCellCache::new(database.clone(), handle);
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(
             cells,
@@ -868,12 +939,12 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
             let now = Arc::new(AtomicU64::new(START));
             let oracle = ScriptedOracle::default();
             let cells = MemoryCells::new();
-            let (_dir, keyspace) = open_keyspace()?;
-            let handle = keyspace.open_partition("ttl-anchor", partition_options())?;
+            let (_dir, database) = open_database()?;
+            let handle = database.keyspace("ttl-anchor", keyspace_options)?;
             let lower =
                 MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
             let cached = Cached::new(
-                FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
+                FjallCellCache::with_clock(database.clone(), handle, Clock::Fixed(now.clone())),
                 lower,
             );
             let id = collection("ttl-anchor")?;
@@ -996,8 +1067,8 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         let now = Arc::new(AtomicU64::new(1_000));
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, keyspace) = open_keyspace()?;
-        let handle = keyspace.open_partition("scan-ttl", partition_options())?;
+        let (_dir, database) = open_database()?;
+        let handle = database.keyspace("scan-ttl", keyspace_options)?;
         let lower = TtlAwareCellStore::new(
             CountingCellStore::new(MemoryCellStore::new(
                 cells,
@@ -1008,7 +1079,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
             ROW_DEATH,
         );
         let cached = Cached::new(
-            FjallCellCache::with_clock(handle, Clock::Fixed(now.clone())),
+            FjallCellCache::with_clock(database.clone(), handle, Clock::Fixed(now.clone())),
             lower.clone(),
         );
         let id = collection("scan-ttl")?;
