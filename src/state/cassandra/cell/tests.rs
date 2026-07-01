@@ -34,6 +34,7 @@ use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use std::slice;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -176,6 +177,133 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         store.get(c.id(), &cell, event(2)).await?,
         Committed::new(None)
     );
+    Ok(())
+}
+
+/// A section-0 cell at a distinct 4-byte coordinate, so a sized test can place
+/// thousands of non-colliding committed and provisional cells.
+fn cell_i(i: u32) -> CellKey {
+    CellKey {
+        section: Section::new(0),
+        coordinate: Coordinate::from_bytes(i.to_be_bytes().to_vec()),
+    }
+}
+
+/// After a clean, fully-resolved event, the recovery sweep issues **zero**
+/// Cassandra queries once its collection is seeded: the first (cold) sweep runs
+/// the one bounded `kind=Index` seed read and marks the collection seeded; the
+/// second (warm) sweep short-circuits on the empty in-memory set. The counters
+/// sit below the short-circuit, so the "zero" is non-vacuous — the cold sweep
+/// provably incremented them first.
+#[tokio::test]
+async fn warm_quiescence_issues_zero_queries() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let counts = store.recovery_reads();
+    let c = collection("warm-quiescence")?;
+    let cell = value_cell();
+
+    // A clean event: stage then promote, leaving nothing provisional and no
+    // live `kind=Index` marker.
+    store
+        .write_provisional(
+            &c,
+            &[(
+                cell.clone(),
+                ProvisionalWrite::new(
+                    Some(Bytes::from_static(b"v")),
+                    Committed::new(None),
+                    event(1),
+                ),
+            )],
+        )
+        .await?;
+    store.mark_resolved(&c, slice::from_ref(&cell)).await?;
+
+    // Cold sweep: the bounded seed read fires (finds no live marker) and seeds.
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    let seed_index = counts.index_range_reads.load(Ordering::Relaxed);
+    let seed_points = counts.cell_point_reads.load(Ordering::Relaxed);
+    assert!(
+        seed_index >= 1,
+        "the cold sweep must issue the kind=Index seed read"
+    );
+
+    // Warm sweep: the seeded, empty set short-circuits with no further query.
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    assert_eq!(
+        counts.index_range_reads.load(Ordering::Relaxed),
+        seed_index,
+        "a warm quiescence issues no kind=Index read"
+    );
+    assert_eq!(
+        counts.cell_point_reads.load(Ordering::Relaxed),
+        seed_points,
+        "a warm quiescence issues no point read"
+    );
+    Ok(())
+}
+
+/// Recovery cost is bounded by **#provisional, never #committed**: a cold sweep
+/// over collections with wildly different committed-cell counts issues the same
+/// one `kind=Index` range read plus exactly one point read per provisional
+/// coordinate. The committed cells live in the `kind=Cell` range recovery never
+/// scans, so they cost nothing.
+///
+/// Sizes are kept modest (not the design's illustrative 1k/100k) so the live
+/// test stays fast and its committed-cell `index_delete` tombstones stay under
+/// Cassandra's scan-warn threshold; 16× is ample to distinguish an O(#cells)
+/// regression, which would read 32 vs 512 rather than a fixed 4.
+#[tokio::test]
+async fn bounded_recovery_is_size_independent() -> Result<()> {
+    const PROVISIONAL: u32 = 4;
+    /// Provisional coordinates, disjoint from the committed range below.
+    const PROV_BASE: u32 = 0xFFFF_0000;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    for committed in [32u32, 512] {
+        let store = fx.bottom_store(ScriptedOracle::default());
+        let c = collection(&format!("bounded-{committed}"))?;
+
+        // `committed` resolved cells: no live `kind=Index` marker.
+        let resolved: Vec<(CellKey, Option<Bytes>)> = (0..committed)
+            .map(|i| (cell_i(i), Some(Bytes::from(i.to_be_bytes().to_vec()))))
+            .collect();
+        store.write_resolved(&c, &resolved).await?;
+
+        // A fixed handful of provisional cells: each a live marker.
+        let staged: Vec<(CellKey, ProvisionalWrite)> = (0..PROVISIONAL)
+            .map(|i| {
+                (
+                    cell_i(PROV_BASE + i),
+                    ProvisionalWrite::new(
+                        Some(Bytes::from_static(b"p")),
+                        Committed::new(None),
+                        event(u128::from(i)),
+                    ),
+                )
+            })
+            .collect();
+        store.write_provisional(&c, &staged).await?;
+
+        // A cold sweep: one bounded seed read + one point read per provisional
+        // coordinate, independent of `committed`.
+        let counts = store.recovery_reads();
+        let found = provisional_cells(&store, c.id()).await?;
+        assert_eq!(found.len(), PROVISIONAL as usize);
+        assert_eq!(
+            counts.index_range_reads.load(Ordering::Relaxed),
+            1,
+            "one bounded kind=Index seed read regardless of committed size {committed}"
+        );
+        assert_eq!(
+            counts.cell_point_reads.load(Ordering::Relaxed),
+            PROVISIONAL as usize,
+            "recovery point reads bounded by #provisional, not #committed {committed}"
+        );
+    }
     Ok(())
 }
 

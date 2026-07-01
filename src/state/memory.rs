@@ -6,6 +6,7 @@ use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
 use super::oracle::CommitOracle;
+use super::provisional_index::ProvisionalIndex;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
 use super::store::CellStore;
@@ -53,6 +54,13 @@ impl MemoryCells {
 pub struct MemoryCellStore<O> {
     cells: MemoryCells,
     resolver: Resolver<O>,
+    /// Per-partition provisional-coordinate index gating the recovery sweep.
+    /// Minted fresh per store (per partition acquisition) even though `cells`
+    /// is process-shared, so a re-acquired partition sees its collections
+    /// unseeded and re-seeds from `cells` — the memory analog of the Cassandra
+    /// cold-window (`kind=Index` re-read). `Arc` so the per-event store clones
+    /// share one instance.
+    index: Arc<ProvisionalIndex>,
 }
 
 impl<O> MemoryCellStore<O> {
@@ -63,6 +71,7 @@ impl<O> MemoryCellStore<O> {
         Self {
             cells,
             resolver: Resolver::new(oracle, registry),
+            index: Arc::default(),
         }
     }
 }
@@ -169,24 +178,35 @@ where
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        let mut provisional: Vec<(CellKey, ProvisionalCell)> = Vec::new();
-        self.map().iter_sync(|(id, cell), stored| {
-            if id == collection
-                && let StoredCell::Provisional { data, prev, event } = stored
-            {
-                provisional.push((
-                    cell.clone(),
-                    ProvisionalCell::new(data.clone(), prev.clone(), *event),
-                ));
-            }
-            true
-        });
         try_stream! {
-            // The snapshot is in-memory (no tokio leaf), so a per-item
-            // `cooperative` checkpoint yields a large recovery drain to the
-            // runtime every ~128 items.
-            for item in provisional {
-                yield cooperative(async move { item }).await;
+            // The coordinates to visit. Warm (seeded): the in-memory set — an
+            // empty set yields nothing and never scans the map. Cold: the
+            // one-time full-map seed scan that populates the set and marks the
+            // collection seeded, mirroring the Cassandra `kind=Index` seed read.
+            let coords = if self.index.is_seeded(collection).await {
+                self.index.snapshot(collection)
+            } else {
+                let mut coords: Vec<CellKey> = Vec::new();
+                self.map().iter_sync(|(id, cell), stored| {
+                    if id == collection && matches!(stored, StoredCell::Provisional { .. }) {
+                        coords.push(cell.clone());
+                    }
+                    true
+                });
+                for cell in &coords {
+                    self.index.record(collection, cell).await;
+                }
+                self.index.mark_seeded(collection).await;
+                coords
+            };
+            // Point-read each coordinate; a concurrently-resolved coordinate
+            // decodes `Resolved` and is dropped (over-report-safe). The reads
+            // touch no tokio leaf, so a per-item `cooperative` checkpoint yields
+            // a large recovery drain to the runtime every ~128 items.
+            for cell in coords {
+                if let Cell::Provisional(provisional) = self.read_raw(collection, &cell) {
+                    yield cooperative(async move { (cell, provisional) }).await;
+                }
             }
         }
     }
@@ -207,6 +227,10 @@ where
                     },
                 )
                 .await;
+            // Record after the write lands (an in-memory upsert never fails, so
+            // the `unseed`-on-error arm the trait contract allows is vacuous
+            // here).
+            self.index.record(collection.id(), cell).await;
         }
         Ok(())
     }
@@ -223,6 +247,9 @@ where
                     StoredCell::Resolved(data.clone()),
                 )
                 .await;
+            // Rollback/committed-write resolves the cell; drop its provisional
+            // coordinate (a no-op for a never-staged direct write).
+            self.index.clear(collection.id(), cell).await;
         }
         Ok(())
     }
@@ -242,6 +269,9 @@ where
                 let data = data.clone();
                 *entry.get_mut() = StoredCell::Resolved(data);
             }
+            // Promote resolves the cell; drop its provisional coordinate
+            // (idempotent — clearing an absent coordinate is a no-op).
+            self.index.clear(collection.id(), cell).await;
         }
         Ok(())
     }

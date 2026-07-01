@@ -59,6 +59,7 @@ pub mod oracle;
 pub mod order_codec;
 pub mod overlay;
 pub mod production;
+pub(crate) mod provisional_index;
 pub mod registry;
 pub mod resolve;
 pub mod session;

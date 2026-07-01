@@ -1072,6 +1072,7 @@ struct OpCounts {
     mark_resolved: AtomicUsize,
     get: AtomicUsize,
     scan_cells: AtomicUsize,
+    provisional_cells: AtomicUsize,
 }
 
 impl<S> CountingCellStore<S> {
@@ -1102,12 +1103,19 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_cells.load(Ordering::Relaxed)
     }
 
+    /// Recovery-sweep entries — one per `provisional_cells` call, so a test can
+    /// pin how many times the sweep consulted the store.
+    pub(crate) fn recovery_sweeps(&self) -> usize {
+        self.counts.provisional_cells.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
+        self.counts.provisional_cells.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1142,6 +1150,10 @@ where
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
+        // One increment per sweep entry, not per yielded provisional cell.
+        self.counts
+            .provisional_cells
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.provisional_cells(collection)
     }
 
@@ -1341,6 +1353,8 @@ mod sweep {
     use super::*;
     use futures::executor;
     use quickcheck::QuickCheck;
+    use std::collections::BTreeSet;
+    use std::slice;
 
     /// A staged cell's promote outcome, assigned at random by the sweep
     /// failure-arm property: resolve cleanly, fail `Permanent` (skipped by the
@@ -1503,12 +1517,148 @@ mod sweep {
             "first sweep must resolve provisional cells"
         );
 
-        // Second sweep is a no-op: no provisional cell remains to resolve.
+        // Second sweep is a no-op: no provisional cell remains to resolve, and
+        // once seeded the recovery entry short-circuits on the empty set.
         store.reset();
         for r in &refs {
             assert!(sweep_provisional(&store, &oracle, r).await?);
         }
         assert_eq!(store.durable_writes(), 0);
+        // The sweep still *entered* `provisional_cells` once per collection —
+        // the counter that makes the durable-write assertion non-vacuous.
+        assert_eq!(store.recovery_sweeps(), refs.len());
         Ok(())
+    }
+
+    /// One provisional-set maintenance op the agreement property drives.
+    #[derive(Clone, Copy, Debug)]
+    enum SetOp {
+        /// Stage a provisional cell and leave it unresolved (it must linger in
+        /// the set).
+        StageOnly(u8),
+        /// Stage then promote (the set entry must clear).
+        Promote(u8),
+        /// Stage then roll back to `prev` (the set entry must clear).
+        Rollback(u8),
+    }
+
+    impl SetOp {
+        fn coord(self) -> u8 {
+            match self {
+                Self::StageOnly(c) | Self::Promote(c) | Self::Rollback(c) => c % CELLS,
+            }
+        }
+    }
+
+    impl Arbitrary for SetOp {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let c = u8::arbitrary(g);
+            match u8::arbitrary(g) % 3 {
+                0 => Self::Promote(c),
+                1 => Self::Rollback(c),
+                _ => Self::StageOnly(c),
+            }
+        }
+    }
+
+    /// A capped random op sequence over a single collection.
+    #[derive(Clone, Debug)]
+    struct SetOps(Vec<SetOp>);
+
+    impl Arbitrary for SetOps {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self(capped_vec(g, 24))
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            Box::new(self.0.shrink().map(Self))
+        }
+    }
+
+    /// The provisional cell coordinates a store reports, as an
+    /// order-independent set — the warm store reads its in-memory set, a
+    /// cold store full-scans.
+    async fn provisional_key_set<S>(store: &S, id: &CollectionId) -> Result<BTreeSet<CellKey>>
+    where
+        S: CellStore,
+    {
+        let stream = store.provisional_cells(id);
+        futures::pin_mut!(stream);
+        let mut set = BTreeSet::new();
+        while let Some(item) = stream.next().await {
+            let (key, _) = item?;
+            set.insert(key);
+        }
+        Ok(set)
+    }
+
+    /// Runs one op sequence against a **seeded** (warm) store, then checks its
+    /// incrementally-maintained provisional set against ground truth: a fresh
+    /// **cold** store over the same backing that enumerates the durable
+    /// provisional cells from scratch. Equality proves the set neither
+    /// under-reports (a provisional cell it missed → a strand) nor over-reports
+    /// beyond what the point-read filter drops (invariant 1: set ⟺ durable
+    /// provisional). O6: minting the cold store fresh over the shared cells is
+    /// the memory cold-window.
+    async fn run_set_agreement(SetOps(ops): SetOps) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let registry = Arc::new(CollectionDefRegistry::default());
+        let warm = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+        let collection = CollectionRef::new(
+            CollectionId::new(
+                StateKey::new(Uuid::new_v4(), Arc::from("k")),
+                StateType::Application,
+                StateName::try_new("agree")?,
+            ),
+            None,
+        );
+
+        // Seed the warm store's latch (empty), so subsequent ops exercise the
+        // incrementally-maintained set, not another cold scan.
+        let _ = provisional_key_set(&warm, collection.id()).await?;
+
+        for (i, op) in ops.into_iter().enumerate() {
+            let event = EventRef::Message {
+                dedup_id: Uuid::from_u128(i as u128),
+            };
+            let cell = cell_at(op.coord());
+            let prev = warm.get(collection.id(), &cell, event).await?;
+            let prev_value = prev.get().cloned();
+            warm.write_provisional(
+                &collection,
+                &[(
+                    cell.clone(),
+                    ProvisionalWrite::new(Some(bytes(i as u8)), prev, event),
+                )],
+            )
+            .await?;
+            match op {
+                SetOp::StageOnly(_) => {}
+                SetOp::Promote(_) => {
+                    warm.mark_resolved(&collection, slice::from_ref(&cell))
+                        .await?;
+                }
+                SetOp::Rollback(_) => {
+                    warm.write_resolved(&collection, &[(cell.clone(), prev_value)])
+                        .await?;
+                }
+            }
+        }
+
+        let warm_set = provisional_key_set(&warm, collection.id()).await?;
+        let cold = MemoryCellStore::new(cells, oracle, registry);
+        let cold_set = provisional_key_set(&cold, collection.id()).await?;
+        Ok(warm_set == cold_set)
+    }
+
+    /// The seeded in-memory provisional set agrees with the durable provisional
+    /// cells after any stage/promote/rollback sequence.
+    #[test]
+    fn prop_provisional_set_agreement() {
+        fn property(ops: SetOps) -> Result<bool> {
+            executor::block_on(run_set_agreement(ops))
+        }
+        QuickCheck::new().quickcheck(property as fn(SetOps) -> Result<bool>);
     }
 }

@@ -69,6 +69,7 @@ use crate::state::cell_key::{CellKey, Direction, Scan};
 use crate::state::encoding::{Encoding, encode_payload};
 use crate::state::event_ref::EventRef;
 use crate::state::oracle::CommitOracle;
+use crate::state::provisional_index::ProvisionalIndex;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
 use crate::state::store::CellStore;
@@ -86,6 +87,8 @@ use scylla::statement::prepared::PreparedStatement;
 use smallvec::smallvec;
 use std::ops::Bound;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::task::coop::cooperative;
 
 pub use crate::state::cassandra::error::CassandraCellStoreError;
@@ -156,12 +159,33 @@ impl CassandraCellResources {
     }
 }
 
+/// Test-only recovery-read counters, incremented **below** the seeded-latch
+/// short-circuit in [`provisional_cells`](CellStore::provisional_cells), so a
+/// warm-clean sweep leaves both at zero — the non-vacuous "zero queries on
+/// quiescence" signal.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct RecoveryReadCounts {
+    /// `kind=Index` range queries issued — one per cold seed, zero when warm.
+    pub(crate) index_range_reads: AtomicUsize,
+    /// `kind=Cell` point reads issued during recovery — bounded by
+    /// #provisional.
+    pub(crate) cell_point_reads: AtomicUsize,
+}
+
 /// Cassandra-backed uniform cell store.
 #[derive(Clone, Debug)]
 pub struct CassandraStore<O> {
     session: CassandraSession,
     queries: Arc<CellQueries>,
     resolver: Resolver<O>,
+    /// Per-partition provisional-coordinate index gating the recovery sweep.
+    /// Minted fresh per store (per partition acquisition), so a re-acquired
+    /// partition seeds from the durable `kind=Index` markers before trusting
+    /// the set (the cold-window). `Arc` so the per-event store clones share it.
+    index: Arc<ProvisionalIndex>,
+    #[cfg(test)]
+    counters: Arc<RecoveryReadCounts>,
 }
 
 impl<O> CassandraStore<O> {
@@ -179,7 +203,18 @@ impl<O> CassandraStore<O> {
             session,
             queries,
             resolver: Resolver::new(oracle, registry),
+            index: Arc::default(),
+            #[cfg(test)]
+            counters: Arc::default(),
         }
+    }
+
+    /// Test handle on the recovery-read counters (shared across clones), for
+    /// the zero-query and bounded-recovery assertions.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn recovery_reads(&self) -> Arc<RecoveryReadCounts> {
+        self.counters.clone()
     }
 
     fn cql(&self) -> &Session {
@@ -613,48 +648,65 @@ where
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        let pk = Pk::of(collection).owned();
         try_stream! {
-            // Bounded recovery: read only the front-of-partition `kind=Index`
-            // marker range (cost ∝ #provisional, never #cells), then point-read
-            // each marked coordinate's `kind=Cell` row. There is no
-            // whole-partition scan.
-            let index = self
-                .cql()
-                .execute_iter(
-                    self.queries.index_scan.clone(),
-                    (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Index),
-                )
-                .await
-                .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O>)?
-                .rows_stream::<decode::IndexRow>()
-                .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O>)?;
-            pin_mut!(index);
+            // The coordinates to visit. Warm (seeded): the in-memory set — an
+            // empty set yields nothing and issues NO Cassandra query, the
+            // zero-query-on-quiescence goal. Cold (first sweep after acquisition
+            // /crash): one bounded front-of-partition `kind=Index` range read
+            // seeds the set (cost ∝ #provisional, never #cells). There is no
+            // whole-partition scan on either path.
+            let coords = if self.index.is_seeded(collection).await {
+                self.index.snapshot(collection)
+            } else {
+                let pk = Pk::of(collection).owned();
+                #[cfg(test)]
+                self.counters.index_range_reads.fetch_add(1, Ordering::Relaxed);
+                let index = self
+                    .cql()
+                    .execute_iter(
+                        self.queries.index_scan.clone(),
+                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Index),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)
+                    .map_err(into_store_err::<O>)?
+                    .rows_stream::<decode::IndexRow>()
+                    .map_err(CassandraStoreError::from)
+                    .map_err(into_store_err::<O>)?;
+                pin_mut!(index);
+                // N (= #provisional) is bounded-small, so the drain stays
+                // sequential behind the `cooperative` checkpoint that yields a
+                // large recovery drain to the runtime every ~128 items.
+                let mut coords: Vec<CellKey> = Vec::new();
+                while let Some(row) = cooperative(index.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)
+                    .map_err(into_store_err::<O>)?
+                {
+                    let key = decode::index_cell_key(row);
+                    self.index.record(collection, &key).await;
+                    coords.push(key);
+                }
+                self.index.mark_seeded(collection).await;
+                coords
+            };
 
-            // N (= #provisional) is bounded-small, so the point reads stay
-            // sequential behind the `cooperative` checkpoint that yields a large
-            // recovery drain to the runtime every ~128 items (matches `memory`).
-            while let Some(row) = cooperative(index.try_next())
-                .await
-                .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O>)?
-            {
-                let key = decode::index_cell_key(row);
+            // Point-read each coordinate's `kind=Cell` row to rebuild its
+            // `ProvisionalCell`. A coordinate whose row is absent (a
+            // compaction-window straggler — cell and marker share one TTL) or
+            // decodes `Cell::Resolved` (concurrently resolved, or a leftover set
+            // entry) is silently dropped — both over-report-safe.
+            for key in coords {
+                #[cfg(test)]
+                self.counters.cell_point_reads.fetch_add(1, Ordering::Relaxed);
                 let Some(raw) = self
                     .read_raw(collection, &key)
                     .await
                     .map_err(ResolveCellError::Store)?
                 else {
-                    // The marker has no live cell row (its cell and marker share
-                    // one TTL, so this is a compaction-window straggler): nothing
-                    // to recover. Over-report-safe to skip.
                     continue;
                 };
                 let cell = decode::try_decode_cell(raw).map_err(ResolveCellError::Store)?;
-                // A coordinate concurrently resolved decodes `Cell::Resolved` and
-                // is silently dropped — over-report-safe.
                 if let Cell::Provisional(provisional) = cell {
                     yield (key, provisional);
                 }
@@ -667,9 +719,22 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        self.write_provisional_raw(collection, writes)
-            .await
-            .map_err(ResolveCellError::Store)
+        match self.write_provisional_raw(collection, writes).await {
+            Ok(()) => {
+                // Record each staged coordinate after the durable ack.
+                for (cell, _) in writes {
+                    self.index.record(collection.id(), cell).await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // A partial durable stage may have landed markers the set now
+                // misses; drop the seeded latch so the next sweep re-seeds from
+                // the durable index and restores completeness (invariant).
+                self.index.unseed(collection.id()).await;
+                Err(ResolveCellError::Store(error))
+            }
+        }
     }
 
     async fn write_resolved<'a>(
@@ -679,7 +744,14 @@ where
     ) -> Result<(), Self::Error> {
         self.write_resolved_raw(collection, cells)
             .await
-            .map_err(ResolveCellError::Store)
+            .map_err(ResolveCellError::Store)?;
+        // Rollback/committed-write resolved the cell; drop its provisional
+        // coordinate (a no-op for a never-staged direct write). A failed write
+        // leaves the coordinate in place — a harmless over-report.
+        for (cell, _) in cells {
+            self.index.clear(collection.id(), cell).await;
+        }
+        Ok(())
     }
 
     async fn mark_resolved<'a>(
@@ -689,7 +761,12 @@ where
     ) -> Result<(), Self::Error> {
         self.mark_resolved_raw(collection, cells)
             .await
-            .map_err(ResolveCellError::Store)
+            .map_err(ResolveCellError::Store)?;
+        // Promote resolved the cell; drop its provisional coordinate.
+        for cell in cells {
+            self.index.clear(collection.id(), cell).await;
+        }
+        Ok(())
     }
 }
 
