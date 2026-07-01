@@ -3,7 +3,9 @@
 -- Purpose: Provision the durable storage for the uniform keyed-state CELL STORE
 --          plus the group-global descriptor identity table. One Cassandra
 --          partition (segment_id, key, state_type, name) is ONE collection; each
---          clustering row (section, coordinate) is ONE cell. A cell is one
+--          `kind = 0` clustering row (section, coordinate) is ONE cell, and a
+--          co-clustered `kind = 1` bare row indexes each provisional
+--          coordinate for bounded recovery. A cell is one
 --          provisional cell: `data` is the committed value once `event` is null,
 --          or the in-flight event's outcome while `event` is set, with
 --          `prev_data` carrying the committed value the event superseded. The
@@ -19,18 +21,27 @@ CREATE TYPE {{KEYSPACE}}.event_ref (
 );
 
 -- One partition = one collection (one transactional cell store). Clustering
--- columns address a cell within it: `section` groups a collection's cells into
--- disjoint sub-structures (bookkeeping vs data), `coordinate` orders cells within
--- a section by unsigned lexicographic byte order (= the order-preserving codec's
--- contract). Both are opaque to the cell store — the collection layer owns their
--- meaning. A single-section forward scan is a contiguous clustering range:
---   WHERE <pk>=… AND section = ? AND coordinate >= ?  (no ALLOW FILTERING).
+-- columns address a cell within it: `kind` splits the partition into two
+-- disjoint front-to-back ranges — `kind = 0` (Cell) rows carry the full cell
+-- columns, `kind = 1` (Index) rows are bare provisional-coordinate markers.
+-- `section` groups a collection's cells into disjoint sub-structures
+-- (bookkeeping vs data), `coordinate` orders cells within a section by unsigned
+-- lexicographic byte order (= the order-preserving codec's contract). All three
+-- are opaque to the cell store — the collection layer owns section/coordinate
+-- meaning; `kind` is bound as a constant clustering predicate, never a value.
+-- `kind` leads so the Index rows form one contiguous front-of-partition range
+-- disjoint from the Cell rows: recovery reads only that range (cost ∝
+-- #provisional, never #cells), then point-reads each coordinate's Cell row. A
+-- single-section forward scan is a contiguous clustering range:
+--   WHERE <pk>=… AND kind = 0 AND section = ? AND coordinate >= ? (no ALLOW
+-- FILTERING).
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (
     segment_id uuid,
     key        text,
     state_type tinyint,
     name       text,
 
+    kind       tinyint,
     section    tinyint,
     coordinate blob,
 
@@ -41,8 +52,8 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (
 
     event      frozen<event_ref>,
 
-    PRIMARY KEY ((segment_id, key, state_type, name), section, coordinate)
-) WITH CLUSTERING ORDER BY (section ASC, coordinate ASC)
+    PRIMARY KEY ((segment_id, key, state_type, name), kind, section, coordinate)
+) WITH CLUSTERING ORDER BY (kind ASC, section ASC, coordinate ASC)
   AND compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };
 

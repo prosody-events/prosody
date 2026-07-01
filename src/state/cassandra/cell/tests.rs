@@ -10,9 +10,12 @@
 //! `segment_id` (and the property suites mint one per iteration) so rows never
 //! collide across runs.
 
-use super::{CassandraStore, CellQueries};
+use super::{
+    CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, IndexUpsertRow,
+    KeyRow, ResolvedRow, StageRow, encode_cell_blobs,
+};
 use crate::Topic;
-use crate::cassandra::{CassandraConfiguration, CassandraStore as CassandraSession};
+use crate::cassandra::{BatchUnit, CassandraConfiguration, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -332,27 +335,38 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
     let c = collection("corrupt-timer")?;
     let id = c.id();
 
-    // `event` non-NULL alone reaches the validator: with data/prev/encoding/
-    // version all NULL the decoder skips straight to `try_into_event`, where
-    // the Timer arm rejects the unknown `timer_type`.
-    let cql = format!(
+    // The corrupt `kind=0` (Cell) row: `event` non-NULL alone reaches the
+    // validator — with data/prev/encoding/version all NULL the decoder skips
+    // straight to `try_into_event`, where the Timer arm rejects the unknown
+    // `timer_type: 99` in the `event_ref` UDT literal (whose own `kind: 1` field
+    // means Timer — distinct from the clustering `kind` column).
+    let insert_cell = format!(
         "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
-         section, coordinate, event) VALUES (?, ?, ?, ?, ?, ?, {{kind: 1, msg_dedup_id: null, \
-         timer_type: 99, time: 0, tag: 0}})"
+         kind, section, coordinate, event) VALUES (?, ?, ?, ?, 0, ?, ?, {{kind: 1, msg_dedup_id: \
+         null, timer_type: 99, time: 0, tag: 0}})"
+    );
+    // Its `kind=1` (Index) marker, so the index-based recovery scan discovers
+    // the coordinate and point-reads the corrupt cell (recovery no longer scans
+    // the whole partition).
+    let insert_marker = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate) VALUES (?, ?, ?, ?, 1, ?, ?)"
+    );
+    let binds = (
+        id.state_key().segment_id,
+        id.state_key().key.as_ref(),
+        i8::from(id.state_type()),
+        id.name().as_str(),
+        0_i8,
+        b"" as &[u8],
     );
     fx.cassandra
         .session()
-        .query_unpaged(
-            cql,
-            (
-                id.state_key().segment_id,
-                id.state_key().key.as_ref(),
-                i8::from(id.state_type()),
-                id.name().as_str(),
-                0_i8,
-                b"" as &[u8],
-            ),
-        )
+        .query_unpaged(insert_cell, binds)
+        .await?;
+    fx.cassandra
+        .session()
+        .query_unpaged(insert_marker, binds)
         .await?;
 
     let stream = store.provisional_cells(id);
@@ -460,7 +474,8 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
         // non-null because every cell wrote a present `data`.
         let cql = format!(
             "SELECT WRITETIME(data), TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND section = ?"
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0 AND \
+             section = ?"
         );
         let result = fx
             .cassandra
@@ -511,71 +526,180 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
         .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
 }
 
-/// Multi-chunk execute smoke: with a deliberately tiny statement-count limit, a
-/// write of five cells splits into three `UNLOGGED BATCH`es (2 + 2 + 1), so the
-/// later chunks bind `&rows[range]` at a **non-zero start offset** — the one
-/// path the `chunk_boundaries` property (offline) and the single-chunk live
-/// batch tests don't compose. Every row must land. The small limit is passed as
-/// an argument precisely so this needs no multi-MiB fixture.
+/// Builds the mixed-statement batch for the binding-order test: three units
+/// whose single flatten interleaves all five row shapes — stage+index for A,
+/// promote+index-delete for B, resolved-write+index-delete for C. The blobs,
+/// cells, and `id` outlive the returned borrows (the caller holds them).
+fn mixed_binding_batch<'a>(
+    q: &'a CellQueries,
+    id: &'a CollectionId,
+    blob_a: &'a CellBlobs,
+    blob_c: &'a CellBlobs,
+    cell_a: &'a CellKey,
+    cell_b: &'a CellKey,
+    cell_c: &'a CellKey,
+) -> Vec<BatchUnit<CellBatchRow<'a>>> {
+    use super::Pk;
+    use smallvec::smallvec;
+
+    let pk = Pk::of(id);
+    let (addr_a, addr_b, addr_c) = (
+        CellAddr::new(pk, cell_a),
+        CellAddr::new(pk, cell_b),
+        CellAddr::new(pk, cell_c),
+    );
+    vec![
+        BatchUnit::new(
+            1_024,
+            smallvec![
+                CellBatchRow::StageCell {
+                    statement: &q.write_provisional_no_ttl,
+                    row: StageRow {
+                        ttl: None,
+                        data: blob_a.data.as_deref(),
+                        prev_data: None,
+                        encoding: blob_a.encoding,
+                        version: blob_a.version,
+                        event: event(2),
+                        addr: addr_a,
+                    },
+                },
+                CellBatchRow::IndexUpsert {
+                    statement: &q.index_insert_no_ttl,
+                    row: IndexUpsertRow {
+                        ttl: None,
+                        addr: addr_a,
+                    },
+                },
+            ],
+        ),
+        BatchUnit::new(
+            1_024,
+            smallvec![
+                CellBatchRow::PromoteCell {
+                    statement: &q.mark_resolved,
+                    row: KeyRow {
+                        kind: CellKind::Cell,
+                        addr: addr_b,
+                    },
+                },
+                CellBatchRow::IndexDelete {
+                    statement: &q.index_delete,
+                    row: KeyRow {
+                        kind: CellKind::Index,
+                        addr: addr_b,
+                    },
+                },
+            ],
+        ),
+        BatchUnit::new(
+            1_024,
+            smallvec![
+                CellBatchRow::RollbackCell {
+                    statement: &q.write_resolved_no_ttl,
+                    row: ResolvedRow {
+                        ttl: None,
+                        data: blob_c.data.as_deref(),
+                        encoding: blob_c.encoding,
+                        version: blob_c.version,
+                        addr: addr_c,
+                    },
+                },
+                CellBatchRow::IndexDelete {
+                    statement: &q.index_delete,
+                    row: KeyRow {
+                        kind: CellKind::Index,
+                        addr: addr_c,
+                    },
+                },
+            ],
+        ),
+    ]
+}
+
+/// Positional binding-order proof (plan §8.1, the one silent-failure surface):
+/// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
+/// count/order mismatch scylla falls back to an **empty** context with no
+/// error — a misordered `unzip` flatten would bind a row against the wrong
+/// statement's columns silently. Build ONE batch whose single flatten
+/// interleaves **all five** [`CellBatchRow`] variants (five distinct prepared
+/// statements) — stage a cell, upsert its index marker, promote a
+/// pre-provisioned cell, delete markers, and write a fresh resolved value —
+/// with **distinct payloads** so any cross-binding corrupts an observable
+/// value. Read every cell back: each landing correctly proves its statement
+/// bound its own columns.
 #[tokio::test]
-async fn execute_unlogged_batches_splits_into_chunks_and_all_rows_land() -> Result<()> {
-    use crate::cassandra::Weighed;
+async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Result<()> {
     use crate::state::cell_key::Coordinate;
-    use crate::state::encoding::{Encoding, encode_payload};
 
     init_test_logging();
     let fx = fixture().await?;
     let store = fx.bottom_store(ScriptedOracle::default());
-    let id = CollectionId::new(
-        StateKey::new(Uuid::new_v4(), Arc::from("k")),
-        StateType::Application,
-        StateName::try_new("multi-chunk")?,
+    let c = collection("mixed-batch")?;
+    let id = c.id().clone();
+
+    let cell = |b: u8| CellKey {
+        section: Section::new(0),
+        coordinate: Coordinate::from_bytes(vec![b]),
+    };
+    let (cell_a, cell_b, cell_c) = (cell(1), cell(2), cell(3));
+    let (data_a, data_b, data_c) = (
+        Bytes::from_static(b"aaa"),
+        Bytes::from_static(b"bbb"),
+        Bytes::from_static(b"ccc"),
     );
 
-    // Five distinct cells; owned coordinate/blob Vecs the bound rows borrow into.
-    let payloads: Vec<Bytes> = (0..5_u8).map(|i| Bytes::from(vec![i; 8])).collect();
-    let blobs: Vec<Bytes> = payloads
-        .iter()
-        .map(|p| encode_payload(p, Encoding::RawZstdV1))
-        .collect::<Result<_, _>>()?;
-    let coords: Vec<[u8; 1]> = (0..5_u8).map(|i| [i]).collect();
-    let rows: Vec<Weighed<_>> = blobs
-        .iter()
-        .zip(&coords)
-        .map(|(blob, coord)| {
-            Weighed::new(
-                blob.len() as u64,
-                (
-                    Some(blob.as_ref()),
-                    Some(Encoding::RawZstdV1),
-                    Some(1_i32),
-                    id.state_key().segment_id,
-                    id.state_key().key.as_ref(),
-                    i8::from(id.state_type()),
-                    id.name().as_str(),
-                    0_i8,
-                    coord.as_slice(),
-                ),
-            )
-        })
-        .collect();
-
-    // Large byte budget, count budget of 2 ⇒ chunks [0,1], [2,3], [4].
-    fx.cassandra
-        .execute_unlogged_batches(&fx.queries.write_resolved_no_ttl, &rows, 1 << 20, 2)
+    // Pre-provision B (a provisional cell + its index marker) so the mixed batch
+    // can promote it.
+    store
+        .write_provisional(
+            &c,
+            &[(
+                cell_b.clone(),
+                ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
+            )],
+        )
         .await?;
 
-    for (i, payload) in payloads.iter().enumerate() {
-        let cell = CellKey {
-            section: Section::new(0),
-            coordinate: Coordinate::from_bytes(vec![i as u8]),
-        };
-        assert_eq!(
-            store.get(&id, &cell, event(1)).await?.into_inner().as_ref(),
-            Some(payload),
-            "cell {i} must land across the multi-chunk batch"
-        );
-    }
+    // Owned blobs the bound rows borrow into; must outlive the awaited batch.
+    let blob_a = encode_cell_blobs(Some(&data_a), None)?;
+    let blob_c = encode_cell_blobs(Some(&data_c), None)?;
+    // One batch, one flatten, five distinct statements interleaved.
+    let units = mixed_binding_batch(
+        &fx.queries,
+        &id,
+        &blob_a,
+        &blob_c,
+        &cell_a,
+        &cell_b,
+        &cell_c,
+    );
+    fx.cassandra
+        .execute_unlogged_batches(&units, 1 << 20, 4_096)
+        .await?;
+
+    // A is provisional with its own payload (StageCell + IndexUpsert bound their
+    // columns; the index-based recovery scan reads it back), and it is the ONLY
+    // provisional cell (IndexDelete cleared B's marker, C never had one).
+    let staged = provisional_cells(&store, &id).await?;
+    assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
+    let (key, prov) = staged
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("expected A provisional"))?;
+    assert_eq!(key, cell_a);
+    assert_eq!(prov.data(), Some(&data_a));
+
+    // B promoted to its own payload (PromoteCell bound its columns); C written
+    // fresh resolved to its own payload (RollbackCell bound its columns).
+    assert_eq!(
+        store.get(&id, &cell_b, event(3)).await?,
+        Committed::new(Some(data_b))
+    );
+    assert_eq!(
+        store.get(&id, &cell_c, event(3)).await?,
+        Committed::new(Some(data_c))
+    );
     Ok(())
 }
 

@@ -82,17 +82,22 @@ pub(super) type CellTtlRow = (
     Option<i32>, // TTL(data) in whole seconds
 );
 
-/// Decodes a keyed cell row into its [`CellKey`] and [`Cell`], discarding the
-/// trailing TTL (the resolving scan/sweep paths do not need it).
-///
-/// # Errors
-///
-/// Returns the same corruption errors as [`try_decode_cell`].
-pub(super) fn try_decode_keyed_cell(
-    row: KeyedCellRow,
-) -> Result<(CellKey, Cell), CassandraCellStoreError> {
-    let (key, cell, _ttl) = try_decode_keyed_cell_ttl(row)?;
-    Ok((key, cell))
+/// Two-column shape produced by `SELECT section, coordinate` against the
+/// `kind=Index` marker range — one bare provisional-coordinate per row.
+pub(super) type IndexRow = (
+    i8,      // section
+    Vec<u8>, // coordinate
+);
+
+/// Builds the [`CellKey`] a bare `kind=Index` marker row addresses. Infallible:
+/// the marker carries only the clustering key, which is opaque to the cell
+/// layer (validated, if at all, by the owning collection).
+pub(super) fn index_cell_key(row: IndexRow) -> CellKey {
+    let (section, coordinate) = row;
+    CellKey {
+        section: Section::new(section),
+        coordinate: Coordinate::from_bytes(coordinate),
+    }
 }
 
 /// Decodes a keyed cell row into its [`CellKey`], [`Cell`], and remaining

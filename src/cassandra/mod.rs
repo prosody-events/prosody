@@ -24,9 +24,8 @@ use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::policies::timestamp_generator::MonotonicTimestampGenerator;
 use scylla::serialize::SerializationError;
-use scylla::serialize::row::{RowSerializationContext, SerializeRow};
+use scylla::serialize::row::SerializeRow;
 use scylla::serialize::value::SerializeValue;
-use scylla::serialize::writers::RowWriter;
 use scylla::statement::Consistency;
 use scylla::statement::batch::{Batch, BatchStatement, BatchType};
 use scylla::statement::prepared::PreparedStatement;
@@ -101,9 +100,11 @@ pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
 /// [`CassandraConfiguration`] only for a deployment with a tighter commitlog.
 pub(crate) const MAX_BATCH_BYTES: u64 = 5 * 1_024 * 1_024;
 
-/// Soft statement-count ceiling for one batch — far under the protocol u16 max
-/// the driver enforces client-side, so the byte budget dominates for any
-/// non-trivial value.
+/// Soft ceiling on the number of **cells** (batch units) in one batch. Each
+/// unit contributes up to two statements (a `kind=Cell` mutation and a
+/// `kind=Index` marker), so the emitted statement count stays under `2 ×` this
+/// — still far under the protocol u16 max the driver enforces client-side, so
+/// the byte budget dominates for any non-trivial value.
 pub(crate) const MAX_BATCH_STATEMENTS: usize = 4_096;
 
 /// Per-statement size the row weight adds on top of its blob bytes, covering
@@ -278,61 +279,69 @@ impl CassandraStore {
         }
     }
 
-    /// Executes `rows` as the **fewest** same-partition `UNLOGGED BATCH`es that
-    /// fit the backend budget, every statement being the one prepared
-    /// `statement`.
+    /// Executes `units` as the **fewest** same-partition `UNLOGGED BATCH`es
+    /// that fit the backend budget. Each unit is an atomic group of rows (one
+    /// keyed-state cell's `kind=Cell` mutation plus its `kind=Index` marker)
+    /// that must never be split across batches; a unit's rows may target
+    /// **different** prepared statements ([`BatchRow::statement`]).
     ///
-    /// Each row carries its own size estimate ([`Weighed`]);
-    /// [`chunk_boundaries`] greedily packs contiguous rows into chunks
-    /// within `max_bytes` and `max_count` (a row heavier than `max_bytes`
-    /// takes its own chunk). Callers pass the cells of **one collection**,
-    /// which share a partition key, so each batch is a single atomic
-    /// replica mutation. An empty `rows` is a no-op.
+    /// Each unit carries its own size estimate ([`BatchUnit`]);
+    /// [`chunk_boundaries`] greedily packs contiguous **whole** units into
+    /// chunks within `max_bytes` and `max_count` (a unit heavier than
+    /// `max_bytes` takes its own chunk). Callers pass the cells of **one
+    /// collection**, which share a partition key, so each batch is a single
+    /// atomic replica mutation. An empty `units` is a no-op.
     ///
     /// The batch is marked idempotent — these are last-write-wins full-column
-    /// `UPDATE`s, and batch idempotency does **not** inherit from the member
-    /// statements — so the `DefaultRetryPolicy` may retry it on timeout.
+    /// `UPDATE`s / `INSERT`s / `DELETE`s, and batch idempotency does **not**
+    /// inherit from the member statements — so the `DefaultRetryPolicy` may
+    /// retry it on timeout.
     ///
     /// # Errors
     ///
     /// Returns [`CassandraStoreError`] when the driver fails to execute a
     /// batch.
-    pub(crate) async fn execute_unlogged_batches<P>(
+    pub(crate) async fn execute_unlogged_batches<R>(
         &self,
-        statement: &PreparedStatement,
-        rows: &[Weighed<P>],
+        units: &[BatchUnit<R>],
         max_bytes: u64,
         max_count: usize,
     ) -> Result<(), CassandraStoreError>
     where
-        P: SerializeRow + Sync,
+        R: BatchRow + Sync,
     {
-        // Collect the chunk ranges eagerly: `Weighed::weight` is a *function
+        // Collect the chunk ranges eagerly: `BatchUnit::weight` is a *function
         // item*, not a closure, so the boundary iterator is higher-ranked over
-        // `P`'s borrow, but draining it into a `SmallVec` up front (heap-free in
+        // `R`'s borrow, but draining it into a `SmallVec` up front (heap-free in
         // the common single-chunk case) lets each chunk's future own its `range`
         // without holding the lazy iterator across an await — sidestepping the
         // "implementation of FnOnce is not general enough" the original `for`
-        // loop was shaped to avoid. The chunks partition this collection's cells
-        // into disjoint sub-slices, so concurrent batches never touch the same
-        // cell; `MonotonicTimestampGenerator` keeps last-write-wins correct
-        // regardless of submission order. `session.batch().await` is a tokio I/O
-        // leaf, so the coop budget decrements naturally — no `cooperative` wrap.
+        // loop was shaped to avoid. Ranges are over **units**; whole cells never
+        // straddle a chunk. The chunks partition this collection's cells into
+        // disjoint sub-slices, so concurrent batches never touch the same cell;
+        // `MonotonicTimestampGenerator` keeps last-write-wins correct regardless
+        // of submission order. `session.batch().await` is a tokio I/O leaf, so
+        // the coop budget decrements naturally — no `cooperative` wrap.
         let ranges: SmallVec<[Range<usize>; 1]> =
-            chunk_boundaries(rows.iter().map(Weighed::weight), max_bytes, max_count).collect();
+            chunk_boundaries(units.iter().map(BatchUnit::weight), max_bytes, max_count).collect();
         stream::iter(ranges)
             .map(|range| async move {
-                // One shallow (Arc) clone of the shared prepared statement per
-                // row; the slice `&rows[range]` is itself the `BatchValues` (no
-                // per-chunk value allocation).
-                let statements: Vec<BatchStatement> =
-                    iter::repeat_with(|| BatchStatement::from(statement.clone()))
-                        .take(range.len())
-                        .collect();
+                // One flatten pass over the chunk's units builds the statement
+                // list and the value list in lockstep via `unzip`, so
+                // `batch.statements[i]` binds `values[i]` — each row's own
+                // statement against its own columns. A misaligned flatten would
+                // bind against the wrong statement's columns *silently* (scylla
+                // falls back to an empty context on a count/order mismatch), so
+                // the single-pass lockstep is load-bearing.
+                let (statements, values): (Vec<BatchStatement>, Vec<&R>) = units[range]
+                    .iter()
+                    .flat_map(|unit| unit.rows.iter())
+                    .map(|row| (BatchStatement::from(row.statement().clone()), row))
+                    .unzip();
                 let mut batch = Batch::new_with_statements(BatchType::Unlogged, statements);
                 batch.set_is_idempotent(true);
                 self.session()
-                    .batch(&batch, &rows[range])
+                    .batch(&batch, &values)
                     .await
                     .map(drop)
                     .map_err(CassandraStoreError::from)
@@ -343,40 +352,39 @@ impl CassandraStore {
     }
 }
 
-/// A bind-row tagged with its estimated serialized size, for
-/// [`chunk_boundaries`] packing. The weight is packing metadata only:
-/// [`SerializeRow`] delegates wholly to `row`, so it is never bound or sent.
-pub(crate) struct Weighed<P> {
-    weight: u64,
-    row: P,
+/// A single prepared-statement + bound-values pair for one row of an
+/// `UNLOGGED BATCH`. Decouples [`CassandraStore::execute_unlogged_batches`]
+/// from the concrete row type: the executor packs and submits, the row names
+/// its own statement — so a batch can carry rows targeting **different**
+/// statements without the executor knowing any of them.
+pub(crate) trait BatchRow: SerializeRow {
+    /// The prepared statement this row's columns bind against.
+    fn statement(&self) -> &PreparedStatement;
 }
 
-impl<P> Weighed<P> {
-    /// Tags `row` with its estimated serialized `weight` (blob bytes plus
-    /// [`PER_STATEMENT_OVERHEAD`]).
-    pub(crate) fn new(weight: u64, row: P) -> Self {
-        Self { weight, row }
+/// An indivisible group of [`BatchRow`]s that must land in the **same** batch:
+/// one keyed-state cell's durable rows (its `kind=Cell` mutation and its
+/// `kind=Index` marker). [`chunk_boundaries`] packs whole units and never
+/// splits one, so a cell's rows are always one same-partition atomic mutation —
+/// "split a cell across batches" is unrepresentable. Two rows fit inline in the
+/// `SmallVec`.
+pub(crate) struct BatchUnit<R> {
+    weight: u64,
+    rows: SmallVec<[R; 2]>,
+}
+
+impl<R> BatchUnit<R> {
+    /// Groups `rows` as one atomic unit weighing `weight` (the cell's blob
+    /// bytes plus [`PER_STATEMENT_OVERHEAD`] per member row).
+    pub(crate) fn new(weight: u64, rows: SmallVec<[R; 2]>) -> Self {
+        Self { weight, rows }
     }
 
     /// The packing weight. A function item (not a closure), so
-    /// `rows.iter().map(Weighed::weight)` stays higher-ranked over `P`'s
+    /// `units.iter().map(BatchUnit::weight)` stays higher-ranked over `R`'s
     /// borrow.
     fn weight(&self) -> u64 {
         self.weight
-    }
-}
-
-impl<P: SerializeRow> SerializeRow for Weighed<P> {
-    fn serialize(
-        &self,
-        ctx: &RowSerializationContext<'_>,
-        writer: &mut RowWriter<'_>,
-    ) -> Result<(), SerializationError> {
-        self.row.serialize(ctx, writer)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.row.is_empty()
     }
 }
 

@@ -398,15 +398,20 @@ where
         let event = EventRef::Message { dedup_id };
 
         let writes = collapse_writes(ev.writes);
-        // Mid-fan-out crashes after a prefix of the *collections* stage — a
-        // collection's own cells are atomic (one batch), so the tear is across
-        // collections, never within one.
-        let staged_count = if ev.outcome.mid_fan_out() {
-            writes.len().saturating_sub(1)
-        } else {
-            writes.len()
-        };
-        let staged = &writes[..staged_count];
+        // Mid-fan-out tears at CELL granularity: a cell is atomic — its
+        // `kind=Cell` row and its `kind=Index` marker land in one batch or not
+        // at all — so a crash mid-stage leaves a whole-cell prefix, never a torn
+        // cell and never one row without the other. Model it by dropping the
+        // last touched collection's final cell (the cell whose batch never
+        // committed), then dropping any collection left empty.
+        let mut staged = writes;
+        if ev.outcome.mid_fan_out() {
+            if let Some((_, cells)) = staged.last_mut() {
+                cells.pop();
+            }
+            staged.retain(|(_, cells)| !cells.is_empty());
+        }
+        let staged = staged.as_slice();
 
         // Stage each collection's whole cell set in ONE `write_provisional` call
         // over its committed base (prev-is-committed at stage time: no

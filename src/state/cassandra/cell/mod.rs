@@ -3,8 +3,9 @@
 //! [`CassandraStore`] implements the untyped [`CellStore`] over the
 //! `keyed_state_cell` table provisioned by migration
 //! `20260522_create_keyed_state.cql`. Every durable mutation writes one
-//! self-consistent column shape in a single statement, so the applied-triple
-//! desync class the write-ahead-log design fought is unwritable here.
+//! self-consistent cell-column shape in a single statement, so the
+//! applied-triple desync class the write-ahead-log design fought is unwritable
+//! here.
 //!
 //! It is the **bottom** store: it owns the commit oracle (via the composed
 //! [`Resolver`]) and oracle-resolves any in-flight provisional cell inside
@@ -12,11 +13,18 @@
 //! ([`Cached`](crate::state::cached::Cached),
 //! [`Overlay`](crate::state::overlay::Overlay)) are oracle-free.
 //!
-//! # Cell column shape
+//! # Cell rows and the provisional index
 //!
-//! Each cell row is one cell over the columns `data | prev_data | encoding |
-//! version | event`, addressed by the `(section, coordinate)` clustering key.
-//! The three mutators write exactly one shape each:
+//! The partition's leading clustering [`CellKind`] splits it into two disjoint
+//! ranges. A `kind=Cell` row is one cell over the columns `data | prev_data |
+//! encoding | version | event`, addressed by `(section, coordinate)`. Beside
+//! every staged cell, a bare `kind=Index` marker row records its coordinate;
+//! recovery ([`provisional_cells`](CellStore::provisional_cells)) reads only
+//! that front-of-partition marker range and point-reads each marked cell, so
+//! its cost is proportional to the number of provisional cells, never the
+//! partition size. A cell's `kind=Cell` mutation and its `kind=Index` marker
+//! are written as one atomic same-partition batch unit, so the two never tear
+//! apart. The three mutators write exactly one cell-column shape each:
 //!
 //! * [`write_provisional`](CellStore::write_provisional) — *stage*: `data`,
 //!   `prev_data`, `event`, and the shared `encoding`/`version` in one `UPDATE`.
@@ -52,7 +60,9 @@ mod tests;
 use crate::cassandra::CassandraStore as CassandraSession;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, PER_STATEMENT_OVERHEAD, Weighed};
+use crate::cassandra::{
+    BatchRow, BatchUnit, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, PER_STATEMENT_OVERHEAD,
+};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Direction, Scan};
@@ -69,6 +79,11 @@ use bytes::Bytes;
 use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
+use scylla::serialize::SerializationError;
+use scylla::serialize::row::{RowSerializationContext, SerializeRow};
+use scylla::serialize::writers::RowWriter;
+use scylla::statement::prepared::PreparedStatement;
+use smallvec::smallvec;
 use std::ops::Bound;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
@@ -86,6 +101,36 @@ const VALUE_ENCODING: Encoding = Encoding::RawZstdV1;
 /// ([`decode::validate_version`]). Per-key identity migration is future work —
 /// the stamp is the dormant hook it would build on.
 pub const INITIAL_VERSION: i32 = 1;
+
+/// The leading clustering discriminator that splits a collection's partition
+/// into two disjoint front-to-back ranges.
+///
+/// [`Cell`](Self::Cell) rows carry the full cell columns;
+/// [`Index`](Self::Index) rows are bare provisional-coordinate markers
+/// co-clustered ahead of them, so recovery reads only the (bounded) `Index`
+/// range instead of scanning every cell. It is **always bound as a constant
+/// clustering predicate**, never decoded back into a value — hence
+/// serialize-only ([`SerializeValue`] in [`super::serialize`]), with no
+/// `TryFrom`/`DeserializeValue`.
+///
+/// [`SerializeValue`]: scylla::serialize::value::SerializeValue
+#[repr(i8)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum CellKind {
+    /// A cell row: the full `data | prev_data | encoding | version | event`
+    /// column shape.
+    Cell = 0,
+
+    /// A bare provisional-coordinate marker row (only the clustering key is
+    /// populated).
+    Index = 1,
+}
+
+impl From<CellKind> for i8 {
+    fn from(kind: CellKind) -> Self {
+        kind as i8
+    }
+}
 
 /// The bottom store's resolving read/sweep error: a raw store failure or an
 /// oracle consult failure.
@@ -156,6 +201,7 @@ impl<O> CassandraStore<O> {
                     pk.key,
                     pk.state_type,
                     pk.name,
+                    CellKind::Cell,
                     i8::from(cell.section),
                     cell.coordinate.as_bytes(),
                 ),
@@ -184,6 +230,7 @@ impl<O> CassandraStore<O> {
                     pk.key,
                     pk.state_type,
                     pk.name,
+                    CellKind::Cell,
                     i8::from(cell.section),
                     cell.coordinate.as_bytes(),
                 ),
@@ -205,74 +252,59 @@ impl<O> CassandraStore<O> {
         let pk = Pk::of(collection.id());
         // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
         // bound rows borrow into it and into each input cell's coordinate slice,
-        // so the whole batch is one `rows` allocation with no per-cell tuple
-        // copy. Both Vecs outlive the awaited batch.
+        // so the whole batch is one `blobs` allocation with no per-cell copy.
         let mut blobs = Vec::with_capacity(writes.len());
         for (_, write) in writes {
             blobs.push(encode_cell_blobs(write.data(), write.prev())?);
         }
 
         // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
-        // hence the bound param shape — is made once for the whole batch, never
-        // per cell.
-        if let Some(ttl) = collection.ttl().map(ttl_to_i32) {
-            let mut rows = Vec::with_capacity(writes.len());
-            for (blob, (cell, write)) in blobs.iter().zip(writes) {
-                rows.push(Weighed::new(
-                    blob_weight(blob),
-                    (
-                        ttl,
-                        blob.data.as_deref(),
-                        blob.prev_data.as_deref(),
-                        blob.encoding,
-                        blob.version,
-                        write.event(),
-                        pk.segment_id,
-                        pk.key,
-                        pk.state_type,
-                        pk.name,
-                        i8::from(cell.section),
-                        cell.coordinate.as_bytes(),
-                    ),
-                ));
-            }
-            self.session
-                .execute_unlogged_batches(
-                    &self.queries.write_provisional,
-                    &rows,
-                    MAX_BATCH_BYTES,
-                    MAX_BATCH_STATEMENTS,
-                )
-                .await?;
+        // hence which statement each row carries — is made once for the whole
+        // batch, never per cell.
+        let ttl = collection.ttl().map(ttl_to_i32);
+        let (cell_stmt, index_stmt) = if ttl.is_some() {
+            (&self.queries.write_provisional, &self.queries.index_insert)
         } else {
-            let mut rows = Vec::with_capacity(writes.len());
-            for (blob, (cell, write)) in blobs.iter().zip(writes) {
-                rows.push(Weighed::new(
-                    blob_weight(blob),
-                    (
-                        blob.data.as_deref(),
-                        blob.prev_data.as_deref(),
-                        blob.encoding,
-                        blob.version,
-                        write.event(),
-                        pk.segment_id,
-                        pk.key,
-                        pk.state_type,
-                        pk.name,
-                        i8::from(cell.section),
-                        cell.coordinate.as_bytes(),
-                    ),
-                ));
-            }
-            self.session
-                .execute_unlogged_batches(
-                    &self.queries.write_provisional_no_ttl,
-                    &rows,
-                    MAX_BATCH_BYTES,
-                    MAX_BATCH_STATEMENTS,
+            (
+                &self.queries.write_provisional_no_ttl,
+                &self.queries.index_insert_no_ttl,
+            )
+        };
+        // One unit per cell holds the cell mutation and its index marker as an
+        // indivisible pair, so `chunk_boundaries` never tears a cell's two rows
+        // into separate batches. Weight = blob bytes + one overhead for the cell
+        // row + one for the bare index row.
+        let units: Vec<BatchUnit<CellBatchRow>> = blobs
+            .iter()
+            .zip(writes)
+            .map(|(blob, (cell, write))| {
+                let addr = CellAddr::new(pk, cell);
+                BatchUnit::new(
+                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
+                    smallvec![
+                        CellBatchRow::StageCell {
+                            statement: cell_stmt,
+                            row: StageRow {
+                                ttl,
+                                data: blob.data.as_deref(),
+                                prev_data: blob.prev_data.as_deref(),
+                                encoding: blob.encoding,
+                                version: blob.version,
+                                event: write.event(),
+                                addr,
+                            },
+                        },
+                        CellBatchRow::IndexUpsert {
+                            statement: index_stmt,
+                            row: IndexUpsertRow { ttl, addr },
+                        },
+                    ],
                 )
-                .await?;
-        }
+            })
+            .collect();
+        self.session
+            .execute_unlogged_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .await?;
         Ok(())
     }
 
@@ -289,60 +321,52 @@ impl<O> CassandraStore<O> {
             blobs.push(encode_cell_blobs(data.as_ref(), None)?);
         }
 
-        if let Some(ttl) = collection.ttl().map(ttl_to_i32) {
-            let mut rows = Vec::with_capacity(cells.len());
-            for (blob, (cell, _)) in blobs.iter().zip(cells) {
-                rows.push(Weighed::new(
-                    blob_weight(blob),
-                    (
-                        ttl,
-                        blob.data.as_deref(),
-                        blob.encoding,
-                        blob.version,
-                        pk.segment_id,
-                        pk.key,
-                        pk.state_type,
-                        pk.name,
-                        i8::from(cell.section),
-                        cell.coordinate.as_bytes(),
-                    ),
-                ));
-            }
-            self.session
-                .execute_unlogged_batches(
-                    &self.queries.write_resolved,
-                    &rows,
-                    MAX_BATCH_BYTES,
-                    MAX_BATCH_STATEMENTS,
-                )
-                .await?;
+        let ttl = collection.ttl().map(ttl_to_i32);
+        let cell_stmt = if ttl.is_some() {
+            &self.queries.write_resolved
         } else {
-            let mut rows = Vec::with_capacity(cells.len());
-            for (blob, (cell, _)) in blobs.iter().zip(cells) {
-                rows.push(Weighed::new(
-                    blob_weight(blob),
-                    (
-                        blob.data.as_deref(),
-                        blob.encoding,
-                        blob.version,
-                        pk.segment_id,
-                        pk.key,
-                        pk.state_type,
-                        pk.name,
-                        i8::from(cell.section),
-                        cell.coordinate.as_bytes(),
-                    ),
-                ));
-            }
-            self.session
-                .execute_unlogged_batches(
-                    &self.queries.write_resolved_no_ttl,
-                    &rows,
-                    MAX_BATCH_BYTES,
-                    MAX_BATCH_STATEMENTS,
+            &self.queries.write_resolved_no_ttl
+        };
+        // Each unit pairs the resolved-value write with an `index_delete`. On the
+        // rollback path (resolving a provisional cell to its `prev`) this clears
+        // the cell's provisional-coordinate marker. On a fresh committed write (a
+        // ReadUncommitted direct write / mid-handler flush that was never staged)
+        // no marker exists, so the delete is a harmless no-op tombstone in the
+        // `kind=Index` slice. Pairing unconditionally keeps a cell's rows one
+        // atomic unit; differentiating rollback from fresh-commit to skip the
+        // no-op is future work — `write_resolved` carries no provisional signal.
+        let units: Vec<BatchUnit<CellBatchRow>> = blobs
+            .iter()
+            .zip(cells)
+            .map(|(blob, (cell, _))| {
+                let addr = CellAddr::new(pk, cell);
+                BatchUnit::new(
+                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
+                    smallvec![
+                        CellBatchRow::RollbackCell {
+                            statement: cell_stmt,
+                            row: ResolvedRow {
+                                ttl,
+                                data: blob.data.as_deref(),
+                                encoding: blob.encoding,
+                                version: blob.version,
+                                addr,
+                            },
+                        },
+                        CellBatchRow::IndexDelete {
+                            statement: &self.queries.index_delete,
+                            row: KeyRow {
+                                kind: CellKind::Index,
+                                addr,
+                            },
+                        },
+                    ],
                 )
-                .await?;
-        }
+            })
+            .collect();
+        self.session
+            .execute_unlogged_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .await?;
         Ok(())
     }
 
@@ -352,30 +376,37 @@ impl<O> CassandraStore<O> {
         cells: &[CellKey],
     ) -> Result<(), CassandraCellStoreError> {
         let pk = Pk::of(collection.id());
-        // Promotes carry no blob — only the key columns — so every row weighs the
-        // fixed per-statement overhead and the byte budget never bites; the count
-        // budget alone splits an enormous promote set.
-        let mut rows = Vec::with_capacity(cells.len());
-        for cell in cells {
-            rows.push(Weighed::new(
-                PER_STATEMENT_OVERHEAD,
-                (
-                    pk.segment_id,
-                    pk.key,
-                    pk.state_type,
-                    pk.name,
-                    i8::from(cell.section),
-                    cell.coordinate.as_bytes(),
-                ),
-            ));
-        }
+        // Promotes carry no blob — only key columns — so every unit weighs a
+        // fixed overhead per member row (the cell promote + its index-marker
+        // delete) and the byte budget never bites; the count budget alone splits
+        // an enormous promote set.
+        let units: Vec<BatchUnit<CellBatchRow>> = cells
+            .iter()
+            .map(|cell| {
+                let addr = CellAddr::new(pk, cell);
+                BatchUnit::new(
+                    2 * PER_STATEMENT_OVERHEAD,
+                    smallvec![
+                        CellBatchRow::PromoteCell {
+                            statement: &self.queries.mark_resolved,
+                            row: KeyRow {
+                                kind: CellKind::Cell,
+                                addr,
+                            },
+                        },
+                        CellBatchRow::IndexDelete {
+                            statement: &self.queries.index_delete,
+                            row: KeyRow {
+                                kind: CellKind::Index,
+                                addr,
+                            },
+                        },
+                    ],
+                )
+            })
+            .collect();
         self.session
-            .execute_unlogged_batches(
-                &self.queries.mark_resolved,
-                &rows,
-                MAX_BATCH_BYTES,
-                MAX_BATCH_STATEMENTS,
-            )
+            .execute_unlogged_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
             .await?;
         Ok(())
     }
@@ -434,14 +465,14 @@ where
                     .cql()
                     .execute_iter(
                         statement,
-                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), section, coord.as_slice()),
+                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Cell, section, coord.as_slice()),
                     )
                     .await,
                 None => self
                     .cql()
                     .execute_iter(
                         statement,
-                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), section),
+                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Cell, section),
                     )
                     .await,
             };
@@ -584,27 +615,46 @@ where
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         let pk = Pk::of(collection).owned();
         try_stream! {
-            let stream = self
+            // Bounded recovery: read only the front-of-partition `kind=Index`
+            // marker range (cost ∝ #provisional, never #cells), then point-read
+            // each marked coordinate's `kind=Cell` row. There is no
+            // whole-partition scan.
+            let index = self
                 .cql()
                 .execute_iter(
-                    self.queries.scan_partition.clone(),
-                    (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str()),
+                    self.queries.index_scan.clone(),
+                    (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Index),
                 )
                 .await
                 .map_err(CassandraStoreError::from)
                 .map_err(into_store_err::<O>)?
-                .rows_stream::<KeyedCellRow>()
+                .rows_stream::<decode::IndexRow>()
                 .map_err(CassandraStoreError::from)
                 .map_err(into_store_err::<O>)?;
-            pin_mut!(stream);
+            pin_mut!(index);
 
-            while let Some(row) = cooperative(stream.try_next())
+            // N (= #provisional) is bounded-small, so the point reads stay
+            // sequential behind the `cooperative` checkpoint that yields a large
+            // recovery drain to the runtime every ~128 items (matches `memory`).
+            while let Some(row) = cooperative(index.try_next())
                 .await
                 .map_err(CassandraStoreError::from)
                 .map_err(into_store_err::<O>)?
             {
-                let (key, cell) =
-                    decode::try_decode_keyed_cell(row).map_err(ResolveCellError::Store)?;
+                let key = decode::index_cell_key(row);
+                let Some(raw) = self
+                    .read_raw(collection, &key)
+                    .await
+                    .map_err(ResolveCellError::Store)?
+                else {
+                    // The marker has no live cell row (its cell and marker share
+                    // one TTL, so this is a compaction-window straggler): nothing
+                    // to recover. Over-report-safe to skip.
+                    continue;
+                };
+                let cell = decode::try_decode_cell(raw).map_err(ResolveCellError::Store)?;
+                // A coordinate concurrently resolved decodes `Cell::Resolved` and
+                // is silently dropped — over-report-safe.
                 if let Cell::Provisional(provisional) = cell {
                     yield (key, provisional);
                 }
@@ -644,6 +694,7 @@ where
 }
 
 /// The four partition-key column values of a collection's Cassandra partition.
+#[derive(Clone, Copy)]
 struct Pk<'a> {
     segment_id: &'a crate::SegmentId,
     key: &'a str,
@@ -691,6 +742,290 @@ struct CellBlobs {
     prev_data: Option<Bytes>,
     encoding: Option<Encoding>,
     version: Option<i32>,
+}
+
+/// The key + clustering columns addressing one cell in its partition: the four
+/// partition-key columns and the cell's `section`/`coordinate`. `kind` is
+/// **not** carried — each [`CellBatchRow`] variant binds its own constant
+/// `kind` (`Cell` vs `Index`), so one address serves both a cell row and its
+/// index-marker row.
+#[derive(Clone, Copy)]
+struct CellAddr<'a> {
+    pk: Pk<'a>,
+    section: i8,
+    coordinate: &'a [u8],
+}
+
+impl<'a> CellAddr<'a> {
+    fn new(pk: Pk<'a>, cell: &'a CellKey) -> Self {
+        Self {
+            pk,
+            section: i8::from(cell.section),
+            coordinate: cell.coordinate.as_bytes(),
+        }
+    }
+}
+
+/// One durable row bound into a same-partition `UNLOGGED BATCH`: the prepared
+/// statement it targets and a row-shape struct that binds exactly that
+/// statement's columns. There is one variant per distinct cell statement
+/// because [`scylla::batch::Batch`] binds its statement list 1:1 with the value
+/// list, so a row must serialize precisely the columns of the statement
+/// [`BatchRow::statement`] returns. `PromoteCell`/`IndexDelete` share the
+/// key-only [`KeyRow`] shape but stay distinct variants because they select
+/// different statements and bind a different constant `kind`.
+enum CellBatchRow<'a> {
+    /// Stage a provisional cell (`kind=Cell`): the full `data | prev_data |
+    /// event` shape plus shared `encoding`/`version`.
+    StageCell {
+        statement: &'a PreparedStatement,
+        row: StageRow<'a>,
+    },
+    /// Promote a provisional cell (`kind=Cell`): nulls `prev_data`/`event`,
+    /// keeping `data` and its TTL. Key columns only.
+    PromoteCell {
+        statement: &'a PreparedStatement,
+        row: KeyRow<'a>,
+    },
+    /// Write a resolved value (`kind=Cell`): committed `data` +
+    /// encoding/version, nulling `prev_data`/`event`.
+    RollbackCell {
+        statement: &'a PreparedStatement,
+        row: ResolvedRow<'a>,
+    },
+    /// Upsert a bare provisional-coordinate marker (`kind=Index`) at the cell's
+    /// TTL, so the marker expires with it.
+    IndexUpsert {
+        statement: &'a PreparedStatement,
+        row: IndexUpsertRow<'a>,
+    },
+    /// Delete a provisional-coordinate marker (`kind=Index`). Key columns only.
+    IndexDelete {
+        statement: &'a PreparedStatement,
+        row: KeyRow<'a>,
+    },
+}
+
+/// The `write_provisional[_no_ttl]` bind shape. `ttl` selects the with-/no-TTL
+/// statement **and** the bound column count — kept consistent with the carried
+/// statement at the single construction site.
+struct StageRow<'a> {
+    ttl: Option<i32>,
+    data: Option<&'a [u8]>,
+    prev_data: Option<&'a [u8]>,
+    encoding: Option<Encoding>,
+    version: Option<i32>,
+    event: EventRef,
+    addr: CellAddr<'a>,
+}
+
+/// The `write_resolved[_no_ttl]` bind shape (committed `data` +
+/// encoding/version; `prev_data`/`event` nulled by the statement).
+struct ResolvedRow<'a> {
+    ttl: Option<i32>,
+    data: Option<&'a [u8]>,
+    encoding: Option<Encoding>,
+    version: Option<i32>,
+    addr: CellAddr<'a>,
+}
+
+/// The `index_insert[_no_ttl]` bind shape: key columns then, with TTL, the
+/// trailing `USING TTL ?` value.
+struct IndexUpsertRow<'a> {
+    ttl: Option<i32>,
+    addr: CellAddr<'a>,
+}
+
+/// The key-only bind shape shared by `mark_resolved` and `index_delete`: the
+/// four PK columns, the constant `kind`, and the cell's `section`/`coordinate`.
+struct KeyRow<'a> {
+    kind: CellKind,
+    addr: CellAddr<'a>,
+}
+
+impl BatchRow for CellBatchRow<'_> {
+    fn statement(&self) -> &PreparedStatement {
+        match self {
+            CellBatchRow::StageCell { statement, .. }
+            | CellBatchRow::PromoteCell { statement, .. }
+            | CellBatchRow::RollbackCell { statement, .. }
+            | CellBatchRow::IndexUpsert { statement, .. }
+            | CellBatchRow::IndexDelete { statement, .. } => statement,
+        }
+    }
+}
+
+impl SerializeRow for CellBatchRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        match self {
+            CellBatchRow::StageCell { row, .. } => row.serialize(ctx, writer),
+            CellBatchRow::RollbackCell { row, .. } => row.serialize(ctx, writer),
+            CellBatchRow::IndexUpsert { row, .. } => row.serialize(ctx, writer),
+            // Promote and index-delete share the key-only `KeyRow` shape (they
+            // differ only in statement + constant `kind`, both carried above).
+            CellBatchRow::PromoteCell { row, .. } | CellBatchRow::IndexDelete { row, .. } => {
+                row.serialize(ctx, writer)
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SerializeRow for StageRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        let a = &self.addr;
+        // The `ttl` arms differ only by the leading `USING TTL ?` column the
+        // no-TTL statement omits; `kind` leads the clustering key.
+        match self.ttl {
+            Some(ttl) => (
+                ttl,
+                self.data,
+                self.prev_data,
+                self.encoding,
+                self.version,
+                self.event,
+                a.pk.segment_id,
+                a.pk.key,
+                a.pk.state_type,
+                a.pk.name,
+                CellKind::Cell,
+                a.section,
+                a.coordinate,
+            )
+                .serialize(ctx, writer),
+            None => (
+                self.data,
+                self.prev_data,
+                self.encoding,
+                self.version,
+                self.event,
+                a.pk.segment_id,
+                a.pk.key,
+                a.pk.state_type,
+                a.pk.name,
+                CellKind::Cell,
+                a.section,
+                a.coordinate,
+            )
+                .serialize(ctx, writer),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SerializeRow for ResolvedRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        let a = &self.addr;
+        match self.ttl {
+            Some(ttl) => (
+                ttl,
+                self.data,
+                self.encoding,
+                self.version,
+                a.pk.segment_id,
+                a.pk.key,
+                a.pk.state_type,
+                a.pk.name,
+                CellKind::Cell,
+                a.section,
+                a.coordinate,
+            )
+                .serialize(ctx, writer),
+            None => (
+                self.data,
+                self.encoding,
+                self.version,
+                a.pk.segment_id,
+                a.pk.key,
+                a.pk.state_type,
+                a.pk.name,
+                CellKind::Cell,
+                a.section,
+                a.coordinate,
+            )
+                .serialize(ctx, writer),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SerializeRow for IndexUpsertRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        let a = &self.addr;
+        // `INSERT … (…, kind, section, coordinate) VALUES (…) USING TTL ?` binds
+        // the TTL **after** the value list.
+        match self.ttl {
+            Some(ttl) => (
+                a.pk.segment_id,
+                a.pk.key,
+                a.pk.state_type,
+                a.pk.name,
+                CellKind::Index,
+                a.section,
+                a.coordinate,
+                ttl,
+            )
+                .serialize(ctx, writer),
+            None => KeyRow {
+                kind: CellKind::Index,
+                addr: self.addr,
+            }
+            .serialize(ctx, writer),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SerializeRow for KeyRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        let a = &self.addr;
+        (
+            a.pk.segment_id,
+            a.pk.key,
+            a.pk.state_type,
+            a.pk.name,
+            self.kind,
+            a.section,
+            a.coordinate,
+        )
+            .serialize(ctx, writer)
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 /// Maps a raw Cassandra error into the resolving store error.
@@ -767,26 +1102,29 @@ fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuration> {
 cassandra_queries! {
     /// Container for the prepared CQL statements used by [`CassandraStore`].
     ///
-    /// Each mutation is one `UPDATE` of one row; a multi-cell collection write
-    /// binds the same prepared statement once per cell into one same-partition
-    /// `UNLOGGED BATCH` (via `execute_unlogged_batches`), so all its cells share
-    /// one write timestamp and TTL anchor. TTL/no-TTL
-    /// pairs exist because Cassandra cannot bind `NULL` to `USING TTL ?`. The
-    /// scans are single-section clustering ranges: the `ORDER BY` direction
-    /// cannot be bound (forward/backward), and the **start-side comparator**
-    /// cannot be bound either, so each direction carries three start variants —
-    /// inclusive (`>=`/`<=`), exclusive (`>`/`<`, for coverage gap
-    /// fall-through), and unbounded (no coordinate clause). The end bound is
-    /// enforced in code (`past_end`), so it needs no statement variant. A
-    /// whole-partition recovery scan completes the set; none use `ALLOW
-    /// FILTERING`.
+    /// Every statement binds the leading clustering `kind` as a constant
+    /// (`CellKind::Cell` for the cell statements, `CellKind::Index` for the
+    /// three index statements) — a clustering-prefix column cannot be skipped.
+    /// Each cell mutation is one `UPDATE`/`INSERT`/`DELETE` of one row; a
+    /// multi-cell collection write binds these once per cell into one
+    /// same-partition `UNLOGGED BATCH` (via `execute_unlogged_batches`), so all
+    /// its cells share one write timestamp and TTL anchor. TTL/no-TTL pairs
+    /// exist because Cassandra cannot bind `NULL` to `USING TTL ?`. The scans
+    /// are single-section clustering ranges within the `kind=Cell` slice: the
+    /// `ORDER BY` direction cannot be bound (forward/backward), and the
+    /// **start-side comparator** cannot be bound either, so each direction
+    /// carries three start variants — inclusive (`>=`/`<=`), exclusive (`>`/`<`,
+    /// for coverage gap fall-through), and unbounded (no coordinate clause). The
+    /// end bound is enforced in code (`past_end`), so it needs no statement
+    /// variant. The `index_*` statements maintain and read the `kind=Index`
+    /// marker range that bounds recovery. None use `ALLOW FILTERING`.
     pub struct CellQueries {
         /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
             "SELECT data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -797,7 +1135,7 @@ cassandra_queries! {
             "SELECT data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -806,7 +1144,7 @@ cassandra_queries! {
             "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate >= ? \
+             AND kind = ? AND section = ? AND coordinate >= ? \
              ORDER BY coordinate ASC",
             TABLE_KEYED_STATE_CELL
         ),
@@ -816,7 +1154,7 @@ cassandra_queries! {
             "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate > ? \
+             AND kind = ? AND section = ? AND coordinate > ? \
              ORDER BY coordinate ASC",
             TABLE_KEYED_STATE_CELL
         ),
@@ -826,7 +1164,7 @@ cassandra_queries! {
             "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? \
+             AND kind = ? AND section = ? \
              ORDER BY coordinate ASC",
             TABLE_KEYED_STATE_CELL
         ),
@@ -836,7 +1174,7 @@ cassandra_queries! {
             "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate <= ? \
+             AND kind = ? AND section = ? AND coordinate <= ? \
              ORDER BY coordinate DESC",
             TABLE_KEYED_STATE_CELL
         ),
@@ -846,7 +1184,7 @@ cassandra_queries! {
             "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate < ? \
+             AND kind = ? AND section = ? AND coordinate < ? \
              ORDER BY coordinate DESC",
             TABLE_KEYED_STATE_CELL
         ),
@@ -857,17 +1195,8 @@ cassandra_queries! {
             "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? \
+             AND kind = ? AND section = ? \
              ORDER BY coordinate DESC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Whole-partition (all sections) provisional scan for recovery. Yields
-        /// every clustering row; resolved rows are filtered in code.
-        scan_partition: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -877,7 +1206,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -886,7 +1215,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} \
              SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -896,7 +1225,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -905,7 +1234,7 @@ cassandra_queries! {
             "UPDATE $keyspace.{} \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
@@ -916,7 +1245,45 @@ cassandra_queries! {
             "UPDATE $keyspace.{} \
              SET prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND section = ? AND coordinate = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Inserts a bare `kind=Index` provisional-coordinate marker with TTL,
+        /// anchored to the staged cell's TTL so the marker expires with it.
+        index_insert: (
+            "INSERT INTO $keyspace.{} \
+             (segment_id, key, state_type, name, kind, section, coordinate) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Inserts a bare `kind=Index` marker without TTL.
+        index_insert_no_ttl: (
+            "INSERT INTO $keyspace.{} \
+             (segment_id, key, state_type, name, kind, section, coordinate) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Deletes a `kind=Index` marker (on cell resolution — promote or
+        /// rollback). A delete of an absent marker is a harmless no-op.
+        index_delete: (
+            "DELETE FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Reads the whole `kind=Index` marker range for recovery — the
+        /// provisional coordinate list, bounded by #provisional and disjoint
+        /// from the `kind=Cell` slice. Recovery point-reads each coordinate's
+        /// cell via `read_cell`.
+        index_scan: (
+            "SELECT section, coordinate \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ?",
             TABLE_KEYED_STATE_CELL
         ),
     }
