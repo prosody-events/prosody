@@ -20,6 +20,11 @@ pub enum FjallCellCacheError {
     #[error("cached cell was empty")]
     EmptyCacheCell,
 
+    /// A coverage bound frame carried a tag byte the decoder does not recognize
+    /// (an own-write corruption bug).
+    #[error("unknown coverage bound tag byte: 0x{0:02X}")]
+    UnknownBoundTag(u8),
+
     /// The blocking task that ran a fjall call failed (panic or cancel).
     #[error("fjall blocking task failed: {0}")]
     BlockingTaskJoin(#[from] JoinError),
@@ -42,7 +47,9 @@ impl ClassifyError for FjallCellCacheError {
             // A corrupt stored cell is permanent for that cell: re-reading the
             // same bytes cannot succeed. The covered serve falls through to the
             // authoritative cell store and re-publishes a fresh entry.
-            Self::UnknownCacheTag(_) | Self::EmptyCacheCell => ErrorCategory::Permanent,
+            Self::UnknownCacheTag(_) | Self::EmptyCacheCell | Self::UnknownBoundTag(_) => {
+                ErrorCategory::Permanent
+            }
         }
     }
 }

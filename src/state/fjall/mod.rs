@@ -118,6 +118,22 @@ pub struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_puts: Arc<AtomicBool>,
+    /// Test-only fault seam: when set, [`index_snapshot`](Self::index_snapshot)
+    /// returns an engine error, so a test can force the warm coords read to
+    /// fail while the collection stays seeded — the branch that must
+    /// degrade the recovery sweep to the cold durable re-seed rather than
+    /// fabricate an empty (clean) sweep that would strand a provisional
+    /// cell.
+    #[cfg(test)]
+    #[educe(Debug(ignore))]
+    fail_index_snapshot: Arc<AtomicBool>,
+    /// Test-only fault seam: when set, [`index_record`](Self::index_record)
+    /// returns an engine error, so a test can force a cold-seed record to fail
+    /// and assert the collection is left **unseeded** (the next sweep re-seeds)
+    /// rather than latched seeded over an incomplete coords set.
+    #[cfg(test)]
+    #[educe(Debug(ignore))]
+    fail_index_record: Arc<AtomicBool>,
 }
 
 /// Backing for a [`FjallCellCache`]: either a bare cache handle plus its
@@ -126,9 +142,19 @@ pub struct FjallCellCache {
 /// revocation (production).
 ///
 /// The [`Database`] is held in both arms because batch writes are issued
-/// through [`Database::batch`], not the keyspace handle.
+/// through [`Database::batch`], not the keyspace handle. The `index` keyspace
+/// (warm provisional coordinates + scan coverage) rides alongside `cache` in
+/// both arms purely for lifecycle co-location — it shares the workspace's epoch
+/// (cold at a fresh assignment, dropped at revocation). Index and cell-cache
+/// writes are **not** issued as one cross-keyspace batch; the warm index is a
+/// rebuildable hint (a fresh epoch re-seeds from the durable `kind=Index`), so
+/// they need no atomicity with the committed-value write.
 enum Inner {
-    Bare { database: Database, cache: Keyspace },
+    Bare {
+        database: Database,
+        cache: Keyspace,
+        index: Keyspace,
+    },
     Owned(FjallWorkspace),
 }
 
@@ -138,6 +164,14 @@ impl Inner {
         match self {
             Self::Bare { cache, .. } => cache,
             Self::Owned(workspace) => workspace.cache_handle(),
+        }
+    }
+
+    /// The warm-index keyspace handle (provisional coordinates + coverage).
+    fn index_handle(&self) -> &Keyspace {
+        match self {
+            Self::Bare { index, .. } => index,
+            Self::Owned(workspace) => workspace.index_handle(),
         }
     }
 
@@ -154,25 +188,38 @@ impl Inner {
 }
 
 impl FjallCellCache {
-    /// Builds a cache over an opened cache `Keyspace` and its owning
-    /// `Database`, owning no workspace.
+    /// Builds a cache over opened `cache` + `index` `Keyspace`s and their
+    /// owning `Database`, owning no workspace.
     ///
-    /// The caller owns the database the handle belongs to and is responsible
-    /// for keeping it (and the keyspace) alive for the cache's lifetime. Used
-    /// by tests; production uses [`Self::for_workspace`], which owns the
-    /// workspace.
+    /// The caller owns the database the handles belong to and is responsible
+    /// for keeping them alive for the cache's lifetime. Used by tests;
+    /// production uses [`Self::for_workspace`], which owns the workspace.
     #[must_use]
-    pub fn new(database: Database, cache: Keyspace) -> Self {
-        Self::from_parts(Inner::Bare { database, cache }, Clock::Wall)
+    pub fn new(database: Database, cache: Keyspace, index: Keyspace) -> Self {
+        Self::from_parts(
+            Inner::Bare {
+                database,
+                cache,
+                index,
+            },
+            Clock::Wall,
+        )
     }
 
-    /// Builds a bare cache over `cache` driven by a test-controlled [`Clock`],
-    /// so a TTL-expiry property can advance time past a stamped expiry
-    /// deterministically.
+    /// Builds a bare cache over `cache` + `index` driven by a test-controlled
+    /// [`Clock`], so a TTL-expiry property can advance time past a stamped
+    /// expiry deterministically.
     #[cfg(test)]
     #[must_use]
-    pub fn with_clock(database: Database, cache: Keyspace, clock: Clock) -> Self {
-        Self::from_parts(Inner::Bare { database, cache }, clock)
+    pub fn with_clock(database: Database, cache: Keyspace, index: Keyspace, clock: Clock) -> Self {
+        Self::from_parts(
+            Inner::Bare {
+                database,
+                cache,
+                index,
+            },
+            clock,
+        )
     }
 
     /// Builds the production cache, taking ownership of the per-partition
@@ -195,6 +242,10 @@ impl FjallCellCache {
             clock,
             #[cfg(test)]
             fail_puts: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_index_snapshot: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_index_record: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -205,6 +256,22 @@ impl FjallCellCache {
     #[must_use]
     pub fn fail_puts(&self) -> Arc<AtomicBool> {
         self.fail_puts.clone()
+    }
+
+    /// Test handle on the [`index_snapshot`](Self::index_snapshot) fault seam:
+    /// the shared flag a test sets to force the warm coords read to fail.
+    #[cfg(test)]
+    #[must_use]
+    pub fn fail_index_snapshot(&self) -> Arc<AtomicBool> {
+        self.fail_index_snapshot.clone()
+    }
+
+    /// Test handle on the [`index_record`](Self::index_record) fault seam: the
+    /// shared flag a test sets to force a cold-seed record to fail.
+    #[cfg(test)]
+    #[must_use]
+    pub fn fail_index_record(&self) -> Arc<AtomicBool> {
+        self.fail_index_record.clone()
     }
 
     /// The cache's `now` source, shared by reads (expiry checks) and the
@@ -490,6 +557,229 @@ impl FjallCellCache {
             .flatten()
             .then(|item| cooperative(async move { item }))
     }
+
+    // --- Warm index: provisional coordinates + cold-seed latch ---------------
+    //
+    // The warm provisional index the recovery sweep short-circuits on. It lives
+    // in the per-partition `index` keyspace, cold at a fresh epoch and dropped
+    // at revocation. It is the disk-spilling relocation of the former in-RAM
+    // `ProvisionalIndex`; the durable Cassandra `kind=Index` markers remain the
+    // authoritative cold-recovery source (a fresh epoch re-seeds from them).
+
+    /// Whether `collection`'s one-time cold seed has run (the seeded latch).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read failure.
+    pub async fn index_seeded(
+        &self,
+        collection: &CollectionId,
+    ) -> Result<bool, FjallCellCacheError> {
+        let raw = cell_io::read_cell(
+            self.inner.index_handle(),
+            codec::index_seeded_key(collection),
+        )
+        .await?;
+        Ok(raw.is_some())
+    }
+
+    /// Marks `collection` seeded once its bounded cold seed read completes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall write failure.
+    pub async fn index_mark_seeded(
+        &self,
+        collection: &CollectionId,
+    ) -> Result<(), FjallCellCacheError> {
+        write_index_empty(
+            self.inner.index_handle(),
+            codec::index_seeded_key(collection),
+        )
+        .await
+    }
+
+    /// Drops `collection`'s seeded latch, forcing the next sweep to re-seed
+    /// from the durable index (used when a stage write fails and a
+    /// coordinate may have landed durably that the coords set now misses).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall write failure.
+    pub async fn index_unseed(&self, collection: &CollectionId) -> Result<(), FjallCellCacheError> {
+        remove_index(
+            self.inner.index_handle(),
+            codec::index_seeded_key(collection),
+        )
+        .await
+    }
+
+    /// Records `cell` as a live provisional coordinate of `collection`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall write failure.
+    pub async fn index_record(
+        &self,
+        collection: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<(), FjallCellCacheError> {
+        #[cfg(test)]
+        if self.fail_index_record.load(Ordering::Relaxed) {
+            return Err(FjallCellCacheError::Injected);
+        }
+        write_index_empty(
+            self.inner.index_handle(),
+            codec::index_coord_key(collection, cell),
+        )
+        .await
+    }
+
+    /// Clears `cell`'s provisional coordinate from `collection`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall write failure.
+    pub async fn index_clear(
+        &self,
+        collection: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<(), FjallCellCacheError> {
+        remove_index(
+            self.inner.index_handle(),
+            codec::index_coord_key(collection, cell),
+        )
+        .await
+    }
+
+    /// Snapshots `collection`'s live provisional coordinates — the recovery
+    /// drain buffer, sized to `#provisional`. Empty ⟹ the warm sweep issues no
+    /// Cassandra reads. Collected in one [`spawn_blocking`] over the bounded
+    /// `Coord` prefix range (the guard cannot cross an `.await`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read failure.
+    pub async fn index_snapshot(
+        &self,
+        collection: &CollectionId,
+    ) -> Result<Vec<CellKey>, FjallCellCacheError> {
+        #[cfg(test)]
+        if self.fail_index_snapshot.load(Ordering::Relaxed) {
+            return Err(FjallCellCacheError::Injected);
+        }
+        let handle = self.inner.index_handle().clone();
+        let prefix = codec::index_coord_prefix(collection);
+        spawn_blocking(move || {
+            let mut out: Vec<CellKey> = Vec::new();
+            for guard in handle.prefix(&prefix) {
+                let (key, _) = guard.into_inner()?;
+                out.push(codec::coord_cell_key(&key));
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    // --- Warm coverage: on-disk `(collection, section)` interval sets ---------
+    //
+    // Each `(collection, section)`'s covered intervals live as a `Cover` prefix
+    // range in the `index` keyspace, one entry per interval keyed by its
+    // low-bound frame → high-bound frame. This is the disk-spilling relocation
+    // of the former in-RAM `Coverage.sections` map: reads load the bounded
+    // per-section interval list, writes rewrite it, all within one blocking hop.
+
+    /// Loads one `(collection, section)`'s stored coverage intervals as
+    /// `(lo, hi)` bound pairs in the fjall range's raw key order, which is
+    /// tag-first and **not** `cmp_low` — the caller re-sorts via
+    /// `IntervalSet::from_pairs`. Bounded by the section's merged interval
+    /// count.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read or bound-frame decode failure.
+    pub async fn cover_load(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+    ) -> Result<Vec<(Bound<Coordinate>, Bound<Coordinate>)>, FjallCellCacheError> {
+        let handle = self.inner.index_handle().clone();
+        let prefix = codec::index_cover_prefix(collection, section);
+        spawn_blocking(move || {
+            let mut out: Vec<(Bound<Coordinate>, Bound<Coordinate>)> = Vec::new();
+            for guard in handle.prefix(&prefix) {
+                let (key, value) = guard.into_inner()?;
+                let lo = codec::cover_low_bound(&key)?;
+                let hi = codec::decode_bound(value.as_ref())?;
+                out.push((lo, hi));
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Rewrites one `(collection, section)`'s coverage: clears its whole
+    /// `Cover` prefix range and re-inserts `intervals`, atomically in one
+    /// [`OwnedWriteBatch`]. Rewriting the whole section (never incremental key
+    /// edits) means a merge that shifts a low bound can never leave a stale
+    /// interval key behind.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall write failure.
+    pub async fn cover_store(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        intervals: &[(Bound<Coordinate>, Bound<Coordinate>)],
+    ) -> Result<(), FjallCellCacheError> {
+        let database = self.inner.database().clone();
+        let handle = self.inner.index_handle().clone();
+        let prefix = codec::index_cover_prefix(collection, section);
+        // Encode every key/value frame up front (bounded, sized once) so the
+        // blocking closure only touches fjall.
+        let mut framed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(intervals.len());
+        for (lo, hi) in intervals {
+            framed.push((
+                codec::index_cover_key(collection, section, lo),
+                codec::encode_bound(hi),
+            ));
+        }
+        spawn_blocking(move || {
+            let mut batch = OwnedWriteBatch::with_capacity(database, framed.len() + 1);
+            // Clear the section's whole existing range, then re-insert the merged
+            // set. `remove_range`-by-prefix has no batch primitive, so stale keys
+            // are removed by first collecting them in the same guard scan.
+            let stale: Vec<fjall::Slice> = handle
+                .prefix(&prefix)
+                .map(|guard| guard.into_inner().map(|(key, _)| key))
+                .collect::<Result<_, _>>()?;
+            for key in &stale {
+                batch.remove(&handle, key.as_ref());
+            }
+            for (key, value) in &framed {
+                batch.insert(&handle, key.as_slice(), value.as_slice());
+            }
+            batch.commit()
+        })
+        .await??;
+        Ok(())
+    }
+}
+
+/// Inserts an empty-valued warm-index key (presence-as-boolean), one blocking
+/// hop.
+async fn write_index_empty(handle: &Keyspace, key: Vec<u8>) -> Result<(), FjallCellCacheError> {
+    let handle = handle.clone();
+    spawn_blocking(move || handle.insert(key.as_slice(), [].as_slice())).await??;
+    Ok(())
+}
+
+/// Removes a warm-index key, one blocking hop.
+async fn remove_index(handle: &Keyspace, key: Vec<u8>) -> Result<(), FjallCellCacheError> {
+    let handle = handle.clone();
+    spawn_blocking(move || handle.remove(key.as_slice())).await??;
+    Ok(())
 }
 
 /// The three-state result of a [`FjallCellCache::get`].

@@ -64,6 +64,27 @@ fn open_database() -> Result<(TempDir, Database)> {
     Ok((dir, database))
 }
 
+/// Builds a [`FjallCellCache`] over the `name` cache keyspace plus its sibling
+/// `name`-index keyspace — the disk-backed warm index + coverage. A distinct
+/// `name` mints a cold pair, modeling a fresh assignment epoch.
+fn fjall_at(database: &Database, name: &str) -> Result<FjallCellCache> {
+    let cache = database.keyspace(name, keyspace_options)?;
+    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
+    Ok(FjallCellCache::new(database.clone(), cache, index))
+}
+
+/// Like [`fjall_at`] but driven by a test-controlled [`Clock`].
+fn fjall_at_clock(database: &Database, name: &str, clock: Clock) -> Result<FjallCellCache> {
+    let cache = database.keyspace(name, keyspace_options)?;
+    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
+    Ok(FjallCellCache::with_clock(
+        database.clone(),
+        cache,
+        index,
+        clock,
+    ))
+}
+
 /// Builds a production-shaped `Cached` over a fresh fjall keyspace and the
 /// shared memory cells.
 fn cached_over(
@@ -72,16 +93,12 @@ fn cached_over(
     oracle: &ScriptedOracle,
     name: &str,
 ) -> Result<Cached<MemoryCellStore<ScriptedOracle>>> {
-    let handle = database.keyspace(name, keyspace_options)?;
     let lower = MemoryCellStore::new(
         cells.clone(),
         oracle.clone(),
         Arc::new(CollectionDefRegistry::default()),
     );
-    Ok(Cached::new(
-        FjallCellCache::new(database.clone(), handle),
-        lower,
-    ))
+    Ok(Cached::new(fjall_at(database, name)?, lower))
 }
 
 /// The cell at coordinate `c` in the shared section (single byte, so byte order
@@ -213,6 +230,14 @@ where
         self.inner.provisional_cells(collection)
     }
 
+    fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+        self.inner.provisional_cell_at(collection, cell)
+    }
+
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
@@ -300,11 +325,7 @@ fn coverage_op_budget() -> Result<()> {
             oracle,
             Arc::new(CollectionDefRegistry::default()),
         ));
-        let handle = database.keyspace("budget", keyspace_options)?;
-        let cached = Cached::new(
-            FjallCellCache::new(database.clone(), handle),
-            counting.clone(),
-        );
+        let cached = Cached::new(fjall_at(&database, "budget")?, counting.clone());
         let id = collection("budget")?;
         let cref = CollectionRef::new(id.clone(), None);
 
@@ -397,6 +418,235 @@ fn coverage_op_budget() -> Result<()> {
 
         Ok(())
     })
+}
+
+/// Warm survival within an assignment: a `Cached` rebuilt over the **same**
+/// fjall workspace (not a fresh epoch) is warm — its disk-backed provisional
+/// index and coverage both survive. The rebuilt cache's recovery sweep answers
+/// from the local fjall index with **zero** cold `provisional_cells` sweeps
+/// (only bounded warm point reads), and a covered `get` serves with zero lower
+/// reads. This is the in-assignment-warm proxy the crash case (a fresh epoch)
+/// is the cold complement of.
+#[test]
+fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let (_dir, database) = open_database()?;
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells,
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let id = collection("warm")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        // First cache instance: cover a value and leave a provisional cell.
+        let cached = Cached::new(fjall_at(&database, "warm")?, counting.clone());
+        cached
+            .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))])
+            .await?;
+        let prev = cached.get(&id, &cell_at(3), event).await?;
+        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        cached
+            .write_provisional(&cref, &[(cell_at(3), write)])
+            .await?;
+
+        // Prime the warm provisional index: the first sweep is a cold seed (one
+        // `provisional_cells` call), which records the coordinate into fjall and
+        // marks the collection seeded.
+        counting.reset();
+        let cold = drain_provisional(&cached, &id).await?;
+        assert_eq!(cold, vec![3], "the cold sweep finds the provisional cell");
+        assert_eq!(
+            counting.recovery_sweeps(),
+            1,
+            "the first sweep is a cold seed"
+        );
+
+        // Rebuild `Cached` over the SAME workspace (a session clone within one
+        // assignment). The disk-backed warm index + coverage survive.
+        let restarted = Cached::new(fjall_at(&database, "warm")?, counting.clone());
+        counting.reset();
+
+        // The rebuilt sweep is WARM: zero cold `provisional_cells` sweeps, and it
+        // still finds the provisional cell via bounded warm point reads.
+        let warm = drain_provisional(&restarted, &id).await?;
+        assert_eq!(
+            warm,
+            vec![3],
+            "the warm sweep still finds the provisional cell"
+        );
+        assert_eq!(
+            counting.recovery_sweeps(),
+            0,
+            "a warm sweep issues NO cold provisional_cells read"
+        );
+        assert_eq!(
+            counting.warm_point_reads(),
+            1,
+            "the warm sweep point-reads exactly the one provisional coordinate"
+        );
+
+        // Coverage also survives: the covered `9` serves from fjall with no
+        // lower read.
+        counting.reset();
+        assert_eq!(
+            restarted.get(&id, &cell_at(9), probe(2)).await?.get(),
+            Some(&bytes(9)),
+            "the covered value survives the rebuild and serves from fjall"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "a covered get after a same-workspace rebuild reads nothing"
+        );
+        Ok(())
+    })
+}
+
+/// A warm-index read failure must degrade the recovery sweep to the cold
+/// durable re-seed — never fabricate an empty (clean) sweep. Forcing
+/// `index_snapshot` to fail while the collection stays *seeded* exercises the
+/// exact branch that would otherwise report zero provisional cells and let the
+/// backstop unschedule, stranding a live provisional cell (F2 / no-strand).
+#[test]
+fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let (_dir, database) = open_database()?;
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let id = collection("degrade")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        let fjall = fjall_at(&database, "degrade")?;
+        let fail_snapshot = fjall.fail_index_snapshot();
+        let cached = Cached::new(fjall, counting.clone());
+
+        // Leave a provisional cell, then seed the warm index with a cold sweep
+        // (records the coordinate into fjall and marks the collection seeded).
+        let prev = cached.get(&id, &cell_at(3), event).await?;
+        cached
+            .write_provisional(
+                &cref,
+                &[(
+                    cell_at(3),
+                    ProvisionalWrite::new(Some(bytes(5)), prev, event),
+                )],
+            )
+            .await?;
+        assert_eq!(
+            drain_provisional(&cached, &id).await?,
+            vec![3],
+            "the cold seed finds the provisional cell"
+        );
+
+        // Force the warm coords read to fail while the collection stays seeded.
+        // The sweep must fall through to a cold `provisional_cells` re-seed that
+        // still finds the cell — not report an empty, clean sweep.
+        counting.reset();
+        fail_snapshot.store(true, Ordering::Relaxed);
+        assert_eq!(
+            drain_provisional(&cached, &id).await?,
+            vec![3],
+            "a warm snapshot failure re-seeds from the durable index, never an empty sweep"
+        );
+        assert_eq!(
+            counting.recovery_sweeps(),
+            1,
+            "the failed warm read degrades to a cold provisional_cells re-seed"
+        );
+        fail_snapshot.store(false, Ordering::Relaxed);
+        Ok(())
+    })
+}
+
+/// A cold-seed `index_record` failure must leave the collection **unseeded** so
+/// the next sweep re-seeds from the durable index — never latch `seeded` over
+/// an incomplete on-disk coords set, which would drop the unrecorded coordinate
+/// from every later warm sweep and strand it (F4). Symmetric with
+/// `write_provisional`'s unseed-on-record-failure.
+#[test]
+fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let (_dir, database) = open_database()?;
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let id = collection("reseed")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        let fjall = fjall_at(&database, "reseed")?;
+        let fail_record = fjall.fail_index_record();
+        let cached = Cached::new(fjall, counting.clone());
+
+        // Leave a provisional cell.
+        let prev = cached.get(&id, &cell_at(3), event).await?;
+        cached
+            .write_provisional(
+                &cref,
+                &[(
+                    cell_at(3),
+                    ProvisionalWrite::new(Some(bytes(5)), prev, event),
+                )],
+            )
+            .await?;
+
+        // Cold seed with a failing `index_record`: the sweep still finds the
+        // cell (from the durable lower), but the failed record must NOT be
+        // papered over by marking the collection seeded.
+        counting.reset();
+        fail_record.store(true, Ordering::Relaxed);
+        assert_eq!(
+            drain_provisional(&cached, &id).await?,
+            vec![3],
+            "the cold seed still yields the provisional cell"
+        );
+        fail_record.store(false, Ordering::Relaxed);
+
+        // The next sweep must be COLD again (re-seed) — proving the collection
+        // was left unseeded. A wrongly-latched `seeded` would take the warm path
+        // over the empty (unrecorded) snapshot and yield nothing, stranding it.
+        counting.reset();
+        assert_eq!(
+            drain_provisional(&cached, &id).await?,
+            vec![3],
+            "the next sweep re-seeds and finds the cell, not an empty warm snapshot"
+        );
+        assert_eq!(
+            counting.recovery_sweeps(),
+            1,
+            "the collection was left unseeded, so the next sweep re-seeds cold"
+        );
+        Ok(())
+    })
+}
+
+/// Drains a `provisional_cells` sweep into the ascending list of covered
+/// coordinate first-bytes it yields.
+async fn drain_provisional<L>(cached: &Cached<L>, id: &CollectionId) -> Result<Vec<u8>>
+where
+    L: CellStore,
+{
+    let stream = cached.provisional_cells(id);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        let (cell, _) = item.map_err(|e| eyre!("provisional sweep failed: {e:?}"))?;
+        out.push(cell.coordinate.as_bytes()[0]);
+    }
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// A covered scan never bleeds into another collection or section sharing the
@@ -502,14 +752,13 @@ fn prop_memory_cached_crash_equivalence() {
         let counter = AtomicU32::new(0);
         let make = || {
             let n = counter.fetch_add(1, Ordering::Relaxed);
-            let handle = database.keyspace(&format!("crash-{n}"), keyspace_options)?;
             let lower = MemoryCellStore::new(
                 cells.clone(),
                 oracle.clone(),
                 Arc::new(CollectionDefRegistry::default()),
             );
             Ok(Cached::new(
-                FjallCellCache::new(database.clone(), handle),
+                fjall_at(&database, &format!("crash-{n}"))?,
                 lower,
             ))
         };
@@ -540,7 +789,6 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let (_dir, database) = open_database()?;
-        let handle = database.keyspace("ttl", keyspace_options)?;
         let lower = TtlAwareCellStore::new(
             CountingCellStore::new(MemoryCellStore::new(
                 cells,
@@ -551,7 +799,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
             ROW_DEATH,
         );
         let cached = Cached::new(
-            FjallCellCache::with_clock(database.clone(), handle, Clock::Fixed(now.clone())),
+            fjall_at_clock(&database, "ttl", Clock::Fixed(now.clone()))?,
             lower.clone(),
         );
         let id = collection("ttl")?;
@@ -617,18 +865,19 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
     })
 }
 
-/// `CovVolatile`: dropping the coverage (a cold restart) makes a covered serve
-/// untrustworthy, so the next read falls through to the lower store. Modelled
-/// by rebuilding `Cached` over the same fjall partition + memory cells: the new
-/// `Cached` has empty coverage, so even though the stale fjall entry is still
-/// present, the uncovered `get` re-reads the (changed) lower truth.
+/// `CovVolatile`: a cold restart (a fresh assignment epoch) trusts nothing
+/// uncovered, so the next read falls through to the lower store. Coverage now
+/// spills to the per-partition fjall `index` keyspace, so a cold restart is a
+/// **fresh epoch** — a brand-new cache + index keyspace pair (the `"restart"`
+/// name), which is empty. Reusing the *same* workspace would be legitimately
+/// warm by design (the on-disk coverage survives within one assignment); the
+/// crash/rebalance case that must trust nothing is exactly the fresh epoch.
 #[test]
 fn cov_volatile_cold_restart_falls_through() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let (_dir, database) = open_database()?;
-        let handle = database.keyspace("volatile", keyspace_options)?;
         let lower = MemoryCellStore::new(
             cells.clone(),
             oracle.clone(),
@@ -637,10 +886,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
         let id = collection("volatile")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        let cached = Cached::new(
-            FjallCellCache::new(database.clone(), handle.clone()),
-            lower.clone(),
-        );
+        let cached = Cached::new(fjall_at(&database, "volatile")?, lower.clone());
         cached
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
             .await?;
@@ -654,10 +900,11 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))])
             .await?;
 
-        // Cold restart: a fresh `Cached` over the SAME fjall keyspace but EMPTY
-        // coverage. The stale fjall entry exists, but the coordinate is
-        // uncovered, so the get falls through and self-heals to `99`.
-        let restarted = Cached::new(FjallCellCache::new(database.clone(), handle), lower.clone());
+        // Cold restart = a fresh epoch: a new cache + index keyspace pair, so
+        // coverage is empty. The stale value from the old epoch's cache keyspace
+        // is gone with it; the uncovered `get` falls through and self-heals to
+        // `99`.
+        let restarted = Cached::new(fjall_at(&database, "restart")?, lower.clone());
         assert_eq!(
             restarted.get(&id, &cell_at(1), probe(2)).await?.get(),
             Some(&bytes(99)),
@@ -677,8 +924,7 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let (_dir, database) = open_database()?;
-        let handle = database.keyspace("fault", keyspace_options)?;
-        let fjall = FjallCellCache::new(database.clone(), handle);
+        let fjall = fjall_at(&database, "fault")?;
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
         let cached = Cached::new(fjall, lower);
@@ -726,8 +972,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let (_dir, database) = open_database()?;
-        let handle = database.keyspace("batch-fault", keyspace_options)?;
-        let fjall = FjallCellCache::new(database.clone(), handle);
+        let fjall = fjall_at(&database, "batch-fault")?;
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
         let cached = Cached::new(fjall, lower);
@@ -783,8 +1028,7 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let (_dir, database) = open_database()?;
-        let handle = database.keyspace("incomplete", keyspace_options)?;
-        let fjall = FjallCellCache::new(database.clone(), handle);
+        let fjall = fjall_at(&database, "incomplete")?;
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(
             cells,
@@ -940,11 +1184,10 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
             let oracle = ScriptedOracle::default();
             let cells = MemoryCells::new();
             let (_dir, database) = open_database()?;
-            let handle = database.keyspace("ttl-anchor", keyspace_options)?;
             let lower =
                 MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
             let cached = Cached::new(
-                FjallCellCache::with_clock(database.clone(), handle, Clock::Fixed(now.clone())),
+                fjall_at_clock(&database, "ttl-anchor", Clock::Fixed(now.clone()))?,
                 lower,
             );
             let id = collection("ttl-anchor")?;
@@ -1068,7 +1311,6 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let (_dir, database) = open_database()?;
-        let handle = database.keyspace("scan-ttl", keyspace_options)?;
         let lower = TtlAwareCellStore::new(
             CountingCellStore::new(MemoryCellStore::new(
                 cells,
@@ -1079,7 +1321,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
             ROW_DEATH,
         );
         let cached = Cached::new(
-            FjallCellCache::with_clock(database.clone(), handle, Clock::Fixed(now.clone())),
+            fjall_at_clock(&database, "scan-ttl", Clock::Fixed(now.clone()))?,
             lower.clone(),
         );
         let id = collection("scan-ttl")?;

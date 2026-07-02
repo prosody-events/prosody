@@ -197,6 +197,14 @@ where
         self.lower.provisional_cells(collection)
     }
 
+    async fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Option<ProvisionalCell>, Self::Error> {
+        self.lower.provisional_cell_at(collection, cell).await
+    }
+
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,

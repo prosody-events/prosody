@@ -1,9 +1,15 @@
-use super::{collection_prefix, decode_cell, encode_absent_cell, encode_present_cell};
+use super::{
+    collection_prefix, coord_cell_key, cover_low_bound, decode_bound, decode_cell,
+    encode_absent_cell, encode_bound, encode_present_cell, index_coord_key, index_cover_key,
+    index_seeded_key,
+};
 use crate::Key;
+use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::{CollectionId, Read, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::ops::Bound;
 use std::sync::Arc;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_128;
@@ -248,4 +254,115 @@ fn null_in_key_or_name_does_not_shift_field_boundary() -> Result<()> {
         "a null in key/name must not collapse the key/name boundary"
     );
     Ok(())
+}
+
+// --- Warm-index key + bound-frame codec ------------------------------------
+
+/// An arbitrary `Bound<Coordinate>` over a tiny byte alphabet so the ordering
+/// property reaches coordinate ties across bound polarities.
+#[derive(Clone, Debug)]
+struct ArbBound(Bound<Coordinate>);
+
+impl Arbitrary for ArbBound {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let polarity = u8::arbitrary(g) % 3;
+        Self(match polarity {
+            0 => Bound::Unbounded,
+            1 => Bound::Included(arb_coord(g)),
+            _ => Bound::Excluded(arb_coord(g)),
+        })
+    }
+}
+
+/// A short coordinate over a tiny byte alphabet.
+fn arb_coord(g: &mut Gen) -> Coordinate {
+    const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
+    let len = usize::arbitrary(g) % 4;
+    let bytes: Vec<u8> = (0..len)
+        .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
+        .collect();
+    Coordinate::from_bytes(bytes)
+}
+
+/// Every bound frame round-trips: `decode_bound(encode_bound(b)) == b` over the
+/// whole `Unbounded`/`Included`/`Excluded` × coordinate space.
+#[test]
+fn prop_bound_frame_round_trips() {
+    fn prop(bound: ArbBound) -> TestResult {
+        let ArbBound(bound) = bound;
+        let frame = encode_bound(&bound);
+        match decode_bound(&frame) {
+            Ok(decoded) => TestResult::from_bool(decoded == bound),
+            Err(e) => TestResult::error(format!("decode_bound failed: {e}")),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(ArbBound) -> TestResult);
+}
+
+/// The frozen wire bytes of a coord key, a seeded key, and a cover key/value —
+/// any persisted encoding gets a pinned-bytes test. Also proves a coord key
+/// round-trips back to its `CellKey` and a cover key back to its low bound.
+#[test]
+fn frozen_warm_index_bytes() -> Result<()> {
+    let id = collection("frozen")?;
+    let prefix = collection_prefix(&id);
+    let cell = CellKey {
+        section: Section::new(7),
+        coordinate: Coordinate::from_bytes(vec![0xAB, 0xCD]),
+    };
+
+    // coord key: [hash][Coord=0x00][section=0x07][coordinate].
+    let coord = index_coord_key(&id, &cell);
+    let mut expected = prefix.to_vec();
+    expected.extend_from_slice(&[0x00, 0x07, 0xAB, 0xCD]);
+    assert_eq!(coord, expected, "coord key layout");
+    assert_eq!(coord_cell_key(&coord), cell, "coord key round-trips");
+
+    // seeded key: [hash][Seeded=0x01].
+    let seeded = index_seeded_key(&id);
+    let mut expected = prefix.to_vec();
+    expected.push(0x01);
+    assert_eq!(seeded, expected, "seeded key layout");
+
+    // cover key: [hash][Cover=0x02][section=0x07][lo-frame]; the lo-frame is
+    // [Included=0x01][coordinate]. The stored value is the hi-frame.
+    let lo = Bound::Included(Coordinate::from_bytes(vec![0x10]));
+    let cover = index_cover_key(&id, Section::new(7), &lo);
+    let mut expected = prefix.to_vec();
+    expected.extend_from_slice(&[0x02, 0x07, 0x01, 0x10]);
+    assert_eq!(cover, expected, "cover key layout");
+    assert_eq!(
+        cover_low_bound(&cover)?,
+        lo,
+        "cover key low bound round-trips"
+    );
+
+    // Excluded-high frame value: [Excluded=0x02][coordinate].
+    let hi = Bound::Excluded(Coordinate::from_bytes(vec![0x20]));
+    assert_eq!(encode_bound(&hi), vec![0x02, 0x20], "excluded hi frame");
+    // Unbounded frame is a single tag byte.
+    assert_eq!(
+        encode_bound(&Bound::Unbounded),
+        vec![0x00],
+        "unbounded frame"
+    );
+    Ok(())
+}
+
+/// The low-bound frame keys each stored coverage interval uniquely: two frames
+/// are byte-equal iff the bounds are structurally equal (both `Unbounded`, or
+/// the same polarity with equal coordinates). Distinct low bounds never collide
+/// on the fjall `Cover` key, so `cover_store`'s clear-and-reinsert can never
+/// leave a stale interval keyed by a shared low bound. (Frame byte *order* is
+/// deliberately not `cmp_low` — the coverage layer re-sorts on load — so this
+/// pins only key injectivity, the property `cover_store` relies on.)
+#[test]
+fn prop_bound_frame_key_is_injective() {
+    fn prop(a: ArbBound, b: ArbBound) -> TestResult {
+        let ArbBound(a) = a;
+        let ArbBound(b) = b;
+        let byte_equal = encode_bound(&a) == encode_bound(&b);
+        TestResult::from_bool(byte_equal == (a == b))
+    }
+    QuickCheck::new().quickcheck(prop as fn(ArbBound, ArbBound) -> TestResult);
 }

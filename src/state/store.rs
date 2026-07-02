@@ -142,10 +142,30 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 
     /// Streams the whole partition's provisional cells (all sections) for the
     /// recovery sweep, filtering resolved rows in code.
+    ///
+    /// This is the **cold** recovery source (the bounded durable `kind=Index`
+    /// range read + point reads on the Cassandra store). The warm short-circuit
+    /// that skips it on a quiescent sweep lives on
+    /// [`Cached`](super::cached::Cached).
     fn provisional_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a;
+
+    /// Point-reads one coordinate's provisional cell, or `None` when it is
+    /// absent or resolved (over-report-safe). Drives the **warm** recovery
+    /// sweep: [`Cached`](super::cached::Cached) has the provisional coordinates
+    /// from its local fjall index and rebuilds each `ProvisionalCell` with
+    /// this, with zero Cassandra range reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on a store failure.
+    fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a;
 
     /// Stages each `(cell, write)`'s provisional cell (`data | prev | event`)
     /// in one same-partition batch, binding `collection`'s TTL.

@@ -39,22 +39,23 @@ fn keyspace_options() -> KeyspaceCreateOptions {
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
-/// Opens a fresh tempdir-backed database and one named cache keyspace under
-/// it. The returned `TempDir` keeps the backing directory alive; the
-/// [`Database`] owns batch writes, so the caller keeps it alongside the
-/// [`Keyspace`] handle.
-fn open(name: &str) -> Result<(TempDir, Database, Keyspace)> {
+/// Opens a fresh tempdir-backed database and a named cache keyspace plus its
+/// sibling warm-index keyspace under it. The returned `TempDir` keeps the
+/// backing directory alive; the [`Database`] owns batch writes, so the caller
+/// keeps it alongside the [`Keyspace`] handles.
+fn open(name: &str) -> Result<(TempDir, Database, Keyspace, Keyspace)> {
     let dir = tempfile::tempdir()?;
     let database = Database::builder(dir.path()).open()?;
     let cache = database.keyspace(name, keyspace_options)?;
-    Ok((dir, database, cache))
+    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
+    Ok((dir, database, cache, index))
 }
 
-/// Opens a fresh tempdir-backed cache keyspace and wraps it in a store. The
-/// returned `TempDir` keeps the backing directory alive.
+/// Opens a fresh tempdir-backed cache + index keyspace and wraps it in a store.
+/// The returned `TempDir` keeps the backing directory alive.
 fn setup() -> Result<(TempDir, FjallCellCache)> {
-    let (dir, database, cache) = open("value_cache")?;
-    Ok((dir, FjallCellCache::new(database, cache)))
+    let (dir, database, cache, index) = open("value_cache")?;
+    Ok((dir, FjallCellCache::new(database, cache, index)))
 }
 
 fn collection(name: &str) -> Result<CollectionId> {
@@ -115,11 +116,11 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
 
-    let (_dir, database, cache_partition) = open("value_cache")?;
+    let (_dir, database, cache_partition, index_partition) = open("value_cache")?;
     let c = collection("raw")?;
     let cell = value_cell();
 
-    let cache = FjallCellCache::new(database, cache_partition.clone());
+    let cache = FjallCellCache::new(database, cache_partition.clone(), index_partition);
     TEST_RUNTIME.block_on(cache.put(
         &c,
         &cell,
@@ -150,8 +151,8 @@ fn expired_entry_reads_as_miss() -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let now = Arc::new(AtomicU64::new(1_000));
-    let (_dir, database, partition) = open("ttl_value")?;
-    let cache = FjallCellCache::with_clock(database, partition, Clock::Fixed(now.clone()));
+    let (_dir, database, partition, index) = open("ttl_value")?;
+    let cache = FjallCellCache::with_clock(database, partition, index, Clock::Fixed(now.clone()));
     let c = collection("ttl")?;
     let cell = value_cell();
     let payload = Committed::new(Some(Bytes::from_static(b"v")));

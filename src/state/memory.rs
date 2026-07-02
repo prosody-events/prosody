@@ -6,7 +6,6 @@ use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
 use super::oracle::CommitOracle;
-use super::provisional_index::ProvisionalIndex;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
 use super::store::CellStore;
@@ -54,13 +53,14 @@ impl MemoryCells {
 pub struct MemoryCellStore<O> {
     cells: MemoryCells,
     resolver: Resolver<O>,
-    /// Per-partition provisional-coordinate index gating the recovery sweep.
-    /// Minted fresh per store (per partition acquisition) even though `cells`
-    /// is process-shared, so a re-acquired partition sees its collections
-    /// unseeded and re-seeds from `cells` — the memory analog of the Cassandra
-    /// cold-window (`kind=Index` re-read). `Arc` so the per-event store clones
-    /// share one instance.
-    index: Arc<ProvisionalIndex>,
+    /// The in-RAM provisional-coordinate index gating the recovery sweep
+    /// (memory-backed runs have no fjall workspace, so the disk-backed index
+    /// the Cassandra path uses is kept in RAM here). Minted fresh per store
+    /// (per partition acquisition) even though `cells` is process-shared,
+    /// so a re-acquired partition sees its collections unseeded and
+    /// re-seeds from `cells` — the memory analog of a fresh fjall epoch.
+    /// `Arc` so the per-event store clones share one instance.
+    warm: Arc<WarmIndex>,
 }
 
 impl<O> MemoryCellStore<O> {
@@ -71,7 +71,7 @@ impl<O> MemoryCellStore<O> {
         Self {
             cells,
             resolver: Resolver::new(oracle, registry),
-            index: Arc::default(),
+            warm: Arc::default(),
         }
     }
 }
@@ -179,12 +179,12 @@ where
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         try_stream! {
-            // The coordinates to visit. Warm (seeded): the in-memory set — an
-            // empty set yields nothing and never scans the map. Cold: the
-            // one-time full-map seed scan that populates the set and marks the
+            // The coordinates to visit. Warm (seeded): the in-RAM index — an
+            // empty snapshot yields nothing and never scans the map. Cold: the
+            // one-time full-map seed scan that populates the index and marks the
             // collection seeded, mirroring the Cassandra `kind=Index` seed read.
-            let coords = if self.index.is_seeded(collection).await {
-                self.index.snapshot(collection)
+            let coords = if self.warm.is_seeded(collection).await {
+                self.warm.snapshot(collection)
             } else {
                 let mut coords: Vec<CellKey> = Vec::new();
                 self.map().iter_sync(|(id, cell), stored| {
@@ -194,9 +194,9 @@ where
                     true
                 });
                 for cell in &coords {
-                    self.index.record(collection, cell).await;
+                    self.warm.record(collection, cell).await;
                 }
-                self.index.mark_seeded(collection).await;
+                self.warm.mark_seeded(collection).await;
                 coords
             };
             // Point-read each coordinate; a concurrently-resolved coordinate
@@ -209,6 +209,17 @@ where
                 }
             }
         }
+    }
+
+    async fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Option<ProvisionalCell>, Self::Error> {
+        Ok(match self.read_raw(collection, cell) {
+            Cell::Provisional(provisional) => Some(provisional),
+            Cell::Resolved(_) => None,
+        })
     }
 
     async fn write_provisional<'a>(
@@ -227,10 +238,8 @@ where
                     },
                 )
                 .await;
-            // Record after the write lands (an in-memory upsert never fails, so
-            // the `unseed`-on-error arm the trait contract allows is vacuous
-            // here).
-            self.index.record(collection.id(), cell).await;
+            // Record after the write lands (an in-memory upsert never fails).
+            self.warm.record(collection.id(), cell).await;
         }
         Ok(())
     }
@@ -249,7 +258,7 @@ where
                 .await;
             // Rollback/committed-write resolves the cell; drop its provisional
             // coordinate (a no-op for a never-staged direct write).
-            self.index.clear(collection.id(), cell).await;
+            self.warm.clear(collection.id(), cell).await;
         }
         Ok(())
     }
@@ -271,7 +280,7 @@ where
             }
             // Promote resolves the cell; drop its provisional coordinate
             // (idempotent — clearing an absent coordinate is a no-op).
-            self.index.clear(collection.id(), cell).await;
+            self.warm.clear(collection.id(), cell).await;
         }
         Ok(())
     }
@@ -332,6 +341,65 @@ impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
 #[derive(Debug, Default)]
 struct CellInner {
     cells: scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>,
+}
+
+/// The memory backend's in-RAM provisional-coordinate index gating the recovery
+/// sweep — the analog of the Cassandra path's disk-backed fjall index.
+///
+/// `coords` is the live provisional `(collection, cell)` set; `seeded` records
+/// the collections whose one-time cold seed scan has run (an unseeded
+/// collection re-scans [`MemoryCells`] before it can short-circuit). Held
+/// behind an `Arc` on [`MemoryCellStore`] and minted fresh per store, so a
+/// re-acquired partition is cold and re-seeds. In-RAM and infallible, so unlike
+/// the fjall index its methods carry no `Result`.
+///
+/// The invariant: `is_seeded(c)` ⟹ `coords` holds every provisional coordinate
+/// of `c`. `record` on stage, `clear` on resolve, and the cold seed's scan
+/// uphold it; no failure path can leave `coords` incomplete while seeded.
+#[derive(Debug, Default)]
+struct WarmIndex {
+    seeded: scc::HashSet<CollectionId, RandomState>,
+    coords: scc::HashSet<(CollectionId, CellKey), RandomState>,
+}
+
+impl WarmIndex {
+    /// Whether `collection`'s one-time cold seed scan has run.
+    async fn is_seeded(&self, collection: &CollectionId) -> bool {
+        self.seeded.contains_async(collection).await
+    }
+
+    /// Marks `collection` seeded once its cold seed scan completes.
+    async fn mark_seeded(&self, collection: &CollectionId) {
+        let _ = self.seeded.insert_async(collection.clone()).await;
+    }
+
+    /// Records `cell` as provisional in `collection` (after a stage).
+    async fn record(&self, collection: &CollectionId, cell: &CellKey) {
+        let _ = self
+            .coords
+            .insert_async((collection.clone(), cell.clone()))
+            .await;
+    }
+
+    /// Clears `cell` from `collection` (after a promote/rollback).
+    async fn clear(&self, collection: &CollectionId, cell: &CellKey) {
+        self.coords
+            .remove_async(&(collection.clone(), cell.clone()))
+            .await;
+    }
+
+    /// Snapshots `collection`'s provisional coordinates — the recovery drain
+    /// buffer, sized to `#provisional`. Empty ⟹ the warm sweep scans nothing.
+    fn snapshot(&self, collection: &CollectionId) -> Vec<CellKey> {
+        let mut out = Vec::new();
+        self.coords.iter_sync(|(id, cell)| {
+            if id == collection {
+                out.push(cell.clone());
+            }
+            true
+        });
+        out
+    }
 }
 
 /// One stored cell in [`MemoryCellStore`].

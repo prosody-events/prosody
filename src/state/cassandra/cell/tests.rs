@@ -191,16 +191,27 @@ fn cell_i(i: u32) -> CellKey {
 
 /// After a clean, fully-resolved event, the recovery sweep issues **zero**
 /// Cassandra queries once its collection is seeded: the first (cold) sweep runs
-/// the one bounded `kind=Index` seed read and marks the collection seeded; the
-/// second (warm) sweep short-circuits on the empty in-memory set. The counters
-/// sit below the short-circuit, so the "zero" is non-vacuous — the cold sweep
-/// provably incremented them first.
+/// the one bounded `kind=Index` seed read and marks the collection seeded in
+/// the disk-backed warm index; the second (warm) sweep short-circuits on the
+/// local fjall index. The warm gate lives on `Cached` (which owns the fjall
+/// workspace), so this runs the production `Cached<CassandraStore>` assembly
+/// and reads the `CassandraStore`'s `RecoveryReadCounts` — which `Cached`
+/// touches only on a cold sweep, so the "zero" is non-vacuous (the cold sweep
+/// provably incremented them first).
 #[tokio::test]
 async fn warm_quiescence_issues_zero_queries() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
-    let counts = store.recovery_reads();
+    let dir = tempfile::tempdir()?;
+    let client = FjallClient::open(&FjallConfiguration {
+        cache_dir: dir.path().to_path_buf(),
+    })?;
+    let workspace = client.workspace(Topic::from("cell-test"), 0, AssignmentEpoch::mint())?;
+    // Keep a clone of the bottom store so we can read its recovery counters; the
+    // clone shares the same `Arc` counters as the one inside `Cached`.
+    let bottom = fx.bottom_store(ScriptedOracle::default());
+    let counts = bottom.recovery_reads();
+    let store = Cached::new(FjallCellCache::for_workspace(workspace), bottom);
     let c = collection("warm-quiescence")?;
     let cell = value_cell();
 
@@ -221,7 +232,9 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
         .await?;
     store.mark_resolved(&c, slice::from_ref(&cell)).await?;
 
-    // Cold sweep: the bounded seed read fires (finds no live marker) and seeds.
+    // Cold sweep: `Cached` finds the collection unseeded, so it drives the
+    // bottom store's bounded seed read (finds no live marker) and seeds the warm
+    // index.
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
     let seed_index = counts.index_range_reads.load(Ordering::Relaxed);
     let seed_points = counts.cell_point_reads.load(Ordering::Relaxed);
@@ -230,7 +243,8 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
         "the cold sweep must issue the kind=Index seed read"
     );
 
-    // Warm sweep: the seeded, empty set short-circuits with no further query.
+    // Warm sweep: the seeded, empty warm index short-circuits with no further
+    // Cassandra query — `Cached` never enters the bottom store's cold seed.
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
     assert_eq!(
         counts.index_range_reads.load(Ordering::Relaxed),

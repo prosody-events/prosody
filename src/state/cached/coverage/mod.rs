@@ -34,10 +34,13 @@
 //!   scan-drain after `lower.scan_for_cache` oracle-resolved the gap; the
 //!   mutators after the lower write established the committed value). A covered
 //!   interval cannot be minted from provisional data.
-//! - **`CovVolatile`.** Coverage is in-memory (dropped when
-//!   [`Cached`](super::Cached) drops at partition revocation), never persisted,
-//!   so "stale coverage survives a crash" is unrepresentable; a cold restart
-//!   trusts nothing uncovered.
+//! - **`CovVolatile`.** Coverage is spilled to the per-partition fjall `index`
+//!   keyspace, which is **epoch-scoped**: a fresh assignment (after crash or
+//!   rebalance) mints an **empty** keyspace and the old one is dropped at
+//!   revocation, so "stale coverage survives a crash" is unrepresentable — a
+//!   cold epoch trusts nothing uncovered. Coverage is authoritative only
+//!   *within* one assignment (exclusive partition ownership), never persisted
+//!   across epochs.
 //! - **`GetNeverReadsOwnStaged`.** Cover-on-get reads the lower store on an
 //!   uncovered (or expired-covered) `get` and publishes the result. It is sound
 //!   because `get` is never called on a cell the current event already staged
@@ -60,100 +63,135 @@
 //! simply serves nothing.
 
 use super::super::cell_key::{Coordinate, Section};
+use super::super::fjall::{FjallCellCache, FjallCellCacheError};
 use super::super::identity::CollectionId;
-use ahash::RandomState;
-use scc::hash_map::Entry;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 
-/// Per-partition scan coverage, keyed by `(CollectionId, Section)`.
+/// Per-partition scan coverage, keyed by `(CollectionId, Section)`, spilled to
+/// the per-partition fjall `index` keyspace.
 ///
-/// Shared across keys via the [`Cached`](super::Cached) `Arc`; cross-key
-/// touches hit disjoint entries and same-key access is framework-serialized, so
-/// the lock-free `scc::HashMap` needs no extra synchronization.
-#[derive(Debug, Default)]
+/// Each `(collection, section)`'s covered intervals live as a `Cover` prefix
+/// range (one fjall entry per interval, keyed by its low-bound frame → high
+/// bound), so the coverage map accumulates **on disk** with RAM bounded only by
+/// fjall's block cache — no unbounded in-RAM `scc::HashMap` over a weeks-long
+/// assignment. Every operation loads the section's bounded interval list from
+/// fjall, runs the [`IntervalSet`] algebra in RAM, and (for mutations) rewrites
+/// the whole section range in one blocking hop. Reads are block-cache hot on
+/// the warm path; the fjall LSM is the on-disk `BTreeMap` (an ascending range
+/// yields intervals already sorted by low bound — see the bound-frame codec).
+///
+/// The one-per-partition [`FjallCellCache`] handle is a cheap `Arc` clone of
+/// the one the [`Cached`](super::Cached) cache operates, so coverage shares the
+/// workspace's epoch lifecycle: cold (empty) at a fresh assignment
+/// (`CovVolatile`), dropped at revocation.
+#[derive(Clone, Debug)]
 pub struct Coverage {
-    sections: scc::HashMap<(CollectionId, Section), IntervalSet, RandomState>,
+    fjall: FjallCellCache,
 }
 
 impl Coverage {
-    /// An empty coverage map.
+    /// Builds coverage backed by `fjall`'s `index` keyspace.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(fjall: FjallCellCache) -> Self {
+        Self { fjall }
+    }
+
+    /// Loads the section's stored intervals into an [`IntervalSet`].
+    async fn load(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+    ) -> Result<IntervalSet, FjallCellCacheError> {
+        let stored = self.fjall.cover_load(collection, section).await?;
+        Ok(IntervalSet::from_pairs(stored))
+    }
+
+    /// Rewrites the section's whole stored range from `set`.
+    async fn store(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        set: &IntervalSet,
+    ) -> Result<(), FjallCellCacheError> {
+        self.fjall
+            .cover_store(collection, section, &set.to_pairs())
+            .await
     }
 
     /// Partitions `request` over the section's coverage into ordered, disjoint
     /// covered/gap pieces. An unseen section is one whole-request gap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read/decode failure; the caller degrades a failure to
+    /// "the whole request is a gap" (a slower fall-through, never a wrong
+    /// answer).
     pub async fn query(
         &self,
         collection: &CollectionId,
         section: Section,
         request: &Interval,
-    ) -> SmallVec<[Piece; 4]> {
-        let pieces = self
-            .sections
-            .read_async(&(collection.clone(), section), |_, set| set.query(request))
-            .await;
-        pieces.unwrap_or_else(|| {
-            let mut single = SmallVec::new();
-            single.push(Piece::Gap(request.clone()));
-            single
-        })
+    ) -> Result<SmallVec<[Piece; 4]>, FjallCellCacheError> {
+        Ok(self.load(collection, section).await?.query(request))
     }
 
     /// Covers `interval` in the section (union/merge). Born resolved
     /// (`CovBuild`): the callers — the scan-drain, the write-through mutator
     /// publishes, and cover-on-get — all carry committed projections only.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read/write failure; the caller degrades a failure to
+    /// leaving the interval uncovered (the next read falls through).
     pub(in crate::state::cached) async fn cover(
         &self,
         collection: &CollectionId,
         section: Section,
         interval: Interval,
-    ) {
-        self.sections
-            .entry_async((collection.clone(), section))
-            .await
-            .or_default()
-            .get_mut()
-            .cover(interval);
+    ) -> Result<(), FjallCellCacheError> {
+        let mut set = self.load(collection, section).await?;
+        set.cover(interval);
+        self.store(collection, section, &set).await
     }
 
     /// Whether `coordinate`'s committed value is already covered — a covered
     /// fjall hit serves with no lower read (Cov1/Cov2). A covered fjall *miss*
     /// means the entry expired (write-through always leaves an entry), so the
     /// caller falls through and re-publishes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read/decode failure; the caller degrades a failure to
+    /// "uncovered" (`false`), falling through to the lower store.
     pub async fn covers(
         &self,
         collection: &CollectionId,
         section: Section,
         coordinate: &Coordinate,
-    ) -> bool {
-        self.sections
-            .read_async(&(collection.clone(), section), |_, set| {
-                set.covers(coordinate)
-            })
-            .await
-            .unwrap_or(false)
+    ) -> Result<bool, FjallCellCacheError> {
+        Ok(self.load(collection, section).await?.covers(coordinate))
     }
 
     /// Punches `coordinate` out of the section's coverage (splitting the
     /// containing interval). A no-op when the coordinate was not covered.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read/write failure; the caller degrades a failure to
+    /// leaving coverage unchanged (a stale covered entry self-heals on the next
+    /// mismatched serve).
     pub async fn punch(
         &self,
         collection: &CollectionId,
         section: Section,
         coordinate: &Coordinate,
-    ) {
-        if let Entry::Occupied(mut entry) = self
-            .sections
-            .entry_async((collection.clone(), section))
-            .await
-        {
-            entry.get_mut().punch(coordinate);
-        }
+    ) -> Result<(), FjallCellCacheError> {
+        let mut set = self.load(collection, section).await?;
+        set.punch(coordinate);
+        self.store(collection, section, &set).await
     }
 }
 
@@ -248,6 +286,29 @@ pub struct IntervalSet {
 }
 
 impl IntervalSet {
+    /// Rebuilds the set from stored `(lo, hi)` bound pairs (a fjall `Cover`
+    /// range). Each pair round-trips through [`Interval::new`], so a degenerate
+    /// on-disk interval is dropped — an empty interval is unrepresentable in
+    /// the materialized set.
+    fn from_pairs(pairs: Vec<(Bound<Coordinate>, Bound<Coordinate>)>) -> Self {
+        let mut intervals = BTreeMap::new();
+        for (lo, hi) in pairs {
+            if let Some(iv) = Interval::new(lo, hi) {
+                intervals.insert(LowBound(iv.lo), iv.hi);
+            }
+        }
+        Self { intervals }
+    }
+
+    /// Dumps the set's intervals as `(lo, hi)` bound pairs for storage,
+    /// ascending by low bound.
+    fn to_pairs(&self) -> Vec<(Bound<Coordinate>, Bound<Coordinate>)> {
+        self.intervals
+            .iter()
+            .map(|(key, hi)| (key.0.clone(), hi.clone()))
+            .collect()
+    }
+
     /// Unions `interval` into the set, merging any intervals it touches or
     /// overlaps (complementary endpoints rejoin; real holes never merge).
     pub(in crate::state::cached) fn cover(&mut self, interval: Interval) {

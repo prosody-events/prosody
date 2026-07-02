@@ -50,7 +50,62 @@ use super::error::FjallCellCacheError;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::{CollectionId, Read};
 use bytes::Bytes;
+use std::ops::Bound;
 use xxhash_rust::xxh3::Xxh3;
+
+/// Length of the collection hash prefix that leads every fjall key (cell and
+/// index alike).
+const COLLECTION_PREFIX_LEN: usize = 16;
+
+/// The row family within the per-partition warm `index` keyspace, discriminated
+/// by the byte immediately after the 16-byte collection hash so each family
+/// forms a contiguous prefix range.
+///
+/// A serialize-only discriminator (`From<_> for u8`) that leads each key we
+/// write. Reads are always prefix-scoped to one family (a `Coord`/`Cover`
+/// range, or a `Seeded` point key), so the discriminator is never decoded back
+/// — the family is known from the range that produced the key.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexKind {
+    /// A live provisional coordinate: key `[hash][Coord][section][coordinate]`,
+    /// empty value. Presence ⟺ `(collection, cell)` is durably provisional.
+    Coord = 0x00,
+    /// The one-time cold-seed latch: key `[hash][Seeded]`, empty value.
+    Seeded = 0x01,
+    /// One stored scan-coverage interval: key
+    /// `[hash][Cover][section][lo-bound frame]`, value `[hi-bound frame]`.
+    Cover = 0x02,
+}
+
+impl From<IndexKind> for u8 {
+    fn from(kind: IndexKind) -> Self {
+        kind as u8
+    }
+}
+
+/// A [`Bound<Coordinate>`] endpoint frame: `[BoundTag][coordinate bytes?]`.
+///
+/// The tag leads the frame, so a coverage `Cover` prefix range keys each stored
+/// interval by its low-bound frame uniquely (two live intervals are disjoint,
+/// so their low bounds never collide). The frame's raw byte order is *not* the
+/// coverage `cmp_low` continuum order — the tag dominates the coordinate — so
+/// the coverage layer re-sorts the loaded pairs into a `BTreeMap` keyed by
+/// `cmp_low` (`IntervalSet::from_pairs`); the fjall range is only a bounded,
+/// per-section batch read, never relied on for order.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundTag {
+    Unbounded = 0x00,
+    Included = 0x01,
+    Excluded = 0x02,
+}
+
+impl From<BoundTag> for u8 {
+    fn from(tag: BoundTag) -> Self {
+        tag as u8
+    }
+}
 
 /// Tag byte for "known absent" entries.
 const CACHE_TAG_ABSENT: u8 = 0x00;
@@ -70,7 +125,7 @@ pub(super) const NEVER_EXPIRES: u64 = 0;
 /// section: the 16-byte collection hash plus the 1-byte section discriminant.
 /// A range scan over `[section_prefix, …]` stays within one section of one
 /// collection; the order-preserving coordinate bytes follow.
-pub(super) const SECTION_PREFIX_LEN: usize = 17;
+pub(super) const SECTION_PREFIX_LEN: usize = COLLECTION_PREFIX_LEN + 1;
 
 /// Returns the full fjall key for one cell: the 16-byte collection prefix
 /// followed by the cell's `section` byte and order-preserving `coordinate`
@@ -109,11 +164,141 @@ pub(super) fn coordinate_of(key: &[u8]) -> Coordinate {
     Coordinate::from_bytes(key[SECTION_PREFIX_LEN..].to_vec())
 }
 
+/// The warm-index key for a provisional coordinate:
+/// `[hash][Coord][section][coordinate]`. Presence ⟺ the cell is provisional.
+#[must_use]
+pub(super) fn index_coord_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
+    let coordinate = cell.coordinate.as_bytes();
+    let mut key = Vec::with_capacity(COLLECTION_PREFIX_LEN + 2 + coordinate.len());
+    key.extend_from_slice(&collection_prefix(id));
+    key.push(IndexKind::Coord.into());
+    key.push(i8::from(cell.section).cast_unsigned());
+    key.extend_from_slice(coordinate);
+    key
+}
+
+/// The `[hash][Coord]` prefix bounding a collection's provisional-coordinate
+/// range — the ascending scan `snapshot` drains.
+#[must_use]
+pub(super) fn index_coord_prefix(id: &CollectionId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(COLLECTION_PREFIX_LEN + 1);
+    prefix.extend_from_slice(&collection_prefix(id));
+    prefix.push(IndexKind::Coord.into());
+    prefix
+}
+
+/// Reconstructs a [`CellKey`] from a `Coord` index key produced by
+/// [`index_coord_key`]: the byte after the collection hash is the family
+/// discriminator, the next is the section, and the tail is the coordinate.
+#[must_use]
+pub(super) fn coord_cell_key(key: &[u8]) -> CellKey {
+    let section = Section::new(key[COLLECTION_PREFIX_LEN + 1].cast_signed());
+    let coordinate = Coordinate::from_bytes(key[COLLECTION_PREFIX_LEN + 2..].to_vec());
+    CellKey {
+        section,
+        coordinate,
+    }
+}
+
+/// The warm-index key for a collection's one-time cold-seed latch:
+/// `[hash][Seeded]`. Presence ⟺ the seed has run.
+#[must_use]
+pub(super) fn index_seeded_key(id: &CollectionId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(COLLECTION_PREFIX_LEN + 1);
+    key.extend_from_slice(&collection_prefix(id));
+    key.push(IndexKind::Seeded.into());
+    key
+}
+
+/// The `[hash][Cover][section]` prefix bounding one `(collection, section)`'s
+/// stored coverage intervals — the range a coverage read-modify-write scans.
+#[must_use]
+pub(super) fn index_cover_prefix(id: &CollectionId, section: Section) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(COLLECTION_PREFIX_LEN + 2);
+    prefix.extend_from_slice(&collection_prefix(id));
+    prefix.push(IndexKind::Cover.into());
+    prefix.push(i8::from(section).cast_unsigned());
+    prefix
+}
+
+/// The full warm-index key for one stored coverage interval: the
+/// `[hash][Cover][section]` prefix followed by the interval's low-bound frame.
+/// The frame is tag-first, so its raw byte order is **not** `cmp_low` (see
+/// [`BoundTag`]); the coverage layer re-sorts the loaded pairs via
+/// [`IntervalSet::from_pairs`](super::super::cached::coverage), so the fjall
+/// range order is not relied on.
+#[must_use]
+pub(super) fn index_cover_key(
+    id: &CollectionId,
+    section: Section,
+    lo: &Bound<Coordinate>,
+) -> Vec<u8> {
+    let prefix = index_cover_prefix(id, section);
+    let frame = encode_bound(lo);
+    let mut key = Vec::with_capacity(prefix.len() + frame.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(&frame);
+    key
+}
+
+/// Decodes the low bound stored in a coverage key's frame tail (the bytes after
+/// the `[hash][Cover][section]` prefix).
+///
+/// # Errors
+///
+/// Returns [`FjallCellCacheError`] when the frame tag is unknown.
+pub(super) fn cover_low_bound(key: &[u8]) -> Result<Bound<Coordinate>, FjallCellCacheError> {
+    decode_bound(&key[COLLECTION_PREFIX_LEN + 2..])
+}
+
+/// Encodes a [`Bound<Coordinate>`] as a frame `[BoundTag][coordinate bytes?]`.
+#[must_use]
+pub(super) fn encode_bound(bound: &Bound<Coordinate>) -> Vec<u8> {
+    match bound {
+        Bound::Unbounded => vec![BoundTag::Unbounded.into()],
+        Bound::Included(c) | Bound::Excluded(c) => {
+            let tag = if matches!(bound, Bound::Included(_)) {
+                BoundTag::Included
+            } else {
+                BoundTag::Excluded
+            };
+            let coordinate = c.as_bytes();
+            let mut frame = Vec::with_capacity(1 + coordinate.len());
+            frame.push(tag.into());
+            frame.extend_from_slice(coordinate);
+            frame
+        }
+    }
+}
+
+/// Decodes a [`Bound<Coordinate>`] frame produced by [`encode_bound`].
+///
+/// # Errors
+///
+/// Returns [`FjallCellCacheError::UnknownBoundTag`] when the leading tag byte
+/// is unrecognized, or [`FjallCellCacheError::EmptyCacheCell`] on a truncated
+/// frame (both are our own writes into a fresh keyspace, so either is a bug).
+pub(super) fn decode_bound(frame: &[u8]) -> Result<Bound<Coordinate>, FjallCellCacheError> {
+    let (tag, rest) = frame
+        .split_first()
+        .ok_or(FjallCellCacheError::EmptyCacheCell)?;
+    match *tag {
+        t if t == u8::from(BoundTag::Unbounded) => Ok(Bound::Unbounded),
+        t if t == u8::from(BoundTag::Included) => {
+            Ok(Bound::Included(Coordinate::from_bytes(rest.to_vec())))
+        }
+        t if t == u8::from(BoundTag::Excluded) => {
+            Ok(Bound::Excluded(Coordinate::from_bytes(rest.to_vec())))
+        }
+        other => Err(FjallCellCacheError::UnknownBoundTag(other)),
+    }
+}
+
 /// Returns the 16-byte collection prefix for a collection identity.
 ///
 /// See module docs for the field layout and rationale.
 #[must_use]
-pub(super) fn collection_prefix(id: &CollectionId) -> [u8; 16] {
+pub(super) fn collection_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN] {
     let segment_bytes = id.state_key().segment_id.as_bytes();
     let key_bytes = id.state_key().key.as_bytes();
     let state_type_byte = i8::from(id.state_type()).cast_unsigned();

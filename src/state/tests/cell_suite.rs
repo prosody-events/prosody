@@ -1073,6 +1073,7 @@ struct OpCounts {
     get: AtomicUsize,
     scan_cells: AtomicUsize,
     provisional_cells: AtomicUsize,
+    provisional_cell_at: AtomicUsize,
 }
 
 impl<S> CountingCellStore<S> {
@@ -1103,10 +1104,17 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_cells.load(Ordering::Relaxed)
     }
 
-    /// Recovery-sweep entries — one per `provisional_cells` call, so a test can
-    /// pin how many times the sweep consulted the store.
+    /// Recovery-sweep entries — one per `provisional_cells` (cold seed) call,
+    /// so a test can pin how many times the sweep hit the durable cold
+    /// source.
     pub(crate) fn recovery_sweeps(&self) -> usize {
         self.counts.provisional_cells.load(Ordering::Relaxed)
+    }
+
+    /// Warm-sweep point reads — one per `provisional_cell_at`, the reads a warm
+    /// (seeded) sweep issues (bounded by #provisional).
+    pub(crate) fn warm_point_reads(&self) -> usize {
+        self.counts.provisional_cell_at.load(Ordering::Relaxed)
     }
 
     pub(crate) fn reset(&self) {
@@ -1116,6 +1124,7 @@ impl<S> CountingCellStore<S> {
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cells.store(0, Ordering::Relaxed);
+        self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1155,6 +1164,18 @@ where
             .provisional_cells
             .fetch_add(1, Ordering::Relaxed);
         self.inner.provisional_cells(collection)
+    }
+
+    async fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Option<ProvisionalCell>, Self::Error> {
+        // One increment per warm-sweep point read.
+        self.counts
+            .provisional_cell_at
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.provisional_cell_at(collection, cell).await
     }
 
     async fn write_provisional<'a>(
@@ -1307,6 +1328,17 @@ where
         self.inner
             .provisional_cells(collection)
             .map(|item| item.map_err(FailCellError::Inner))
+    }
+
+    async fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Option<ProvisionalCell>, Self::Error> {
+        self.inner
+            .provisional_cell_at(collection, cell)
+            .await
+            .map_err(FailCellError::Inner)
     }
 
     async fn write_provisional<'a>(

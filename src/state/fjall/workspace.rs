@@ -47,6 +47,7 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 const PARTITION_NAME_PREFIX: &str = "value_";
 const CACHE_ROLE: &str = "cache";
+const INDEX_ROLE: &str = "index";
 
 /// Per-Kafka-partition workspace creation epoch.
 ///
@@ -113,15 +114,17 @@ impl FjallClient {
 
     /// Mints a fresh per-Kafka-partition workspace tagged with `epoch`.
     ///
-    /// Opens one named Fjall keyspace (`cache`) named via
-    /// `xxh3_128(role, topic, partition, epoch)` so concurrent assign/revoke
-    /// cycles cannot collide and arbitrary topic names cannot violate
-    /// fjall's keyspace-name charset.
+    /// Opens two named Fjall keyspaces — `cache` (committed-value mirror) and
+    /// `index` (the warm provisional-coordinate index + scan coverage) — each
+    /// named via `xxh3_128(role, topic, partition, epoch)` so concurrent
+    /// assign/revoke cycles cannot collide and arbitrary topic names cannot
+    /// violate fjall's keyspace-name charset. Both are cold at a fresh epoch
+    /// and dropped together at revocation.
     ///
     /// # Errors
     ///
-    /// Returns [`FjallCellCacheError::Engine`] when the keyspace cannot
-    /// be opened.
+    /// Returns [`FjallCellCacheError::Engine`] when a keyspace cannot be
+    /// opened.
     pub fn workspace(
         self: &Arc<Self>,
         topic: Topic,
@@ -129,8 +132,10 @@ impl FjallClient {
         epoch: AssignmentEpoch,
     ) -> Result<FjallWorkspace, FjallCellCacheError> {
         let cache_name = partition_name(CACHE_ROLE, topic, partition, epoch);
+        let index_name = partition_name(INDEX_ROLE, topic, partition, epoch);
 
         let cache = self.database.keyspace(&cache_name, keyspace_options)?;
+        let index = self.database.keyspace(&index_name, keyspace_options)?;
 
         Ok(FjallWorkspace {
             client: Arc::clone(self),
@@ -138,15 +143,16 @@ impl FjallClient {
             topic,
             partition,
             cache,
+            index,
         })
     }
 }
 
 /// Per-Kafka-partition workspace.
 ///
-/// Owns the named Fjall cache keyspace for one `(topic, partition,
-/// epoch)`. Drop deletes it; if delete fails it logs and continues
-/// — the next process startup will reap the leftover via
+/// Owns the named Fjall `cache` and `index` keyspaces for one `(topic,
+/// partition, epoch)`. Drop deletes both; if a delete fails it logs and
+/// continues — the next process startup will reap the leftover via
 /// [`FjallClient::open`].
 #[derive(Educe)]
 #[educe(Debug)]
@@ -158,6 +164,8 @@ pub struct FjallWorkspace {
     partition: Partition,
     #[educe(Debug(ignore))]
     cache: Keyspace,
+    #[educe(Debug(ignore))]
+    index: Keyspace,
 }
 
 impl FjallWorkspace {
@@ -167,27 +175,37 @@ impl FjallWorkspace {
         self.client.database()
     }
 
-    /// Returns the cache keyspace handle.
+    /// Returns the committed-value cache keyspace handle.
     #[must_use]
     pub fn cache_handle(&self) -> &Keyspace {
         &self.cache
+    }
+
+    /// Returns the warm-index keyspace handle (provisional coordinates +
+    /// scan coverage).
+    #[must_use]
+    pub fn index_handle(&self) -> &Keyspace {
+        &self.index
     }
 }
 
 impl Drop for FjallWorkspace {
     fn drop(&mut self) {
-        // `Keyspace` wraps an `Arc`, so cloning here is cheap and
-        // matches fjall's expected ownership for `delete_keyspace`.
-        if let Err(err) = self.client.database.delete_keyspace(self.cache.clone()) {
-            warn!(
-                role = CACHE_ROLE,
-                topic = ?self.topic,
-                partition = self.partition,
-                epoch = ?self.epoch,
-                error = ?err,
-                "delete_keyspace failed on workspace drop; \
-                 stale keyspace will be reaped on next startup"
-            );
+        // `Keyspace` wraps an `Arc`, so cloning here is cheap and matches
+        // fjall's expected ownership for `delete_keyspace`. Both keyspaces are
+        // deleted; a failure on either logs and continues (startup sweep reaps).
+        for (role, keyspace) in [(CACHE_ROLE, &self.cache), (INDEX_ROLE, &self.index)] {
+            if let Err(err) = self.client.database.delete_keyspace(keyspace.clone()) {
+                warn!(
+                    role,
+                    topic = ?self.topic,
+                    partition = self.partition,
+                    epoch = ?self.epoch,
+                    error = ?err,
+                    "delete_keyspace failed on workspace drop; \
+                     stale keyspace will be reaped on next startup"
+                );
+            }
         }
     }
 }

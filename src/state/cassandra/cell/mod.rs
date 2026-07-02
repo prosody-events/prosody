@@ -69,7 +69,6 @@ use crate::state::cell_key::{CellKey, Direction, Scan};
 use crate::state::encoding::{Encoding, encode_payload};
 use crate::state::event_ref::EventRef;
 use crate::state::oracle::CommitOracle;
-use crate::state::provisional_index::ProvisionalIndex;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
 use crate::state::store::CellStore;
@@ -159,10 +158,12 @@ impl CassandraCellResources {
     }
 }
 
-/// Test-only recovery-read counters, incremented **below** the seeded-latch
-/// short-circuit in [`provisional_cells`](CellStore::provisional_cells), so a
-/// warm-clean sweep leaves both at zero — the non-vacuous "zero queries on
-/// quiescence" signal.
+/// Test-only recovery-read counters, incremented inside
+/// [`provisional_cells`](CellStore::provisional_cells) — the **unconditional
+/// cold seed**. The seeded-latch short-circuit lives one layer up on
+/// [`Cached`](crate::state::cached::Cached), which calls this only on a cold
+/// sweep, so a warm-clean sweep never enters here and both counters stay at
+/// zero — the non-vacuous "zero queries on quiescence" signal.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryReadCounts {
@@ -179,11 +180,6 @@ pub struct CassandraStore<O> {
     session: CassandraSession,
     queries: Arc<CellQueries>,
     resolver: Resolver<O>,
-    /// Per-partition provisional-coordinate index gating the recovery sweep.
-    /// Minted fresh per store (per partition acquisition), so a re-acquired
-    /// partition seeds from the durable `kind=Index` markers before trusting
-    /// the set (the cold-window). `Arc` so the per-event store clones share it.
-    index: Arc<ProvisionalIndex>,
     #[cfg(test)]
     counters: Arc<RecoveryReadCounts>,
 }
@@ -203,7 +199,6 @@ impl<O> CassandraStore<O> {
             session,
             queries,
             resolver: Resolver::new(oracle, registry),
-            index: Arc::default(),
             #[cfg(test)]
             counters: Arc::default(),
         }
@@ -649,15 +644,13 @@ where
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         try_stream! {
-            // The coordinates to visit. Warm (seeded): the in-memory set — an
-            // empty set yields nothing and issues NO Cassandra query, the
-            // zero-query-on-quiescence goal. Cold (first sweep after acquisition
-            // /crash): one bounded front-of-partition `kind=Index` range read
-            // seeds the set (cost ∝ #provisional, never #cells). There is no
-            // whole-partition scan on either path.
-            let coords = if self.index.is_seeded(collection).await {
-                self.index.snapshot(collection)
-            } else {
+            // The unconditional **cold seed**: one bounded front-of-partition
+            // `kind=Index` range read yields the provisional coordinate list
+            // (cost ∝ #provisional, never #cells) — the durable recovery source.
+            // The warm short-circuit that skips this on a quiescent sweep lives
+            // one layer up on `Cached` (which owns the fjall warm index), so this
+            // is reached only on a cold sweep. There is no whole-partition scan.
+            let coords = {
                 let pk = Pk::of(collection).owned();
                 #[cfg(test)]
                 self.counters.index_range_reads.fetch_add(1, Ordering::Relaxed);
@@ -683,11 +676,8 @@ where
                     .map_err(CassandraStoreError::from)
                     .map_err(into_store_err::<O>)?
                 {
-                    let key = decode::index_cell_key(row);
-                    self.index.record(collection, &key).await;
-                    coords.push(key);
+                    coords.push(decode::index_cell_key(row));
                 }
-                self.index.mark_seeded(collection).await;
                 coords
             };
 
@@ -714,27 +704,39 @@ where
         }
     }
 
+    async fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Option<ProvisionalCell>, Self::Error> {
+        // Point-read the `kind=Cell` row and keep only a genuinely provisional
+        // shape; an absent or resolved coordinate reads `None` (over-report-safe
+        // — a coordinate the warm index over-reports is dropped here).
+        #[cfg(test)]
+        self.counters
+            .cell_point_reads
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(raw) = self
+            .read_raw(collection, cell)
+            .await
+            .map_err(ResolveCellError::Store)?
+        else {
+            return Ok(None);
+        };
+        match decode::try_decode_cell(raw).map_err(ResolveCellError::Store)? {
+            Cell::Provisional(provisional) => Ok(Some(provisional)),
+            Cell::Resolved(_) => Ok(None),
+        }
+    }
+
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        match self.write_provisional_raw(collection, writes).await {
-            Ok(()) => {
-                // Record each staged coordinate after the durable ack.
-                for (cell, _) in writes {
-                    self.index.record(collection.id(), cell).await;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                // A partial durable stage may have landed markers the set now
-                // misses; drop the seeded latch so the next sweep re-seeds from
-                // the durable index and restores completeness (invariant).
-                self.index.unseed(collection.id()).await;
-                Err(ResolveCellError::Store(error))
-            }
-        }
+        self.write_provisional_raw(collection, writes)
+            .await
+            .map_err(ResolveCellError::Store)
     }
 
     async fn write_resolved<'a>(
@@ -744,14 +746,7 @@ where
     ) -> Result<(), Self::Error> {
         self.write_resolved_raw(collection, cells)
             .await
-            .map_err(ResolveCellError::Store)?;
-        // Rollback/committed-write resolved the cell; drop its provisional
-        // coordinate (a no-op for a never-staged direct write). A failed write
-        // leaves the coordinate in place — a harmless over-report.
-        for (cell, _) in cells {
-            self.index.clear(collection.id(), cell).await;
-        }
-        Ok(())
+            .map_err(ResolveCellError::Store)
     }
 
     async fn mark_resolved<'a>(
@@ -761,12 +756,7 @@ where
     ) -> Result<(), Self::Error> {
         self.mark_resolved_raw(collection, cells)
             .await
-            .map_err(ResolveCellError::Store)?;
-        // Promote resolved the cell; drop its provisional coordinate.
-        for cell in cells {
-            self.index.clear(collection.id(), cell).await;
-        }
-        Ok(())
+            .map_err(ResolveCellError::Store)
     }
 }
 
