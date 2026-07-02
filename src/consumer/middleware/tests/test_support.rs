@@ -7,6 +7,7 @@
 use std::future::{self, Future};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use educe::Educe;
 use parking_lot::Mutex;
@@ -22,16 +23,19 @@ use crate::state::session::{CellSession, UnavailableState};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
-/// Timer-operation error the mock injects on demand. Always classifies
-/// [`ErrorCategory::Permanent`] so a `with_arm_failure` context drives the
-/// backstop arm to [`StepOutcome::Skip`](crate::consumer::middleware).
+/// Timer-operation error the mock injects on demand, carrying the category to
+/// classify as. The backstop arm is must-succeed (invariant 8), so it retries
+/// **every** category forever — a `with_timer_failures(k, category)` context
+/// exercises the retry-forever self-heal for each, including `Terminal` (which
+/// `retry_step` retries rather than abandons) and `Permanent` (which the arm's
+/// own loop retries past `retry_step`'s `Skip`).
 #[derive(Debug, Error)]
-#[error("mock timer operation failed")]
-pub struct MockTimerError;
+#[error("mock timer operation failed ({0:?})")]
+pub struct MockTimerError(pub ErrorCategory);
 
 impl ClassifyError for MockTimerError {
     fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
+        self.0
     }
 }
 
@@ -83,9 +87,14 @@ pub struct MockEventContext<P = serde_json::Value, S = UnavailableState<P>> {
     /// Timer operation tracking (None = disabled).
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
 
-    /// When set, every timer schedule fails permanently — used to drive the
-    /// backstop arm to `Skip` (invariant 8).
-    arm_failure: bool,
+    /// Number of leading timer schedules that fail (with
+    /// [`Self::timer_fail_category`]) before schedules start succeeding —
+    /// drives the arm's retry-forever self-heal. Shared so a clone observes
+    /// the same countdown.
+    timer_fail_count: Arc<AtomicUsize>,
+
+    /// The category the leading failures classify as.
+    timer_fail_category: ErrorCategory,
 
     /// Keyed-state session descriptor binds route to; defaults to the
     /// [`UnavailableState`] stub.
@@ -121,7 +130,8 @@ where
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
             timer_operations: None,
-            arm_failure: false,
+            timer_fail_count: Arc::new(AtomicUsize::new(0)),
+            timer_fail_category: ErrorCategory::Permanent,
             session: UnavailableState::new(),
             _payload: PhantomData,
         }
@@ -138,18 +148,22 @@ impl<P, S> MockEventContext<P, S> {
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             timer_operations: self.timer_operations,
-            arm_failure: self.arm_failure,
+            timer_fail_count: self.timer_fail_count,
+            timer_fail_category: self.timer_fail_category,
             session,
             _payload: PhantomData,
         }
     }
 
-    /// Make every timer schedule fail permanently, so the backstop arm
-    /// resolves to `Skip` (invariant 8: arm-gates-marker).
+    /// Make the first `count` timer schedules fail with `category`, then
+    /// succeed — so the backstop arm's retry-forever loop self-heals after
+    /// `count` retries. Run on a paused clock so the retry backoff advances
+    /// instantly.
     #[must_use]
-    pub fn with_arm_failure(self) -> Self {
+    pub fn with_timer_failures(self, count: usize, category: ErrorCategory) -> Self {
         Self {
-            arm_failure: true,
+            timer_fail_count: Arc::new(AtomicUsize::new(count)),
+            timer_fail_category: category,
             ..self
         }
     }
@@ -235,13 +249,18 @@ impl<P, S> MockEventContext<P, S> {
         }
     }
 
-    /// The result a schedule returns: a permanent failure when
-    /// `with_arm_failure` is set, otherwise success.
+    /// The result a schedule returns: a `with_timer_failures` failure (of the
+    /// configured category) while the countdown is still positive (decrementing
+    /// it), otherwise success.
     fn timer_result(&self) -> Result<(), MockTimerError> {
-        if self.arm_failure {
-            Err(MockTimerError)
-        } else {
-            Ok(())
+        // fetch_update fails (leaving 0) once the countdown is exhausted; while
+        // positive it decrements and we inject one more failure.
+        match self
+            .timer_fail_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        {
+            Ok(_) => Err(MockTimerError(self.timer_fail_category)),
+            Err(_) => Ok(()),
         }
     }
 }

@@ -38,9 +38,11 @@ use crate::timers::{
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::{Stream, StreamExt};
+use quickcheck::{QuickCheck, TestResult};
 use std::array::from_fn;
 use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::runtime::Builder;
 use tokio::sync::{Semaphore, watch};
 use tracing::Span;
 use uuid::Uuid;
@@ -298,14 +300,17 @@ async fn stage_under_timer(
 }
 
 /// `recover` resolves a committed provisional cell to its `data`, clears the
-/// per-key armed flag, and unschedules the backstop timer.
+/// per-key armed flag, and — on a fully resolved sweep — commits without ever
+/// unscheduling the backstop (the fired trigger is a per-key singleton the arm
+/// commits; recover never touches the timer store on success).
 #[tokio::test]
-async fn recover_promotes_committed_cell_clears_armed_and_timer() -> Result<()> {
+async fn recover_promotes_committed_cell_clears_armed_and_leaves_backstop() -> Result<()> {
     let oracle = FixedOracle::committed();
     let registry = registry_with_cart()?;
     let cell = cell_store(oracle.clone(), &registry);
     let manager = acquire(&provider_with(cell.clone(), oracle, registry)).await?;
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
+    let (_no_shutdown_tx, no_shutdown) = watch::channel(ShutdownPhase::default());
     let key: Key = Arc::from("k");
 
     let session = manager
@@ -322,10 +327,11 @@ async fn recover_promotes_committed_cell_clears_armed_and_timer() -> Result<()> 
         ))
         .await?;
 
-    manager
-        .recover(key.clone(), &timers)
-        .await
-        .map_err(|e| eyre!("recover failed: {e}"))?;
+    assert_eq!(
+        manager.recover(key.clone(), &timers, &no_shutdown).await,
+        SweepResolution::Commit,
+        "a fully resolved sweep commits the fired trigger",
+    );
 
     assert_eq!(
         committed(&cell, &id_for(&key, "cart")?).await?,
@@ -337,11 +343,11 @@ async fn recover_promotes_committed_cell_clears_armed_and_timer() -> Result<()> 
         "recover clears the per-key armed flag on fire",
     );
     assert!(
-        timers
+        !timers
             .scheduled_times(&key, TimerType::StateRecovery)
             .await?
             .is_empty(),
-        "an all-resolved sweep unschedules the backstop",
+        "recover never unschedules the backstop; the arm commits the fired trigger",
     );
     Ok(())
 }
@@ -357,15 +363,17 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
     let (_stream, timers, _shutdown_tx) = timer_manager().await?;
     let key: Key = Arc::from("k");
 
+    let (_no_shutdown_tx, no_shutdown) = watch::channel(ShutdownPhase::default());
     let session = manager
         .session(key.clone(), timer_event(&key), termination())
         .handle();
     stage_under_timer(session, &manager, &key, 99).await?;
 
-    manager
-        .recover(key.clone(), &timers)
-        .await
-        .map_err(|e| eyre!("recover failed: {e}"))?;
+    assert_eq!(
+        manager.recover(key.clone(), &timers, &no_shutdown).await,
+        SweepResolution::Commit,
+        "a fully resolved rollback commits the fired trigger",
+    );
 
     assert_eq!(
         committed(&cell, &id_for(&key, "cart")?).await?,
@@ -375,63 +383,130 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
     Ok(())
 }
 
-/// No-strand (inv 6): when a collection's resolution fails permanently, the
-/// sweep returns "not all resolved", so `recover` leaves the backstop timer
-/// scheduled for a later sweep / first-touch rather than stranding the
-/// unresolved cell.
-#[tokio::test]
-async fn recover_leaves_backstop_when_resolution_fails() -> Result<()> {
-    let registry = registry_with_cart()?;
-    let inner = cell_store(FixedOracle::committed(), &registry);
-    let cell = FailingCellStore::new(inner, StateName::try_new("cart")?);
-    let manager = poison_provider(cell, registry)
-        .acquire(Topic::from("t"), 0)
-        .await
-        .map_err(|e| eyre!("acquire failed: {e}"))?;
-    let (_stream, timers, _shutdown_tx) = timer_manager().await?;
-    let key: Key = Arc::from("k");
+/// `recover` **never aborts the fired trigger except on shutdown** (retry
+/// forever; abort only on shutdown), over a generated sweep-failure category
+/// and a shutdown flag. Invariants proven for a staged cell whose promote
+/// fails:
+///
+/// * A per-cell **Permanent** failure → `Commit` with **no** reschedule
+///   (rescheduling a cell that never resolves would spin a refire loop;
+///   first-touch and the key's next commit recover it).
+/// * A **Transient** or **Terminal** sweep failure without shutdown → `Commit`
+///   after rescheduling a fresh backstop, recorded in `armed`.
+/// * A transient/terminal failure **with** shutdown → `Abort`, leaving the
+///   standing backstop for reacquisition (the reschedule was interrupted).
+///
+/// Across every case a **single** `StateRecovery` trigger ever exists (the
+/// reschedule is a singleton overwrite — why the boundary needs no
+/// `unschedule_all`) and `recover` clears the pre-existing `armed` entry at its
+/// top (re-set only by a successful reschedule). Each iteration builds a fresh
+/// current-thread runtime (TESTING.md: per-iteration runtimes); no path sleeps
+/// (a healthy reschedule lands first try; shutdown returns before the backoff).
+#[test]
+fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
+    async fn run(category: ErrorCategory, shutdown: bool) -> Result<TestResult> {
+        let cart = StateName::try_new("cart")?;
+        let registry = registry_with_cart()?;
+        let inner = cell_store(FixedOracle::committed(), &registry);
+        let cell = FailingCellStore::new_with_category(inner, cart.clone(), category);
+        let manager = poison_provider(cell, registry)
+            .acquire(Topic::from("t"), 0)
+            .await
+            .map_err(|e| eyre!("acquire failed: {e}"))?;
+        let (_stream, timers, _shutdown_tx) = timer_manager().await?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        if shutdown {
+            shutdown_tx.send_replace(ShutdownPhase::Cancelling);
+        }
+        let key: Key = Arc::from("k");
 
-    let session = manager
-        .session(key.clone(), timer_event(&key), termination())
-        .handle();
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("cart")?,
-            &value_cell(),
-            &bytes(7),
-        )
-        .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    let _ = manager
-        .inner
-        .armed
-        .insert_async(key.clone(), CompactDateTime::now()?)
-        .await;
+        // Stage a committed cell whose sweep-time promote hits the poison.
+        let session = manager
+            .session(key.clone(), timer_event(&key), termination())
+            .handle();
+        session
+            .set(StateType::Application, &cart, &value_cell(), &bytes(7))
+            .await?;
+        if session.finalize().await? != FinalizeOutcome::Staged {
+            return Ok(TestResult::error("expected the cell to stage"));
+        }
 
-    let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
-    timers
-        .schedule(TimerRequest::new(
-            key.clone(),
-            fire,
-            TimerType::StateRecovery,
-            Span::current(),
-        ))
-        .await?;
+        // A standing backstop + a pre-existing armed entry: a reschedule
+        // overwrites the timer (singleton) and re-arms; every other outcome
+        // leaves the timer intact and clears the armed entry.
+        let standing = CompactDateTime::now()?.add_duration(CompactDuration::new(600))?;
+        timers
+            .schedule(TimerRequest::new(
+                key.clone(),
+                standing,
+                TimerType::StateRecovery,
+                Span::current(),
+            ))
+            .await?;
+        let _ = manager
+            .inner
+            .armed
+            .insert_async(key.clone(), standing)
+            .await;
 
-    manager
-        .recover(key.clone(), &timers)
-        .await
-        .map_err(|e| eyre!("recover failed: {e}"))?;
-
-    assert!(
-        !timers
+        let resolution = manager.recover(key.clone(), &timers, &shutdown_rx).await;
+        let scheduled = timers
             .scheduled_times(&key, TimerType::StateRecovery)
-            .await?
-            .is_empty(),
-        "a failed resolution must leave the backstop armed (no-strand)",
-    );
-    Ok(())
+            .await?;
+        let armed = manager.inner.armed.contains_async(&key).await;
+
+        if scheduled.len() != 1 {
+            return Ok(TestResult::error(format!(
+                "exactly one StateRecovery trigger must ever exist, got {}",
+                scheduled.len()
+            )));
+        }
+        let rescheduled = scheduled[0] < standing;
+
+        let reschedule_case =
+            matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal) && !shutdown;
+        let shutdown_abort =
+            matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal) && shutdown;
+
+        let ok = if shutdown_abort {
+            // Shutdown interrupted the reschedule: abort, standing timer intact,
+            // armed cleared.
+            resolution == SweepResolution::Abort && !rescheduled && !armed
+        } else if reschedule_case {
+            // Non-shutdown transient/terminal: commit after a sooner singleton
+            // reschedule, armed re-set.
+            resolution == SweepResolution::Commit && rescheduled && armed
+        } else {
+            // Permanent per-cell skip: commit, no reschedule, armed cleared.
+            resolution == SweepResolution::Commit && !rescheduled && !armed
+        };
+        if !ok {
+            return Ok(TestResult::error(format!(
+                "category={category:?} shutdown={shutdown}: resolution={resolution:?} \
+                 rescheduled={rescheduled} armed={armed}"
+            )));
+        }
+        Ok(TestResult::passed())
+    }
+
+    fn property(category_sel: u8, shutdown: bool) -> TestResult {
+        let category = match category_sel % 3 {
+            0 => ErrorCategory::Permanent,
+            1 => ErrorCategory::Transient,
+            _ => ErrorCategory::Terminal,
+        };
+        let Ok(runtime) = Builder::new_current_thread().enable_all().build() else {
+            return TestResult::error("failed to build runtime");
+        };
+        runtime.block_on(async move {
+            match run(category, shutdown).await {
+                Ok(result) => result,
+                Err(e) => TestResult::error(format!("setup failed: {e}")),
+            }
+        })
+    }
+
+    QuickCheck::new().quickcheck(property as fn(u8, bool) -> TestResult);
 }
 
 /// Buffers writes to two `ReadCommitted` collections (`cart`, `wishlist`) and

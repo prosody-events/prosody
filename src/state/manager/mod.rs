@@ -27,7 +27,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::consumer::event_context::BoxEventContextError;
+use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{
@@ -45,25 +45,27 @@ use crate::state::{
     CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
     StateBackendFactory, StateKey, StateName, StateType,
 };
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, TimerType};
+use crate::timers::{TimerManager, TimerRequest, TimerType};
 use crate::{Key, Partition, SegmentId, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use tokio::task::coop::cooperative;
+use tokio::time::sleep;
+use tracing::{Span, error};
 
-/// The uniform cell store's error of a [`StateBackend`] bundle (it already
-/// wraps oracle failures, since `get`/`scan` resolve inside the store).
-type CellErr<B> = <<B as StateBackend>::Cell as CellStore>::Error;
-
-/// The shared commit oracle's error of a [`StateBackend`] bundle.
-type OracleErr<B> = <<B as StateBackend>::Oracle as CommitOracle>::Error;
+/// Delay between retries of a transient failure while rescheduling a fresh
+/// `StateRecovery` backstop after a failed sweep. Mirrors the durability-step
+/// retry cadence in [`crate::consumer::middleware`].
+const RESCHEDULE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
@@ -138,12 +140,6 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
     type Session: CellSession;
 
-    /// Error raised by the recovery sweep. Classified so the partition loop
-    /// can drop a permanently-failing trigger (committing it) rather than
-    /// refiring it forever — first-touch / the next sweep still recover the
-    /// staged cell.
-    type RecoveryError: ClassifyError + Error + Send + Sync + 'static;
-
     /// Mints the per-event session scope for `event` on `key`.
     ///
     /// Returns an [`EventStateScope`]: the single owned, non-`Clone` value
@@ -158,22 +154,42 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
         termination: TerminationWatch,
     ) -> EventStateScope<Self::Session>;
 
-    /// Runs the `StateRecovery` sweep for `key` and clears the
-    /// `StateRecovery` timer once every provisional cell on the key resolves.
+    /// Runs the `StateRecovery` sweep for `key` and decides what the fired
+    /// trigger's commit guard should do.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Self::RecoveryError`] when the sweep or the timer clear
-    /// fails. The caller classifies: Transient/Terminal aborts the firing
-    /// trigger so the sweep re-runs; Permanent commits it to stop the
-    /// refire loop (first-touch and the key's next commit still recover).
+    /// **Never aborts the trigger except on shutdown** (retry forever; abort
+    /// only on shutdown). A fully resolved sweep, and a sweep that skips a
+    /// per-cell *permanent* failure, both return [`SweepResolution::Commit`]:
+    /// the fired trigger commits and nothing is rescheduled (a permanent cell
+    /// never resolves, so rescheduling would only spin a refire loop —
+    /// first-touch and the key's next commit recover it). A *transient* or
+    /// *terminal* store failure reschedules a fresh backstop
+    /// (`clear_and_schedule(now + recovery_delay)`, retried until it lands or
+    /// shutdown) so a future sweep retries, then commits. Only when shutdown
+    /// interrupts a reschedule before it lands does this return
+    /// [`SweepResolution::Abort`], so the trigger refires and re-sweeps on the
+    /// next partition acquisition.
     fn recover<T>(
         &self,
         key: Key,
         timers: &TimerManager<T>,
-    ) -> impl Future<Output = Result<(), Self::RecoveryError>> + Send
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> impl Future<Output = SweepResolution> + Send
     where
         T: TriggerStore;
+}
+
+/// What the fired `StateRecovery` trigger's commit guard should do once
+/// [`PartitionStateManager::recover`] returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepResolution {
+    /// Commit the fired trigger — the sweep made progress (resolved, a
+    /// permanent per-cell skip, or a fresh backstop rescheduled).
+    Commit,
+
+    /// Abort the fired trigger — shutdown interrupted a reschedule, so let the
+    /// trigger refire (and re-sweep) on the next partition acquisition.
+    Abort,
 }
 
 /// Process-wide factory for per-partition [`PartitionStateManager`]s,
@@ -261,7 +277,6 @@ where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
-    type RecoveryError = RecoveryError<CellErr<B>, OracleErr<B>>;
     type Session = KeyedStateSession<B, L>;
 
     fn session(
@@ -288,47 +303,124 @@ where
         &self,
         key: Key,
         timers: &TimerManager<T>,
-    ) -> Result<(), Self::RecoveryError>
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> SweepResolution
     where
         T: TriggerStore,
     {
         let state_key = StateKey::new(self.inner.segment_id, key.clone());
-        // The backstop fired, so it no longer stands: clear the armed flag so
-        // the key's next stateful commit re-arms. Per-key serialization means
-        // no commit on this key runs while the sweep does, so this cannot race
-        // a `mark_backstop_armed`. If the sweep then aborts and the trigger
-        // refires, the next commit's re-arm (`clear_and_schedule`, a singleton
-        // overwrite) simply replaces the refiring timer — still one backstop.
+        // Sweep↔debounce ordering (invariant 4 / finding F2): clear the armed
+        // flag BEFORE reading the provisional set, so the key's next stateful
+        // commit (or the reschedule below) re-arms a fresh backstop. Per-key
+        // serialization — a key's message and timer events run through one
+        // `KeyManager` queue — means no `arm_backstop` / `mark_backstop_armed`
+        // on this key runs while this sweep does, so this clear cannot race a
+        // re-arm. The boundary never point-clears another event's backstop:
+        // only this fired sweep clears, and only its own.
         self.inner.armed.remove_async(&key).await;
         // Sweep every registered collection on the key through the one uniform
-        // cell store, ANDing the results: the single backstop unschedules only
-        // when every collection resolved (the no-strand invariant). Names come
-        // from the in-process registry (the authoritative declared set) — a
-        // collection whose descriptor was removed is dormant, not swept.
+        // cell store. Names come from the in-process registry (the authoritative
+        // declared set) — a collection whose descriptor was removed is dormant,
+        // not swept.
         let collections: Vec<(StateType, StateName)> = self
             .inner
             .registry
             .collections()
             .map(|(state_type, name)| (state_type, name.clone()))
             .collect();
-        let all_resolved = sweep_partition(
+        match sweep_partition(
             &self.inner.cell,
             &self.inner.oracle,
             collections,
             &self.inner.registry,
             &state_key,
         )
-        .await?;
-        // Only clear the backstop when every cell ended resolved (the
-        // no-strand invariant): a skipped Permanent cell leaves the timer
-        // armed for first-touch / a later sweep.
-        if all_resolved {
-            timers
-                .unschedule_all(&key, TimerType::StateRecovery)
-                .await
-                .map_err(|e| RecoveryError::Timer(Box::new(e)))?;
+        .await
+        {
+            // Fully resolved, or a per-cell Permanent skip (`false`): commit the
+            // fired trigger and reschedule nothing. Rescheduling a permanent skip
+            // would only spin a refire loop on a cell that never resolves;
+            // first-touch and the key's next commit recover it. The fired trigger
+            // is a per-(key, TimerType) singleton, so committing it is the whole
+            // story — no separate unschedule needed.
+            Ok(_all_resolved) => SweepResolution::Commit,
+            // A whole-sweep permanent failure (e.g. a permanently failing scan):
+            // commit to stop refiring forever; first-touch still recovers.
+            Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+                error!(
+                    key = ?key,
+                    "keyed-state recovery sweep failed permanently: {error:#}; \
+                     committing trigger (first-touch still recovers)"
+                );
+                SweepResolution::Commit
+            }
+            // A transient/terminal store failure: never abort the trigger — an
+            // abort would stall it until reassignment (possibly days). Reschedule
+            // a fresh backstop so a soon sweep retries, then commit the fired
+            // trigger for progress.
+            Err(error) => {
+                error!(
+                    key = ?key,
+                    "keyed-state recovery sweep failed: {error:#}; rescheduling a fresh backstop"
+                );
+                self.reschedule_backstop(&key, timers, shutdown).await
+            }
         }
-        Ok(())
+    }
+}
+
+impl<B, L> StateManager<B, L>
+where
+    B: StateBackend,
+{
+    /// Reschedules a fresh `StateRecovery` backstop at `now + recovery_delay`
+    /// after a failed sweep, retrying every non-shutdown failure until it
+    /// lands.
+    ///
+    /// A rescheduled backstop is durable in the trigger store — it survives
+    /// shutdown and fires on reacquisition — so once it lands this returns
+    /// [`SweepResolution::Commit`] even if shutdown is now in progress. It
+    /// returns [`SweepResolution::Abort`] only when shutdown interrupts
+    /// *before* the backstop lands; then the fired trigger refires and
+    /// re-sweeps on the next acquisition, so the cell is never orphaned.
+    async fn reschedule_backstop<T>(
+        &self,
+        key: &Key,
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> SweepResolution
+    where
+        T: TriggerStore,
+    {
+        let delay = self.inner.recovery_delay;
+        loop {
+            if *shutdown.borrow() >= ShutdownPhase::Cancelling {
+                return SweepResolution::Abort;
+            }
+            let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
+                Ok(fire) => fire,
+                Err(error) => {
+                    error!(error = %error, "failed to compute StateRecovery reschedule time; retrying");
+                    sleep(RESCHEDULE_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            let request =
+                TimerRequest::new(key.clone(), fire, TimerType::StateRecovery, Span::current());
+            match timers.clear_and_schedule(request).await {
+                Ok(()) => {
+                    // The rescheduled backstop is now the standing one; record
+                    // its fire so the arm-if-sooner path on the key's next commit
+                    // sees it (mirrors `mark_backstop_armed`).
+                    self.inner.armed.upsert_async(key.clone(), fire).await;
+                    return SweepResolution::Commit;
+                }
+                Err(error) => {
+                    error!(error = %error, "failed to reschedule StateRecovery backstop; retrying");
+                    sleep(RESCHEDULE_RETRY_DELAY).await;
+                }
+            }
+        }
     }
 }
 
@@ -468,17 +560,18 @@ where
 /// declaration returns and the key is accessed (an accepted non-concern). TTLs
 /// come from `registry`, falling back to the middleware-wide default.
 ///
-/// Returns `true` iff every collection ended fully resolved — the caller
-/// unschedules the backstop only then (the no-strand invariant). A
-/// never-touched name streams no provisional cell and resolves trivially. A
-/// per-cell Permanent failure is logged and skipped inside
+/// Returns `true` iff every collection ended fully resolved. A never-touched
+/// name streams no provisional cell and resolves trivially. A per-cell
+/// Permanent failure is logged and skipped inside
 /// [`sweep_provisional`](crate::state::resolve), leaving that collection
 /// unresolved (`false`) for first-touch or a later sweep; a transient/terminal
-/// failure propagates so the trigger aborts and the sweep refires.
+/// failure propagates via `Err`. [`PartitionStateManager::recover`] maps the
+/// outcome: `Ok(_)` and a permanent error both commit the fired trigger, a
+/// transient/terminal error reschedules a fresh backstop.
 ///
 /// # Errors
 ///
-/// Returns [`RecoveryError`] on a transient/terminal backend or oracle
+/// Returns [`ResolveCellError`] on a transient/terminal backend or oracle
 /// failure.
 pub(crate) async fn sweep_partition<S, O>(
     cell: &S,
@@ -540,65 +633,6 @@ where
         match self {
             Self::Factory(e) => e.classify_error(),
             Self::Identity(e) => e.classify_error(),
-        }
-    }
-}
-
-/// Errors raised by the state-recovery sweep.
-///
-/// The sweep only ever fails while resolving provisional cells (the durable
-/// cell store or the commit oracle) or clearing the recovery timer. It never
-/// runs a handler, drives a transaction, or computes a fire time, so those
-/// variants are absent.
-#[derive(Debug, Error)]
-pub enum RecoveryError<StoreErr, OracleErr>
-where
-    StoreErr: Error + 'static,
-    OracleErr: Error + 'static,
-{
-    /// A durable cell store operation failed.
-    #[error("keyed-state cell store failed")]
-    Store(#[source] StoreErr),
-
-    /// The commit oracle failed.
-    #[error("keyed-state commit oracle failed")]
-    Oracle(#[source] OracleErr),
-
-    /// Clearing the recovery timer failed (type-erased timer error).
-    #[error("keyed-state recovery timer failed: {0:#}")]
-    Timer(BoxEventContextError),
-}
-
-/// Each variant delegates to its inner error's classification, so the
-/// partition loop can decide whether a failed sweep is worth refiring
-/// (transient) or should be dropped and left to first-touch / the next sweep
-/// (permanent). The boxed `Timer` error classifies through its
-/// [`EventContextError`](crate::consumer::event_context::EventContextError)
-/// supertrait.
-impl<StoreErr, OracleErr> ClassifyError for RecoveryError<StoreErr, OracleErr>
-where
-    StoreErr: ClassifyError + Error + 'static,
-    OracleErr: ClassifyError + Error + 'static,
-{
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Store(e) => e.classify_error(),
-            Self::Oracle(e) => e.classify_error(),
-            Self::Timer(e) => e.classify_error(),
-        }
-    }
-}
-
-impl<StoreErr, OracleErr> From<ResolveCellError<StoreErr, OracleErr>>
-    for RecoveryError<StoreErr, OracleErr>
-where
-    StoreErr: ClassifyError + Error + Send + Sync + 'static,
-    OracleErr: ClassifyError + Error + Send + Sync + 'static,
-{
-    fn from(error: ResolveCellError<StoreErr, OracleErr>) -> Self {
-        match error {
-            ResolveCellError::Store(e) => Self::Store(e),
-            ResolveCellError::Oracle(e) => Self::Oracle(e),
         }
     }
 }

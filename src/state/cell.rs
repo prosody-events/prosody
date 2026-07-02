@@ -80,22 +80,14 @@ impl Cell {
     /// `data` for a resolved one. No oracle, no mutation — sound because of
     /// the prev-is-committed invariant.
     ///
-    /// This is the external reader's view (`StateReader`): one point read,
-    /// committed-only, possibly stale by the single in-flight event.
+    /// This is the committed-projection primitive a future non-owner reader
+    /// will observe: one point read, committed-only, possibly stale by the
+    /// single in-flight event. No production caller consumes it yet.
     #[must_use]
     pub fn project_committed(&self) -> Option<&Bytes> {
         match self {
             Self::Resolved(committed) => committed.get(),
             Self::Provisional(cell) => cell.prev(),
-        }
-    }
-
-    /// The provisional cell, when this cell carries one.
-    #[must_use]
-    pub fn as_provisional(&self) -> Option<&ProvisionalCell> {
-        match self {
-            Self::Provisional(cell) => Some(cell),
-            Self::Resolved(_) => None,
         }
     }
 }

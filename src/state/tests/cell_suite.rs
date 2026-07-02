@@ -1212,9 +1212,9 @@ where
 /// Where a [`FailingCellStore`] injects its `mark_resolved` failure.
 #[derive(Clone)]
 enum Poison {
-    /// Every cell of one named collection fails `Permanent` — the session's
-    /// best-effort `commit_apply` and the manager's no-strand recovery.
-    Collection(StateName),
+    /// Every cell of one named collection fails with the given category — the
+    /// session's best-effort `commit_apply` and the manager's recovery sweep.
+    Collection(StateName, ErrorCategory),
     /// Chosen single-byte coordinates each fail with a fixed category — a mixed
     /// per-cell sweep where unpoisoned siblings must still resolve.
     Cells(BTreeMap<u8, ErrorCategory>),
@@ -1235,9 +1235,16 @@ impl<S> FailingCellStore<S> {
     /// Wraps `inner`, poisoning `mark_resolved` `Permanent` for every cell of
     /// the `poison` collection.
     pub(crate) fn new(inner: S, poison: StateName) -> Self {
+        Self::new_with_category(inner, poison, ErrorCategory::Permanent)
+    }
+
+    /// Wraps `inner`, poisoning `mark_resolved` with `category` for every cell
+    /// of the `poison` collection — e.g. `Transient` to drive the recovery
+    /// sweep's reschedule path.
+    pub(crate) fn new_with_category(inner: S, poison: StateName, category: ErrorCategory) -> Self {
         Self {
             inner,
-            poison: Poison::Collection(poison),
+            poison: Poison::Collection(poison, category),
         }
     }
 
@@ -1253,8 +1260,8 @@ impl<S> FailingCellStore<S> {
     /// The category to inject when `mark_resolved` touches `cells`, or `None`.
     fn injected(&self, collection: &CollectionRef, cells: &[CellKey]) -> Option<ErrorCategory> {
         match &self.poison {
-            Poison::Collection(name) => {
-                (*collection.id().name() == *name).then_some(ErrorCategory::Permanent)
+            Poison::Collection(name, category) => {
+                (*collection.id().name() == *name).then_some(*category)
             }
             Poison::Cells(targets) => cells
                 .iter()

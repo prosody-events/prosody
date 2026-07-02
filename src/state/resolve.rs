@@ -81,8 +81,9 @@ impl<O> Resolver<O> {
 /// `ResolveCellError<RawErr, OracleErr>`, since its `get` resolves), that nests
 /// one extra layer. The two `OracleErr`s are identical (one oracle), so the
 /// nesting is pure redundancy: unwrap the inner store error and re-tag the
-/// oracle arm. (The recovery sweep keeps the nesting — `RecoveryError::Store`
-/// holds the cell store's whole error — so this only applies to `get`/`scan`.)
+/// oracle arm. (The recovery sweep keeps the nesting — its
+/// [`ResolveCellError::Store`] holds the cell store's whole error — so this
+/// only applies to `get`/`scan`.)
 pub(crate) fn flatten_resolve<StoreErr, OracleErr>(
     error: ResolveCellError<ResolveCellError<StoreErr, OracleErr>, OracleErr>,
 ) -> ResolveCellError<StoreErr, OracleErr>

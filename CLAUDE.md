@@ -262,23 +262,42 @@ so do not re-add a disk-backed dirty store. Fjall is retained **only** as the
 committed-value write-through cache (`FjallCellCache`, which owns its
 workspace).
 `settle` does, in straight-line code: stage provisional cells / write resolved
-(`finalize`, retrying transient failures in place) → arm `StateRecovery` if
-anything staged (a per-key singleton via `clear_and_schedule`, **arm-if-sooner**:
-re-armed only when the newly-staged fire is strictly earlier than the standing
-one, else skipped; a permanent arm failure gates the marker, invariant 8) →
+(`finalize`) → arm `StateRecovery` if anything staged (a per-key singleton via
+`clear_and_schedule`, **arm-if-sooner**: re-armed only when the newly-staged fire
+is strictly earlier than the standing one, else skipped) →
 **flush the registered dedup marker, strictly after the stage** → commit the
 offset/trigger → promote the staged cells (best-effort, O(1) per cell) →
 `after_commit`.
+**Retry forever; abort only on shutdown; never emit Terminal.** Every internal
+durability step (`retry_step`) retries **transient _and_ terminal** store
+failures forever — a broken store self-heals when it recovers, and a genuinely
+stuck store stalls the offset until the liveness probe restarts the process (a
+visible last resort, strictly better than silently abandoning); only a
+**permanent** data-rejection is skipped, and only **shutdown** abandons (aborts
+the marker → redelivery). Arming the backstop is **must-succeed** (invariant 8):
+`arm_backstop` retries *every* non-shutdown failure — including a permanent
+timer-store error and a fire-time-computation error — and returns
+`ArmOutcome::ShuttingDown` only on shutdown, so it never gates the marker except
+by a shutdown abandon. This makes "abort in normal operation" structurally
+unwritable at the boundary.
 The per-key fire is `min(recovery_delay, tightest touched collection's
 `recovery_within`)`: `recovery_delay` is the always-on durability floor and
 per-collection `recovery_within` is a tightening-only reader-convergence bound
 (it never loosens the floor). `ArmedKeys` maps each key to its standing fire time
 so arm-if-sooner can compare.
 The boundary **never** unschedules the backstop: the per-key `StateRecovery`
-timer is only ever pulled sooner (never pushed out) by each stateful commit and
-removed only by the sweep's `unschedule_all` once the key goes quiet, so one
-event can no longer point-clear — nor loosen — another event's still-needed
-backstop (finding F2). Because the
+timer is only ever pulled sooner (never pushed out) by each stateful commit, and
+the fired trigger (a per-`(key, TimerType)` singleton) is committed by the sweep
+arm itself — there is **no** `unschedule_all`, so one event can never
+point-clear — nor loosen — another event's still-needed backstop (finding F2).
+The sweep (`StateManager::recover`) mirrors the boundary's posture: it **never
+aborts the trigger except on shutdown**, committing it on progress (a resolved
+sweep, or a per-cell permanent skip that first-touch/the next commit recover)
+and, on a transient sweep failure, rescheduling a fresh backstop
+(`clear_and_schedule(now + recovery_delay)`, retried until it lands or shutdown)
+before committing. The stage→arm→commit order also closes the
+crash-before-arm window without any acquisition-time sweep: the offset is
+uncommitted until after the arm, so a crash there redelivers and re-arms. Because the
 marker flush is textually after the stage in one
 function, "marker before durable state" is **unwritable**. The dedup middleware
 in the stack only *filters* duplicates and *registers* the marker (on `Ok` /

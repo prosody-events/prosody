@@ -120,8 +120,9 @@ type StagedSet = Vec<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>;
 ///
 /// `get`/`scan` describe the session's **visible committed bytes** for a cell —
 /// the writer's [`KeyedStateSession`] realises that through the dirty overlay +
-/// oracle resolution; a reader realises the same contract through a pure
-/// committed projection. Neither realisation leaks into this contract.
+/// oracle resolution. The same contract admits a committed-only realisation (a
+/// pure committed projection) for a future non-owner reader; that realisation
+/// is not built yet, and neither realisation leaks into this contract.
 pub trait CellRead: sealed::ReadSessionMarker + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
@@ -266,8 +267,13 @@ pub(crate) mod sealed {
         /// Every staged cell resolved (promoted, or rolled back to its base).
         Resolved,
 
-        /// At least one resolution failed; the per-key `StateRecovery` backstop
-        /// (always left armed by the durability boundary) lets the sweep retry.
+        /// At least one resolution failed. Recovery is guaranteed without any
+        /// point-clear: the durability boundary never unschedules the per-key
+        /// `StateRecovery` backstop (only the sweep's own fire clears it), so
+        /// the standing backstop fires and the sweep retries; a
+        /// transient sweep failure reschedules a fresh backstop, a
+        /// permanent per-cell skip is left to first-touch and the key's
+        /// next commit. The backstop aborts only on shutdown.
         Incomplete,
     }
 

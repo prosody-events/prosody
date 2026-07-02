@@ -19,11 +19,10 @@ use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_m
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
-use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
-use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
+use crate::state::manager::{PartitionStateManager, PartitionStateProvider, SweepResolution};
 use crate::state::session::{CellSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::telemetry::sender::TelemetrySender;
@@ -748,37 +747,22 @@ async fn process_event<T, S, M, P>(
                 // here, owned by the state manager, and user handlers
                 // structurally never see the trigger. State is always
                 // wired, so the sweep is always intercepted (it is inert
-                // when no collections are registered). Commit on success.
-                // On failure, classify: a transient/terminal failure aborts
-                // so the trigger redelivers and the sweep re-runs; a
-                // permanent failure (e.g. a permanently failing scan — the
-                // sweep already skips per-entry Permanent failures inside)
-                // commits the trigger to stop refiring it forever — the
-                // seal stays recoverable by first-touch on the next access
-                // and by the backstop the key's next commit arms.
+                // when no collections are registered). `recover` never aborts
+                // the fired trigger except on shutdown (retry forever; abort
+                // only on shutdown): it commits the trigger on progress —
+                // resolved, a permanent per-cell skip, or after rescheduling a
+                // fresh backstop for a transient failure — and returns `Abort`
+                // only when shutdown interrupts the reschedule, so the trigger
+                // refires and re-sweeps on the next partition acquisition.
                 if firing.timer_type() == TimerType::StateRecovery {
                     let _guard = firing.process_scope();
                     let (trigger, commit_guard) = firing.into_inner();
                     match state_manager
-                        .recover(trigger.key.clone(), timer_manager)
+                        .recover(trigger.key.clone(), timer_manager, shutdown_rx)
                         .await
                     {
-                        Ok(()) => commit_guard.commit().await,
-                        Err(error) if error.classify_error() == ErrorCategory::Permanent => {
-                            error!(
-                                key = ?trigger.key,
-                                "keyed-state recovery sweep failed permanently: {error:#}; \
-                                 committing trigger to stop refiring (first-touch still recovers)"
-                            );
-                            commit_guard.commit().await;
-                        }
-                        Err(error) => {
-                            error!(
-                                key = ?trigger.key,
-                                "keyed-state recovery sweep failed: {error:#}; aborting trigger to retry"
-                            );
-                            commit_guard.abort().await;
-                        }
+                        SweepResolution::Commit => commit_guard.commit().await,
+                        SweepResolution::Abort => commit_guard.abort().await,
                     }
                     return;
                 }

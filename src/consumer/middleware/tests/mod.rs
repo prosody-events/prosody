@@ -534,7 +534,9 @@ mod rollback_safety {
     use crate::state::{CollectionId, StateKey, StateName, StateType};
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
+    use quickcheck::{QuickCheck, TestResult};
     use serde_json::json;
+    use tokio::runtime::Builder;
     use uuid::Uuid;
 
     /// Whether the durable cell at `id` is still provisional — the public,
@@ -584,22 +586,17 @@ mod rollback_safety {
 
     /// Stages one provisional cell on `cart` through a real session and returns
     /// the context (ready to abandon / settle), the durable store, and the cell
-    /// id. When `arm_failure` is set the context fails every timer schedule
-    /// permanently, so the backstop arm resolves to `Skip`.
+    /// id. `configure` applies context modifiers (`with_timer_failures`,
+    /// `with_shutdown`, ...) before staging.
     async fn staged(
-        arm_failure: bool,
+        configure: impl FnOnce(Ctx) -> Ctx,
     ) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&cart(), CollectionDef::new(None))?;
         let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
         let (session, cell_store) =
             test_session_parts(MemoryLoader::new(), registry, state_key.clone());
-        let base = MockEventContext::new().with_session(session);
-        let context: Ctx = if arm_failure {
-            base.with_arm_failure()
-        } else {
-            base
-        };
+        let context: Ctx = configure(MockEventContext::new().with_session(session));
 
         // Write a value and finalize → one provisional cell staged durably.
         let handle = context
@@ -629,7 +626,7 @@ mod rollback_safety {
     /// provisional for the sweep to resolve through the oracle.
     #[tokio::test]
     async fn after_marker_flush_keeps_the_cell_provisional() -> Result<()> {
-        let (context, cell_store, cart_id) = staged(false).await?;
+        let (context, cell_store, cart_id) = staged(|c| c).await?;
         let handler = ProbeHandler::ok(0);
 
         abandon(
@@ -652,7 +649,7 @@ mod rollback_safety {
     /// committed base — here the empty base, so the cell resolves to absent.
     #[tokio::test]
     async fn before_marker_flush_rolls_the_cell_back() -> Result<()> {
-        let (context, cell_store, cart_id) = staged(false).await?;
+        let (context, cell_store, cart_id) = staged(|c| c).await?;
         let handler = ProbeHandler::ok(0);
 
         abandon(
@@ -671,38 +668,90 @@ mod rollback_safety {
         Ok(())
     }
 
-    /// Arm-gates-marker (invariant 8), end to end through `settle`'s success
-    /// path: when the backstop arm fails permanently, `settle` must NOT flush
-    /// the marker and must abandon *before* it — so the staged cell rolls back
-    /// to its committed base and the offset aborts (the event redelivers). A
-    /// committed-and-promoted cell here would be a marker-uncertified write
-    /// that could TTL out unresolved.
-    #[tokio::test]
-    async fn permanent_arm_failure_skips_marker_and_aborts() -> Result<()> {
-        let (context, cell_store, cart_id) = staged(true).await?;
-        let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+    /// Abort-only-on-shutdown, end to end through `settle`'s success path: a
+    /// shutdown is the *sole* thing that stops the durability sequence short of
+    /// a commit — it abandons *before* the marker flush, so the staged cell
+    /// rolls back to its committed base and the offset aborts (the event
+    /// redelivers and re-runs). Every store failure instead retries forever.
+    /// This is exercised by the `prop_settle_aborts_iff_shutdown` property
+    /// below (its `shutdown` / non-`shutdown` × `fail_count` axes subsume the
+    /// abort-on-shutdown and retry-forever-self-heal directed cases).
+    ///
+    /// The never-abort-except-shutdown invariant, as a property over a
+    /// generated leading-failure count, the **category** those failures
+    /// classify as, and a shutdown flag: `settle`'s success path aborts the
+    /// offset **iff** shutdown (rolling the staged cell back), and
+    /// otherwise self-heals to a commit **no matter how many** failures —
+    /// of **any** category — the arm hits first (the arm is must-succeed,
+    /// invariant 8) — then flushes the marker, commits, and promotes the
+    /// cell. Generating the category is what exercises the retry-forever
+    /// fold in `retry_step`: `Terminal` retries rather than abandons, and
+    /// `Permanent` is retried by the arm's own loop past `retry_step`'s
+    /// `Skip`. Each iteration runs on its own paused single-thread
+    /// runtime so the retry backoff advances instantly and never blocks.
+    #[test]
+    fn prop_settle_aborts_iff_shutdown() {
+        fn property(fail_count: u8, category_sel: u8, shutdown: bool) -> TestResult {
+            // A small bound keeps each iteration's paused-clock retry loop fast
+            // while still crossing the zero / non-zero boundary.
+            let fail_count = usize::from(fail_count % 6);
+            let category = match category_sel % 3 {
+                0 => ErrorCategory::Transient,
+                1 => ErrorCategory::Permanent,
+                _ => ErrorCategory::Terminal,
+            };
+            let runtime = Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build();
+            let Ok(runtime) = runtime else {
+                return TestResult::error("failed to build paused runtime");
+            };
+            runtime.block_on(async move {
+                let configure = |c: Ctx| {
+                    let c = c.with_timer_failures(fail_count, category);
+                    if shutdown { c.with_shutdown() } else { c }
+                };
+                let Ok((context, cell_store, cart_id)) = staged(configure).await else {
+                    return TestResult::error("failed to stage");
+                };
+                let handler = ProbeHandler::ok(0);
+                let committed = Arc::new(AtomicUsize::new(0));
+                let aborted = Arc::new(AtomicUsize::new(0));
+                let guard = RecordingGuard {
+                    committed: committed.clone(),
+                    aborted: aborted.clone(),
+                };
 
-        // Success result drives the full durability sequence; the arm fails.
-        settle(&handler, context, guard, Ok(0)).await;
+                settle(&handler, context, guard, Ok(0)).await;
 
-        assert_eq!(
-            committed.load(Ordering::SeqCst),
-            0,
-            "marker must not commit"
-        );
-        assert_eq!(aborted.load(Ordering::SeqCst), 1, "offset must abort");
-        assert!(
-            !is_provisional(&cell_store, &cart_id).await?,
-            "a skipped arm must roll the staged cell back (no marker-uncertified provisional left \
-             to TTL out)",
-        );
-        Ok(())
+                let committed = committed.load(Ordering::SeqCst);
+                let aborted = aborted.load(Ordering::SeqCst);
+                let provisional = cell_store.provisional_cells(&cart_id);
+                futures::pin_mut!(provisional);
+                let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
+
+                if shutdown {
+                    // Abort iff shutdown: the offset aborts and the cell rolls back.
+                    if aborted != 1 || committed != 0 || still_provisional {
+                        return TestResult::error(format!(
+                            "shutdown must abort+rollback: committed={committed} \
+                             aborted={aborted} provisional={still_provisional}"
+                        ));
+                    }
+                } else {
+                    // No shutdown: self-heal to a commit however many failures first.
+                    if committed != 1 || aborted != 0 || still_provisional {
+                        return TestResult::error(format!(
+                            "non-shutdown must self-heal to commit: committed={committed} \
+                             aborted={aborted} provisional={still_provisional}"
+                        ));
+                    }
+                }
+                TestResult::passed()
+            })
+        }
+        QuickCheck::new().quickcheck(property as fn(u8, u8, bool) -> TestResult);
     }
 }
 
@@ -763,7 +812,7 @@ mod backstop_amortization {
 
             let outcome = arm_backstop(&context, &lifecycle).await;
             assert!(
-                matches!(outcome, StepOutcome::Done(())),
+                matches!(outcome, ArmOutcome::Armed),
                 "arm must succeed every commit"
             );
             total_scheduled += context.count_scheduled(TimerType::StateRecovery);

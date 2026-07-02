@@ -900,9 +900,31 @@ enum StepOutcome<R> {
     /// flushes a marker over an uncertain seal.
     Skip,
 
-    /// Shutdown, or a terminal failure: abandon the event — abort the
-    /// marker, roll back, and let redelivery re-run from clean state.
+    /// Shutdown: abandon the event — abort the marker, roll back, and let
+    /// redelivery re-run from clean state. Reached **only** via
+    /// [`EventContext::is_shutdown`], so every downstream `abandon` is, by
+    /// construction, a shutdown abort — a transient or terminal store failure
+    /// retries forever instead (see [`retry_step`]).
+    ///
+    /// [`EventContext::is_shutdown`]: crate::consumer::event_context::EventContext::is_shutdown
     Abandon,
+}
+
+/// Outcome of arming the `StateRecovery` backstop.
+///
+/// Arming is durability-critical (invariant 8: never certify a stage whose
+/// backstop we could not arm), so [`arm_backstop`] retries **every**
+/// non-shutdown failure forever — transient, terminal, *and* permanent
+/// timer-store errors, and a fire-time computation error alike. It can
+/// therefore end only one of two ways, which makes "abort in normal operation"
+/// unrepresentable for the arm.
+enum ArmOutcome {
+    /// The backstop is armed, or a standing one already covers this commit.
+    Armed,
+
+    /// Shutdown intervened before the backstop could be armed. The caller
+    /// abandons (aborts the marker) so redelivery re-runs and re-arms.
+    ShuttingDown,
 }
 
 /// The durability sequence: the single owner of seal → arm → marker-flush →
@@ -971,6 +993,27 @@ pub(crate) async fn settle<T, C, G>(
 
 /// The success arm of [`settle`]: seal, arm the backstop, flush the marker
 /// strictly after the seal, commit, then resolve the sealed set.
+///
+/// # Crash windows
+///
+/// The step order — stage → **arm** → marker flush → **commit** → promote —
+/// closes every crash window without any acquisition-time sweep (there is
+/// none):
+///
+/// * Crash after the stage, before the arm: the offset never commits, so the
+///   event **redelivers**, re-stages, and re-arms; the redelivered handler's
+///   own reads first-touch-resolve the orphan to its committed base.
+/// * Crash after the arm, before the commit: still uncommitted → redelivery,
+///   *and* the backstop is armed → the sweep resolves it either way.
+/// * Crash after the commit, before the promote: committed (no redelivery), but
+///   the backstop is armed → the sweep resolves; the flushed marker also
+///   dedup-filters any redelivery.
+///
+/// So every durable provisional cell is covered by redelivery
+/// (arm-precedes-commit) or an armed backstop. The lone first-touch-only
+/// residual is the permanent-partial-stage path below (a `finalize` `Skip`
+/// committed unarmed), an accepted edge bounded by first-touch and the cell
+/// TTL.
 async fn settle_committed<T, C, G>(
     handler: &T,
     context: C,
@@ -998,10 +1041,12 @@ async fn settle_committed<T, C, G>(
             // Permanent stage failure: a partial stage may be durable. Arm the
             // backstop defensively so the sweep resolves it, skip the marker
             // flush (invariant: marker present ⇒ stage durable), and commit.
-            // A shutdown `Abandon` from the arm is deliberately ignored:
+            // A shutdown `ShuttingDown` from the arm is deliberately ignored:
             // committing a permanently-unstageable event beats livelocking,
-            // and first-touch covers the unarmed cell. No marker was flushed
-            // before this commit, so rollback-safety does not arise.
+            // and first-touch covers the unarmed cell (the sole first-touch-only
+            // recovery residual — everything else is redelivery or an armed
+            // sweep). No marker was flushed before this commit, so
+            // rollback-safety does not arise.
             let _ = arm_backstop(&context, &lifecycle).await;
             guard.commit().await;
             handler.after_commit(context, result).await;
@@ -1029,18 +1074,16 @@ async fn settle_committed<T, C, G>(
     // backstop (F2).
     //
     // Arm-gates-marker (invariant 8): a backstop is the only guarantee that a
-    // staged provisional cell resolves before its TTL, so if arming does not
-    // succeed we must NOT certify the stage. Both a permanent failure (`Skip`)
-    // and a shutdown (`Abandon`) therefore skip the marker flush and abandon
-    // *before* it — the staged set rolls back to its committed base (no
-    // lingering provisional, nothing to TTL out) and the offset aborts so the
-    // event redelivers and re-runs. A *persistent* permanent arm failure
-    // redelivers until the timer store recovers; that is preferred over
-    // committing a marker-certified write that could later TTL out unresolved.
+    // staged provisional cell resolves before its TTL, so we must NOT certify
+    // the stage until it is armed. `arm_backstop` is must-succeed — it retries
+    // every non-shutdown failure forever — so the only non-`Armed` outcome is a
+    // shutdown, which abandons *before* the marker flush: the staged set rolls
+    // back to its committed base (no lingering provisional, nothing to TTL out)
+    // and the offset aborts so the event redelivers, re-runs, and re-arms.
     if staged {
         match arm_backstop(&context, &lifecycle).await {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Skip | StepOutcome::Abandon => {
+            ArmOutcome::Armed => {}
+            ArmOutcome::ShuttingDown => {
                 abandon(
                     handler,
                     context,
@@ -1157,6 +1200,13 @@ pub(crate) async fn abandon<T, C, G>(
 
 /// Arms the per-key `StateRecovery` backstop as an arm-if-sooner singleton.
 ///
+/// Arming is **must-succeed** (invariant 8: a backstop is the only guarantee a
+/// staged provisional cell resolves before its TTL, so we must not certify the
+/// stage without one). Every non-shutdown failure — a transient, terminal, or
+/// permanent timer-store error, or a fire-time computation error — therefore
+/// retries forever; the arm returns [`ArmOutcome::ShuttingDown`] only when
+/// shutdown interrupts it, never a swallow or an abort.
+///
 /// The first stateful commit on a quiet key issues one `clear_and_schedule`
 /// (a type-scoped singleton overwrite — only the key's `StateRecovery` timers
 /// move; user timers of other types are untouched) and records the standing
@@ -1184,40 +1234,61 @@ pub(crate) async fn abandon<T, C, G>(
 /// `Incomplete` leftover on a hot key whose collection is never read again
 /// waits for the next sweep to resolve it — bounded by first-touch on any
 /// access and by the cell's TTL.
-async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> StepOutcome<()>
+async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> ArmOutcome
 where
     C: EventContext,
 {
     let delay = lifecycle.recovery_fire_delay();
-    let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
-        Ok(fire) => fire,
-        Err(error) => {
-            error!(error = %error, "failed to compute StateRecovery fire time; skipping backstop");
-            return StepOutcome::Skip;
+    loop {
+        if context.is_shutdown() {
+            return ArmOutcome::ShuttingDown;
         }
-    };
-    // Arm-if-sooner: a standing backstop that fires no later than this one
-    // already covers this commit's staged cells, so skip re-arming. Per-key
-    // serialization makes the standing fire reliable — the sweep that consumes
-    // it cannot run while this commit decides.
-    if lifecycle
-        .backstop_armed()
+        // Compute the fire time. A failure here — the clock is unavailable, or a
+        // misconfigured recovery delay overflows the representable range — is
+        // not a shutdown signal, so retry rather than skip: arming is
+        // must-succeed (invariant 8), never a swallow.
+        let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
+            Ok(fire) => fire,
+            Err(error) => {
+                error!(error = %error, "failed to compute StateRecovery fire time; retrying");
+                sleep(DURABILITY_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        // Arm-if-sooner: a standing backstop that fires no later than this one
+        // already covers this commit's staged cells, so skip re-arming. Per-key
+        // serialization makes the standing fire reliable — the sweep that
+        // consumes it cannot run while this commit decides.
+        if lifecycle
+            .backstop_armed()
+            .await
+            .is_some_and(|standing| standing <= fire)
+        {
+            return ArmOutcome::Armed;
+        }
+        match retry_step(context, "arm StateRecovery backstop", || {
+            // Singleton overwrite: tightening replaces the one standing timer.
+            context.clear_and_schedule(fire, TimerType::StateRecovery)
+        })
         .await
-        .is_some_and(|standing| standing <= fire)
-    {
-        return StepOutcome::Done(());
+        {
+            StepOutcome::Done(()) => {
+                // Record the standing fire only after a successful arm, so a
+                // failed arm leaves the prior fire (or none) standing.
+                lifecycle.mark_backstop_armed(fire).await;
+                return ArmOutcome::Armed;
+            }
+            // A permanent timer-store/manager failure (a stale `InvalidContext`
+            // or a past fire time — both unreachable for a future-dated arm on a
+            // live context) is nonetheless retried: arming is must-succeed, so we
+            // recompute the fire and try again rather than certify a stage with
+            // no backstop.
+            StepOutcome::Skip => {
+                sleep(DURABILITY_RETRY_DELAY).await;
+            }
+            StepOutcome::Abandon => return ArmOutcome::ShuttingDown,
+        }
     }
-    let outcome = retry_step(context, "arm StateRecovery backstop", || {
-        // Singleton overwrite: tightening replaces the one standing timer.
-        context.clear_and_schedule(fire, TimerType::StateRecovery)
-    })
-    .await;
-    // Record the standing fire only after a successful arm, so a failed arm
-    // leaves the prior fire (or none) standing and the next commit retries.
-    if matches!(outcome, StepOutcome::Done(())) {
-        lifecycle.mark_backstop_armed(fire).await;
-    }
-    outcome
 }
 
 /// Flushes the registered marker, retrying transient failures; a permanent
@@ -1233,10 +1304,15 @@ where
     .await;
 }
 
-/// Retries one durability step until it succeeds, is abandoned on shutdown,
-/// or fails terminally; a permanent failure is skipped so the straight-line
-/// sequence continues defensively. Mirrors the retry-until-shutdown idiom of
-/// the timer commit loop and state-manager initialization.
+/// Retries one durability step until it succeeds or shutdown intervenes.
+/// **Transient and terminal store failures both retry forever** — a terminal
+/// store error is a broken dependency, not a process-shutdown signal, and
+/// retrying self-heals when the store recovers (a store that stays broken
+/// stalls the offset until the liveness probe restarts the process, the
+/// visible last resort). Only a **permanent** (data-rejection) failure is
+/// skipped, so the straight-line sequence can continue defensively; only
+/// shutdown abandons. Mirrors the retry-until-shutdown idiom of the timer
+/// commit loop and state-manager initialization.
 async fn retry_step<C, R, E, F, Fut>(context: &C, label: &str, mut step: F) -> StepOutcome<R>
 where
     C: EventContext,
@@ -1251,17 +1327,20 @@ where
         match step().await {
             Ok(value) => return StepOutcome::Done(value),
             Err(error) => match error.classify_error() {
-                ErrorCategory::Transient => {
+                // Retry forever, not just on Transient: a Terminal store error
+                // is a broken dependency, not a process-shutdown signal.
+                // Retrying self-heals the instant the store recovers; a store
+                // that stays broken stalls the offset until the liveness probe
+                // restarts the process — a visible last resort, strictly better
+                // than silently abandoning the event here. `abandon` is
+                // reserved for genuine shutdown, caught at the top of the loop.
+                ErrorCategory::Transient | ErrorCategory::Terminal => {
                     error!(label, error = %error, "durability step failed; retrying");
                     sleep(DURABILITY_RETRY_DELAY).await;
                 }
                 ErrorCategory::Permanent => {
                     error!(label, error = %error, "durability step failed permanently; skipping");
                     return StepOutcome::Skip;
-                }
-                ErrorCategory::Terminal => {
-                    error!(label, error = %error, "durability step terminal failure; abandoning");
-                    return StepOutcome::Abandon;
                 }
             },
         }

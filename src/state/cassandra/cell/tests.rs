@@ -18,7 +18,7 @@ use crate::Topic;
 use crate::cassandra::{BatchUnit, CassandraConfiguration, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallClient, FjallConfiguration};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
@@ -32,6 +32,7 @@ use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
+use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -265,6 +266,12 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 /// coordinate. The committed cells live in the `kind=Cell` range recovery never
 /// scans, so they cost nothing.
 ///
+/// This also pins the **set-gated read-skip**: before any cell is staged,
+/// a committed `get` and full-section `scan` over the clean cells touch only
+/// the `kind=Cell` range — **neither** recovery counter moves — so reads never
+/// consult the provisional index (byte-for-byte today's cost). The zeros are
+/// non-vacuous: the very same counters provably increment on the sweep below.
+///
 /// Sizes are kept modest (not the design's illustrative 1k/100k) so the live
 /// test stays fast and its committed-cell `index_delete` tombstones stay under
 /// Cassandra's scan-warn threshold; 16× is ample to distinguish an O(#cells)
@@ -287,6 +294,43 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
             .collect();
         store.write_resolved(&c, &resolved).await?;
 
+        // Read-skip: a committed get + full-section scan over the clean cells
+        // consult only the `kind=Cell` range — no recovery read of either kind.
+        let counts = store.recovery_reads();
+        assert!(
+            store
+                .get(c.id(), &cell_i(0), event(1))
+                .await?
+                .get()
+                .is_some(),
+            "the committed cell reads back present",
+        );
+        let scan = Scan {
+            section: Section::new(0),
+            start: Bound::Unbounded,
+            dir: Direction::Forward,
+            end: Bound::Unbounded,
+            limit: None,
+        };
+        let stream = store.scan_cells(c.id(), scan, event(1));
+        futures::pin_mut!(stream);
+        let mut scanned = 0_u32;
+        while let Some(item) = stream.next().await {
+            item?;
+            scanned += 1;
+        }
+        assert_eq!(scanned, committed, "the scan yields every committed cell");
+        assert_eq!(
+            counts.index_range_reads.load(Ordering::Relaxed),
+            0,
+            "a committed get/scan never issues a kind=Index read"
+        );
+        assert_eq!(
+            counts.cell_point_reads.load(Ordering::Relaxed),
+            0,
+            "a committed get/scan never issues a recovery point read"
+        );
+
         // A fixed handful of provisional cells: each a live marker.
         let staged: Vec<(CellKey, ProvisionalWrite)> = (0..PROVISIONAL)
             .map(|i| {
@@ -303,8 +347,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         store.write_provisional(&c, &staged).await?;
 
         // A cold sweep: one bounded seed read + one point read per provisional
-        // coordinate, independent of `committed`.
-        let counts = store.recovery_reads();
+        // coordinate, independent of `committed` (the same `counts` handle).
         let found = provisional_cells(&store, c.id()).await?;
         assert_eq!(found.len(), PROVISIONAL as usize);
         assert_eq!(

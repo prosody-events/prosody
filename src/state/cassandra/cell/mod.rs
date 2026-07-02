@@ -115,6 +115,25 @@ pub const INITIAL_VERSION: i32 = 1;
 /// serialize-only ([`SerializeValue`] in [`super::serialize`]), with no
 /// `TryFrom`/`DeserializeValue`.
 ///
+/// # Reserved-`kind` safety (invariant 6)
+///
+/// `kind` is **cell-store-internal**: it splits the physical partition into the
+/// data slice and the recovery-marker slice, and no collection may address the
+/// marker slice. This is enforced structurally, not by a runtime check:
+///
+/// * `CellKind` and its `Index` variant are private to this module — never
+///   re-exported, never reachable from a collection.
+/// * A collection addresses a cell only through a [`CellKey`], which carries
+///   **only** `(section, coordinate)` — it has no `kind` field, so the marker
+///   slice is unnameable from the collection layer.
+/// * This store binds `kind` itself, as the compile-time constant
+///   `CellKind::Cell` on every data read/write and `CellKind::Index` only on
+///   the marker mutators.
+///
+/// So "a collection reads or writes the index slice" is uncompilable, and no
+/// assertion or property test is needed to defend it.
+///
+/// [`CellKey`]: crate::state::cell_key::CellKey
 /// [`SerializeValue`]: scylla::serialize::value::SerializeValue
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
