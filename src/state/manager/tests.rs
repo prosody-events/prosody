@@ -286,9 +286,14 @@ async fn stage_under_timer(
         )
         .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    // `insert_async` returns `Err(key)` if already present — harmless; the flag
-    // is idempotent.
-    let _ = manager.inner.armed.insert_async(key.clone()).await;
+    // `insert_async` returns `Err(...)` if already present — harmless; the entry
+    // is idempotent. The stored fire is immaterial to `recover`, which only
+    // removes the key.
+    let _ = manager
+        .inner
+        .armed
+        .insert_async(key.clone(), CompactDateTime::now()?)
+        .await;
     Ok(())
 }
 
@@ -398,7 +403,11 @@ async fn recover_leaves_backstop_when_resolution_fails() -> Result<()> {
         )
         .await?;
     assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    let _ = manager.inner.armed.insert_async(key.clone()).await;
+    let _ = manager
+        .inner
+        .armed
+        .insert_async(key.clone(), CompactDateTime::now()?)
+        .await;
 
     let fire = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
     timers

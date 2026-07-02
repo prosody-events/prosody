@@ -87,9 +87,8 @@ so failures reduce to minimal reproductions. Without shrinking, a failing
 inside generators — deterministic ranges keep failures reproducible.
 
 Exemplars: `src/state/tests/cell_suite.rs` (`Trace`/`OverlayTrace`/`ScanTrace`
-and their `Arbitrary` impls), `src/state/fjall/codec/tests.rs` (`PrefixFields`
-generator over a null-prone alphabet), and the durability-sequence properties in
-`src/consumer/middleware/tests/durability_boundary.rs`.
+and their `Arbitrary` impls) and `src/state/fjall/codec/tests.rs` (`PrefixFields`
+generator over a null-prone alphabet).
 
 ### Backend-generic suite runners
 

@@ -809,3 +809,165 @@ mod backstop_amortization {
         Ok(())
     }
 }
+
+/// `arm_backstop` is arm-if-sooner: it (re-)arms the per-key `StateRecovery`
+/// backstop only when a newly-staged commit's fire is strictly sooner than the
+/// standing one. A per-collection `recovery_within` can thereby *tighten* the
+/// single timer, while a later, looser commit keeps the tighter one — so every
+/// staged cell is swept no later than its own bound and the amortized single
+/// timer is preserved.
+mod arm_backstop {
+    use super::*;
+    use crate::Key;
+    use crate::codec::JsonCodec;
+    use crate::consumer::middleware::tests::test_support::TimerOperation;
+    use crate::loader::MemoryLoader;
+    use crate::state::StateKey;
+    use crate::state::descriptor::tests::test_session_with_armed;
+    use crate::state::descriptor::{Registered, value_state};
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::{ArmedKeys, LifecycleAccessExt};
+    use crate::timers::duration::CompactDuration;
+    use color_eyre::eyre::{Result, eyre};
+    use futures::executor;
+    use quickcheck::{QuickCheck, TestResult};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    const FLOOR_SECS: u32 = 30;
+
+    /// The fire time of the most recent `StateRecovery` `clear_and_schedule`,
+    /// or `None` if the arm did not (re-)schedule one.
+    fn scheduled_recovery_fire(ops: &[TimerOperation]) -> Option<CompactDateTime> {
+        ops.iter().rev().find_map(|op| match op {
+            TimerOperation::ClearAndSchedule(fire, TimerType::StateRecovery) => Some(*fire),
+            _ => None,
+        })
+    }
+
+    /// Stages a cell in one `ReadCommitted` value collection per entry in
+    /// `bounds` (each carrying that `recovery_within`), sharing `armed`/`key`
+    /// with prior events, then runs `arm_backstop`. Brackets the arm with `now`
+    /// so the caller can bound the scheduled fire time.
+    async fn run_arm(
+        bounds: &[Option<u32>],
+        key: &StateKey,
+        armed: &ArmedKeys,
+    ) -> Result<(CompactDateTime, CompactDateTime, Vec<TimerOperation>)> {
+        let mut registry = CollectionDefRegistry::default();
+        for (i, within) in bounds.iter().enumerate() {
+            registry.register(
+                &value_state::<JsonCodec>(&format!("c{i}")),
+                CollectionDef::new(None).with_recovery_within(within.map(CompactDuration::new)),
+            )?;
+        }
+        let (session, _store) =
+            test_session_with_armed(MemoryLoader::new(), registry, key.clone(), armed.clone());
+        let context = MockEventContext::new()
+            .with_session(session)
+            .with_timer_tracking();
+        for i in 0..bounds.len() {
+            let handle = context
+                .state(Registered::new(value_state::<JsonCodec>(&format!("c{i}"))))
+                .map_err(|e| eyre!("bind: {e}"))?;
+            handle.set(json!({ "v": i as i32 })).await?;
+        }
+        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
+        lifecycle
+            .finalize()
+            .await
+            .map_err(|e| eyre!("finalize: {e}"))?;
+        let before = CompactDateTime::now()?;
+        arm_backstop(&context, &lifecycle).await;
+        let after = CompactDateTime::now()?;
+        Ok((before, after, context.timer_operations()))
+    }
+
+    /// Arm-if-sooner **and** the convergence bound, as one property over
+    /// `(bounds, standing)`:
+    ///
+    /// - **Fire time** — a staged event schedules its `StateRecovery` sweep at
+    ///   `now + min(recovery_delay, tightest touched recovery_within)`, so no
+    ///   provisional cell outlives its collection's bound and the fire never
+    ///   exceeds the floor (hence stays below every collection's TTL, the
+    ///   `TtlBelowRecoveryDelay` invariant — no dedup-margin regression).
+    /// - **Arm-if-sooner** — a standing backstop is re-armed **iff** the new
+    ///   fire is strictly sooner; on re-arm `ArmedKeys` holds the scheduled
+    ///   fire, and when kept the standing fire is left untouched.
+    ///
+    /// `standing`: `None` = unarmed → arm; `Some(true)` = a far-future standing
+    /// fire (looser) → must tighten; `Some(false)` = a far-past one (tighter) →
+    /// must keep. The far-future/past extremes make the strict-`<` decision
+    /// immune to sub-second wall-clock drift across the bracketing `now` reads.
+    #[test]
+    fn prop_arm_backstop_arms_iff_new_fire_is_sooner() {
+        async fn check(bounds: &[Option<u32>], standing: Option<bool>) -> Result<()> {
+            let armed: ArmedKeys = Arc::default();
+            let raw_key: Key = Arc::from("k");
+            let key = StateKey::new(Uuid::from_u128(0xC0), raw_key.clone());
+
+            // Seed the standing backstop at an extreme so the decision cannot
+            // flip on sub-second drift: MAX is always later than the new fire
+            // (must tighten), MIN always earlier-or-equal (must keep).
+            let seed = standing.map(|future| {
+                if future {
+                    CompactDateTime::MAX
+                } else {
+                    CompactDateTime::MIN
+                }
+            });
+            if let Some(seed) = seed {
+                let _ = armed.insert_async(raw_key.clone(), seed).await;
+            }
+
+            let (before, after, ops) = run_arm(bounds, &key, &armed).await?;
+            let delay = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
+            let stored = armed.read_async(&raw_key, |_, &f| f).await;
+            let scheduled = scheduled_recovery_fire(&ops);
+
+            // Re-arm unless a sooner-or-equal backstop (the far-past seed)
+            // already stands.
+            if standing == Some(false) {
+                if scheduled.is_some() {
+                    return Err(eyre!("a sooner-or-equal standing backstop must not re-arm"));
+                }
+                if stored != seed {
+                    return Err(eyre!(
+                        "the kept path must leave the standing fire untouched"
+                    ));
+                }
+                return Ok(());
+            }
+
+            let fire = scheduled.ok_or_else(|| eyre!("expected an arm, none scheduled"))?;
+            let (lo, hi) = (
+                before.epoch_seconds() + delay,
+                after.epoch_seconds() + delay,
+            );
+            if !(lo..=hi).contains(&fire.epoch_seconds()) {
+                return Err(eyre!(
+                    "fire {} not in [{lo},{hi}] (delay {delay}s ≤ floor {FLOOR_SECS}s)",
+                    fire.epoch_seconds(),
+                ));
+            }
+            if stored != Some(fire) {
+                return Err(eyre!("stored fire {stored:?} != scheduled {fire:?}"));
+            }
+            Ok(())
+        }
+
+        fn prop(raw: Vec<Option<u16>>, standing: Option<bool>) -> TestResult {
+            // ≥1 collection (so something stages); bounded count keeps the
+            // interned-name set small.
+            if raw.is_empty() || raw.len() > 6 {
+                return TestResult::discard();
+            }
+            let bounds: Vec<Option<u32>> = raw.into_iter().map(|o| o.map(u32::from)).collect();
+            match executor::block_on(check(&bounds, standing)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e.to_string()),
+            }
+        }
+        QuickCheck::new().quickcheck(prop as fn(Vec<Option<u16>>, Option<bool>) -> TestResult);
+    }
+}

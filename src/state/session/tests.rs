@@ -220,6 +220,77 @@ fn message(n: u128) -> (EventRef, Uuid) {
     (EventRef::Message { dedup_id }, dedup_id)
 }
 
+/// Builds a session whose registry has one `ReadCommitted` value collection per
+/// entry in `bounds` (each carrying that `recovery_within`), stages one cell in
+/// every collection, finalizes, and returns the resulting
+/// `recovery_fire_delay`. `floor_secs` is the `recovery_delay`.
+async fn staged_fire_delay(bounds: &[Option<u32>], floor_secs: u32) -> Result<CompactDuration> {
+    let mut registry = CollectionDefRegistry::new(None);
+    let mut names = Vec::with_capacity(bounds.len());
+    for (i, within) in bounds.iter().enumerate() {
+        let name = format!("c{i}");
+        registry.register(
+            &value_state::<JsonCodec>(&name),
+            CollectionDef::new(None).with_recovery_within(within.map(CompactDuration::new)),
+        )?;
+        names.push(StateName::try_new(&name)?);
+    }
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let registry = Arc::new(registry);
+    let oracle = ScriptedOracle::default();
+    let cell = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let session: Session = KeyedStateSession::new(SessionParts {
+        cell,
+        dirty: Arc::new(DirtyStore::new()),
+        oracle,
+        loader: (),
+        registry,
+        state_key: StateKey::new(Uuid::from_u128(0xF01D), Arc::from("key")),
+        event: EventRef::Message {
+            dedup_id: Uuid::new_v4(),
+        },
+        recovery_delay: CompactDuration::new(floor_secs),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    });
+    for name in &names {
+        session
+            .set(StateType::Application, name, &value_cell(), b"v")
+            .await?;
+    }
+    session.finalize().await?;
+    Ok(session.recovery_fire_delay())
+}
+
+/// `recovery_fire_delay` is `min(recovery_delay, min over staged collections'
+/// recovery_within)`: a `None` bound or one above the floor is inert, a tighter
+/// one pulls the delay down, and a clean (empty) staged set keeps the floor.
+#[test]
+fn prop_recovery_fire_delay_folds_bounds_against_floor() {
+    const FLOOR_SECS: u32 = 30;
+
+    fn prop(raw: Vec<Option<u16>>) -> TestResult {
+        // Cap the collection count so the interned-name set stays bounded.
+        if raw.len() > 8 {
+            return TestResult::discard();
+        }
+        let bounds: Vec<Option<u32>> = raw.into_iter().map(|o| o.map(u32::from)).collect();
+        // Empty (nothing staged) → floor; otherwise the floor tightened by the
+        // smallest declared bound.
+        let expected = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
+        match executor::block_on(staged_fire_delay(&bounds, FLOOR_SECS)) {
+            Ok(delay) if delay.seconds() == expected => TestResult::passed(),
+            Ok(delay) => TestResult::error(format!(
+                "expected {expected}s, got {}s for {bounds:?}",
+                delay.seconds(),
+            )),
+            Err(e) => TestResult::error(format!("staging failed: {e}")),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(Vec<Option<u16>>) -> TestResult);
+}
+
 /// The single marker flushes **exactly once, strictly after the stage**: it is
 /// not recorded after `finalize` alone, is recorded after `flush_marker`, and a
 /// second flush writes nothing (the slot clears on success). Pins an ordering a

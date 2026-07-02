@@ -216,8 +216,10 @@ where
     registry: Arc<CollectionDefRegistry>,
     segment_id: SegmentId,
     recovery_delay: CompactDuration,
-    /// Keys with a standing `StateRecovery` backstop. Sessions read/set it to
-    /// amortize re-arming; `recover` removes the key when the sweep fires.
+    /// Keys mapped to the fire time of their standing `StateRecovery` backstop.
+    /// Sessions read it to re-arm only when a newer commit's fire is sooner
+    /// (the `recovery_within` tightening); `recover` removes the key when
+    /// the sweep fires.
     armed: ArmedKeys,
 }
 

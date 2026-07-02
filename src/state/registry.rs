@@ -10,7 +10,8 @@ use thiserror::Error;
 
 /// Operational per-collection settings that override middleware defaults.
 ///
-/// Carries the collection's TTL and [`CommitMode`]. `ttl` is `None` for
+/// Carries the collection's TTL, [`CommitMode`], and recovery-convergence
+/// bound. `ttl` is `None` for
 /// "do not bind a TTL" (explicit indefinite retention); a `Some(ttl)` over
 /// Cassandra's `USING TTL` ceiling is rejected at
 /// [`CollectionDefRegistry::register`] time, never silently collapsed.
@@ -18,6 +19,20 @@ use thiserror::Error;
 /// cell that promotes to committed after the event commit
 /// ([`CommitMode::ReadCommitted`]) or apply straight to the committed value
 /// on handler success ([`CommitMode::ReadUncommitted`]).
+///
+/// `recovery_within` is a **reader-convergence bound**, not a durability knob:
+/// `Some(d)` guarantees this collection's provisional cells are swept back to
+/// committed within `d` of the commit, tightening how long an external
+/// (non-owner) reader can observe the prior
+/// committed value. `None` (the default) leaves the collection on the always-on
+/// `recovery_delay` durability floor. The effective per-key fire is
+/// `min(recovery_delay, tightest touched recovery_within)`, so this field only
+/// ever pulls the single per-key backstop *sooner* — a value above the floor is
+/// clamped by it, and a value on a `ReadUncommitted` collection is inert
+/// (those writes never stage a provisional cell, so they have no convergence
+/// window). Being tightening-only, it needs no ceiling or ordering validation:
+/// the floor already sits strictly below every collection's TTL
+/// ([`RegisterStateError::TtlBelowRecoveryDelay`]).
 ///
 /// Operational settings are deliberately separate from the collection's
 /// frozen [`StructuralIdentity`]: the identity comes only from the
@@ -34,16 +49,22 @@ pub struct CollectionDef {
 
     /// Per-collection commit mode.
     pub commit_mode: CommitMode,
+
+    /// Per-collection recovery-convergence bound (see the type doc).
+    /// `None` uses the always-on `recovery_delay` floor.
+    pub recovery_within: Option<CompactDuration>,
 }
 
 impl CollectionDef {
     /// Creates a collection definition with the supplied TTL; commit
-    /// mode defaults to [`CommitMode::ReadCommitted`].
+    /// mode defaults to [`CommitMode::ReadCommitted`] and the
+    /// recovery-convergence bound to `None` (the `recovery_delay` floor).
     #[must_use]
     pub fn new(ttl: Option<CompactDuration>) -> Self {
         Self {
             ttl,
             commit_mode: CommitMode::ReadCommitted,
+            recovery_within: None,
         }
     }
 
@@ -51,6 +72,13 @@ impl CollectionDef {
     #[must_use]
     pub fn with_commit_mode(mut self, mode: CommitMode) -> Self {
         self.commit_mode = mode;
+        self
+    }
+
+    /// Builder-style override for the recovery-convergence bound.
+    #[must_use]
+    pub fn with_recovery_within(mut self, recovery_within: Option<CompactDuration>) -> Self {
+        self.recovery_within = recovery_within;
         self
     }
 }
@@ -202,6 +230,20 @@ impl CollectionDefRegistry {
     pub fn commit_mode_for(&self, state_type: StateType, name: &StateName) -> CommitMode {
         self.lookup_collection(state_type, name)
             .map_or(CommitMode::ReadCommitted, |c| c.def.commit_mode)
+    }
+
+    /// Returns the recovery-convergence bound declared for `(state_type,
+    /// name)`, or `None` for a name with no bound (or not in the registry).
+    /// The durability boundary folds this against the `recovery_delay`
+    /// floor, so `None` means "use the floor"; see [`CollectionDef`].
+    #[must_use]
+    pub fn recovery_within_for(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Option<CompactDuration> {
+        self.lookup_collection(state_type, name)
+            .and_then(|c| c.def.recovery_within)
     }
 
     fn lookup_collection(

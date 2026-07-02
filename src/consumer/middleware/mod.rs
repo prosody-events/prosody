@@ -1155,28 +1155,32 @@ pub(crate) async fn abandon<T, C, G>(
     handler.after_abort(context, result).await;
 }
 
-/// Arms the per-key `StateRecovery` backstop as an amortized singleton.
+/// Arms the per-key `StateRecovery` backstop as an arm-if-sooner singleton.
 ///
 /// The first stateful commit on a quiet key issues one `clear_and_schedule`
 /// (a type-scoped singleton overwrite — only the key's `StateRecovery` timers
-/// move; user timers of other types are untouched) and marks the key armed.
-/// While that backstop stands, later commits skip re-arming entirely: the
-/// standing timer at first-commit-plus-`delay` already covers their staged
-/// cells. So a burst of commits on one key issues a *single* timer-store write
-/// rather than one per commit — the amortization the redesign's
-/// tombstone-accounting depends on.
+/// move; user timers of other types are untouched) and records the standing
+/// fire. A later commit re-arms **only** when its fire is strictly sooner than
+/// the standing one — the tightening a per-collection `recovery_within` bound
+/// needs — and otherwise skips: the standing timer already sweeps its staged
+/// cells no later than its own bound. A commit that only loosens keeps the
+/// tighter timer. So a burst of same-delay commits on one key still issues a
+/// *single* timer-store write — the amortization the redesign's
+/// tombstone-accounting depends on — while a tighter commit pulls the one timer
+/// sooner.
 ///
-/// The armed flag is cleared only when the sweep fires (the manager's
+/// The standing fire is cleared only when the sweep fires (the manager's
 /// `recover`), so the durability boundary never unschedules and one event can
 /// never clear another's still-needed backstop (finding F2). Per-key
-/// serialization makes the flag race-free: the sweep that consumes a backstop
-/// cannot run while a commit on the same key decides whether to re-arm.
+/// serialization makes the decision race-free: the sweep that consumes a
+/// backstop cannot run while a commit on the same key decides whether to
+/// re-arm.
 ///
-/// Cost and healing: at most one `clear_and_schedule` per backstop generation,
-/// and the sweep fires `delay` after the first commit of a generation (on a
-/// sustained hot key, periodically). Any read of a provisional collection heals
-/// it immediately via first-touch (the cell store's resolving `get`). Accepted
-/// residual: an
+/// Cost and healing: at most one `clear_and_schedule` per backstop generation
+/// (plus one per tightening), and the sweep fires by the tightest bound of a
+/// generation (on a sustained hot key, periodically). Any read of a provisional
+/// collection heals it immediately via first-touch (the cell store's resolving
+/// `get`). Accepted residual: an
 /// `Incomplete` leftover on a hot key whose collection is never read again
 /// waits for the next sweep to resolve it — bounded by first-touch on any
 /// access and by the cell's TTL.
@@ -1184,12 +1188,6 @@ async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> St
 where
     C: EventContext,
 {
-    // Amortize: a standing backstop already covers this commit's staged cells,
-    // so skip re-arming. Per-key serialization makes the standing flag reliable
-    // — the sweep that consumes it cannot run while this commit decides.
-    if lifecycle.backstop_armed().await {
-        return StepOutcome::Done(());
-    }
     let delay = lifecycle.recovery_fire_delay();
     let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
         Ok(fire) => fire,
@@ -1198,14 +1196,26 @@ where
             return StepOutcome::Skip;
         }
     };
+    // Arm-if-sooner: a standing backstop that fires no later than this one
+    // already covers this commit's staged cells, so skip re-arming. Per-key
+    // serialization makes the standing fire reliable — the sweep that consumes
+    // it cannot run while this commit decides.
+    if lifecycle
+        .backstop_armed()
+        .await
+        .is_some_and(|standing| standing <= fire)
+    {
+        return StepOutcome::Done(());
+    }
     let outcome = retry_step(context, "arm StateRecovery backstop", || {
+        // Singleton overwrite: tightening replaces the one standing timer.
         context.clear_and_schedule(fire, TimerType::StateRecovery)
     })
     .await;
-    // Record the standing backstop only after a successful arm, so a failed
-    // arm leaves the flag clear and the next commit retries.
+    // Record the standing fire only after a successful arm, so a failed arm
+    // leaves the prior fire (or none) standing and the next commit retries.
     if matches!(outcome, StepOutcome::Done(())) {
-        lifecycle.mark_backstop_armed().await;
+        lifecycle.mark_backstop_armed(fire).await;
     }
     outcome
 }

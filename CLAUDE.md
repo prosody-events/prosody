@@ -98,6 +98,14 @@ If you can't name the invariant, you don't yet understand the code well enough t
   their place (a stub that only shows syntax, or a comment that restates the
   prose above it, adds nothing). Bad or needless docs **hurt** readability —
   prefer fewer, sharper words over more.
+- **Never cite a plan's or spec's section number, phase number, or ordinal
+  (`§2.7`, "Phase 4", "(O8)", "finding #3") in durable docs** — code doc
+  comments, CLAUDE.md, TESTING.md, PR/commit text. Plans live in gitignored
+  scratch (`docs/`, `specs/`); the number is meaningless to a reader without
+  that file and goes stale when the plan is renumbered or deleted. Name the
+  concept instead, or link a durable symbol (`[`CollectionDef`]`). Stable
+  cross-references to invariants/findings **documented in CLAUDE.md itself**
+  (e.g. "invariant 8", "finding F2") are fine — those live in a durable doc.
 
 **Style:**
 
@@ -255,15 +263,22 @@ committed-value write-through cache (`FjallCellCache`, which owns its
 workspace).
 `settle` does, in straight-line code: stage provisional cells / write resolved
 (`finalize`, retrying transient failures in place) → arm `StateRecovery` if
-anything staged (an amortized per-key singleton via `clear_and_schedule`,
-skipped while a backstop already stands; a permanent arm failure gates the
-marker, invariant 8) → **flush the registered dedup marker, strictly after the
-stage** → commit the offset/trigger → promote the staged cells (best-effort,
-O(1) per cell) → `after_commit`.
+anything staged (a per-key singleton via `clear_and_schedule`, **arm-if-sooner**:
+re-armed only when the newly-staged fire is strictly earlier than the standing
+one, else skipped; a permanent arm failure gates the marker, invariant 8) →
+**flush the registered dedup marker, strictly after the stage** → commit the
+offset/trigger → promote the staged cells (best-effort, O(1) per cell) →
+`after_commit`.
+The per-key fire is `min(recovery_delay, tightest touched collection's
+`recovery_within`)`: `recovery_delay` is the always-on durability floor and
+per-collection `recovery_within` is a tightening-only reader-convergence bound
+(it never loosens the floor). `ArmedKeys` maps each key to its standing fire time
+so arm-if-sooner can compare.
 The boundary **never** unschedules the backstop: the per-key `StateRecovery`
-timer is debounced outward by each stateful commit and removed only by the
-sweep's `unschedule_all` once the key goes quiet, so one event can no longer
-point-clear another event's still-needed backstop (finding F2). Because the
+timer is only ever pulled sooner (never pushed out) by each stateful commit and
+removed only by the sweep's `unschedule_all` once the key goes quiet, so one
+event can no longer point-clear — nor loosen — another event's still-needed
+backstop (finding F2). Because the
 marker flush is textually after the stage in one
 function, "marker before durable state" is **unwritable**. The dedup middleware
 in the stack only *filters* duplicates and *registers* the marker (on `Ok` /

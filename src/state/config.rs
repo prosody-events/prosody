@@ -176,6 +176,7 @@ mod tests {
     use crate::state::registry::RegisterStateError;
     use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::Result;
+    use quickcheck::{QuickCheck, TestResult};
     use std::path::PathBuf;
     use validator::Validate;
 
@@ -273,5 +274,45 @@ mod tests {
         let _ = config.register(cart().ttl(CompactDuration::new(61)));
         assert!(config.build_registry().is_ok());
         Ok(())
+    }
+
+    /// Round-trip: whatever `recovery_within` a descriptor is built with —
+    /// set, then optionally cleared — is exactly what `recovery_within_for`
+    /// reads back after registration (unset / cleared ⇒ `None`). Proves the
+    /// fluent config reaches the registry unaltered and that the bound needs no
+    /// validation (`build_registry` accepts any duration, since it is
+    /// tightening-only against the recovery-delay floor).
+    #[test]
+    fn prop_recovery_within_round_trips_through_the_registry() {
+        fn prop(within: Option<u32>, clear: bool) -> TestResult {
+            let bound = within.map(CompactDuration::new);
+            let mut descriptor = cart();
+            if let Some(d) = bound {
+                descriptor = descriptor.recovery_within(d);
+            }
+            if clear {
+                descriptor = descriptor.no_recovery_within();
+            }
+            let expected = if clear { None } else { bound };
+
+            match round_trip(descriptor) {
+                Ok(read) if read == expected => TestResult::passed(),
+                Ok(read) => TestResult::error(format!("expected {expected:?}, read {read:?}")),
+                Err(e) => TestResult::error(format!("registry build failed: {e}")),
+            }
+        }
+        QuickCheck::new().quickcheck(prop as fn(Option<u32>, bool) -> TestResult);
+    }
+
+    /// Registers `descriptor` and reads its `recovery_within` back from the
+    /// built registry.
+    fn round_trip(descriptor: ValueDescriptor) -> Result<Option<CompactDuration>> {
+        use crate::state::{StateName, StateType};
+
+        let mut config = KeyedStateConfiguration::builder().build()?;
+        let _ = config.register(descriptor);
+        Ok(config
+            .build_registry()?
+            .recovery_within_for(StateType::Application, &StateName::try_new("cart")?))
     }
 }

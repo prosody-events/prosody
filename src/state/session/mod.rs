@@ -70,13 +70,14 @@ use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
 };
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
-use scc::HashSet as ConcurrentHashSet;
+use scc::HashMap as ConcurrentHashMap;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use std::error::Error;
 use std::fmt;
@@ -91,13 +92,18 @@ use uuid::Uuid;
 #[cfg(test)]
 mod tests;
 
-/// Shared per-partition set of keys with a standing `StateRecovery` backstop.
+/// Shared per-partition map from a key to the fire time of its standing
+/// `StateRecovery` backstop.
 ///
-/// A lock-free [`scc::HashSet`](ConcurrentHashSet) (not a `Mutex<HashSet>`):
+/// A lock-free [`scc::HashMap`](ConcurrentHashMap) (not a `Mutex<HashMap>`):
 /// the durability boundary touches it on every stateful commit, concurrently
 /// across the partition's keys, so a single mutex would serialize unrelated
-/// keys.
-pub(crate) type ArmedKeys = Arc<ConcurrentHashSet<Key, RandomState>>;
+/// keys. The stored fire lets `arm_backstop` re-arm only when a newly-staged
+/// commit's fire is *sooner* than the standing one (the tightening the
+/// per-collection `recovery_within` bound needs); the map is still
+/// self-draining (`recover` removes the key when the sweep fires), so it never
+/// grows without bound.
+pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomState>>;
 
 /// The provisional cells `finalize` staged, grouped by collection (its ref
 /// carries the TTL). Only `ReadCommitted` collections appear; `ReadUncommitted`
@@ -227,7 +233,7 @@ pub trait CellSession: CellRead + StateLifecycle {
 /// bounds but can neither implement it nor reach the lifecycle: staging,
 /// promoting, and resetting are framework-only moves.
 pub(crate) mod sealed {
-    use super::{CompactDuration, Future, StateAccessError, Uuid};
+    use super::{CompactDateTime, CompactDuration, Future, StateAccessError, Uuid};
 
     /// Crate-private marker keeping [`super::CellRead`] consistent with the
     /// framework's seal-everything hygiene: only the in-crate
@@ -327,16 +333,19 @@ pub(crate) mod sealed {
         /// once `finalize` has run.
         fn discard_dirty(&self);
 
-        /// Delay between staging and the `StateRecovery` sweep.
+        /// Delay between staging and the `StateRecovery` sweep: the
+        /// `recovery_delay` floor tightened by the smallest `recovery_within`
+        /// among the staged collections.
         fn recovery_fire_delay(&self) -> CompactDuration;
 
-        /// Whether a `StateRecovery` backstop is already standing for this
-        /// session's key.
-        fn backstop_armed(&self) -> impl Future<Output = bool> + Send;
+        /// The fire time of the `StateRecovery` backstop already standing for
+        /// this session's key, or `None` when none stands. `arm_backstop`
+        /// re-arms only when its new fire is sooner than this.
+        fn backstop_armed(&self) -> impl Future<Output = Option<CompactDateTime>> + Send;
 
-        /// Records that a `StateRecovery` backstop is now standing for this
-        /// session's key.
-        fn mark_backstop_armed(&self) -> impl Future<Output = ()> + Send;
+        /// Records that a `StateRecovery` backstop firing at `fire` now stands
+        /// for this session's key (overwriting any earlier standing fire).
+        fn mark_backstop_armed(&self, fire: CompactDateTime) -> impl Future<Output = ()> + Send;
     }
 }
 
@@ -770,21 +779,38 @@ where
     }
 
     fn recovery_fire_delay(&self) -> CompactDuration {
-        self.inner.recovery_delay
+        // Tighten the always-on floor by the smallest `recovery_within` among
+        // the collections this event staged. Runs after `finalize` records the
+        // staged set, so a `Clean` (or not-yet-staged) event reads `None` and
+        // keeps the floor. `recovery_within` on a `ReadUncommitted` collection
+        // is inert: such collections never stage a provisional cell, so they
+        // never appear here. The fold is sync (`recovery_within_for` is sync),
+        // so no await runs under the `staged` lock.
+        let floor = self.inner.recovery_delay;
+        self.inner.staged.lock().as_ref().map_or(floor, |staged| {
+            staged
+                .iter()
+                .filter_map(|(collection, _)| {
+                    let id = collection.id();
+                    self.inner
+                        .registry
+                        .recovery_within_for(id.state_type(), id.name())
+                })
+                .fold(floor, CompactDuration::min)
+        })
     }
 
-    async fn backstop_armed(&self) -> bool {
+    async fn backstop_armed(&self) -> Option<CompactDateTime> {
         self.inner
             .armed
-            .contains_async(&self.inner.state_key.key)
+            .read_async(&self.inner.state_key.key, |_, &fire| fire)
             .await
     }
 
-    async fn mark_backstop_armed(&self) {
-        let _ = self
-            .inner
+    async fn mark_backstop_armed(&self, fire: CompactDateTime) {
+        self.inner
             .armed
-            .insert_async(self.inner.state_key.key.clone())
+            .upsert_async(self.inner.state_key.key.clone(), fire)
             .await;
     }
 }
@@ -954,13 +980,13 @@ where
     }
 
     /// See [`StateLifecycle::backstop_armed`].
-    pub(crate) async fn backstop_armed(&self) -> bool {
+    pub(crate) async fn backstop_armed(&self) -> Option<CompactDateTime> {
         self.session.backstop_armed().await
     }
 
     /// See [`StateLifecycle::mark_backstop_armed`].
-    pub(crate) async fn mark_backstop_armed(&self) {
-        self.session.mark_backstop_armed().await;
+    pub(crate) async fn mark_backstop_armed(&self, fire: CompactDateTime) {
+        self.session.mark_backstop_armed(fire).await;
     }
 }
 
@@ -1143,9 +1169,9 @@ where
         CompactDuration::MIN
     }
 
-    async fn backstop_armed(&self) -> bool {
-        false
+    async fn backstop_armed(&self) -> Option<CompactDateTime> {
+        None
     }
 
-    async fn mark_backstop_armed(&self) {}
+    async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
 }
