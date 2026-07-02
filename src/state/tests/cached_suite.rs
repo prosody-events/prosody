@@ -41,8 +41,8 @@ use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Bound;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -55,21 +55,69 @@ fn keyspace_options() -> KeyspaceCreateOptions {
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
-/// A fresh tempdir-backed database; every `Cached` opens its cache keyspace
-/// under it, so a "crash" (a new keyspace) starts cold while the database —
-/// and the warm `MemoryCells` — outlives the run.
-fn open_database() -> Result<(TempDir, Database)> {
-    let dir = tempfile::tempdir()?;
-    let database = Database::builder(dir.path()).open()?;
-    Ok((dir, database))
+/// One fjall database shared by every test in the process, created once.
+///
+/// # Concurrency and isolation
+///
+/// * **Never serialized.** Under `cargo nextest` (process per test) this is one
+///   database per test; under `cargo test` it is shared across the process, but
+///   fjall's keyspaces are independent and each test uses a **distinct keyspace
+///   name** (verified: only `warm` recurs, within one test), so concurrent
+///   tests never touch the same keyspace, and every iteration uses a distinct
+///   v4 segment so they never touch the same row.
+/// * **Reused across a property's iterations**, so the ~37 ms open and the ~128
+///   ms keyspace-create fsync are paid **once per process**, not per iteration.
+///   This is the win: non-crash suites never `clear` (distinct v4 segments keep
+///   iterations disjoint, so the keyspace simply grows), and the crash suite
+///   [`clear`](fjall::Keyspace::clear)s its own `crash` keyspace for a cold
+///   epoch — ~3× faster than a fresh keyspace per crash (682 s → 222 s).
+/// * **`clear` is race-free.** Quickcheck runs iterations sequentially (no
+///   threads), and each property drives its trace sequentially, so the only
+///   `clear`er of the `crash` keyspace does so one call at a time — and no
+///   other test names that keyspace.
+///
+/// The `TempDir` is held for the process lifetime (a process-scoped fixture,
+/// not a memory leak); nextest's short-lived test processes leave it to the OS
+/// temp reclaimer.
+static SHARED_DB: LazyLock<Result<(Database, TempDir), String>> = LazyLock::new(|| {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let database = Database::builder(dir.path())
+        .open()
+        .map_err(|e| e.to_string())?;
+    Ok((database, dir))
+});
+
+/// The process-shared database (see [`SHARED_DB`]). The `()` guard keeps the
+/// `let (_guard, db)` call sites unchanged.
+fn open_database() -> Result<((), Database)> {
+    match &*SHARED_DB {
+        Ok((db, _)) => Ok(((), db.clone())),
+        Err(e) => Err(eyre!("shared fjall database init failed: {e}")),
+    }
 }
 
 /// Builds a [`FjallCellCache`] over the `name` cache keyspace plus its sibling
-/// `name`-index keyspace — the disk-backed warm index + coverage. A distinct
-/// `name` mints a cold pair, modeling a fresh assignment epoch.
+/// `name`-index keyspace — the disk-backed warm index + coverage. On the shared
+/// database the keyspace pair is created once and reused; distinct v4 segments
+/// keep iterations disjoint, so no clear is needed (a warm-reuse cache).
 fn fjall_at(database: &Database, name: &str) -> Result<FjallCellCache> {
     let cache = database.keyspace(name, keyspace_options)?;
     let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
+    Ok(FjallCellCache::new(database.clone(), cache, index))
+}
+
+/// A **cold** [`FjallCellCache`] over the `name` keyspace pair: get-or-create,
+/// then `clear` both. Clearing is a cheap journal marker (no fsync), so this
+/// models a fresh assignment epoch (a cold cache over the same warm durable
+/// backing) **without** creating a keyspace — measured ~3× faster than a fresh
+/// database/keyspace per epoch on APFS, where keyspace creation is a ~128 ms
+/// fsync. Cache lookups key on `(segment, key, cell)`, never the keyspace name,
+/// so a cleared reused keyspace is byte-for-byte a brand-new one.
+fn cold_fjall_at(database: &Database, name: &str) -> Result<FjallCellCache> {
+    let cache = database.keyspace(name, keyspace_options)?;
+    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
+    cache.clear()?;
+    index.clear()?;
     Ok(FjallCellCache::new(database.clone(), cache, index))
 }
 
@@ -744,23 +792,21 @@ fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        // Each `make` opens a fresh cache keyspace (cold cache) over the same
-        // warm memory cells + oracle, so a crash drops coverage but not durable
-        // state. An atomic counter keeps the closure `Fn` (the runner calls it
-        // repeatedly).
-        let counter = AtomicU32::new(0);
+        let (_guard, database) = open_database()?;
+        // Each `make` yields a cold cache over the same warm memory cells +
+        // oracle, so a crash drops coverage but not durable state. `cold_fjall_at`
+        // reuses the `crash` keyspace pair on the shared database and CLEARS it
+        // (a cheap journal marker, no fsync) — modeling a fresh epoch without a
+        // ~128 ms keyspace creation. Measured ~3× faster than a fresh
+        // database/keyspace per make (682 s → 222 s at 256 iterations). Distinct
+        // v4 segments per iteration keep the shared keyspace's crashes disjoint.
         let make = || {
-            let n = counter.fetch_add(1, Ordering::Relaxed);
             let lower = MemoryCellStore::new(
                 cells.clone(),
                 oracle.clone(),
                 Arc::new(CollectionDefRegistry::default()),
             );
-            Ok(Cached::new(
-                fjall_at(&database, &format!("crash-{n}"))?,
-                lower,
-            ))
+            Ok(Cached::new(cold_fjall_at(&database, "crash")?, lower))
         };
         TEST_RUNTIME.block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
     }
