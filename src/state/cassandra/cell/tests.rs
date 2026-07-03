@@ -14,12 +14,11 @@ use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, IndexUpsertRow,
     KeyRow, ResolvedRow, StageRow, encode_cell_blobs,
 };
-use crate::Topic;
 use crate::cassandra::{BatchUnit, CassandraConfiguration, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallClient, FjallConfiguration};
+use crate::state::fjall::test_db;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{
@@ -195,7 +194,7 @@ fn cell_i(i: u32) -> CellKey {
 /// the one bounded `kind=Index` seed read and marks the collection seeded in
 /// the disk-backed warm index; the second (warm) sweep short-circuits on the
 /// local fjall index. The warm gate lives on `Cached` (which owns the fjall
-/// workspace), so this runs the production `Cached<CassandraStore>` assembly
+/// cache), so this runs the production `Cached<CassandraStore>` assembly
 /// and reads the `CassandraStore`'s `RecoveryReadCounts` — which `Cached`
 /// touches only on a cold sweep, so the "zero" is non-vacuous (the cold sweep
 /// provably incremented them first).
@@ -203,16 +202,11 @@ fn cell_i(i: u32) -> CellKey {
 async fn warm_quiescence_issues_zero_queries() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let dir = tempfile::tempdir()?;
-    let client = FjallClient::open(&FjallConfiguration {
-        cache_dir: dir.path().to_path_buf(),
-    })?;
-    let workspace = client.workspace(Topic::from("cell-test"), 0, AssignmentEpoch::mint())?;
     // Keep a clone of the bottom store so we can read its recovery counters; the
     // clone shares the same `Arc` counters as the one inside `Cached`.
     let bottom = fx.bottom_store(ScriptedOracle::default());
     let counts = bottom.recovery_reads();
-    let store = Cached::new(FjallCellCache::for_workspace(workspace), bottom);
+    let store = Cached::new(test_db::cache("cassandra_warm")?, bottom);
     let c = collection("warm-quiescence")?;
     let cell = value_cell();
 
@@ -913,15 +907,14 @@ fn prop_cassandra_cell_crash_equivalence() {
     async fn run(trace: Trace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
-        let dir = tempfile::tempdir()?;
-        let client = FjallClient::open(&FjallConfiguration {
-            cache_dir: dir.path().to_path_buf(),
-        })?;
+        // Each `make` is a crash: a cold fjall cache over the same durable
+        // Cassandra rows. `cold_cache` clears the shared `cassandra_crash`
+        // keyspace pair (a cheap journal marker, no keyspace-creation fsync)
+        // instead of minting a fresh workspace per make; distinct v4 segments
+        // per iteration keep the shared keyspace disjoint.
         let make = || -> Result<Bottom> {
-            let workspace =
-                client.workspace(Topic::from("cell-test"), 0, AssignmentEpoch::mint())?;
             Ok(Cached::new(
-                FjallCellCache::for_workspace(workspace),
+                test_db::cold_cache("cassandra_crash")?,
                 fx.bottom_store(oracle.clone()),
             ))
         };
@@ -945,15 +938,13 @@ fn prop_cassandra_cell_implicit_overwrite() {
     async fn run(trace: OverwriteTrace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
-        let dir = tempfile::tempdir()?;
-        let client = FjallClient::open(&FjallConfiguration {
-            cache_dir: dir.path().to_path_buf(),
-        })?;
+        // Each op reads its committed base through a fresh COLD store, so
+        // `make` clears the shared `cassandra_overwrite` keyspace pair (no
+        // keyspace-creation fsync); distinct v4 segments per iteration keep it
+        // disjoint.
         let make = || -> Result<Bottom> {
-            let workspace =
-                client.workspace(Topic::from("cell-test"), 0, AssignmentEpoch::mint())?;
             Ok(Cached::new(
-                FjallCellCache::for_workspace(workspace),
+                test_db::cold_cache("cassandra_overwrite")?,
                 fx.bottom_store(oracle.clone()),
             ))
         };
@@ -967,13 +958,12 @@ fn prop_cassandra_cell_implicit_overwrite() {
     );
 }
 
-/// A single `Cached<CassandraStore>` over a fresh fjall workspace.
-/// `dir`/`client` must outlive the returned store, so callers keep them in
-/// scope.
-fn assembly(fx: &Fixture, client: &Arc<FjallClient>) -> Result<Bottom> {
-    let workspace = client.workspace(Topic::from("cell-test"), 0, AssignmentEpoch::mint())?;
+/// A single `Cached<CassandraStore>` over the shared `cassandra_overlay`
+/// fjall keyspace pair (warm-reuse; distinct v4 segments keep iterations
+/// disjoint).
+fn assembly(fx: &Fixture) -> Result<Bottom> {
     Ok(Cached::new(
-        FjallCellCache::for_workspace(workspace),
+        test_db::cache("cassandra_overlay")?,
         fx.bottom_store(ScriptedOracle::default()),
     ))
 }
@@ -989,13 +979,9 @@ fn prop_cassandra_overlay_view() {
 
     async fn run(trace: OverlayTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let dir = tempfile::tempdir()?;
-        let client = FjallClient::open(&FjallConfiguration {
-            cache_dir: dir.path().to_path_buf(),
-        })?;
         // Box the future: the assembly + trace exceed clippy's large-future
         // threshold on the stack.
-        Box::pin(run_overlay_trace(assembly(&fx, &client)?, trace)).await
+        Box::pin(run_overlay_trace(assembly(&fx)?, trace)).await
     }
 
     init_test_logging();

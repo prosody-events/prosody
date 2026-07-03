@@ -20,7 +20,8 @@
 use super::super::cached::Cached;
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use super::super::fjall::{Clock, FjallCellCache};
+use super::super::fjall::Clock;
+use super::super::fjall::test_db;
 use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
@@ -34,109 +35,21 @@ use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use fjall::config::CompressionPolicy;
-use fjall::{CompressionType, Database, KeyspaceCreateOptions};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Bound;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock};
-use tempfile::TempDir;
 use uuid::Uuid;
 
 /// The single section the cell suites address (mirrors a Map's entry section).
 const SECTION: Section = Section::new(0);
 
-/// LZ4 block compression, matching the production workspace.
-fn keyspace_options() -> KeyspaceCreateOptions {
-    KeyspaceCreateOptions::default()
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
-}
-
-/// One fjall database shared by every test in the process, created once.
-///
-/// # Concurrency and isolation
-///
-/// * **Never serialized.** Under `cargo nextest` (process per test) this is one
-///   database per test; under `cargo test` it is shared across the process, but
-///   fjall's keyspaces are independent and each test uses a **distinct keyspace
-///   name** (verified: only `warm` recurs, within one test), so concurrent
-///   tests never touch the same keyspace, and every iteration uses a distinct
-///   v4 segment so they never touch the same row.
-/// * **Reused across a property's iterations**, so the ~37 ms open and the ~128
-///   ms keyspace-create fsync are paid **once per process**, not per iteration.
-///   This is the win: non-crash suites never `clear` (distinct v4 segments keep
-///   iterations disjoint, so the keyspace simply grows), and the crash suite
-///   [`clear`](fjall::Keyspace::clear)s its own `crash` keyspace for a cold
-///   epoch — ~3× faster than a fresh keyspace per crash (682 s → 222 s).
-/// * **`clear` is race-free.** Quickcheck runs iterations sequentially (no
-///   threads), and each property drives its trace sequentially, so the only
-///   `clear`er of the `crash` keyspace does so one call at a time — and no
-///   other test names that keyspace.
-///
-/// The `TempDir` is held for the process lifetime (a process-scoped fixture,
-/// not a memory leak); nextest's short-lived test processes leave it to the OS
-/// temp reclaimer.
-static SHARED_DB: LazyLock<Result<(Database, TempDir), String>> = LazyLock::new(|| {
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let database = Database::builder(dir.path())
-        .open()
-        .map_err(|e| e.to_string())?;
-    Ok((database, dir))
-});
-
-/// The process-shared database (see [`SHARED_DB`]). The `()` guard keeps the
-/// `let (_guard, db)` call sites unchanged.
-fn open_database() -> Result<((), Database)> {
-    match &*SHARED_DB {
-        Ok((db, _)) => Ok(((), db.clone())),
-        Err(e) => Err(eyre!("shared fjall database init failed: {e}")),
-    }
-}
-
-/// Builds a [`FjallCellCache`] over the `name` cache keyspace plus its sibling
-/// `name`-index keyspace — the disk-backed warm index + coverage. On the shared
-/// database the keyspace pair is created once and reused; distinct v4 segments
-/// keep iterations disjoint, so no clear is needed (a warm-reuse cache).
-fn fjall_at(database: &Database, name: &str) -> Result<FjallCellCache> {
-    let cache = database.keyspace(name, keyspace_options)?;
-    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
-    Ok(FjallCellCache::new(database.clone(), cache, index))
-}
-
-/// A **cold** [`FjallCellCache`] over the `name` keyspace pair: get-or-create,
-/// then `clear` both. Clearing is a cheap journal marker (no fsync), so this
-/// models a fresh assignment epoch (a cold cache over the same warm durable
-/// backing) **without** creating a keyspace — measured ~3× faster than a fresh
-/// database/keyspace per epoch on APFS, where keyspace creation is a ~128 ms
-/// fsync. Cache lookups key on `(segment, key, cell)`, never the keyspace name,
-/// so a cleared reused keyspace is byte-for-byte a brand-new one.
-fn cold_fjall_at(database: &Database, name: &str) -> Result<FjallCellCache> {
-    let cache = database.keyspace(name, keyspace_options)?;
-    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
-    cache.clear()?;
-    index.clear()?;
-    Ok(FjallCellCache::new(database.clone(), cache, index))
-}
-
-/// Like [`fjall_at`] but driven by a test-controlled [`Clock`].
-fn fjall_at_clock(database: &Database, name: &str, clock: Clock) -> Result<FjallCellCache> {
-    let cache = database.keyspace(name, keyspace_options)?;
-    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
-    Ok(FjallCellCache::with_clock(
-        database.clone(),
-        cache,
-        index,
-        clock,
-    ))
-}
-
-/// Builds a production-shaped `Cached` over a fresh fjall keyspace and the
-/// shared memory cells.
+/// Builds a production-shaped `Cached` over the shared fjall database (the
+/// `name` warm-reuse keyspace pair) and the shared memory cells.
 fn cached_over(
-    database: &Database,
     cells: &MemoryCells,
     oracle: &ScriptedOracle,
     name: &str,
@@ -146,7 +59,7 @@ fn cached_over(
         oracle.clone(),
         Arc::new(CollectionDefRegistry::default()),
     );
-    Ok(Cached::new(fjall_at(database, name)?, lower))
+    Ok(Cached::new(test_db::cache(name)?, lower))
 }
 
 /// The cell at coordinate `c` in the shared section (single byte, so byte order
@@ -321,8 +234,7 @@ fn prop_memory_cached_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        let lower = cached_over(&database, &cells, &oracle, "overlay")?;
+        let lower = cached_over(&cells, &oracle, "overlay")?;
         TEST_RUNTIME.block_on(run_overlay_trace(lower, trace))
     }
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
@@ -367,13 +279,12 @@ fn coverage_op_budget() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
         let counting = CountingCellStore::new(MemoryCellStore::new(
             cells,
             oracle,
             Arc::new(CollectionDefRegistry::default()),
         ));
-        let cached = Cached::new(fjall_at(&database, "budget")?, counting.clone());
+        let cached = Cached::new(test_db::cache("budget")?, counting.clone());
         let id = collection("budget")?;
         let cref = CollectionRef::new(id.clone(), None);
 
@@ -480,7 +391,6 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
         let counting = CountingCellStore::new(MemoryCellStore::new(
             cells,
             oracle.clone(),
@@ -491,7 +401,7 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
         let event = probe(1);
 
         // First cache instance: cover a value and leave a provisional cell.
-        let cached = Cached::new(fjall_at(&database, "warm")?, counting.clone());
+        let cached = Cached::new(test_db::cache("warm")?, counting.clone());
         cached
             .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))])
             .await?;
@@ -515,7 +425,7 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
 
         // Rebuild `Cached` over the SAME workspace (a session clone within one
         // assignment). The disk-backed warm index + coverage survive.
-        let restarted = Cached::new(fjall_at(&database, "warm")?, counting.clone());
+        let restarted = Cached::new(test_db::cache("warm")?, counting.clone());
         counting.reset();
 
         // The rebuilt sweep is WARM: zero cold `provisional_cells` sweeps, and it
@@ -563,7 +473,6 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
 fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
-        let (_dir, database) = open_database()?;
         let counting = CountingCellStore::new(MemoryCellStore::new(
             MemoryCells::new(),
             oracle.clone(),
@@ -573,7 +482,7 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
         let cref = CollectionRef::new(id.clone(), None);
         let event = probe(1);
 
-        let fjall = fjall_at(&database, "degrade")?;
+        let fjall = test_db::cache("degrade")?;
         let fail_snapshot = fjall.fail_index_snapshot();
         let cached = Cached::new(fjall, counting.clone());
 
@@ -624,7 +533,6 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
 fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
-        let (_dir, database) = open_database()?;
         let counting = CountingCellStore::new(MemoryCellStore::new(
             MemoryCells::new(),
             oracle.clone(),
@@ -634,7 +542,7 @@ fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
         let cref = CollectionRef::new(id.clone(), None);
         let event = probe(1);
 
-        let fjall = fjall_at(&database, "reseed")?;
+        let fjall = test_db::cache("reseed")?;
         let fail_record = fjall.fail_index_record();
         let cached = Cached::new(fjall, counting.clone());
 
@@ -705,8 +613,7 @@ fn coverage_scan_isolation() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        let cached = cached_over(&database, &cells, &oracle, "isolation")?;
+        let cached = cached_over(&cells, &oracle, "isolation")?;
 
         let a = collection("alpha")?;
         let b = collection("beta")?;
@@ -760,8 +667,7 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
         const N: u8 = 200;
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        let cached = cached_over(&database, &cells, &oracle, "wide")?;
+        let cached = cached_over(&cells, &oracle, "wide")?;
         let id = collection("wide")?;
         let cref = CollectionRef::new(id.clone(), None);
 
@@ -792,21 +698,21 @@ fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_guard, database) = open_database()?;
         // Each `make` yields a cold cache over the same warm memory cells +
-        // oracle, so a crash drops coverage but not durable state. `cold_fjall_at`
-        // reuses the `crash` keyspace pair on the shared database and CLEARS it
-        // (a cheap journal marker, no fsync) — modeling a fresh epoch without a
-        // ~128 ms keyspace creation. Measured ~3× faster than a fresh
-        // database/keyspace per make (682 s → 222 s at 256 iterations). Distinct
-        // v4 segments per iteration keep the shared keyspace's crashes disjoint.
+        // oracle, so a crash drops coverage but not durable state.
+        // `test_db::cold_cache` reuses the `crash` keyspace pair on the shared
+        // database and CLEARS it (a cheap journal marker, no fsync) — modeling a
+        // fresh epoch without a ~128 ms keyspace creation. Measured ~3× faster
+        // than a fresh database/keyspace per make (682 s → 222 s at 256
+        // iterations). Distinct v4 segments per iteration keep the shared
+        // keyspace's crashes disjoint.
         let make = || {
             let lower = MemoryCellStore::new(
                 cells.clone(),
                 oracle.clone(),
                 Arc::new(CollectionDefRegistry::default()),
             );
-            Ok(Cached::new(cold_fjall_at(&database, "crash")?, lower))
+            Ok(Cached::new(test_db::cold_cache("crash")?, lower))
         };
         TEST_RUNTIME.block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
     }
@@ -834,7 +740,6 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         let now = Arc::new(AtomicU64::new(1_000));
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
         let lower = TtlAwareCellStore::new(
             CountingCellStore::new(MemoryCellStore::new(
                 cells,
@@ -845,7 +750,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
             ROW_DEATH,
         );
         let cached = Cached::new(
-            fjall_at_clock(&database, "ttl", Clock::Fixed(now.clone()))?,
+            test_db::cache_with_clock("ttl", Clock::Fixed(now.clone()))?,
             lower.clone(),
         );
         let id = collection("ttl")?;
@@ -923,7 +828,6 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
         let lower = MemoryCellStore::new(
             cells.clone(),
             oracle.clone(),
@@ -932,7 +836,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
         let id = collection("volatile")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        let cached = Cached::new(fjall_at(&database, "volatile")?, lower.clone());
+        let cached = Cached::new(test_db::cache("volatile")?, lower.clone());
         cached
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
             .await?;
@@ -950,7 +854,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
         // coverage is empty. The stale value from the old epoch's cache keyspace
         // is gone with it; the uncovered `get` falls through and self-heals to
         // `99`.
-        let restarted = Cached::new(fjall_at(&database, "restart")?, lower.clone());
+        let restarted = Cached::new(test_db::cache("restart")?, lower.clone());
         assert_eq!(
             restarted.get(&id, &cell_at(1), probe(2)).await?.get(),
             Some(&bytes(99)),
@@ -969,8 +873,7 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        let fjall = fjall_at(&database, "fault")?;
+        let fjall = test_db::cache("fault")?;
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
         let cached = Cached::new(fjall, lower);
@@ -1017,8 +920,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        let fjall = fjall_at(&database, "batch-fault")?;
+        let fjall = test_db::cache("batch-fault")?;
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
         let cached = Cached::new(fjall, lower);
@@ -1073,8 +975,7 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
-        let fjall = fjall_at(&database, "incomplete")?;
+        let fjall = test_db::cache("incomplete")?;
         let fail = fjall.fail_puts();
         let lower = MemoryCellStore::new(
             cells,
@@ -1229,11 +1130,10 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
             let now = Arc::new(AtomicU64::new(START));
             let oracle = ScriptedOracle::default();
             let cells = MemoryCells::new();
-            let (_dir, database) = open_database()?;
             let lower =
                 MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
             let cached = Cached::new(
-                fjall_at_clock(&database, "ttl-anchor", Clock::Fixed(now.clone()))?,
+                test_db::cache_with_clock("ttl-anchor", Clock::Fixed(now.clone()))?,
                 lower,
             );
             let id = collection("ttl-anchor")?;
@@ -1356,7 +1256,6 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         let now = Arc::new(AtomicU64::new(1_000));
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let (_dir, database) = open_database()?;
         let lower = TtlAwareCellStore::new(
             CountingCellStore::new(MemoryCellStore::new(
                 cells,
@@ -1367,7 +1266,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
             ROW_DEATH,
         );
         let cached = Cached::new(
-            fjall_at_clock(&database, "scan-ttl", Clock::Fixed(now.clone()))?,
+            test_db::cache_with_clock("scan-ttl", Clock::Fixed(now.clone()))?,
             lower.clone(),
         );
         let id = collection("scan-ttl")?;

@@ -9,6 +9,7 @@
 //! the copying fallback.
 
 use super::codec::cell_key;
+use super::test_db;
 use super::{AssignmentEpoch, CacheRead, FjallCellCache, FjallClient, FjallConfiguration};
 use crate::state::cell::Committed;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -17,11 +18,8 @@ use crate::test_util::TEST_RUNTIME;
 use crate::{Key, Topic};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use fjall::config::CompressionPolicy;
-use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
 use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
-use tempfile::TempDir;
 use uuid::Uuid;
 
 /// The single Value cell (`ValueNs::Entries`, empty coordinate).
@@ -30,32 +28,6 @@ fn value_cell() -> CellKey {
         section: Section::new(0),
         coordinate: Coordinate::empty(),
     }
-}
-
-/// LZ4 block compression, matching the production workspace's
-/// `keyspace_options`.
-fn keyspace_options() -> KeyspaceCreateOptions {
-    KeyspaceCreateOptions::default()
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
-}
-
-/// Opens a fresh tempdir-backed database and a named cache keyspace plus its
-/// sibling warm-index keyspace under it. The returned `TempDir` keeps the
-/// backing directory alive; the [`Database`] owns batch writes, so the caller
-/// keeps it alongside the [`Keyspace`] handles.
-fn open(name: &str) -> Result<(TempDir, Database, Keyspace, Keyspace)> {
-    let dir = tempfile::tempdir()?;
-    let database = Database::builder(dir.path()).open()?;
-    let cache = database.keyspace(name, keyspace_options)?;
-    let index = database.keyspace(&format!("{name}_index"), keyspace_options)?;
-    Ok((dir, database, cache, index))
-}
-
-/// Opens a fresh tempdir-backed cache + index keyspace and wraps it in a store.
-/// The returned `TempDir` keeps the backing directory alive.
-fn setup() -> Result<(TempDir, FjallCellCache)> {
-    let (dir, database, cache, index) = open("value_cache")?;
-    Ok((dir, FjallCellCache::new(database, cache, index)))
 }
 
 fn collection(name: &str) -> Result<CollectionId> {
@@ -73,7 +45,7 @@ fn collection(name: &str) -> Result<CollectionId> {
 #[test]
 fn prop_fjall_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {
-        let (_dir, store) = setup()?;
+        let store = test_db::cache("value_cache")?;
         let c = collection("uniq")?;
         let cell = value_cell();
         store
@@ -116,7 +88,7 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
 
-    let (_dir, database, cache_partition, index_partition) = open("value_cache")?;
+    let (database, cache_partition, index_partition) = test_db::keyspace_pair("value_cache")?;
     let c = collection("raw")?;
     let cell = value_cell();
 
@@ -151,8 +123,7 @@ fn expired_entry_reads_as_miss() -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let now = Arc::new(AtomicU64::new(1_000));
-    let (_dir, database, partition, index) = open("ttl_value")?;
-    let cache = FjallCellCache::with_clock(database, partition, index, Clock::Fixed(now.clone()));
+    let cache = test_db::cache_with_clock("ttl_value", Clock::Fixed(now.clone()))?;
     let c = collection("ttl")?;
     let cell = value_cell();
     let payload = Committed::new(Some(Bytes::from_static(b"v")));

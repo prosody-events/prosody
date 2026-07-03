@@ -48,6 +48,8 @@ mod error;
 mod workspace;
 
 #[cfg(test)]
+pub(crate) mod test_db;
+#[cfg(test)]
 mod tests;
 
 pub use config::FjallConfiguration;
