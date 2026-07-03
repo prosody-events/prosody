@@ -140,7 +140,7 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
-    SP: PartitionStateProvider,
+    SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
         CellSession<Loader: MessageLoader<Payload = PL>>,
     PL: Clone + Send + Sync + 'static + EventType + EventIdentity,

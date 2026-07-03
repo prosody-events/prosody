@@ -27,8 +27,7 @@ use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::{
-    CollectionId, CommitDecision, EventRef, SharedStateBackend, StateBackendFactory, StateKey,
-    StateName, StateType,
+    CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -44,11 +43,11 @@ use uuid::Uuid;
 const VALUE_NAME: &str = "cart";
 
 /// The per-event session type the fixture mints (loader slot unused, so `()`).
-type TestBackend = <SharedStateBackend<
-    MemoryCellStore<ScriptedOracle>,
-    MemoryDescriptorIdentityStore,
+type TestBackend = PartitionBackend<
     ScriptedOracle,
-> as StateBackendFactory>::Backend;
+    MemoryDescriptorIdentityStore,
+    MemoryCellStore<ScriptedOracle>,
+>;
 type Session = KeyedStateSession<TestBackend, ()>;
 
 /// The single Value cell (`ValueNs::Entries`, empty coordinate).
@@ -489,7 +488,6 @@ fn prop_value_lifecycle_equivalence() {
 /// reduction and the `Incomplete`-dominance of the staged-set resolution.
 #[tokio::test]
 async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
-    use crate::state::PartitionBackend;
     use crate::state::tests::cell_suite::FailingCellStore;
 
     let mut registry = CollectionDefRegistry::new(None);

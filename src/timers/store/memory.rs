@@ -700,14 +700,14 @@ pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
 
 /// Hands out per-segment views of one shared in-memory trigger store.
 ///
-/// Every `create_store` call returns a store over the **same** shared maps,
-/// so the partition's timer writes and the keyed-state commit oracle's tag
-/// reads observe the same rows — mirroring
-/// [`MemoryDeduplicationStoreProvider`]. A fresh store per call would
-/// split-brain the oracle: reading a permanently empty store, it would
-/// answer "committed" for every abandoned, uncommitted timer event and
-/// recovery would promote staged state that never committed. All maps are
-/// keyed by [`SegmentId`], so sharing across segments cannot collide.
+/// The shared maps are memory mode's **durable substrate**: every
+/// `create_store` call returns a store over the same maps, so stores minted
+/// across partition (re)acquisitions observe the same rows — mirroring
+/// [`MemoryDeduplicationStoreProvider`]. A fresh store per call would make
+/// every "durable" row vanish with the store that wrote it. All maps are
+/// keyed by [`SegmentId`], so sharing across segments cannot collide. (The
+/// keyed-state commit oracle does not mint from here — it receives a clone
+/// of the partition's store handle.)
 ///
 /// [`MemoryDeduplicationStoreProvider`]:
 ///     crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider

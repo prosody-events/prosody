@@ -53,10 +53,11 @@ use uuid::Uuid;
 /// Two implementations exist: [`TimerManager`] (consults its in-memory
 /// scheduler before the store; used where a live manager is in hand, e.g.
 /// tests that drive the full timer lifecycle) and [`StoreTagSource`] (a
-/// bare [`TriggerStore`] read; production keyed-state wiring, where the
-/// partition's live manager is not reachable and the oracle is only ever
-/// consulted for events that have fully completed — per-key serialization
-/// guarantees their durability markers landed before recovery runs).
+/// bare [`TriggerStore`] read over a clone of the partition's own writing
+/// store; production keyed-state wiring, where the partition's live manager
+/// is not reachable and the oracle is only ever consulted for events that
+/// have fully completed — per-key serialization guarantees their durability
+/// markers landed before recovery runs).
 pub trait TimerTagSource: Clone + Send + Sync + 'static {
     /// Error type for tag reads.
     type Error: ClassifyError + Error + Send + Sync + 'static;

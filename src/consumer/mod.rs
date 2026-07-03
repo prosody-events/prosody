@@ -175,9 +175,7 @@ pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationB
 use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::production::{
-    CassandraStateBackendFactory, MemoryStateBackendFactory, OracleProviders,
-};
+use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::state::session::CellSession;
 use crate::telemetry::Telemetry;
@@ -186,8 +184,7 @@ use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::TriggerStoreProvider;
-use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
-use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use crate::timers::store::cassandra::CassandraTriggerStoreError;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -776,7 +773,6 @@ struct KeyedStateInputs {
     group: ConsumerGroup,
     version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
-    timer_slab_size: CompactDuration,
 }
 
 impl KeyedStateInputs {
@@ -788,16 +784,16 @@ impl KeyedStateInputs {
         consumer_config: &ConsumerConfiguration,
         dedup_version: &str,
     ) -> Result<Self, ConsumerError> {
+        // Fail fast on an invalid timer slab size — the partition loop would
+        // otherwise only log and fall back to a default at rebalance time.
+        CompactDuration::try_from(consumer_config.slab_size)
+            .map_err(ConsumerError::InvalidSlabSize)?;
         let registry = Arc::new(config.build_registry().map_err(KeyedStateInitError::from)?);
         Ok(Self {
             config,
             group: Arc::from(consumer_config.group_id.as_str()),
             version: Arc::from(dedup_version),
             registry,
-            timer_slab_size: consumer_config
-                .slab_size
-                .try_into()
-                .map_err(ConsumerError::InvalidSlabSize)?,
         })
     }
 
@@ -847,7 +843,7 @@ impl PipelineMiddlewareStack {
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
         PP: TriggerStoreProvider,
-        SP: PartitionStateProvider,
+        SP: PartitionStateProvider<PP::Store>,
         <SP::Manager as PartitionStateManager>::Session:
             CellSession<Loader: MessageLoader<Payload = C::Payload>>,
         L: MessageLoader<Payload = C::Payload> + 'static,
@@ -1078,18 +1074,19 @@ where
         .layer(dedup_middleware))
 }
 
-/// Builds the keyed-state provider for a [`StorePair::Memory`] arm: the
-/// in-memory durable store, backend factory, and in-memory message loader,
-/// wrapped in the partition state provider. Shared by every constructor's
-/// memory arm.
+/// Builds the keyed-state provider for a [`StorePair::Memory`] arm (and the
+/// stateless Cassandra arm): the in-memory durable store, backend factory,
+/// and in-memory message loader, wrapped in the partition state provider.
+/// The factory is store-type agnostic — the commit oracle's trigger store
+/// handle arrives per partition via
+/// [`PartitionStateProvider::acquire`] — so the concrete return type serves
+/// any trigger backend.
 fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,
-    trigger_provider: &InMemoryTriggerStoreProvider,
-) -> impl PartitionStateProvider<
-    Manager: PartitionStateManager<
-        Session: CellSession<Loader: MessageLoader<Payload = C::Payload>>,
-    >,
+) -> StateManagerProvider<
+    MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
+    MemoryLoader<C::Payload>,
 >
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
@@ -1098,12 +1095,8 @@ where
         MemoryCells::new(),
         MemoryDescriptorIdentityStore::new(),
         keyed_state.registry.clone(),
-        OracleProviders {
-            dedup: dedup_provider,
-            triggers: trigger_provider.clone(),
-            consumer_group: keyed_state.group.clone(),
-            timer_slab_size: keyed_state.timer_slab_size,
-        },
+        dedup_provider,
+        keyed_state.group.clone(),
     );
     keyed_state.provider(backend, MemoryLoader::<C::Payload>::new())
 }
@@ -1118,14 +1111,12 @@ fn cassandra_state_provider<C: Codec>(
     consumer_config: &ConsumerConfiguration,
     heartbeats: &HeartbeatRegistry,
     dedup_provider: CassandraDeduplicationStoreProvider,
-    trigger_provider: &CassandraTriggerStoreProvider,
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
 ) -> Result<
-    impl PartitionStateProvider<
-        Manager: PartitionStateManager<
-            Session: CellSession<Loader: MessageLoader<Payload = C::Payload>>,
-        >,
+    StateManagerProvider<
+        CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
+        KafkaLoader<C>,
     >,
     ConsumerError,
 >
@@ -1146,12 +1137,8 @@ where
         cell_store,
         identity_store,
         keyed_state.registry.clone(),
-        OracleProviders {
-            dedup: dedup_provider,
-            triggers: trigger_provider.clone(),
-            consumer_group: keyed_state.group.clone(),
-            timer_slab_size: keyed_state.timer_slab_size,
-        },
+        dedup_provider,
+        keyed_state.group.clone(),
     );
     Ok(keyed_state.provider(backend, loader))
 }
@@ -1172,7 +1159,7 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     S: TriggerStoreProvider,
-    SP: PartitionStateProvider,
+    SP: PartitionStateProvider<S::Store>,
     <SP::Manager as PartitionStateManager>::Session:
         CellSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
@@ -1289,8 +1276,7 @@ where
                 dedup_provider,
                 ..
             } => {
-                let state_provider =
-                    memory_state_provider::<C>(&keyed_state, dedup_provider, &trigger_provider);
+                let state_provider = memory_state_provider::<C>(&keyed_state, dedup_provider);
                 initialize_consumer_with_provider::<_, _, _, C>(
                     consumer_config,
                     keyed_state.version.clone(),
@@ -1311,11 +1297,11 @@ where
                 // otherwise spawn a loader `BaseConsumer` + poll thread and
                 // create the fjall cache dir for a backend that seals nothing.
                 // The real Cassandra `trigger_provider` still drives the timer
-                // system.
+                // system, and its per-partition store handle is what the (never
+                // consulted) commit oracle receives at acquisition.
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     MemoryDeduplicationStoreProvider::new(),
-                    &InMemoryTriggerStoreProvider::new(),
                 );
                 initialize_consumer_with_provider::<_, _, _, C>(
                     consumer_config,
@@ -1377,12 +1363,8 @@ where
                     MemoryCells::new(),
                     MemoryDescriptorIdentityStore::new(),
                     keyed_state.registry.clone(),
-                    OracleProviders {
-                        dedup: dedup_provider.clone(),
-                        triggers: trigger_provider.clone(),
-                        consumer_group: keyed_state.group.clone(),
-                        timer_slab_size: keyed_state.timer_slab_size,
-                    },
+                    dedup_provider.clone(),
+                    keyed_state.group.clone(),
                 );
                 let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
@@ -1431,12 +1413,8 @@ where
                     cell_store,
                     identity_store,
                     keyed_state.registry.clone(),
-                    OracleProviders {
-                        dedup: dedup_provider.clone(),
-                        triggers: trigger_provider.clone(),
-                        consumer_group: keyed_state.group.clone(),
-                        timer_slab_size: keyed_state.timer_slab_size,
-                    },
+                    dedup_provider.clone(),
+                    keyed_state.group.clone(),
                 );
                 let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
@@ -1513,11 +1491,8 @@ where
                 dedup_provider,
                 ..
             } => {
-                let state_provider = memory_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider.clone(),
-                    &trigger_provider,
-                );
+                let state_provider =
+                    memory_state_provider::<C>(&keyed_state, dedup_provider.clone());
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
                     consumer_config,
@@ -1550,7 +1525,6 @@ where
                     consumer_config,
                     &heartbeats,
                     dedup_provider.clone(),
-                    &trigger_provider,
                     cell_store,
                     identity_store,
                 )?;
@@ -1615,11 +1589,8 @@ where
                 dedup_provider,
                 ..
             } => {
-                let state_provider = memory_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider.clone(),
-                    &trigger_provider,
-                );
+                let state_provider =
+                    memory_state_provider::<C>(&keyed_state, dedup_provider.clone());
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
                     consumer_config,
@@ -1650,7 +1621,6 @@ where
                     consumer_config,
                     &heartbeats,
                     dedup_provider.clone(),
-                    &trigger_provider,
                     cell_store,
                     identity_store,
                 )?;
@@ -1846,7 +1816,7 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
-    SP: PartitionStateProvider,
+    SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
         CellSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,

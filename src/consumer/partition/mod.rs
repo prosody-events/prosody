@@ -241,7 +241,7 @@ impl<P: Send + 'static> PartitionManager<P> {
     where
         T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
-        SP: PartitionStateProvider,
+        SP: PartitionStateProvider<S::Store>,
         <SP::Manager as PartitionStateManager>::Session:
             CellSession<Loader: MessageLoader<Payload = P>>,
         P: Sync + EventType + EventIdentity,
@@ -473,24 +473,31 @@ where
 /// the shutdown signal is received — the same pattern as
 /// [`init_timer_manager`]. Acquisition is eager: descriptor identities are
 /// validated against the segment's durable rows before any event
-/// dispatches.
+/// dispatches. `trigger_store` is the partition's own store handle, cloned
+/// into each attempt so the commit oracle reads timer tags through the
+/// exact instance the timer manager writes through.
 ///
 /// Returns `None` if shutdown is signaled before acquisition succeeds.
-async fn init_state_manager<SP>(
+async fn init_state_manager<SP, S>(
     state_provider: &SP,
+    trigger_store: &S,
     topic: Topic,
     partition: Partition,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
 ) -> Option<SP::Manager>
 where
-    SP: PartitionStateProvider,
+    SP: PartitionStateProvider<S>,
+    S: Clone,
 {
     loop {
         if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
             return None;
         }
 
-        match state_provider.acquire(topic, partition).await {
+        match state_provider
+            .acquire(topic, partition, trigger_store.clone())
+            .await
+        {
             Ok(manager) => return Some(manager),
             Err(error) => {
                 error!("failed to acquire keyed-state manager: {error:#}; retrying");
@@ -525,7 +532,7 @@ async fn handle_messages<T, S, SP, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
-    SP: PartitionStateProvider,
+    SP: PartitionStateProvider<S::Store>,
     <SP::Manager as PartitionStateManager>::Session:
         CellSession<Loader: MessageLoader<Payload = P>>,
     P: Send + Sync + 'static + EventType + EventIdentity,
@@ -554,6 +561,7 @@ async fn handle_messages<T, S, SP, P>(
 
     let Some(state_manager) = init_state_manager(
         &state_provider,
+        &trigger_store,
         partition_info.topic,
         partition_info.partition,
         &context.shutdown_rx,

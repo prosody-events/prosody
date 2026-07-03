@@ -26,7 +26,9 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::CellSession;
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use crate::state::tests::cell_suite::{FailingCellStore, bytes};
-use crate::state::{CommitDecision, CommitMode, EventRef, SharedStateBackend, TimerEventRef};
+use crate::state::{
+    CommitDecision, CommitMode, EventRef, PartitionBackend, SharedStateBackend, TimerEventRef,
+};
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::adapter::TableAdapter;
@@ -80,8 +82,10 @@ impl CommitOracle for FixedOracle {
 type MemCell = MemoryCellStore<FixedOracle>;
 type TestBackend = SharedStateBackend<MemCell, MemoryDescriptorIdentityStore, FixedOracle>;
 type TestProvider = StateManagerProvider<TestBackend, MemoryLoader<serde_json::Value>>;
-type TestManager =
-    StateManager<<TestBackend as StateBackendFactory>::Backend, MemoryLoader<serde_json::Value>>;
+type TestManager = StateManager<
+    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemCell>,
+    MemoryLoader<serde_json::Value>,
+>;
 type TestSession = <TestManager as PartitionStateManager>::Session;
 
 /// A `FailingCellStore` over a memory store, poisoning one collection's
@@ -178,9 +182,21 @@ fn poison_provider(cell: PoisonCell, registry: Arc<CollectionDefRegistry>) -> Po
     )
 }
 
+/// A fresh in-memory trigger store standing in for the partition's store
+/// handle; the [`SharedStateBackend`] providers here carry a pre-built
+/// oracle, so the handle is accepted and ignored.
+fn test_triggers() -> TableAdapter<InMemoryTriggerStore> {
+    memory_store(Segment {
+        id: Uuid::new_v4(),
+        name: "test".to_owned(),
+        slab_size: CompactDuration::new(300),
+        version: SegmentVersion::V3,
+    })
+}
+
 async fn acquire(provider: &TestProvider) -> Result<TestManager> {
     provider
-        .acquire(Topic::from("t"), 0)
+        .acquire(Topic::from("t"), 0, test_triggers())
         .await
         .map_err(|e| eyre!("acquire failed: {e}"))
 }
@@ -443,7 +459,7 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
         let inner = cell_store(FixedOracle::committed(), &registry);
         let cell = FailingCellStore::new_with_category(inner, cart.clone(), category);
         let manager = poison_provider(cell, registry)
-            .acquire(Topic::from("t"), 0)
+            .acquire(Topic::from("t"), 0, test_triggers())
             .await
             .map_err(|e| eyre!("acquire failed: {e}"))?;
         let (_stream, timers, _shutdown_tx) = timer_manager().await?;
@@ -683,7 +699,7 @@ async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
     let inner = cell_store(FixedOracle::committed(), &registry);
     let cell = FailingCellStore::new(inner, StateName::try_new("wishlist")?);
     let manager = poison_provider(cell.clone(), registry)
-        .acquire(Topic::from("t"), 0)
+        .acquire(Topic::from("t"), 0, test_triggers())
         .await
         .map_err(|e| eyre!("acquire failed: {e}"))?;
     let key: Key = Arc::from("k");

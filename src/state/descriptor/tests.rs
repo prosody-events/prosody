@@ -20,8 +20,7 @@ use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
-    CommitDecision, CommitMode, EventRef, SharedStateBackend, StateBackendFactory, StateKey,
-    StateName, StateType,
+    CommitDecision, CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType,
 };
 use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
@@ -73,15 +72,10 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
     }
 }
 
-pub(crate) type TestSession =
-    KeyedStateSession<
-        <SharedStateBackend<
-            MemoryCellStore<FixedOracle>,
-            MemoryDescriptorIdentityStore,
-            FixedOracle,
-        > as StateBackendFactory>::Backend,
-        MemoryLoader<Value>,
-    >;
+pub(crate) type TestSession = KeyedStateSession<
+    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>,
+    MemoryLoader<Value>,
+>;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor

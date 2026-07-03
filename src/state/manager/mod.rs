@@ -201,7 +201,11 @@ pub enum SweepResolution {
 /// Process-wide factory for per-partition [`PartitionStateManager`]s,
 /// the keyed-state analog of
 /// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider).
-pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
+///
+/// `T` is the partition's trigger-store handle, threaded through to
+/// [`StateBackendFactory::for_partition`] (which owns the handle-passing
+/// rationale).
+pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
     /// Manager minted per partition assignment.
     type Manager: PartitionStateManager;
 
@@ -210,6 +214,8 @@ pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
 
     /// Acquires the manager for `(topic, partition)`, eagerly validating
     /// descriptor identities against the group-global identity table.
+    /// `triggers` is the partition's trigger-store handle, forwarded to the
+    /// backend factory for the commit oracle's timer half.
     ///
     /// # Errors
     ///
@@ -220,6 +226,7 @@ pub trait PartitionStateProvider: Clone + Send + Sync + 'static {
         &self,
         topic: Topic,
         partition: Partition,
+        triggers: T,
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send;
 }
 
@@ -527,10 +534,11 @@ impl<F, L> fmt::Debug for StateManagerProvider<F, L> {
     }
 }
 
-impl<F, L> PartitionStateProvider for StateManagerProvider<F, L>
+impl<F, L, T> PartitionStateProvider<T> for StateManagerProvider<F, L>
 where
-    F: StateBackendFactory,
+    F: StateBackendFactory<T>,
     L: Clone + Send + Sync + 'static,
+    T: Send,
 {
     type AcquireError = StateAcquireError<F::Error, IdentityErr<F::Backend>>;
     type Manager = StateManager<F::Backend, L>;
@@ -539,11 +547,12 @@ where
         &self,
         topic: Topic,
         partition: Partition,
+        triggers: T,
     ) -> Result<Self::Manager, Self::AcquireError> {
         let segment_id = partition_segment_id(topic, partition, &self.consumer_group);
         let backend = self
             .backend
-            .for_partition(topic, partition)
+            .for_partition(topic, partition, triggers)
             .map_err(StateAcquireError::Factory)?;
         let oracle = backend.oracle();
         // Invariant: no state op executes under an unvalidated identity —

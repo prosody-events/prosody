@@ -1276,18 +1276,16 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     Ok(())
 }
 
-/// The keyed-state commit oracle reads timer tags through its own store
-/// instance while the partition's writes flow through a sibling instance
-/// minted by the same provider. `current_tag` must reflect durable state on
-/// every consult (see its contract on `TriggerStore`): after recovery's
-/// first-touch consult observes a standing trigger, the refired event's
-/// commit through the sibling store must flip the oracle's answer to
-/// committed — an answer served from the first consult's cache would roll
-/// the committed write back. The reverse flip (a consult that observed
-/// absence pinning "committed" over a later schedule) must not happen
-/// either.
+/// The keyed-state commit oracle reads timer tags through a **clone of the
+/// partition's writing store** (handle passing at partition acquisition —
+/// see `StateBackendFactory::for_partition`). `current_tag` is cache-first,
+/// so the answer must still flip when a mutation lands through the writer:
+/// the clone shares the writer's `state_cache`. Each consult here first
+/// warms the cache, then the writer mutates, and the next consult must
+/// observe the mutation — an answer pinned by the warmed cache would roll a
+/// committed write back (or resurrect an uncommitted one).
 #[tokio::test]
-async fn oracle_tag_reads_see_sibling_store_writes() -> Result<()> {
+async fn oracle_reads_through_the_writers_store() -> Result<()> {
     use super::CassandraTriggerStoreProvider;
     use crate::commit_manager::{CommitManager, StoreTagSource};
     use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
@@ -1301,24 +1299,24 @@ async fn oracle_tag_reads_see_sibling_store_writes() -> Result<()> {
             .await?;
     let segment = Segment {
         id: SegmentId::from(Uuid::new_v4()),
-        name: "oracle_sibling".to_owned(),
+        name: "oracle_writer_handle".to_owned(),
         slab_size: CompactDuration::new(60),
         version: SegmentVersion::V3,
     };
-    let writer = provider.create_store(segment.clone());
+    let writer = provider.create_store(segment);
     let oracle = CommitManager::new(
         MemoryDeduplicationStore::new(),
-        StoreTagSource(provider.create_store(segment)),
+        StoreTagSource(writer.clone()),
     );
 
-    let key: Key = format!("oracle-sibling-{}", Uuid::new_v4()).into();
+    let key: Key = format!("oracle-writer-{}", Uuid::new_v4()).into();
     let timer_type = TimerType::Application;
     let time = CompactDateTime::from(1_500_000u32);
     let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
     let wal_tag = trigger.tag;
 
     // Stage → crash: the trigger row stands. Recovery's first-touch consult
-    // must observe it (NotCommitted → the event refires).
+    // observes it (NotCommitted → the event refires) and warms the cache.
     writer.add_trigger(trigger).await?;
     assert!(
         !oracle
@@ -1328,17 +1326,18 @@ async fn oracle_tag_reads_see_sibling_store_writes() -> Result<()> {
     );
 
     // The refired event commits the trigger through the partition's store
-    // (row removed). The sweep's consult must observe the commit and promote.
+    // (row removed). The sweep's consult must observe the commit even though
+    // the previous consult warmed the cache.
     writer.remove_trigger(&key, time, timer_type).await?;
     assert!(
         oracle
             .is_timer_committed(&key, timer_type, time, wal_tag)
             .await?,
-        "commit through the sibling store must flip the oracle to committed"
+        "commit through the writer must flip the warmed oracle to committed"
     );
 
-    // Reverse flip: a consult that observed absence must see a later
-    // schedule through the sibling.
+    // Reverse flip: a consult that observed (and cached) absence must see a
+    // later schedule through the writer.
     let second = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
     let second_tag = second.tag;
     assert!(
@@ -1352,7 +1351,7 @@ async fn oracle_tag_reads_see_sibling_store_writes() -> Result<()> {
         !oracle
             .is_timer_committed(&key, timer_type, time, second_tag)
             .await?,
-        "schedule through the sibling store must read NotCommitted"
+        "schedule through the writer must read NotCommitted"
     );
 
     writer.remove_trigger(&key, time, timer_type).await?;

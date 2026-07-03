@@ -205,12 +205,14 @@ impl Segment {
 
 /// Factory for segment-scoped [`TriggerStore`] instances.
 ///
-/// Holds shared resources (Cassandra session and prepared statements; the
-/// in-memory store's shared maps) and creates per-segment stores. Every store
-/// a provider creates for the same segment must observe the same durable rows:
-/// production mints the partition's store and the keyed-state commit oracle's
-/// store from one provider, and the oracle reads what the partition writes.
-/// Store creation is synchronous.
+/// Holds shared resources and creates per-segment stores; store creation is
+/// synchronous. For Cassandra the shared resources are the session and
+/// prepared statements; for the in-memory store they are the shared maps —
+/// the durable substrate memory mode keeps across store mints, so stores
+/// created for the same segment observe the same rows. The keyed-state
+/// commit oracle never mints its own store here: it receives a clone of the
+/// partition's store handle (see
+/// [`StateBackendFactory::for_partition`](crate::state::StateBackendFactory::for_partition)).
 pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
     /// The store type created by this provider.
     type Store: TriggerStore;
@@ -409,11 +411,13 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Returns `None` if the row is absent (commit oracle: "committed").
     /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
     ///
-    /// **Contract: the answer must reflect durable state, never a
-    /// per-instance cache.** The keyed-state commit oracle may consult
-    /// through a different store instance than the partition's writer, and
-    /// a stale answer flips a recovery decision (rolling back a committed
-    /// write, or promoting an abandoned one).
+    /// **Contract: the answer must reflect every write performed through
+    /// this store and its clones.** The keyed-state commit oracle holds a
+    /// clone of the partition's writing store (handle passing — see
+    /// [`StateBackendFactory::for_partition`](crate::state::StateBackendFactory::for_partition)),
+    /// so a per-instance cache is fine as long as clones share it; a stale
+    /// answer flips a recovery decision (rolling back a committed write, or
+    /// promoting an abandoned one).
     fn current_tag(
         &self,
         key: &Key,

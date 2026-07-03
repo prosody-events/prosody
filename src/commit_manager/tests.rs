@@ -304,16 +304,17 @@ async fn store_tag_source_resolves_three_states() -> Result<()> {
     Ok(())
 }
 
-/// The in-memory trigger provider hands every `create_store` call a view of
-/// the same shared store — production mints the partition's store and the
-/// commit oracle's store from one provider. Over a disjoint fresh store the
-/// oracle would read a permanently empty store and answer "committed" for an
-/// abandoned, uncommitted timer event (a phantom commit recovery would
-/// promote); over the shared store it must answer `NotCommitted` while the
-/// trigger row stands and flip only once the partition's store commits the
-/// fire.
+/// Production hands the commit oracle a **clone of the partition's own
+/// trigger store** (handle passing at partition acquisition). Over a
+/// disjoint fresh store the oracle would read a permanently empty store and
+/// answer "committed" for an abandoned, uncommitted timer event (a phantom
+/// commit recovery would promote); over the shared handle it must answer
+/// `NotCommitted` while the trigger row stands and flip only once the
+/// partition's store commits the fire. The partition store is minted from
+/// the provider exactly as production does — the provider's shared maps are
+/// memory mode's durable substrate.
 #[tokio::test]
-async fn memory_provider_shares_store_with_oracle() -> Result<()> {
+async fn oracle_reads_through_the_partitions_store() -> Result<()> {
     let provider = InMemoryTriggerStoreProvider::new();
     let segment = Segment {
         id: Uuid::new_v4(),
@@ -321,10 +322,10 @@ async fn memory_provider_shares_store_with_oracle() -> Result<()> {
         slab_size: CompactDuration::new(300),
         version: SegmentVersion::V3,
     };
-    let partition_store = provider.create_store(segment.clone());
+    let partition_store = provider.create_store(segment);
     let oracle = CommitManager::new(
         MemoryDeduplicationStore::new(),
-        StoreTagSource(provider.create_store(segment)),
+        StoreTagSource(partition_store.clone()),
     );
 
     // The partition schedules a timer; the event is then abandoned before its

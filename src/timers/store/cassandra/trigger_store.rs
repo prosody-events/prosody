@@ -1023,18 +1023,21 @@ impl TriggerOperations for CassandraTriggerStore {
 
     /// Reads the commit-oracle tag for a single timer at `time`.
     ///
-    /// **Always reads durable state — never the per-instance `state_cache`.**
-    /// The keyed-state commit oracle consults this through its own store
-    /// instance while the partition's timer manager writes through a sibling
-    /// instance (same session, separate caches), so a cached answer here
-    /// could outlive a commit performed via the sibling and flip a recovery
-    /// decision. Bypassing the cache in both directions (no read, no
-    /// populate) makes that staleness unrepresentable. The two-step read
-    /// (state entry, then clustering row on `Overflow`) is sound because
-    /// per-key serialization guarantees no same-key mutation is in flight
-    /// while the oracle — or a `clear_and_schedule` tag preservation —
-    /// consults.
-    #[instrument(level = "debug", skip(self), err)]
+    /// Cache-first via `resolve_state`: a hit answers with zero DB reads.
+    /// This is sound because the partition's single writer is the only
+    /// mutator of this instance's `state_cache`, and the keyed-state commit
+    /// oracle consults through a **clone of this instance** (handle passing
+    /// at partition acquisition — see
+    /// [`StateBackendFactory::for_partition`]), so writer and oracle share
+    /// one cache; per-key serialization orders every consult against the
+    /// mutations it must observe. On `Overflow`, the clustering row's tag
+    /// column is read under the per-key mutex so a concurrent
+    /// promote/demote cannot interleave between the state check and the row
+    /// read.
+    ///
+    /// [`StateBackendFactory::for_partition`]:
+    ///     crate::state::StateBackendFactory::for_partition
+    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_tag(
         &self,
         key: &Key,
@@ -1042,7 +1045,11 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
     ) -> Result<Option<i32>, Self::Error> {
         let segment_id = self.segment.id;
-        match self.fetch_state(&segment_id, key, timer_type).await? {
+        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
+        Span::current().record("state_cached", cached);
+
+        let guard = handle.lock().await;
+        match &*guard {
             TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
             TimerState::Inline(_) | TimerState::Absent => Ok(None),
             TimerState::Overflow => {

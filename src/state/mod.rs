@@ -184,14 +184,24 @@ where
 /// workspace is per assignment), so the backend cannot be a single global
 /// value — the keyed-state manager calls [`Self::for_partition`] at partition
 /// acquisition and surfaces failures on the retry-until-shutdown loop.
-pub trait StateBackendFactory: Clone + Send + Sync + 'static {
+///
+/// `T` is the partition's trigger-store handle, passed down from the
+/// partition loop so the backend's commit oracle reads timer tags **through
+/// the same store instance the partition writes through** — one identity,
+/// one value. Minting a sibling store from a provider is not equivalent: a
+/// store may answer tag reads from a per-instance cache that only its own
+/// writes keep current. Factories whose oracle is supplied whole (e.g.
+/// [`SharedStateBackend`]) ignore the handle and accept any `T`.
+pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     /// The per-partition backend bundle this factory mints.
     type Backend: StateBackend;
 
     /// Error returned when a partition's backend cannot be materialized.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Mints the backend for `(topic, partition)`.
+    /// Mints the backend for `(topic, partition)`, wiring `triggers` — the
+    /// partition's trigger-store handle — into the commit oracle's timer
+    /// half.
     ///
     /// # Errors
     ///
@@ -201,6 +211,7 @@ pub trait StateBackendFactory: Clone + Send + Sync + 'static {
         &self,
         topic: Topic,
         partition: Partition,
+        triggers: T,
     ) -> Result<Self::Backend, Self::Error>;
 }
 
@@ -230,7 +241,9 @@ impl<S, I, O> SharedStateBackend<S, I, O> {
     }
 }
 
-impl<S, I, O> StateBackendFactory for SharedStateBackend<S, I, O>
+/// The oracle is supplied whole at construction, so the partition's
+/// trigger-store handle is ignored and any `T` is accepted.
+impl<S, I, O, T> StateBackendFactory<T> for SharedStateBackend<S, I, O>
 where
     S: CellStore + Clone,
     I: DescriptorIdentityStore + Clone,
@@ -243,6 +256,7 @@ where
         &self,
         _topic: Topic,
         _partition: Partition,
+        _triggers: T,
     ) -> Result<Self::Backend, Self::Error> {
         Ok(PartitionBackend::new(
             self.oracle.clone(),

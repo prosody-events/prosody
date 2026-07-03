@@ -5,7 +5,7 @@
 //!
 //! * [`CassandraStateBackendFactory`] mints, per partition, the
 //!   [`CassandraStore`] (shared), a per-partition fjall committed-value cache,
-//!   and the segment-scoped commit oracle.
+//!   and the partition's commit oracle.
 //! * [`MemoryStateBackendFactory`] mints the in-memory equivalents over a
 //!   process-wide shared [`MemoryCellStore`].
 //! * [`ProductionOracle`] names the commit oracle ([`CommitManager`]) that
@@ -26,66 +26,46 @@ use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallCellCacheError, 
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{PartitionBackend, StateBackendFactory};
-use crate::timers::duration::CompactDuration;
-use crate::timers::store::{Segment, TriggerStoreProvider};
+use crate::timers::store::TriggerStore;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::sync::Arc;
 
 /// The oracle both production backend factories mint: a [`CommitManager`]
-/// whose timer half reads tags straight from the partition's segment-scoped
-/// trigger store.
+/// whose timer half reads tags through the partition's own trigger store
+/// handle `S` (`mint_oracle` documents why the handle must be shared) and
+/// whose message half reads the dedup marker through a provider-minted
+/// dedup store.
 ///
-/// The store-backed tag source is sound here because the oracle is only
-/// consulted for *provisional* cells during recovery, and per-key
-/// serialization guarantees the staging event fully completed — durability
-/// markers included — before any later event on the key dispatches. The
-/// oracle's store instance is distinct from the one the partition's timer
-/// manager writes through; that is safe because
-/// [`current_tag`](crate::timers::store::TriggerStore::current_tag) always
-/// reads durable state, never a per-instance cache.
-pub type ProductionOracle<DP, TP> = CommitManager<
-    <DP as DeduplicationStoreProvider>::Store,
-    StoreTagSource<<TP as TriggerStoreProvider>::Store>,
->;
-
-/// The per-partition commit-oracle ingredients both factories mint their
-/// [`ProductionOracle`] from: the deduplication store provider (the message
-/// commit half), the trigger store provider (the timer-tag half), and the
-/// segment-deriving consumer group + timer slab size. The factories store the
-/// bundle whole and mint one oracle from it per partition.
-#[derive(Clone)]
-pub struct OracleProviders<DP, TP> {
-    /// Deduplication store provider — the mandatory message-commit oracle half.
-    pub dedup: DP,
-    /// Trigger store provider — the timer-tag oracle half.
-    pub triggers: TP,
-    /// Consumer group, deriving the partition's segment id.
-    pub consumer_group: ConsumerGroup,
-    /// Timer slab size for the segment.
-    pub timer_slab_size: CompactDuration,
-}
+/// The oracle is only consulted for *provisional* cells during recovery, and
+/// per-key serialization guarantees the staging event fully completed —
+/// durability markers included — before any later event on the key
+/// dispatches.
+pub type ProductionOracle<DP, S> =
+    CommitManager<<DP as DeduplicationStoreProvider>::Store, StoreTagSource<S>>;
 
 /// [`StateBackendFactory`] for the Cassandra storage backend.
 ///
 /// Per partition it opens one fjall workspace (the committed-value cache),
-/// mints the segment-scoped commit oracle, and hands out clones of the shared
-/// [`CassandraStore`] and [`CassandraDescriptorIdentityStore`] — so the
-/// sessions stage and the recovery sweep resolve through one oracle while
-/// identity validation runs against the one group-global identity store. The
-/// cache store owns the workspace, so the workspace's `Drop` (which deletes the
-/// fjall partition) fires only at partition revocation.
+/// mints the commit oracle over the partition's trigger-store handle, and
+/// hands out clones of the shared [`CassandraStore`] and
+/// [`CassandraDescriptorIdentityStore`] — so the sessions stage and the
+/// recovery sweep resolve through one oracle while identity validation runs
+/// against the one group-global identity store. The cache store owns the
+/// workspace, so the workspace's `Drop` (which deletes the fjall partition)
+/// fires only at partition revocation.
 #[derive(Clone)]
-pub struct CassandraStateBackendFactory<DP, TP> {
+pub struct CassandraStateBackendFactory<DP> {
     client: Arc<FjallClient>,
     session: CassandraSession,
     queries: Arc<CellQueries>,
     identity: CassandraDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
-    oracle: OracleProviders<DP, TP>,
+    dedup: DP,
+    consumer_group: ConsumerGroup,
 }
 
-impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
+impl<DP> CassandraStateBackendFactory<DP> {
     /// Creates the factory.
     ///
     /// Deduplication is mandatory — it is the commit oracle for message-event
@@ -99,7 +79,8 @@ impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
         cell: CassandraCellResources,
         identity: CassandraDescriptorIdentityStore,
         registry: Arc<CollectionDefRegistry>,
-        oracle: OracleProviders<DP, TP>,
+        dedup: DP,
+        consumer_group: ConsumerGroup,
     ) -> Self {
         let CassandraCellResources { session, queries } = cell;
         Self {
@@ -108,20 +89,21 @@ impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
             queries,
             identity,
             registry,
-            oracle,
+            dedup,
+            consumer_group,
         }
     }
 }
 
-impl<DP, TP> StateBackendFactory for CassandraStateBackendFactory<DP, TP>
+impl<DP, S> StateBackendFactory<S> for CassandraStateBackendFactory<DP>
 where
     DP: DeduplicationStoreProvider,
-    TP: TriggerStoreProvider,
+    S: TriggerStore,
 {
     type Backend = PartitionBackend<
-        ProductionOracle<DP, TP>,
+        ProductionOracle<DP, S>,
         CassandraDescriptorIdentityStore,
-        Cached<CassandraStore<ProductionOracle<DP, TP>>>,
+        Cached<CassandraStore<ProductionOracle<DP, S>>>,
     >;
     type Error = FjallCellCacheError;
 
@@ -129,6 +111,7 @@ where
         &self,
         topic: Topic,
         partition: Partition,
+        triggers: S,
     ) -> Result<Self::Backend, Self::Error> {
         let epoch = AssignmentEpoch::mint();
         let workspace = self.client.workspace(topic, partition, epoch)?;
@@ -136,7 +119,13 @@ where
         // partition) alive until the partition's state manager is dropped at
         // revocation.
         let fjall = FjallCellCache::for_workspace(workspace);
-        let oracle = mint_oracle(&self.oracle, topic, partition);
+        let oracle = mint_oracle(
+            &self.dedup,
+            &self.consumer_group,
+            topic,
+            partition,
+            triggers,
+        );
         // Production writer bottom: fjall write-through cache over the resolving
         // Cassandra cell store; the session wraps this in its per-event Overlay.
         // `Cached` owns the fjall workspace, so its warm provisional index and
@@ -161,14 +150,15 @@ where
 /// identities survive reassignment within the process); the committed-value
 /// cache and oracle are minted per partition, mirroring the Cassandra factory.
 #[derive(Clone)]
-pub struct MemoryStateBackendFactory<DP, TP> {
+pub struct MemoryStateBackendFactory<DP> {
     cells: MemoryCells,
     identity: MemoryDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
-    oracle: OracleProviders<DP, TP>,
+    dedup: DP,
+    consumer_group: ConsumerGroup,
 }
 
-impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
+impl<DP> MemoryStateBackendFactory<DP> {
     /// Creates the factory over a shared memory cell map and identity store.
     /// See [`CassandraStateBackendFactory::new`] for the `dedup`/`registry`
     /// contract.
@@ -177,26 +167,28 @@ impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
         cells: MemoryCells,
         identity: MemoryDescriptorIdentityStore,
         registry: Arc<CollectionDefRegistry>,
-        oracle: OracleProviders<DP, TP>,
+        dedup: DP,
+        consumer_group: ConsumerGroup,
     ) -> Self {
         Self {
             cells,
             identity,
             registry,
-            oracle,
+            dedup,
+            consumer_group,
         }
     }
 }
 
-impl<DP, TP> StateBackendFactory for MemoryStateBackendFactory<DP, TP>
+impl<DP, S> StateBackendFactory<S> for MemoryStateBackendFactory<DP>
 where
     DP: DeduplicationStoreProvider,
-    TP: TriggerStoreProvider,
+    S: TriggerStore,
 {
     type Backend = PartitionBackend<
-        ProductionOracle<DP, TP>,
+        ProductionOracle<DP, S>,
         MemoryDescriptorIdentityStore,
-        MemoryCellStore<ProductionOracle<DP, TP>>,
+        MemoryCellStore<ProductionOracle<DP, S>>,
     >;
     type Error = Infallible;
 
@@ -204,39 +196,55 @@ where
         &self,
         topic: Topic,
         partition: Partition,
+        triggers: S,
     ) -> Result<Self::Backend, Self::Error> {
-        let oracle = mint_oracle(&self.oracle, topic, partition);
+        let oracle = mint_oracle(
+            &self.dedup,
+            &self.consumer_group,
+            topic,
+            partition,
+            triggers,
+        );
         let cell = MemoryCellStore::new(self.cells.clone(), oracle.clone(), self.registry.clone());
         Ok(PartitionBackend::new(oracle, self.identity.clone(), cell))
     }
 }
 
-/// Mints the segment-scoped commit oracle shared by both factories.
+/// Mints the partition's commit oracle, shared by both factories.
 ///
-/// The trigger store is created over [`Segment::for_partition`] — the same
-/// formula the partition loop uses — so the oracle reads the exact timer
-/// rows the partition writes.
-fn mint_oracle<DP, TP>(
-    providers: &OracleProviders<DP, TP>,
+/// **Timer half — handle sharing is required.** `triggers` is a clone of the
+/// very store the partition's timer manager writes through, threaded down
+/// from the partition loop via
+/// [`StateBackendFactory::for_partition`]. The Cassandra store answers
+/// [`current_tag`](crate::timers::store::TriggerStore::current_tag)
+/// cache-first from a per-instance state cache that only writes through the
+/// instance (and its clones) keep current, so a sibling store minted from a
+/// provider could serve a stale tag and roll back a committed write.
+///
+/// **Dedup half — provider minting is sound.** The marker *write* already
+/// goes through this oracle's own store ([`CommitOracle::record_message`] is
+/// the `settle` boundary's flush), so writer and recovery reader are one
+/// instance by construction. The dedup middleware's separate filter
+/// instance cannot diverge either: every store a
+/// [`DeduplicationStoreProvider`] creates shares its state — the Cassandra
+/// provider shares one session and one write-through marker cache across
+/// all stores it mints (and the cache is presence-only over an insert-only
+/// table, so it can never claim a marker that was not durably written); the
+/// memory provider hands out clones of one shared set.
+///
+/// [`CommitOracle::record_message`]:
+///     crate::state::oracle::CommitOracle::record_message
+fn mint_oracle<DP, S>(
+    dedup: &DP,
+    consumer_group: &str,
     topic: Topic,
     partition: Partition,
-) -> ProductionOracle<DP, TP>
+    triggers: S,
+) -> ProductionOracle<DP, S>
 where
     DP: DeduplicationStoreProvider,
-    TP: TriggerStoreProvider,
+    S: TriggerStore,
 {
-    let OracleProviders {
-        dedup,
-        triggers,
-        consumer_group,
-        timer_slab_size,
-    } = providers;
     let dedup = dedup.create_store(topic, partition, consumer_group);
-    let triggers = StoreTagSource(triggers.create_store(Segment::for_partition(
-        consumer_group,
-        topic,
-        partition,
-        *timer_slab_size,
-    )));
-    CommitManager::new(dedup, triggers)
+    CommitManager::new(dedup, StoreTagSource(triggers))
 }
