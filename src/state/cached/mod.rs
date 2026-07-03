@@ -14,18 +14,25 @@
 //! Coverage is the single trust bit for both points and ranges: a point is the
 //! singleton interval `[X,X]`, a scan is a range, and one coverage-aware path
 //! serves both. **The success path only publishes and covers — it never
-//! invalidates.** The sole `punch` (uncover) is a failed `fjall.put`: the
-//! coordinate drops out of coverage so the next read falls through and
-//! self-heals.
+//! invalidates.** `punch` (uncover) happens for two reasons, each dropping a
+//! coordinate from coverage so the next read falls through and re-publishes
+//! from the lower store: (a) a write-path publish that could not be established
+//! in fjall (a failed `put`/`put_batch`, or a `commit_provisional` whose stage
+//! entry was missing/unreadable) — the coordinate self-heals on the next read;
+//! and (b) the raw `mark_resolved` promote, which cannot project the new
+//! committed `data` from keys alone — since a covered hit is served verbatim, a
+//! stale `prev` must not stay covered.
 //!
 //! The five soundness invariants (Cov1/Cov2/Cov3, `CovBuild`, `CovVolatile`,
 //! `GetNeverReadsOwnStaged`) are stated on the `coverage` module. The ones
 //! carried into this file:
 //!
 //! - **Cov3 — establish-then-publish.** `lower.write` precedes `fjall.put`+
-//!   `cover`; the only mutator `punch` is on a `fjall.put` failure. A failed
-//!   `lower.write` returns the error and leaves coverage untouched (the atomic
-//!   batch changed nothing). Publishing before lower confirmation is forbidden.
+//!   `cover`; the write-path `punch` fires only when that fjall publish cannot
+//!   be established — reason (a) above (the raw-promote `punch` in (b) is not a
+//!   write path). A failed `lower.write` returns the error and leaves coverage
+//!   untouched (the atomic batch changed nothing). Publishing before lower
+//!   confirmation is forbidden.
 //! - **The Incomplete trap.** [`Cached`]'s
 //!   [`commit_provisional`](CellStore::commit_provisional) /
 //!   [`abort_provisional`](CellStore::abort_provisional) overrides MUST return
@@ -447,10 +454,7 @@ where
         // The request interval is absolute (direction-independent); the scan's
         // direction-relative bounds map onto it (start = low forward / high
         // backward).
-        let (lo, hi) = match dir {
-            Direction::Forward => (scan.start, scan.end),
-            Direction::Backward => (scan.end, scan.start),
-        };
+        let (lo, hi) = scan.low_high();
         let request = Interval::new(lo.cloned(), hi.cloned());
         try_stream! {
             // An empty request (e.g. `(a, a)`) yields nothing.
@@ -659,13 +663,11 @@ where
         // so the cache cannot publish the new committed projection from the keys
         // alone. `commit_provisional` is the promote path that *does* carry the
         // staged writes (and publishes `data`); this raw promote is only reached
-        // by the recovery sweep / `resolve_cell`, where the next covered read
-        // re-publishes from the lower store. Leave coverage untouched: the lower
-        // promote did not change the committed value (provisional `data` ==
-        // committed once promoted), and any stale fjall `prev` is corrected by
-        // the falls-through-on-mismatch covered serve. To stay conservative,
-        // punch the touched coordinates so the next read re-publishes the
-        // promoted value.
+        // by the recovery sweep / `resolve_cell`. Because a covered hit is served
+        // verbatim (Cov1/Cov2 — `get` never falls through on a value mismatch), a
+        // stale `prev` left covered would be served forever. So punch the touched
+        // coordinates, dropping them from coverage; the next read falls through
+        // and re-publishes the promoted value from the lower store.
         self.lower.mark_resolved(collection, cells).await?;
         for cell in cells {
             degrade_cover_mut(

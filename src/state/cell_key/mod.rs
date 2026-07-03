@@ -140,15 +140,29 @@ pub struct Scan<'a> {
 }
 
 impl Scan<'_> {
-    /// Whether `coordinate` lies within the scan's coordinate range, accounting
-    /// for direction and bound exclusivity. The single definition every backend
-    /// range predicate defers to, so the in-memory and Cassandra legs agree.
+    /// The scan's direction-relative bounds resolved to absolute `(low, high)`:
+    /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]
-    pub fn contains(&self, coordinate: &Coordinate) -> bool {
-        let (low, high) = match self.dir {
+    pub fn low_high(&self) -> (Bound<&Coordinate>, Bound<&Coordinate>) {
+        match self.dir {
             Direction::Forward => (self.start, self.end),
             Direction::Backward => (self.end, self.start),
-        };
+        }
+    }
+
+    /// Whether `coordinate` lies within the scan's coordinate range, accounting
+    /// for direction and bound exclusivity.
+    ///
+    /// One of three equivalent range predicates — this one (used by the
+    /// in-memory and overlay legs), the Cassandra hand-roll (CQL comparators
+    /// plus `past_end`), and the test oracle `in_scan_range`. Their parity is
+    /// pinned by the backend-generic property test `run_bottom_scan_trace`,
+    /// which runs one generator against both `MemoryCellStore` and a live
+    /// `CassandraStore` under the shared oracle across the full
+    /// Direction × exclusivity space, so a one-sided edit fails the suite.
+    #[must_use]
+    pub fn contains(&self, coordinate: &Coordinate) -> bool {
+        let (low, high) = self.low_high();
         above_low(coordinate, low) && below_high(coordinate, high)
     }
 }

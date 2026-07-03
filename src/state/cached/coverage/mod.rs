@@ -6,9 +6,11 @@
 //! fjall; gaps fall through to the lower store and are covered as their cells
 //! are consumed. Because the cache is **write-through**, a write covers the
 //! coordinate it touched with the new committed projection — coverage *grows*
-//! on both reads and writes. The only `punch` (uncover) is a failed
-//! `fjall.put`, so a coordinate whose publish failed falls through on the next
-//! read and self-heals.
+//! on both reads and writes. `punch` (uncover) happens on a write-path publish
+//! that could not be established in fjall (self-heal on the next read), and on
+//! the raw `mark_resolved` promote, which cannot project the new committed
+//! value from keys alone and so drops the coordinate for the next read to
+//! re-publish.
 //!
 //! # Soundness invariants (the cache serves committed projections only)
 //!
@@ -26,8 +28,9 @@
 //!   `data`/`prev`. The covered serve skips the oracle and ignores `own`;
 //!   resolution-on-read fires only in gaps.
 //! - **Cov3 — establish-then-publish.** `lower.write` precedes
-//!   [`IntervalSet::cover`]; the only mutator `punch` is on a `fjall.put`
-//!   failure. Publishing before lower confirmation is forbidden.
+//!   [`IntervalSet::cover`]; a write-path mutator punches only when that fjall
+//!   publish cannot be established. Publishing before lower confirmation is
+//!   forbidden.
 //! - **`CovBuild` — born resolved.** [`IntervalSet::cover`] is `pub(in
 //!   crate::state::cached)`; its call sites — the scan-drain, the mutator
 //!   publishes, and cover-on-get — carry committed projections only (the

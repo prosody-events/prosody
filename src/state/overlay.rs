@@ -32,6 +32,7 @@ use super::dirty::{DirtyStore, DirtyVal};
 use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
 use super::store::CellStore;
+use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -190,6 +191,31 @@ where
         }
     }
 
+    fn get_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        // Cache-fill mirrors the lower committed projection (and its real TTL),
+        // never this handler's uncommitted dirty overlay — so delegate straight
+        // to `lower` rather than inheriting the default, which would route
+        // through `Overlay::get` and cache the dirty value with a `None` TTL.
+        self.lower.get_for_cache(collection, cell, own)
+    }
+
+    fn scan_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        // Cache-fill bypasses the dirty overlay by design (see `get_for_cache`).
+        self.lower.scan_for_cache(collection, scan, own)
+    }
+
     fn provisional_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -252,5 +278,62 @@ fn front_cmp(dir: Direction, top: &Coordinate, bottom: &Coordinate) -> Ordering 
     match dir {
         Direction::Forward => top.cmp(bottom),
         Direction::Backward => bottom.cmp(top),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::cell_key::Section;
+    use super::*;
+    use crate::state::identity::{StateKey, StateName, StateType};
+    use crate::state::memory::{MemoryCellStore, MemoryCells};
+    use crate::state::registry::CollectionDefRegistry;
+    use crate::state::tests::cell_suite::ScriptedOracle;
+    use color_eyre::eyre::Result;
+    use uuid::Uuid;
+
+    /// Cache-fill bypasses the dirty overlay: `get_for_cache` must reflect the
+    /// lower committed projection, never this handler's uncommitted buffer —
+    /// else a fill would cache the dirty value (and stamp it "never
+    /// expires").
+    #[tokio::test]
+    async fn get_for_cache_reads_lower_committed_not_dirty() -> Result<()> {
+        let id = CollectionId::new(
+            StateKey::new(Uuid::new_v4(), Arc::from("k")),
+            StateType::Application,
+            StateName::try_new("entries")?,
+        );
+        let cref = CollectionRef::new(id.clone(), None);
+        let own = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let cell = CellKey {
+            section: Section::new(0),
+            coordinate: Coordinate::from_bytes(vec![7]),
+        };
+
+        let lower = MemoryCellStore::new(
+            MemoryCells::new(),
+            ScriptedOracle::default(),
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        // Seed a committed value (resolved, no event) in the lower store.
+        let committed = Bytes::from_static(b"committed");
+        lower
+            .write_resolved(&cref, &[(cell.clone(), Some(committed.clone()))])
+            .await?;
+
+        // Buffer a *different* dirty value on the same key.
+        let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower, own);
+        overlay.buffer_set(&id, &cell, b"dirty");
+
+        // The transactional read sees the dirty overlay...
+        let dirty_read = overlay.get(&id, &cell, own).await?;
+        assert_eq!(dirty_read.get(), Some(&Bytes::from_static(b"dirty")));
+
+        // ...but cache-fill delegates to the lower committed projection.
+        let (fill, _ttl) = overlay.get_for_cache(&id, &cell, own).await?;
+        assert_eq!(fill.get(), Some(&committed));
+        Ok(())
     }
 }
