@@ -68,60 +68,165 @@
 use super::super::cell_key::{Coordinate, Section};
 use super::super::fjall::{FjallCellCache, FjallCellCacheError};
 use super::super::identity::CollectionId;
+use ahash::RandomState;
+use educe::Educe;
+use quick_cache::sync::Cache;
 use smallvec::SmallVec;
+use std::array::from_fn;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Shards in the coverage-mutation lock pool. Mutations of one section always
+/// share a shard; distinct sections almost never collide, so unrelated keys'
+/// coverage writes don't serialize.
+const LOCK_SHARDS: usize = 16;
+
+/// Sections whose materialized [`IntervalSet`] is memoized in RAM. Bounds the
+/// memo regardless of how many sections an epoch touches; an evicted section
+/// simply reloads from fjall on its next access.
+const MEMO_SECTIONS: usize = 1024;
 
 /// Per-partition scan coverage, keyed by `(CollectionId, Section)`, spilled to
 /// the per-partition fjall `index` keyspace.
 ///
 /// Each `(collection, section)`'s covered intervals live as a `Cover` prefix
 /// range (one fjall entry per interval, keyed by its low-bound frame → high
-/// bound), so the coverage map accumulates **on disk** with RAM bounded only by
-/// fjall's block cache — no unbounded in-RAM `scc::HashMap` over a weeks-long
-/// assignment. Every operation loads the section's bounded interval list from
-/// fjall, runs the [`IntervalSet`] algebra in RAM, and (for mutations) rewrites
-/// the whole section range in one blocking hop. Reads are block-cache hot on
-/// the warm path; the fjall LSM is the on-disk `BTreeMap` (an ascending range
-/// yields intervals already sorted by low bound — see the bound-frame codec).
+/// bound), so the coverage map accumulates **on disk** with RAM bounded by the
+/// fixed-capacity memo below plus fjall's block cache — no unbounded in-RAM
+/// `scc::HashMap` over a weeks-long assignment. The materialized
+/// [`IntervalSet`] of each hot section is **memoized** ([`MEMO_SECTIONS`]
+/// capacity): reads answer from the memo with zero fjall I/O, and every
+/// mutation runs the algebra on the memoized set and rewrites the whole
+/// section range in one blocking hop (fjall is the spill + reload source, an
+/// ascending range yields intervals sorted by low bound — see the bound-frame
+/// codec).
 ///
 /// The one-per-partition [`FjallCellCache`] handle is a cheap `Arc` clone of
 /// the one the [`Cached`](super::Cached) cache operates, so coverage shares the
 /// workspace's epoch lifecycle: cold (empty) at a fresh assignment
-/// (`CovVolatile`), dropped at revocation.
-#[derive(Clone, Debug)]
+/// (`CovVolatile`), dropped at revocation. Like the mutation locks, the memo
+/// is sound only because this `Coverage` (through its `Arc`-shared clones) is
+/// the workspace's **single owner** for the epoch — a second live instance
+/// over the same keyspace would neither serialize with nor observe this one's
+/// mutations.
+///
+/// # Mutation atomicity
+///
+/// Every mutation is a whole-section load→mutate→store cycle; two interleaved
+/// cycles on one section would lose the first store, and a **lost punch
+/// resurrects stale coverage** — a wrong covered answer for the rest of the
+/// epoch. Per-key event serialization does **not** exclude this: session ops
+/// are `&self`, so one handler can hold two of them concurrently polled (a
+/// `join!`-ed flush and scan, a scan stream held across a get). Each mutation
+/// therefore serializes on a hash-sharded per-`(collection, section)` async
+/// lock, which also owns every **memo write**: a mutation refreshes the memo
+/// only after its store landed (and drops the entry when the store failed, so
+/// the next access reloads whatever fjall actually holds), and a read that
+/// misses the memo populates it under the same lock — so a stale read-side
+/// load can never clobber a newer mutation's entry. Memo-hit reads
+/// (`covers`/`query`) stay lock-free: the memoized `Arc` snapshot is replaced
+/// wholesale, so a racing read sees the set before-or-after a mutation, and an
+/// under-read is a benign fall-through.
+#[derive(Clone, Educe)]
+#[educe(Debug)]
 pub struct Coverage {
     fjall: FjallCellCache,
+    locks: Arc<MutationLocks>,
+    #[educe(Debug(ignore))]
+    memo: Arc<Cache<(CollectionId, Section), Arc<IntervalSet>>>,
+}
+
+/// The shared coverage-mutation lock pool (see [`Coverage`]'s mutation-
+/// atomicity note): a fixed shard array indexed by the hash of
+/// `(collection, section)`, so it is bounded regardless of how many sections
+/// an epoch touches.
+#[derive(Debug)]
+struct MutationLocks {
+    hasher: RandomState,
+    shards: [Mutex<()>; LOCK_SHARDS],
+}
+
+impl MutationLocks {
+    /// The shard serializing mutations of `(collection, section)`.
+    fn shard(&self, collection: &CollectionId, section: Section) -> &Mutex<()> {
+        // Same inputs always map to the same shard; which shard is purely a
+        // spreading choice.
+        let hash = self.hasher.hash_one((collection, section));
+        &self.shards[(hash as usize) % LOCK_SHARDS]
+    }
 }
 
 impl Coverage {
     /// Builds coverage backed by `fjall`'s `index` keyspace.
     #[must_use]
     pub fn new(fjall: FjallCellCache) -> Self {
-        Self { fjall }
+        Self {
+            fjall,
+            locks: Arc::new(MutationLocks {
+                hasher: RandomState::new(),
+                shards: from_fn(|_| Mutex::new(())),
+            }),
+            memo: Arc::new(Cache::new(MEMO_SECTIONS)),
+        }
     }
 
-    /// Loads the section's stored intervals into an [`IntervalSet`].
-    async fn load(
+    /// The section's materialized interval set: the memo answer when present,
+    /// else loaded from fjall **under the section's mutation lock** and
+    /// memoized (see the mutation-atomicity note — the lock owns every memo
+    /// write, so this fill can never clobber a concurrent mutation's newer
+    /// set).
+    async fn snapshot(
         &self,
         collection: &CollectionId,
         section: Section,
-    ) -> Result<IntervalSet, FjallCellCacheError> {
+    ) -> Result<Arc<IntervalSet>, FjallCellCacheError> {
+        let key = (collection.clone(), section);
+        if let Some(set) = self.memo.get(&key) {
+            return Ok(set);
+        }
+        let _mutation = self.locks.shard(collection, section).lock().await;
+        // A mutation may have populated the memo while we awaited the lock.
+        if let Some(set) = self.memo.get(&key) {
+            return Ok(set);
+        }
         let stored = self.fjall.cover_load(collection, section).await?;
-        Ok(IntervalSet::from_pairs(stored))
+        let set = Arc::new(IntervalSet::from_pairs(stored));
+        self.memo.insert(key, set.clone());
+        Ok(set)
     }
 
-    /// Rewrites the section's whole stored range from `set`.
-    async fn store(
+    /// The one coverage write path: under the section's mutation lock, runs
+    /// `mutate` over the section's materialized set (memoized, else loaded
+    /// from fjall), rewrites the whole stored range in one blocking hop, and
+    /// refreshes the memo — or drops the memo entry when the store failed, so
+    /// the next access reloads whatever fjall actually holds.
+    async fn mutate(
         &self,
         collection: &CollectionId,
         section: Section,
-        set: &IntervalSet,
+        mutate: impl FnOnce(&mut IntervalSet),
     ) -> Result<(), FjallCellCacheError> {
-        self.fjall
+        let _mutation = self.locks.shard(collection, section).lock().await;
+        let key = (collection.clone(), section);
+        let mut set = match self.memo.get(&key) {
+            Some(memoized) => (*memoized).clone(),
+            None => IntervalSet::from_pairs(self.fjall.cover_load(collection, section).await?),
+        };
+        mutate(&mut set);
+        let stored = self
+            .fjall
             .cover_store(collection, section, &set.to_pairs())
-            .await
+            .await;
+        match stored {
+            Ok(()) => self.memo.insert(key, Arc::new(set)),
+            Err(_) => {
+                self.memo.remove(&key);
+            }
+        }
+        stored
     }
 
     /// Partitions `request` over the section's coverage into ordered, disjoint
@@ -138,7 +243,7 @@ impl Coverage {
         section: Section,
         request: &Interval,
     ) -> Result<SmallVec<[Piece; 4]>, FjallCellCacheError> {
-        Ok(self.load(collection, section).await?.query(request))
+        Ok(self.snapshot(collection, section).await?.query(request))
     }
 
     /// Covers `interval` in the section (union/merge). Born resolved
@@ -155,9 +260,31 @@ impl Coverage {
         section: Section,
         interval: Interval,
     ) -> Result<(), FjallCellCacheError> {
-        let mut set = self.load(collection, section).await?;
-        set.cover(interval);
-        self.store(collection, section, &set).await
+        self.mutate(collection, section, |set| set.cover(interval))
+            .await
+    }
+
+    /// Covers each coordinate's singleton interval `[X, X]` in one
+    /// load→mutate→store cycle — the batch counterpart of
+    /// [`cover`](Self::cover) for a settle batch's cells, N in-memory unions
+    /// for one section rewrite. Born resolved (`CovBuild`), same as `cover`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall read/write failure; the caller degrades a failure to
+    /// leaving the points uncovered (the next read falls through).
+    pub(in crate::state::cached) async fn cover_points(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        coordinates: &[Coordinate],
+    ) -> Result<(), FjallCellCacheError> {
+        self.mutate(collection, section, |set| {
+            for coordinate in coordinates {
+                set.cover(point_interval(coordinate));
+            }
+        })
+        .await
     }
 
     /// Whether `coordinate`'s committed value is already covered — a covered
@@ -175,26 +302,33 @@ impl Coverage {
         section: Section,
         coordinate: &Coordinate,
     ) -> Result<bool, FjallCellCacheError> {
-        Ok(self.load(collection, section).await?.covers(coordinate))
+        Ok(self.snapshot(collection, section).await?.covers(coordinate))
     }
 
-    /// Punches `coordinate` out of the section's coverage (splitting the
-    /// containing interval). A no-op when the coordinate was not covered.
+    /// Punches each coordinate out of the section's coverage (splitting its
+    /// containing interval) in one load→mutate→store cycle. A no-op for
+    /// coordinates that were not covered.
     ///
     /// # Errors
     ///
-    /// Propagates a fjall read/write failure; the caller degrades a failure to
-    /// leaving coverage unchanged (a stale covered entry self-heals on the next
-    /// mismatched serve).
-    pub async fn punch(
+    /// Propagates a fjall read/write failure. A covered hit is served verbatim
+    /// — there is **no** read-side mismatch detection — so where the punch
+    /// guards a moved durable value the caller must not swallow the failure:
+    /// `Cached::punch_cells_must_succeed` retries it until it lands. Only the
+    /// cover-on-get fill may degrade a punch failure (its coordinate is
+    /// uncovered or expired-covered, both of which fall through anyway).
+    pub async fn punch_many(
         &self,
         collection: &CollectionId,
         section: Section,
-        coordinate: &Coordinate,
+        coordinates: &[Coordinate],
     ) -> Result<(), FjallCellCacheError> {
-        let mut set = self.load(collection, section).await?;
-        set.punch(coordinate);
-        self.store(collection, section, &set).await
+        self.mutate(collection, section, |set| {
+            for coordinate in coordinates {
+                set.punch(coordinate);
+            }
+        })
+        .await
     }
 }
 
@@ -283,7 +417,7 @@ impl PartialOrd for LowBound {
 /// unrepresentable), and the low is recovered from the key, so it is the single
 /// source of truth and cannot drift from a duplicated copy. Every mutation
 /// preserves pairwise-disjointness and non-emptiness.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IntervalSet {
     intervals: BTreeMap<LowBound, Bound<Coordinate>>,
 }
@@ -457,6 +591,16 @@ fn interval(key: &LowBound, hi: &Bound<Coordinate>) -> Interval {
     Interval {
         lo: key.0.clone(),
         hi: hi.clone(),
+    }
+}
+
+/// The singleton interval `[X, X]` — non-empty by construction
+/// (`Included`/`Included` at one coordinate), so it skips the
+/// [`Interval::new`] empty-check.
+fn point_interval(coordinate: &Coordinate) -> Interval {
+    Interval {
+        lo: Bound::Included(coordinate.clone()),
+        hi: Bound::Included(coordinate.clone()),
     }
 }
 

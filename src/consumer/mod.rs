@@ -127,7 +127,7 @@
 
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
-use crate::consumer::kafka_context::{PartitionProviders, new_context};
+use crate::consumer::kafka_context::{ManagerRegistry, PartitionProviders, new_context};
 pub use crate::consumer::kafka_state::{
     MessageDescriptor, MessageRef, MessageRefCodec, MessageRefCodecError, MessageResolver,
     MessageStateError, message_state,
@@ -215,6 +215,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::error;
 use validator::{Validate, ValidationErrors};
@@ -753,6 +754,12 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     #[educe(Debug(ignore))]
     managers: Arc<Managers<C::Payload>>,
 
+    /// Current assigned-partition count, republished by the rebalance callback
+    /// after every assign/revoke. Awaited by
+    /// [`ProsodyConsumer::wait_for_assigned_partitions`].
+    #[educe(Debug(ignore))]
+    assignment: watch::Receiver<u32>,
+
     /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
     runtime_state: Arc<Mutex<Option<RuntimeState>>>,
@@ -1179,6 +1186,7 @@ where
     let managers: Arc<Managers<C::Payload>> = Arc::default();
     let shutdown: Arc<AtomicBool> = Arc::default();
     let telemetry_sender = telemetry.sender();
+    let (assignment_tx, assignment) = watch::channel(0u32);
 
     let (managers, runtime_state) = initialize_consumer::<T, S, SP, C>(ConsumerInitParams {
         config: consumer_config.clone(),
@@ -1188,6 +1196,7 @@ where
         state_provider,
         watermark_version: watermark_version.clone(),
         managers: managers.clone(),
+        assignment_tx,
         telemetry: telemetry_sender,
         shutdown: shutdown.clone(),
         heartbeats: heartbeats.clone(),
@@ -1196,6 +1205,7 @@ where
     Ok(ProsodyConsumer {
         shutdown,
         managers,
+        assignment,
         runtime_state,
         heartbeats,
     })
@@ -1681,6 +1691,26 @@ impl<C: Codec> ProsodyConsumer<C> {
         get_assigned_partition_count(&self.managers)
     }
 
+    /// Awaits until at least `count` partitions are assigned, returning the
+    /// observed count.
+    ///
+    /// The rebalance callback republishes the assignment count after every
+    /// assign/revoke, so this awaits that transition rather than polling
+    /// [`assigned_partition_count`](Self::assigned_partition_count). Returns
+    /// immediately if the current count already satisfies `count`. If the
+    /// publishing side has shut down, it falls back to a direct read.
+    pub async fn wait_for_assigned_partitions(&self, count: u32) -> u32 {
+        match self
+            .assignment
+            .clone()
+            .wait_for(|&assigned| assigned >= count)
+            .await
+        {
+            Ok(assigned) => *assigned,
+            Err(_) => self.assigned_partition_count(),
+        }
+    }
+
     /// Checks if any assigned partition or consumer-level actor is stalled.
     ///
     /// A partition is considered stalled if it hasn't processed messages
@@ -1781,6 +1811,8 @@ where
     watermark_version: Arc<WatermarkVersion>,
     /// Thread-safe map of active partition managers.
     managers: Arc<Managers<PL>>,
+    /// Publishes the assigned-partition count from the rebalance callback.
+    assignment_tx: watch::Sender<u32>,
     /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
     /// Atomic flag for coordinating consumer shutdown.
@@ -1829,7 +1861,10 @@ where
             state: params.state_provider,
         },
         params.watermark_version.clone(),
-        params.managers.clone(),
+        ManagerRegistry {
+            managers: params.managers.clone(),
+            assignment_tx: params.assignment_tx,
+        },
         params.telemetry,
         params.version,
     )?;

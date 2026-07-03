@@ -155,6 +155,23 @@ impl FallibleHandler for ProbeHandler {
     async fn shutdown(self) {}
 }
 
+/// A commit guard that records whether it was committed or aborted, so a
+/// test can assert which terminal the durability sequence chose.
+struct RecordingGuard {
+    committed: Arc<AtomicUsize>,
+    aborted: Arc<AtomicUsize>,
+}
+
+impl Uncommitted for RecordingGuard {
+    async fn commit(self) {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn abort(self) {
+        self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn make_offset_tracker() -> OffsetTracker {
     let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version)
@@ -530,6 +547,7 @@ mod rollback_safety {
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
     use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::FinalizeOutcome;
+    use crate::state::session::sealed::StateLifecycle;
     use crate::state::store::CellStore;
     use crate::state::{CollectionId, StateKey, StateName, StateType};
     use color_eyre::eyre::{Result, eyre};
@@ -558,23 +576,6 @@ mod rollback_safety {
         async fn commit(self) {}
 
         async fn abort(self) {}
-    }
-
-    /// A commit guard that records whether it was committed or aborted, so a
-    /// test can assert which terminal the durability sequence chose.
-    struct RecordingGuard {
-        committed: Arc<AtomicUsize>,
-        aborted: Arc<AtomicUsize>,
-    }
-
-    impl Uncommitted for RecordingGuard {
-        async fn commit(self) {
-            self.committed.fetch_add(1, Ordering::SeqCst);
-        }
-
-        async fn abort(self) {
-            self.aborted.fetch_add(1, Ordering::SeqCst);
-        }
     }
 
     type Ctx = MockEventContext<serde_json::Value, TestSession>;
@@ -765,6 +766,7 @@ mod backstop_amortization {
     use crate::state::descriptor::tests::test_session_with_armed;
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::sealed::StateLifecycle;
     use crate::state::session::{ArmedKeys, LifecycleAccessExt};
     use color_eyre::eyre::{Result, eyre};
     use serde_json::json;
@@ -872,9 +874,10 @@ mod arm_backstop {
     use crate::consumer::middleware::tests::test_support::TimerOperation;
     use crate::loader::MemoryLoader;
     use crate::state::StateKey;
-    use crate::state::descriptor::tests::test_session_with_armed;
+    use crate::state::descriptor::tests::{TestSession, test_session_with_armed};
     use crate::state::descriptor::{Registered, value_state};
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::sealed::StateLifecycle;
     use crate::state::session::{ArmedKeys, LifecycleAccessExt};
     use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::{Result, eyre};
@@ -896,13 +899,20 @@ mod arm_backstop {
 
     /// Stages a cell in one `ReadCommitted` value collection per entry in
     /// `bounds` (each carrying that `recovery_within`), sharing `armed`/`key`
-    /// with prior events, then runs `arm_backstop`. Brackets the arm with `now`
-    /// so the caller can bound the scheduled fire time.
+    /// with prior events, then runs `arm_backstop`. `durable` seeds a
+    /// `StateRecovery` timer standing in the mock's durable store (a prior
+    /// epoch's backstop). Brackets the arm with `now` so the caller can bound
+    /// the scheduled fire time; returns the context for op/durable inspection.
     async fn run_arm(
         bounds: &[Option<u32>],
         key: &StateKey,
         armed: &ArmedKeys,
-    ) -> Result<(CompactDateTime, CompactDateTime, Vec<TimerOperation>)> {
+        durable: Option<CompactDateTime>,
+    ) -> Result<(
+        CompactDateTime,
+        CompactDateTime,
+        MockEventContext<serde_json::Value, TestSession>,
+    )> {
         let mut registry = CollectionDefRegistry::default();
         for (i, within) in bounds.iter().enumerate() {
             registry.register(
@@ -912,9 +922,12 @@ mod arm_backstop {
         }
         let (session, _store) =
             test_session_with_armed(MemoryLoader::new(), registry, key.clone(), armed.clone());
-        let context = MockEventContext::new()
+        let mut context = MockEventContext::new()
             .with_session(session)
             .with_timer_tracking();
+        if let Some(time) = durable {
+            context = context.with_durable_timer(time, TimerType::StateRecovery);
+        }
         for i in 0..bounds.len() {
             let handle = context
                 .state(Registered::new(value_state::<JsonCodec>(&format!("c{i}"))))
@@ -929,7 +942,7 @@ mod arm_backstop {
         let before = CompactDateTime::now()?;
         arm_backstop(&context, &lifecycle).await;
         let after = CompactDateTime::now()?;
-        Ok((before, after, context.timer_operations()))
+        Ok((before, after, context))
     }
 
     /// Arm-if-sooner **and** the convergence bound, as one property over
@@ -969,7 +982,8 @@ mod arm_backstop {
                 let _ = armed.insert_async(raw_key.clone(), seed).await;
             }
 
-            let (before, after, ops) = run_arm(bounds, &key, &armed).await?;
+            let (before, after, context) = run_arm(bounds, &key, &armed, None).await?;
+            let ops = context.timer_operations();
             let delay = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
             let stored = armed.read_async(&raw_key, |_, &f| f).await;
             let scheduled = scheduled_recovery_fire(&ops);
@@ -1018,5 +1032,329 @@ mod arm_backstop {
             }
         }
         QuickCheck::new().quickcheck(prop as fn(Vec<Option<u16>>, Option<bool>) -> TestResult);
+    }
+
+    /// Never-loosen across reacquisition: `ArmedKeys` is minted empty per
+    /// acquisition while a prior epoch's backstop survives in the durable
+    /// trigger store, so the first arm on a key must consult the durable
+    /// store. A sooner standing durable fire is kept (no singleton overwrite)
+    /// and seeded into `ArmedKeys`; a later one is tightened. Either way the
+    /// standing durable fire never moves later.
+    ///
+    /// `standing`: `None` = no durable backstop (plain first arm);
+    /// `Some(false)` = far-past durable fire (sooner) → must keep;
+    /// `Some(true)` = far-future durable fire (later) → must tighten. The
+    /// extremes make the decision immune to sub-second wall-clock drift, as in
+    /// `prop_arm_backstop_arms_iff_new_fire_is_sooner`.
+    #[test]
+    fn prop_reacquisition_never_loosens_standing_backstop() {
+        async fn check(bounds: &[Option<u32>], standing: Option<bool>) -> Result<()> {
+            // Fresh per-acquisition RAM: the durable seed is the only record
+            // of the prior epoch's backstop.
+            let armed: ArmedKeys = Arc::default();
+            let raw_key: Key = Arc::from("k");
+            let key = StateKey::new(Uuid::from_u128(0xC1), raw_key.clone());
+            let durable = standing.map(|future| {
+                if future {
+                    CompactDateTime::MAX
+                } else {
+                    CompactDateTime::MIN
+                }
+            });
+
+            let (before, after, context) = run_arm(bounds, &key, &armed, durable).await?;
+            let ops = context.timer_operations();
+            let now_durable = context.durable_scheduled(TimerType::StateRecovery);
+            let stored = armed.read_async(&raw_key, |_, &f| f).await;
+            let scheduled = scheduled_recovery_fire(&ops);
+            let delay = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
+
+            if standing == Some(false) {
+                if scheduled.is_some() {
+                    return Err(eyre!(
+                        "a sooner durable backstop must not be overwritten (loosened)"
+                    ));
+                }
+                if now_durable != vec![CompactDateTime::MIN] {
+                    return Err(eyre!(
+                        "the sooner durable fire must be left standing, got {now_durable:?}"
+                    ));
+                }
+                if stored != Some(CompactDateTime::MIN) {
+                    return Err(eyre!(
+                        "the durable fire must seed the fresh ArmedKeys, got {stored:?}"
+                    ));
+                }
+                return Ok(());
+            }
+
+            // No durable backstop, or a later (far-future) one: arm/tighten.
+            let fire = scheduled.ok_or_else(|| eyre!("expected an arm, none scheduled"))?;
+            let (lo, hi) = (
+                before.epoch_seconds() + delay,
+                after.epoch_seconds() + delay,
+            );
+            if !(lo..=hi).contains(&fire.epoch_seconds()) {
+                return Err(eyre!("fire {} not in [{lo},{hi}]", fire.epoch_seconds()));
+            }
+            if now_durable != vec![fire] {
+                return Err(eyre!(
+                    "the singleton overwrite must leave exactly the new fire standing, got \
+                     {now_durable:?}"
+                ));
+            }
+            if stored != Some(fire) {
+                return Err(eyre!("stored fire {stored:?} != scheduled {fire:?}"));
+            }
+            Ok(())
+        }
+
+        fn prop(raw: Vec<Option<u16>>, standing: Option<bool>) -> TestResult {
+            if raw.is_empty() || raw.len() > 6 {
+                return TestResult::discard();
+            }
+            let bounds: Vec<Option<u32>> = raw.into_iter().map(|o| o.map(u32::from)).collect();
+            match executor::block_on(check(&bounds, standing)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e.to_string()),
+            }
+        }
+        QuickCheck::new().quickcheck(prop as fn(Vec<Option<u16>>, Option<bool>) -> TestResult);
+    }
+}
+
+/// The success-path marker flush is **must-succeed**: `settle` retries a
+/// failed flush of ANY category — Transient, Terminal, and Permanent alike —
+/// until the marker lands. The marker is framework bookkeeping, never a data
+/// rejection: skipping a Permanent failure would commit the offset with the
+/// stage uncertified, and the armed sweep would then silently roll a
+/// successful handler's writes back with no redelivery to replay them.
+mod marker_flush_must_succeed {
+    use super::*;
+    use crate::consumer::partition::ShutdownPhase;
+    use crate::loader::MemoryLoader;
+    use crate::state::cell::Committed;
+    use crate::state::cell_key::{CellKey, Coordinate, Section};
+    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
+    use crate::state::dirty::DirtyStore;
+    use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+    use crate::state::oracle::CommitOracle;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::sealed::StateLifecycle;
+    use crate::state::session::{
+        KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
+    };
+    use crate::state::store::CellStore;
+    use crate::state::{
+        CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
+    };
+    use crate::timers::duration::CompactDuration;
+    use color_eyre::eyre::Result;
+    use futures::StreamExt;
+    use quickcheck::{QuickCheck, TestResult};
+    use serde_json::json;
+    use thiserror::Error;
+    use tokio::runtime::Builder;
+    use tokio::sync::watch;
+    use uuid::Uuid;
+
+    /// Marker-store failure with a configured classification.
+    #[derive(Debug, Error)]
+    #[error("mock marker store failed ({0:?})")]
+    struct MockMarkerError(ErrorCategory);
+
+    impl ClassifyError for MockMarkerError {
+        fn classify_error(&self) -> ErrorCategory {
+            self.0
+        }
+    }
+
+    /// Oracle whose `record_message` fails a configured number of times with a
+    /// configured category before succeeding, counting successful records;
+    /// `resolve` always answers Committed.
+    #[derive(Clone)]
+    struct FlakyMarkerOracle {
+        remaining: Arc<AtomicUsize>,
+        category: ErrorCategory,
+        recorded: Arc<AtomicUsize>,
+    }
+
+    impl FlakyMarkerOracle {
+        fn new(fail_count: usize, category: ErrorCategory) -> Self {
+            Self {
+                remaining: Arc::new(AtomicUsize::new(fail_count)),
+                category,
+                recorded: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl CommitOracle for FlakyMarkerOracle {
+        type Error = MockMarkerError;
+
+        async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+            // While the countdown is positive, decrement it and inject one
+            // more failure; once exhausted, record the marker.
+            if self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(MockMarkerError(self.category));
+            }
+            self.recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn resolve<'a>(
+            &'a self,
+            _state_key: &'a StateKey,
+            _event: EventRef,
+        ) -> Result<CommitDecision, Self::Error> {
+            Ok(CommitDecision::Committed)
+        }
+    }
+
+    type FlakyBackend = PartitionBackend<
+        FlakyMarkerOracle,
+        MemoryDescriptorIdentityStore,
+        MemoryCellStore<FlakyMarkerOracle>,
+    >;
+    type FlakySession = KeyedStateSession<FlakyBackend, MemoryLoader<serde_json::Value>>;
+
+    fn cart() -> ValueDescriptor {
+        value_state("cart")
+    }
+
+    /// A real session whose marker flush routes through `oracle`, plus the
+    /// shared durable cell store and the `cart` collection id for post-settle
+    /// inspection.
+    fn flaky_session(
+        oracle: FlakyMarkerOracle,
+    ) -> Result<(
+        FlakySession,
+        MemoryCellStore<FlakyMarkerOracle>,
+        CollectionId,
+    )> {
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&cart(), CollectionDef::new(None))?;
+        let registry = Arc::new(registry);
+        let cell_store = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let state_key = StateKey::new(Uuid::from_u128(0xD), Arc::from("user-1"));
+        let session = KeyedStateSession::new(SessionParts {
+            cell: cell_store.clone(),
+            dirty: Arc::new(DirtyStore::new()),
+            oracle,
+            loader: MemoryLoader::new(),
+            registry,
+            state_key: state_key.clone(),
+            event: EventRef::Message {
+                dedup_id: Uuid::new_v4(),
+            },
+            recovery_delay: CompactDuration::new(30),
+            armed: Arc::default(),
+            termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        });
+        let cart_id = CollectionId::new(
+            state_key,
+            StateType::Application,
+            StateName::try_new("cart")?,
+        );
+        Ok((session, cell_store, cart_id))
+    }
+
+    /// However many leading marker-flush failures of whatever category the
+    /// oracle throws, `settle`'s success path self-heals: the offset commits
+    /// exactly once, the marker is recorded exactly once (the stage is
+    /// certified), and the staged cell is promoted — never left provisional
+    /// for the sweep to roll back. Each iteration runs on its own paused
+    /// runtime so the retry backoff advances instantly.
+    #[test]
+    fn prop_marker_flush_self_heals_to_certified_commit() {
+        fn property(fail_count: u8, category_sel: u8) -> TestResult {
+            let fail_count = usize::from(fail_count % 6);
+            let category = match category_sel % 3 {
+                0 => ErrorCategory::Transient,
+                1 => ErrorCategory::Permanent,
+                _ => ErrorCategory::Terminal,
+            };
+            let runtime = Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build();
+            let Ok(runtime) = runtime else {
+                return TestResult::error("failed to build paused runtime");
+            };
+            runtime.block_on(async move {
+                let oracle = FlakyMarkerOracle::new(fail_count, category);
+                let (session, cell_store, cart_id) = match flaky_session(oracle.clone()) {
+                    Ok(parts) => parts,
+                    Err(e) => return TestResult::error(format!("setup: {e}")),
+                };
+                let context = MockEventContext::new().with_session(session);
+                let Ok(handle) = context.state(Registered::new(cart())) else {
+                    return TestResult::error("bind failed");
+                };
+                if let Err(e) = handle.set(json!({ "x": 1_i32 })).await {
+                    return TestResult::error(format!("set: {e}"));
+                }
+                let Ok(lifecycle) = context.lifecycle() else {
+                    return TestResult::error("lifecycle bind failed");
+                };
+                lifecycle.register_marker(Uuid::from_u128(0xFEED));
+
+                let handler = ProbeHandler::ok(0);
+                let committed = Arc::new(AtomicUsize::new(0));
+                let aborted = Arc::new(AtomicUsize::new(0));
+                let guard = RecordingGuard {
+                    committed: committed.clone(),
+                    aborted: aborted.clone(),
+                };
+
+                settle(&handler, context, guard, Ok(0)).await;
+
+                let committed = committed.load(Ordering::SeqCst);
+                let aborted = aborted.load(Ordering::SeqCst);
+                let recorded = oracle.recorded.load(Ordering::SeqCst);
+                let provisional = cell_store.provisional_cells(&cart_id);
+                futures::pin_mut!(provisional);
+                let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
+                let probe = EventRef::Message {
+                    dedup_id: Uuid::from_u128(u128::MAX),
+                };
+                let value = match cell_store
+                    .get(
+                        &cart_id,
+                        &CellKey {
+                            section: Section::new(0),
+                            coordinate: Coordinate::empty(),
+                        },
+                        probe,
+                    )
+                    .await
+                {
+                    Ok(committed) => Committed::into_inner(committed),
+                    Err(e) => return TestResult::error(format!("read back: {e}")),
+                };
+
+                if committed != 1
+                    || aborted != 0
+                    || recorded != 1
+                    || still_provisional
+                    || value.is_none()
+                {
+                    return TestResult::error(format!(
+                        "category={category:?} fail_count={fail_count}: committed={committed} \
+                         aborted={aborted} recorded={recorded} provisional={still_provisional} \
+                         promoted={}",
+                        value.is_some()
+                    ));
+                }
+                TestResult::passed()
+            })
+        }
+        QuickCheck::new().quickcheck(property as fn(u8, u8) -> TestResult);
     }
 }

@@ -63,7 +63,8 @@ fn memory_store(cells: MemoryCells, oracle: ScriptedOracle) -> MemoryCellStore<S
 
 /// Crash-recovery equivalence over the memory cell store: every resolution path
 /// (clean promote, inline rollback, crash → sweep / first-touch) converges each
-/// cell's committed projection to the model (invariants 1, 5).
+/// cell's committed projection to the model (crash-recovery equivalence and
+/// oracle-correctness properties).
 #[test]
 fn prop_memory_cell_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
@@ -94,7 +95,8 @@ fn prop_memory_cell_implicit_overwrite() {
 /// `scan`s (bounded, bidirectional, limited, early-stopped), dirty buffering,
 /// and committed writes **intermixed** in one trace all match the
 /// dirty-over-committed oracle — dirty-wins, clear-hides, the dirty leg bounded
-/// to the scan range, the limit applied to the merge (invariants 3, 5; DT7).
+/// to the scan range, the limit applied to the merge (unified-view soundness
+/// with point-range interleaving and oracle-correctness properties).
 #[test]
 fn prop_memory_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
@@ -121,8 +123,8 @@ fn prop_memory_bottom_scan() {
 /// Deque collection soundness over the real session lifecycle: random
 /// push/pop traces with commit/abort/crash outcomes keep the handle's
 /// `len`/`stream`/`get` and every `pop` return value in step with a `VecDeque`
-/// oracle — the dense-window invariant and the bounds+entries crash atomicity
-/// (invariants 1, 4).
+/// oracle — the dense-window invariant and bounds+entries crash atomicity
+/// (crash-recovery equivalence and collection-bounds-atomicity properties).
 #[test]
 fn prop_deque_collection_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
@@ -134,7 +136,8 @@ fn prop_deque_collection_lifecycle() {
 /// Map collection soundness over the real session lifecycle: random
 /// set/remove/get traces with commit/abort/crash outcomes keep the handle's
 /// `get` and key-ordered `stream` in step with a `BTreeMap` oracle — the
-/// loose-superset bounds and crash atomicity (invariants 1, 4).
+/// loose-superset bounds and crash atomicity (crash-recovery equivalence and
+/// collection-bounds-atomicity properties).
 #[test]
 fn prop_map_collection_lifecycle() {
     fn property(trace: MapTrace) -> Result<bool> {

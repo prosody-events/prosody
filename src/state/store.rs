@@ -108,8 +108,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// Backends with no per-write TTL inherit the default: the committed value
     /// from [`Self::get`] with a `None` TTL. Only the Cassandra store overrides
-    /// it (selecting `TTL(data)`); the TTL is a best-effort hint, so a wrong or
-    /// missing value only makes the cache fall through early, never stale.
+    /// it (selecting the TTL of whichever blob resolution returns); the TTL is
+    /// a best-effort hint, so a wrong or missing value only makes the cache
+    /// fall through early, never stale.
     ///
     /// # Errors
     ///
@@ -128,7 +129,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// remaining TTL, for the [`Cached`](super::cached::Cached) cache to mirror
     /// a covered gap with co-expiring fjall entries. The default delegates
     /// to [`Self::scan_cells`] with a `None` TTL per cell; only the
-    /// Cassandra store overrides it (selecting `TTL(data)`).
+    /// Cassandra store overrides it (selecting the TTL of whichever blob
+    /// resolution returns).
     fn scan_for_cache<'a>(
         &'a self,
         collection: &'a CollectionId,

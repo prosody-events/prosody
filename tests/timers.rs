@@ -30,7 +30,7 @@ use prosody::{
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -238,14 +238,13 @@ impl TestEnvironment {
 
         // Wait until Kafka has assigned the consumer its partition before
         // producing — records sent before the subscription is live can be
-        // missed. Polls the real readiness condition (partition assignment,
-        // per `consumer::probes`) under a generous hang-guard, rather than
+        // missed. Awaits the assignment signal the rebalance callback
+        // publishes (not a poll) under a generous hang-guard, rather than
         // guessing a fixed startup delay that is sensitive to load.
-        timeout(Duration::from_secs(30), async {
-            while consumer.assigned_partition_count() == 0 {
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
+        timeout(
+            Duration::from_secs(30),
+            consumer.wait_for_assigned_partitions(1),
+        )
         .await
         .map_err(|_| eyre!("consumer did not receive a partition assignment in time"))?;
 

@@ -1023,14 +1023,18 @@ impl TriggerOperations for CassandraTriggerStore {
 
     /// Reads the commit-oracle tag for a single timer at `time`.
     ///
-    /// Uses `resolve_state` (cache-first):
-    /// - **Inline(timer), time matches**: tag from cache (0 DB reads).
-    /// - **Inline(_), time mismatch** or **Absent**: `None` (Inline guarantees
-    ///   no other timers; post-V3 Absent is unambiguous).
-    /// - **Overflow**: SELECT the clustering row's tag column under the per-key
-    ///   mutex so a concurrent promote/demote cannot interleave between the
-    ///   state check and the row read.
-    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
+    /// **Always reads durable state — never the per-instance `state_cache`.**
+    /// The keyed-state commit oracle consults this through its own store
+    /// instance while the partition's timer manager writes through a sibling
+    /// instance (same session, separate caches), so a cached answer here
+    /// could outlive a commit performed via the sibling and flip a recovery
+    /// decision. Bypassing the cache in both directions (no read, no
+    /// populate) makes that staleness unrepresentable. The two-step read
+    /// (state entry, then clustering row on `Overflow`) is sound because
+    /// per-key serialization guarantees no same-key mutation is in flight
+    /// while the oracle — or a `clear_and_schedule` tag preservation —
+    /// consults.
+    #[instrument(level = "debug", skip(self), err)]
     async fn current_tag(
         &self,
         key: &Key,
@@ -1038,11 +1042,7 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
     ) -> Result<Option<i32>, Self::Error> {
         let segment_id = self.segment.id;
-        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
-        Span::current().record("state_cached", cached);
-
-        let guard = handle.lock().await;
-        match &*guard {
+        match self.fetch_state(&segment_id, key, timer_type).await? {
             TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
             TimerState::Inline(_) | TimerState::Absent => Ok(None),
             TimerState::Overflow => {

@@ -87,6 +87,14 @@ pub struct MockEventContext<P = serde_json::Value, S = UnavailableState<P>> {
     /// Timer operation tracking (None = disabled).
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
 
+    /// Durable timer rows the mock's timer ops maintain, so `scheduled`
+    /// answers from the same state `schedule`/`clear_and_schedule` mutate —
+    /// like the real trigger store. Seed with
+    /// [`with_durable_timer`](Self::with_durable_timer) to simulate a prior
+    /// epoch's timer surviving a partition reacquisition; observe what an op
+    /// left standing with [`durable_scheduled`](Self::durable_scheduled).
+    durable_timers: Arc<Mutex<Vec<(CompactDateTime, TimerType)>>>,
+
     /// Number of leading timer schedules that fail (with
     /// [`Self::timer_fail_category`]) before schedules start succeeding —
     /// drives the arm's retry-forever self-heal. Shared so a clone observes
@@ -130,6 +138,7 @@ where
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
             timer_operations: None,
+            durable_timers: Arc::new(Mutex::new(Vec::new())),
             timer_fail_count: Arc::new(AtomicUsize::new(0)),
             timer_fail_category: ErrorCategory::Permanent,
             session: UnavailableState::new(),
@@ -148,11 +157,31 @@ impl<P, S> MockEventContext<P, S> {
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             timer_operations: self.timer_operations,
+            durable_timers: self.durable_timers,
             timer_fail_count: self.timer_fail_count,
             timer_fail_category: self.timer_fail_category,
             session,
             _payload: PhantomData,
         }
+    }
+
+    /// Seeds a durable timer standing before the test runs — simulating a
+    /// prior epoch's trigger surviving a partition reacquisition.
+    #[must_use]
+    pub fn with_durable_timer(self, time: CompactDateTime, timer_type: TimerType) -> Self {
+        self.durable_timers.lock().push((time, timer_type));
+        self
+    }
+
+    /// The durable scheduled times of `timer_type` (what `scheduled` answers).
+    #[must_use]
+    pub fn durable_scheduled(&self, timer_type: TimerType) -> Vec<CompactDateTime> {
+        self.durable_timers
+            .lock()
+            .iter()
+            .filter(|(_, t)| *t == timer_type)
+            .map(|(time, _)| *time)
+            .collect()
     }
 
     /// Make the first `count` timer schedules fail with `category`, then
@@ -334,7 +363,11 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.record(TimerOperation::Schedule(time, timer_type));
-        future::ready(self.timer_result())
+        let result = self.timer_result();
+        if result.is_ok() {
+            self.durable_timers.lock().push((time, timer_type));
+        }
+        future::ready(result)
     }
 
     fn clear_and_schedule(
@@ -343,7 +376,14 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.record(TimerOperation::ClearAndSchedule(time, timer_type));
-        future::ready(self.timer_result())
+        let result = self.timer_result();
+        if result.is_ok() {
+            // Type-scoped singleton overwrite, like the real store.
+            let mut timers = self.durable_timers.lock();
+            timers.retain(|(_, t)| *t != timer_type);
+            timers.push((time, timer_type));
+        }
+        future::ready(result)
     }
 
     fn unschedule(
@@ -352,6 +392,9 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.record(TimerOperation::Unschedule(time, timer_type));
+        self.durable_timers
+            .lock()
+            .retain(|entry| *entry != (time, timer_type));
         future::ready(Ok(()))
     }
 
@@ -360,6 +403,7 @@ where
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.record(TimerOperation::ClearScheduled(timer_type));
+        self.durable_timers.lock().retain(|(_, t)| *t != timer_type);
         future::ready(Ok(()))
     }
 
@@ -369,8 +413,8 @@ where
 
     fn scheduled(
         &self,
-        _timer_type: TimerType,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
-        future::ready(Ok(Vec::new()))
+        future::ready(Ok(self.durable_scheduled(timer_type)))
     }
 }

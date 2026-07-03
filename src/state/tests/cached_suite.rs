@@ -26,11 +26,12 @@ use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::store::CellStore;
-use super::super::{CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType};
+use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    CountingCellStore, OverlayTrace, ScriptedOracle, Trace, bytes, run_crash_equivalence_trace,
-    run_overlay_trace,
+    CountingCellStore, OverlayTrace, SECTION, ScriptedOracle, Trace, bytes, cell_at,
+    run_crash_equivalence_trace, run_overlay_trace,
 };
+use super::collection_id as collection;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -43,9 +44,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
-
-/// The single section the cell suites address (mirrors a Map's entry section).
-const SECTION: Section = Section::new(0);
 
 /// Builds a production-shaped `Cached` over the shared fjall database (the
 /// `name` warm-reuse keyspace pair) and the shared memory cells.
@@ -60,24 +58,6 @@ fn cached_over(
         Arc::new(CollectionDefRegistry::default()),
     );
     Ok(Cached::new(test_db::cache(name)?, lower))
-}
-
-/// The cell at coordinate `c` in the shared section (single byte, so byte order
-/// equals numeric order).
-fn cell_at(c: u8) -> CellKey {
-    CellKey {
-        section: SECTION,
-        coordinate: Coordinate::from_bytes(vec![c]),
-    }
-}
-
-/// A fresh-segment Value collection identity for the named collection.
-fn collection(name: &str) -> Result<CollectionId> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), Arc::from("k")),
-        StateType::Application,
-        StateName::try_new(name)?,
-    ))
 }
 
 fn probe(n: u128) -> EventRef {
@@ -961,6 +941,106 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
                 "a failed batch uncovers every coordinate, so each read self-heals"
             );
         }
+        Ok(())
+    })
+}
+
+/// The promote punch is must-succeed: `mark_resolved` (the recovery sweep's
+/// raw promote) cannot re-publish `data` from keys alone, so it punches the
+/// coordinate — and a transiently-failing punch must **retry and land**, never
+/// be swallowed. Swallowed, the pre-promote `prev` stays covered and a covered
+/// `get` serves it verbatim (no read-side mismatch detection) for the rest of
+/// the epoch. Injects one coverage-rewrite failure via the `cover_store`
+/// fault seam and asserts the promoted value is served after the promote.
+#[test]
+fn promote_punch_failure_never_freezes_stale_prev() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let fjall = test_db::cache("promote-punch")?;
+        let fail_covers = fjall.fail_cover_stores();
+        let lower = MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let cached = Cached::new(fjall, lower);
+        let id = collection("promote-punch")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        // Committed base `1`, covered by write-through; stage `5` over it (the
+        // stage publishes `prev` = 1, so the coordinate stays covered with 1).
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))])
+            .await?;
+        let prev = cached.get(&id, &cell_at(0), event).await?;
+        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        cached
+            .write_provisional(&cref, &[(cell_at(0), write)])
+            .await?;
+
+        // The raw promote with the punch's next coverage rewrite failing: the
+        // punch must retry until it lands, dropping the stale covered `1`.
+        fail_covers.store(1, Ordering::Relaxed);
+        cached.mark_resolved(&cref, &[cell_at(0)]).await?;
+        assert_eq!(
+            fail_covers.load(Ordering::Relaxed),
+            0,
+            "the injected coverage-rewrite failure must have fired"
+        );
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            Some(&bytes(5)),
+            "a failed punch must not leave the stale pre-promote value covered"
+        );
+        Ok(())
+    })
+}
+
+/// The write-path punch is must-succeed too: a write-through whose fjall
+/// publish fails punches the coordinate, and if that punch also transiently
+/// fails it must retry — a double fault must not freeze the pre-write value
+/// behind coverage. Fails the publish (put seam) and the first punch rewrite
+/// (`cover_store` seam) together, then heals and asserts the fresh durable
+/// value is served.
+#[test]
+fn write_path_punch_retries_until_it_lands() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let fjall = test_db::cache("write-punch")?;
+        let fail_puts = fjall.fail_puts();
+        let fail_covers = fjall.fail_cover_stores();
+        let lower = MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let cached = Cached::new(fjall, lower);
+        let id = collection("write-punch")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Cover `1` cleanly, then write `2` with the publish AND the first
+        // punch rewrite failing.
+        cached
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .await?;
+        fail_puts.store(true, Ordering::Relaxed);
+        fail_covers.store(1, Ordering::Relaxed);
+        cached
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))])
+            .await?;
+        fail_puts.store(false, Ordering::Relaxed);
+
+        assert_eq!(
+            fail_covers.load(Ordering::Relaxed),
+            0,
+            "the injected coverage-rewrite failure must have fired"
+        );
+        assert_eq!(
+            cached.get(&id, &cell_at(1), probe(1)).await?.get(),
+            Some(&bytes(2)),
+            "a doubly-failed publish+punch must still uncover, so the read self-heals"
+        );
         Ok(())
     })
 }

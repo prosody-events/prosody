@@ -15,8 +15,8 @@
 //! (`run_overlay_trace`), where point `get`s, range `scan`s, dirty buffering,
 //! and committed writes are **intermixed** in one trace so their interaction is
 //! exercised — dirty-wins, clear-hides, scan bounds / direction / limit /
-//! early-stop (invariants 3, 5); the bottom-store scan primitive; and sweep
-//! idempotence.
+//! early-stop (unified-view soundness and oracle-correctness); the bottom-store
+//! scan primitive; and sweep idempotence.
 //!
 //! Faithfulness to production:
 //!
@@ -71,8 +71,8 @@ const CELLS: u8 = 12;
 
 /// Value's single section (`ValueNs::Entries = 0`); the overlay/scan suites
 /// place every cell here and address by coordinate, mirroring a Map's entry
-/// section.
-const SECTION: Section = Section::new(0);
+/// section. Shared with `cached_suite`.
+pub(crate) const SECTION: Section = Section::new(0);
 
 /// Upper bound on generated trace lengths, keeping property runs bounded.
 pub(crate) const MAX_TRACE_OPS: usize = 40;
@@ -98,8 +98,9 @@ fn value_cell() -> CellKey {
 }
 
 /// The cell at coordinate `c` in the shared section (single byte, so byte order
-/// == numeric order — the in-memory oracle keys on `u8`).
-fn cell_at(c: u8) -> CellKey {
+/// == numeric order — the in-memory oracle keys on `u8`). Shared with
+/// `cached_suite`.
+pub(crate) fn cell_at(c: u8) -> CellKey {
     CellKey {
         section: SECTION,
         coordinate: Coordinate::from_bytes(vec![c]),
@@ -708,8 +709,8 @@ impl CellModel {
 /// and the point leg (`get` per cell vs the dirty-over-committed oracle, after
 /// **every** op). This is the unified view property: point reads, range reads,
 /// and writes interleave so their interaction is exercised, not just each in
-/// isolation (dirty-wins, clear-hides, bounds, direction, limit — invariants 3,
-/// 5; DT7).
+/// isolation (dirty-wins, clear-hides, bounds, direction, limit —
+/// unified-view soundness and oracle-correctness properties).
 ///
 /// # Errors
 ///
@@ -728,7 +729,7 @@ where
     let own = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower, own);
+    let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower);
     let mut model = CellModel::default();
 
     for op in trace.ops {

@@ -449,14 +449,15 @@ where
 
 /// Waits for partition stall state to match `expected` or times out.
 ///
-/// Unlike [`wait_for_processed_offsets`] — which awaits the handler's
-/// `Notify`, fired on each processed message — `is_stalled` has no readiness
-/// signal to await: it is a derived predicate over time-thresholded state
-/// (uncommitted-offset age and heartbeat freshness against the stall
-/// threshold). It flips purely with the passage of wall-clock time, with no
-/// edge event the production code could notify on, so deadline-bounded
-/// polling is the only way to observe the transition. The `sleep` here is a
-/// readiness poll, not a backpressure or timing simulation.
+/// Awaits the offset tracker's stall-transition signal
+/// (`OffsetTracker::wait_for_stall_state`) rather than polling: the background
+/// watermark task flips the offset stall flag at two explicit points (the
+/// oldest uncommitted offset exceeding the threshold, and a watermark advance
+/// clearing it). The composite `PartitionManager::is_stalled` also folds in
+/// heartbeat staleness, but the keyed processing loop beats its heartbeat every
+/// `stall_threshold / HEARTBEAT_MARGIN`, so under normal dispatch only the
+/// offset half ever transitions — this asserts the composite once the edge
+/// fires to confirm it matches.
 async fn wait_for_partition_stalled<P>(
     partition_manager: &PartitionManager<P>,
     expected: bool,
@@ -466,24 +467,23 @@ where
     P: Send + 'static,
 {
     let deadline = Instant::now() + timeout;
-    loop {
-        let actual = partition_manager.is_stalled();
-        if actual == expected {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
+    tokio::select! {
+        result = partition_manager.offsets.wait_for_stall_state(expected) => result?,
+        () = sleep_until(deadline) => {
             return Err(eyre!(
-                "Timeout waiting for partition stalled state {expected}; last state was {actual}"
+                "Timeout waiting for partition stalled state {expected}; last state was {}",
+                partition_manager.is_stalled()
             ));
         }
-        tokio::select! {
-            () = sleep(Duration::from_millis(10)) => {},
-            () = sleep_until(deadline) => {
-                return Err(eyre!(
-                    "Timeout waiting for partition stalled state {expected}; last state was {actual}"
-                ));
-            }
-        }
+    }
+    let actual = partition_manager.is_stalled();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "partition stalled state {actual} did not match expected {expected} after the offset \
+             stall signal fired"
+        ))
     }
 }
 

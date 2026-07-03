@@ -35,16 +35,14 @@
 //! mutation).
 
 use super::{
-    CellView, DescriptorIdentity, StateDescriptor, StructuralIdentity, decode_cell, encode_cell,
-    ensure_live, intern_descriptor_str,
+    CellView, CollectionSpec, Descriptor, StructuralIdentity, decode_cell, encode_cell, ensure_live,
 };
 use crate::codec::{Codec, JsonCodec};
-use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec};
-use crate::state::registry::CollectionDef;
-use crate::state::session::{CellRead, CellSession};
+use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, StateName, StateType};
 use async_stream::try_stream;
 use educe::Educe;
@@ -103,39 +101,20 @@ pub type MapEntry<KC, VC> = Result<
 /// [`OrderedKeyCodec`] (the key encoding, frozen into the identity) and a value
 /// [`Codec`] (JSON by default). There is no resolver. Declare via
 /// [`map_state`].
-#[derive(Educe)]
-#[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
-pub struct MapDescriptor<KC, VC = JsonCodec> {
-    name: &'static str,
-    def: CollectionDef,
-    #[educe(Debug(ignore))]
-    _marker: PhantomData<fn() -> (KC, VC)>,
-}
+pub type MapDescriptor<KC, VC = JsonCodec> = Descriptor<MapKind<KC, VC>>;
 
-impl<KC, VC> MapDescriptor<KC, VC> {
-    /// Declares a map collection named `name`. `name` may be any runtime string
-    /// and is interned (it stays `Copy`); an empty name fails loudly at
-    /// registration, the fallible boundary.
-    #[must_use]
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: intern_descriptor_str(name),
-            def: CollectionDef::new(None),
-            _marker: PhantomData,
-        }
-    }
-}
+/// The Map [`CollectionSpec`]: one cell per key plus the min/max bound cells;
+/// the key codec is frozen into the identity.
+pub struct MapKind<KC, VC>(PhantomData<fn() -> (KC, VC)>);
 
-impl<KC, VC> DescriptorIdentity for MapDescriptor<KC, VC>
+impl<KC, VC> CollectionSpec for MapKind<KC, VC>
 where
     KC: OrderedKeyCodec,
     VC: Codec,
 {
-    fn name(&self) -> &'static str {
-        self.name
-    }
+    type Handle<S: CellSession> = MapHandle<S, KC, VC>;
 
-    fn structural_identity(&self) -> StructuralIdentity {
+    fn structural_identity() -> StructuralIdentity {
         StructuralIdentity {
             kind: CollectionKindId::Map,
             codec_id: VC::CODEC_ID,
@@ -143,39 +122,18 @@ where
             key_codec_id: Some(KC::KEY_CODEC_ID),
         }
     }
-}
 
-impl<KC, VC> StateDescriptor for MapDescriptor<KC, VC>
-where
-    KC: OrderedKeyCodec,
-    VC: Codec,
-{
-    type Handle<S: CellRead> = MapHandle<S, KC, VC>;
-
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        let name = session.verify_state_registration(
-            self.name,
-            self.state_type(),
-            &self.structural_identity(),
-        )?;
-        Ok(MapHandle::new(session.clone(), self.state_type(), name))
-    }
-
-    fn collection_def(&self) -> CollectionDef {
-        self.def
-    }
-
-    fn with_collection_def(mut self, def: CollectionDef) -> Self {
-        self.def = def;
-        self
+    fn handle<S: CellSession>(
+        session: S,
+        state_type: StateType,
+        name: StateName,
+    ) -> MapHandle<S, KC, VC> {
+        MapHandle::new(session, state_type, name)
     }
 }
 
 /// Typed, owned handle over a codec-backed ordered map — a thin composition
-/// over a [`CellView`]. Reads (`get`/`stream`) need only [`CellRead`]; the
-/// mutators (`set`/`remove`) need [`CellSession`], so a reader-minted handle
-/// has the readers but **cannot name** a mutator (the read-only-handle
-/// invariant). Every operation guards on session termination.
+/// over a [`CellView`]. Every operation guards on session termination.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct MapHandle<S, KC, VC> {
@@ -197,7 +155,7 @@ impl<S, KC, VC> MapHandle<S, KC, VC> {
 
 impl<S, KC, VC> MapHandle<S, KC, VC>
 where
-    S: CellRead,
+    S: CellSession,
     KC: OrderedKeyCodec,
     VC: Codec,
 {
@@ -273,14 +231,7 @@ where
     ) -> Result<Option<Coordinate>, MapStateError<VC::Error>> {
         Ok(self.view.get(cell).await?.map(Coordinate::from_bytes))
     }
-}
 
-impl<S, KC, VC> MapHandle<S, KC, VC>
-where
-    S: CellSession,
-    KC: OrderedKeyCodec,
-    VC: Codec,
-{
     /// Inserts or overwrites `key`'s value (a blind last-writer-wins write —
     /// the entry is never read first), ratcheting the min/max bounds
     /// outward.

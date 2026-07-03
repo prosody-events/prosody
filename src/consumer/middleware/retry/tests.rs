@@ -957,3 +957,285 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
     }
     Ok(())
 }
+
+// =========================================================================
+// Between-attempt reset over a real keyed-state session
+// =========================================================================
+//
+// The load-bearing `lifecycle.reset()` in the retry loop discards a failed
+// attempt's buffered dirty ops *and* its registered dedup marker before the
+// next attempt runs, so a later successful attempt stages and certifies only
+// its own writes — the marker-before-durable-state class the settle boundary
+// was rebuilt to make unwritable. Every other retry test drives the inert
+// `UnavailableState` session (whose `finalize` is always `Clean` and whose
+// `reset` is a no-op), so this is the one test that exercises the reset over a
+// **real** session end to end through `settle`.
+
+mod reset_between_attempts {
+    use super::*;
+    use crate::codec::JsonCodec;
+    use crate::consumer::partition::ShutdownPhase;
+    use crate::loader::MemoryLoader;
+    use crate::state::cell::Committed;
+    use crate::state::cell_key::{CellKey, Coordinate, Section};
+    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
+    use crate::state::dirty::DirtyStore;
+    use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+    use crate::state::oracle::CommitOracle;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::sealed::StateLifecycle;
+    use crate::state::session::{
+        KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
+    };
+    use crate::state::store::CellStore;
+    use crate::state::{
+        CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
+    };
+    use crate::timers::duration::CompactDuration;
+    use color_eyre::eyre::{Result, bail};
+    use serde_json::{Value, json};
+    use std::convert::Infallible;
+    use tokio::sync::watch;
+    use uuid::Uuid;
+
+    /// Attempt 1 stages `cart` + registers this marker, then fails Transient.
+    const ATTEMPT_1_MARKER: Uuid = Uuid::from_u128(0xA11);
+    /// Attempt 2 stages `wishlist` + registers this marker, then succeeds.
+    const ATTEMPT_2_MARKER: Uuid = Uuid::from_u128(0xA22);
+
+    fn cart() -> ValueDescriptor {
+        value_state::<JsonCodec>("cart")
+    }
+
+    fn wishlist() -> ValueDescriptor {
+        value_state::<JsonCodec>("wishlist")
+    }
+
+    /// Oracle that records every flushed marker and always resolves Committed,
+    /// so a test can read back exactly which marker `settle` certified.
+    #[derive(Clone)]
+    struct RecordingOracle {
+        recorded: Arc<Mutex<Vec<Uuid>>>,
+    }
+
+    impl CommitOracle for RecordingOracle {
+        type Error = Infallible;
+
+        async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
+            self.recorded.lock().push(dedup_id);
+            Ok(())
+        }
+
+        async fn resolve<'a>(
+            &'a self,
+            _state_key: &'a StateKey,
+            _event: EventRef,
+        ) -> Result<CommitDecision, Self::Error> {
+            Ok(CommitDecision::Committed)
+        }
+    }
+
+    type RecordingBackend = PartitionBackend<
+        RecordingOracle,
+        MemoryDescriptorIdentityStore,
+        MemoryCellStore<RecordingOracle>,
+    >;
+    type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Value>>;
+
+    /// A real session, its durable cell store (for read-back), and the shared
+    /// log of every marker the oracle recorded.
+    type RecordingParts = (
+        RecordingSession,
+        MemoryCellStore<RecordingOracle>,
+        Arc<Mutex<Vec<Uuid>>>,
+    );
+
+    /// A real session over `cart` + `wishlist`, whose marker flush routes
+    /// through the returned [`RecordingOracle`], plus the durable cell store
+    /// for post-settle read-back.
+    fn recording_session() -> Result<RecordingParts> {
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&cart(), CollectionDef::new(None))?;
+        registry.register(&wishlist(), CollectionDef::new(None))?;
+        let registry = Arc::new(registry);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let oracle = RecordingOracle {
+            recorded: recorded.clone(),
+        };
+        let cell_store = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let state_key = StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1"));
+        let session = KeyedStateSession::new(SessionParts {
+            cell: cell_store.clone(),
+            dirty: Arc::new(DirtyStore::new()),
+            oracle,
+            loader: MemoryLoader::new(),
+            registry,
+            state_key,
+            event: EventRef::Message {
+                dedup_id: Uuid::new_v4(),
+            },
+            recovery_delay: CompactDuration::new(30),
+            armed: Arc::default(),
+            termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        });
+        Ok((session, cell_store, recorded))
+    }
+
+    /// The committed value at the single Value cell of `name`.
+    async fn committed_value(
+        cell_store: &MemoryCellStore<RecordingOracle>,
+        name: &str,
+    ) -> Result<Option<Value>> {
+        let id = CollectionId::new(
+            StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1")),
+            StateType::Application,
+            StateName::try_new(name)?,
+        );
+        let cell = CellKey {
+            section: Section::new(0),
+            coordinate: Coordinate::empty(),
+        };
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX),
+        };
+        match Committed::into_inner(cell_store.get(&id, &cell, probe).await?) {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fails attempt 1 (`Normal`) after staging `cart` + registering marker M1;
+    /// succeeds attempt 2 (`Failure`) after staging `wishlist` + registering
+    /// marker M2. The two attempts touch **disjoint** collections and distinct
+    /// markers, so a leaked attempt-1 write would surface as a committed
+    /// `cart`.
+    #[derive(Clone)]
+    struct AttemptAwareHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FallibleHandler for AttemptAwareHandler {
+        type Error = TestError;
+        type Output = ();
+        type Payload = Value;
+
+        async fn on_message<C>(
+            &self,
+            context: C,
+            _message: ConsumerMessage<Self::Payload>,
+            demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let lifecycle = context
+                .lifecycle()
+                .map_err(|_| TestError(ErrorCategory::Terminal))?;
+            match demand_type {
+                DemandType::Normal => {
+                    let handle = context
+                        .state(Registered::new(cart()))
+                        .map_err(|_| TestError(ErrorCategory::Terminal))?;
+                    handle
+                        .set(json!({ "attempt": 1_i32 }))
+                        .await
+                        .map_err(|_| TestError(ErrorCategory::Terminal))?;
+                    lifecycle.register_marker(ATTEMPT_1_MARKER);
+                    Err(TestError(ErrorCategory::Transient))
+                }
+                DemandType::Failure => {
+                    let handle = context
+                        .state(Registered::new(wishlist()))
+                        .map_err(|_| TestError(ErrorCategory::Terminal))?;
+                    handle
+                        .set(json!({ "attempt": 2_i32 }))
+                        .await
+                        .map_err(|_| TestError(ErrorCategory::Terminal))?;
+                    lifecycle.register_marker(ATTEMPT_2_MARKER);
+                    Ok(())
+                }
+            }
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            Ok(())
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    /// Retry over a real session: attempt 1 stages `cart` and registers marker
+    /// M1 then fails Transient; the loop's `after_abort` + `lifecycle.reset()`
+    /// discards both; attempt 2 stages `wishlist`, registers M2, and succeeds;
+    /// `settle` then certifies only attempt 2's work. The committed state must
+    /// show `wishlist` present and `cart` **absent**, and the oracle must have
+    /// recorded exactly attempt 2's marker.
+    ///
+    /// Deleting the between-attempt `reset()` fails this: attempt 1's `cart`
+    /// write would survive in the dirty overlay, `finalize` would stage it
+    /// alongside `wishlist`, and the read-back would find `cart` committed to
+    /// attempt 1's value — precisely the leak the reset exists to prevent.
+    #[tokio::test]
+    async fn retry_resets_session_between_attempts() -> Result<()> {
+        let (session, cell_store, recorded) = recording_session()?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = AttemptAwareHandler {
+            calls: calls.clone(),
+        };
+        let retry_handler = create_retry_handler(handler, 10);
+        let context = MockEventContext::new().with_session(session);
+
+        let tracker = create_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let uncommitted_message = message.into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(
+            &retry_handler,
+            context,
+            uncommitted_message,
+            DemandType::Normal,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one failed then one ok attempt"
+        );
+        assert_eq!(
+            committed_value(&cell_store, "wishlist").await?,
+            Some(json!({ "attempt": 2_i32 })),
+            "attempt 2's write must be committed",
+        );
+        assert_eq!(
+            committed_value(&cell_store, "cart").await?,
+            None,
+            "attempt 1's discarded write must NOT leak into the committed state",
+        );
+        assert_eq!(
+            recorded.lock().clone(),
+            vec![ATTEMPT_2_MARKER],
+            "settle must certify only attempt 2's marker, exactly once",
+        );
+        assert_eq!(
+            tracker.shutdown().await,
+            Some(0),
+            "the offset commits after the successful retry",
+        );
+        Ok(())
+    }
+}

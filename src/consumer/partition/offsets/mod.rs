@@ -15,10 +15,11 @@ use humantime::format_duration;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc::{OwnedPermit, Receiver, Sender, channel};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tokio::{select, spawn};
@@ -46,9 +47,11 @@ pub struct OffsetTracker {
     #[educe(Debug(ignore))]
     watermark: Arc<CachePadded<AtomicI64>>,
 
-    /// Indicates if message processing has stalled
+    /// Latest stall state, published by the background watermark task at each
+    /// transition. Read synchronously via [`OffsetTracker::is_stalled`]; tests
+    /// await transitions on a clone of this receiver.
     #[educe(Debug(ignore))]
-    is_stalled: Arc<CachePadded<AtomicBool>>,
+    stalled: watch::Receiver<bool>,
 
     /// Background task handle for watermark updates
     #[educe(Debug(ignore))]
@@ -76,7 +79,7 @@ impl OffsetTracker {
         // Create channel with space for all uncommitted offsets plus one
         let (action_tx, action_rx) = channel(max_uncommitted + 1);
         let watermark = Arc::new(CachePadded::new(AtomicI64::new(-1)));
-        let is_stalled = Arc::new(CachePadded::new(AtomicBool::new(false)));
+        let (stalled_tx, stalled) = watch::channel(false);
 
         let handle = Arc::new(Mutex::new(Some(spawn(track_watermark(
             topic,
@@ -85,13 +88,13 @@ impl OffsetTracker {
             watermark.clone(),
             watermark_version,
             stall_threshold,
-            is_stalled.clone(),
+            stalled_tx,
         )))));
 
         Self {
             action_tx,
             watermark,
-            is_stalled,
+            stalled,
             handle,
         }
     }
@@ -142,7 +145,29 @@ impl OffsetTracker {
     ///
     /// `true` if processing has stalled, `false` otherwise
     pub fn is_stalled(&self) -> bool {
-        self.is_stalled.load(Ordering::Acquire)
+        *self.stalled.borrow()
+    }
+
+    /// Awaits until the stall flag equals `expected`.
+    ///
+    /// The background watermark task flips the flag at exactly two points —
+    /// when the oldest uncommitted offset exceeds the stall threshold, and
+    /// when a watermark advance clears the stall — so this awaits that
+    /// transition rather than polling. Returns immediately if the current
+    /// state already matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OffsetTrackerError::Shutdown`] if the background task has
+    /// stopped (the tracker is shutting down).
+    #[cfg(test)]
+    pub async fn wait_for_stall_state(&self, expected: bool) -> Result<(), OffsetTrackerError> {
+        self.stalled
+            .clone()
+            .wait_for(|&stalled| stalled == expected)
+            .await
+            .map(drop)
+            .map_err(|_| OffsetTrackerError::Shutdown)
     }
 
     /// Shuts down the offset tracker.
@@ -281,7 +306,7 @@ fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
 /// * `watermark` - The shared watermark value
 /// * `watermark_version` - Counter tracking watermark changes
 /// * `stall_threshold` - Duration after which processing is considered stalled
-/// * `is_stalled` - Flag indicating stalled processing
+/// * `stalled` - Publishes the stall state at each transition
 async fn track_watermark(
     topic: Topic,
     partition: Partition,
@@ -289,7 +314,7 @@ async fn track_watermark(
     watermark: Arc<CachePadded<AtomicI64>>,
     watermark_version: Arc<CachePadded<AtomicUsize>>,
     stall_threshold: Duration,
-    is_stalled: Arc<CachePadded<AtomicBool>>,
+    stalled: watch::Sender<bool>,
 ) {
     let topic = topic.as_ref();
 
@@ -297,12 +322,14 @@ async fn track_watermark(
     let mut watermarks = BTreeMap::new();
 
     loop {
-        let stall_future = wait_for_stall(stall_threshold, &is_stalled, &watermarks);
+        let stall_future = wait_for_stall(stall_threshold, &stalled, &watermarks);
 
         select! {
             // Handle stalled processing detection
             Some((offset, take_time)) = stall_future => {
-                is_stalled.store(true, Ordering::Release);
+                // `wait_for_stall` yields only from the not-stalled state, so
+                // this is always a false→true transition.
+                stalled.send_replace(true);
                 warn!(
                     "{topic}:{partition} has stalled at offset {offset} \
                     for {}, which exceeded the stall threshold of {}",
@@ -336,8 +363,14 @@ async fn track_watermark(
                     watermark.store(new_offset, Ordering::Release);
                     watermark_version.fetch_add(1, Ordering::AcqRel);
 
-                    // Clear stalled state if it was set
-                    if is_stalled.fetch_and(false, Ordering::AcqRel) {
+                    // Clear stalled state if it was set. `send_if_modified`
+                    // notifies waiters only on the true→false transition.
+                    let was_stalled = stalled.send_if_modified(|stalled| {
+                        let was_stalled = *stalled;
+                        *stalled = false;
+                        was_stalled
+                    });
+                    if was_stalled {
                         info!("{topic}:{partition} is no longer stalled");
                     }
                 }
@@ -353,7 +386,7 @@ async fn track_watermark(
 /// # Arguments
 ///
 /// * `stall_threshold` - Duration after which processing is considered stalled
-/// * `is_stalled` - Flag indicating stalled processing
+/// * `stalled` - Current stall state
 /// * `watermarks` - Current offset operations map
 ///
 /// # Returns
@@ -361,11 +394,11 @@ async fn track_watermark(
 /// The stalled offset and its take timestamp if stalled
 async fn wait_for_stall(
     stall_threshold: Duration,
-    is_stalled: &AtomicBool,
+    stalled: &watch::Sender<bool>,
     watermarks: &BTreeMap<Offset, Operation>,
 ) -> Option<(Offset, Instant)> {
     // Skip if already stalled
-    if is_stalled.load(Ordering::Acquire) {
+    if *stalled.borrow() {
         return None;
     }
 

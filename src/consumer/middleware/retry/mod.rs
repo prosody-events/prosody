@@ -142,6 +142,7 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
 use crate::state::session::LifecycleAccessExt;
+use crate::state::session::sealed::StateLifecycle;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Offset, Partition, Topic};

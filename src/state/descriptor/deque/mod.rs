@@ -32,16 +32,14 @@
 //! can never outlive — or be outlived by — the entries it anchors.
 
 use super::{
-    CellView, DescriptorIdentity, StateDescriptor, StructuralIdentity, decode_cell, encode_cell,
-    ensure_live, intern_descriptor_str,
+    CellView, CollectionSpec, Descriptor, StructuralIdentity, decode_cell, encode_cell, ensure_live,
 };
 use crate::codec::{Codec, JsonCodec};
-use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::order_codec::order_preserving_i64;
-use crate::state::registry::CollectionDef;
-use crate::state::session::{CellRead, CellSession};
+use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, StateName, StateType};
 use async_stream::try_stream;
 use educe::Educe;
@@ -102,38 +100,19 @@ impl TryFrom<i8> for DequeNs {
 /// the binding `DequeDescriptor<MyCodec>` to pick another codec). The element
 /// codec types the cell; there is no resolver or key codec (the index encoding
 /// is fixed by the kind). Declare via [`deque_state`].
-#[derive(Educe)]
-#[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
-pub struct DequeDescriptor<C = JsonCodec> {
-    name: &'static str,
-    def: CollectionDef,
-    #[educe(Debug(ignore))]
-    _marker: PhantomData<fn() -> C>,
-}
+pub type DequeDescriptor<C = JsonCodec> = Descriptor<DequeKind<C>>;
 
-impl<C> DequeDescriptor<C> {
-    /// Declares a deque collection named `name`. `name` may be any runtime
-    /// string and is interned (it stays `Copy`); an empty name fails loudly at
-    /// registration, the fallible boundary.
-    #[must_use]
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: intern_descriptor_str(name),
-            def: CollectionDef::new(None),
-            _marker: PhantomData,
-        }
-    }
-}
+/// The Deque [`CollectionSpec`]: a dense index window plus the head/tail bounds
+/// cell; the index encoding is fixed by the kind, so there is no key codec.
+pub struct DequeKind<C>(PhantomData<fn() -> C>);
 
-impl<C> DescriptorIdentity for DequeDescriptor<C>
+impl<C> CollectionSpec for DequeKind<C>
 where
     C: Codec,
 {
-    fn name(&self) -> &'static str {
-        self.name
-    }
+    type Handle<S: CellSession> = DequeHandle<S, C>;
 
-    fn structural_identity(&self) -> StructuralIdentity {
+    fn structural_identity() -> StructuralIdentity {
         StructuralIdentity {
             kind: CollectionKindId::Deque,
             codec_id: C::CODEC_ID,
@@ -142,38 +121,18 @@ where
             key_codec_id: None,
         }
     }
-}
 
-impl<C> StateDescriptor for DequeDescriptor<C>
-where
-    C: Codec,
-{
-    type Handle<S: CellRead> = DequeHandle<S, C>;
-
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        let name = session.verify_state_registration(
-            self.name,
-            self.state_type(),
-            &self.structural_identity(),
-        )?;
-        Ok(DequeHandle::new(session.clone(), self.state_type(), name))
-    }
-
-    fn collection_def(&self) -> CollectionDef {
-        self.def
-    }
-
-    fn with_collection_def(mut self, def: CollectionDef) -> Self {
-        self.def = def;
-        self
+    fn handle<S: CellSession>(
+        session: S,
+        state_type: StateType,
+        name: StateName,
+    ) -> DequeHandle<S, C> {
+        DequeHandle::new(session, state_type, name)
     }
 }
 
 /// Typed, owned handle over a codec-backed deque — a thin composition over a
-/// [`CellView`]. Reads (`stream`/`get`/`len`/`is_empty`) need only
-/// [`CellRead`]; the push/pop mutators need [`CellSession`], so a reader-minted
-/// handle has the readers but **cannot name** a mutator (the read-only-handle
-/// invariant). Every operation guards on session termination.
+/// [`CellView`]. Every operation guards on session termination.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct DequeHandle<S, C> {
@@ -195,7 +154,7 @@ impl<S, C> DequeHandle<S, C> {
 
 impl<S, C> DequeHandle<S, C>
 where
-    S: CellRead,
+    S: CellSession,
     C: Codec,
 {
     /// The number of live elements (`tail − head`, O(1) from the bounds cell).
@@ -312,13 +271,7 @@ where
             None => Ok((0, 0)),
         }
     }
-}
 
-impl<S, C> DequeHandle<S, C>
-where
-    S: CellSession,
-    C: Codec,
-{
     /// Appends `value` at the back, extending the window to `tail + 1`.
     ///
     /// # Errors

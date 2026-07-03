@@ -41,8 +41,10 @@ pub trait CommitOracle: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`Self::Error`] when the upstream store write fails; the
-    /// boundary retries transient failures in place.
+    /// Returns [`Self::Error`] when the upstream store write fails; on the
+    /// success path the boundary retries every non-shutdown failure in place
+    /// (the marker is framework data, never a data-rejection), abandoning only
+    /// on shutdown.
     fn record_message(
         &self,
         dedup_id: Uuid,

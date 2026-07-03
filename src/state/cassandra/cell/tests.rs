@@ -12,7 +12,7 @@
 
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, IndexUpsertRow,
-    KeyRow, ResolvedRow, StageRow, encode_cell_blobs,
+    KeyRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs,
 };
 use crate::cassandra::{BatchUnit, CassandraConfiguration, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
@@ -25,7 +25,9 @@ use crate::state::tests::cell_suite::{
     OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
     run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
-use crate::state::{CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType};
+use crate::state::{
+    CollectionId, CollectionRef, EventRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
+};
 use crate::test_util::TEST_KEYSPACE;
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
@@ -706,9 +708,10 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
 }
 
 /// Builds the mixed-statement batch for the binding-order test: three units
-/// whose single flatten interleaves all five row shapes — stage+index for A,
-/// promote+index-delete for B, resolved-write+index-delete for C. The blobs,
-/// cells, and `id` outlive the returned borrows (the caller holds them).
+/// whose single flatten interleaves every row shape and all five cell
+/// statements — stage+index for A, promote+index-delete for B,
+/// resolved-write+index-delete for C. The blobs, cells, and `id` outlive the
+/// returned borrows (the caller holds them).
 fn mixed_binding_batch<'a>(
     q: &'a CellQueries,
     id: &'a CollectionId,
@@ -731,9 +734,9 @@ fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![
-                CellBatchRow::StageCell {
+                CellBatchRow {
                     statement: &q.write_provisional_no_ttl,
-                    row: StageRow {
+                    row: RowShape::Stage(StageRow {
                         ttl: None,
                         data: blob_a.data.as_deref(),
                         prev_data: None,
@@ -741,68 +744,68 @@ fn mixed_binding_batch<'a>(
                         version: blob_a.version,
                         event: event(2),
                         addr: addr_a,
-                    },
+                    }),
                 },
-                CellBatchRow::IndexUpsert {
+                CellBatchRow {
                     statement: &q.index_insert_no_ttl,
-                    row: IndexUpsertRow {
+                    row: RowShape::IndexUpsert(IndexUpsertRow {
                         ttl: None,
                         addr: addr_a,
-                    },
+                    }),
                 },
             ],
         ),
         BatchUnit::new(
             1_024,
             smallvec![
-                CellBatchRow::PromoteCell {
+                CellBatchRow {
                     statement: &q.mark_resolved,
-                    row: KeyRow {
+                    row: RowShape::Key(KeyRow {
                         kind: CellKind::Cell,
                         addr: addr_b,
-                    },
+                    }),
                 },
-                CellBatchRow::IndexDelete {
+                CellBatchRow {
                     statement: &q.index_delete,
-                    row: KeyRow {
+                    row: RowShape::Key(KeyRow {
                         kind: CellKind::Index,
                         addr: addr_b,
-                    },
+                    }),
                 },
             ],
         ),
         BatchUnit::new(
             1_024,
             smallvec![
-                CellBatchRow::RollbackCell {
+                CellBatchRow {
                     statement: &q.write_resolved_no_ttl,
-                    row: ResolvedRow {
+                    row: RowShape::Resolved(ResolvedRow {
                         ttl: None,
                         data: blob_c.data.as_deref(),
                         encoding: blob_c.encoding,
                         version: blob_c.version,
                         addr: addr_c,
-                    },
+                    }),
                 },
-                CellBatchRow::IndexDelete {
+                CellBatchRow {
                     statement: &q.index_delete,
-                    row: KeyRow {
+                    row: RowShape::Key(KeyRow {
                         kind: CellKind::Index,
                         addr: addr_c,
-                    },
+                    }),
                 },
             ],
         ),
     ]
 }
 
-/// Positional binding-order proof (plan §8.1, the one silent-failure surface):
+/// Positional binding-order proof (the one silent-failure surface):
 /// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
 /// count/order mismatch scylla falls back to an **empty** context with no
 /// error — a misordered `unzip` flatten would bind a row against the wrong
 /// statement's columns silently. Build ONE batch whose single flatten
-/// interleaves **all five** [`CellBatchRow`] variants (five distinct prepared
-/// statements) — stage a cell, upsert its index marker, promote a
+/// interleaves every [`RowShape`] across **five distinct prepared
+/// statements** — stage a cell, upsert its index marker, promote a
 /// pre-provisioned cell, delete markers, and write a fresh resolved value —
 /// with **distinct payloads** so any cross-binding corrupts an observable
 /// value. Read every cell back: each landing correctly proves its statement
@@ -854,12 +857,13 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         &cell_c,
     );
     fx.cassandra
-        .execute_unlogged_batches(&units, 1 << 20, 4_096)
+        .execute_unlogged_batches(&units, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
 
-    // A is provisional with its own payload (StageCell + IndexUpsert bound their
-    // columns; the index-based recovery scan reads it back), and it is the ONLY
-    // provisional cell (IndexDelete cleared B's marker, C never had one).
+    // A is provisional with its own payload (the stage + index-upsert rows
+    // bound their columns; the index-based recovery scan reads it back), and it
+    // is the ONLY provisional cell (the index-delete cleared B's marker, C
+    // never had one).
     let staged = provisional_cells(&store, &id).await?;
     assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
     let (key, prov) = staged
@@ -869,8 +873,9 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     assert_eq!(key, cell_a);
     assert_eq!(prov.data(), Some(&data_a));
 
-    // B promoted to its own payload (PromoteCell bound its columns); C written
-    // fresh resolved to its own payload (RollbackCell bound its columns).
+    // B promoted to its own payload (the key-only promote row bound its
+    // columns); C written fresh resolved to its own payload (the resolved-write
+    // row bound its columns).
     assert_eq!(
         store.get(&id, &cell_b, event(3)).await?,
         Committed::new(Some(data_b))
@@ -895,10 +900,11 @@ fn finish(result: Result<bool>) -> quickcheck::TestResult {
 }
 
 /// The crash-recovery-equivalence property over the production
-/// `Cached<CassandraStore>` assembly (invariants 1, 5). A "crash" rebuilds the
-/// cache cold over the same durable Cassandra rows and oracle set. The tempdir
-/// and fjall client outlive every store the `make` closure mints (the await
-/// completes before they drop).
+/// `Cached<CassandraStore>` assembly (crash-recovery equivalence and
+/// oracle-correctness properties). A "crash" rebuilds the cache cold over the
+/// same durable Cassandra rows and oracle set. The tempdir and fjall client
+/// outlive every store the `make` closure mints (the await completes before
+/// they drop).
 #[test]
 fn prop_cassandra_cell_crash_equivalence() {
     use crate::test_util::TEST_RUNTIME;
@@ -971,7 +977,7 @@ fn assembly(fx: &Fixture) -> Result<Bottom> {
 /// Unified view soundness over `Overlay<Cached<CassandraStore>>`: point `get`s,
 /// range `scan`s (bounds, direction, limit, early-stop), dirty buffering, and
 /// committed writes intermixed in one trace, all vs the sorted-map oracle
-/// (invariants 3, 5; DT7).
+/// (unified-view soundness and oracle-correctness properties).
 #[test]
 fn prop_cassandra_overlay_view() {
     use crate::test_util::TEST_RUNTIME;
@@ -1037,4 +1043,77 @@ fn ttl_seconds_surfacing_distinguishes_no_ttl_from_sub_second() {
         Some(CompactDuration::new(0)),
         "a defensive negative also stamps an immediate expiry, not never"
     );
+}
+
+/// The cache-fill co-expiry matches the value actually returned, not the
+/// pre-resolution `TTL(data)`. A staged clear over a present base (`data`
+/// NULL, `prev_data` present, finite stage TTL) whose event the oracle never
+/// committed rolls back to `prev` on read — and both cache-fill paths must
+/// report a finite co-expiry no later than the stage TTL. Reporting `None`
+/// ("never expires", the old `TTL(data)`-only read) stamped the fjall entry
+/// to strictly outlive the durable row, serving the value after the row died.
+#[tokio::test]
+async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
+    use crate::timers::duration::CompactDuration;
+    use futures::TryStreamExt;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let ttl = CompactDuration::new(3_600);
+    let old = Bytes::from_static(b"old");
+
+    // One collection per cache-fill path — resolution mutates the cell, so the
+    // two paths each need their own rolled-back read.
+    for path in ["get_for_cache", "scan_for_cache"] {
+        let c = CollectionRef::new(
+            collection(&format!("co-expiry-{path}"))?.id().clone(),
+            Some(ttl),
+        );
+        let cell = value_cell();
+        store
+            .write_resolved(&c, &[(cell.clone(), Some(old.clone()))])
+            .await?;
+        // `event(1)` is never recorded in the oracle, so resolution rolls the
+        // staged clear back to `prev`.
+        store
+            .write_provisional(
+                &c,
+                &[(
+                    cell.clone(),
+                    ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
+                )],
+            )
+            .await?;
+
+        let (value, co_expiry) = if path == "get_for_cache" {
+            let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
+            (committed.into_inner(), co_expiry)
+        } else {
+            let scan = Scan {
+                section: Section::new(0),
+                start: Bound::Unbounded,
+                dir: Direction::Forward,
+                end: Bound::Unbounded,
+                limit: None,
+            };
+            let stream = store.scan_for_cache(c.id(), scan, event(2));
+            futures::pin_mut!(stream);
+            let (_, bytes, co_expiry) = stream
+                .try_next()
+                .await?
+                .ok_or_else(|| eyre!("{path}: the rolled-back cell must scan back present"))?;
+            (Some(bytes), co_expiry)
+        };
+
+        assert_eq!(value.as_ref(), Some(&old), "{path}: rollback returns prev");
+        let co_expiry = co_expiry.ok_or_else(|| {
+            eyre!("{path}: a rolled-back staged clear must report a finite co-expiry, not never")
+        })?;
+        assert!(
+            co_expiry <= ttl,
+            "{path}: co-expiry {co_expiry:?} must not exceed the stage TTL {ttl:?}"
+        );
+    }
+    Ok(())
 }

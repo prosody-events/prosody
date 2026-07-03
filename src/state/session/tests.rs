@@ -15,7 +15,7 @@
 //! counter).
 
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use super::{ArmedKeys, CellRead, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::cell_key::{CellKey, Coordinate, Section};

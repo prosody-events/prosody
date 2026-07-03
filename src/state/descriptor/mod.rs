@@ -37,11 +37,11 @@
 //! incompatible descriptor fails loudly instead of silently misreading cells.
 
 use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
-use crate::consumer::event_context::StateAccessError;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::registry::CollectionDef;
-use crate::state::session::{CellRead, CellSession};
+use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, CommitMode, StateName, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -133,7 +133,7 @@ pub trait DescriptorIdentity {
 }
 
 /// A typed view over one keyed-state collection, bindable to any
-/// [`CellRead`] session.
+/// [`CellSession`].
 ///
 /// Handlers reach this through
 /// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
@@ -142,13 +142,11 @@ pub trait DescriptorIdentity {
 /// [`verify_state_registration`] and returns an owned, `Clone` handle that
 /// wraps the session's byte cells with the descriptor's typing.
 ///
-/// [`verify_state_registration`]: CellRead::verify_state_registration
+/// [`verify_state_registration`]: CellSession::verify_state_registration
 pub trait StateDescriptor: DescriptorIdentity + Copy {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
-    /// session. Bound on [`CellRead`] (binding only reads), so a cross-group
-    /// reader session can bind every descriptor; the handle's *mutators* still
-    /// require [`CellSession`].
-    type Handle<S: CellRead>;
+    /// [`CellSession`].
+    type Handle<S: CellSession>;
 
     /// Validates registration + structural identity and returns the typed
     /// handle.
@@ -164,7 +162,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     /// collection is unregistered, or
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
+    fn bind<S: CellSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings (TTL, commit mode) this descriptor carries
     /// into registration, set via its fluent methods (see [`Self::ttl`]).
@@ -278,12 +276,12 @@ where
 ///
 /// The resolver is a zero-sized *strategy*, never an instance: every method
 /// is static (no `&self`). Any runtime dependency it needs (for example a
-/// message loader) is read from the [`CellRead`] session handed to
+/// message loader) is read from the [`CellSession`] handed to
 /// [`Self::resolve`] — see the consumer layer's reference resolver. A
 /// descriptor carries no resolver *state*; the resolver's durable *token*
 /// ([`ResolverId`]) is a separate, session-agnostic const that rides the
 /// [`StructuralIdentity`].
-pub trait CellResolver<S: CellRead> {
+pub trait CellResolver<S: CellSession> {
     /// The decoded cell type — pinned to the codec's payload by the handle.
     type Stored;
 
@@ -324,7 +322,7 @@ impl<T> ResolverId for Passthrough<T> {
 
 impl<S, T> CellResolver<S> for Passthrough<T>
 where
-    S: CellRead,
+    S: CellSession,
     T: Send + 'static,
 {
     type Resolved = T;
@@ -340,6 +338,101 @@ where
     }
 }
 
+/// Per-kind specialization for the shared [`Descriptor`] skeleton: the frozen
+/// structural identity a kind asserts and the typed handle a bind mints. One
+/// zero-sized impl per collection kind ([`ValueKind`], [`map::MapKind`],
+/// [`deque::DequeKind`]); the public
+/// [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases pick the
+/// spec, so every descriptor shares one `new`, `name`,
+/// `collection_def`/`with_collection_def`, and `bind` body.
+pub trait CollectionSpec {
+    /// The typed handle [`Descriptor::bind`] returns over session `S`.
+    type Handle<S: CellSession>;
+
+    /// The frozen structural identity descriptors of this kind assert.
+    fn structural_identity() -> StructuralIdentity;
+
+    /// Mints the handle over a verified session and the collection's
+    /// `(state_type, name)`.
+    fn handle<S: CellSession>(
+        session: S,
+        state_type: StateType,
+        name: StateName,
+    ) -> Self::Handle<S>;
+}
+
+/// The one descriptor skeleton every collection kind shares: an interned name,
+/// operational settings, and a zero-sized [`CollectionSpec`] `K` supplying the
+/// per-kind identity and handle. The three public names
+/// ([`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`]) are aliases over
+/// this type.
+///
+/// A plain `Copy` value (the name is interned) so descriptors are cheap to
+/// build wherever they are needed.
+#[derive(Educe)]
+#[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
+pub struct Descriptor<K> {
+    name: &'static str,
+    def: CollectionDef,
+    #[educe(Debug(ignore))]
+    _marker: PhantomData<fn() -> K>,
+}
+
+impl<K> Descriptor<K> {
+    /// Declares a collection named `name`.
+    ///
+    /// Bound-free by design: construction needs no [`CollectionSpec`] bound
+    /// (identity/handle surface only at bind and on the handle's `get`/`set`),
+    /// so a consumer-layer alias can build a descriptor over a bespoke spec.
+    ///
+    /// `name` may be any runtime string — FFI clients register collections at
+    /// client startup from host-language names — and is interned, so the
+    /// descriptor stays `Copy`. It is not validated here; an empty name fails
+    /// loudly at registration, the fallible boundary.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: intern_descriptor_str(name),
+            def: CollectionDef::new(None),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<K: CollectionSpec> DescriptorIdentity for Descriptor<K> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn structural_identity(&self) -> StructuralIdentity {
+        K::structural_identity()
+    }
+}
+
+impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
+    type Handle<S: CellSession> = K::Handle<S>;
+
+    fn bind<S: CellSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+        // The handle carries the binding descriptor's `state_type` so its cell
+        // ops address the right namespace.
+        let name = session.verify_state_registration(
+            self.name,
+            self.state_type(),
+            &self.structural_identity(),
+        )?;
+        Ok(K::handle(session.clone(), self.state_type(), name))
+    }
+
+    fn collection_def(&self) -> CollectionDef {
+        self.def
+    }
+
+    fn with_collection_def(mut self, def: CollectionDef) -> Self {
+        self.def = def;
+        self
+    }
+}
+
 /// Descriptor for a codec-backed single value collection.
 ///
 /// Generic over a [`Codec`] (the cell typing) and a [`CellResolver`] (how a
@@ -350,13 +443,39 @@ where
 /// runtime string (it is interned, so descriptors stay `Copy`); for a
 /// typed cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and
 /// annotate the binding `ValueDescriptor<CartCodec>`.
-#[derive(Educe)]
-#[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
-pub struct ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> {
-    name: &'static str,
-    def: CollectionDef,
-    #[educe(Debug(ignore))]
-    _marker: PhantomData<fn() -> (C, R)>,
+pub type ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> =
+    Descriptor<ValueKind<C, R>>;
+
+/// The Value [`CollectionSpec`]: a single codec-produced cell, no key codec.
+pub struct ValueKind<C, R>(PhantomData<fn() -> (C, R)>);
+
+impl<C, R> CollectionSpec for ValueKind<C, R>
+where
+    C: Codec,
+    R: ResolverId,
+{
+    type Handle<S: CellSession> = StateHandle<S, C, R>;
+
+    fn structural_identity() -> StructuralIdentity {
+        StructuralIdentity {
+            kind: CollectionKindId::Value,
+            codec_id: C::CODEC_ID,
+            // The resolver token rides the identity via `R: ResolverId`; the
+            // operational `R: CellResolver<S>` requirement surfaces on the
+            // handle's `get`/`set`, not here.
+            resolver_id: R::RESOLVER_ID,
+            // Value is single-cell: no key codec. Map emits `Some(KC::KEY_CODEC_ID)`.
+            key_codec_id: None,
+        }
+    }
+
+    fn handle<S: CellSession>(
+        session: S,
+        state_type: StateType,
+        name: StateName,
+    ) -> StateHandle<S, C, R> {
+        StateHandle::new(session, state_type, name)
+    }
 }
 
 /// Declares a codec-backed value collection named `name` (JSON by
@@ -378,90 +497,13 @@ where
     ValueDescriptor::new(name)
 }
 
-impl<C, R> ValueDescriptor<C, R> {
-    /// Declares a value collection named `name` over an explicit codec and
-    /// resolver pair.
-    ///
-    /// Bound-free by design: construction needs no `Codec`/`CellResolver`
-    /// bounds (those surface only on [`StateHandle::get`]/`set`), so a
-    /// consumer-layer alias can build a non-[`Passthrough`] descriptor — e.g.
-    /// a reference cell whose resolver loads through a message loader.
-    /// [`value_state`] is the convenience constructor for the common
-    /// [`Passthrough`] case.
-    ///
-    /// `name` may be any runtime string and is interned (see
-    /// [`value_state`]); it is not validated here — an empty name fails
-    /// loudly at registration, the fallible boundary.
-    #[must_use]
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: intern_descriptor_str(name),
-            def: CollectionDef::new(None),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<C, R> DescriptorIdentity for ValueDescriptor<C, R>
-where
-    C: Codec,
-    R: ResolverId,
-{
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn structural_identity(&self) -> StructuralIdentity {
-        StructuralIdentity {
-            kind: CollectionKindId::Value,
-            codec_id: C::CODEC_ID,
-            resolver_id: R::RESOLVER_ID,
-            // Value is single-cell: no key codec. Map emits `Some(KC::KEY_CODEC_ID)`.
-            key_codec_id: None,
-        }
-    }
-}
-
-impl<C, R> StateDescriptor for ValueDescriptor<C, R>
-where
-    C: Codec,
-    R: ResolverId,
-{
-    type Handle<S: CellRead> = StateHandle<S, C, R>;
-
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        // The resolver token rides the identity (via `R: ResolverId`), but the
-        // operational `R: CellResolver<S>` requirement surfaces on `get`/`set`,
-        // not here, so this compiles through the shared `StateDescriptor` trait.
-        // The handle carries the binding descriptor's `state_type` so its cell
-        // ops address the right namespace.
-        let name = session.verify_state_registration(
-            self.name,
-            self.state_type(),
-            &self.structural_identity(),
-        )?;
-        Ok(StateHandle::new(session.clone(), self.state_type(), name))
-    }
-
-    fn collection_def(&self) -> CollectionDef {
-        self.def
-    }
-
-    fn with_collection_def(mut self, def: CollectionDef) -> Self {
-        self.def = def;
-        self
-    }
-}
-
 /// A cell store scoped to ONE collection partition (the unit of atomicity).
 ///
 /// Pins the collection's `(state_type, name)` once at bind and forwards by
 /// [`CellKey`], so a collection handle addresses only cells within its own
 /// partition and **cannot escape it** (the `CollectionScopeContainment`
 /// invariant — the segment/key are injected by the session, the wrapped
-/// session is private). Cheap `Clone`. Read forwarders need only [`CellRead`];
-/// mutators need [`CellSession`], so a view over a `CellRead`-only session
-/// exposes `get`/`scan` but has no `set`/`clear`/`flush` to forward.
+/// session is private). Cheap `Clone`.
 #[derive(Clone)]
 pub struct CellView<S> {
     session: S,
@@ -487,7 +529,7 @@ impl<S> CellView<S> {
     }
 }
 
-impl<S: CellRead> CellView<S> {
+impl<S: CellSession> CellView<S> {
     /// The bound session, for a [`CellResolver`] to read its loader from.
     pub(in crate::state) fn session(&self) -> &S {
         &self.session
@@ -510,9 +552,7 @@ impl<S: CellRead> CellView<S> {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), S::ScanError>> + Send + 'a {
         self.session.scan(self.state_type, &self.name, scan)
     }
-}
 
-impl<S: CellSession> CellView<S> {
     /// Buffers a set of one cell's bytes.
     ///
     /// # Errors
@@ -552,9 +592,7 @@ impl<S: CellSession> CellView<S> {
 /// Owns a clone of the binding session (`Clone + Send + Sync + 'static` — an
 /// FFI requirement); the codec runs only at the edges (`get` decodes, `set`
 /// encodes) over the cell's bytes, and the resolver maps the decoded cell
-/// to/from the exposed value. Reads need only [`CellRead`]; mutators need
-/// [`CellSession`], so a reader-minted handle exposes `get` and **cannot name**
-/// `set`/`clear`/`flush`. Every operation guards on session termination.
+/// to/from the exposed value. Every operation guards on session termination.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct StateHandle<S, C, R> {
@@ -576,7 +614,7 @@ impl<S, C, R> StateHandle<S, C, R> {
 
 impl<S, C, R> StateHandle<S, C, R>
 where
-    S: CellRead,
+    S: CellSession,
     C: Codec,
     R: CellResolver<S, Stored = C::Payload>,
 {
@@ -595,14 +633,7 @@ where
         let stored = decode_cell::<C>(cell).map_err(ValueStateError::Codec)?;
         Ok(Some(R::resolve(self.view.session(), stored).await?))
     }
-}
 
-impl<S, C, R> StateHandle<S, C, R>
-where
-    S: CellSession,
-    C: Codec,
-    R: CellResolver<S, Stored = C::Payload>,
-{
     /// Lowers `value` through the resolver, encodes it, and buffers a set.
     ///
     /// # Errors
@@ -685,7 +716,7 @@ fn intern_descriptor_str(s: &str) -> &'static str {
 /// [`StateAccessError::Terminated`].
 fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
 where
-    S: CellRead,
+    S: CellSession,
 {
     if session.is_terminated() {
         return Err(StateAccessError::Terminated);

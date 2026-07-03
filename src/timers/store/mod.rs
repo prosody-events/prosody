@@ -205,8 +205,12 @@ impl Segment {
 
 /// Factory for segment-scoped [`TriggerStore`] instances.
 ///
-/// Holds shared resources (Cassandra session, prepared statements) and creates
-/// per-segment stores with independent caches. Store creation is synchronous.
+/// Holds shared resources (Cassandra session and prepared statements; the
+/// in-memory store's shared maps) and creates per-segment stores. Every store
+/// a provider creates for the same segment must observe the same durable rows:
+/// production mints the partition's store and the keyed-state commit oracle's
+/// store from one provider, and the oracle reads what the partition writes.
+/// Store creation is synchronous.
 pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
     /// The store type created by this provider.
     type Store: TriggerStore;
@@ -404,6 +408,12 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// Returns `None` if the row is absent (commit oracle: "committed").
     /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
+    ///
+    /// **Contract: the answer must reflect durable state, never a
+    /// per-instance cache.** The keyed-state commit oracle may consult
+    /// through a different store instance than the partition's writer, and
+    /// a stale answer flips a recovery decision (rolling back a committed
+    /// write, or promoting an abandoned one).
     fn current_tag(
         &self,
         key: &Key,

@@ -29,6 +29,7 @@
 
 use crate::consumer::event_context::EventContext;
 use crate::state::session::LifecycleAccessExt;
+use crate::state::session::sealed::StateLifecycle;
 use crate::timers::duration::CompactDuration;
 use rand::RngExt;
 use std::cmp::min;

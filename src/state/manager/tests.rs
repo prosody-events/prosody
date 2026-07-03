@@ -6,7 +6,7 @@
 //! These pin the glue `recover` and the real session add on top: resolving a
 //! provisional cell staged under a real [`EventRef`] through the oracle (commit
 //! **and** abort arms), clearing the per-key armed flag, unscheduling the
-//! backstop **only** when every cell resolved (no-strand, inv 6), and the
+//! backstop **only** when every cell is resolved (no strand-back), and the
 //! mixed-mode `finalize`/`commit_apply`/`rollback_aborted` over the real
 //! session. The manager is Kafka-agnostic, so these mint a session from a key
 //! and an `EventRef` directly; all are broker-free.
@@ -111,8 +111,19 @@ fn value_cell() -> CellKey {
 }
 
 fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {
+    registry_with_cart_within(None)
+}
+
+/// Like [`registry_with_cart`] but binds a `recovery_within` bound to `cart`,
+/// so a test can assert the reschedule-after-failed-sweep tightening.
+fn registry_with_cart_within(
+    within: Option<CompactDuration>,
+) -> Result<Arc<CollectionDefRegistry>> {
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
-    registry.register(&cart(), CollectionDef::new(None))?;
+    registry.register(
+        &cart(),
+        CollectionDef::new(None).with_recovery_within(within),
+    )?;
     Ok(Arc::new(registry))
 }
 
@@ -383,6 +394,20 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
     Ok(())
 }
 
+/// Whether a rescheduled backstop's `fire` honors the tightened retry delay:
+/// the 30s test floor tightened by `within`, floored at the 1s retry cadence,
+/// bracketed by the `now` reads around `recover`.
+fn fire_in_tightened_window(
+    fire: CompactDateTime,
+    before: CompactDateTime,
+    after: CompactDateTime,
+    within: Option<u32>,
+) -> bool {
+    let expected = within.map_or(30, |w| w.min(30)).max(1);
+    (before.epoch_seconds() + expected..=after.epoch_seconds() + expected)
+        .contains(&fire.epoch_seconds())
+}
+
 /// `recover` **never aborts the fired trigger except on shutdown** (retry
 /// forever; abort only on shutdown), over a generated sweep-failure category
 /// and a shutdown flag. Invariants proven for a staged cell whose promote
@@ -392,7 +417,11 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
 ///   (rescheduling a cell that never resolves would spin a refire loop;
 ///   first-touch and the key's next commit recover it).
 /// * A **Transient** or **Terminal** sweep failure without shutdown → `Commit`
-///   after rescheduling a fresh backstop, recorded in `armed`.
+///   after rescheduling a fresh backstop, recorded in `armed`. The reschedule
+///   fires at the `recovery_delay` floor tightened by the registered
+///   collections' `recovery_within` (floored at the retry cadence) — the same
+///   tightening the commit path applies, so a failed sweep does not stretch a
+///   tightly bounded collection's convergence out to the full floor.
 /// * A transient/terminal failure **with** shutdown → `Abort`, leaving the
 ///   standing backstop for reacquisition (the reschedule was interrupted).
 ///
@@ -404,9 +433,13 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
 /// (a healthy reschedule lands first try; shutdown returns before the backoff).
 #[test]
 fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
-    async fn run(category: ErrorCategory, shutdown: bool) -> Result<TestResult> {
+    async fn run(
+        category: ErrorCategory,
+        shutdown: bool,
+        within: Option<u32>,
+    ) -> Result<TestResult> {
         let cart = StateName::try_new("cart")?;
-        let registry = registry_with_cart()?;
+        let registry = registry_with_cart_within(within.map(CompactDuration::new))?;
         let inner = cell_store(FixedOracle::committed(), &registry);
         let cell = FailingCellStore::new_with_category(inner, cart.clone(), category);
         let manager = poison_provider(cell, registry)
@@ -449,7 +482,9 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
             .insert_async(key.clone(), standing)
             .await;
 
+        let before = CompactDateTime::now()?;
         let resolution = manager.recover(key.clone(), &timers, &shutdown_rx).await;
+        let after = CompactDateTime::now()?;
         let scheduled = timers
             .scheduled_times(&key, TimerType::StateRecovery)
             .await?;
@@ -474,7 +509,15 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
             resolution == SweepResolution::Abort && !rescheduled && !armed
         } else if reschedule_case {
             // Non-shutdown transient/terminal: commit after a sooner singleton
-            // reschedule, armed re-set.
+            // reschedule, armed re-set — and the reschedule honors the
+            // registered `recovery_within` tightening.
+            if !fire_in_tightened_window(scheduled[0], before, after, within) {
+                return Ok(TestResult::error(format!(
+                    "rescheduled fire {} outside the tightened window (recovery_within {within:?} \
+                     must tighten the retry delay)",
+                    scheduled[0].epoch_seconds()
+                )));
+            }
             resolution == SweepResolution::Commit && rescheduled && armed
         } else {
             // Permanent per-cell skip: commit, no reschedule, armed cleared.
@@ -489,24 +532,27 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
         Ok(TestResult::passed())
     }
 
-    fn property(category_sel: u8, shutdown: bool) -> TestResult {
+    fn property(category_sel: u8, shutdown: bool, within_sel: Option<u16>) -> TestResult {
         let category = match category_sel % 3 {
             0 => ErrorCategory::Permanent,
             1 => ErrorCategory::Transient,
             _ => ErrorCategory::Terminal,
         };
+        // Fold the raw bound into 0..60s so it lands on both sides of the 30s
+        // floor (and on the 0 → 1s cadence floor) with real probability.
+        let within = within_sel.map(|w| u32::from(w % 60));
         let Ok(runtime) = Builder::new_current_thread().enable_all().build() else {
             return TestResult::error("failed to build runtime");
         };
         runtime.block_on(async move {
-            match run(category, shutdown).await {
+            match run(category, shutdown, within).await {
                 Ok(result) => result,
                 Err(e) => TestResult::error(format!("setup failed: {e}")),
             }
         })
     }
 
-    QuickCheck::new().quickcheck(property as fn(u8, bool) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(u8, bool, Option<u16>) -> TestResult);
 }
 
 /// Buffers writes to two `ReadCommitted` collections (`cart`, `wishlist`) and

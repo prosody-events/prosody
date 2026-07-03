@@ -18,10 +18,13 @@
 //! coordinate from coverage so the next read falls through and re-publishes
 //! from the lower store: (a) a write-path publish that could not be established
 //! in fjall (a failed `put`/`put_batch`, or a `commit_provisional` whose stage
-//! entry was missing/unreadable) — the coordinate self-heals on the next read;
-//! and (b) the raw `mark_resolved` promote, which cannot project the new
-//! committed `data` from keys alone — since a covered hit is served verbatim, a
-//! stale `prev` must not stay covered.
+//! entry was missing/unreadable); and (b) the raw `mark_resolved` promote,
+//! which cannot project the new committed `data` from keys alone. In both
+//! cases the durable value moved while fjall may still hold the old projection
+//! — and since a covered hit is served **verbatim** (no read-side mismatch
+//! detection exists), a lost punch is a wrong answer, not a slow one. These
+//! punches are therefore **must-succeed** (`Cached::punch_cells_must_succeed`):
+//! retried until they land, never degraded.
 //!
 //! The five soundness invariants (Cov1/Cov2/Cov3, `CovBuild`, `CovVolatile`,
 //! `GetNeverReadsOwnStaged`) are stated on the `coverage` module. The ones
@@ -77,24 +80,46 @@
 //! The cache is a **hint**: every fjall failure is logged and degraded (a miss,
 //! a skipped publish leaving the coordinate uncovered, a fall-through scan),
 //! never surfaced — correctness rests on the lower store, so
-//! [`Cached::Error`](CellStore::Error) is just the lower store's error.
+//! [`Cached::Error`](CellStore::Error) is just the lower store's error. The one
+//! exception is the must-succeed punch above: it retries in place (still never
+//! surfaced) because losing it would leave coverage claiming a projection the
+//! durable store no longer holds.
 
 mod coverage;
 
 use self::coverage::{Coverage, Interval, Piece};
+use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, CoverDecision, FjallCellCache, ScanHit};
 use super::identity::{CollectionId, CollectionRef};
 use super::store::CellStore;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::{Stream, StreamExt, pin_mut};
+use futures::{Stream, StreamExt, pin_mut, stream};
 use smallvec::SmallVec;
 use std::ops::Bound;
+use std::slice;
+use std::time::Duration;
+use tokio::task::coop::cooperative;
+use tokio::time::sleep;
 use tracing::warn;
+
+/// Delay between retries of a must-succeed coverage punch
+/// ([`Cached::punch_cells_must_succeed`]) while fjall is transiently failing.
+const PUNCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Cells consumed from a gap scan between coverage write-throughs in
+/// `serve_gap`: the consumed frontier advances in memory per yielded cell and
+/// is persisted every this-many cells (plus the whole-gap cover on
+/// exhaustion). An early drop or failure loses at most this much *coverage* —
+/// under-covering only, which the next read re-fetches; over-covering is
+/// impossible because the frontier extends only over contiguously published
+/// cells.
+const GAP_COVER_STRIDE: usize = 64;
 
 /// A write-through fjall coverage cache over a lower committed [`CellStore`].
 ///
@@ -150,10 +175,76 @@ impl<L> Cached<L> {
         self.fjall.stored_expiry(collection, cell).await
     }
 
+    /// Punches `cells` out of coverage where a stale covered projection would
+    /// otherwise outlive a durable change, retrying a transient failure until
+    /// it lands — one grouped coverage rewrite per touched section, not per
+    /// cell. A covered hit is served verbatim with **no read-side mismatch
+    /// detection**, so this punch is correctness, not a hint: swallowing a
+    /// failure would freeze the pre-change value behind coverage for the rest
+    /// of the epoch. Retrying matches the durability posture elsewhere —
+    /// a broken fjall self-heals when it recovers, and a genuinely stuck one
+    /// visibly stalls rather than silently serving wrong answers.
+    ///
+    /// A **Permanent** failure is a corrupt stored bound frame in that
+    /// section's coverage. The same frame deterministically fails every
+    /// `covers`/`query` load of the section, so all its reads already degrade
+    /// to the lower store and no stale covered serve is reachable — proceeding
+    /// without the punch is safe (and retrying could never succeed).
+    async fn punch_cells_must_succeed<'c>(
+        &self,
+        collection: &CollectionId,
+        cells: impl Iterator<Item = &'c CellKey>,
+    ) {
+        for (section, coordinates) in group_by_section(cells) {
+            loop {
+                match self
+                    .coverage
+                    .punch_many(collection, section, &coordinates)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) => {
+                        // Not a degrade: this punch is must-succeed, so a
+                        // transient failure retries in place.
+                        warn!(error = %error, "committed-value cache punch failed");
+                        if error.classify_error() == ErrorCategory::Permanent {
+                            break;
+                        }
+                        sleep(PUNCH_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Covers `cells` after a successful batch publish — one grouped coverage
+    /// rewrite per touched section. A failure degrades (the points stay
+    /// uncovered; the next read falls through and re-publishes).
+    async fn cover_cells<'c>(
+        &self,
+        collection: &CollectionId,
+        cells: impl Iterator<Item = &'c CellKey>,
+    ) {
+        for (section, coordinates) in group_by_section(cells) {
+            degrade_cover_mut(
+                "cover",
+                self.coverage
+                    .cover_points(collection, section, &coordinates)
+                    .await,
+            );
+        }
+    }
+
     /// Publishes one cell's committed `projection` into fjall with an absolute
     /// `expiry` (`0` = never), then **covers** the coordinate on success or
     /// **punches** it on a `fjall.put` failure (Cov3: the only mutator
     /// uncover). Called only after the lower write succeeded.
+    ///
+    /// The punch here may degrade (unlike the write-path punches): this
+    /// publish is the cover-on-get fill, which runs only on an uncovered or
+    /// expired-covered coordinate — a lost punch leaves at worst an expired
+    /// covered entry, and an expired covered read falls through (Cov1), never
+    /// serving it.
     async fn publish(
         &self,
         collection: &CollectionId,
@@ -164,30 +255,23 @@ impl<L> Cached<L> {
         L: CellStore,
     {
         match self.fjall.put(collection, cell, projection, expiry).await {
-            Ok(()) => self.cover_point(collection, cell).await,
+            Ok(()) => {
+                degrade_cover_mut(
+                    "cover",
+                    self.coverage
+                        .cover_points(collection, cell.section, slice::from_ref(&cell.coordinate))
+                        .await,
+                );
+            }
             Err(error) => {
                 warn_skip("publish", &error);
                 degrade_cover_mut(
                     "punch",
                     self.coverage
-                        .punch(collection, cell.section, &cell.coordinate)
+                        .punch_many(collection, cell.section, slice::from_ref(&cell.coordinate))
                         .await,
                 );
             }
-        }
-    }
-
-    /// Covers a single coordinate (the point interval `[X, X]`) after a
-    /// successful publish.
-    async fn cover_point(&self, collection: &CollectionId, cell: &CellKey) {
-        if let Some(point) = Interval::new(
-            Bound::Included(cell.coordinate.clone()),
-            Bound::Included(cell.coordinate.clone()),
-        ) {
-            degrade_cover_mut(
-                "cover",
-                self.coverage.cover(collection, cell.section, point).await,
-            );
         }
     }
 }
@@ -217,28 +301,24 @@ where
         let expiry = expiry_at(stamped_at, collection.ttl());
         // Build the bounded batch input once, then publish atomically: a
         // multi-cell update is never torn, and the whole settle is one blocking
-        // thread-hop instead of N. The coverage updates below are in-memory
-        // `scc` ops, so a serial loop is correct and cheap.
+        // thread-hop instead of N. The coverage update after it is likewise
+        // grouped — one section rewrite per touched section, not per cell.
         let mut batch: Vec<(CellKey, Committed, u64)> = Vec::with_capacity(cells.len());
         for (cell, value) in cells {
             batch.push((cell.clone(), project(value), expiry));
         }
         match self.fjall.put_batch(collection.id(), &batch).await {
             Ok(()) => {
-                for (cell, ..) in &batch {
-                    self.cover_point(collection.id(), cell).await;
-                }
+                self.cover_cells(collection.id(), batch.iter().map(|(cell, ..)| cell))
+                    .await;
             }
             Err(error) => {
+                // The durable value moved but the fjall projection did not: a
+                // coordinate left covered would serve the pre-write value
+                // verbatim, so the punch is must-succeed.
                 warn_skip("publish", &error);
-                for (cell, ..) in &batch {
-                    degrade_cover_mut(
-                        "punch",
-                        self.coverage
-                            .punch(collection.id(), cell.section, &cell.coordinate)
-                            .await,
-                    );
-                }
+                self.punch_cells_must_succeed(collection.id(), batch.iter().map(|(cell, ..)| cell))
+                    .await;
             }
         }
     }
@@ -248,7 +328,8 @@ where
     /// floor rounding) or a fjall read errors — degradation is always a slower
     /// fall-through, never a wrong answer. Ignores `own` on the covered serve
     /// (Cov2) but forwards it on the fall-through gap read, which also
-    /// re-publishes the refilled cells with a fresh expiry.
+    /// re-publishes the refilled cells with a fresh expiry. `limit` caps the
+    /// fjall drain at what the stitched scan can still yield.
     fn serve_covered<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -256,11 +337,12 @@ where
         piece: &'a Interval,
         dir: Direction,
         own: EventRef,
+        limit: Option<usize>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         try_stream! {
             let covered = self
                 .fjall
-                .scan_present(collection, section, piece.low(), piece.high(), dir);
+                .scan_present(collection, scan_for_piece(section, piece, dir, limit));
             pin_mut!(covered);
             let mut last: Option<Coordinate> = None;
             // Set when the covered serve must hand the remainder to the lower
@@ -301,11 +383,14 @@ where
     /// [`CellStore::scan_for_cache`], publishing each yielded cell into
     /// fjall (best-effort, stamped with its remaining TTL) and **covering
     /// on consume**: coverage extends only over the cells actually
-    /// published, contiguously from the gap edge. The whole gap interval is
-    /// covered only if the scan **exhausts** with no publish failure — a
-    /// `limit`/early-drop or a failed publish caps coverage at the
-    /// last good cell, so a covered re-scan can never serve a
-    /// published-but-uncovered present cell as absent.
+    /// published, contiguously from the gap edge. The consumed frontier
+    /// advances in memory and is persisted every [`GAP_COVER_STRIDE`] cells
+    /// — never per cell — so a `limit`/early-drop or a failed publish caps
+    /// coverage at the last *persisted* frontier (at most one stride behind
+    /// the last good cell). Under-covering only: a covered re-scan can never
+    /// serve a published-but-uncovered present cell as absent. The whole gap
+    /// interval is covered only if the scan **exhausts** with no publish
+    /// failure.
     fn serve_gap<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -315,27 +400,46 @@ where
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         try_stream! {
-            let scan = scan_for_piece(section, piece, dir);
+            // Never pass a limit to the gap scan: a truncated lower scan would
+            // read as exhaustion below and over-cover the unscanned tail. The
+            // stream is lazy, so a limited caller dropping it early stops the
+            // lower paging anyway.
+            let scan = scan_for_piece(section, piece, dir, None);
             let inner = self.lower.scan_for_cache(collection, scan, own);
             pin_mut!(inner);
             let mut contiguous = true;
+            // The consumed frontier: the last contiguously published
+            // coordinate, and how many cells it lags the persisted coverage.
+            let mut frontier: Option<Coordinate> = None;
+            let mut pending = 0usize;
             while let Some(item) = inner.next().await {
                 let (cell, bytes, remaining) = item?;
                 let published = self
                     .try_put(collection, &cell, &Committed::new(Some(bytes.clone())), remaining)
                     .await;
-                // Cover up to (and including) this cell only while the run from
-                // the gap edge is unbroken; a failed publish stops extension.
+                // The frontier extends up to (and including) this cell only
+                // while the run from the gap edge is unbroken; a failed publish
+                // stops extension after persisting the completed prefix.
                 if contiguous && published {
-                    self.cover_consumed(collection, section, piece, dir, &cell.coordinate)
-                        .await;
+                    frontier = Some(cell.coordinate.clone());
+                    pending += 1;
+                    if pending >= GAP_COVER_STRIDE {
+                        self.cover_consumed(collection, section, piece, dir, &cell.coordinate)
+                            .await;
+                        pending = 0;
+                    }
                 } else {
+                    if pending > 0 && let Some(done) = frontier.take() {
+                        self.cover_consumed(collection, section, piece, dir, &done).await;
+                        pending = 0;
+                    }
                     contiguous = false;
                 }
                 yield (cell, bytes);
             }
             // Exhausted with no hole: the empty tail is genuinely absent, so
-            // cover the whole gap (crucial for unbounded-end `iter()`).
+            // cover the whole gap (crucial for unbounded-end `iter()`), which
+            // subsumes any pending frontier.
             if contiguous {
                 degrade_cover_mut(
                     "cover",
@@ -486,9 +590,14 @@ where
                 // applies to the merged output. `Either` (left/right stream)
                 // unifies the two piece stream types without `dyn`.
                 let sub = match piece {
-                    Piece::Covered(iv) => self
-                        .serve_covered(collection, section, iv, dir, own)
-                        .left_stream(),
+                    Piece::Covered(iv) => {
+                        // Cap the covered fjall drain at what the merged output
+                        // can still yield (the gap serve stays uncapped — see
+                        // `serve_gap`'s exhaustion-covering note).
+                        let cap = limit.map(|n| n - yielded);
+                        self.serve_covered(collection, section, iv, dir, own, cap)
+                            .left_stream()
+                    }
                     Piece::Gap(iv) => {
                         self.serve_gap(collection, section, iv, dir, own).right_stream()
                     }
@@ -545,14 +654,25 @@ where
             };
             if let Some(coords) = warm_coords {
                 // Warm: the local fjall snapshot answers with ZERO Cassandra
-                // queries; an empty snapshot yields nothing.
-                for cell in coords {
-                    // Point-read the `kind=Cell` row; a concurrently-resolved or
-                    // absent coordinate reads `None` and is dropped
-                    // (over-report-safe, matching the cold path's filter).
-                    if let Some(provisional) =
-                        self.lower.provisional_cell_at(collection, &cell).await?
-                    {
+                // queries; an empty snapshot yields nothing. The `kind=Cell`
+                // point-reads run concurrently — the sweep resolves cells
+                // independently and order-free — with each per-item future
+                // coop-wrapped so a large drain still yields to the runtime. A
+                // concurrently-resolved or absent coordinate reads `None` and
+                // is dropped (over-report-safe, matching the cold path's
+                // filter).
+                let reads = stream::iter(coords)
+                    .map(|cell| {
+                        cooperative(async move {
+                            let read = self.lower.provisional_cell_at(collection, &cell).await;
+                            read.map(|provisional| (cell, provisional))
+                        })
+                    })
+                    .buffered(SHARD_FANOUT_CONCURRENCY);
+                pin_mut!(reads);
+                while let Some(item) = reads.next().await {
+                    let (cell, provisional) = item?;
+                    if let Some(provisional) = provisional {
                         yield (cell, provisional);
                     }
                 }
@@ -613,15 +733,17 @@ where
             degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
             return Err(error);
         }
-        // Record each staged coordinate into the warm index after the durable
-        // ack. A warm write failure drops the seeded latch so the next sweep
-        // re-seeds from the durable `kind=Index` — never leaving the latch true
-        // with an unaccounted coordinate (F4).
-        for (cell, _) in writes {
-            if let Err(error) = self.fjall.index_record(collection.id(), cell).await {
-                warn_skip("record", &error);
-                degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
-            }
+        // Record the staged coordinates into the warm index after the durable
+        // ack, as one atomic batch. A warm write failure drops the seeded
+        // latch so the next sweep re-seeds from the durable `kind=Index` —
+        // never leaving the latch true with an unaccounted coordinate (F4).
+        if let Err(error) = self
+            .fjall
+            .index_record_batch(collection.id(), writes.iter().map(|(cell, _)| cell))
+            .await
+        {
+            warn_skip("record", &error);
+            degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
         }
         // The committed value stays `prev` while the cell is provisional (commit
         // /abort republishes), so publish `prev` — never the in-flight `data`.
@@ -641,12 +763,16 @@ where
         // `write_provisional`.
         let stamped_at = self.fjall.clock().now_ms();
         self.lower.write_resolved(collection, cells).await?;
-        // Rollback/committed-write resolved the cell; drop its warm provisional
-        // coordinate (a no-op for a never-staged direct write). A failed clear is
-        // a harmless over-report the sweep's point-read filter drops.
-        for (cell, _) in cells {
-            degrade_cover_mut("clear", self.fjall.index_clear(collection.id(), cell).await);
-        }
+        // Rollback/committed-write resolved the cells; drop their warm
+        // provisional coordinates in one batch (a no-op for a never-staged
+        // direct write). A failed clear is a harmless over-report the sweep's
+        // point-read filter drops.
+        degrade_cover_mut(
+            "clear",
+            self.fjall
+                .index_clear_batch(collection.id(), cells.iter().map(|(cell, _)| cell))
+                .await,
+        );
         self.publish_written(collection, cells, stamped_at, |data| {
             Committed::new(data.clone())
         })
@@ -666,19 +792,25 @@ where
         // by the recovery sweep / `resolve_cell`. Because a covered hit is served
         // verbatim (Cov1/Cov2 — `get` never falls through on a value mismatch), a
         // stale `prev` left covered would be served forever. So punch the touched
-        // coordinates, dropping them from coverage; the next read falls through
-        // and re-publishes the promoted value from the lower store.
+        // coordinates (must-succeed), dropping them from coverage; the next read
+        // falls through and re-publishes the promoted value from the lower store.
+        //
+        // The punch runs BEFORE the durable promote: uncovering early only costs
+        // a fall-through (the lower read resolves through the oracle), while
+        // punching after would leave a promoted-but-still-covered `prev` if the
+        // caller is cancelled mid-punch — a window the sweep could never repair,
+        // since a resolved cell is never re-promoted. Punch-first, a crash or
+        // cancellation leaves the cell provisional and the sweep retries whole.
+        self.punch_cells_must_succeed(collection.id(), cells.iter())
+            .await;
         self.lower.mark_resolved(collection, cells).await?;
-        for cell in cells {
-            degrade_cover_mut(
-                "punch",
-                self.coverage
-                    .punch(collection.id(), cell.section, &cell.coordinate)
-                    .await,
-            );
-            // Promote resolved the cell; drop its warm provisional coordinate.
-            degrade_cover_mut("clear", self.fjall.index_clear(collection.id(), cell).await);
-        }
+        // Promote resolved the cells; drop their warm provisional coordinates.
+        degrade_cover_mut(
+            "clear",
+            self.fjall
+                .index_clear_batch(collection.id(), cells.iter())
+                .await,
+        );
         Ok(())
     }
 
@@ -711,19 +843,30 @@ where
             // best-effort republish never folds into `ApplyOutcome::Incomplete`
             // (the Incomplete trap).
             let decisions = self.fjall.commit_batch(collection.id(), writes).await;
+            // Split the per-write decisions, then apply each side as grouped
+            // coverage rewrites (one per touched section, not per cell). The
+            // punches guard a promote that landed while fjall still holds
+            // `prev` — a lost punch would serve it verbatim forever, so they
+            // are must-succeed; that retries the cache only, and `result` is
+            // still returned verbatim (the Incomplete trap).
+            let mut cover: SmallVec<[&CellKey; 8]> = SmallVec::new();
+            let mut punch: SmallVec<[&CellKey; 8]> = SmallVec::new();
             for ((cell, _), decision) in writes.iter().zip(decisions) {
                 match decision {
-                    CoverDecision::Cover => self.cover_point(collection.id(), cell).await,
-                    CoverDecision::Punch => degrade_cover_mut(
-                        "punch",
-                        self.coverage
-                            .punch(collection.id(), cell.section, &cell.coordinate)
-                            .await,
-                    ),
+                    CoverDecision::Cover => cover.push(cell),
+                    CoverDecision::Punch => punch.push(cell),
                 }
-                // The cell is resolved; drop its warm provisional coordinate.
-                degrade_cover_mut("clear", self.fjall.index_clear(collection.id(), cell).await);
             }
+            self.cover_cells(collection.id(), cover.into_iter()).await;
+            self.punch_cells_must_succeed(collection.id(), punch.into_iter())
+                .await;
+            // Every write is resolved; drop the warm provisional coordinates.
+            degrade_cover_mut(
+                "clear",
+                self.fjall
+                    .index_clear_batch(collection.id(), writes.iter().map(|(cell, _)| cell))
+                    .await,
+            );
         }
         result
     }
@@ -742,11 +885,14 @@ where
         let stamped_at = self.fjall.clock().now_ms();
         let result = self.lower.write_resolved(collection, &cells).await;
         if result.is_ok() {
-            // The rollback resolved each cell; drop its warm provisional
-            // coordinate, then publish the rolled-back `prev`.
-            for (cell, _) in &cells {
-                degrade_cover_mut("clear", self.fjall.index_clear(collection.id(), cell).await);
-            }
+            // The rollback resolved the cells; drop their warm provisional
+            // coordinates in one batch, then publish the rolled-back `prev`.
+            degrade_cover_mut(
+                "clear",
+                self.fjall
+                    .index_clear_batch(collection.id(), cells.iter().map(|(cell, _)| cell))
+                    .await,
+            );
             self.publish_written(collection, writes, stamped_at, |write| {
                 Committed::new(write.prev().cloned())
             })
@@ -780,10 +926,39 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
     }
 }
 
+/// One batch's coordinates grouped by section. Coverage mutations are
+/// per-`(collection, section)`; a settle batch typically spans one or two
+/// sections (e.g. a Map's Meta + Entries) with a handful of cells each, so
+/// both levels stay inline.
+type SectionGroups = SmallVec<[(Section, SmallVec<[Coordinate; 8]>); 2]>;
+
+/// Groups `cells` by section for the grouped coverage mutations
+/// ([`Cached::cover_cells`] / [`Cached::punch_cells_must_succeed`]): one
+/// coverage load + rewrite per touched section instead of per cell.
+fn group_by_section<'c>(cells: impl Iterator<Item = &'c CellKey>) -> SectionGroups {
+    let mut groups = SectionGroups::new();
+    for cell in cells {
+        match groups
+            .iter_mut()
+            .find(|(section, _)| *section == cell.section)
+        {
+            Some((_, coordinates)) => coordinates.push(cell.coordinate.clone()),
+            None => groups.push((cell.section, SmallVec::from_iter([cell.coordinate.clone()]))),
+        }
+    }
+    groups
+}
+
 /// Builds the direction-relative [`Scan`] for one piece interval: forward walks
-/// `low → high`, backward `high → low`. No limit — the stitched scan applies
-/// the merged-output limit across pieces.
-fn scan_for_piece(section: Section, piece: &Interval, dir: Direction) -> Scan<'_> {
+/// `low → high`, backward `high → low`. `limit` is an optional per-piece cap
+/// on the covered serve; the stitched scan still applies the merged-output
+/// limit across pieces, and the gap serve must pass `None` (see `serve_gap`).
+fn scan_for_piece(
+    section: Section,
+    piece: &Interval,
+    dir: Direction,
+    limit: Option<usize>,
+) -> Scan<'_> {
     let (start, end) = match dir {
         Direction::Forward => (piece.low(), piece.high()),
         Direction::Backward => (piece.high(), piece.low()),
@@ -793,7 +968,7 @@ fn scan_for_piece(section: Section, piece: &Interval, dir: Direction) -> Scan<'_
         start,
         dir,
         end,
-        limit: None,
+        limit,
     }
 }
 
@@ -821,9 +996,12 @@ fn warn_skip(op: &str, error: &super::fjall::FjallCellCacheError) {
     warn!(error = %error, "committed-value cache {op} failed; degrading");
 }
 
-/// Degrades a coverage mutation (`cover`/`punch`): a fjall failure logs and
-/// leaves coverage unchanged, so the next read self-heals via fall-through —
-/// the cache is a hint, never surfaced.
+/// Degrades a *safe-to-lose* cache mutation: a fjall failure logs and leaves
+/// the state unchanged. Sound only where losing the mutation under-covers or
+/// over-reports (a `cover`, an index clear/seed, the cover-on-get fill's
+/// punch) — the next read then falls through or re-seeds. The write-path and
+/// promote punches are NOT safe to lose and go through
+/// [`Cached::punch_cells_must_succeed`] instead.
 fn degrade_cover_mut(op: &str, result: Result<(), super::fjall::FjallCellCacheError>) {
     if let Err(error) = result {
         warn_skip(op, &error);

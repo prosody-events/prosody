@@ -698,22 +698,29 @@ pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
     TableAdapter::new(InMemoryTriggerStore::new(segment))
 }
 
-/// Trivial provider for tests that creates a fresh `InMemoryTriggerStore` per
-/// partition.
-#[derive(Clone, Debug)]
-pub struct InMemoryTriggerStoreProvider;
-
-impl InMemoryTriggerStoreProvider {
-    /// Creates a new provider.
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
+/// Hands out per-segment views of one shared in-memory trigger store.
+///
+/// Every `create_store` call returns a store over the **same** shared maps,
+/// so the partition's timer writes and the keyed-state commit oracle's tag
+/// reads observe the same rows — mirroring
+/// [`MemoryDeduplicationStoreProvider`]. A fresh store per call would
+/// split-brain the oracle: reading a permanently empty store, it would
+/// answer "committed" for every abandoned, uncommitted timer event and
+/// recovery would promote staged state that never committed. All maps are
+/// keyed by [`SegmentId`], so sharing across segments cannot collide.
+///
+/// [`MemoryDeduplicationStoreProvider`]:
+///     crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryTriggerStoreProvider {
+    inner: Arc<Inner>,
 }
 
-impl Default for InMemoryTriggerStoreProvider {
-    fn default() -> Self {
-        Self::new()
+impl InMemoryTriggerStoreProvider {
+    /// Creates a new provider backed by one fresh shared store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -721,7 +728,10 @@ impl TriggerStoreProvider for InMemoryTriggerStoreProvider {
     type Store = TableAdapter<InMemoryTriggerStore>;
 
     fn create_store(&self, segment: Segment) -> Self::Store {
-        memory_store(segment)
+        TableAdapter::new(InMemoryTriggerStore {
+            segment,
+            inner: Arc::clone(&self.inner),
+        })
     }
 }
 

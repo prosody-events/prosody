@@ -23,7 +23,7 @@ use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
@@ -38,6 +38,16 @@ use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{EventIdentity, EventType, Partition, Topic};
+
+/// The shared partition-manager map paired with the channel that republishes
+/// its size after each rebalance, so assignment readiness can be awaited rather
+/// than polled.
+pub struct ManagerRegistry<PL> {
+    /// Thread-safe storage for partition managers.
+    pub managers: Arc<Managers<PL>>,
+    /// Publishes the assigned-partition count after each rebalance.
+    pub assignment_tx: watch::Sender<u32>,
+}
 
 /// The per-partition factories the context threads into each
 /// [`PartitionConfiguration`]: trigger stores for the timer system and
@@ -90,6 +100,10 @@ pub struct Context<F, PL> {
     /// Thread-safe storage for partition managers
     managers: Arc<Managers<PL>>,
 
+    /// Publishes the assigned-partition count after each rebalance so readiness
+    /// can be awaited rather than polled.
+    assignment_tx: watch::Sender<u32>,
+
     telemetry: TelemetrySender,
 }
 
@@ -107,7 +121,7 @@ pub struct Context<F, PL> {
 /// * `handler_provider` - Creates message handlers for partitions
 /// * `providers` - Per-partition trigger-store and keyed-state factories
 /// * `watermark_version` - Shared counter tracking watermark updates
-/// * `managers` - Thread-safe storage for partition managers
+/// * `registry` - Partition-manager map plus its assignment-count publisher
 ///
 /// # Errors
 ///
@@ -118,7 +132,7 @@ pub fn new_context<T, P, SP, PL>(
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
     watermark_version: Arc<WatermarkVersion>,
-    managers: Arc<Managers<PL>>,
+    registry: ManagerRegistry<PL>,
     telemetry: TelemetrySender,
     version: Arc<str>,
 ) -> Result<Context<impl MakeManager<PL>, PL>, BuildError>
@@ -177,7 +191,8 @@ where
 
     Ok(Context {
         make_manager,
-        managers,
+        managers: registry.managers,
+        assignment_tx: registry.assignment_tx,
         telemetry,
     })
 }
@@ -278,6 +293,12 @@ where
                 error!("unexpected rebalance error: {error:#}");
             }
         }
+
+        // Publish the new assignment count so readiness can be awaited rather
+        // than polled. Assign, revoke, and rebalance-error all fall through
+        // here; empty rebalances returned early and left the count unchanged.
+        self.assignment_tx
+            .send_replace(self.managers.read().len() as u32);
 
         debug!("pre-rebalance complete");
     }

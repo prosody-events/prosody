@@ -39,7 +39,11 @@ use std::sync::Arc;
 /// The store-backed tag source is sound here because the oracle is only
 /// consulted for *provisional* cells during recovery, and per-key
 /// serialization guarantees the staging event fully completed — durability
-/// markers included — before any later event on the key dispatches.
+/// markers included — before any later event on the key dispatches. The
+/// oracle's store instance is distinct from the one the partition's timer
+/// manager writes through; that is safe because
+/// [`current_tag`](crate::timers::store::TriggerStore::current_tag) always
+/// reads durable state, never a per-instance cache.
 pub type ProductionOracle<DP, TP> = CommitManager<
     <DP as DeduplicationStoreProvider>::Store,
     StoreTagSource<<TP as TriggerStoreProvider>::Store>,
@@ -48,8 +52,8 @@ pub type ProductionOracle<DP, TP> = CommitManager<
 /// The per-partition commit-oracle ingredients both factories mint their
 /// [`ProductionOracle`] from: the deduplication store provider (the message
 /// commit half), the trigger store provider (the timer-tag half), and the
-/// segment-deriving consumer group + timer slab size. Bundled so a factory
-/// constructor stays readable.
+/// segment-deriving consumer group + timer slab size. The factories store the
+/// bundle whole and mint one oracle from it per partition.
 #[derive(Clone)]
 pub struct OracleProviders<DP, TP> {
     /// Deduplication store provider — the mandatory message-commit oracle half.
@@ -78,10 +82,7 @@ pub struct CassandraStateBackendFactory<DP, TP> {
     queries: Arc<CellQueries>,
     identity: CassandraDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
-    dedup: DP,
-    triggers: TP,
-    consumer_group: ConsumerGroup,
-    timer_slab_size: CompactDuration,
+    oracle: OracleProviders<DP, TP>,
 }
 
 impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
@@ -101,22 +102,13 @@ impl<DP, TP> CassandraStateBackendFactory<DP, TP> {
         oracle: OracleProviders<DP, TP>,
     ) -> Self {
         let CassandraCellResources { session, queries } = cell;
-        let OracleProviders {
-            dedup,
-            triggers,
-            consumer_group,
-            timer_slab_size,
-        } = oracle;
         Self {
             client,
             session,
             queries,
             identity,
             registry,
-            dedup,
-            triggers,
-            consumer_group,
-            timer_slab_size,
+            oracle,
         }
     }
 }
@@ -144,14 +136,7 @@ where
         // partition) alive until the partition's state manager is dropped at
         // revocation.
         let fjall = FjallCellCache::for_workspace(workspace);
-        let oracle = mint_oracle(
-            &self.dedup,
-            &self.triggers,
-            &self.consumer_group,
-            self.timer_slab_size,
-            topic,
-            partition,
-        );
+        let oracle = mint_oracle(&self.oracle, topic, partition);
         // Production writer bottom: fjall write-through cache over the resolving
         // Cassandra cell store; the session wraps this in its per-event Overlay.
         // `Cached` owns the fjall workspace, so its warm provisional index and
@@ -180,10 +165,7 @@ pub struct MemoryStateBackendFactory<DP, TP> {
     cells: MemoryCells,
     identity: MemoryDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
-    dedup: DP,
-    triggers: TP,
-    consumer_group: ConsumerGroup,
-    timer_slab_size: CompactDuration,
+    oracle: OracleProviders<DP, TP>,
 }
 
 impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
@@ -197,20 +179,11 @@ impl<DP, TP> MemoryStateBackendFactory<DP, TP> {
         registry: Arc<CollectionDefRegistry>,
         oracle: OracleProviders<DP, TP>,
     ) -> Self {
-        let OracleProviders {
-            dedup,
-            triggers,
-            consumer_group,
-            timer_slab_size,
-        } = oracle;
         Self {
             cells,
             identity,
             registry,
-            dedup,
-            triggers,
-            consumer_group,
-            timer_slab_size,
+            oracle,
         }
     }
 }
@@ -232,14 +205,7 @@ where
         topic: Topic,
         partition: Partition,
     ) -> Result<Self::Backend, Self::Error> {
-        let oracle = mint_oracle(
-            &self.dedup,
-            &self.triggers,
-            &self.consumer_group,
-            self.timer_slab_size,
-            topic,
-            partition,
-        );
+        let oracle = mint_oracle(&self.oracle, topic, partition);
         let cell = MemoryCellStore::new(self.cells.clone(), oracle.clone(), self.registry.clone());
         Ok(PartitionBackend::new(oracle, self.identity.clone(), cell))
     }
@@ -251,10 +217,7 @@ where
 /// formula the partition loop uses — so the oracle reads the exact timer
 /// rows the partition writes.
 fn mint_oracle<DP, TP>(
-    dedup: &DP,
-    triggers: &TP,
-    consumer_group: &ConsumerGroup,
-    timer_slab_size: CompactDuration,
+    providers: &OracleProviders<DP, TP>,
     topic: Topic,
     partition: Partition,
 ) -> ProductionOracle<DP, TP>
@@ -262,12 +225,18 @@ where
     DP: DeduplicationStoreProvider,
     TP: TriggerStoreProvider,
 {
+    let OracleProviders {
+        dedup,
+        triggers,
+        consumer_group,
+        timer_slab_size,
+    } = providers;
     let dedup = dedup.create_store(topic, partition, consumer_group);
     let triggers = StoreTagSource(triggers.create_store(Segment::for_partition(
         consumer_group,
         topic,
         partition,
-        timer_slab_size,
+        *timer_slab_size,
     )));
     CommitManager::new(dedup, triggers)
 }

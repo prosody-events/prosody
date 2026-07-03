@@ -13,6 +13,7 @@ use super::*;
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
+use std::iter::empty;
 
 /// Coordinate pool: small so covers overlap, punches land inside intervals, and
 /// complementary endpoints recur.
@@ -262,4 +263,171 @@ fn complementary_endpoints_merge_but_holes_do_not() -> Result<()> {
     holed.cover(iv(Bound::Excluded(x), Bound::Included(b))?);
     assert_eq!(holed.intervals.len(), 2, "a real hole at X must not merge");
     Ok(())
+}
+
+/// One batch mutation of a live [`Coverage`] (as opposed to the bare
+/// [`IntervalSet`] ops above): a ranged cover, a settle batch's point covers,
+/// or a batch punch.
+#[derive(Clone, Debug)]
+enum LiveOp {
+    Cover(GenInterval),
+    CoverPoints(Vec<u8>),
+    PunchMany(Vec<u8>),
+}
+
+impl Arbitrary for LiveOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let coords = |g: &mut Gen| -> Vec<u8> {
+            (0..usize::arbitrary(g) % 4)
+                .map(|_| u8::arbitrary(g))
+                .collect()
+        };
+        match u8::arbitrary(g) % 3 {
+            0 => Self::Cover(GenInterval::arbitrary(g)),
+            1 => Self::CoverPoints(coords(g)),
+            _ => Self::PunchMany(coords(g)),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        match self {
+            Self::Cover(_) => Box::new(empty()),
+            Self::CoverPoints(coords) => Box::new(coords.shrink().map(Self::CoverPoints)),
+            Self::PunchMany(coords) => Box::new(coords.shrink().map(Self::PunchMany)),
+        }
+    }
+}
+
+/// **Memo coherence (warmth invariance).** After any op sequence, a warm
+/// [`Coverage`] (answering from its memoized interval sets) and a cold one
+/// freshly built over the same fjall keyspace (forced to reload the durable
+/// spill) must agree with each other and with a plain set-of-points model on
+/// every pool point. A memo that went stale against the fjall spill — a
+/// mutation that updated one but not the other, or a batch op that diverged
+/// from N singles — falsifies the triple equality.
+#[test]
+fn prop_coverage_memo_matches_durable_spill() {
+    use crate::state::fjall::test_db;
+    use crate::state::identity::{StateKey, StateName, StateType};
+    use crate::test_util::TEST_RUNTIME;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn property(ops: Vec<LiveOp>) -> Result<bool> {
+        TEST_RUNTIME.block_on(async move {
+            let fjall = test_db::cache("cover_memo")?;
+            let warm = Coverage::new(fjall.clone());
+            let id = CollectionId::new(
+                StateKey::new(Uuid::new_v4(), Arc::from("k")),
+                StateType::Application,
+                StateName::try_new("memo")?,
+            );
+            let section = Section::new(0);
+            let mut model: BTreeSet<u8> = BTreeSet::new();
+
+            for (index, op) in ops.iter().enumerate() {
+                match op {
+                    LiveOp::Cover(gi) => {
+                        let Some(interval) = gi.build() else {
+                            continue;
+                        };
+                        warm.cover(&id, section, interval.clone()).await?;
+                        for b in 0..POOL {
+                            if interval.contains(&point(b)) {
+                                model.insert(b);
+                            }
+                        }
+                    }
+                    LiveOp::CoverPoints(coords) => {
+                        let points: Vec<Coordinate> = coords.iter().map(|&b| point(b)).collect();
+                        warm.cover_points(&id, section, &points).await?;
+                        model.extend(coords.iter().map(|&b| b % POOL));
+                    }
+                    LiveOp::PunchMany(coords) => {
+                        let points: Vec<Coordinate> = coords.iter().map(|&b| point(b)).collect();
+                        warm.punch_many(&id, section, &points).await?;
+                        for b in coords {
+                            model.remove(&(b % POOL));
+                        }
+                    }
+                }
+
+                // A cold instance reloads the durable spill (empty memo).
+                let cold = Coverage::new(fjall.clone());
+                for b in 0..POOL {
+                    let want = model.contains(&b);
+                    if warm.covers(&id, section, &point(b)).await? != want {
+                        return Err(eyre!("op {index}: warm (memoized) diverged at {b}"));
+                    }
+                    if cold.covers(&id, section, &point(b)).await? != want {
+                        return Err(eyre!("op {index}: durable spill diverged at {b}"));
+                    }
+                }
+            }
+            Ok(true)
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<LiveOp>) -> Result<bool>);
+}
+
+/// A `punch` racing a `cover` of a disjoint interval in the same section must
+/// never be lost (the mutation-atomicity note on [`Coverage`]). Both are
+/// whole-section load→mutate→store cycles: unserialized, the cover's store —
+/// computed from a load that still contained the punched coordinate — can land
+/// after the punch's store and resurrect its coverage, and a resurrected
+/// coordinate is served verbatim for the rest of the epoch. Per-key event
+/// serialization does not exclude the race: one handler can hold two `&self`
+/// session ops concurrently polled (`join!`). Each round re-covers, races the
+/// two mutations on the multi-threaded runtime, and asserts the punch stuck.
+#[test]
+fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
+    use crate::state::fjall::test_db;
+    use crate::state::identity::{StateKey, StateName, StateType};
+    use crate::test_util::TEST_RUNTIME;
+    use std::slice::from_ref;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Race repetitions: each round is one full interleaving opportunity.
+    const ROUNDS: u32 = 64;
+
+    /// A raw single-byte coordinate (not pool-folded like [`point`]).
+    fn coord(b: u8) -> Coordinate {
+        Coordinate::from_bytes(vec![b])
+    }
+
+    TEST_RUNTIME.block_on(async {
+        let coverage = Coverage::new(test_db::cache("cover_race")?);
+        let id = CollectionId::new(
+            StateKey::new(Uuid::new_v4(), Arc::from("k")),
+            StateType::Application,
+            StateName::try_new("race")?,
+        );
+        let section = Section::new(0);
+        let iv = |a: u8, b: u8| {
+            Interval::new(Bound::Included(coord(a)), Bound::Included(coord(b)))
+                .ok_or_else(|| eyre!("non-empty interval"))
+        };
+        for round in 0..ROUNDS {
+            // Re-cover the punch target, then race the punch against a cover
+            // of a disjoint interval in the same section.
+            coverage.cover(&id, section, iv(0, 10)?).await?;
+            let five = coord(5);
+            let (punched, covered) = tokio::join!(
+                coverage.punch_many(&id, section, from_ref(&five)),
+                coverage.cover(&id, section, iv(20, 30)?),
+            );
+            punched?;
+            covered?;
+            assert!(
+                !coverage.covers(&id, section, &coord(5)).await?,
+                "round {round}: the concurrent cover resurrected the punched coordinate"
+            );
+            assert!(
+                coverage.covers(&id, section, &coord(25)).await?,
+                "round {round}: the concurrent cover was lost"
+            );
+        }
+        Ok(())
+    })
 }

@@ -13,22 +13,19 @@
 //! share the per-event state, so repeated descriptor binds of one collection
 //! accumulate into one write.
 //!
-//! # The read / mutate / lifecycle split
+//! # The session / lifecycle split
 //!
-//! The session surface is three traits, so a read-only consumer (a cross-group
-//! reader) is structurally non-mutating:
+//! The session surface is two traits:
 //!
-//! - [`CellRead`] — the read-only half: `get`/`scan` +
-//!   `loader`/`is_terminated`/ `verify_state_registration`. Crate-sealed via
-//!   `sealed::ReadSessionMarker`.
-//! - [`CellSession`] (`= CellRead + StateLifecycle`) — adds the buffering
-//!   mutators `set`/`clear`/`flush`. [`EventContext::State`] bounds this.
+//! - [`CellSession`] — the read/buffer/mutate surface handlers reach through
+//!   collection handles: `get`/`scan` + the buffering mutators
+//!   `set`/`clear`/`flush`, plus `loader`/`is_terminated`/
+//!   `verify_state_registration`. [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
-//!   (`finalize`/`commit_apply`/`rollback_aborted`/marker/reset).
-//!
-//! Collection handles gate their methods by the session bound: reads need only
-//! `CellRead`, mutators need `CellSession`, so a handle minted over a
-//! `CellRead`-only session *cannot name* a mutator.
+//!   (`finalize`/`commit_apply`/`rollback_aborted`/marker/reset), a
+//!   `pub(crate)` supertrait of [`CellSession`] that seals it: downstream
+//!   crates can name `CellSession` in bounds but can neither implement it nor
+//!   reach the lifecycle.
 //!
 //! # Lifecycle
 //!
@@ -50,11 +47,12 @@
 //!    and staged set plus the registered marker.
 
 use crate::Key;
-use crate::consumer::event_context::{EventContext, StateAccessError};
+use crate::consumer::event_context::EventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 #[cfg(test)]
 use crate::loader::MemoryLoader;
+use crate::state::access::StateAccessError;
 use crate::state::cell::ProvisionalWrite;
 use crate::state::cell_key::{CellKey, Coordinate, Scan};
 use crate::state::descriptor::{
@@ -102,7 +100,10 @@ mod tests;
 /// commit's fire is *sooner* than the standing one (the tightening the
 /// per-collection `recovery_within` bound needs); the map is still
 /// self-draining (`recover` removes the key when the sweep fires), so it never
-/// grows without bound.
+/// grows without bound. Minted empty per acquisition: an absent key means
+/// *unknown*, not *unarmed* — `arm_backstop` seeds it from the durable trigger
+/// store on a key's first arm, so a prior epoch's standing backstop is never
+/// loosened.
 pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomState>>;
 
 /// The provisional cells `finalize` staged, grouped by collection (its ref
@@ -112,18 +113,16 @@ pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomSt
 /// to.
 type StagedSet = Vec<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>;
 
-/// The read-only half of a per-event session: visible committed-value reads
-/// (`get`/`scan`), the loader slot, the termination flag, and the registration
-/// check. The only surface a cross-group reader implements, so a reader-minted
-/// collection handle carries no mutator (the `ReadOnlyHandleCannotMutate`
-/// invariant, enforced at the handle's method-impl bound).
+/// The per-event session collections read, buffer, and mutate through.
 ///
 /// `get`/`scan` describe the session's **visible committed bytes** for a cell —
-/// the writer's [`KeyedStateSession`] realises that through the dirty overlay +
-/// oracle resolution. The same contract admits a committed-only realisation (a
-/// pure committed projection) for a future non-owner reader; that realisation
-/// is not built yet, and neither realisation leaks into this contract.
-pub trait CellRead: sealed::ReadSessionMarker + Clone + Send + Sync + 'static {
+/// [`KeyedStateSession`] realises that through the dirty overlay + oracle
+/// resolution — and `set`/`clear`/`flush` buffer this event's mutations. The
+/// framework reaches the manager-driven lifecycle through the sealed
+/// `StateLifecycle` supertrait, which is what seals `CellSession`: downstream
+/// crates can name it in bounds (e.g. [`EventContext::State`]) but can neither
+/// implement it nor reach the lifecycle.
+pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
     /// [`CellResolver`](crate::state::descriptor::CellResolver)
@@ -179,13 +178,7 @@ pub trait CellRead: sealed::ReadSessionMarker + Clone + Send + Sync + 'static {
         name: &'a StateName,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a;
-}
 
-/// The read/buffer/mutate session collections write through. Adds the buffering
-/// mutators to [`CellRead`]; the framework reaches the lifecycle through the
-/// sealed `StateLifecycle` supertrait. Everything readable is inherited from
-/// [`CellRead`].
-pub trait CellSession: CellRead + StateLifecycle {
     /// Buffers a set of the cell's bytes.
     ///
     /// # Errors
@@ -235,14 +228,6 @@ pub trait CellSession: CellRead + StateLifecycle {
 /// promoting, and resetting are framework-only moves.
 pub(crate) mod sealed {
     use super::{CompactDateTime, CompactDuration, Future, StateAccessError, Uuid};
-
-    /// Crate-private marker keeping [`super::CellRead`] consistent with the
-    /// framework's seal-everything hygiene: only the in-crate
-    /// [`KeyedStateSession`](super::KeyedStateSession) (and the future reader
-    /// session) implement it, so `CellRead` cannot be implemented downstream.
-    /// Hygiene, not correctness — a downstream `CellRead` impl could reach no
-    /// mutator anyway (those need the sealed [`StateLifecycle`]).
-    pub trait ReadSessionMarker {}
 
     /// Whether `finalize` staged any provisional cells.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,9 +329,12 @@ pub(crate) mod sealed {
         /// among the staged collections.
         fn recovery_fire_delay(&self) -> CompactDuration;
 
-        /// The fire time of the `StateRecovery` backstop already standing for
-        /// this session's key, or `None` when none stands. `arm_backstop`
-        /// re-arms only when its new fire is sooner than this.
+        /// The fire time of the `StateRecovery` backstop recorded as standing
+        /// for this session's key, or `None` when none has been recorded this
+        /// acquisition. `None` means *unknown*, not *unarmed*: the durable
+        /// trigger store may still hold a prior epoch's backstop, which
+        /// `arm_backstop` consults (and records here) before deciding.
+        /// `arm_backstop` re-arms only when its new fire is sooner.
         fn backstop_armed(&self) -> impl Future<Output = Option<CompactDateTime>> + Send;
 
         /// Records that a `StateRecovery` backstop firing at `fire` now stands
@@ -500,7 +488,7 @@ where
         } = parts;
         Self {
             inner: Arc::new(SessionInner {
-                overlay: Overlay::new(dirty, cell, event),
+                overlay: Overlay::new(dirty, cell),
                 oracle,
                 loader,
                 registry,
@@ -574,9 +562,7 @@ where
     }
 }
 
-impl<B, L> sealed::ReadSessionMarker for KeyedStateSession<B, L> where B: StateBackend {}
-
-impl<B, L> CellRead for KeyedStateSession<B, L>
+impl<B, L> CellSession for KeyedStateSession<B, L>
 where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
@@ -657,13 +643,7 @@ where
             }
         }
     }
-}
 
-impl<B, L> CellSession for KeyedStateSession<B, L>
-where
-    B: StateBackend,
-    L: Clone + Send + Sync + 'static,
-{
     async fn set(
         &self,
         state_type: StateType,
@@ -892,14 +872,23 @@ fn dirty_data(value: DirtyVal) -> Option<Bytes> {
     }
 }
 
-/// Crate-private descriptor the framework uses to reach a session's staged
-/// lifecycle through the one public [`EventContext::state`] method.
+/// Crate-private descriptor the framework uses to reach a session through the
+/// one public [`EventContext::state`] method — the sole state surface wrapper
+/// contexts forward. Binding it yields the session itself (`Handle<S> = S`), so
+/// the durability boundary calls the sealed [`StateLifecycle`] methods on the
+/// session directly; a second required context method would burden every
+/// wrapper and expose the raw session to handlers.
 ///
 /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LifecycleAccess;
 
 impl DescriptorIdentity for LifecycleAccess {
+    /// Inert: [`LifecycleAccess::bind`](StateDescriptor::bind) returns the
+    /// session verbatim without validating registration, and `LifecycleAccess`
+    /// is never registered, so neither `name` nor `structural_identity` is ever
+    /// consulted. They exist only to satisfy the [`StateDescriptor`]
+    /// supertrait.
     fn name(&self) -> &'static str {
         "\u{0}lifecycle"
     }
@@ -915,98 +904,35 @@ impl DescriptorIdentity for LifecycleAccess {
 }
 
 impl StateDescriptor for LifecycleAccess {
-    type Handle<S: CellRead> = LifecycleView<S>;
+    type Handle<S: CellSession> = S;
 
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        Ok(LifecycleView {
-            session: session.clone(),
-        })
+    /// Returns the session itself — the lifecycle tunnel binds no typed handle
+    /// and validates no registration; the boundary drives the sealed
+    /// [`StateLifecycle`] on the returned session.
+    fn bind<S: CellSession>(self, session: &S) -> Result<S, StateAccessError> {
+        Ok(session.clone())
     }
 
-    /// No-op: the lifecycle handle carries no operational settings, so it
-    /// keeps the default [`collection_def`](StateDescriptor::collection_def)
-    /// and the inherited fluent setters are unreachable no-ops.
+    /// No-op: the lifecycle tunnel carries no operational settings, so it keeps
+    /// the default [`collection_def`](StateDescriptor::collection_def) and the
+    /// inherited fluent setters are unreachable no-ops.
     fn with_collection_def(self, _def: CollectionDef) -> Self {
         self
     }
 }
 
-/// Crate-private view over a session's staged lifecycle, returned by binding
-/// [`LifecycleAccess`]. Its methods are gated on [`CellSession`] (the writer
-/// session), so relaxing `bind` to [`CellRead`] does not leak the lifecycle.
-pub(crate) struct LifecycleView<S> {
-    session: S,
-}
-
-impl<S> LifecycleView<S>
-where
-    S: CellSession,
-{
-    /// See [`StateLifecycle::finalize`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a type-erased store error when staging fails.
-    pub(crate) async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        self.session.finalize().await
-    }
-
-    /// See [`StateLifecycle::commit_apply`].
-    pub(crate) async fn commit_apply(&self) -> ApplyOutcome {
-        self.session.commit_apply().await
-    }
-
-    /// See [`StateLifecycle::rollback_aborted`].
-    pub(crate) async fn rollback_aborted(&self) -> ApplyOutcome {
-        self.session.rollback_aborted().await
-    }
-
-    /// See [`StateLifecycle::register_marker`].
-    pub(crate) fn register_marker(&self, dedup_id: Uuid) {
-        self.session.register_marker(dedup_id);
-    }
-
-    /// See [`StateLifecycle::flush_marker`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a type-erased store error when the oracle write fails.
-    pub(crate) async fn flush_marker(&self) -> Result<(), StateAccessError> {
-        self.session.flush_marker().await
-    }
-
-    /// See [`StateLifecycle::reset`].
-    pub(crate) fn reset(&self) {
-        self.session.reset();
-    }
-
-    /// See [`StateLifecycle::recovery_fire_delay`].
-    pub(crate) fn recovery_fire_delay(&self) -> CompactDuration {
-        self.session.recovery_fire_delay()
-    }
-
-    /// See [`StateLifecycle::backstop_armed`].
-    pub(crate) async fn backstop_armed(&self) -> Option<CompactDateTime> {
-        self.session.backstop_armed().await
-    }
-
-    /// See [`StateLifecycle::mark_backstop_armed`].
-    pub(crate) async fn mark_backstop_armed(&self, fire: CompactDateTime) {
-        self.session.mark_backstop_armed(fire).await;
-    }
-}
-
 /// Crate-private extension giving every [`EventContext`] one-call access to its
-/// session's staged lifecycle through the public [`EventContext::state`]
-/// method.
+/// per-event session through the public [`EventContext::state`] method. The
+/// returned session exposes the sealed [`StateLifecycle`] the durability
+/// boundary drives.
 pub(crate) trait LifecycleAccessExt: EventContext {
-    /// Binds the session's lifecycle view.
+    /// Binds the event's session through the lifecycle tunnel.
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError`] only when the context is terminated;
     /// [`LifecycleAccess`] is otherwise registration-independent.
-    fn lifecycle(&self) -> Result<LifecycleView<Self::State>, StateAccessError> {
+    fn lifecycle(&self) -> Result<Self::State, StateAccessError> {
         self.state(Registered::new(LifecycleAccess))
     }
 }
@@ -1060,10 +986,7 @@ impl<P> fmt::Debug for UnavailableState<P> {
 }
 
 #[cfg(test)]
-impl<P> sealed::ReadSessionMarker for UnavailableState<P> {}
-
-#[cfg(test)]
-impl<P> CellRead for UnavailableState<P>
+impl<P> CellSession for UnavailableState<P>
 where
     P: Clone + Send + Sync + 'static,
 {
@@ -1104,13 +1027,7 @@ where
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
-}
 
-#[cfg(test)]
-impl<P> CellSession for UnavailableState<P>
-where
-    P: Clone + Send + Sync + 'static,
-{
     async fn set(
         &self,
         _state_type: StateType,

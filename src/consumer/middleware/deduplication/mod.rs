@@ -51,6 +51,7 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::state::session::LifecycleAccessExt;
+use crate::state::session::sealed::StateLifecycle;
 use crate::timers::Trigger;
 use crate::{EventIdentity, Partition, Topic};
 

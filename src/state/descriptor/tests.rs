@@ -20,8 +20,8 @@ use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
-    CommitDecision, CommitMode, Direction, EventRef, SharedStateBackend, StateBackendFactory,
-    StateKey, StateName, StateType,
+    CommitDecision, CommitMode, EventRef, SharedStateBackend, StateBackendFactory, StateKey,
+    StateName, StateType,
 };
 use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::convert::Infallible;
-use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -428,20 +427,13 @@ fn prop_descriptors_from_equal_strings_are_interchangeable() {
     QuickCheck::new().quickcheck(prop as fn(String) -> TestResult);
 }
 
-/// Behavioral arms of the scope-containment (inv 6) and read-only-handle (inv
-/// 8) invariants. The *discriminating* proofs are the trybuild compile-fail
-/// goldens (`tests/compile_fail/`); these pin the runtime behavior the
-/// type-level proofs pair with.
-mod scope_and_parity {
+/// Behavioral arm of the `CollectionScopeContainment` invariant. The
+/// *discriminating* proof is the trybuild compile-fail golden
+/// (`tests/compile_fail/cellview_scope_is_pinned.rs`); this pins the runtime
+/// behavior the type-level proof pairs with.
+mod scope_containment {
     use super::*;
-    use crate::state::cell::Committed;
-    use crate::state::cell_key::{CellKey, Coordinate, Scan};
     use crate::state::order_codec::Utf8KeyCodec;
-    use crate::state::session::{CellRead, sealed::ReadSessionMarker, sealed::StateLifecycle};
-    use crate::state::store::CellStore;
-    use crate::state::{CollectionId, EventRef};
-    use bytes::Bytes;
-    use futures::{Stream, StreamExt};
 
     fn wishlist() -> ValueDescriptor {
         value_state("wishlist")
@@ -508,224 +500,5 @@ mod scope_and_parity {
             )
         }
         QuickCheck::new().quickcheck(prop as fn(ArbJson, ArbJson) -> TestResult);
-    }
-
-    /// A read-only session: implements [`CellRead`] (so descriptors bind and
-    /// handles read) but **not** `CellSession`/`StateLifecycle`, so a handle
-    /// minted over it exposes `get` and cannot name a mutator (inv 8). Reads
-    /// delegate to the shared committed cell store — sound on the quiescent
-    /// committed state this test scopes to.
-    #[derive(Clone)]
-    struct ReaderSession {
-        store: MemoryCellStore<FixedOracle>,
-        registry: Arc<CollectionDefRegistry>,
-        loader: MemoryLoader<Value>,
-        state_key: StateKey,
-    }
-
-    impl ReadSessionMarker for ReaderSession {}
-
-    impl CellRead for ReaderSession {
-        type Loader = MemoryLoader<Value>;
-        type ScanError = <MemoryCellStore<FixedOracle> as CellStore>::Error;
-
-        fn loader(&self) -> &Self::Loader {
-            &self.loader
-        }
-
-        fn is_terminated(&self) -> bool {
-            false
-        }
-
-        fn verify_state_registration(
-            &self,
-            name: &'static str,
-            state_type: StateType,
-            identity: &StructuralIdentity,
-        ) -> Result<StateName, StateAccessError> {
-            let Some((state_name, registered)) = self.registry.lookup(state_type, name) else {
-                return Err(StateAccessError::Unregistered { name });
-            };
-            if registered.identity != *identity {
-                return Err(StateAccessError::IdentityMismatch {
-                    stored: registered.identity.clone(),
-                    asserted: identity.clone(),
-                });
-            }
-            Ok(state_name.clone())
-        }
-
-        async fn get(
-            &self,
-            state_type: StateType,
-            name: &StateName,
-            cell: &CellKey,
-        ) -> Result<Option<Bytes>, StateAccessError> {
-            // Quiescent committed state, so the resolving read is a pure
-            // committed projection (no provisional cell to resolve).
-            let id = CollectionId::new(self.state_key.clone(), state_type, name.clone());
-            let probe = EventRef::Message {
-                dedup_id: Uuid::from_u128(0),
-            };
-            self.store
-                .get(&id, cell, probe)
-                .await
-                .map(Committed::into_inner)
-                .map_err(|e| StateAccessError::store(&e))
-        }
-
-        fn scan<'a>(
-            &'a self,
-            state_type: StateType,
-            name: &'a StateName,
-            scan: Scan<'a>,
-        ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
-            let id = CollectionId::new(self.state_key.clone(), state_type, name.clone());
-            let store = self.store.clone();
-            let probe = EventRef::Message {
-                dedup_id: Uuid::from_u128(0),
-            };
-            // Own the scan coordinates so the stream borrows nothing from the
-            // caller's `Scan<'_>` (mirrors `KeyedStateSession::scan`).
-            let section = scan.section;
-            let start: Bound<Coordinate> = scan.start.cloned();
-            let end: Bound<Coordinate> = scan.end.cloned();
-            let dir = scan.dir;
-            let limit = scan.limit;
-            async_stream::try_stream! {
-                let scan = Scan {
-                    section,
-                    start: start.as_ref(),
-                    dir,
-                    end: end.as_ref(),
-                    limit,
-                };
-                let inner = store.scan_cells(&id, scan, probe);
-                futures::pin_mut!(inner);
-                while let Some(item) = inner.next().await {
-                    yield item?;
-                }
-            }
-        }
-    }
-
-    /// Inv 8 (behavioral): over quiescent committed state, a `CellRead`-only
-    /// handle's `get` agrees with the full writer handle's `get`. The writer
-    /// flushes a value to committed state, then both read it identically.
-    #[test]
-    fn prop_reader_get_matches_writer() {
-        async fn check(value: Value) -> Result<bool> {
-            let state_key = StateKey::new(Uuid::new_v4(), Arc::from("user-1"));
-            let mut registry = CollectionDefRegistry::new(None);
-            registry.register(&cart(), CollectionDef::new(None))?;
-            let registry = Arc::new(registry);
-            let (writer, cell_store) =
-                test_session_parts(MemoryLoader::new(), (*registry).clone(), state_key.clone());
-
-            let writer_handle = cart()
-                .bind(&writer)
-                .map_err(|e| eyre!("bind writer: {e}"))?;
-            // Flush a value straight to committed state (write-through), leaving
-            // no dirty overlay or provisional cell — quiescent committed state.
-            writer_handle.set(value.clone()).await?;
-            writer_handle.flush().await?;
-
-            let reader = ReaderSession {
-                store: cell_store,
-                registry,
-                loader: MemoryLoader::new(),
-                state_key,
-            };
-            let reader_handle = cart()
-                .bind(&reader)
-                .map_err(|e| eyre!("bind reader: {e}"))?;
-
-            Ok(reader_handle.get().await? == writer_handle.get().await?
-                && reader_handle.get().await? == Some(value))
-        }
-        fn prop(value: ArbJson) -> TestResult {
-            let input = format!("{:#?}", value.0);
-            finish_trace(
-                executor::block_on(check(value.0)),
-                "reader/writer parity",
-                &input,
-            )
-        }
-        QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
-    }
-
-    /// Inv 8 (behavioral, Map/Deque): a reader-minted Map/Deque handle's
-    /// `get`/`stream`/`len` agree with the writer handle on quiescent committed
-    /// state. The writer commits through the real lifecycle (`finalize` then
-    /// `commit_apply` — `FixedOracle` resolves `Committed`); the
-    /// `CellRead`-only reader then reads the promoted cells.
-    #[test]
-    fn reader_collections_match_writer() -> Result<()> {
-        executor::block_on(async {
-            let state_key = StateKey::new(Uuid::new_v4(), Arc::from("user-1"));
-            let registry = Arc::new(registry_with_siblings()?);
-            let (writer, cell_store) =
-                test_session_parts(MemoryLoader::new(), (*registry).clone(), state_key.clone());
-
-            let w_counts = counts().bind(&writer).map_err(|e| eyre!("bind: {e}"))?;
-            let w_log = log().bind(&writer).map_err(|e| eyre!("bind: {e}"))?;
-            w_counts.set(&"a".to_owned(), json!(1_i32)).await?;
-            w_counts.set(&"b".to_owned(), json!(2_i32)).await?;
-            w_log.push_back(json!("x")).await?;
-            w_log.push_front(json!("w")).await?;
-
-            // Promote the staged writes to committed state.
-            writer.finalize().await?;
-            writer.commit_apply().await;
-
-            let reader = ReaderSession {
-                store: cell_store,
-                registry,
-                loader: MemoryLoader::new(),
-                state_key,
-            };
-            let r_counts = counts().bind(&reader).map_err(|e| eyre!("bind: {e}"))?;
-            let r_log = log().bind(&reader).map_err(|e| eyre!("bind: {e}"))?;
-
-            // Map: point reads and the ordered stream agree.
-            for key in ["a", "b", "absent"] {
-                let key = key.to_owned();
-                assert_eq!(r_counts.get(&key).await?, w_counts.get(&key).await?);
-            }
-            assert_eq!(collect_map(&r_counts).await?, collect_map(&w_counts).await?);
-
-            // Deque: len, positional reads, and the ordered stream agree.
-            assert_eq!(r_log.len().await?, w_log.len().await?);
-            for index in 0..=r_log.len().await? {
-                assert_eq!(r_log.get(index).await?, w_log.get(index).await?);
-            }
-            assert_eq!(collect_deque(&r_log).await?, collect_deque(&w_log).await?);
-            Ok(())
-        })
-    }
-
-    /// Collects a Map handle's forward stream into an ordered `(key, value)`
-    /// vector.
-    async fn collect_map<S: CellRead>(
-        handle: &MapHandle<S, Utf8KeyCodec, JsonCodec>,
-    ) -> Result<Vec<(String, Value)>> {
-        let stream = handle.stream(Direction::Forward);
-        futures::pin_mut!(stream);
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item?);
-        }
-        Ok(out)
-    }
-
-    /// Collects a Deque handle's forward stream into an ordered vector.
-    async fn collect_deque<S: CellRead>(handle: &DequeHandle<S, JsonCodec>) -> Result<Vec<Value>> {
-        let stream = handle.stream(Direction::Forward);
-        futures::pin_mut!(stream);
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item?);
-        }
-        Ok(out)
     }
 }

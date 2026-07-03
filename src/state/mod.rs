@@ -41,6 +41,7 @@ use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
 
+pub mod access;
 pub mod cached;
 pub mod cassandra;
 pub mod cell;
@@ -68,6 +69,7 @@ pub mod transaction;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub use access::StateAccessError;
 pub use cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 pub use encoding::{Encoding, EncodingError};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};

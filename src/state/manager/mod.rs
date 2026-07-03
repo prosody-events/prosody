@@ -67,6 +67,11 @@ use tracing::{Span, error};
 /// retry cadence in [`crate::consumer::middleware`].
 const RESCHEDULE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Floor on a rescheduled backstop's fire delay, so a zero (or sub-second)
+/// `recovery_within` cannot turn a persistently failing sweep into a hot
+/// refire loop. Matches [`RESCHEDULE_RETRY_DELAY`].
+const RESCHEDULE_FLOOR: CompactDuration = CompactDuration::new(1);
+
 /// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
 
@@ -164,9 +169,10 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// never resolves, so rescheduling would only spin a refire loop —
     /// first-touch and the key's next commit recover it). A *transient* or
     /// *terminal* store failure reschedules a fresh backstop
-    /// (`clear_and_schedule(now + recovery_delay)`, retried until it lands or
-    /// shutdown) so a future sweep retries, then commits. Only when shutdown
-    /// interrupts a reschedule before it lands does this return
+    /// (`clear_and_schedule` at the `recovery_delay` floor tightened by the
+    /// registered collections' `recovery_within` bounds, retried until it
+    /// lands or shutdown) so a future sweep retries, then commits. Only when
+    /// shutdown interrupts a reschedule before it lands does this return
     /// [`SweepResolution::Abort`], so the trigger refires and re-sweeps on the
     /// next partition acquisition.
     fn recover<T>(
@@ -235,7 +241,8 @@ where
     /// Keys mapped to the fire time of their standing `StateRecovery` backstop.
     /// Sessions read it to re-arm only when a newer commit's fire is sooner
     /// (the `recovery_within` tightening); `recover` removes the key when
-    /// the sweep fires.
+    /// the sweep fires. Semantics of an absent key are owned by
+    /// [`ArmedKeys`](crate::state::session::ArmedKeys): unknown, not unarmed.
     armed: ArmedKeys,
 }
 
@@ -373,9 +380,18 @@ impl<B, L> StateManager<B, L>
 where
     B: StateBackend,
 {
-    /// Reschedules a fresh `StateRecovery` backstop at `now + recovery_delay`
-    /// after a failed sweep, retrying every non-shutdown failure until it
-    /// lands.
+    /// Reschedules a fresh `StateRecovery` backstop after a failed sweep,
+    /// retrying every non-shutdown failure until it lands.
+    ///
+    /// The fire delay is the `recovery_delay` floor tightened by the smallest
+    /// `recovery_within` among the registered collections — the same
+    /// tightening the durability boundary's `recovery_fire_delay` applies at
+    /// commit time, so a transient sweep failure does not stretch a tightly
+    /// bounded collection's convergence out to the full floor. Which
+    /// collections still hold provisional cells is unknown here (the sweep
+    /// failed), so folding the whole registered set is the conservative
+    /// direction: it can only fire sooner, and an early sweep that finds
+    /// nothing resolves trivially. Floored at [`RESCHEDULE_FLOOR`].
     ///
     /// A rescheduled backstop is durable in the trigger store — it survives
     /// shutdown and fires on reacquisition — so once it lands this returns
@@ -392,7 +408,15 @@ where
     where
         T: TriggerStore,
     {
-        let delay = self.inner.recovery_delay;
+        let delay = self
+            .inner
+            .registry
+            .collections()
+            .filter_map(|(state_type, name)| {
+                self.inner.registry.recovery_within_for(state_type, name)
+            })
+            .fold(self.inner.recovery_delay, CompactDuration::min)
+            .max(RESCHEDULE_FLOOR);
         loop {
             if *shutdown.borrow() >= ShutdownPhase::Cancelling {
                 return SweepResolution::Abort;

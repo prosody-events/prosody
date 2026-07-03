@@ -164,8 +164,8 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{DemandType, EventHandler, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome};
-use crate::state::session::{LifecycleAccessExt, LifecycleView};
+use crate::state::session::LifecycleAccessExt;
+use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
@@ -895,9 +895,12 @@ enum StepOutcome<R> {
     /// The step succeeded, carrying its result.
     Done(R),
 
-    /// The step failed permanently. The sequence continues defensively
-    /// (the `StateRecovery` sweep cleans up any partial effect); it never
-    /// flushes a marker over an uncertain seal.
+    /// The step failed permanently. Only a genuine data rejection is skipped
+    /// (the `finalize` stage): the sequence continues defensively, and it
+    /// never flushes a marker over an uncertain seal. Steps whose permanent
+    /// failure is *not* a data rejection — the backstop arm and the
+    /// success-path marker flush, both pure framework bookkeeping — retry
+    /// past `Skip` in their own loops instead.
     Skip,
 
     /// Shutdown: abandon the event — abort the marker, roll back, and let
@@ -1019,7 +1022,7 @@ async fn settle_committed<T, C, G>(
     context: C,
     guard: G,
     result: Result<T::Output, T::Error>,
-    lifecycle: Option<LifecycleView<C::State>>,
+    lifecycle: Option<C::State>,
 ) where
     T: FallibleHandler,
     C: EventContext<Payload = T::Payload>,
@@ -1098,35 +1101,39 @@ async fn settle_committed<T, C, G>(
     }
 
     // 3. Flush the registered dedup marker — STRICTLY after the stage, so a
-    // present marker always certifies a durable stage.
-    match retry_step(&context, "keyed-state marker flush", || {
-        lifecycle.flush_marker()
-    })
-    .await
-    {
-        StepOutcome::Done(()) => {}
-        StepOutcome::Skip => {
-            // Permanent flush failure: the committed stage won't be certified,
-            // so recovery rolls it back. Leave the backstop armed and commit.
-            guard.commit().await;
-            handler.after_commit(context, result).await;
-            return;
-        }
-        StepOutcome::Abandon => {
-            // A marker-flush attempt was made before shutdown: its durability
-            // is ambiguous, so the staged cells must NOT roll back. They stay
-            // provisional and the armed sweep resolves them through the oracle
-            // (invariant 7). Rolling back here could erase a committed write
-            // that redelivery then dedup-filters.
-            abandon(
-                handler,
-                context,
-                guard,
-                result,
-                RollbackSafety::AfterMarkerFlush,
-            )
-            .await;
-            return;
+    // present marker always certifies a durable stage. Like the arm, the
+    // flush is must-succeed: the marker is framework data (a bare dedup id),
+    // so no failure here is a data rejection the sequence may skip.
+    // Committing with the stage uncertified would have the armed sweep
+    // silently roll a successful handler's writes back — with the offset
+    // committed, nothing ever replays them. A permanently-failing store
+    // therefore retries until it heals (or the liveness probe restarts the
+    // process, the visible last resort); only shutdown abandons.
+    loop {
+        match retry_step(&context, "keyed-state marker flush", || {
+            lifecycle.flush_marker()
+        })
+        .await
+        {
+            StepOutcome::Done(()) => break,
+            StepOutcome::Skip => sleep(DURABILITY_RETRY_DELAY).await,
+            StepOutcome::Abandon => {
+                // A marker-flush attempt was made before shutdown: its
+                // durability is ambiguous, so the staged cells must NOT roll
+                // back. They stay provisional and the armed sweep resolves
+                // them through the oracle (invariant 7). Rolling back here
+                // could erase a committed write that redelivery then
+                // dedup-filters.
+                abandon(
+                    handler,
+                    context,
+                    guard,
+                    result,
+                    RollbackSafety::AfterMarkerFlush,
+                )
+                .await;
+                return;
+            }
         }
     }
 
@@ -1219,6 +1226,13 @@ pub(crate) async fn abandon<T, C, G>(
 /// tombstone-accounting depends on — while a tighter commit pulls the one timer
 /// sooner.
 ///
+/// The recorded fire lives in the per-acquisition in-RAM `ArmedKeys`, but a
+/// durable backstop outlives an acquisition. So a key's first arm after
+/// reacquisition seeds the map from the durable trigger store before deciding:
+/// a prior epoch's sooner still-standing fire is kept, never overwritten with
+/// a later one. Never-loosen therefore holds across reacquisition, not just
+/// within one epoch.
+///
 /// The standing fire is cleared only when the sweep fires (the manager's
 /// `recover`), so the durability boundary never unschedules and one event can
 /// never clear another's still-needed backstop (finding F2). Per-key
@@ -1234,7 +1248,7 @@ pub(crate) async fn abandon<T, C, G>(
 /// `Incomplete` leftover on a hot key whose collection is never read again
 /// waits for the next sweep to resolve it — bounded by first-touch on any
 /// access and by the cell's TTL.
-async fn arm_backstop<C>(context: &C, lifecycle: &LifecycleView<C::State>) -> ArmOutcome
+async fn arm_backstop<C>(context: &C, lifecycle: &C::State) -> ArmOutcome
 where
     C: EventContext,
 {
@@ -1258,12 +1272,36 @@ where
         // Arm-if-sooner: a standing backstop that fires no later than this one
         // already covers this commit's staged cells, so skip re-arming. Per-key
         // serialization makes the standing fire reliable — the sweep that
-        // consumes it cannot run while this commit decides.
-        if lifecycle
-            .backstop_armed()
+        // consumes it cannot run while this commit decides. `ArmedKeys` is
+        // minted empty per acquisition while a prior epoch's backstop survives
+        // in the durable trigger store, so a RAM miss consults the store and
+        // seeds the map: assuming "unarmed" there would let the singleton
+        // overwrite replace a sooner still-standing fire with a later one — a
+        // loosening the boundary must never perform.
+        let standing = match lifecycle.backstop_armed().await {
+            Some(standing) => Some(standing),
+            None => match retry_step(context, "read standing StateRecovery backstop", || {
+                context.scheduled(TimerType::StateRecovery)
+            })
             .await
-            .is_some_and(|standing| standing <= fire)
-        {
+            {
+                StepOutcome::Done(times) => {
+                    let standing = times.into_iter().min();
+                    if let Some(standing) = standing {
+                        lifecycle.mark_backstop_armed(standing).await;
+                    }
+                    standing
+                }
+                // Arming is must-succeed: a permanent read failure retries
+                // (with a recomputed fire) rather than guessing "unarmed".
+                StepOutcome::Skip => {
+                    sleep(DURABILITY_RETRY_DELAY).await;
+                    continue;
+                }
+                StepOutcome::Abandon => return ArmOutcome::ShuttingDown,
+            },
+        };
+        if standing.is_some_and(|standing| standing <= fire) {
             return ArmOutcome::Armed;
         }
         match retry_step(context, "arm StateRecovery backstop", || {
@@ -1294,7 +1332,7 @@ where
 /// Flushes the registered marker, retrying transient failures; a permanent
 /// failure or shutdown is tolerated (the failed-but-final message simply
 /// isn't deduplicated and re-runs, re-failing the same way).
-async fn flush_marker_best_effort<C>(context: &C, lifecycle: &LifecycleView<C::State>)
+async fn flush_marker_best_effort<C>(context: &C, lifecycle: &C::State)
 where
     C: EventContext,
 {

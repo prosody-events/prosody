@@ -53,12 +53,12 @@ pub(super) type RawCellRow = (
     Option<RawEventRef>, // event (validated into EventRef during decode)
 );
 
-/// Eight-column shape produced by `SELECT section, coordinate, data,
-/// prev_data, encoding, version, event, TTL(data)` — a [`RawCellRow`] prefixed
-/// with the clustering columns and suffixed with the durable row's remaining
-/// `data` TTL (NULL when the row has no expiry, or `data` is NULL). Used by
-/// scans, the recovery sweep, and the cache-fill scan; the resolving paths
-/// discard the trailing TTL, the cache-fill path keeps it.
+/// Nine-column shape produced by `SELECT section, coordinate, data,
+/// prev_data, encoding, version, event, TTL(data), TTL(prev_data)` — a
+/// [`RawCellRow`] prefixed with the clustering columns and suffixed with the
+/// per-blob remaining TTLs [`blob_ttl`] coalesces. Used by scans, the recovery
+/// sweep, and the cache-fill scan; the resolving paths discard the trailing
+/// TTL, the cache-fill path keeps it.
 pub(super) type KeyedCellRow = (
     i8,      // section
     Vec<u8>, // coordinate
@@ -68,11 +68,13 @@ pub(super) type KeyedCellRow = (
     Option<i32>,
     Option<RawEventRef>,
     Option<i32>, // TTL(data) in whole seconds
+    Option<i32>, // TTL(prev_data) in whole seconds
 );
 
-/// Six-column shape produced by `SELECT data, prev_data, encoding, version,
-/// event, TTL(data)` — a [`RawCellRow`] suffixed with the row's remaining
-/// `data` TTL, for the cache-fill point read.
+/// Seven-column shape produced by `SELECT data, prev_data, encoding, version,
+/// event, TTL(data), TTL(prev_data)` — a [`RawCellRow`] suffixed with the
+/// per-blob remaining TTLs [`blob_ttl`] coalesces, for the cache-fill point
+/// read.
 pub(super) type CellTtlRow = (
     Option<Vec<u8>>,
     Option<Vec<u8>>,
@@ -80,6 +82,7 @@ pub(super) type CellTtlRow = (
     Option<i32>,
     Option<RawEventRef>,
     Option<i32>, // TTL(data) in whole seconds
+    Option<i32>, // TTL(prev_data) in whole seconds
 );
 
 /// Two-column shape produced by `SELECT section, coordinate` against the
@@ -100,8 +103,8 @@ pub(super) fn index_cell_key(row: IndexRow) -> CellKey {
     }
 }
 
-/// Decodes a keyed cell row into its [`CellKey`], [`Cell`], and remaining
-/// `data` TTL (whole seconds), for the cache-fill scan.
+/// Decodes a keyed cell row into its [`CellKey`], [`Cell`], and cache-fill
+/// co-expiry TTL ([`blob_ttl`], whole seconds), for the cache-fill scan.
 ///
 /// # Errors
 ///
@@ -109,16 +112,17 @@ pub(super) fn index_cell_key(row: IndexRow) -> CellKey {
 pub(super) fn try_decode_keyed_cell_ttl(
     row: KeyedCellRow,
 ) -> Result<(CellKey, Cell, Option<i32>), CassandraCellStoreError> {
-    let (section, coordinate, data, prev_data, encoding, version, event, ttl) = row;
+    let (section, coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     let key = CellKey {
         section: Section::new(section),
         coordinate: Coordinate::from_bytes(coordinate),
     };
     let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
-    Ok((key, cell, ttl))
+    Ok((key, cell, blob_ttl(ttl_data, ttl_prev)))
 }
 
-/// Decodes a cache-fill point row into its [`Cell`] and remaining `data` TTL.
+/// Decodes a cache-fill point row into its [`Cell`] and co-expiry TTL
+/// ([`blob_ttl`]).
 ///
 /// # Errors
 ///
@@ -126,9 +130,26 @@ pub(super) fn try_decode_keyed_cell_ttl(
 pub(super) fn try_decode_cell_ttl(
     row: CellTtlRow,
 ) -> Result<(Cell, Option<i32>), CassandraCellStoreError> {
-    let (data, prev_data, encoding, version, event, ttl) = row;
+    let (data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
-    Ok((cell, ttl))
+    Ok((cell, blob_ttl(ttl_data, ttl_prev)))
+}
+
+/// The cache-fill co-expiry: the remaining TTL of whichever blob the row
+/// carries.
+///
+/// `data` and `prev_data` are only ever written together, by one stage
+/// statement, so a present blob's TTL **is** the row's shared write TTL —
+/// coalescing keeps the co-expiry valid for whichever blob resolution ends up
+/// returning. Reading `TTL(data)` alone was wrong: a staged clear (`data`
+/// NULL, `prev_data` present) that resolution rolls back to `prev` reported
+/// "no TTL", stamping the cache entry *never expires* while the durable row
+/// kept a finite TTL. For a rollback the write-back re-binds the full
+/// collection TTL, so this pre-resolution remainder is a conservative lower
+/// bound — the cache entry can only under-live the durable row (an early
+/// fall-through re-fetch), never outlive it.
+fn blob_ttl(ttl_data: Option<i32>, ttl_prev: Option<i32>) -> Option<i32> {
+    ttl_data.or(ttl_prev)
 }
 
 /// Decodes a cell row into a [`Cell`].

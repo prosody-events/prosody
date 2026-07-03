@@ -19,7 +19,7 @@ use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::loader::MessageLoader;
 use crate::state::descriptor::{CellResolver, ResolverId, ValueDescriptor, ValueStateError};
-use crate::state::session::CellRead;
+use crate::state::session::CellSession;
 use crate::{Offset, Partition, Topic};
 use rmp_serde::decode::Error as MsgPackDecodeError;
 use rmp_serde::encode::{Error as MsgPackEncodeError, write_named};
@@ -99,7 +99,7 @@ impl ResolverId for MessageResolver {
 
 impl<S> CellResolver<S> for MessageResolver
 where
-    S: CellRead<Loader: MessageLoader>,
+    S: CellSession<Loader: MessageLoader>,
 {
     type Resolved = ConsumerMessage<<S::Loader as MessageLoader>::Payload>;
     type Stored = MessageRef;

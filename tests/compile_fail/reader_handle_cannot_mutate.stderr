@@ -1,8 +1,0 @@
-error[E0599]: the method `set` exists for struct `StateHandle<S, JsonCodec, Passthrough<serde_json::Value>>`, but its trait bounds were not satisfied
-  --> tests/compile_fail/reader_handle_cannot_mutate.rs:17:20
-   |
-17 |     let _ = handle.set(Value::Null).await;
-   |                    ^^^
-   |
-   = note: the following trait bounds were not satisfied:
-           `S: CellSession`

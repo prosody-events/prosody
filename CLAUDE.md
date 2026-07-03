@@ -265,7 +265,11 @@ workspace).
 (`finalize`) → arm `StateRecovery` if anything staged (a per-key singleton via
 `clear_and_schedule`, **arm-if-sooner**: re-armed only when the newly-staged fire
 is strictly earlier than the standing one, else skipped) →
-**flush the registered dedup marker, strictly after the stage** → commit the
+**flush the registered dedup marker, strictly after the stage** (on this
+success path the flush is must-succeed: every non-shutdown failure — permanent
+included — retries, since the marker is framework data whose absence would let
+the sweep silently roll back a committed handler's writes; the error-path flush
+stays best-effort) → commit the
 offset/trigger → promote the staged cells (best-effort, O(1) per cell) →
 `after_commit`.
 **Retry forever; abort only on shutdown; never emit Terminal.** Every internal
@@ -284,7 +288,9 @@ The per-key fire is `min(recovery_delay, tightest touched collection's
 `recovery_within`)`: `recovery_delay` is the always-on durability floor and
 per-collection `recovery_within` is a tightening-only reader-convergence bound
 (it never loosens the floor). `ArmedKeys` maps each key to its standing fire time
-so arm-if-sooner can compare.
+so arm-if-sooner can compare; it is per-acquisition RAM, so on a miss (first arm
+for a key after reacquisition) `arm_backstop` seeds it from the durable trigger
+store before comparing — a prior epoch's sooner backstop is never loosened.
 The boundary **never** unschedules the backstop: the per-key `StateRecovery`
 timer is only ever pulled sooner (never pushed out) by each stateful commit, and
 the fired trigger (a per-`(key, TimerType)` singleton) is committed by the sweep
@@ -294,8 +300,9 @@ The sweep (`StateManager::recover`) mirrors the boundary's posture: it **never
 aborts the trigger except on shutdown**, committing it on progress (a resolved
 sweep, or a per-cell permanent skip that first-touch/the next commit recover)
 and, on a transient sweep failure, rescheduling a fresh backstop
-(`clear_and_schedule(now + recovery_delay)`, retried until it lands or shutdown)
-before committing. The stage→arm→commit order also closes the
+(`clear_and_schedule` at `recovery_delay` tightened by the registered
+collections' `recovery_within` bounds and floored at the retry cadence, retried
+until it lands or shutdown) before committing. The stage→arm→commit order also closes the
 crash-before-arm window without any acquisition-time sweep: the offset is
 uncommitted until after the arm, so a crash there redelivers and re-arms. Because the
 marker flush is textually after the stage in one

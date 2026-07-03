@@ -10,16 +10,23 @@
 
 use super::codec::cell_key;
 use super::test_db;
-use super::{AssignmentEpoch, CacheRead, FjallCellCache, FjallClient, FjallConfiguration};
+use super::{
+    AssignmentEpoch, CacheRead, Clock, FjallCellCache, FjallClient, FjallConfiguration, ScanHit,
+};
 use crate::state::cell::Committed;
-use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::{CollectionId, StateKey, StateName, StateType};
 use crate::test_util::TEST_RUNTIME;
 use crate::{Key, Topic};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use quickcheck::{QuickCheck, TestResult};
+use futures::StreamExt;
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
+use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use uuid::Uuid;
 
 /// The single Value cell (`ValueNs::Entries`, empty coordinate).
@@ -152,6 +159,262 @@ fn expired_entry_reads_as_miss() -> Result<()> {
         Ok::<_, Report>(())
     })?;
     Ok(())
+}
+
+/// The fixed instant the scan-fixture clock reads; entries stamped `1` are
+/// expired, entries stamped `0` never expire.
+const FIXTURE_NOW: u64 = 10_000;
+
+/// The kind of entry seeded at one coordinate of a [`ScanFixture`].
+#[derive(Clone, Debug)]
+enum EntryKind {
+    /// A live present cell carrying a one-byte payload.
+    Present(u8),
+    /// A cleared (`Absent`-tagged) entry — the scan skips it.
+    Absent,
+    /// A present cell whose stamped expiry has passed — the scan yields it as
+    /// [`ScanHit::Expired`].
+    Expired(u8),
+}
+
+/// A comparable projection of one [`ScanHit`] (coordinate bytes + payload).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Hit {
+    Present(Vec<u8>, Vec<u8>),
+    Expired(Vec<u8>),
+}
+
+impl From<ScanHit> for Hit {
+    fn from(hit: ScanHit) -> Self {
+        match hit {
+            ScanHit::Present(cell, bytes) => {
+                Self::Present(cell.coordinate.as_bytes().to_vec(), bytes.to_vec())
+            }
+            ScanHit::Expired(cell) => Self::Expired(cell.coordinate.as_bytes().to_vec()),
+        }
+    }
+}
+
+/// A generated `scan_present` case: entries over a small coordinate alphabet
+/// (so collisions, adjacency and boundary hits recur), an ordered bound pair,
+/// a direction, and an optional limit.
+#[derive(Clone, Debug)]
+struct ScanFixture {
+    entries: Vec<(Vec<u8>, EntryKind)>,
+    lo: Bound<Vec<u8>>,
+    hi: Bound<Vec<u8>>,
+    backward: bool,
+    limit: Option<usize>,
+}
+
+/// A coordinate over the small alphabet: 0–2 bytes, each in `0..4`.
+fn fixture_coord(g: &mut Gen) -> Vec<u8> {
+    let len = usize::arbitrary(g) % 3;
+    (0..len).map(|_| u8::arbitrary(g) % 4).collect()
+}
+
+impl Arbitrary for ScanFixture {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 24;
+        let entries = (0..len)
+            .map(|_| {
+                let kind = match u8::arbitrary(g) % 4 {
+                    0 => EntryKind::Absent,
+                    1 => EntryKind::Expired(u8::arbitrary(g)),
+                    _ => EntryKind::Present(u8::arbitrary(g)),
+                };
+                (fixture_coord(g), kind)
+            })
+            .collect();
+        // An ordered bound pair; equal endpoints stay doubly-Included so the
+        // pair is a valid (possibly empty) range for every range consumer.
+        let (mut a, mut b) = (fixture_coord(g), fixture_coord(g));
+        if a > b {
+            mem::swap(&mut a, &mut b);
+        }
+        let equal = a == b;
+        let pick = |g: &mut Gen, c: Vec<u8>| match u8::arbitrary(g) % 3 {
+            0 => Bound::Unbounded,
+            1 => Bound::Included(c),
+            _ if equal => Bound::Included(c),
+            _ => Bound::Excluded(c),
+        };
+        Self {
+            lo: pick(g, a),
+            hi: pick(g, b),
+            entries,
+            backward: bool::arbitrary(g),
+            limit: bool::arbitrary(g).then(|| usize::arbitrary(g) % 6),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let unlimited = self.limit.map(|_| Self {
+            limit: None,
+            ..self.clone()
+        });
+        let this = self.clone();
+        let prefixes = (0..self.entries.len()).map(move |n| Self {
+            entries: this.entries[..n].to_vec(),
+            ..this.clone()
+        });
+        Box::new(unlimited.into_iter().chain(prefixes))
+    }
+}
+
+/// What the scan must yield: the seeded entries within the bounds in the scan
+/// direction — `Absent` skipped, `Expired` reported — truncated at the limit.
+fn model_hits(fixture: &ScanFixture, seeded: &BTreeMap<Vec<u8>, EntryKind>) -> Vec<Hit> {
+    let mut hits: Vec<Hit> = seeded
+        .range::<Vec<u8>, _>((fixture.lo.as_ref(), fixture.hi.as_ref()))
+        .filter_map(|(coord, kind)| match kind {
+            EntryKind::Present(v) => Some(Hit::Present(coord.clone(), vec![*v])),
+            EntryKind::Expired(_) => Some(Hit::Expired(coord.clone())),
+            EntryKind::Absent => None,
+        })
+        .collect();
+    if fixture.backward {
+        hits.reverse();
+    }
+    if let Some(limit) = fixture.limit {
+        hits.truncate(limit);
+    }
+    hits
+}
+
+/// Chunked `scan_present` answer-vs-oracle (the hop/re-seek arithmetic): over
+/// random entries, bounds, direction and limit, the hopping drain — driven at
+/// a tiny per-hop budget so a single scan crosses many re-seeks — must yield
+/// exactly the model's ordered hits, and the production hop size must agree.
+/// This is the regression for the chunking that replaced the unbounded
+/// whole-interval collect: a re-seek that skipped or repeated a row, broke at
+/// a section boundary, or mis-counted the limit falsifies the equality.
+#[test]
+fn prop_scan_present_hops_match_model() {
+    /// A hop budget small enough that most fixtures need several re-seeks.
+    const TEST_HOP_ROWS: usize = 3;
+
+    async fn check(fixture: ScanFixture) -> Result<bool> {
+        let now = Arc::new(AtomicU64::new(FIXTURE_NOW));
+        let cache = test_db::cache_with_clock("scan_hop", Clock::Fixed(now))?;
+        let c = collection("hop")?;
+        let section = Section::new(0);
+
+        // Later duplicates overwrite earlier ones, in fjall and model alike.
+        let mut seeded: BTreeMap<Vec<u8>, EntryKind> = BTreeMap::new();
+        for (coord, kind) in &fixture.entries {
+            seeded.insert(coord.clone(), kind.clone());
+            let cell = CellKey {
+                section,
+                coordinate: Coordinate::from_bytes(coord.clone()),
+            };
+            let (value, expiry) = match kind {
+                EntryKind::Present(v) => (Committed::new(Some(Bytes::from(vec![*v]))), 0),
+                EntryKind::Absent => (Committed::new(None), 0),
+                EntryKind::Expired(v) => (Committed::new(Some(Bytes::from(vec![*v]))), 1),
+            };
+            cache.put(&c, &cell, &value, expiry).await?;
+        }
+
+        let want = model_hits(&fixture, &seeded);
+        let lo = fixture.lo.clone().map(Coordinate::from_bytes);
+        let hi = fixture.hi.clone().map(Coordinate::from_bytes);
+        let dir = if fixture.backward {
+            Direction::Backward
+        } else {
+            Direction::Forward
+        };
+        let (start, end) = if fixture.backward {
+            (hi.as_ref(), lo.as_ref())
+        } else {
+            (lo.as_ref(), hi.as_ref())
+        };
+        let scan = Scan {
+            section,
+            start,
+            dir,
+            end,
+            limit: fixture.limit,
+        };
+        let tiny = drain_hits(cache.scan_present_hopping(&c, scan, TEST_HOP_ROWS)).await?;
+        let production = drain_hits(cache.scan_present(&c, scan)).await?;
+        Ok(tiny == want && production == want)
+    }
+
+    fn prop(fixture: ScanFixture) -> TestResult {
+        match TEST_RUNTIME.block_on(check(fixture)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+
+    QuickCheck::new().quickcheck(prop as fn(ScanFixture) -> TestResult);
+}
+
+/// Collects a `scan_present` stream into comparable hits.
+async fn drain_hits<S>(stream: S) -> Result<Vec<Hit>>
+where
+    S: futures::Stream<Item = Result<ScanHit, super::FjallCellCacheError>>,
+{
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(Hit::from(item?));
+    }
+    Ok(out)
+}
+
+/// Warm-index batch round-trip: `index_record_batch` of arbitrary (duplicate-
+/// prone) coordinates followed by `index_clear_batch` of an arbitrary subset
+/// must leave `index_snapshot` holding exactly the recorded-minus-cleared set —
+/// the batch ops must agree with the model a sequence of single-key
+/// `index_record`s would produce (one atomic hop instead of N).
+#[test]
+fn prop_index_batches_round_trip_the_snapshot() {
+    fn cells_of(coords: &[u8]) -> Vec<CellKey> {
+        coords
+            .iter()
+            .map(|&b| CellKey {
+                section: Section::new(0),
+                coordinate: Coordinate::from_bytes(vec![b]),
+            })
+            .collect()
+    }
+
+    async fn check(record: Vec<u8>, clear: Vec<u8>) -> Result<bool> {
+        let cache = test_db::cache("index_batch")?;
+        let c = collection("batch")?;
+        let recorded = cells_of(&record);
+        let cleared = cells_of(&clear);
+        cache.index_record_batch(&c, recorded.iter()).await?;
+        cache.index_clear_batch(&c, cleared.iter()).await?;
+
+        let want: BTreeSet<u8> = record
+            .iter()
+            .filter(|b| !clear.contains(b))
+            .copied()
+            .collect();
+        let mut got: Vec<u8> = cache
+            .index_snapshot(&c)
+            .await?
+            .into_iter()
+            .map(|cell| cell.coordinate.as_bytes()[0])
+            .collect();
+        got.sort_unstable();
+        got.dedup();
+        Ok(got.into_iter().eq(want))
+    }
+
+    fn prop(record: Vec<u8>, clear: Vec<u8>) -> TestResult {
+        match TEST_RUNTIME.block_on(check(record, clear)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, Vec<u8>) -> TestResult);
 }
 
 /// `for_workspace` must *retain* the workspace it is handed, not extract the

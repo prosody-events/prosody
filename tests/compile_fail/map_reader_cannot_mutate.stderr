@@ -1,8 +1,0 @@
-error[E0599]: the method `set` exists for struct `MapHandle<S, Utf8KeyCodec, JsonCodec>`, but its trait bounds were not satisfied
-  --> tests/compile_fail/map_reader_cannot_mutate.rs:16:20
-   |
-16 |     let _ = handle.set(&"k".to_owned(), Value::Null).await;
-   |                    ^^^
-   |
-   = note: the following trait bounds were not satisfied:
-           `S: CellSession`

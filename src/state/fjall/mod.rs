@@ -58,13 +58,13 @@ pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspa
 
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::transaction::Read;
+use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
-use fjall::{Database, Keyspace, OwnedWriteBatch};
-use futures::{Stream, StreamExt, stream};
-use std::iter;
+use fjall::{Database, Guard, Keyspace, OwnedWriteBatch};
+use futures::{Stream, StreamExt};
 use std::ops::Bound;
 use std::sync::Arc;
 #[cfg(test)]
@@ -74,6 +74,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::coop::cooperative;
 use tokio::task::spawn_blocking;
 use tracing::warn;
+
+/// Rows examined per blocking hop of a chunked
+/// [`scan_present`](FjallCellCache::scan_present): each hop collects at most
+/// this many rows in one [`spawn_blocking`], then re-seeks from the last key it
+/// saw. A covered drain therefore holds O(hop) hits in RAM — never the whole
+/// covered interval — while the synchronous fjall range guard still never
+/// crosses an `.await`.
+const SCAN_HOP_ROWS: usize = 256;
 
 /// The cache's `now` source for TTL co-expiry, in milliseconds since the Unix
 /// epoch.
@@ -130,12 +138,20 @@ pub struct FjallCellCache {
     #[educe(Debug(ignore))]
     fail_index_snapshot: Arc<AtomicBool>,
     /// Test-only fault seam: when set, [`index_record`](Self::index_record)
-    /// returns an engine error, so a test can force a cold-seed record to fail
+    /// and [`index_record_batch`](Self::index_record_batch)
+    /// return an engine error, so a test can force a cold-seed record to fail
     /// and assert the collection is left **unseeded** (the next sweep re-seeds)
     /// rather than latched seeded over an incomplete coords set.
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_index_record: Arc<AtomicBool>,
+    /// Test-only fault seam: a countdown of [`cover_store`](Self::cover_store)
+    /// calls to fail (each failure decrements it), so a test can make exactly
+    /// the next N coverage rewrites fail — forcing the must-succeed punch's
+    /// retry path — and then heal automatically.
+    #[cfg(test)]
+    #[educe(Debug(ignore))]
+    fail_cover_stores: Arc<AtomicU64>,
 }
 
 /// Backing for a [`FjallCellCache`]: either a bare cache handle plus its
@@ -248,6 +264,8 @@ impl FjallCellCache {
             fail_index_snapshot: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_index_record: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_cover_stores: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -274,6 +292,14 @@ impl FjallCellCache {
     #[must_use]
     pub fn fail_index_record(&self) -> Arc<AtomicBool> {
         self.fail_index_record.clone()
+    }
+
+    /// Test handle on the [`cover_store`](Self::cover_store) fault seam: the
+    /// shared countdown of coverage rewrites to fail before healing.
+    #[cfg(test)]
+    #[must_use]
+    pub fn fail_cover_stores(&self) -> Arc<AtomicU64> {
+        self.fail_cover_stores.clone()
     }
 
     /// The cache's `now` source, shared by reads (expiry checks) and the
@@ -481,8 +507,8 @@ impl FjallCellCache {
         })
     }
 
-    /// Streams the committed cells of one `(collection, section)` whose
-    /// coordinate falls in `[lo, hi]`, in `dir` order — the range-read the
+    /// Streams the committed cells of one `(collection, section)` over the
+    /// scan's coordinate range, in [`Scan::dir`] order — the range-read the
     /// coverage cache serves a covered scan sub-range from.
     ///
     /// `Absent` (cleared) entries are skipped, so the stream yields only
@@ -491,73 +517,86 @@ impl FjallCellCache {
     /// [`ScanHit::Expired`] so the covered serve can fall through and
     /// re-fetch it (FLOOR rounding makes an entry expire slightly before
     /// its durable row, so an expired covered coordinate must not read as
-    /// absent — it is treated as a gap). The window is bounded by the
-    /// covered interval, so it is collected in a single [`spawn_blocking`]
-    /// (fjall's range iterator is synchronous and its guard is not held
-    /// across an `.await`); each yielded item is then coop-wrapped
-    /// so a large covered drain yields to the runtime.
+    /// absent — it is treated as a gap).
+    ///
+    /// The drain is **chunked**: each [`spawn_blocking`] hop examines at most
+    /// `SCAN_HOP_ROWS` rows and re-seeks from the last key it saw, so a
+    /// covered interval of any size costs O(hop) RAM per hop — never one
+    /// whole-interval buffer — while fjall's synchronous range guard still
+    /// never crosses an `.await`. [`Scan::limit`] caps the total hits yielded
+    /// (a caller consuming fewer simply stops polling, ending the hops early).
+    /// Each yielded item is coop-wrapped so a large drain yields to the
+    /// runtime.
     ///
     /// The fjall keyspace is shared across **all** collections, so the scan is
     /// bounded to the `(collection, section)` byte prefix on both ends — an
-    /// unbounded `hi` stops at the section's upper boundary, never bleeding
-    /// into the next section or another collection. A per-item prefix check
-    /// guards the same invariant defensively.
+    /// unbounded high bound stops at the section's upper boundary, never
+    /// bleeding into the next section or another collection. A per-row prefix
+    /// check guards the same invariant defensively (see `scan_hop`).
     pub fn scan_present<'a>(
         &'a self,
         collection: &'a CollectionId,
-        section: Section,
-        lo: Bound<&'a Coordinate>,
-        hi: Bound<&'a Coordinate>,
-        dir: Direction,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<ScanHit, FjallCellCacheError>> + Send + 'a {
+        self.scan_present_hopping(collection, scan, SCAN_HOP_ROWS)
+    }
+
+    /// [`scan_present`](Self::scan_present) with an explicit per-hop row
+    /// budget, so tests can drive many re-seek hops over a small fixture.
+    fn scan_present_hopping<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        hop_rows: usize,
     ) -> impl Stream<Item = Result<ScanHit, FjallCellCacheError>> + Send + 'a {
         let handle = self.inner.handle().clone();
+        let section = scan.section;
+        let dir = scan.dir;
         let section_prefix = codec::section_prefix(collection, section);
-        let lo_bound = byte_low_bound(&section_prefix, lo);
-        let hi_bound = byte_high_bound(&section_prefix, hi);
+        let (lo, hi) = scan.low_high();
+        let mut lo_bound = byte_low_bound(&section_prefix, lo);
+        let mut hi_bound = byte_high_bound(&section_prefix, hi);
+        let mut remaining = scan.limit;
         let now = self.clock.now_ms();
 
-        let collected = async move {
-            spawn_blocking(move || {
-                let mut window: Vec<ScanHit> = Vec::new();
-                for guard in handle.range((lo_bound, hi_bound)) {
-                    let (key, value) = guard.into_inner()?;
-                    // Defensive: the byte bounds already confine the scan to the
-                    // section, so this never trips — but it guarantees no other
-                    // collection's cell can be served even if a bound is wrong.
-                    if !key.starts_with(&section_prefix) {
-                        break;
-                    }
-                    let (expiry, read) = codec::decode_cell(Some(value.as_ref()))?;
-                    let cell = CellKey {
-                        section,
-                        coordinate: codec::coordinate_of(&key),
-                    };
-                    if expired(expiry, now) {
-                        // The fjall entry expired before its durable row could
-                        // have (FLOOR): the covered coordinate must fall through,
-                        // not read as absent.
-                        window.push(ScanHit::Expired(cell));
-                    } else if let Read::Present(payload) = read {
-                        window.push(ScanHit::Present(cell, payload));
-                    }
+        try_stream! {
+            loop {
+                if remaining == Some(0) {
+                    break;
                 }
-                Ok::<_, FjallCellCacheError>(window)
-            })
-            .await?
-        };
-
-        stream::once(collected)
-            .map(move |result| match result {
-                Ok(mut window) => {
-                    if dir == Direction::Backward {
-                        window.reverse();
+                let budget = hop_rows.max(1);
+                let need = remaining.map_or(budget, |n| n.min(budget));
+                let hop_handle = handle.clone();
+                let hop_prefix = section_prefix.clone();
+                let (hop_lo, hop_hi) = (lo_bound.clone(), hi_bound.clone());
+                let (hits, resume) = spawn_blocking(move || {
+                    let rows = hop_handle.range((hop_lo, hop_hi));
+                    match dir {
+                        Direction::Forward => {
+                            scan_hop(rows, &hop_prefix, section, now, budget, need, dir)
+                        }
+                        Direction::Backward => {
+                            scan_hop(rows.rev(), &hop_prefix, section, now, budget, need, dir)
+                        }
                     }
-                    stream::iter(window.into_iter().map(Ok)).left_stream()
+                })
+                .await??;
+                remaining = remaining.map(|n| n.saturating_sub(hits.len()));
+                for hit in hits {
+                    yield hit;
                 }
-                Err(error) => stream::iter(iter::once(Err(error))).right_stream(),
-            })
-            .flatten()
-            .then(|item| cooperative(async move { item }))
+                match resume {
+                    // The hop stopped on a budget/need bound; re-seek just past
+                    // the last examined key on the direction's moving side.
+                    Some(key) => match dir {
+                        Direction::Forward => lo_bound = Bound::Excluded(key),
+                        Direction::Backward => hi_bound = Bound::Excluded(key),
+                    },
+                    None => break,
+                }
+            }
+        }
+        .then(|item| cooperative(async move { item }))
     }
 
     // --- Warm index: provisional coordinates + cold-seed latch ---------------
@@ -637,21 +676,69 @@ impl FjallCellCache {
         .await
     }
 
-    /// Clears `cell`'s provisional coordinate from `collection`.
+    /// Records a batch of live provisional coordinates of `collection` in one
+    /// atomic [`OwnedWriteBatch`] — the settle-time counterpart of the
+    /// streaming single-key [`index_record`](Self::index_record), collapsing N
+    /// blocking hops to one. All-or-nothing: on a failure the caller cannot
+    /// know which coordinates landed durably, so it drops the seeded latch
+    /// ([`index_unseed`](Self::index_unseed)) and the next sweep re-seeds.
     ///
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn index_clear(
+    pub async fn index_record_batch<'a, I>(
         &self,
         collection: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<(), FjallCellCacheError> {
-        remove_index(
-            self.inner.index_handle(),
-            codec::index_coord_key(collection, cell),
-        )
-        .await
+        cells: I,
+    ) -> Result<(), FjallCellCacheError>
+    where
+        I: ExactSizeIterator<Item = &'a CellKey>,
+    {
+        #[cfg(test)]
+        if self.fail_index_record.load(Ordering::Relaxed) {
+            return Err(FjallCellCacheError::Injected);
+        }
+        let keys = index_keys(collection, cells);
+        let database = self.inner.database().clone();
+        let handle = self.inner.index_handle().clone();
+        spawn_blocking(move || {
+            let mut batch = OwnedWriteBatch::with_capacity(database, keys.len());
+            for key in &keys {
+                batch.insert(&handle, key.as_slice(), [].as_slice());
+            }
+            batch.commit()
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Clears a batch of resolved provisional coordinates from `collection` in
+    /// one atomic [`OwnedWriteBatch`]. A failure is a harmless over-report:
+    /// the sweep's point-read filter drops already-resolved coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a fjall write failure.
+    pub async fn index_clear_batch<'a, I>(
+        &self,
+        collection: &CollectionId,
+        cells: I,
+    ) -> Result<(), FjallCellCacheError>
+    where
+        I: ExactSizeIterator<Item = &'a CellKey>,
+    {
+        let keys = index_keys(collection, cells);
+        let database = self.inner.database().clone();
+        let handle = self.inner.index_handle().clone();
+        spawn_blocking(move || {
+            let mut batch = OwnedWriteBatch::with_capacity(database, keys.len());
+            for key in &keys {
+                batch.remove(&handle, key.as_slice());
+            }
+            batch.commit()
+        })
+        .await??;
+        Ok(())
     }
 
     /// Snapshots `collection`'s live provisional coordinates — the recovery
@@ -735,6 +822,14 @@ impl FjallCellCache {
         section: Section,
         intervals: &[(Bound<Coordinate>, Bound<Coordinate>)],
     ) -> Result<(), FjallCellCacheError> {
+        #[cfg(test)]
+        if self
+            .fail_cover_stores
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(FjallCellCacheError::Injected);
+        }
         let database = self.inner.database().clone();
         let handle = self.inner.index_handle().clone();
         let prefix = codec::index_cover_prefix(collection, section);
@@ -767,6 +862,69 @@ impl FjallCellCache {
         .await??;
         Ok(())
     }
+}
+
+/// One bounded hop of a chunked [`FjallCellCache::scan_present`]: walks `rows`
+/// (already oriented in the scan direction) collecting up to `need` hits from
+/// at most `budget` rows, and returns the hits plus the re-seek key — `Some`
+/// (the last raw key examined) when the hop stopped on a bound and more rows
+/// may remain, `None` when the range was exhausted.
+///
+/// The fjall keyspace is shared across all collections, so a row outside the
+/// section prefix is never yielded: walking forward it marks the section's
+/// upper boundary (reachable only through the missing-successor unbounded high
+/// bound) and ends the scan; walking backward it *precedes* the section (the
+/// low byte bound pins the other side), so it is skipped but still counted
+/// against the budget, keeping every hop's work bounded.
+fn scan_hop(
+    rows: impl Iterator<Item = Guard>,
+    section_prefix: &[u8],
+    section: Section,
+    now: u64,
+    budget: usize,
+    need: usize,
+    dir: Direction,
+) -> Result<(Vec<ScanHit>, Option<Vec<u8>>), FjallCellCacheError> {
+    let mut hits: Vec<ScanHit> = Vec::with_capacity(need);
+    let mut examined = 0usize;
+    for guard in rows {
+        let (key, value) = guard.into_inner()?;
+        examined += 1;
+        if key.starts_with(section_prefix) {
+            let (expiry, read) = codec::decode_cell(Some(value.as_ref()))?;
+            let cell = CellKey {
+                section,
+                coordinate: codec::coordinate_of(&key),
+            };
+            if expired(expiry, now) {
+                // The fjall entry expired before its durable row could have
+                // (FLOOR): the covered coordinate must fall through, not read
+                // as absent.
+                hits.push(ScanHit::Expired(cell));
+            } else if let Read::Present(payload) = read {
+                hits.push(ScanHit::Present(cell, payload));
+            }
+        } else if dir == Direction::Forward {
+            return Ok((hits, None));
+        }
+        if hits.len() >= need || examined >= budget {
+            return Ok((hits, Some(key.as_ref().to_vec())));
+        }
+    }
+    Ok((hits, None))
+}
+
+/// The encoded warm-index keys of a batch of coordinates — built up front
+/// (bounded, sized once) so the blocking batch closure only touches fjall.
+fn index_keys<'a>(
+    collection: &CollectionId,
+    cells: impl ExactSizeIterator<Item = &'a CellKey>,
+) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(cells.len());
+    for cell in cells {
+        keys.push(codec::index_coord_key(collection, cell));
+    }
+    keys
 }
 
 /// Inserts an empty-valued warm-index key (presence-as-boolean), one blocking

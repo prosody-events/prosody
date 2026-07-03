@@ -5,7 +5,6 @@
 //! a single session and unified migration system.
 
 use crate::propagator::new_propagator;
-use crate::state::SHARD_FANOUT_CONCURRENCY;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -90,27 +89,6 @@ pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
-
-/// Soft byte ceiling for one same-partition `UNLOGGED BATCH`.
-///
-/// A single-partition batch is one replica mutation, bounded by Cassandra's
-/// `max_mutation_size` — half of `commitlog_segment_size` (16 MiB at the 5.0
-/// default 32 MiB segment). 5 MiB keeps a generous margin even if an operator
-/// halves the commitlog to an 8 MiB ceiling; promote to
-/// [`CassandraConfiguration`] only for a deployment with a tighter commitlog.
-pub(crate) const MAX_BATCH_BYTES: u64 = 5 * 1_024 * 1_024;
-
-/// Soft ceiling on the number of **cells** (batch units) in one batch. Each
-/// unit contributes up to two statements (a `kind=Cell` mutation and a
-/// `kind=Index` marker), so the emitted statement count stays under `2 ×` this
-/// — still far under the protocol u16 max the driver enforces client-side, so
-/// the byte budget dominates for any non-trivial value.
-pub(crate) const MAX_BATCH_STATEMENTS: usize = 4_096;
-
-/// Per-statement size the row weight adds on top of its blob bytes, covering
-/// the partition/clustering key, the `event` UDT, and column metadata the blob
-/// count omits — so the estimate over-counts rather than under-counts.
-pub(crate) const PER_STATEMENT_OVERHEAD: u64 = 512;
 
 /// Unified Cassandra store providing session and infrastructure for all
 /// components.
@@ -280,17 +258,17 @@ impl CassandraStore {
     }
 
     /// Executes `units` as the **fewest** same-partition `UNLOGGED BATCH`es
-    /// that fit the backend budget. Each unit is an atomic group of rows (one
-    /// keyed-state cell's `kind=Cell` mutation plus its `kind=Index` marker)
-    /// that must never be split across batches; a unit's rows may target
+    /// that fit the backend budget. Each unit is an atomic group of rows that
+    /// must never be split across batches; a unit's rows may target
     /// **different** prepared statements ([`BatchRow::statement`]).
     ///
     /// Each unit carries its own size estimate ([`BatchUnit`]);
     /// [`chunk_boundaries`] greedily packs contiguous **whole** units into
     /// chunks within `max_bytes` and `max_count` (a unit heavier than
-    /// `max_bytes` takes its own chunk). Callers pass the cells of **one
-    /// collection**, which share a partition key, so each batch is a single
-    /// atomic replica mutation. An empty `units` is a no-op.
+    /// `max_bytes` takes its own chunk), and up to `concurrency` chunks are in
+    /// flight at once — the caller supplies its own fan-out bound alongside its
+    /// batch budget. Callers pass units sharing **one** partition key, so each
+    /// batch is a single atomic replica mutation. An empty `units` is a no-op.
     ///
     /// The batch is marked idempotent — these are last-write-wins full-column
     /// `UPDATE`s / `INSERT`s / `DELETE`s, and batch idempotency does **not**
@@ -306,6 +284,7 @@ impl CassandraStore {
         units: &[BatchUnit<R>],
         max_bytes: u64,
         max_count: usize,
+        concurrency: usize,
     ) -> Result<(), CassandraStoreError>
     where
         R: BatchRow + Sync,
@@ -346,7 +325,7 @@ impl CassandraStore {
                     .map(drop)
                     .map_err(CassandraStoreError::from)
             })
-            .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
+            .buffer_unordered(concurrency)
             .try_collect::<()>()
             .await
     }
@@ -362,20 +341,19 @@ pub(crate) trait BatchRow: SerializeRow {
     fn statement(&self) -> &PreparedStatement;
 }
 
-/// An indivisible group of [`BatchRow`]s that must land in the **same** batch:
-/// one keyed-state cell's durable rows (its `kind=Cell` mutation and its
-/// `kind=Index` marker). [`chunk_boundaries`] packs whole units and never
-/// splits one, so a cell's rows are always one same-partition atomic mutation —
-/// "split a cell across batches" is unrepresentable. Two rows fit inline in the
-/// `SmallVec`.
+/// An indivisible group of [`BatchRow`]s that must land in the **same** batch —
+/// a caller-defined atom (e.g. a record's mutation and its marker row).
+/// [`chunk_boundaries`] packs whole units and never splits one, so a unit's
+/// rows are always one same-partition atomic mutation — "split a unit across
+/// batches" is unrepresentable. Two rows fit inline in the `SmallVec`.
 pub(crate) struct BatchUnit<R> {
     weight: u64,
     rows: SmallVec<[R; 2]>,
 }
 
 impl<R> BatchUnit<R> {
-    /// Groups `rows` as one atomic unit weighing `weight` (the cell's blob
-    /// bytes plus [`PER_STATEMENT_OVERHEAD`] per member row).
+    /// Groups `rows` as one atomic unit weighing `weight` (the unit's payload
+    /// bytes plus a per-row overhead estimate, supplied by the caller).
     pub(crate) fn new(weight: u64, rows: SmallVec<[R; 2]>) -> Self {
         Self { weight, rows }
     }

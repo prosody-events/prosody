@@ -26,8 +26,11 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::Segment;
 use crate::timers::store::SegmentVersion;
 use crate::timers::store::TriggerStore;
+use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::adapter::TableAdapter;
-use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+use crate::timers::store::memory::{
+    InMemoryTriggerStore, InMemoryTriggerStoreProvider, memory_store,
+};
 use crate::timers::{
     FiringTimer, PendingTimer, TimerManager, TimerManagerConfig, TimerRequest, TimerSemaphores,
     TimerType, Trigger,
@@ -297,6 +300,61 @@ async fn store_tag_source_resolves_three_states() -> Result<()> {
             .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, live_tag)
             .await?,
         "store row absent → committed"
+    );
+    Ok(())
+}
+
+/// The in-memory trigger provider hands every `create_store` call a view of
+/// the same shared store — production mints the partition's store and the
+/// commit oracle's store from one provider. Over a disjoint fresh store the
+/// oracle would read a permanently empty store and answer "committed" for an
+/// abandoned, uncommitted timer event (a phantom commit recovery would
+/// promote); over the shared store it must answer `NotCommitted` while the
+/// trigger row stands and flip only once the partition's store commits the
+/// fire.
+#[tokio::test]
+async fn memory_provider_shares_store_with_oracle() -> Result<()> {
+    let provider = InMemoryTriggerStoreProvider::new();
+    let segment = Segment {
+        id: Uuid::new_v4(),
+        name: "oracle-shared".to_owned(),
+        slab_size: CompactDuration::new(300),
+        version: SegmentVersion::V3,
+    };
+    let partition_store = provider.create_store(segment.clone());
+    let oracle = CommitManager::new(
+        MemoryDeduplicationStore::new(),
+        StoreTagSource(provider.create_store(segment)),
+    );
+
+    // The partition schedules a timer; the event is then abandoned before its
+    // trigger commit (shutdown abandon), so the row and its WAL tag stand.
+    let trigger = test_trigger("k", 5)?;
+    let (key, time, timer_type, wal_tag) = (
+        trigger.key.clone(),
+        trigger.time,
+        trigger.timer_type,
+        trigger.tag,
+    );
+    partition_store.add_trigger(trigger).await?;
+
+    assert!(
+        !oracle
+            .is_timer_committed(&key, timer_type, time, wal_tag)
+            .await?,
+        "abandoned pre-commit: the standing trigger row must read NotCommitted"
+    );
+
+    // Committing the fire through the partition's store removes the row; the
+    // oracle must observe it through its own view of the shared store.
+    partition_store
+        .remove_trigger(&key, time, timer_type)
+        .await?;
+    assert!(
+        oracle
+            .is_timer_committed(&key, timer_type, time, wal_tag)
+            .await?,
+        "fired-and-removed must read committed through the shared store"
     );
     Ok(())
 }

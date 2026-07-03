@@ -15,9 +15,9 @@ use crate::codec::ErasedStateCodec;
 use crate::consumer::kafka_state::message_state;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::error::ClassifyError;
 use crate::loader::MessageLoader;
-use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity, value_state};
+use crate::state::descriptor::{Registered, StateDescriptor, value_state};
 use crate::state::session::CellSession;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
@@ -33,7 +33,6 @@ use std::error::Error;
 use std::future::{Future, ready};
 use std::ops::AsyncFnOnce;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::select;
 use tokio::sync::watch;
 use tracing::Span;
@@ -207,15 +206,8 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// (`type State = C::State`). State itself is Kafka-agnostic, so the
     /// payload tie lives here: the session's loader yields `Self::Payload`,
     /// which keeps Kafka-message handles fully typed inside generic handlers
-    /// without [`CellRead`](crate::state::session::CellRead) ever naming a
-    /// payload.
-    ///
-    /// The bound is the full [`CellSession`] (handlers mutate): it adds
-    /// `set`/`clear`/`flush` and the sealed lifecycle to the read-only
-    /// [`CellRead`](crate::state::session::CellRead), whose inherited `Loader`
-    /// is pinned to the message loader here. A collection handle's mutators
-    /// require `CellSession`, so a read-only consumer (bound on `CellRead`)
-    /// structurally cannot mutate.
+    /// without [`CellSession`] ever naming a payload — its `Loader` associated
+    /// type is pinned to the message loader here.
     type State: CellSession<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a registered keyed-state collection, returning its typed handle.
@@ -223,7 +215,7 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// Takes a [`Registered<DESC>`] capability handle, not a raw descriptor, so
     /// a handler can bind only collections it registered — binding an
     /// unregistered one is a compile error, not a runtime one. (The access-time
-    /// [`verify_state_registration`](crate::state::session::CellRead::verify_state_registration)
+    /// [`verify_state_registration`](crate::state::session::CellSession::verify_state_registration)
     /// check is the backstop for names that slip past the type system, e.g.
     /// through the erased FFI seam.)
     ///
@@ -903,104 +895,11 @@ where
     }
 }
 
-/// Error raised by the [`EventContext`] keyed-state capabilities and by
-/// descriptor binds.
-///
-/// One concrete enum for the whole capability surface: store and loader
-/// errors are type-erased at the boundary (message + captured
-/// [`ErrorCategory`]) so the error type needs no generics.
-#[derive(Debug, Error)]
-pub enum StateAccessError {
-    /// This context does not provide keyed state (the default for every
-    /// context outside the keyed-state middleware).
-    #[error("keyed state is unavailable on this context")]
-    Unavailable,
-
-    /// The collection name was never registered with the consumer.
-    #[error("state collection {name:?} is not registered")]
-    Unregistered {
-        /// The descriptor's collection name.
-        name: &'static str,
-    },
-
-    /// The registry holds a different identity for this name.
-    #[error(
-        "state collection identity mismatch: registered {stored:?}, descriptor asserts \
-         {asserted:?}"
-    )]
-    IdentityMismatch {
-        /// Identity held by the registry.
-        stored: StructuralIdentity,
-
-        /// Identity the binding descriptor asserts.
-        asserted: StructuralIdentity,
-    },
-
-    /// A state handle was used while the context is shutting down or the
-    /// message is cancelled.
-    #[error("state access attempted on a terminated context")]
-    Terminated,
-
-    /// The underlying state store failed (type-erased).
-    #[error("keyed-state store failed: {message}")]
-    Store {
-        /// Rendered store error.
-        message: String,
-
-        /// The store error's captured classification.
-        category: ErrorCategory,
-    },
-
-    /// The message loader failed (type-erased).
-    #[error("keyed-state message loader failed: {message}")]
-    Load {
-        /// Rendered loader error.
-        message: String,
-
-        /// The loader error's captured classification.
-        category: ErrorCategory,
-    },
-}
-
-impl StateAccessError {
-    /// Type-erases a store error into [`Self::Store`], capturing its
-    /// classification.
-    pub(crate) fn store<E>(error: &E) -> Self
-    where
-        E: ClassifyError + Error,
-    {
-        Self::Store {
-            message: error.to_string(),
-            category: error.classify_error(),
-        }
-    }
-
-    /// Type-erases a loader error into [`Self::Load`], capturing its
-    /// classification.
-    pub(crate) fn load<E>(error: &E) -> Self
-    where
-        E: ClassifyError + Error,
-    {
-        Self::Load {
-            message: error.to_string(),
-            category: error.classify_error(),
-        }
-    }
-}
-
-impl ClassifyError for StateAccessError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Unavailable | Self::Unregistered { .. } | Self::IdentityMismatch { .. } => {
-                ErrorCategory::Permanent
-            }
-            // Aligned with the cancellation middleware: a terminated
-            // context is a transient condition (retry decides).
-            Self::Terminated => ErrorCategory::Transient,
-            Self::Store { category, .. } | Self::Load { category, .. } => *category,
-        }
-    }
-}
+/// The keyed-state capability error, raised by the [`EventContext`] state
+/// surface and by descriptor binds. Defined in [`crate::state`] (its
+/// `IdentityMismatch` embeds state's `StructuralIdentity`) and re-exported here
+/// so the capability's error keeps its `EventContext`-local path.
+pub use crate::state::StateAccessError;
 
 #[cfg(test)]
 mod tests;

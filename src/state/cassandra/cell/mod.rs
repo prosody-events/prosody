@@ -60,25 +60,24 @@ mod tests;
 use crate::cassandra::CassandraStore as CassandraSession;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{
-    BatchRow, BatchUnit, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, PER_STATEMENT_OVERHEAD,
-};
+use crate::cassandra::{BatchRow, BatchUnit};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Direction, Scan};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan};
 use crate::state::encoding::{Encoding, encode_payload};
 use crate::state::event_ref::EventRef;
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
 use crate::state::store::CellStore;
-use crate::state::{CollectionId, CollectionRef, StateType};
+use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
-use futures::{Stream, TryStreamExt, pin_mut};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
 use scylla::client::session::Session;
+use scylla::deserialize::row::DeserializeRow;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;
@@ -95,6 +94,28 @@ pub use decode::CellCorruptReason;
 
 /// Payload encoding for cell blobs written by this build.
 const VALUE_ENCODING: Encoding = Encoding::RawZstdV1;
+
+/// Soft byte ceiling for one same-partition `UNLOGGED BATCH`.
+///
+/// A single-partition batch is one replica mutation, bounded by Cassandra's
+/// `max_mutation_size` — half of `commitlog_segment_size` (16 MiB at the 5.0
+/// default 32 MiB segment). 5 MiB keeps a generous margin even if an operator
+/// halves the commitlog to an 8 MiB ceiling; promote to
+/// [`CassandraConfiguration`](crate::cassandra::CassandraConfiguration) only
+/// for a deployment with a tighter commitlog.
+const MAX_BATCH_BYTES: u64 = 5 * 1_024 * 1_024;
+
+/// Soft ceiling on the number of **cells** (batch units) in one batch. Each
+/// unit contributes up to two statements (a `kind=Cell` mutation and a
+/// `kind=Index` marker), so the emitted statement count stays under `2 ×` this
+/// — still far under the protocol u16 max the driver enforces client-side, so
+/// the byte budget dominates for any non-trivial value.
+const MAX_BATCH_STATEMENTS: usize = 4_096;
+
+/// Per-statement size the row weight adds on top of its blob bytes, covering
+/// the partition/clustering key, the `event` UDT, and column metadata the blob
+/// count omits — so the estimate over-counts rather than under-counts.
+const PER_STATEMENT_OVERHEAD: u64 = 512;
 
 /// The only cell `version` stamp this build writes or accepts.
 ///
@@ -235,16 +256,23 @@ impl<O> CassandraStore<O> {
         self.session.session()
     }
 
-    async fn read_raw(
+    /// Point-reads one `kind=Cell` row with `statement`, generic over the
+    /// selected row shape — `read_cell` ([`RawCellRow`]) and `read_cell_ttl`
+    /// ([`CellTtlRow`]) share this one bind tuple.
+    async fn point_read<R>(
         &self,
+        statement: &PreparedStatement,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<RawCellRow>, CassandraCellStoreError> {
+    ) -> Result<Option<R>, CassandraCellStoreError>
+    where
+        R: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
+    {
         let pk = Pk::of(id);
         let row = self
             .cql()
             .execute_unpaged(
-                &self.queries.read_cell,
+                statement,
                 (
                     pk.segment_id,
                     pk.key,
@@ -259,36 +287,7 @@ impl<O> CassandraStore<O> {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<RawCellRow>()
-            .map_err(CassandraStoreError::from)?;
-        Ok(row)
-    }
-
-    async fn read_raw_ttl(
-        &self,
-        id: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<Option<CellTtlRow>, CassandraCellStoreError> {
-        let pk = Pk::of(id);
-        let row = self
-            .cql()
-            .execute_unpaged(
-                &self.queries.read_cell_ttl,
-                (
-                    pk.segment_id,
-                    pk.key,
-                    pk.state_type,
-                    pk.name,
-                    CellKind::Cell,
-                    i8::from(cell.section),
-                    cell.coordinate.as_bytes(),
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<CellTtlRow>()
+            .maybe_first_row::<R>()
             .map_err(CassandraStoreError::from)?;
         Ok(row)
     }
@@ -331,9 +330,9 @@ impl<O> CassandraStore<O> {
                 BatchUnit::new(
                     blob_weight(blob) + PER_STATEMENT_OVERHEAD,
                     smallvec![
-                        CellBatchRow::StageCell {
+                        CellBatchRow {
                             statement: cell_stmt,
-                            row: StageRow {
+                            row: RowShape::Stage(StageRow {
                                 ttl,
                                 data: blob.data.as_deref(),
                                 prev_data: blob.prev_data.as_deref(),
@@ -341,18 +340,23 @@ impl<O> CassandraStore<O> {
                                 version: blob.version,
                                 event: write.event(),
                                 addr,
-                            },
+                            }),
                         },
-                        CellBatchRow::IndexUpsert {
+                        CellBatchRow {
                             statement: index_stmt,
-                            row: IndexUpsertRow { ttl, addr },
+                            row: RowShape::IndexUpsert(IndexUpsertRow { ttl, addr }),
                         },
                     ],
                 )
             })
             .collect();
         self.session
-            .execute_unlogged_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .execute_unlogged_batches(
+                &units,
+                MAX_BATCH_BYTES,
+                MAX_BATCH_STATEMENTS,
+                SHARD_FANOUT_CONCURRENCY,
+            )
             .await?;
         Ok(())
     }
@@ -392,29 +396,34 @@ impl<O> CassandraStore<O> {
                 BatchUnit::new(
                     blob_weight(blob) + PER_STATEMENT_OVERHEAD,
                     smallvec![
-                        CellBatchRow::RollbackCell {
+                        CellBatchRow {
                             statement: cell_stmt,
-                            row: ResolvedRow {
+                            row: RowShape::Resolved(ResolvedRow {
                                 ttl,
                                 data: blob.data.as_deref(),
                                 encoding: blob.encoding,
                                 version: blob.version,
                                 addr,
-                            },
+                            }),
                         },
-                        CellBatchRow::IndexDelete {
+                        CellBatchRow {
                             statement: &self.queries.index_delete,
-                            row: KeyRow {
+                            row: RowShape::Key(KeyRow {
                                 kind: CellKind::Index,
                                 addr,
-                            },
+                            }),
                         },
                     ],
                 )
             })
             .collect();
         self.session
-            .execute_unlogged_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .execute_unlogged_batches(
+                &units,
+                MAX_BATCH_BYTES,
+                MAX_BATCH_STATEMENTS,
+                SHARD_FANOUT_CONCURRENCY,
+            )
             .await?;
         Ok(())
     }
@@ -436,26 +445,31 @@ impl<O> CassandraStore<O> {
                 BatchUnit::new(
                     2 * PER_STATEMENT_OVERHEAD,
                     smallvec![
-                        CellBatchRow::PromoteCell {
+                        CellBatchRow {
                             statement: &self.queries.mark_resolved,
-                            row: KeyRow {
+                            row: RowShape::Key(KeyRow {
                                 kind: CellKind::Cell,
                                 addr,
-                            },
+                            }),
                         },
-                        CellBatchRow::IndexDelete {
+                        CellBatchRow {
                             statement: &self.queries.index_delete,
-                            row: KeyRow {
+                            row: RowShape::Key(KeyRow {
                                 kind: CellKind::Index,
                                 addr,
-                            },
+                            }),
                         },
                     ],
                 )
             })
             .collect();
         self.session
-            .execute_unlogged_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .execute_unlogged_batches(
+                &units,
+                MAX_BATCH_BYTES,
+                MAX_BATCH_STATEMENTS,
+                SHARD_FANOUT_CONCURRENCY,
+            )
             .await?;
         Ok(())
     }
@@ -466,7 +480,8 @@ where
     O: CommitOracle,
 {
     /// The single resolving section scan, yielding each present cell's
-    /// committed bytes **and** its remaining `data` TTL.
+    /// committed bytes **and** its cache-fill co-expiry TTL (the remaining TTL
+    /// of whichever blob the row carries — [`decode`]'s `blob_ttl`).
     /// [`scan_cells`](CellStore::scan_cells) drops the TTL;
     /// [`scan_for_cache`](CellStore::scan_for_cache) keeps it.
     fn scan_inner<'a>(
@@ -478,15 +493,15 @@ where
         Item = Result<(CellKey, Bytes, Option<CompactDuration>), CellStoreError<O::Error>>,
     > + Send
     + 'a {
-        let pk = Pk::of(collection).owned();
         let section = i8::from(scan.section);
         let dir = scan.dir;
         let limit = scan.limit;
         // The start bound goes into CQL (the comparator is chosen by selecting
         // one of the per-bound prepared statements; an unbounded start binds no
         // coordinate at all). The end bound is enforced in-code by `past_end`,
-        // so it needs no statement variant — only an owned copy to compare
-        // against each streamed coordinate.
+        // so it needs no statement variant. Both bounds are held as owned
+        // `Coordinate`s across the stream's awaits — O(1) refcount bumps
+        // (`Coordinate` is `Bytes`), never byte copies.
         let statement = match (dir, &scan.start) {
             (Direction::Forward, Bound::Unbounded) => self.queries.scan_forward_all.clone(),
             (Direction::Forward, Bound::Included(_)) => self.queries.scan_forward_incl.clone(),
@@ -495,33 +510,30 @@ where
             (Direction::Backward, Bound::Included(_)) => self.queries.scan_backward_incl.clone(),
             (Direction::Backward, Bound::Excluded(_)) => self.queries.scan_backward_excl.clone(),
         };
-        let start_coord: Option<Vec<u8>> = match scan.start {
+        let start = match scan.start.cloned() {
             Bound::Unbounded => None,
-            Bound::Included(c) | Bound::Excluded(c) => Some(c.as_bytes().to_vec()),
+            Bound::Included(c) | Bound::Excluded(c) => Some(c),
         };
-        let end: Bound<Vec<u8>> = match scan.end {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(c) => Bound::Included(c.as_bytes().to_vec()),
-            Bound::Excluded(c) => Bound::Excluded(c.as_bytes().to_vec()),
-        };
+        let end = scan.end.cloned();
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
+            let pk = Pk::of(collection);
             // Both arms yield the same `QueryPager`; the bounded arm binds the
             // start coordinate, the unbounded arm omits it (its statement has no
             // coordinate marker).
-            let pager = match &start_coord {
+            let pager = match &start {
                 Some(coord) => self
                     .cql()
                     .execute_iter(
                         statement,
-                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Cell, section, coord.as_slice()),
+                        (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section, coord.as_bytes()),
                     )
                     .await,
                 None => self
                     .cql()
                     .execute_iter(
                         statement,
-                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Cell, section),
+                        (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section),
                     )
                     .await,
             };
@@ -556,7 +568,7 @@ where
                 }
                 let (key, raw, ttl) =
                     decode::try_decode_keyed_cell_ttl(row).map_err(ResolveCellError::Store)?;
-                if past_end(dir, &key, end.as_ref().map(Vec::as_slice)) {
+                if past_end(dir, &key, end.as_ref()) {
                     break;
                 }
                 let committed =
@@ -585,7 +597,7 @@ where
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
         let raw = match self
-            .read_raw(collection, cell)
+            .point_read::<RawCellRow>(&self.queries.read_cell, collection, cell)
             .await
             .map_err(ResolveCellError::Store)?
         {
@@ -612,7 +624,7 @@ where
         own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         let (raw, ttl) = match self
-            .read_raw_ttl(collection, cell)
+            .point_read::<CellTtlRow>(&self.queries.read_cell_ttl, collection, cell)
             .await
             .map_err(ResolveCellError::Store)?
         {
@@ -670,14 +682,14 @@ where
             // one layer up on `Cached` (which owns the fjall warm index), so this
             // is reached only on a cold sweep. There is no whole-partition scan.
             let coords = {
-                let pk = Pk::of(collection).owned();
+                let pk = Pk::of(collection);
                 #[cfg(test)]
                 self.counters.index_range_reads.fetch_add(1, Ordering::Relaxed);
                 let index = self
                     .cql()
                     .execute_iter(
                         self.queries.index_scan.clone(),
-                        (pk.segment_id, pk.key.as_str(), pk.state_type, pk.name.as_str(), CellKind::Index),
+                        (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Index),
                     )
                     .await
                     .map_err(CassandraStoreError::from)
@@ -701,18 +713,32 @@ where
             };
 
             // Point-read each coordinate's `kind=Cell` row to rebuild its
-            // `ProvisionalCell`. A coordinate whose row is absent (a
+            // `ProvisionalCell`, pipelined on the partition's shard fan-out —
+            // the reads are independent and both consumers are order-free (the
+            // sweep resolves `buffer_unordered`; the warm index records a set),
+            // so a store-outage backlog no longer stretches the sweep by one
+            // serial round-trip per cell. A coordinate whose row is absent (a
             // compaction-window straggler — cell and marker share one TTL) or
             // decodes `Cell::Resolved` (concurrently resolved, or a leftover set
             // entry) is silently dropped — both over-report-safe.
-            for key in coords {
-                #[cfg(test)]
-                self.counters.cell_point_reads.fetch_add(1, Ordering::Relaxed);
-                let Some(raw) = self
-                    .read_raw(collection, &key)
-                    .await
-                    .map_err(ResolveCellError::Store)?
-                else {
+            let reads = stream::iter(coords)
+                .map(|key| {
+                    // `cooperative` adds a per-cell coop-budget checkpoint;
+                    // `buffered` keeps full concurrency (and the index order).
+                    cooperative(async move {
+                        #[cfg(test)]
+                        self.counters.cell_point_reads.fetch_add(1, Ordering::Relaxed);
+                        let raw = self
+                            .point_read::<RawCellRow>(&self.queries.read_cell, collection, &key)
+                            .await
+                            .map_err(ResolveCellError::Store)?;
+                        Ok::<_, CellStoreError<O::Error>>((key, raw))
+                    })
+                })
+                .buffered(SHARD_FANOUT_CONCURRENCY);
+            pin_mut!(reads);
+            while let Some((key, raw)) = reads.try_next().await? {
+                let Some(raw) = raw else {
                     continue;
                 };
                 let cell = decode::try_decode_cell(raw).map_err(ResolveCellError::Store)?;
@@ -736,7 +762,7 @@ where
             .cell_point_reads
             .fetch_add(1, Ordering::Relaxed);
         let Some(raw) = self
-            .read_raw(collection, cell)
+            .point_read::<RawCellRow>(&self.queries.read_cell, collection, cell)
             .await
             .map_err(ResolveCellError::Store)?
         else {
@@ -797,25 +823,6 @@ impl<'a> Pk<'a> {
             name: id.name().as_str(),
         }
     }
-
-    /// An owned snapshot, so a `try_stream!` can hold the partition key across
-    /// its `.await`s without borrowing the collection id.
-    fn owned(&self) -> OwnedPk {
-        OwnedPk {
-            segment_id: *self.segment_id,
-            key: self.key.to_owned(),
-            state_type: self.state_type,
-            name: self.name.to_owned(),
-        }
-    }
-}
-
-/// Owned partition key, for streamed reads.
-struct OwnedPk {
-    segment_id: crate::SegmentId,
-    key: String,
-    state_type: StateType,
-    name: String,
 }
 
 /// The cell column values bound by the stage / resolved-write paths.
@@ -832,9 +839,8 @@ struct CellBlobs {
 
 /// The key + clustering columns addressing one cell in its partition: the four
 /// partition-key columns and the cell's `section`/`coordinate`. `kind` is
-/// **not** carried — each [`CellBatchRow`] variant binds its own constant
-/// `kind` (`Cell` vs `Index`), so one address serves both a cell row and its
-/// index-marker row.
+/// **not** carried — each [`RowShape`] binds its own `kind` (`Cell` vs
+/// `Index`), so one address serves both a cell row and its index-marker row.
 #[derive(Clone, Copy)]
 struct CellAddr<'a> {
     pk: Pk<'a>,
@@ -853,43 +859,35 @@ impl<'a> CellAddr<'a> {
 }
 
 /// One durable row bound into a same-partition `UNLOGGED BATCH`: the prepared
-/// statement it targets and a row-shape struct that binds exactly that
-/// statement's columns. There is one variant per distinct cell statement
-/// because [`scylla::batch::Batch`] binds its statement list 1:1 with the value
-/// list, so a row must serialize precisely the columns of the statement
-/// [`BatchRow::statement`] returns. `PromoteCell`/`IndexDelete` share the
-/// key-only [`KeyRow`] shape but stay distinct variants because they select
-/// different statements and bind a different constant `kind`.
-enum CellBatchRow<'a> {
+/// statement it targets and the [`RowShape`] that binds exactly that
+/// statement's columns. [`scylla::statement::batch::Batch`] binds its
+/// statement list 1:1 with the value list, so each row must serialize
+/// precisely the columns of the statement [`BatchRow::statement`] returns —
+/// kept consistent at the construction sites, which pair each shape with its
+/// own statement.
+struct CellBatchRow<'a> {
+    statement: &'a PreparedStatement,
+    row: RowShape<'a>,
+}
+
+/// The column shape a [`CellBatchRow`] binds — one variant per distinct bind
+/// tuple. A cell promote and an index-marker delete share the key-only
+/// [`Key`](Self::Key) shape: they differ only in statement and constant
+/// `kind`, both carried as data.
+enum RowShape<'a> {
     /// Stage a provisional cell (`kind=Cell`): the full `data | prev_data |
     /// event` shape plus shared `encoding`/`version`.
-    StageCell {
-        statement: &'a PreparedStatement,
-        row: StageRow<'a>,
-    },
-    /// Promote a provisional cell (`kind=Cell`): nulls `prev_data`/`event`,
-    /// keeping `data` and its TTL. Key columns only.
-    PromoteCell {
-        statement: &'a PreparedStatement,
-        row: KeyRow<'a>,
-    },
+    Stage(StageRow<'a>),
     /// Write a resolved value (`kind=Cell`): committed `data` +
     /// encoding/version, nulling `prev_data`/`event`.
-    RollbackCell {
-        statement: &'a PreparedStatement,
-        row: ResolvedRow<'a>,
-    },
-    /// Upsert a bare provisional-coordinate marker (`kind=Index`) at the cell's
-    /// TTL, so the marker expires with it.
-    IndexUpsert {
-        statement: &'a PreparedStatement,
-        row: IndexUpsertRow<'a>,
-    },
-    /// Delete a provisional-coordinate marker (`kind=Index`). Key columns only.
-    IndexDelete {
-        statement: &'a PreparedStatement,
-        row: KeyRow<'a>,
-    },
+    Resolved(ResolvedRow<'a>),
+    /// Upsert a bare provisional-coordinate marker (`kind=Index`) at the
+    /// cell's TTL, so the marker expires with it.
+    IndexUpsert(IndexUpsertRow<'a>),
+    /// Key columns only, binding the carried [`CellKind`]: a cell promote
+    /// (`kind=Cell`, nulling `prev_data`/`event` while keeping `data` and its
+    /// TTL) or an index-marker delete (`kind=Index`).
+    Key(KeyRow<'a>),
 }
 
 /// The `write_provisional[_no_ttl]` bind shape. `ttl` selects the with-/no-TTL
@@ -931,13 +929,7 @@ struct KeyRow<'a> {
 
 impl BatchRow for CellBatchRow<'_> {
     fn statement(&self) -> &PreparedStatement {
-        match self {
-            CellBatchRow::StageCell { statement, .. }
-            | CellBatchRow::PromoteCell { statement, .. }
-            | CellBatchRow::RollbackCell { statement, .. }
-            | CellBatchRow::IndexUpsert { statement, .. }
-            | CellBatchRow::IndexDelete { statement, .. } => statement,
-        }
+        self.statement
     }
 }
 
@@ -947,15 +939,11 @@ impl SerializeRow for CellBatchRow<'_> {
         ctx: &RowSerializationContext<'_>,
         writer: &mut RowWriter<'_>,
     ) -> Result<(), SerializationError> {
-        match self {
-            CellBatchRow::StageCell { row, .. } => row.serialize(ctx, writer),
-            CellBatchRow::RollbackCell { row, .. } => row.serialize(ctx, writer),
-            CellBatchRow::IndexUpsert { row, .. } => row.serialize(ctx, writer),
-            // Promote and index-delete share the key-only `KeyRow` shape (they
-            // differ only in statement + constant `kind`, both carried above).
-            CellBatchRow::PromoteCell { row, .. } | CellBatchRow::IndexDelete { row, .. } => {
-                row.serialize(ctx, writer)
-            }
+        match &self.row {
+            RowShape::Stage(row) => row.serialize(ctx, writer),
+            RowShape::Resolved(row) => row.serialize(ctx, writer),
+            RowShape::IndexUpsert(row) => row.serialize(ctx, writer),
+            RowShape::Key(row) => row.serialize(ctx, writer),
         }
     }
 
@@ -1125,14 +1113,14 @@ where
 /// Whether `key` has walked past the in-code `end` bound for the scan
 /// direction. `Unbounded` never stops; an `Excluded` bound also stops *on* the
 /// endpoint (the exclusive variant for coverage gap fall-through).
-fn past_end(dir: Direction, key: &CellKey, end: Bound<&[u8]>) -> bool {
+fn past_end(dir: Direction, key: &CellKey, end: Bound<&Coordinate>) -> bool {
     let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
         (_, Bound::Unbounded) => false,
-        (Direction::Forward, Bound::Included(end)) => coordinate > end,
-        (Direction::Forward, Bound::Excluded(end)) => coordinate >= end,
-        (Direction::Backward, Bound::Included(end)) => coordinate < end,
-        (Direction::Backward, Bound::Excluded(end)) => coordinate <= end,
+        (Direction::Forward, Bound::Included(end)) => coordinate > end.as_bytes(),
+        (Direction::Forward, Bound::Excluded(end)) => coordinate >= end.as_bytes(),
+        (Direction::Backward, Bound::Included(end)) => coordinate < end.as_bytes(),
+        (Direction::Backward, Bound::Excluded(end)) => coordinate <= end.as_bytes(),
     }
 }
 
@@ -1173,14 +1161,14 @@ fn ttl_to_i32(ttl: CompactDuration) -> i32 {
     ttl.seconds().try_into().unwrap_or(i32::MAX)
 }
 
-/// Converts a `TTL(data)` read into the cache-fill remaining duration. A NULL
-/// (`None`) means the cell has no TTL — it never expires. A present value is
-/// the whole remaining seconds (a FLOOR), so a fjall entry stamped
-/// `now + remaining` never outlives the durable row — including `0`, which
-/// means *sub-second remaining* and must stamp an (almost) immediate expiry,
-/// never "never" (a negative is treated the same, defensively). Collapsing `0`
-/// into `None` would let the fjall entry outlive a durable row that dies within
-/// the second.
+/// Converts a blob-TTL read (`decode`'s `blob_ttl`) into the cache-fill
+/// remaining duration. A NULL (`None`) means the cell has no TTL — it never
+/// expires. A present value is the whole remaining seconds (a FLOOR), so a
+/// fjall entry stamped `now + remaining` never outlives the durable row —
+/// including `0`, which means *sub-second remaining* and must stamp an
+/// (almost) immediate expiry, never "never" (a negative is treated the same,
+/// defensively). Collapsing `0` into `None` would let the fjall entry outlive
+/// a durable row that dies within the second.
 fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuration> {
     ttl.map(|s| CompactDuration::new(u32::try_from(s).unwrap_or(0)))
 }
@@ -1214,11 +1202,13 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Reads one cell's columns plus the row's remaining `data` TTL, for the
-        /// cache-fill point read. `TTL(data)` is a read function (no schema
-        /// change); it returns NULL when `data` is NULL or the row has no TTL.
+        /// Reads one cell's columns plus each blob's remaining TTL, for the
+        /// cache-fill point read. `TTL(column)` is a read function (no schema
+        /// change); it returns NULL when the column is NULL or the row has no
+        /// TTL. Both blobs are selected so the co-expiry can follow whichever
+        /// blob resolution returns (the `decode` module's `blob_ttl`).
         read_cell_ttl: (
-            "SELECT data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT data, prev_data, encoding, version, event, TTL(data), TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
@@ -1227,7 +1217,8 @@ cassandra_queries! {
 
         /// Forward single-section scan from an inclusive `coordinate` anchor.
         scan_forward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
+             TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate >= ? \
@@ -1237,7 +1228,8 @@ cassandra_queries! {
 
         /// Forward single-section scan from an exclusive `coordinate` anchor.
         scan_forward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
+             TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate > ? \
@@ -1247,7 +1239,8 @@ cassandra_queries! {
 
         /// Forward single-section scan over the whole section (unbounded start).
         scan_forward_all: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
+             TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? \
@@ -1257,7 +1250,8 @@ cassandra_queries! {
 
         /// Backward single-section scan from an inclusive `coordinate` anchor.
         scan_backward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
+             TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate <= ? \
@@ -1267,7 +1261,8 @@ cassandra_queries! {
 
         /// Backward single-section scan from an exclusive `coordinate` anchor.
         scan_backward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
+             TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate < ? \
@@ -1278,7 +1273,8 @@ cassandra_queries! {
         /// Backward single-section scan over the whole section (unbounded
         /// start).
         scan_backward_all: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
+             TTL(prev_data) \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? \

@@ -8,9 +8,9 @@
 //! collection's observable state must equal a plain `VecDeque`/`BTreeMap` model
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
-//! caught. This single property covers the dense-window / loose-bounds
-//! invariants (inv 4), key/positional ordering, containment, and the
-//! bounds-and-entries-promote-together crash atomicity (inv 1 composite).
+//! caught. This single property covers dense-window / loose-bounds invariants,
+//! key/positional ordering, containment, and the bounds-and-entries-promote-
+//! together crash atomicity.
 //!
 //! Memory-backed only: the `cell_suite` runners already prove memory ↔
 //! Cassandra parity for the underlying store, and the collection logic lives
@@ -29,7 +29,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{
-    ArmedKeys, CellRead, KeyedStateSession, SessionParts, TerminationWatch,
+    ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
 use crate::state::{
@@ -268,20 +268,55 @@ async fn resolve_event(
     Ok(true)
 }
 
-/// Drives a deque trace, asserting the handle equals a `VecDeque` model after
-/// every event and that each `pop` returns the model's value.
+/// The warm backing shared across a trace's events, handed to the read-back
+/// assertion so a kind whose invariant needs the raw cells (Map's bound-cell
+/// superset check) can reach them.
+struct Backing<'a> {
+    cells: &'a MemoryCells,
+    oracle: &'a ScriptedOracle,
+    registry: &'a Arc<CollectionDefRegistry>,
+    state_key: &'a StateKey,
+}
+
+/// Drives a generated trace through the real [`KeyedStateSession`] lifecycle
+/// for any collection kind — the Deque and Map suites differ only in the op
+/// alphabet, the model, and the assertions, so everything else lives here once:
+/// bind a fresh session per event, apply each op (`apply_op`, which also
+/// asserts mid-trace `pop`/`get` returns), `finalize`, resolve along the
+/// event's outcome (promote / rollback / crash → sweep), advance the model on
+/// commit, then assert the committed collection through a fresh read-back
+/// session (`assert`, which absorbs any kind-specific check such as Map's
+/// bound-cell superset).
 ///
 /// # Errors
 ///
 /// Propagates backend / oracle errors raised during the run.
-pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
+async fn run_collection_trace<D, O, M, Apply, Assert>(
+    trace: Trace<O>,
+    descriptor: D,
+    name: &str,
+    apply_op: Apply,
+    assert: Assert,
+) -> Result<bool>
+where
+    D: StateDescriptor,
+    O: Copy,
+    M: Clone + Default,
+    Apply: AsyncFn(&D::Handle<SuiteSession>, O, &mut M) -> Result<bool>,
+    Assert: AsyncFn(&D::Handle<SuiteSession>, &M, &Backing<'_>) -> Result<bool>,
+{
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let descriptor = deque_state::<JsonCodec>("dq");
-    let (registry, collection_ref) = registry_and_ref(&descriptor, "dq", &state_key)?;
+    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key)?;
     let armed: ArmedKeys = Arc::default();
-    let mut model: VecDeque<Value> = VecDeque::new();
+    let backing = Backing {
+        cells: &cells,
+        oracle: &oracle,
+        registry: &registry,
+        state_key: &state_key,
+    };
+    let mut model = M::default();
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let event = EventRef::Message {
@@ -292,23 +327,7 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
 
         let mut scratch = model.clone();
         for op in &ev.ops {
-            let ok = match *op {
-                DequeOp::PushBack(b) => {
-                    let v = Value::from(b);
-                    handle.push_back(v.clone()).await?;
-                    scratch.push_back(v);
-                    true
-                }
-                DequeOp::PushFront(b) => {
-                    let v = Value::from(b);
-                    handle.push_front(v.clone()).await?;
-                    scratch.push_front(v);
-                    true
-                }
-                DequeOp::PopBack => handle.pop_back().await? == scratch.pop_back(),
-                DequeOp::PopFront => handle.pop_front().await? == scratch.pop_front(),
-            };
-            if !ok {
+            if !apply_op(&handle, *op, &mut scratch).await? {
                 return Ok(false);
             }
         }
@@ -351,101 +370,84 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
         let read_handle = descriptor
             .bind(&read)
             .map_err(|e| eyre!("bind read: {e}"))?;
-        if !assert_deque(&read_handle, &model).await? {
+        if !assert(&read_handle, &model, &backing).await? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
+/// Drives a deque trace, asserting the handle equals a `VecDeque` model after
+/// every event and that each `pop` returns the model's value.
+///
+/// # Errors
+///
+/// Propagates backend / oracle errors raised during the run.
+pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
+    run_collection_trace(
+        trace,
+        deque_state::<JsonCodec>("dq"),
+        "dq",
+        async |handle, op, scratch: &mut VecDeque<Value>| match op {
+            DequeOp::PushBack(b) => {
+                let v = Value::from(b);
+                handle.push_back(v.clone()).await?;
+                scratch.push_back(v);
+                Ok(true)
+            }
+            DequeOp::PushFront(b) => {
+                let v = Value::from(b);
+                handle.push_front(v.clone()).await?;
+                scratch.push_front(v);
+                Ok(true)
+            }
+            DequeOp::PopBack => Ok(handle.pop_back().await? == scratch.pop_back()),
+            DequeOp::PopFront => Ok(handle.pop_front().await? == scratch.pop_front()),
+        },
+        async |handle, model, _backing: &Backing<'_>| assert_deque(handle, model).await,
+    )
+    .await
+}
+
 /// Drives a map trace, asserting the handle equals a `BTreeMap` model after
-/// every event and that each mid-trace `get` returns the model's value.
+/// every event, that each mid-trace `get` returns the model's value, and that
+/// the stored bounds cover a loose superset of the live key range.
 ///
 /// # Errors
 ///
 /// Propagates backend / oracle errors raised during the run.
 pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
-    let oracle = ScriptedOracle::default();
-    let cells = MemoryCells::new();
-    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let (registry, collection_ref) = registry_and_ref(&descriptor, "mp", &state_key)?;
-    let armed: ArmedKeys = Arc::default();
-    let mut model: BTreeMap<i64, Value> = BTreeMap::new();
-
-    for (index, ev) in trace.events.into_iter().enumerate() {
-        let event = EventRef::Message {
-            dedup_id: Uuid::from_u128(index as u128),
-        };
-        let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
-        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-
-        let mut scratch = model.clone();
-        for op in &ev.ops {
-            let ok = match *op {
-                MapOp::Set(k, b) => {
-                    let v = Value::from(b);
-                    handle.set(&k, v.clone()).await?;
-                    scratch.insert(k, v);
-                    true
-                }
-                MapOp::Remove(k) => {
-                    handle.remove(&k).await?;
-                    scratch.remove(&k);
-                    true
-                }
-                MapOp::Get(k) => handle.get(&k).await? == scratch.get(&k).cloned(),
-            };
-            if !ok {
-                return Ok(false);
+    run_collection_trace(
+        trace,
+        map_state::<I64KeyCodec, JsonCodec>("mp"),
+        "mp",
+        async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
+            MapOp::Set(k, b) => {
+                let v = Value::from(b);
+                handle.set(&k, v.clone()).await?;
+                scratch.insert(k, v);
+                Ok(true)
             }
-        }
-
-        session
-            .finalize()
-            .await
-            .map_err(|e| eyre!("finalize: {e}"))?;
-        if ev.outcome.commits() {
-            oracle
-                .record_message(event_dedup(event))
-                .await
-                .map_err(|e| eyre!("marker: {e}"))?;
-        }
-        if !resolve_event(
-            session,
-            ev.outcome,
-            &cells,
-            &oracle,
-            &registry,
-            &collection_ref,
-        )
-        .await?
-        {
-            return Ok(false);
-        }
-        if ev.outcome.commits() {
-            model = scratch;
-        }
-
-        let read = make_session(
-            &cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(index),
-        );
-        let read_handle = descriptor
-            .bind(&read)
-            .map_err(|e| eyre!("bind read: {e}"))?;
-        if !assert_map(&read_handle, &model).await? {
-            return Ok(false);
-        }
-        if !assert_map_bounds(&cells, &oracle, &registry, &state_key, &model).await? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+            MapOp::Remove(k) => {
+                handle.remove(&k).await?;
+                scratch.remove(&k);
+                Ok(true)
+            }
+            MapOp::Get(k) => Ok(handle.get(&k).await? == scratch.get(&k).cloned()),
+        },
+        async |handle, model, backing: &Backing<'_>| {
+            Ok(assert_map(handle, model).await?
+                && assert_map_bounds(
+                    backing.cells,
+                    backing.oracle,
+                    backing.registry,
+                    backing.state_key,
+                    model,
+                )
+                .await?)
+        },
+    )
+    .await
 }
 
 /// Inv 4 (`MetaBoundsCoverLive`, Map): the stored `META_MIN`/`META_MAX` bound a
@@ -498,7 +500,7 @@ async fn assert_map_bounds(
 /// `get` at every position (including out of range → `None`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
-    S: CellRead,
+    S: CellSession,
     C: Codec<Payload = Value>,
 {
     if handle.len().await? != model.len() || handle.is_empty().await? != model.is_empty() {
@@ -523,7 +525,7 @@ where
 /// Collects a deque handle's `stream(dir)` into a vector.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
-    S: CellRead,
+    S: CellSession,
     C: Codec<Payload = Value>,
 {
     let mut out = Vec::new();
@@ -543,7 +545,7 @@ async fn assert_map<S>(
     model: &BTreeMap<i64, Value>,
 ) -> Result<bool>
 where
-    S: CellRead,
+    S: CellSession,
 {
     for key in KEY_POOL {
         if handle.get(&key).await? != model.get(&key).cloned() {
@@ -564,7 +566,7 @@ async fn collect_map<S>(
     dir: Direction,
 ) -> Result<Vec<(i64, Value)>>
 where
-    S: CellRead,
+    S: CellSession,
 {
     let mut out = Vec::new();
     let stream = handle.stream(dir);
