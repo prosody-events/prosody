@@ -695,7 +695,7 @@ where
                 // any record failed, leave it unseeded so the next sweep re-seeds
                 // cold from the durable `kind=Index` markers rather than
                 // short-circuiting on an incomplete snapshot and stranding a
-                // provisional cell (F4) — symmetric with `write_provisional`.
+                // provisional cell — symmetric with `write_provisional`.
                 if all_recorded {
                     degrade_cover_mut(
                         "mark_seeded",
@@ -729,14 +729,14 @@ where
             // A partial durable stage may have landed `kind=Index` markers the
             // warm set now misses; drop the seeded latch so the next sweep
             // re-seeds from the durable index and restores completeness (the
-            // warm-index invariant), closing the strand hole (F4).
+            // warm-index invariant), closing the strand hole.
             degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
             return Err(error);
         }
         // Record the staged coordinates into the warm index after the durable
         // ack, as one atomic batch. A warm write failure drops the seeded
         // latch so the next sweep re-seeds from the durable `kind=Index` —
-        // never leaving the latch true with an unaccounted coordinate (F4).
+        // never leaving the latch true with an unaccounted coordinate.
         if let Err(error) = self
             .fjall
             .index_record_batch(collection.id(), writes.iter().map(|(cell, _)| cell))

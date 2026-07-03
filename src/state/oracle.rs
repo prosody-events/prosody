@@ -11,8 +11,8 @@
 //!
 //! The resolve half is intentionally kind-agnostic at the callsite — the
 //! [`StateKey`] supplies the application [`Key`] the timer
-//! arm needs (`docs/keyed-state/design-summary.md` §"Commit Oracles"), and
-//! the message arm ignores it. The write half is message-only: the timer
+//! arm's tag lookup needs, and the message arm ignores it. The write half
+//! is message-only: the timer
 //! oracle's row (the trigger tag) is written by the timer's own commit
 //! machinery, never through this trait.
 //!

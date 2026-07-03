@@ -1,9 +1,9 @@
 //! Descriptor binding, registration, and typed round-trip tests.
 //!
-//! N2 — the typed `set(T) → cell bytes → store → get() → T` round-trip over
-//! the real per-event session machinery. N4 — the two-instance interface
-//! proof: the JSON and Kafka descriptors bind through the *same* session
-//! machinery ([`bind_registered`]). N5 — registration and bind error surfaces,
+//! The typed `set(T) → cell bytes → store → get() → T` round-trip over the
+//! real per-event session machinery; the one-binding-path proof that the
+//! JSON and Kafka descriptors bind through the *same* session machinery
+//! ([`bind_registered`]); and the registration and bind error surfaces,
 //! including the state-unavailable stub on contexts without keyed state.
 
 use super::*;
@@ -79,8 +79,8 @@ pub(crate) type TestSession = KeyedStateSession<
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
-/// kind runs through (the N4 proof is that both the JSON tests here and
-/// the Kafka-message tests in
+/// kind runs through (the one-binding-path proof is that both the JSON
+/// tests here and the Kafka-message tests in
 /// [`crate::consumer::kafka_state::tests`] call exactly this).
 pub(crate) fn bind_registered<DESC>(
     descriptor: DESC,
@@ -159,8 +159,8 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// N2 invariant: for every JSON-representable value, `set(v)` then `get()`
-/// returns `Some(v)` — the value survives the full
+/// Round-trip invariant: for every JSON-representable value, `set(v)` then
+/// `get()` returns `Some(v)` — the value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
 /// the real session substrate.
 async fn roundtrip(value: Value) -> Result<bool> {
@@ -229,7 +229,7 @@ impl Codec for CartCodec {
     }
 }
 
-/// N2 (typed): a cell declared with a user codec round-trips its payload
+/// Typed round-trip: a cell declared with a user codec round-trips its payload
 /// type and records the codec's token in the structural identity.
 #[tokio::test]
 async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
@@ -245,7 +245,7 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
     Ok(())
 }
 
-/// N5: binding against a context without keyed state (any context whose
+/// Binding against a context without keyed state (any context whose
 /// session is the [`UnavailableState`](crate::state::session::UnavailableState)
 /// stub — here the bare mock) fails with the Permanent
 /// [`StateAccessError::Unavailable`].
@@ -260,7 +260,7 @@ fn state_unavailable_without_keyed_state() -> Result<()> {
     Ok(())
 }
 
-/// N5: binding an unregistered descriptor fails with a Permanent
+/// Binding an unregistered descriptor fails with a Permanent
 /// [`StateAccessError::Unregistered`] — access requires prior
 /// registration.
 #[tokio::test]
@@ -277,7 +277,7 @@ async fn state_with_unregistered_descriptor_errors() -> Result<()> {
     Ok(())
 }
 
-/// N5: binding a descriptor whose identity differs from the registered one
+/// Binding a descriptor whose identity differs from the registered one
 /// fails with [`StateAccessError::IdentityMismatch`].
 #[tokio::test]
 async fn bind_with_mismatched_identity_errors() -> Result<()> {
@@ -294,7 +294,7 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
     Ok(())
 }
 
-/// N5: re-registering the same name with a *different* structural identity
+/// Re-registering the same name with a *different* structural identity
 /// is rejected — both for a differing `codec_id` (a Kafka descriptor over a
 /// name registered as a JSON value) and for a differing collection `kind` (a
 /// Map, then a Deque, over a name registered as a Value).
@@ -322,7 +322,7 @@ fn conflicting_registration_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// N5: binding a descriptor of one kind where a different kind was registered
+/// Binding a descriptor of one kind where a different kind was registered
 /// under the same name fails with a Permanent
 /// [`StateAccessError::IdentityMismatch`] — the kind is part of the frozen
 /// structural identity.
@@ -343,7 +343,7 @@ async fn bind_with_mismatched_kind_errors() -> Result<()> {
     Ok(())
 }
 
-/// N5: re-registering the same name with an *unchanged* identity is
+/// Re-registering the same name with an *unchanged* identity is
 /// accepted and updates the operational settings — the second `CollectionDef`
 /// wins. Identity is frozen; TTL and commit mode are not.
 #[test]
@@ -381,7 +381,7 @@ fn reregistration_updates_operational_settings() -> Result<()> {
     Ok(())
 }
 
-/// N5: an empty descriptor name fails loudly at registration — the
+/// An empty descriptor name fails loudly at registration — the
 /// fallible boundary backing the infallible `const fn value_state`.
 #[test]
 fn empty_name_rejected_at_registration() {

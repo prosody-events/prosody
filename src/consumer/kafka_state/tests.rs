@@ -2,9 +2,9 @@
 //! property and the end-to-end resolve-through-loader path.
 //!
 //! These bind through the *same* [`bind_registered`] machinery the JSON
-//! descriptor tests use — the N4 proof that the Kafka-message descriptor is
-//! just a `ValueDescriptor<C, R>` over a codec + resolver, with no bespoke
-//! binding path.
+//! descriptor tests use — the one-binding-path proof that the Kafka-message
+//! descriptor is just a `ValueDescriptor<C, R>` over a codec + resolver,
+//! with no bespoke binding path.
 
 use super::*;
 use crate::Key;

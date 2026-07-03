@@ -60,7 +60,9 @@ pub use state::{InlineTimer, TimerState};
 
 /// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///
-/// Each instance is scoped to a single partition and has its own state cache.
+/// Each store is scoped to a single partition and carries a per-store state
+/// cache **shared by its clones** — the sharing the commit oracle's
+/// cache-first `current_tag` read relies on (see its doc).
 /// Created by [`CassandraTriggerStoreProvider`].
 #[derive(Clone, Educe)]
 #[educe(Debug)]

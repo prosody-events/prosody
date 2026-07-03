@@ -507,7 +507,7 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
 /// A cold-seed `index_record` failure must leave the collection **unseeded** so
 /// the next sweep re-seeds from the durable index — never latch `seeded` over
 /// an incomplete on-disk coords set, which would drop the unrecorded coordinate
-/// from every later warm sweep and strand it (F4). Symmetric with
+/// from every later warm sweep and strand it. Symmetric with
 /// `write_provisional`'s unseed-on-record-failure.
 #[test]
 fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
