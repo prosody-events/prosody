@@ -764,11 +764,6 @@ async fn test_timer_different_keys() -> Result<()> {
         let expected_keys: HashSet<String> = timers.iter().map(|k| (*k).to_owned()).collect();
         TestEnvironment::verify_timer_keys(&received_timers, &expected_keys)?;
 
-        // Verify each timer has correct key
-        for timer_event in &received_timers {
-            TestEnvironment::verify_timer_event(timer_event, &timer_event.key)?;
-        }
-
         // Clean up
         env.cleanup().await?;
         Ok(())

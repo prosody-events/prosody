@@ -12,7 +12,7 @@ const TOMBSTONE_COUNT: i64 = 5_000;
 #[tokio::test]
 async fn test_get_next_skips_low_offset_tombstones() -> color_eyre::Result<()> {
     let store = build_store().await?;
-    let k: Key = Arc::from(format!("tombstone-msg-{}", uuid::Uuid::new_v4()));
+    let k = key("tombstone-msg");
     let segment_id = store.segment_id().await?;
     let ttl = store.store.base_ttl();
 

@@ -8,7 +8,7 @@ async fn seeded_legacy(
     retry_count: Option<u32>,
 ) -> color_eyre::Result<(CassandraMessageDeferStore, Key)> {
     let store = build_store().await?;
-    let k: Key = Arc::from(format!("legacy-key-{}", uuid::Uuid::new_v4()));
+    let k = key("legacy-key");
     store
         .seed_legacy_for_test(&k, clustering, retry_count)
         .await?;

@@ -141,11 +141,14 @@ async fn test_partition_manager_capacity() {
     partition_manager.shutdown().await;
 }
 
+/// Same-key events are strictly serialized, in order: each handler holds its
+/// key "in processing" for a real delay, so any second same-key dispatch
+/// before the first completes would trip the concurrency flag.
 #[tokio::test]
 async fn test_partition_manager_ordering() {
     init_test_logging();
 
-    let handler = TestHandler::new();
+    let handler = TestHandler::with_delay(Duration::from_millis(20));
     let config = default_config();
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
@@ -170,37 +173,11 @@ async fn test_partition_manager_ordering() {
         &*processed_offsets, &offsets,
         "Messages should be processed in order"
     );
+    drop(processed_offsets);
 
-    partition_manager.shutdown().await;
-}
-
-#[tokio::test]
-async fn test_partition_manager_concurrent_processing() {
-    init_test_logging();
-
-    let handler = TestHandler::new();
-    let config = default_config();
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
-
-    // Send messages with different keys
-    for i in 0..5_u8 {
-        let key = format!("key{i}");
-        let message = create_test_message(Offset::from(i), &key);
-        assert!(
-            partition_manager.try_send(message).is_ok(),
-            "Message send should succeed"
-        );
-    }
-
-    // Wait for all messages to be processed
-    wait_for_processed_offsets(&handler, 5, Duration::from_secs(1))
-        .await
-        .expect("Messages should be processed");
-
-    // Check that no concurrent processing of the same key occurred
-    let has_concurrent = handler.has_concurrent_processing.lock().await;
+    // Verify no two handlers ever ran the same key concurrently
     assert!(
-        !*has_concurrent,
+        !*handler.has_concurrent_processing.lock().await,
         "No concurrent processing of the same key should occur"
     );
 
@@ -495,15 +472,24 @@ struct TestHandler {
     has_concurrent_processing: Arc<Mutex<bool>>,
     keys_in_processing: Arc<Mutex<Vec<Key>>>,
     notify: Arc<Notify>,
+    delay: Duration,
 }
 
 impl TestHandler {
     fn new() -> Self {
+        Self::with_delay(Duration::ZERO)
+    }
+
+    /// A handler that holds each key "in processing" for `delay` (simulated
+    /// processing time), widening the window in which a second same-key
+    /// dispatch would overlap and trip the concurrency flag.
+    fn with_delay(delay: Duration) -> Self {
         Self {
             processed_offsets: Arc::new(Mutex::new(Vec::new())),
             has_concurrent_processing: Arc::new(Mutex::new(false)),
             keys_in_processing: Arc::new(Mutex::new(Vec::new())),
             notify: Arc::new(Notify::new()),
+            delay,
         }
     }
 }
@@ -536,6 +522,7 @@ impl EventHandler for TestHandler {
         let concurrent_flag = self.has_concurrent_processing.clone();
         let keys_proc = self.keys_in_processing.clone();
         let notify = self.notify.clone();
+        let delay = self.delay;
         async move {
             {
                 let mut keys = keys_proc.lock().await;
@@ -546,13 +533,16 @@ impl EventHandler for TestHandler {
                     keys.push(key.clone());
                 }
             }
-            {
-                let mut keys = keys_proc.lock().await;
-                keys.retain(|k| k != &key);
-            };
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
             {
                 let mut list = processed.lock().await;
                 list.push(offset);
+            };
+            {
+                let mut keys = keys_proc.lock().await;
+                keys.retain(|k| k != &key);
             };
             notify.notify_waiters();
             message.commit().await;
@@ -586,39 +576,19 @@ fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage<serde_json:
     )
 }
 
-fn create_test_message_with_event_id(
-    offset: Offset,
-    key: &str,
-    event_id: Option<&str>,
-) -> ConsumerMessage<serde_json::Value> {
-    let payload = event_id.map_or_else(
-        || serde_json::json!({}),
-        |id| serde_json::json!({ "id": id }),
-    );
-    let semaphore = Arc::new(Semaphore::new(10));
-    ConsumerMessage::new(
-        ConsumerMessageValue {
-            offset,
-            key: key.into(),
-            payload,
-            ..Default::default()
-        },
-        Span::current(),
-        semaphore
-            .try_acquire_owned()
-            .expect("Failed to acquire permit"),
-    )
-}
-
+/// Timer and processing heartbeats stay integrated into partition stall
+/// detection: a registered-but-never-beaten heartbeat trips stall detection
+/// once its last beat is older than the threshold, so remaining un-stalled
+/// across a window several thresholds wide proves every registered heartbeat
+/// is actively beaten.
 #[tokio::test]
 async fn test_partition_manager_timer_heartbeat_integration() {
     init_test_logging();
 
-    // Test verifies that timer heartbeats are properly integrated into partition
-    // stall detection
     let handler = TestHandler::new();
-    let config = default_config();
-    let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
+    let mut config = default_config();
+    config.stall_threshold = Duration::from_millis(200);
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Initially, the partition should not be stalled
     assert!(
@@ -626,23 +596,27 @@ async fn test_partition_manager_timer_heartbeat_integration() {
         "Partition should not be stalled initially"
     );
 
-    // Send a message to trigger timer manager initialization
-    let message = create_test_message_with_event_id(1, "test-key", None);
-    let _ = partition_manager.try_send(message);
+    // Send a message to spin up the keyed processing loop and timer manager,
+    // registering their heartbeats
+    let message = create_test_message(1, "test-key");
+    assert!(
+        partition_manager.try_send(message).is_ok(),
+        "Message send should succeed"
+    );
+    wait_for_processed_offsets(&handler, 1, Duration::from_secs(1))
+        .await
+        .expect("Message should be processed");
 
-    // Give some time for the timer manager to initialize and heartbeat to be set
-    sleep(Duration::from_millis(100)).await;
-
-    // The partition should still not be stalled after timer initialization
+    // Negative-invariant observation window (~3× the stall threshold): by its
+    // end every registered heartbeat is past the threshold unless actively
+    // beaten, so this fails if the heartbeats stop being beaten or integrated
+    sleep(Duration::from_millis(600)).await;
     assert!(
         !partition_manager.is_stalled(),
-        "Partition should not be stalled after timer initialization"
+        "Partition must not stall while its heartbeats are actively beaten"
     );
 
-    // Clean shutdown
+    // Shutdown drains the in-flight commit, so the watermark reflects it
     let watermark = partition_manager.shutdown().await;
-    assert!(
-        watermark.is_some() || watermark.is_none(),
-        "Shutdown should complete"
-    );
+    assert_eq!(watermark, Some(1), "Shutdown should drain the commit");
 }

@@ -1133,13 +1133,13 @@ async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
 
 /// Property test verifying the timer state invariant:
 ///
-/// - **1 timer** for a `(segment_id, key, timer_type)` → state must be `Inline`
-///   holding it, no clustering rows.
+/// - **1 timer** for a `(key, timer_type)` → state must be `Inline` holding it,
+///   no clustering rows.
 /// - **>1 timer** → state must be `Overflow`, all timers in clustering rows.
 /// - **0 timers** → state must be `Absent`.
 ///
 /// Applies a random sequence of operations then inspects every
-/// `(segment_id, key, timer_type)` combination against the reference model.
+/// `(key, timer_type)` combination against the reference model.
 #[test]
 fn test_prop_timer_state_invariant() {
     use crate::test_util::TEST_RUNTIME;
@@ -1400,7 +1400,7 @@ async fn apply_op_and_verify_tags(
     expected_tags: &mut HashMap<(Key, TimerType, CompactDateTime), i32>,
 ) -> Result<()> {
     match op {
-        KeyTriggerOperation::Insert { trigger, .. } => {
+        KeyTriggerOperation::Insert { trigger } => {
             store.upsert_key_trigger(trigger.clone()).await?;
             snapshot_tag(
                 store,
@@ -1417,23 +1417,20 @@ async fn apply_op_and_verify_tags(
             timer_type,
             key,
             time,
-            ..
         } => {
             store.delete_key_trigger(*timer_type, key, *time).await?;
             expected_tags.remove(&(key.clone(), *timer_type, *time));
             verify_tags_for_key_type(store, expected_tags, key, *timer_type).await?;
         }
-        KeyTriggerOperation::ClearByType {
-            timer_type, key, ..
-        } => {
+        KeyTriggerOperation::ClearByType { timer_type, key } => {
             store.clear_key_triggers(*timer_type, key).await?;
             expected_tags.retain(|(k, tt, _), _| !(k == key && *tt == *timer_type));
         }
-        KeyTriggerOperation::ClearAllTypes { key, .. } => {
+        KeyTriggerOperation::ClearAllTypes { key } => {
             store.clear_key_triggers_all_types(key).await?;
             expected_tags.retain(|(k, ..), _| k != key);
         }
-        KeyTriggerOperation::ClearAndSchedule { trigger, .. } => {
+        KeyTriggerOperation::ClearAndSchedule { trigger } => {
             store.clear_and_schedule_key(trigger.clone()).await?;
             expected_tags.retain(|(k, tt, _), _| !(k == &trigger.key && *tt == trigger.timer_type));
             snapshot_tag(
@@ -1474,7 +1471,7 @@ async fn snapshot_tag(
 }
 
 /// Applies operations from [`KeyTriggerTestInput`] and verifies the
-/// timer state invariant holds for every `(segment_id, key, timer_type)`.
+/// timer state invariant holds for every `(key, timer_type)`.
 async fn prop_timer_state_invariant(
     store: &CassandraTriggerStore,
     input: KeyTriggerTestInput,
@@ -1484,11 +1481,9 @@ async fn prop_timer_state_invariant(
     let key_pool = ["key-a", "key-b", "key-c"];
 
     // Clean up before test
-    for _segment_id in &input.segment_ids {
-        for key_str in &key_pool {
-            let key = Key::from(*key_str);
-            store.clear_key_triggers_all_types(&key).await?;
-        }
+    for key_str in &key_pool {
+        let key = Key::from(*key_str);
+        store.clear_key_triggers_all_types(&key).await?;
     }
 
     // Apply all operations to both model and store, verifying tags as we go.
@@ -1499,35 +1494,37 @@ async fn prop_timer_state_invariant(
         apply_op_and_verify_tags(store, op, &mut expected_tags).await?;
     }
 
-    // Verify timer state invariant for every (segment_id, key, timer_type)
-    for (segment_id, key) in &model.all_keys() {
+    // Verify timer state invariant for every (key, timer_type) against the
+    // store's real partition (its own segment).
+    for key in &model.all_keys() {
         for &timer_type in TimerType::VARIANTS {
-            let expected_count = model.get_times(segment_id, timer_type, key).len();
-            let (handle, _) = store.resolve_state(segment_id, key, timer_type).await?;
+            let expected_count = model.get_times(timer_type, key).len();
+            let (handle, _) = store
+                .resolve_state(&store.segment.id, key, timer_type)
+                .await?;
             let timer_state = handle.lock().await.clone();
 
             match expected_count {
                 0 => {
                     assert!(
                         matches!(timer_state, TimerState::Absent),
-                        "Invariant violation: 0 timers for ({segment_id}, {key}, {timer_type:?}) \
-                         but state is {timer_state:?}"
+                        "Invariant violation: 0 timers for ({key}, {timer_type:?}) but state is \
+                         {timer_state:?}"
                     );
                 }
                 1 => {
-                    let expected_time = model.get_times(segment_id, timer_type, key)[0];
+                    let expected_time = model.get_times(timer_type, key)[0];
                     assert!(
                         matches!(&timer_state, TimerState::Inline(t) if t.time == expected_time),
                         "Invariant violation: exactly 1 timer (time={expected_time:?}) for \
-                         ({segment_id}, {key}, {timer_type:?}) but state is {timer_state:?} — \
-                         expected Inline"
+                         ({key}, {timer_type:?}) but state is {timer_state:?} — expected Inline"
                     );
                 }
                 n => {
                     assert!(
                         matches!(timer_state, TimerState::Overflow),
-                        "Invariant violation: {n} timers for ({segment_id}, {key}, \
-                         {timer_type:?}) but state is {timer_state:?} — expected Overflow"
+                        "Invariant violation: {n} timers for ({key}, {timer_type:?}) but state is \
+                         {timer_state:?} — expected Overflow"
                     );
                 }
             }

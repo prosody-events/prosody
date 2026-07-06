@@ -12,6 +12,12 @@ use crate::defer_store_tests;
 use crate::test_util::TEST_KEYSPACE;
 use crate::{ConsumerGroup, Partition, Topic};
 
+/// A unique, prefix-tagged key. The prefix tags which test seeded a row in
+/// the shared `prosody_test` keyspace; the uuid suffix keeps runs isolated.
+fn key(prefix: &str) -> Key {
+    Arc::from(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+}
+
 pub(super) async fn build_store() -> color_eyre::Result<CassandraMessageDeferStore> {
     let config = CassandraConfiguration::builder()
         .nodes(vec!["localhost:9042".to_owned()])

@@ -59,21 +59,12 @@ fn prop_i1_i4(input: TimerDeferTestInput) -> TestResult {
                     continue;
                 }
 
-                if pending_legacy.contains(&key) {
-                    // The two retry-only ops mutate the static `retry_count`
-                    // alone; they never recompute `next_timer`, so they do not
-                    // trigger the lazy repair and the key stays pending. Every
-                    // other op recomputes or repairs `next_timer`, clearing the
-                    // pending mark so the invariants can be checked from here on.
-                    if matches!(
-                        op,
-                        TimerDeferOperation::SetRetryCount { .. }
-                            | TimerDeferOperation::IncrementRetryCount { .. }
-                    ) {
-                        continue;
-                    }
-                    pending_legacy.remove(&key);
-                }
+                // Any op after `SeedLegacy` reaches the store's read path and
+                // triggers the lazy repair that synthesizes `next_timer` —
+                // the two retry-only ops included, since setting `retry_count`
+                // first resolves the static columns. So the key's legacy NULL
+                // state is cleared and its invariants can be checked from here.
+                pending_legacy.remove(&key);
 
                 // I1: the static `next_timer.time` equals the model minimum.
                 let db_next = store

@@ -56,7 +56,7 @@ crate::timer_defer_store_tests!(async { build_test_store().await });
 async fn test_cassandra_timer_defer_store() -> color_eyre::Result<()> {
     let defer_store = build_test_store().await?;
 
-    let key: Key = Arc::from("test-key");
+    let key = key("timer-defer-smoke");
     let time = CompactDateTime::from(1000_u32);
     let trigger = Trigger::new(
         key.clone(),
