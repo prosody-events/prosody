@@ -175,10 +175,10 @@ impl FallibleHandler for MockHandler {
     async fn shutdown(self) {}
 }
 
-fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
+fn create_test_message() -> Result<ConsumerMessage<serde_json::Value>> {
     let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned().ok()?;
-    Some(ConsumerMessage::new(
+    let permit = semaphore.try_acquire_owned()?;
+    Ok(ConsumerMessage::new(
         ConsumerMessageValue::default(),
         Span::current(),
         permit,
@@ -205,49 +205,45 @@ fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
 // === Success Tests ===
 
 #[tokio::test]
-async fn success_on_first_attempt_returns_ok_immediately() {
+async fn success_on_first_attempt_returns_ok_immediately() -> Result<()> {
     let handler = MockHandler::success();
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
 
     assert!(result.is_ok());
     assert_eq!(handler.call_count(), 1, "Should only call handler once");
+    Ok(())
 }
 
 // === Transient Error Tests ===
 
 #[tokio::test]
-async fn transient_error_retries_then_succeeds() {
+async fn transient_error_retries_then_succeeds() -> Result<()> {
     // Fail twice with transient errors, then succeed
     let handler =
         MockHandler::failing_then_success(vec![ErrorCategory::Transient, ErrorCategory::Transient]);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
 
     assert!(result.is_ok(), "Should succeed after retries");
     assert_eq!(handler.call_count(), 3, "Should retry twice then succeed");
+    Ok(())
 }
 
 #[tokio::test]
-async fn transient_error_fails_after_max_retries() {
+async fn transient_error_fails_after_max_retries() -> Result<()> {
     let handler = MockHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
@@ -259,55 +255,52 @@ async fn transient_error_fails_after_max_retries() {
         4,
         "Should attempt 1 + max_retries times"
     );
+    Ok(())
 }
 
 // === Permanent Error Tests ===
 
 #[tokio::test]
-async fn permanent_error_fails_immediately_no_retry() {
+async fn permanent_error_fails_immediately_no_retry() -> Result<()> {
     let handler = MockHandler::always_failing(ErrorCategory::Permanent);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
 
     assert!(result.is_err());
     assert_eq!(handler.call_count(), 1, "Should not retry permanent errors");
+    Ok(())
 }
 
 // === Terminal Error Tests ===
 
 #[tokio::test]
-async fn terminal_error_fails_immediately_no_retry() {
+async fn terminal_error_fails_immediately_no_retry() -> Result<()> {
     let handler = MockHandler::always_failing(ErrorCategory::Terminal);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
 
     assert!(result.is_err());
     assert_eq!(handler.call_count(), 1, "Should not retry terminal errors");
+    Ok(())
 }
 
 // === Demand Type Tests ===
 
 #[tokio::test]
-async fn first_attempt_uses_original_demand_type_retries_use_failure() {
+async fn first_attempt_uses_original_demand_type_retries_use_failure() -> Result<()> {
     // Fail once with transient, then succeed
     let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
@@ -325,12 +318,13 @@ async fn first_attempt_uses_original_demand_type_retries_use_failure() {
         DemandType::Failure,
         "Retry should use Failure"
     );
+    Ok(())
 }
 
 // === Shutdown Tests ===
 
 #[tokio::test]
-async fn shutdown_during_retry_sleep_returns_error() {
+async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
     let handler = MockHandler::always_failing(ErrorCategory::Transient);
     // Use longer delays to give time for shutdown signal
     let retry_handler = RetryHandler {
@@ -340,9 +334,7 @@ async fn shutdown_during_retry_sleep_returns_error() {
         handler: handler.clone(),
     };
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     // Spawn the retry operation
     let ctx = context.clone();
@@ -356,17 +348,15 @@ async fn shutdown_during_retry_sleep_returns_error() {
     // Signal shutdown
     context.request_shutdown();
 
-    // Should complete quickly due to shutdown
+    // Should complete quickly due to shutdown; the deadline is a hang-guard,
+    // not the assertion.
     let Ok(join_result) = timeout(Duration::from_millis(500), handle).await else {
-        // Timed out waiting for shutdown - test fails
-        return;
+        bail!("retry loop did not observe the shutdown signal within 500ms");
     };
-    let Ok(result) = join_result else {
-        // Task panicked - test fails
-        return;
-    };
+    let result = join_result?;
 
     assert!(result.is_err(), "Should return error on shutdown");
+    Ok(())
 }
 
 // === Timer Path Tests ===
@@ -435,25 +425,33 @@ fn sleep_time_has_exponential_growth_with_jitter() {
     }
 
     // Attempt 1: exp_backoff = 2^1 * 100 = 200ms, jitter in [0, 200)
-    let Some(&max_attempt_1) = samples_attempt_1.iter().max() else {
-        return;
-    };
+    let max_attempt_1 = samples_attempt_1.iter().max().copied().unwrap_or(u64::MAX);
     assert!(max_attempt_1 < 200, "Attempt 1 jitter should be < 200ms");
 
     // Attempt 3: exp_backoff = 2^3 * 100 = 800ms, jitter in [0, 800)
-    let Some(&max_attempt_3) = samples_attempt_3.iter().max() else {
-        return;
-    };
+    let max_attempt_3 = samples_attempt_3.iter().max().copied().unwrap_or(u64::MAX);
     assert!(max_attempt_3 < 800, "Attempt 3 jitter should be < 800ms");
 
     // Verify there's some variation (jitter is working)
-    let Some(&min_attempt_3) = samples_attempt_3.iter().min() else {
-        return;
-    };
+    let min_attempt_3 = samples_attempt_3.iter().min().copied().unwrap_or(u64::MAX);
     assert!(
         max_attempt_3 > min_attempt_3 + 50,
         "Jitter should introduce variation"
     );
+}
+
+#[test]
+fn sleep_time_survives_zero_backoff() {
+    // A sub-millisecond base delay truncates exp_backoff to 0; the jitter
+    // bound must clamp instead of panicking on an empty range.
+    let retry_handler = RetryHandler {
+        base_delay_millis: 0,
+        max_delay_millis: 0,
+        max_retries: 10,
+        handler: MockHandler::success(),
+    };
+
+    assert_eq!(retry_handler.sleep_time(1), Duration::ZERO);
 }
 
 #[test]
@@ -586,9 +584,7 @@ async fn fallible_on_message_shutdown_aborts() -> Result<()> {
     let context = MockEventContext::new();
     context.request_shutdown();
 
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
 
@@ -628,9 +624,7 @@ async fn event_on_message_shutdown_aborts() -> Result<()> {
 
     let tracker = create_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
     let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(
@@ -676,9 +670,7 @@ async fn fallible_on_message_cancellation_retries() -> Result<()> {
     let context = MockEventContext::new();
     context.request_cancellation();
 
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
     let result =
         FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
 
@@ -719,9 +711,7 @@ async fn event_on_message_cancellation_retries() -> Result<()> {
 
     let tracker = create_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
     let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(
@@ -791,9 +781,7 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_retries_then_succee
     let context = MockEventContext::new();
     let tracker = create_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
     let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(
@@ -837,9 +825,7 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_max_retries_exhaust
     let handler = MockHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 2);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
 
     let result =
         FallibleHandler::on_message(&retry_handler, context.clone(), message, DemandType::Normal)
@@ -898,9 +884,7 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
 
     let tracker = create_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let Some(message) = create_test_message() else {
-        bail!("failed to create test message");
-    };
+    let message = create_test_message()?;
     let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
     // Spawn the dispatch and signal shutdown shortly after the first
@@ -992,7 +976,7 @@ mod reset_between_attempts {
         CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
     };
     use crate::timers::duration::CompactDuration;
-    use color_eyre::eyre::{Result, bail};
+    use color_eyre::eyre::Result;
     use serde_json::{Value, json};
     use std::convert::Infallible;
     use tokio::sync::watch;
@@ -1198,9 +1182,7 @@ mod reset_between_attempts {
 
         let tracker = create_offset_tracker();
         let uncommitted_offset = tracker.take(0).await?;
-        let Some(message) = create_test_message() else {
-            bail!("failed to create test message");
-        };
+        let message = create_test_message()?;
         let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
         EventHandler::on_message(

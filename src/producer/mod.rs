@@ -37,7 +37,7 @@ use crate::util::{
 use crate::{Codec, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER, Topic};
 use std::marker::PhantomData;
 use tracing::field::debug;
-use tracing::log::info;
+use tracing::info;
 use whoami::hostname;
 
 mod error;

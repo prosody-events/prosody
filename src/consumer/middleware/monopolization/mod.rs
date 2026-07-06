@@ -387,13 +387,17 @@ where
             .as_nanos() as u64;
         let window_nanos = self.window_duration.as_nanos() as u64;
         let window_start = now_nanos.saturating_sub(window_nanos);
-        let window_interval_set = [(window_start, now_nanos)].to_interval_set();
 
-        let windowed_intervals = intervals.intersection(&window_interval_set);
-
-        let key_time_nanos: u64 = windowed_intervals
+        // Clamp each interval to the window and sum directly — equivalent to
+        // intersecting with a single-interval set, without allocating one per
+        // event (intervals outside the window saturate to zero length).
+        let key_time_nanos: u64 = intervals
             .iter()
-            .map(|interval| interval.upper().saturating_sub(interval.lower()))
+            .map(|iv| {
+                iv.upper()
+                    .min(now_nanos)
+                    .saturating_sub(iv.lower().max(window_start))
+            })
             .sum();
 
         let monopolization_ratio = key_time_nanos as f64 / window_nanos as f64;

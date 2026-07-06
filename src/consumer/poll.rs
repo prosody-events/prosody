@@ -164,10 +164,13 @@ where
             continue;
         };
 
-        let topic = message.topic().to_owned();
+        let topic = Topic::from(message.topic());
         let partition = message.partition();
         let offset = message.offset();
-        debug!(topic, partition, offset, "received message");
+        debug!(
+            topic = topic.as_ref(),
+            partition, offset, "received message"
+        );
 
         // Decode message through extraction, validation, and filtering
         let maybe_decoded = decode_message(&mut message, &propagator, &mut codec);
@@ -190,7 +193,7 @@ where
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 
-        debug!(topic, partition, offset, "poll complete");
+        debug!(topic = topic.as_ref(), partition, offset, "poll complete");
     }
 
     debug!("polling stopped");

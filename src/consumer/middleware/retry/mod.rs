@@ -349,7 +349,9 @@ impl<T> RetryHandler<T> {
             self.max_delay_millis,
         );
 
-        let jitter = rand::rng().random_range(0..exp_backoff);
+        // `random_range` panics on an empty range: a sub-millisecond base delay
+        // (or zero max delay) truncates `exp_backoff` to 0, so clamp the bound.
+        let jitter = rand::rng().random_range(0..exp_backoff.max(1));
         Duration::from_millis(jitter)
     }
 

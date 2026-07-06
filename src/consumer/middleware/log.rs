@@ -4,18 +4,15 @@
 //! preserving the original error flow verbatim. This middleware is a pure
 //! pass-through: it observes outcomes and emits log records, but it never
 //! changes the dispatch result or the apply-hook outcome that downstream
-//! layers see. Typically positioned as an outer layer for comprehensive
-//! error visibility.
+//! layers see.
 //!
-//! # Execution Order
-//!
-//! **Request Path:**
-//! 1. Pass control to inner middleware layers (no-op)
-//!
-//! **Response Path:**
-//! 1. Receive result from inner layers
-//! 2. **Log error if present** - Categorizes and logs with appropriate severity
-//! 3. Pass original result through unchanged
+//! Each failure is logged exactly once, from the after-dispatch error hooks
+//! ([`FallibleEventHandler::on_message_error`] /
+//! [`FallibleEventHandler::on_timer_error`]) — the
+//! dispatch path itself is pure delegation. Those hooks fire only when this
+//! middleware terminates the chain, so `LogMiddleware` is meaningful only as
+//! the **outermost (terminal) layer**; composing it under another middleware
+//! silently disables its logging.
 //!
 //! **Apply Hooks:**
 //!
@@ -172,26 +169,7 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        // Attempt to process the message with the wrapped handler
-        let error = match self.handler.on_message(context, message, demand_type).await {
-            Ok(output) => return Ok(output),
-            Err(error) => error,
-        };
-
-        // Log the error based on its category
-        match error.classify_error() {
-            ErrorCategory::Transient => {
-                error!("transient error occurred during message processing: {error:#}");
-            }
-            ErrorCategory::Permanent => {
-                error!("permanent error occurred during message processing: {error:#}");
-            }
-            ErrorCategory::Terminal => {
-                error!("terminal error occurred during message processing: {error:#}");
-            }
-        }
-
-        Err(error)
+        self.handler.on_message(context, message, demand_type).await
     }
 
     async fn on_timer<C>(
@@ -203,26 +181,7 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        // Attempt to process the timer with the wrapped handler
-        let error = match self.handler.on_timer(context, trigger, demand_type).await {
-            Ok(output) => return Ok(output),
-            Err(error) => error,
-        };
-
-        // Log the error based on its category
-        match error.classify_error() {
-            ErrorCategory::Transient => {
-                error!("transient error occurred during timer processing: {error:#}");
-            }
-            ErrorCategory::Permanent => {
-                error!("permanent error occurred during timer processing: {error:#}");
-            }
-            ErrorCategory::Terminal => {
-                error!("terminal error occurred during timer processing: {error:#}");
-            }
-        }
-
-        Err(error)
+        self.handler.on_timer(context, trigger, demand_type).await
     }
 
     /// Pass-through forwarder for the final-dispatch apply hook.
