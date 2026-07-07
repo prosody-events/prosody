@@ -218,15 +218,15 @@ fn corrupt_event_udt_is_rejected() -> Result<()> {
 }
 
 /// Wire-format freeze for the payload-encoding discriminants: the `i16` is a
-/// durable column, so the live values are pinned and the retired
-/// `MsgPack`-era discriminants (`1`/`2`, plus never-assigned `0`) must keep
-/// rejecting loudly as a Permanent [`EncodingError::UnknownEncoding`] — a
-/// round-trip test cannot prove any of this.
+/// durable column, so the live value is pinned and the retired discriminants
+/// (`1`/`2` `MsgPack`-era, `3` uncompressed `RawV1`, plus never-assigned `0`)
+/// must keep rejecting loudly as a Permanent
+/// [`EncodingError::UnknownEncoding`] — a round-trip test cannot prove any of
+/// this.
 #[test]
 fn encoding_wire_contract_is_frozen() -> Result<()> {
-    assert_eq!(i16::from(Encoding::RawV1), 3);
     assert_eq!(i16::from(Encoding::RawZstdV1), 4);
-    for retired in [0_i16, 1, 2] {
+    for retired in [0_i16, 1, 2, 3] {
         let Err(error) = Encoding::try_from(retired) else {
             bail!("discriminant {retired} must stay retired");
         };
@@ -236,26 +236,21 @@ fn encoding_wire_contract_is_frozen() -> Result<()> {
     Ok(())
 }
 
-/// Payload round-trip over both encodings and arbitrary bytes:
+/// Payload round-trip over arbitrary bytes:
 /// `decode_payload(encode_payload(b)) == b` — the property that covers the
 /// zstd leg the shape-table examples only touch implicitly.
 #[test]
 fn prop_payload_encoding_round_trips() {
-    fn prop(bytes: Vec<u8>, zstd: bool) -> TestResult {
-        let encoding = if zstd {
-            Encoding::RawZstdV1
-        } else {
-            Encoding::RawV1
-        };
+    fn prop(bytes: Vec<u8>) -> TestResult {
         let payload = Bytes::from(bytes);
-        match encode_payload(&payload, encoding)
-            .and_then(|encoded| decode_payload(&encoded, encoding))
+        match encode_payload(&payload, Encoding::RawZstdV1)
+            .and_then(|encoded| decode_payload(&encoded, Encoding::RawZstdV1))
         {
             Ok(decoded) => TestResult::from_bool(decoded == payload),
             Err(error) => TestResult::error(format!("{error}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, bool) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
 /// The cache-fill co-expiry coalesces whichever blob's TTL is present, `data`

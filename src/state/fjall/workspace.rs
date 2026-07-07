@@ -29,13 +29,13 @@
 //! `value_*` keyspace and deletes them — design §"Local Workspace"
 //! §"Process restart": "Delete old workspaces; Cassandra recovers truth."
 
-use super::config::FjallConfiguration;
 use super::error::FjallCellCacheError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::{Partition, Topic};
 use educe::Educe;
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -90,18 +90,22 @@ pub struct FjallClient {
 }
 
 impl FjallClient {
-    /// Opens the shared database and wipes any `value_*` keyspaces left
-    /// over from a prior process.
+    /// Opens the shared database at `cache_dir` and wipes any `value_*`
+    /// keyspaces left over from a prior process — Cassandra is authoritative,
+    /// so stale local workspaces are deleted, never recovered.
     ///
-    /// Design §"Local Workspace" §"Process restart": "Delete old
-    /// workspaces; Cassandra recovers truth."
+    /// `cache_dir` arrives already resolved: the environment-variable
+    /// resolution, defaulting, and validation live on
+    /// [`KeyedStateConfiguration`](crate::state::config::KeyedStateConfiguration).
+    /// Production deployments mount it at an emptyDir-type volume; on
+    /// partition revocation the per-partition keyspace is dropped.
     ///
     /// # Errors
     ///
     /// Returns [`FjallClientError::Engine`] when the database cannot be
     /// opened or stale keyspaces cannot be swept.
-    pub fn open(config: &FjallConfiguration) -> Result<Arc<Self>, FjallClientError> {
-        let database = Database::builder(&config.cache_dir).open()?;
+    pub fn open(cache_dir: &Path) -> Result<Arc<Self>, FjallClientError> {
+        let database = Database::builder(cache_dir).open()?;
         sweep_orphaned(&database)?;
         Ok(Arc::new(Self { database }))
     }

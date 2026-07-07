@@ -388,7 +388,10 @@ fn reregistration_updates_operational_settings() -> Result<()> {
     // Same name, same identity, different operational settings.
     registry.register(
         &cart(),
-        CollectionDef::new(Some(updated_ttl)).with_commit_mode(CommitMode::ReadUncommitted),
+        CollectionDef {
+            commit_mode: CommitMode::ReadUncommitted,
+            ..CollectionDef::new(Some(updated_ttl))
+        },
     )?;
     assert_eq!(
         registry.ttl_for(StateType::Application, &name),
@@ -404,7 +407,7 @@ fn reregistration_updates_operational_settings() -> Result<()> {
 }
 
 /// An empty descriptor name fails loudly at registration — the
-/// fallible boundary backing the infallible `const fn value_state`.
+/// fallible boundary backing the infallible `value_state`.
 #[test]
 fn empty_name_rejected_at_registration() {
     let mut registry = CollectionDefRegistry::new(None);

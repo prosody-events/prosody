@@ -1,7 +1,6 @@
 mod cached_suite;
 pub(crate) mod cell_suite;
 mod collection_suite;
-mod identity;
 pub(crate) mod identity_suite;
 
 use self::cell_suite::{

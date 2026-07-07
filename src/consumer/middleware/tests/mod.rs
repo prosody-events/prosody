@@ -1012,7 +1012,10 @@ mod arm_backstop {
         for (i, within) in bounds.iter().enumerate() {
             registry.register(
                 &value_state::<JsonCodec>(&format!("c{i}")),
-                CollectionDef::new(None).with_recovery_within(within.map(CompactDuration::new)),
+                CollectionDef {
+                    recovery_within: within.map(CompactDuration::new),
+                    ..CollectionDef::new(None)
+                },
             )?;
         }
         let (session, _store) =

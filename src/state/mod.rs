@@ -1,7 +1,7 @@
 //! Keyed application state protocol types.
 //!
-//! This module defines the shared collection identity and transaction state
-//! shapes used by the keyed-state cell store. The cell layer is **uniform and
+//! This module defines the shared collection identity and cell shapes used by
+//! the keyed-state cell store. The cell layer is **uniform and
 //! untyped** — it addresses cells by [`CellKey`] and names no collection
 //! family; typed collection handles (Value, Map, Deque) are built
 //! atop it in [`descriptor`].
@@ -22,7 +22,8 @@
 //! * [`store`] — the uniform [`CellStore`] backend trait.
 //! * [`descriptor`] — typed collection handles bound over the raw byte cells
 //!   the stores persist.
-//! * [`transaction`] — transaction-side state ([`CommitMode`], [`Read`], …).
+//! * [`registry`] — per-collection operational settings ([`CommitMode`],
+//!   [`registry::CollectionDef`], …).
 //!
 //! The cross-cutting backend abstraction — the [`StateBackend`] bundle trait,
 //! its one concrete [`PartitionBackend`], and the [`StateBackendFactory`] that
@@ -38,6 +39,7 @@ use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::oracle::CommitOracle;
 use crate::state::store::CellStore;
 use crate::{Partition, Topic};
+#[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
 
@@ -64,7 +66,6 @@ pub mod registry;
 pub mod resolve;
 pub mod session;
 pub mod store;
-pub mod transaction;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -80,7 +81,7 @@ pub use order_codec::{
     I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
     order_preserving_i64_decode,
 };
-pub use transaction::{CommitMode, Read};
+pub use registry::CommitMode;
 
 /// Maximum concurrent per-collection durable operations in the keyed-state
 /// lifecycle (finalize stage, commit promote, rollback, recovery sweep).
@@ -190,8 +191,8 @@ where
 /// the same store instance the partition writes through** — one identity,
 /// one value. Minting a sibling store from a provider is not equivalent: a
 /// store may answer tag reads from a per-instance cache that only its own
-/// writes keep current. Factories whose oracle is supplied whole (e.g.
-/// [`SharedStateBackend`]) ignore the handle and accept any `T`.
+/// writes keep current. Factories whose oracle is supplied whole (e.g. the
+/// test-only `SharedStateBackend`) ignore the handle and accept any `T`.
 pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     /// The per-partition backend bundle this factory mints.
     type Backend: StateBackend;
@@ -218,10 +219,11 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
 /// Partition-agnostic [`StateBackendFactory`]: clones the same cell store,
 /// identity store, and oracle for every partition.
 ///
-/// Suits compositions whose stores are not partition-scoped — memory-backed
-/// tests and bespoke wiring; production uses the partition-scoped factories in
+/// Test-only: suits memory-backed compositions whose stores are not
+/// partition-scoped; production uses the partition-scoped factories in
 /// [`production`]. The supplied `cell` must already embed `oracle` (it resolves
 /// provisional cells through it), so the two are the same instance.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct SharedStateBackend<S, I, O> {
     cell: S,
@@ -229,6 +231,7 @@ pub struct SharedStateBackend<S, I, O> {
     oracle: O,
 }
 
+#[cfg(test)]
 impl<S, I, O> SharedStateBackend<S, I, O> {
     /// Creates a backend factory that hands out clones of the supplied parts.
     #[must_use]
@@ -243,6 +246,7 @@ impl<S, I, O> SharedStateBackend<S, I, O> {
 
 /// The oracle is supplied whole at construction, so the partition's
 /// trigger-store handle is ignored and any `T` is accepted.
+#[cfg(test)]
 impl<S, I, O, T> StateBackendFactory<T> for SharedStateBackend<S, I, O>
 where
     S: CellStore + Clone,

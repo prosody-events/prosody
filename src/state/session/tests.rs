@@ -230,7 +230,10 @@ async fn staged_fire_delay(bounds: &[Option<u32>], floor_secs: u32) -> Result<Co
         let name = format!("c{i}");
         registry.register(
             &value_state::<JsonCodec>(&name),
-            CollectionDef::new(None).with_recovery_within(within.map(CompactDuration::new)),
+            CollectionDef {
+                recovery_within: within.map(CompactDuration::new),
+                ..CollectionDef::new(None)
+            },
         )?;
         names.push(StateName::try_new(&name)?);
     }

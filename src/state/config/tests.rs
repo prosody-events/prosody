@@ -104,32 +104,27 @@ fn collection_ttl_above_the_recovery_delay_is_allowed() -> Result<()> {
     Ok(())
 }
 
-/// Round-trip: whatever `recovery_within` a descriptor is built with —
-/// set, then optionally cleared — is exactly what `recovery_within_for`
-/// reads back after registration (unset / cleared ⇒ `None`). Proves the
-/// fluent config reaches the registry unaltered and that the bound needs no
-/// validation (`build_registry` accepts any duration, since it is
-/// tightening-only against the recovery-delay floor).
+/// Round-trip: whatever `recovery_within` a descriptor is built with is
+/// exactly what `recovery_within_for` reads back after registration (unset ⇒
+/// `None`). Proves the fluent config reaches the registry unaltered and that
+/// the bound needs no validation (`build_registry` accepts any duration,
+/// since it is tightening-only against the recovery-delay floor).
 #[test]
 fn prop_recovery_within_round_trips_through_the_registry() {
-    fn prop(within: Option<u32>, clear: bool) -> TestResult {
+    fn prop(within: Option<u32>) -> TestResult {
         let bound = within.map(CompactDuration::new);
         let mut descriptor = cart();
         if let Some(d) = bound {
             descriptor = descriptor.recovery_within(d);
         }
-        if clear {
-            descriptor = descriptor.no_recovery_within();
-        }
-        let expected = if clear { None } else { bound };
 
         match round_trip(descriptor) {
-            Ok(read) if read == expected => TestResult::passed(),
-            Ok(read) => TestResult::error(format!("expected {expected:?}, read {read:?}")),
+            Ok(read) if read == bound => TestResult::passed(),
+            Ok(read) => TestResult::error(format!("expected {bound:?}, read {read:?}")),
             Err(e) => TestResult::error(format!("registry build failed: {e}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(Option<u32>, bool) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(Option<u32>) -> TestResult);
 }
 
 /// Registers `descriptor` and reads its `recovery_within` back from the

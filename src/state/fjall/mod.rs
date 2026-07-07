@@ -24,8 +24,8 @@
 //! Unlike the durable stores (Memory/Cassandra) whose `get` returns only
 //! `Present`/`Absent`, the cache observes a third state: an entry that
 //! has never been populated. That state is encoded as the **absence of an
-//! entry** in the fjall keyspace, and decodes as
-//! [`Read::Unknown`]. Tag byte `0x00` is
+//! entry** in the fjall keyspace, and decodes as the codec's three-valued
+//! `Read::Unknown`. Tag byte `0x00` is
 //! `Absent` (known cleared); tag byte `0x01` is `Present`. Each frame carries
 //! an absolute expiry header (`[tag][expiry: u64 BE millis][payload]`, `0` =
 //! never) mirroring the durable row's TTL death — fjall has no native per-entry
@@ -37,13 +37,10 @@
 //! # Blocking I/O
 //!
 //! fjall's public API is synchronous, so the cache's reads and writes are
-//! dispatched through [`tokio::task::spawn_blocking`] (in the `cell_io`
-//! submodule), which clones the cheap `Arc`-backed handle into each blocking
-//! closure.
+//! dispatched through [`tokio::task::spawn_blocking`], which clones the cheap
+//! `Arc`-backed handle into each blocking closure.
 
-mod cell_io;
 mod codec;
-mod config;
 mod error;
 mod workspace;
 
@@ -52,18 +49,17 @@ pub(crate) mod test_db;
 #[cfg(test)]
 mod tests;
 
-pub use config::FjallConfiguration;
 pub use error::FjallCellCacheError;
 pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
+use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use crate::state::transaction::Read;
 use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
-use fjall::{Database, Guard, Keyspace, OwnedWriteBatch};
+use fjall::{Database, Guard, Keyspace, OwnedWriteBatch, Slice};
 use futures::{Stream, StreamExt};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -329,8 +325,7 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<CacheRead, FjallCellCacheError> {
-        let raw =
-            cell_io::read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
         let (expiry, read) = codec::decode_cell(raw.as_deref())?;
         Ok(match read {
             Read::Unknown => CacheRead::Miss,
@@ -358,8 +353,7 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        let raw =
-            cell_io::read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
         let (expiry, read) = codec::decode_cell(raw.as_deref())?;
         Ok(match read {
             Read::Unknown => None,
@@ -391,7 +385,7 @@ impl FjallCellCache {
             Some(payload) => codec::encode_present_cell(payload, expiry),
             None => codec::encode_absent_cell(expiry),
         };
-        cell_io::write_cell(
+        write_cell(
             self.inner.handle(),
             codec::cell_key(collection, cell),
             frame,
@@ -616,7 +610,7 @@ impl FjallCellCache {
         &self,
         collection: &CollectionId,
     ) -> Result<bool, FjallCellCacheError> {
-        let raw = cell_io::read_cell(
+        let raw = read_cell(
             self.inner.index_handle(),
             codec::index_seeded_key(collection),
         )
@@ -847,7 +841,7 @@ impl FjallCellCache {
             // Clear the section's whole existing range, then re-insert the merged
             // set. `remove_range`-by-prefix has no batch primitive, so stale keys
             // are removed by first collecting them in the same guard scan.
-            let stale: Vec<fjall::Slice> = handle
+            let stale: Vec<Slice> = handle
                 .prefix(&prefix)
                 .map(|guard| guard.into_inner().map(|(key, _)| key))
                 .collect::<Result<_, _>>()?;
@@ -925,6 +919,24 @@ fn index_keys<'a>(
         keys.push(codec::index_coord_key(collection, cell));
     }
     keys
+}
+
+/// Reads the raw cell at `key`, or `None` when the key is absent — one
+/// blocking hop.
+async fn read_cell(cache: &Keyspace, key: Vec<u8>) -> Result<Option<Slice>, FjallCellCacheError> {
+    let cache = cache.clone();
+    Ok(spawn_blocking(move || cache.get(key)).await??)
+}
+
+/// Writes `cell` at `key`, overwriting any existing cell — one blocking hop.
+async fn write_cell(
+    cache: &Keyspace,
+    key: Vec<u8>,
+    cell: Bytes,
+) -> Result<(), FjallCellCacheError> {
+    let cache = cache.clone();
+    spawn_blocking(move || cache.insert(key.as_slice(), cell.as_ref())).await??;
+    Ok(())
 }
 
 /// Inserts an empty-valued warm-index key (presence-as-boolean), one blocking

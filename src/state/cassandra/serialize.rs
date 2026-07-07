@@ -16,9 +16,9 @@
 //! `DeserializationError`, which would tear the partition down over one bad
 //! row.
 
+use crate::state::StateType;
 use crate::state::cassandra::cell::CellKind;
 use crate::state::encoding::Encoding;
-use crate::state::{CollectionKindId, StateType};
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
@@ -34,16 +34,6 @@ impl SerializeValue for CellKind {
 }
 
 impl SerializeValue for StateType {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i8::from(*self).serialize(typ, writer)
-    }
-}
-
-impl SerializeValue for CollectionKindId {
     fn serialize<'b>(
         &self,
         typ: &ColumnType,

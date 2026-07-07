@@ -1,11 +1,11 @@
 use super::{
-    collection_prefix, coord_cell_key, cover_low_bound, decode_bound, decode_cell,
+    Read, collection_prefix, coord_cell_key, cover_low_bound, decode_bound, decode_cell,
     encode_absent_cell, encode_bound, encode_present_cell, index_coord_key, index_cover_key,
     index_seeded_key,
 };
 use crate::Key;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::{CollectionId, Read, StateKey, StateName, StateType};
+use crate::state::{CollectionId, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};

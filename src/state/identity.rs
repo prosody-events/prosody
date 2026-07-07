@@ -11,7 +11,6 @@
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use crate::{Key, SegmentId};
-use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -19,15 +18,15 @@ use thiserror::Error;
 
 /// Stable runtime discriminator for a collection kind.
 ///
-/// `#[serde(into = "i8", try_from = "i8")]` routes serde through the
-/// [`From`]/[`TryFrom`] pair, so the only durable wire surface is the `i8`
-/// discriminator the Cassandra `kind` column stores, never the variant name.
-/// A variant rename therefore cannot drift the on-wire encoding away from the
-/// type it encodes; an unknown discriminator decodes as
-/// [`UnknownCollectionKindId`], which classifies `Permanent`.
+/// The only durable wire surface is the `i8` the [`From`] impl produces for
+/// the Cassandra `kind` column, so a variant rename cannot drift the on-wire
+/// encoding away from the type it encodes. There is no decode direction: the
+/// identity read path **compares** the stored `i8` against the asserted
+/// durable identity's raw field, never reconstructing the enum. The
+/// variant→byte assignments are pinned by
+/// `durable_identity_wire_contract_is_frozen`.
 #[repr(i8)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(into = "i8", try_from = "i8")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CollectionKindId {
     /// A single optional byte payload.
     Value = 1,
@@ -42,19 +41,6 @@ pub enum CollectionKindId {
 impl From<CollectionKindId> for i8 {
     fn from(id: CollectionKindId) -> Self {
         id as i8
-    }
-}
-
-impl TryFrom<i8> for CollectionKindId {
-    type Error = UnknownCollectionKindId;
-
-    fn try_from(value: i8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Value),
-            2 => Ok(Self::Map),
-            3 => Ok(Self::Deque),
-            _ => Err(UnknownCollectionKindId(value)),
-        }
     }
 }
 
@@ -79,8 +65,8 @@ impl StateKey {
 /// Logical state namespace.
 ///
 /// The wire discriminator persisted beside durable identity is the `i8` the
-/// [`From`]/[`TryFrom`] pair round-trips through, so the on-wire encoding
-/// cannot drift from the type it encodes.
+/// [`From`] impl produces; like [`CollectionKindId`], reads compare the stored
+/// raw `i8`, never decoding it back into the enum.
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateType {
@@ -98,19 +84,6 @@ pub enum StateType {
 impl From<StateType> for i8 {
     fn from(state_type: StateType) -> Self {
         state_type as i8
-    }
-}
-
-impl TryFrom<i8> for StateType {
-    type Error = UnknownStateType;
-
-    fn try_from(value: i8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Application),
-            #[cfg(test)]
-            1 => Ok(Self::Framework),
-            _ => Err(UnknownStateType(value)),
-        }
     }
 }
 
@@ -150,8 +123,10 @@ impl AsRef<str> for StateName {
 }
 
 /// Lets registry maps keyed by [`StateName`] resolve `&str` lookups without
-/// allocating. Sound because the derived `Hash`/`Eq` delegate to the inner
-/// `str`, matching `str`'s own implementations.
+/// allocating (`CollectionDefRegistry::lookup` passes the descriptor's
+/// `&'static str` straight to `HashMap::get_key_value`). Sound because the
+/// derived `Hash`/`Eq` delegate to the inner `str`, matching `str`'s own
+/// implementations.
 impl Borrow<str> for StateName {
     fn borrow(&self) -> &str {
         self.as_str()
@@ -283,13 +258,3 @@ impl ClassifyError for StateNameError {
         ErrorCategory::Permanent
     }
 }
-
-/// Error converting an `i8` that matches no [`StateType`] variant.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("unknown state type discriminator: {0}")]
-pub struct UnknownStateType(i8);
-
-/// Error converting an `i8` that matches no [`CollectionKindId`] variant.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("unknown collection kind discriminator: {0}")]
-pub struct UnknownCollectionKindId(i8);

@@ -10,9 +10,7 @@
 
 use super::codec::cell_key;
 use super::test_db;
-use super::{
-    AssignmentEpoch, CacheRead, Clock, FjallCellCache, FjallClient, FjallConfiguration, ScanHit,
-};
+use super::{AssignmentEpoch, CacheRead, Clock, FjallCellCache, FjallClient, ScanHit};
 use crate::state::cell::Committed;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::{CollectionId, StateKey, StateName, StateType};
@@ -434,9 +432,7 @@ fn prop_index_batches_round_trip_the_snapshot() {
 #[test]
 fn for_workspace_retains_the_workspace() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let client = FjallClient::open(&FjallConfiguration {
-        cache_dir: dir.path().to_path_buf(),
-    })?;
+    let client = FjallClient::open(dir.path())?;
     let database = client.database().clone();
     let live_cache_partitions = || {
         database

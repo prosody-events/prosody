@@ -172,7 +172,7 @@ pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
 use crate::state::cassandra::{CassandraCellResources, CassandraDescriptorIdentityStore};
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
-use crate::state::fjall::{FjallClient, FjallClientError, FjallConfiguration};
+use crate::state::fjall::{FjallClient, FjallClientError};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
@@ -1128,10 +1128,8 @@ where
     // The fjall workspace root is wiped on restart (Cassandra is
     // authoritative), so creating the default directory here is safe.
     fs::create_dir_all(&keyed_state.config.cache_dir)?;
-    let fjall_client = FjallClient::open(&FjallConfiguration {
-        cache_dir: keyed_state.config.cache_dir.clone(),
-    })
-    .map_err(KeyedStateInitError::from)?;
+    let fjall_client =
+        FjallClient::open(&keyed_state.config.cache_dir).map_err(KeyedStateInitError::from)?;
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
         cell_store,
@@ -1404,10 +1402,8 @@ where
                 // authoritative), so creating the default directory here is
                 // safe; mounted production paths already exist.
                 fs::create_dir_all(&keyed_state.config.cache_dir)?;
-                let fjall_client = FjallClient::open(&FjallConfiguration {
-                    cache_dir: keyed_state.config.cache_dir.clone(),
-                })
-                .map_err(KeyedStateInitError::from)?;
+                let fjall_client = FjallClient::open(&keyed_state.config.cache_dir)
+                    .map_err(KeyedStateInitError::from)?;
                 let backend = CassandraStateBackendFactory::new(
                     fjall_client,
                     cell_store,

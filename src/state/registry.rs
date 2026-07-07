@@ -3,10 +3,41 @@
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
-use crate::state::{CommitMode, StateName, StateNameError, StateType};
+use crate::state::{StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
 use thiserror::Error;
+
+/// Persistence mode for a collection's state changes, chosen per collection
+/// at registration
+/// ([`StateDescriptor::read_uncommitted`](crate::state::descriptor::StateDescriptor::read_uncommitted);
+/// the default is [`Self::ReadCommitted`]).
+///
+/// The modes are named by the **read guarantee** they give, not the mechanism:
+///
+/// * **`ReadCommitted` — atomic with the event, crash-recoverable.** On handler
+///   success the buffered write stages as a provisional cell (new value beside
+///   the prior committed value) *before* the event's commit marker, then
+///   promotes to committed after the marker is durable; crash recovery resolves
+///   the cell through the commit oracle. A handler that fails or redelivers
+///   never exposes its writes — internal and external readers only ever observe
+///   committed values.
+/// * **`ReadUncommitted` — cheaper, at-least-once.** The buffered write applies
+///   straight to the committed value when the handler succeeds, visible even if
+///   the event later fails. A crash between the apply and the event's commit
+///   re-runs the handler against already-applied state, so writes must be
+///   idempotent (last-writer-wins `set`s usually are). Choose it for state
+///   where re-application is harmless and the extra promote per event matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitMode {
+    /// Stage the write provisionally before the event commit marker and
+    /// promote it after — readers observe committed values only.
+    ReadCommitted,
+
+    /// Apply the write to committed state immediately — cheaper, with
+    /// at-least-once, read-uncommitted semantics.
+    ReadUncommitted,
+}
 
 /// Operational per-collection settings that override middleware defaults.
 ///
@@ -66,20 +97,6 @@ impl CollectionDef {
             commit_mode: CommitMode::ReadCommitted,
             recovery_within: None,
         }
-    }
-
-    /// Builder-style override for the commit mode.
-    #[must_use]
-    pub fn with_commit_mode(mut self, mode: CommitMode) -> Self {
-        self.commit_mode = mode;
-        self
-    }
-
-    /// Builder-style override for the recovery-convergence bound.
-    #[must_use]
-    pub fn with_recovery_within(mut self, recovery_within: Option<CompactDuration>) -> Self {
-        self.recovery_within = recovery_within;
-        self
     }
 }
 

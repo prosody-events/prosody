@@ -16,15 +16,13 @@ const ZSTD_LEVEL: i32 = 0;
 ///
 /// Mapped to and from `i16` so durable storage can persist a small
 /// integer column without leaking the named enum representation.
-/// Discriminants `1`/`2` belonged to the retired `MsgPack`-wrapped cell
-/// encodings and are never reused — a stale cell carrying one fails
-/// loudly as [`EncodingError::UnknownEncoding`] (Permanent).
+/// Discriminants `1`/`2` (the `MsgPack`-wrapped cell encodings) and `3`
+/// (uncompressed `RawV1`) are retired and never reused — a stale cell
+/// carrying one fails loudly as [`EncodingError::UnknownEncoding`]
+/// (Permanent).
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Encoding {
-    /// Raw codec bytes stored verbatim.
-    RawV1 = 3,
-
     /// Raw codec bytes compressed with zstd.
     RawZstdV1 = 4,
 }
@@ -40,7 +38,6 @@ impl TryFrom<i16> for Encoding {
 
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
-            3 => Ok(Self::RawV1),
             4 => Ok(Self::RawZstdV1),
             _ => Err(EncodingError::UnknownEncoding(value)),
         }
@@ -57,7 +54,6 @@ impl TryFrom<i16> for Encoding {
 /// Returns [`EncodingError`] when zstd compression fails.
 pub fn encode_payload(payload: &Bytes, encoding: Encoding) -> Result<Bytes, EncodingError> {
     match encoding {
-        Encoding::RawV1 => Ok(payload.clone()),
         Encoding::RawZstdV1 => compress(payload),
     }
 }
@@ -69,7 +65,6 @@ pub fn encode_payload(payload: &Bytes, encoding: Encoding) -> Result<Bytes, Enco
 /// Returns [`EncodingError`] when zstd decompression fails.
 pub fn decode_payload(bytes: &[u8], encoding: Encoding) -> Result<Bytes, EncodingError> {
     match encoding {
-        Encoding::RawV1 => Ok(Bytes::copy_from_slice(bytes)),
         Encoding::RawZstdV1 => decompress(bytes).map(Bytes::from),
     }
 }

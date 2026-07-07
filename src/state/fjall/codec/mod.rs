@@ -47,8 +47,8 @@
 //! slightly early falls through and re-populates.
 
 use super::error::FjallCellCacheError;
+use crate::state::CollectionId;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::{CollectionId, Read};
 use bytes::Bytes;
 use std::ops::Bound;
 use xxhash_rust::xxh3::Xxh3;
@@ -105,6 +105,24 @@ impl From<BoundTag> for u8 {
     fn from(tag: BoundTag) -> Self {
         tag as u8
     }
+}
+
+/// The cache's three-valued read, decoded from a stored cell frame by
+/// [`decode_cell`].
+///
+/// `Unknown` (no entry) is what makes the cache a pass-through layer: only a
+/// stored frame may answer `Present`/`Absent`, so a miss always falls through
+/// to the durable store instead of being mistaken for a known-absent value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Read<T> {
+    /// Value is present.
+    Present(T),
+
+    /// Value is known absent.
+    Absent,
+
+    /// This layer has not observed the value.
+    Unknown,
 }
 
 /// Tag byte for "known absent" entries.

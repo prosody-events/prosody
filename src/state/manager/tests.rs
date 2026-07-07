@@ -126,7 +126,10 @@ fn registry_with_cart_within(
     let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
     registry.register(
         &cart(),
-        CollectionDef::new(None).with_recovery_within(within),
+        CollectionDef {
+            recovery_within: within,
+            ..CollectionDef::new(None)
+        },
     )?;
     Ok(Arc::new(registry))
 }
@@ -140,7 +143,10 @@ fn registry_with_mixed() -> Result<Arc<CollectionDefRegistry>> {
     registry.register(&wishlist(), CollectionDef::new(None))?;
     registry.register(
         &last_seen(),
-        CollectionDef::new(None).with_commit_mode(CommitMode::ReadUncommitted),
+        CollectionDef {
+            commit_mode: CommitMode::ReadUncommitted,
+            ..CollectionDef::new(None)
+        },
     )?;
     Ok(Arc::new(registry))
 }

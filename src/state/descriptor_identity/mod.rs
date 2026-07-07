@@ -47,6 +47,9 @@ use thiserror::Error;
 /// codec/resolver tokens) rather than on decoded enums, so a row written by a
 /// *future* build with discriminants this build does not know simply compares
 /// unequal — acquisition fails `Permanent` instead of silently coercing it.
+/// The raw-`i8` discriminator fields are also what keeps this DTO
+/// backend-agnostic (Cassandra and memory persist it as-is), so no scylla
+/// serde bridge should be re-added for them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableDescriptorIdentity {
     /// [`StateType`] discriminator (part of the row key).

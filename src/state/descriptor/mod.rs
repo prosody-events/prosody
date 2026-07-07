@@ -187,15 +187,6 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
         self.with_collection_def(def)
     }
 
-    /// Clears the collection's TTL, selecting indefinite retention (the
-    /// default).
-    #[must_use]
-    fn no_ttl(self) -> Self {
-        let mut def = self.collection_def();
-        def.ttl = None;
-        self.with_collection_def(def)
-    }
-
     /// Sets the collection's recovery-convergence bound: guarantee its
     /// provisional cells are swept back to committed within `d` of the commit,
     /// tightening how long an external (non-owner) reader can observe the
@@ -206,25 +197,6 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
     fn recovery_within(self, d: CompactDuration) -> Self {
         let mut def = self.collection_def();
         def.recovery_within = Some(d);
-        self.with_collection_def(def)
-    }
-
-    /// Clears the recovery-convergence bound (the default). This removes only
-    /// the per-collection *tightening*; the always-on `recovery_delay` floor
-    /// still sweeps the collection's provisional cells.
-    #[must_use]
-    fn no_recovery_within(self) -> Self {
-        let mut def = self.collection_def();
-        def.recovery_within = None;
-        self.with_collection_def(def)
-    }
-
-    /// Selects [`CommitMode::ReadCommitted`] (the default): writes stage
-    /// provisionally and promote after the event commit.
-    #[must_use]
-    fn read_committed(self) -> Self {
-        let mut def = self.collection_def();
-        def.commit_mode = CommitMode::ReadCommitted;
         self.with_collection_def(def)
     }
 
