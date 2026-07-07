@@ -1,23 +1,12 @@
 use super::*;
-use crate::timers::duration::CompactDuration;
 use crate::timers::store::memory::memory_store;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::test_support::test_segment;
 use color_eyre::eyre::{self as eyre, Result};
 use futures::future;
-use uuid::Uuid;
-
-fn create_test_segment() -> Segment {
-    Segment {
-        id: Uuid::new_v4(),
-        name: "test-segment".to_owned(),
-        slab_size: CompactDuration::new(60),
-        version: SegmentVersion::V3,
-    }
-}
 
 #[tokio::test]
 async fn test_get_or_create_segment_new() -> Result<()> {
-    let test_segment = create_test_segment();
+    let test_segment = test_segment("test-segment", 60_u32);
     let store = memory_store(test_segment.clone());
 
     let segment = get_or_create_segment(&store, "test-segment").await?;
@@ -34,7 +23,7 @@ async fn test_get_or_create_segment_new() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_or_create_segment_existing() -> Result<()> {
-    let test_segment = create_test_segment();
+    let test_segment = test_segment("test-segment", 60_u32);
     let store = memory_store(test_segment.clone());
 
     let segment1 = get_or_create_segment(&store, "first-segment").await?;
@@ -48,7 +37,7 @@ async fn test_get_or_create_segment_existing() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_or_create_segment_concurrent() -> Result<()> {
-    let test_segment = create_test_segment();
+    let test_segment = test_segment("test-segment", 60_u32);
     let store = memory_store(test_segment.clone());
 
     let futures: Vec<_> = (0_i32..10_i32)

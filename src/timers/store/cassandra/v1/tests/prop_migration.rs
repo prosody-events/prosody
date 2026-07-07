@@ -3,8 +3,9 @@
 //! Tests V1→V2 schema migration, V2→V3 key state backfill, and slab size
 //! migration using random scenarios to verify all migration invariants.
 
+use super::test_cassandra_config;
 use crate::Key;
-use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::cassandra::CassandraStore;
 use crate::otel::SpanRelation;
 use crate::test_util::TEST_KEYSPACE;
 use crate::timers::datetime::CompactDateTime;
@@ -267,11 +268,10 @@ async fn setup_v2_state(
     // layout produced by old V2 write paths before state backfill existed.
     for trigger_data in &input.triggers {
         let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
-        let trigger = Trigger::new(
+        let trigger = Trigger::for_testing(
             trigger_data.key.clone(),
             trigger_data.time,
             trigger_data.timer_type,
-            Span::current(),
         );
 
         store
@@ -311,11 +311,10 @@ async fn setup_v3_state(
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 slab: {e:?}"))?;
 
-        let trigger = Trigger::new(
+        let trigger = Trigger::for_testing(
             trigger_data.key.clone(),
             trigger_data.time,
             trigger_data.timer_type,
-            Span::current(),
         );
         Box::pin(store.add_trigger(trigger))
             .await
@@ -740,21 +739,6 @@ async fn verify_key_state_invariant(
     }
 
     Ok(())
-}
-
-/// Creates a test Cassandra configuration.
-fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
-    use std::time::Duration;
-
-    CassandraConfiguration {
-        nodes: vec!["127.0.0.1:9042".to_owned()],
-        keyspace: keyspace.to_owned(),
-        datacenter: Some("datacenter1".to_owned()),
-        rack: None,
-        user: None,
-        password: None,
-        retention: Duration::from_hours(24),
-    }
 }
 
 /// Property test: migration preserves all invariants.

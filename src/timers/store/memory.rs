@@ -738,10 +738,9 @@ impl TriggerStoreProvider for InMemoryTriggerStoreProvider {
 #[cfg(test)]
 mod test {
     use super::{InMemoryTriggerStore, memory_store};
-    use crate::timers::store::{Segment, SegmentVersion};
+    use crate::timers::test_support::test_segment;
     use crate::trigger_store_tests;
     use std::convert::Infallible;
-    use uuid::Uuid;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
     // Low-level tests use InMemoryTriggerStore directly
@@ -750,23 +749,11 @@ mod test {
     trigger_store_tests!(
         InMemoryTriggerStore,
         |slab_size| async move {
-            let segment = Segment {
-                id: Uuid::new_v4(),
-                name: String::new(),
-                slab_size,
-                version: SegmentVersion::V3,
-            };
-            Result::<_, Infallible>::Ok(InMemoryTriggerStore::new(segment))
+            Result::<_, Infallible>::Ok(InMemoryTriggerStore::new(test_segment("", slab_size)))
         },
         crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
         |slab_size| async move {
-            let segment = Segment {
-                id: Uuid::new_v4(),
-                name: String::new(),
-                slab_size,
-                version: SegmentVersion::V3,
-            };
-            Result::<_, Infallible>::Ok(memory_store(segment))
+            Result::<_, Infallible>::Ok(memory_store(test_segment("", slab_size)))
         }
     );
 }

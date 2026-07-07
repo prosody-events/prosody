@@ -21,8 +21,10 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::test_support::test_segment;
 use crate::tracing::init_test_logging;
 use crate::trigger_store_tests;
 use color_eyre::Result;
@@ -46,14 +48,11 @@ async fn setup_test_store_with_version(
     name: &str,
     version: SegmentVersion,
 ) -> Result<(CassandraTriggerStore, SegmentId)> {
-    let slab_size = CompactDuration::new(60);
-    let segment_id = SegmentId::from(Uuid::new_v4());
     let segment = Segment {
-        id: segment_id,
-        name: name.to_owned(),
-        slab_size,
         version,
+        ..test_segment(name, 60_u32)
     };
+    let segment_id = segment.id;
     let config = test_cassandra_config();
     let cassandra_store = CassandraStore::new(&config).await?;
     let store = CassandraTriggerStore::with_store(
@@ -75,24 +74,14 @@ trigger_store_tests!(
     |slab_size| async move {
         let config = test_cassandra_config();
         let store = CassandraStore::new(&config).await?;
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            name: String::new(),
-            slab_size,
-            version: SegmentVersion::V3,
-        };
+        let segment = test_segment("", slab_size);
         CassandraTriggerStore::with_store(store, &config.keyspace, segment, SpanRelation::default())
             .await
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
         let config = test_cassandra_config();
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            name: String::new(),
-            slab_size,
-            version: SegmentVersion::V3,
-        };
+        let segment = test_segment("", slab_size);
         cassandra_store(&config, segment, SpanRelation::default()).await
     },
     integration_test_count(25)
@@ -1130,12 +1119,7 @@ fn test_prop_timer_state_invariant() {
             async {
                 let config = test_cassandra_config();
                 let store = CassandraStore::new(&config).await?;
-                let segment = Segment {
-                    id: Uuid::new_v4(),
-                    name: String::new(),
-                    slab_size,
-                    version: SegmentVersion::V3,
-                };
+                let segment = test_segment("", slab_size);
                 CassandraTriggerStore::with_store(
                     store,
                     &config.keyspace,
@@ -1178,13 +1162,7 @@ fn test_prop_timer_state_invariant() {
 async fn test_provider_creates_independent_stores() -> Result<()> {
     init_test_logging();
 
-    let slab_size = CompactDuration::new(60);
-    let segment = Segment {
-        id: SegmentId::from(Uuid::new_v4()),
-        name: "provider_independent".to_owned(),
-        slab_size,
-        version: SegmentVersion::V3,
-    };
+    let segment = test_segment("provider_independent", 60_u32);
     let config = test_cassandra_config();
 
     // Build store A with the chosen segment.
@@ -1272,12 +1250,7 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     let provider =
         CassandraTriggerStoreProvider::with_store(base, &config.keyspace, SpanRelation::default())
             .await?;
-    let segment = Segment {
-        id: SegmentId::from(Uuid::new_v4()),
-        name: "oracle_writer_handle".to_owned(),
-        slab_size: CompactDuration::new(60),
-        version: SegmentVersion::V3,
-    };
+    let segment = test_segment("oracle_writer_handle", 60_u32);
     let writer = provider.create_store(segment);
     let oracle = CommitManager::new(
         MemoryDeduplicationStore::new(),
@@ -1453,10 +1426,8 @@ async fn prop_timer_state_invariant(
 ) -> Result<()> {
     use crate::timers::store::tests::prop_key_triggers::KeyTriggerModel;
 
-    let key_pool = ["key-a", "key-b", "key-c"];
-
     // Clean up before test
-    for key_str in &key_pool {
+    for key_str in &KEY_POOL {
         let key = Key::from(*key_str);
         store.clear_key_triggers_all_types(&key).await?;
     }

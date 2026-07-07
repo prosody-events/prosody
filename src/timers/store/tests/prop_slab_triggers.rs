@@ -6,6 +6,7 @@
 //! Each store instance is scoped to exactly one segment. All slab trigger
 //! operations are routed through that segment's partition.
 
+use super::common::KEY_POOL;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -19,7 +20,6 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 use strum::VariantArray;
-use tracing::Span;
 
 /// Operations that can be performed on the slab trigger table.
 #[derive(Clone, Debug)]
@@ -72,9 +72,6 @@ impl Arbitrary for SlabTriggerTestInput {
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
         let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
-        // Use small pools for keys to increase collision probability
-        let key_pool = ["key-a", "key-b", "key-c"];
-
         // Generate 10-50 operations
         let op_count = (usize::arbitrary(g) % 40) + 10;
         let mut operations = Vec::with_capacity(op_count);
@@ -82,8 +79,8 @@ impl Arbitrary for SlabTriggerTestInput {
         for _ in 0..op_count {
             let slab_id = SlabId::from(u8::arbitrary(g) % 5); // 0-4
 
-            let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
-            let key = Key::from(key_pool[key_idx]);
+            let key_idx = usize::from(u8::arbitrary(g)) % KEY_POOL.len();
+            let key = Key::from(KEY_POOL[key_idx]);
 
             let timer_type =
                 TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
@@ -92,7 +89,7 @@ impl Arbitrary for SlabTriggerTestInput {
 
             let op = match u8::arbitrary(g) % 5 {
                 0 => {
-                    let trigger = Trigger::new(key, time, timer_type, Span::current());
+                    let trigger = Trigger::for_testing(key, time, timer_type);
                     SlabTriggerOperation::Insert { slab_id, trigger }
                 }
                 1 => SlabTriggerOperation::GetByType {

@@ -3,7 +3,7 @@
 //! Tests the low-level key trigger CRUD operations in isolation using a
 //! simple reference model to verify correctness.
 
-use super::common::derive_tag;
+use super::common::{KEY_POOL, derive_tag};
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -92,16 +92,13 @@ impl Arbitrary for KeyTriggerTestInput {
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
         let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
-        // Use small key pool to increase collision probability
-        let key_pool = ["key-a", "key-b", "key-c"];
-
         // Generate 10-50 operations
         let op_count = (usize::arbitrary(g) % 40) + 10;
         let mut operations = Vec::with_capacity(op_count);
 
         for _ in 0..op_count {
-            let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
-            let key = Key::from(key_pool[key_idx]);
+            let key_idx = usize::from(u8::arbitrary(g)) % KEY_POOL.len();
+            let key = Key::from(KEY_POOL[key_idx]);
 
             let timer_type =
                 TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
@@ -538,9 +535,7 @@ where
 {
     // Clean up the keys from this trial to ensure isolation: trials share a
     // fixed key pool, so cleanup prevents pollution across trials and reruns.
-    let key_pool = ["key-a", "key-b", "key-c"]; // Match the pool in Arbitrary
-
-    for key_str in &key_pool {
+    for key_str in &KEY_POOL {
         let key = Key::from(*key_str);
         operations
             .clear_key_triggers_all_types(&key)

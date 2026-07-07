@@ -147,11 +147,10 @@ impl Arbitrary for TriggerTestInput {
             let key = format!("key-{i}");
             for _ in 0..triggers_per_key {
                 let time = CompactDateTime::arbitrary(g);
-                triggers.push(Trigger::new(
+                triggers.push(Trigger::for_testing(
                     Key::from(key.clone()),
                     time,
                     TimerType::Application,
-                    tracing::Span::current(),
                 ));
             }
         }

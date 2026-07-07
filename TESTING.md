@@ -29,7 +29,8 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 | Crate-wide (`integration_test_count`, `test_cassandra_config`) | `src/tests/test_util.rs` |
 | Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support.rs` |
 | Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |
-| Timer stores (trigger/segment fixtures, suite macros) | `src/timers/store/tests/` |
+| Timers (segment/trigger factories, in-memory `TimerManager` harness) | `src/timers/test_support.rs` |
+| Timer stores (store helpers, `KEY_POOL`, suite macros) | `src/timers/store/tests/` |
 | Integration | `tests/common.rs` |
 
 If the helper you need exists in a sibling test file but not a shared home,

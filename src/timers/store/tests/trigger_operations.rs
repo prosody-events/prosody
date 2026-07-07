@@ -268,12 +268,7 @@ where
 
         match op {
             TriggerOperation::Add => {
-                let trigger = Trigger::new(
-                    input.key.clone(),
-                    time,
-                    TimerType::Application,
-                    Span::current(),
-                );
+                let trigger = Trigger::for_testing(input.key.clone(), time, TimerType::Application);
 
                 add_trigger(store, &trigger).await?;
                 expected_times.insert(time);

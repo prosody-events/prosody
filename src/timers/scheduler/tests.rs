@@ -33,7 +33,8 @@ use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
-use crate::timers::store::{Segment, SegmentVersion, TriggerStore};
+use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use color_eyre::eyre::Result;
@@ -46,21 +47,11 @@ use strum::VariantArray;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::time::{Instant, advance};
 use tracing::Span;
-use uuid::Uuid;
 
 /// Tests use a 300s slab and a deterministic preload window so slab
 /// math is predictable across runs.
 const SLAB_SIZE_SECS: u32 = 300;
 const PRELOAD_SECS: u32 = 120;
-
-fn test_segment() -> Segment {
-    Segment {
-        id: Uuid::new_v4(),
-        name: "scheduler-test".to_owned(),
-        slab_size: CompactDuration::new(SLAB_SIZE_SECS),
-        version: SegmentVersion::V3,
-    }
-}
 
 type TestStore = TableAdapter<InMemoryTriggerStore>;
 
@@ -135,7 +126,7 @@ fn test_calculate_preload_within_bounds() {
 
 #[test]
 fn test_next_unloaded_slab_id_from_fresh_state() {
-    let segment = test_segment();
+    let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
     let store = memory_store(segment.clone());
     let mut state = fresh_state(store, segment);
     // No watermark, no high-water: scan starts at 0.
@@ -276,9 +267,9 @@ struct TriggerModel {
 type TriggerModels = HashMap<(Key, CompactDateTime, TimerType), TriggerModel>;
 
 struct Fixture {
-    store: TableAdapter<InMemoryTriggerStore>,
+    store: TestStore,
     segment: Segment,
-    state: ActorState<TableAdapter<InMemoryTriggerStore>>,
+    state: ActorState<TestStore>,
     triggers: TriggerQueue,
     /// Authoritative per-trigger model.
     expected: TriggerModels,
@@ -292,7 +283,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> StdResult<Self, String> {
-        let segment = test_segment();
+        let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
         let store = memory_store(segment.clone());
         store
             .insert_segment()
@@ -790,7 +781,7 @@ fn build_universe(now_slab: SlabId) -> Vec<(Key, CompactDateTime, TimerType)> {
 
 #[tokio::test]
 async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> Result<()> {
-    let segment = test_segment();
+    let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
     let store = memory_store(segment.clone());
     store.insert_segment().await?;
 

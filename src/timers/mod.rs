@@ -75,6 +75,8 @@ mod scheduler;
 mod segment;
 mod slab;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod uncommitted;
 
 /// Classifies a timer by its origin, used to route and account for execution

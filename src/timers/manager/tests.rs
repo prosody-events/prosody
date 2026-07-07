@@ -2,87 +2,24 @@ use super::*;
 use crate::Topic;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::telemetry::Telemetry;
-use crate::timers::TimerSemaphores;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::test_support::{
+    create_test_trigger, setup_timer_manager, test_segment, test_semaphores,
+};
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use color_eyre::eyre::{Result, eyre};
 use futures::{StreamExt, pin_mut};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use std::array::from_fn;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
-use tokio::sync::{Semaphore, watch};
-
-const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
-
-fn test_semaphores() -> Arc<TimerSemaphores> {
-    Arc::new(from_fn(|_| {
-        Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE))
-    }))
-}
-
+use tokio::sync::watch;
 use tokio::task;
 use tokio::time::{self, advance, timeout};
 use tracing::Span;
-use uuid::Uuid;
-
-fn test_segment() -> Segment {
-    Segment {
-        id: Uuid::new_v4(),
-        name: "test-segment".to_owned(),
-        slab_size: CompactDuration::new(300),
-        version: SegmentVersion::V3,
-    }
-}
-
-/// Helper function to create a test trigger
-fn create_test_trigger(key: &str, seconds_offset: u32, timer_type: TimerType) -> Result<Trigger> {
-    let time = CompactDateTime::now()?.add_duration(CompactDuration::new(seconds_offset))?;
-
-    Ok(Trigger::new(
-        Key::from(key),
-        time,
-        timer_type,
-        Span::current(),
-    ))
-}
-
-/// Helper function to set up a timer manager for testing.
-///
-/// Returns `(stream, manager, shutdown_tx)`. The caller holds
-/// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
-/// background scheduler actor.
-async fn setup_timer_manager() -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
-    watch::Sender<ShutdownPhase>,
-)> {
-    let store = memory_store(test_segment());
-    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let telemetry = Telemetry::new();
-
-    let config = TimerManagerConfig {
-        name: "test-manager".to_owned(),
-        store,
-        telemetry: telemetry.partition_sender(Topic::from("test"), 0),
-        source: Arc::from(""),
-    };
-
-    let (stream, manager) = TimerManager::new(
-        config,
-        HeartbeatRegistry::test(),
-        shutdown_rx,
-        test_semaphores(),
-    )
-    .await
-    .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
-    Ok((stream, manager, shutdown_tx))
-}
 
 /// Helper: count scheduled times for a key and timer type
 async fn count_scheduled<T: TriggerStore>(
@@ -114,7 +51,7 @@ where
 async fn test_new_timer_manager_creation() -> Result<()> {
     time::pause();
 
-    let segment = test_segment();
+    let segment = test_segment("test-segment", 300_u32);
     let store = memory_store(segment.clone());
     let telemetry = Telemetry::new();
 

@@ -6,7 +6,6 @@ use crate::timers::{TimerType, Trigger};
 use color_eyre::eyre::{Result, bail};
 use tokio::task::coop::cooperative;
 use tokio::time::{Duration, advance, pause};
-use tracing::Span;
 
 #[tokio::test]
 async fn test_insert_and_next() -> Result<()> {
@@ -16,7 +15,7 @@ async fn test_insert_and_next() -> Result<()> {
 
     let key = Key::from("test-key");
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?; // 1 second in the future
-    let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
+    let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
 
     // Insert the trigger
     triggers.insert(trigger.clone()).await;
@@ -41,7 +40,7 @@ async fn test_remove_trigger() -> Result<()> {
 
     let key = Key::from("test-key");
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?; // 5 seconds in the future
-    let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
+    let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
 
     // Insert the trigger
     triggers.insert(trigger.clone()).await;
@@ -74,21 +73,12 @@ async fn test_multiple_triggers() -> Result<()> {
 
     let key_first = Key::from("key1");
     let time_first = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?; // 1 second in the future
-    let trigger_first = Trigger::new(
-        key_first.clone(),
-        time_first,
-        TimerType::Application,
-        Span::current(),
-    );
+    let trigger_first = Trigger::for_testing(key_first.clone(), time_first, TimerType::Application);
 
     let key_second = Key::from("key2");
     let time_second = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?; // 2 seconds in the future
-    let trigger_second = Trigger::new(
-        key_second.clone(),
-        time_second,
-        TimerType::Application,
-        Span::current(),
-    );
+    let trigger_second =
+        Trigger::for_testing(key_second.clone(), time_second, TimerType::Application);
 
     // Insert both triggers
     triggers.insert(trigger_first.clone()).await;
@@ -125,7 +115,7 @@ async fn test_active_triggers() -> Result<()> {
 
     let key = Key::from("active-key");
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?; // 5 seconds in the future
-    let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
+    let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
 
     // Insert the trigger
     triggers.insert(trigger.clone()).await;
