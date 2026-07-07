@@ -676,13 +676,15 @@ impl ConsumerConfigurationBuilder {
     }
 }
 
-/// Configuration for middleware common to all consumer types.
+/// Configuration shared by every consumer mode (pipeline, low-latency, and
+/// best-effort).
 ///
-/// Contains configurations for the telemetry, timeout, scheduler, and shutdown
-/// middleware that are applied to all consumer types (pipeline, low-latency,
-/// and best-effort).
+/// Carries the scheduler, timeout, and deduplication configurations, plus the
+/// mode-independent keyed-state configuration. Named without a "middleware"
+/// qualifier because keyed state is not middleware — its durability sequence
+/// runs at the `settle` boundary, outside the middleware stack.
 #[derive(Clone, Debug)]
-pub struct CommonMiddlewareConfiguration {
+pub struct CommonConfiguration {
     /// Scheduler configuration for fair work-conserving dispatch.
     pub scheduler: SchedulerConfiguration,
     /// Timeout configuration for handler execution limits.
@@ -693,12 +695,15 @@ pub struct CommonMiddlewareConfiguration {
     /// the keyed-state recovery path reads (a message's dedup row existing
     /// means it committed), so it cannot be pipeline-specific.
     pub dedup: DeduplicationConfiguration,
+    /// Keyed-state configuration (mode-independent, always-on; inert when no
+    /// collections are registered).
+    pub keyed_state: KeyedStateConfiguration,
 }
 
 /// Configuration for middleware specific to pipeline consumers.
 ///
-/// Bundles the retry, monopolization, defer, deduplication, and keyed-state
-/// configurations that are only used by the pipeline processing mode.
+/// Bundles the retry, monopolization, and defer configurations that are only
+/// used by the pipeline processing mode.
 #[derive(Clone, Debug)]
 pub struct PipelineMiddlewareConfiguration {
     /// Retry configuration for failed messages.
@@ -707,9 +712,6 @@ pub struct PipelineMiddlewareConfiguration {
     pub monopolization: MonopolizationConfiguration,
     /// Defer middleware configuration.
     pub defer: DeferConfiguration,
-    /// Keyed-state configuration (always-on; inert when no collections are
-    /// registered).
-    pub keyed_state: KeyedStateConfiguration,
 }
 
 /// Configuration for middleware specific to low-latency consumers.
@@ -722,9 +724,6 @@ pub struct LowLatencyMiddlewareConfiguration {
     pub retry: RetryConfiguration,
     /// Failure topic configuration for routing unrecoverable messages.
     pub failure_topic: FailureTopicConfiguration,
-    /// Keyed-state configuration (always-on; inert when no collections are
-    /// registered).
-    pub keyed_state: KeyedStateConfiguration,
 }
 
 /// High-level Kafka consumer implementation.
@@ -819,7 +818,7 @@ impl KeyedStateInputs {
 struct PipelineMiddlewareStack {
     consumer_config: ConsumerConfiguration,
     defer_config: DeferConfiguration,
-    common_config: CommonMiddlewareConfiguration,
+    common_config: CommonConfiguration,
     failure_tracker: FailureTracker,
     monopolization_middleware: Option<MonopolizationMiddleware>,
     retry_middleware: RetryMiddleware,
@@ -952,10 +951,14 @@ fn validate_recovery_ttl_margin(
 async fn build_shared_state(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
-    common_config: &CommonMiddlewareConfiguration,
-    keyed_state_config: KeyedStateConfiguration,
+    common_config: &CommonConfiguration,
 ) -> Result<(StorePair, KeyedStateInputs, HeartbeatRegistry), ConsumerError> {
     consumer_config.validate()?;
+    // Clone (never drain) the registered keyed-state config: callers pass
+    // `common_config` by reference and retain the intact configuration, so a
+    // re-subscribe rebuilds the registry from the same registrations and
+    // existing `Registered<_>` tokens stay valid.
+    let keyed_state_config = common_config.keyed_state.clone();
     keyed_state_config.validate()?;
     let dedup_config = common_config.dedup.clone();
     // The commit oracle is the dedup marker; a provisional cell must resolve
@@ -993,22 +996,16 @@ async fn prepare_pipeline_stack(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
     pipeline_config: PipelineMiddlewareConfiguration,
-    common_config: &CommonMiddlewareConfiguration,
+    common_config: &CommonConfiguration,
     telemetry: Telemetry,
 ) -> Result<(StorePair, KeyedStateInputs, PipelineMiddlewareStack), ConsumerError> {
     let PipelineMiddlewareConfiguration {
         retry: retry_config,
         monopolization: monopolization_config,
         defer: defer_config,
-        keyed_state: keyed_state_config,
     } = pipeline_config;
-    let (stores, keyed_state, heartbeats) = build_shared_state(
-        consumer_config,
-        trigger_store_config,
-        common_config,
-        keyed_state_config,
-    )
-    .await?;
+    let (stores, keyed_state, heartbeats) =
+        build_shared_state(consumer_config, trigger_store_config, common_config).await?;
     let monopolization_middleware =
         MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
     let failure_tracker = FailureTracker::new(
@@ -1047,7 +1044,7 @@ async fn prepare_pipeline_stack(
 /// this is called INSIDE the storage `match` arm where the concrete
 /// `dedup_provider` is in hand.
 fn build_common_middleware<DP, P>(
-    config: &CommonMiddlewareConfiguration,
+    config: &CommonConfiguration,
     consumer_config: &ConsumerConfiguration,
     telemetry: Telemetry,
     dedup_provider: DP,
@@ -1329,7 +1326,7 @@ where
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         pipeline_config: PipelineMiddlewareConfiguration,
-        common_config: &CommonMiddlewareConfiguration,
+        common_config: &CommonConfiguration,
         telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
@@ -1450,7 +1447,7 @@ where
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         low_latency_config: LowLatencyMiddlewareConfiguration,
-        common_config: &CommonMiddlewareConfiguration,
+        common_config: &CommonConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
@@ -1462,15 +1459,9 @@ where
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
             failure_topic: topic_config,
-            keyed_state: keyed_state_config,
         } = low_latency_config;
-        let (stores, keyed_state, heartbeats) = build_shared_state(
-            consumer_config,
-            trigger_store_config,
-            common_config,
-            keyed_state_config,
-        )
-        .await?;
+        let (stores, keyed_state, heartbeats) =
+            build_shared_state(consumer_config, trigger_store_config, common_config).await?;
         let version = keyed_state.version.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware =
@@ -1557,8 +1548,7 @@ where
     pub(crate) async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        common_config: &CommonMiddlewareConfiguration,
-        keyed_state_config: KeyedStateConfiguration,
+        common_config: &CommonConfiguration,
         telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
@@ -1566,13 +1556,8 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats) = build_shared_state(
-            consumer_config,
-            trigger_store_config,
-            common_config,
-            keyed_state_config,
-        )
-        .await?;
+        let (stores, keyed_state, heartbeats) =
+            build_shared_state(consumer_config, trigger_store_config, common_config).await?;
         let version = keyed_state.version.clone();
 
         // dedup lives inside the common block; `log` (which swallows failures)

@@ -21,7 +21,7 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonMiddlewareConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
+    CommonConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
     MessageDescriptor, MessageStateError, PipelineMiddlewareConfiguration, ProsodyConsumer,
     message_state,
 };
@@ -303,13 +303,13 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
         retry: RetryConfigurationBuilder::default().build()?,
         monopolization: MonopolizationConfigurationBuilder::default().build()?,
         defer: DeferConfigurationBuilder::default().build()?,
-        keyed_state,
     };
 
-    let common_config = CommonMiddlewareConfiguration {
+    let common_config = CommonConfiguration {
         scheduler: SchedulerConfigurationBuilder::default().build()?,
         timeout: TimeoutConfigurationBuilder::default().build()?,
         dedup: DeduplicationConfigurationBuilder::default().build()?,
+        keyed_state,
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(

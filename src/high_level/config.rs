@@ -34,7 +34,7 @@ use crate::consumer::middleware::topic::{
     FailureTopicConfigurationBuilderError,
 };
 use crate::consumer::{
-    CommonMiddlewareConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
+    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
     ConsumerConfigurationBuilderError, KeyedStateConfiguration,
 };
 use crate::high_level::mode::Mode;
@@ -89,10 +89,8 @@ pub enum ModeConfiguration {
         monopolization: MonopolizationConfiguration,
         /// Defer middleware configuration.
         defer: DeferConfiguration,
-        /// Common middleware configuration (scheduler, timeout, dedup).
-        common: CommonMiddlewareConfiguration,
-        /// Keyed-state configuration (mode-independent; carries registrations).
-        keyed_state: KeyedStateConfiguration,
+        /// Common configuration (scheduler, timeout, dedup, keyed state).
+        common: CommonConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -104,10 +102,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
-        /// Common middleware configuration (scheduler, timeout, dedup).
-        common: CommonMiddlewareConfiguration,
-        /// Keyed-state configuration (mode-independent; carries registrations).
-        keyed_state: KeyedStateConfiguration,
+        /// Common configuration (scheduler, timeout, dedup, keyed state).
+        common: CommonConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -115,10 +111,8 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
-        /// Common middleware configuration (scheduler, timeout, dedup).
-        common: CommonMiddlewareConfiguration,
-        /// Keyed-state configuration (mode-independent; carries registrations).
-        keyed_state: KeyedStateConfiguration,
+        /// Common configuration (scheduler, timeout, dedup, keyed state).
+        common: CommonConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -151,11 +145,14 @@ impl ModeConfiguration {
         // common configuration rather than pipeline-only.
         let dedup = params.dedup_builder.build()?;
 
-        // Build common middleware configuration
-        let common = CommonMiddlewareConfiguration {
+        // Build the common configuration shared by every mode. Keyed state is
+        // mode-independent (it carries the registrations), so it lives here
+        // rather than in a per-mode struct.
+        let common = CommonConfiguration {
             scheduler,
             timeout,
             dedup,
+            keyed_state: params.keyed_state.clone(),
         };
 
         // Create trigger store configuration based on mock mode
@@ -165,8 +162,6 @@ impl ModeConfiguration {
             let cassandra_config = params.cassandra_builder.build()?;
             TriggerStoreConfiguration::Cassandra(cassandra_config)
         };
-
-        let keyed_state = params.keyed_state.clone();
 
         Ok(match params.mode {
             Mode::Pipeline => {
@@ -178,7 +173,6 @@ impl ModeConfiguration {
                     monopolization,
                     defer,
                     common,
-                    keyed_state,
                     trigger_store,
                 }
             }
@@ -189,14 +183,12 @@ impl ModeConfiguration {
                     retry,
                     failure_topic,
                     common,
-                    keyed_state,
                     trigger_store,
                 }
             }
             Mode::BestEffort => Self::BestEffort {
                 consumer,
                 common,
-                keyed_state,
                 trigger_store,
             },
         })
@@ -265,9 +257,9 @@ impl ModeConfiguration {
         D: StateDescriptor,
     {
         match self {
-            Self::Pipeline { keyed_state, .. }
-            | Self::LowLatency { keyed_state, .. }
-            | Self::BestEffort { keyed_state, .. } => keyed_state.register(descriptor),
+            Self::Pipeline { common, .. }
+            | Self::LowLatency { common, .. }
+            | Self::BestEffort { common, .. } => common.keyed_state.register(descriptor),
         }
     }
 }

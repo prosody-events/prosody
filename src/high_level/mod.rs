@@ -306,9 +306,14 @@ where
                 monopolization,
                 defer,
                 common,
-                keyed_state,
                 trigger_store,
             } => {
+                // `common` (carrying the registered keyed-state config) is
+                // passed by reference and cloned inside the constructor, so the
+                // intact `ModeConfiguration` is retained in `Running` and moved
+                // back to `Configured` on `unsubscribe`: a re-subscribe rebuilds
+                // the registry from the same registrations and existing
+                // `Registered<_>` tokens stay valid.
                 ProsodyConsumer::<C>::pipeline_consumer(
                     consumer,
                     trigger_store,
@@ -316,13 +321,6 @@ where
                         retry: retry.clone(),
                         monopolization: monopolization.clone(),
                         defer: defer.clone(),
-                        // Clone (never drain) the registered config: the intact
-                        // `ModeConfiguration` is retained in `Running` and moved
-                        // back to `Configured` on `unsubscribe`, so a
-                        // re-subscribe rebuilds the registry from the same
-                        // registrations and existing `Registered<_>` tokens stay
-                        // valid.
-                        keyed_state: keyed_state.clone(),
                     },
                     common,
                     self.telemetry.clone(),
@@ -335,7 +333,6 @@ where
                 retry,
                 failure_topic,
                 common,
-                keyed_state,
                 trigger_store,
             } => {
                 ProsodyConsumer::low_latency_consumer(
@@ -344,7 +341,6 @@ where
                     LowLatencyMiddlewareConfiguration {
                         retry: retry.clone(),
                         failure_topic: failure_topic.clone(),
-                        keyed_state: keyed_state.clone(),
                     },
                     common,
                     self.producer.clone(),
@@ -356,14 +352,12 @@ where
             ModeConfiguration::BestEffort {
                 consumer,
                 common,
-                keyed_state,
                 trigger_store,
             } => {
                 ProsodyConsumer::<C>::best_effort_consumer(
                     consumer,
                     trigger_store,
                     common,
-                    keyed_state.clone(),
                     self.telemetry.clone(),
                     handler.clone(),
                 )
