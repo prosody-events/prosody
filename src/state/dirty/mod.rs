@@ -44,6 +44,14 @@ const COLLECTIONS_INLINE: usize = 4;
 /// coordinate-ordered.
 pub type CellSnapshot = SmallVec<[(CellKey, DirtyVal); CELLS_INLINE]>;
 
+/// One collection's dirty cells in committed-write form (`(cell, data)`),
+/// owned and coordinate-ordered — the [`CellStore::write_resolved`] input
+/// shape, inline like [`CellSnapshot`] so a flush of a Value or a small
+/// Map/Deque allocates nothing.
+///
+/// [`CellStore::write_resolved`]: crate::state::store::CellStore::write_resolved
+pub type ResolvedCells = SmallVec<[(CellKey, Option<Bytes>); CELLS_INLINE]>;
+
 /// One event's touched cells grouped by collection: `(state_type, name)` and
 /// its [`CellSnapshot`].
 pub type TouchedCollection = ((StateType, StateName), CellSnapshot);
@@ -70,6 +78,18 @@ pub enum DirtyVal {
 
     /// The cell was cleared (set-to-absent).
     Cleared,
+}
+
+impl DirtyVal {
+    /// The committed bytes this outcome stages to (`Set` → its bytes,
+    /// `Cleared` → absence).
+    #[must_use]
+    pub fn into_data(self) -> Option<Bytes> {
+        match self {
+            Self::Set(bytes) => Some(bytes),
+            Self::Cleared => None,
+        }
+    }
 }
 
 /// In-memory dirty cell store: the latest [`DirtyVal`] per touched cell, keyed
@@ -100,20 +120,14 @@ impl DirtyStore {
             .upsert_sync(dirty_key(collection, cell), DirtyVal::Cleared);
     }
 
-    /// Removes one cell's buffered outcome (after a mid-handler flush, which
-    /// writes it through directly).
-    pub fn remove(&self, collection: &CollectionId, cell: &CellKey) {
-        self.entries.remove_sync(&dirty_key(collection, cell));
-    }
-
     /// The cell's buffered outcome, if any — the [`Overlay`] point lookup.
     ///
     /// Uses the lock-free [`scc::TreeIndex::peek_with`], not `read_sync`: a
     /// [`DirtyVal`] is replaced wholesale by [`Self::set`]/[`Self::clear`]
     /// (never interior-mutated), so the lock-free snapshot read is exactly
     /// right — and it avoids `read_sync`'s lock-retry loop, which spins
-    /// forever on a key that was just `remove`d in the same
-    /// (single-threaded) event (the flush → re-read path).
+    /// forever on a key that was just drained by [`Self::remove_collection`]
+    /// in the same (single-threaded) event (the flush → re-read path).
     ///
     /// [`Overlay`]: crate::state::overlay::Overlay
     #[must_use]
@@ -148,6 +162,29 @@ impl DirtyStore {
             .range(scope.clone()..=scope, &guard)
             .map(|(k, v)| (k.cell.clone(), v.clone()))
             .collect()
+    }
+
+    /// An owned, coordinate-ordered snapshot of one collection's dirty cells
+    /// across every section, already in committed-write form — the mid-handler
+    /// flush's drain read. Same owned-snapshot rationale as
+    /// [`Self::section_snapshot`].
+    #[must_use]
+    pub fn collection_snapshot(&self, collection: &CollectionId) -> ResolvedCells {
+        let scope = collection_scope(collection);
+        let guard = Guard::new();
+        self.entries
+            .range(scope.clone()..=scope, &guard)
+            .map(|(k, v)| (k.cell.clone(), v.clone().into_data()))
+            .collect()
+    }
+
+    /// Discards one collection's buffered outcomes (after a mid-handler flush
+    /// wrote them through). Race-free for the same reason as
+    /// [`Self::clear_event`]: no handler op is in flight while the handler
+    /// itself awaits the flush.
+    pub fn remove_collection(&self, collection: &CollectionId) {
+        let scope = collection_scope(collection);
+        self.entries.remove_range_sync(scope.clone()..=scope);
     }
 
     /// Groups this event's (one `key`) dirty cells by collection — the
@@ -205,6 +242,48 @@ impl scc::Equivalent<DirtyKey> for KeyScope {
 impl scc::Comparable<DirtyKey> for KeyScope {
     fn compare(&self, key: &DirtyKey) -> Ordering {
         self.0.cmp(&key.key)
+    }
+}
+
+/// Builds the query matching every [`DirtyKey`] in `collection`.
+fn collection_scope(collection: &CollectionId) -> CollectionScope {
+    CollectionScope {
+        key: collection.state_key().key.clone(),
+        state_type: collection.state_type(),
+        name: collection.name().clone(),
+    }
+}
+
+/// Query matching every [`DirtyKey`] in one collection — the mid-handler
+/// flush sub-range, for [`DirtyStore::collection_snapshot`] and
+/// [`DirtyStore::remove_collection`]. Compares on `(key, state_type, name)`,
+/// ignoring the cell, so the inclusive range spans the collection's cells
+/// across every section in coordinate order.
+#[derive(Clone, PartialEq, Eq)]
+struct CollectionScope {
+    key: Key,
+    state_type: StateType,
+    name: StateName,
+}
+
+impl CollectionScope {
+    fn cmp_key(&self, key: &DirtyKey) -> Ordering {
+        self.key
+            .cmp(&key.key)
+            .then(self.state_type.cmp(&key.state_type))
+            .then(self.name.cmp(&key.name))
+    }
+}
+
+impl scc::Equivalent<DirtyKey> for CollectionScope {
+    fn equivalent(&self, key: &DirtyKey) -> bool {
+        self.cmp_key(key) == Ordering::Equal
+    }
+}
+
+impl scc::Comparable<DirtyKey> for CollectionScope {
+    fn compare(&self, key: &DirtyKey) -> Ordering {
+        self.cmp_key(key)
     }
 }
 

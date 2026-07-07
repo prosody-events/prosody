@@ -1,18 +1,22 @@
 //! Session lifecycle property + the marker-ordering pin.
 //!
-//! [`prop_value_lifecycle_equivalence`] drives a random sequence of
-//! mutate/commit/abort/reset/fail events through the **real** production
-//! session lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`)
-//! over **one partition-shared [`DirtyStore`]**, minting each event's session
-//! as an [`EventStateScope`] that drops at event-end (the production
-//! lifecycle). It asserts, after every event, that a plain `Option<Bytes>`
-//! model equals both the committed projection and a fresh **overlay read** (the
-//! dirty short-circuit a `committed_value` probe bypasses), and that the shared
+//! [`prop_value_lifecycle_equivalence`] drives a random sequence of events —
+//! each a short op list (set/clear/mid-handler flush) plus a
+//! commit/abort/reset/fail outcome — through the **real** production session
+//! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`) over **one
+//! partition-shared [`DirtyStore`]**, minting each event's session as an
+//! [`EventStateScope`] that drops at event-end (the production lifecycle). It
+//! asserts, after every event, that a plain `Option<Bytes>` model equals both
+//! the committed projection and a fresh **overlay read** (the dirty
+//! short-circuit a `committed_value` probe bypasses), and that the shared
 //! dirty buffer is empty for the key — so a failed event's buffered write can
-//! neither linger nor be read as uncommitted. One focused example pins the
-//! ordering a trace cannot observe: the single marker flushes **exactly once,
-//! strictly after the stage** (the [`ScriptedOracle`] `record_message`
-//! counter).
+//! neither linger nor be read as uncommitted. A flush advances the model's
+//! durable snapshot immediately, so the property also proves the at-least-once
+//! flush contract: flushed writes survive abort/reset/failure while post-flush
+//! ops still roll back. One focused example pins the ordering a trace cannot
+//! observe: the single marker flushes **exactly once, strictly after the
+//! stage** (the [`ScriptedOracle`] `record_message` counter); another pins the
+//! flush drain to its own collection.
 
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
@@ -28,6 +32,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
+    StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -327,18 +332,95 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
     Ok(())
 }
 
-/// One event in the Value lifecycle trace: a mutation and a terminal outcome.
-#[derive(Clone, Copy, Debug)]
+/// A mid-handler flush drains only its own collection: the flushed
+/// collection's write is committed durably while the sibling's stays buffered
+/// and unwritten — the drain is collection-scoped, never key-scoped.
+#[tokio::test]
+async fn flush_drains_only_its_collection() -> Result<()> {
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
+    registry.register(
+        &value_state::<JsonCodec>("wishlist"),
+        CollectionDef::new(None),
+    )?;
+    let registry = Arc::new(registry);
+    let oracle = ScriptedOracle::default();
+    let cell = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let state_key = StateKey::new(Uuid::from_u128(8), Arc::from("key"));
+    let dirty = Arc::new(DirtyStore::new());
+    let (event, _dedup) = message(1);
+    let session: Session = KeyedStateSession::new(SessionParts {
+        cell: cell.clone(),
+        dirty: dirty.clone(),
+        oracle,
+        loader: (),
+        registry,
+        state_key: state_key.clone(),
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    });
+
+    let cart = StateName::try_new("cart")?;
+    let wishlist = StateName::try_new("wishlist")?;
+    session
+        .set(StateType::Application, &cart, &value_cell(), b"a")
+        .await?;
+    session
+        .set(StateType::Application, &wishlist, &value_cell(), b"b")
+        .await?;
+
+    assert_eq!(
+        session.flush(StateType::Application, &cart).await?,
+        StoreOutcome::Applied,
+    );
+
+    // Cart's write is committed durably; wishlist's is still only buffered.
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    let cart_id = CollectionId::new(state_key.clone(), StateType::Application, cart);
+    assert_eq!(
+        cell.get(&cart_id, &value_cell(), probe).await?.into_inner(),
+        Some(Bytes::from_static(b"a")),
+    );
+    let wishlist_id =
+        CollectionId::new(state_key.clone(), StateType::Application, wishlist.clone());
+    assert_eq!(
+        cell.get(&wishlist_id, &value_cell(), probe)
+            .await?
+            .into_inner(),
+        None,
+        "the sibling collection's buffered op must not be written through",
+    );
+    let touched = dirty.touched(&state_key.key);
+    assert_eq!(touched.len(), 1, "only the un-flushed sibling stays dirty");
+    assert_eq!(touched[0].0.1, wishlist);
+    Ok(())
+}
+
+/// Cap on ops per event: enough for flush/mutate interleavings, small enough
+/// that a failing trace stays readable.
+const MAX_EVENT_OPS: usize = 4;
+
+/// One event in the Value lifecycle trace: a short op list and a terminal
+/// outcome. An empty op list is the skip event.
+#[derive(Clone, Debug)]
 struct ValueEvent {
-    mutation: ValueMut,
+    ops: Vec<ValueOp>,
     outcome: Outcome,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ValueMut {
+enum ValueOp {
     Set(u8),
     Clear,
-    Skip,
+    /// The mid-handler write-through: everything buffered so far becomes
+    /// durable immediately and survives every non-commit outcome.
+    Flush,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -352,20 +434,35 @@ enum Outcome {
     Failed,
 }
 
+impl Arbitrary for ValueOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // Sets weighted up so state actually accumulates between flushes.
+        match u8::arbitrary(g) % 4 {
+            0 | 1 => Self::Set(u8::arbitrary(g)),
+            2 => Self::Clear,
+            _ => Self::Flush,
+        }
+    }
+}
+
 impl Arbitrary for ValueEvent {
     fn arbitrary(g: &mut Gen) -> Self {
-        let mutation = match u8::arbitrary(g) % 3 {
-            0 => ValueMut::Set(u8::arbitrary(g)),
-            1 => ValueMut::Clear,
-            _ => ValueMut::Skip,
-        };
+        let ops = Vec::<ValueOp>::arbitrary(g)
+            .into_iter()
+            .take(MAX_EVENT_OPS)
+            .collect();
         let outcome = match u8::arbitrary(g) % 5 {
             0 => Outcome::Reset,
             1 => Outcome::Abort,
             2 => Outcome::Failed,
             _ => Outcome::Commit,
         };
-        Self { mutation, outcome }
+        Self { ops, outcome }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let outcome = self.outcome;
+        Box::new(self.ops.shrink().map(move |ops| Self { ops, outcome }))
     }
 }
 
@@ -392,6 +489,11 @@ impl Arbitrary for Trace {
 
 /// Drives the trace through the real session lifecycle, asserting the committed
 /// projection equals a plain `Option<Bytes>` model after every event.
+///
+/// A mid-event flush snapshots the scratch model as immediately durable: on a
+/// commit the full scratch wins, on every other outcome the durable state must
+/// equal the last flushed snapshot (post-flush ops roll back; pre-flush ops
+/// survive) — the at-least-once flush contract.
 async fn run(trace: Trace) -> Result<bool> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
@@ -399,29 +501,57 @@ async fn run(trace: Trace) -> Result<bool> {
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let (event, dedup_id) = message(index as u128 + 1);
+        // Committed + buffered projection as the ops run.
+        let mut scratch = model.clone();
+        // The scratch as of the last flush — durable regardless of outcome.
+        let mut flushed: Option<Option<Bytes>> = None;
+        // Whether anything is buffered since event start / the last flush.
+        let mut buffered = false;
         // The scope drops at the end of this block — the production per-event
         // lifetime that clears the shared dirty buffer.
         {
             let scope = fx.session(event);
             let session = scope.handle();
 
-            match ev.mutation {
-                ValueMut::Set(byte) => {
-                    session
-                        .set(
-                            StateType::Application,
-                            &fx.value_name,
-                            &value_cell(),
-                            &[byte],
-                        )
-                        .await?;
+            for op in &ev.ops {
+                match *op {
+                    ValueOp::Set(byte) => {
+                        session
+                            .set(
+                                StateType::Application,
+                                &fx.value_name,
+                                &value_cell(),
+                                &[byte],
+                            )
+                            .await?;
+                        scratch = Some(Bytes::copy_from_slice(&[byte]));
+                        buffered = true;
+                    }
+                    ValueOp::Clear => {
+                        session
+                            .clear(StateType::Application, &fx.value_name, &value_cell())
+                            .await?;
+                        scratch = None;
+                        buffered = true;
+                    }
+                    ValueOp::Flush => {
+                        let outcome = session
+                            .flush(StateType::Application, &fx.value_name)
+                            .await?;
+                        // The outcome contract: `Applied` iff the drain found
+                        // buffered ops.
+                        let expected = if buffered {
+                            StoreOutcome::Applied
+                        } else {
+                            StoreOutcome::NoOp
+                        };
+                        if outcome != expected {
+                            return Ok(false);
+                        }
+                        flushed = Some(scratch.clone());
+                        buffered = false;
+                    }
                 }
-                ValueMut::Clear => {
-                    session
-                        .clear(StateType::Application, &fx.value_name, &value_cell())
-                        .await?;
-                }
-                ValueMut::Skip => {}
             }
 
             match ev.outcome {
@@ -431,26 +561,29 @@ async fn run(trace: Trace) -> Result<bool> {
                     session.flush_marker().await?;
                     session.commit_apply().await;
                     // Commit advances the model (last-writer-wins).
-                    match ev.mutation {
-                        ValueMut::Set(byte) => model = Some(Bytes::copy_from_slice(&[byte])),
-                        ValueMut::Clear => model = None,
-                        ValueMut::Skip => {}
-                    }
+                    model = scratch;
                 }
                 Outcome::Abort => {
                     session.finalize().await?;
                     session.rollback_aborted().await;
+                    // Post-flush ops roll back to their `prev`, which finalize
+                    // captured *after* the flush landed — the flushed snapshot.
+                    model = flushed.unwrap_or(model);
                 }
                 Outcome::Reset => {
                     session.finalize().await?;
                     // Discards dirty + staged; any provisional written by
-                    // `finalize` lingers but projects its `prev` (the unchanged
-                    // committed base).
+                    // `finalize` lingers but projects its `prev` (the flushed
+                    // snapshot, or the unchanged committed base).
                     session.reset();
+                    model = flushed.unwrap_or(model);
                 }
                 // Final-error path: no `finalize`, no `reset`. Only the scope's
-                // `Drop` clears the buffered write.
-                Outcome::Failed => {}
+                // `Drop` clears the buffered write — but a flush already wrote
+                // its snapshot through, and it must survive.
+                Outcome::Failed => {
+                    model = flushed.unwrap_or(model);
+                }
             }
         }
 

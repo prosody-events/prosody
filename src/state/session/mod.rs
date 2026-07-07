@@ -58,7 +58,7 @@ use crate::state::cell_key::{CellKey, Coordinate, Scan};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
 };
-use crate::state::dirty::{DirtyStore, DirtyVal};
+use crate::state::dirty::{DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
@@ -206,18 +206,33 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
         cell: &CellKey,
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-    /// Writes the cell's buffered outcome straight to committed state — the
-    /// mid-handler write-through escape hatch.
+    /// Drains the collection's buffered ops straight to committed state — the
+    /// mid-handler write-through escape hatch, valid in **either** commit
+    /// mode.
+    ///
+    /// Every currently-buffered cell of the collection is written resolved in
+    /// one same-partition batch and dropped from the dirty buffer, so
+    /// multi-cell kinds flush data and bookkeeping as a unit (a Map's entries
+    /// and bound ratchets, a Deque's entries and window bounds). The contract
+    /// is **at-least-once**: a flushed write is durable immediately, *not*
+    /// atomically with the event's commit marker — a handler that fails after
+    /// flushing re-runs against the already-applied state on retry or
+    /// redelivery, so flushed writes must be idempotent. Ops buffered *after*
+    /// the flush ride the collection's normal stage→promote path; reads
+    /// already see buffered writes without flushing.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when buffered ops were written, or
+    /// [`StoreOutcome::NoOp`] when nothing was buffered.
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
+    /// [`StateAccessError::Store`] when the underlying store fails (the
+    /// buffer is left intact, so the ops still ride the normal commit path).
     fn flush(
         &self,
         state_type: StateType,
         name: &StateName,
-        cell: &CellKey,
     ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
 }
 
@@ -671,21 +686,22 @@ where
         &self,
         state_type: StateType,
         name: &StateName,
-        cell: &CellKey,
     ) -> Result<StoreOutcome, StateAccessError> {
         let id = self.id_for(state_type, name);
-        let Some(value) = self.inner.overlay.dirty().lookup(&id, cell) else {
+        let resolved = self.inner.overlay.dirty().collection_snapshot(&id);
+        if resolved.is_empty() {
             return Ok(StoreOutcome::NoOp);
-        };
+        }
         let collection_ref = self.ref_for(state_type, name);
-        let data = dirty_data(value);
         self.inner
             .overlay
             .lower()
-            .write_resolved(&collection_ref, &[(cell.clone(), data)])
+            .write_resolved(&collection_ref, &resolved)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
-        self.inner.overlay.dirty().remove(&id, cell);
+        // Drain only after the write landed: a store failure leaves the
+        // buffer intact, so the ops still ride the normal commit path.
+        self.inner.overlay.dirty().remove_collection(&id);
         Ok(StoreOutcome::Applied)
     }
 }
@@ -831,7 +847,7 @@ where
             // `SHARD_FANOUT_CONCURRENCY`, not the cross-partition bound.
             let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(cells)
                 .map(|(cell, value)| {
-                    let data = dirty_data(value);
+                    let data = value.into_data();
                     cooperative(async move {
                         let prev = lower
                             .get(id, &cell, event)
@@ -850,9 +866,9 @@ where
             Ok(Some((collection_ref, writes)))
         }
         CommitMode::ReadUncommitted => {
-            let resolved: Vec<(CellKey, Option<Bytes>)> = cells
+            let resolved: ResolvedCells = cells
                 .into_iter()
-                .map(|(cell, value)| (cell, dirty_data(value)))
+                .map(|(cell, value)| (cell, value.into_data()))
                 .collect();
             lower
                 .write_resolved(&collection_ref, &resolved)
@@ -860,15 +876,6 @@ where
                 .map_err(|e| StateAccessError::store(&e))?;
             Ok(None)
         }
-    }
-}
-
-/// The committed bytes a buffered outcome stages to (`Set` → its bytes,
-/// `Cleared` → absence).
-fn dirty_data(value: DirtyVal) -> Option<Bytes> {
-    match value {
-        DirtyVal::Set(bytes) => Some(bytes),
-        DirtyVal::Cleared => None,
     }
 }
 
@@ -1051,7 +1058,6 @@ where
         &self,
         _state_type: StateType,
         _name: &StateName,
-        _cell: &CellKey,
     ) -> Result<StoreOutcome, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }

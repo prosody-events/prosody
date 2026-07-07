@@ -547,14 +547,15 @@ impl<S: CellSession> CellView<S> {
         self.session.clear(self.state_type, &self.name, cell).await
     }
 
-    /// Writes one cell's buffered outcome straight through to committed state.
+    /// Drains this collection's buffered ops straight through to committed
+    /// state. At-least-once; see [`CellSession::flush`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns [`StateAccessError`] when the session refuses or the store
     /// fails.
-    pub async fn flush(&self, cell: &CellKey) -> Result<StoreOutcome, StateAccessError> {
-        self.session.flush(self.state_type, &self.name, cell).await
+    pub async fn flush(&self) -> Result<StoreOutcome, StateAccessError> {
+        self.session.flush(self.state_type, &self.name).await
     }
 }
 
@@ -630,21 +631,15 @@ where
     }
 
     /// Drains the buffered op directly to authoritative state — a mid-handler
-    /// write-through, valid in **either** commit mode.
-    ///
-    /// The contract is **at-least-once**: a flushed write is durable
-    /// immediately, *not* atomically with the event's commit marker. A handler
-    /// that fails after flushing re-runs against the already-applied state on
-    /// retry or redelivery, so flushed writes must be idempotent. Ops buffered
-    /// *after* the flush still ride the collection's normal commit path. Reads
-    /// already see buffered writes without flushing.
+    /// write-through. At-least-once; see [`CellSession::flush`] for the
+    /// contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
     pub async fn flush(&self) -> Result<StoreOutcome, ValueStateError<C::Error>> {
         ensure_live(self.view.session())?;
-        Ok(self.view.flush(&VALUE_CELL).await?)
+        Ok(self.view.flush().await?)
     }
 }
 

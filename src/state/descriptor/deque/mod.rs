@@ -28,8 +28,9 @@
 //! sits below `head` or at/above `tail`). Co-stamping makes the window heal as
 //! a unit: a handler's entry mutation and the bounds move it buffers in one op
 //! stage in one batch with one write TS/TTL (see
-//! [`KeyedStateSession::finalize`](crate::state::session)), so the bounds cell
-//! can never outlive — or be outlived by — the entries it anchors.
+//! [`KeyedStateSession::finalize`](crate::state::session)) — and a mid-handler
+//! [`DequeHandle::flush`] drains them in one batch the same way — so the
+//! bounds cell can never outlive — or be outlived by — the entries it anchors.
 
 use super::{
     CellView, CollectionSpec, Descriptor, StructuralIdentity, decode_cell, encode_cell, ensure_live,
@@ -40,7 +41,7 @@ use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::order_codec::order_preserving_i64;
 use crate::state::session::CellSession;
-use crate::state::{CollectionKindId, StateName, StateType};
+use crate::state::{CollectionKindId, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
@@ -338,6 +339,18 @@ where
         self.view.clear(&entry_cell(last)).await?;
         self.write_bounds(head, last).await?;
         Ok(value)
+    }
+
+    /// Drains this deque's buffered ops — entries and the window bounds
+    /// together, in one batch — straight to committed state. At-least-once;
+    /// see [`CellSession::flush`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub async fn flush(&self) -> Result<StoreOutcome, DequeStateError<C::Error>> {
+        ensure_live(self.view.session())?;
+        Ok(self.view.flush().await?)
     }
 
     /// Encodes and buffers an entry cell at absolute index `index`.

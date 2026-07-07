@@ -43,7 +43,7 @@ use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec};
 use crate::state::session::CellSession;
-use crate::state::{CollectionKindId, StateName, StateType};
+use crate::state::{CollectionKindId, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
@@ -264,6 +264,18 @@ where
         let coordinate = KC::encode(key);
         self.view.clear(&entry_cell(&coordinate)).await?;
         Ok(())
+    }
+
+    /// Drains this map's buffered ops — entries and bound ratchets together,
+    /// in one batch — straight to committed state. At-least-once; see
+    /// [`CellSession::flush`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub async fn flush(&self) -> Result<StoreOutcome, MapStateError<VC::Error>> {
+        ensure_live(self.view.session())?;
+        Ok(self.view.flush().await?)
     }
 
     /// Ratchets `META_MIN`/`META_MAX` outward to `coordinate`. Reads both bound

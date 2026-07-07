@@ -120,10 +120,11 @@ fn prop_memory_bottom_scan() {
 }
 
 /// Deque collection soundness over the real session lifecycle: random
-/// push/pop traces with commit/abort/crash outcomes keep the handle's
-/// `len`/`stream`/`get` and every `pop` return value in step with a `VecDeque`
-/// oracle — the dense-window invariant and bounds+entries crash atomicity
-/// (crash-recovery equivalence and collection-bounds-atomicity properties).
+/// push/pop/mid-handler-flush traces with commit/abort/crash outcomes keep the
+/// handle's `len`/`stream`/`get` and every `pop` return value in step with a
+/// `VecDeque` oracle — the dense-window invariant, bounds+entries crash
+/// atomicity, and the at-least-once flush contract (flushed ops survive
+/// abort/crash-rollback; post-flush ops roll back).
 #[test]
 fn prop_deque_collection_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
@@ -133,10 +134,11 @@ fn prop_deque_collection_lifecycle() {
 }
 
 /// Map collection soundness over the real session lifecycle: random
-/// set/remove/get traces with commit/abort/crash outcomes keep the handle's
-/// `get` and key-ordered `stream` in step with a `BTreeMap` oracle — the
-/// loose-superset bounds and crash atomicity (crash-recovery equivalence and
-/// collection-bounds-atomicity properties).
+/// set/remove/get/mid-handler-flush traces with commit/abort/crash outcomes
+/// keep the handle's `get` and key-ordered `stream` in step with a `BTreeMap`
+/// oracle — the loose-superset bounds, crash atomicity, and the at-least-once
+/// flush contract (flushed ops survive abort/crash-rollback; post-flush ops
+/// roll back).
 #[test]
 fn prop_map_collection_lifecycle() {
     fn property(trace: MapTrace) -> Result<bool> {

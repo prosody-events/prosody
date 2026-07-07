@@ -12,6 +12,12 @@
 //! key/positional ordering, containment, and the bounds-and-entries-promote-
 //! together crash atomicity.
 //!
+//! Both op alphabets include the mid-handler `Flush`: the runner snapshots the
+//! scratch model at each flush, and on a non-committing outcome the committed
+//! read-back must equal the last flushed snapshot — flushed ops (entries *and*
+//! bookkeeping cells, as one batch) survive abort and crash-rollback while
+//! post-flush ops still roll back, the at-least-once flush contract.
+//!
 //! Memory-backed only: the `cell_suite` runners already prove memory ↔
 //! Cassandra parity for the underlying store, and the collection logic lives
 //! entirely in the descriptor layer above it.
@@ -103,6 +109,15 @@ impl Arbitrary for Outcome {
     }
 }
 
+/// What one applied op observed: keep going, a mid-event flush happened (the
+/// runner snapshots the scratch model as immediately durable), or a return
+/// value diverged from the model (property failure).
+enum OpOutcome {
+    Continue,
+    Flushed,
+    Mismatch,
+}
+
 /// One deque mutation. Payloads are single `u8`s wrapped as JSON numbers.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DequeOp {
@@ -110,34 +125,39 @@ pub(crate) enum DequeOp {
     PushFront(u8),
     PopBack,
     PopFront,
+    Flush,
 }
 
 impl Arbitrary for DequeOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 4 {
+        match u8::arbitrary(g) % 5 {
             0 => Self::PushBack(u8::arbitrary(g)),
             1 => Self::PushFront(u8::arbitrary(g)),
             2 => Self::PopBack,
-            _ => Self::PopFront,
+            3 => Self::PopFront,
+            _ => Self::Flush,
         }
     }
 }
 
-/// One map mutation or mid-trace read over the bounded key pool.
+/// One map mutation, mid-trace read, or mid-handler flush over the bounded
+/// key pool.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MapOp {
     Set(i64, u8),
     Remove(i64),
     Get(i64),
+    Flush,
 }
 
 impl Arbitrary for MapOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let key = g.choose(&KEY_POOL).copied().unwrap_or(0);
-        match u8::arbitrary(g) % 3 {
-            0 => Self::Set(key, u8::arbitrary(g)),
-            1 => Self::Remove(key),
-            _ => Self::Get(key),
+        match u8::arbitrary(g) % 5 {
+            0 | 1 => Self::Set(key, u8::arbitrary(g)),
+            2 => Self::Remove(key),
+            3 => Self::Get(key),
+            _ => Self::Flush,
         }
     }
 }
@@ -282,11 +302,12 @@ struct Backing<'a> {
 /// for any collection kind — the Deque and Map suites differ only in the op
 /// alphabet, the model, and the assertions, so everything else lives here once:
 /// bind a fresh session per event, apply each op (`apply_op`, which also
-/// asserts mid-trace `pop`/`get` returns), `finalize`, resolve along the
-/// event's outcome (promote / rollback / crash → sweep), advance the model on
-/// commit, then assert the committed collection through a fresh read-back
-/// session (`assert`, which absorbs any kind-specific check such as Map's
-/// bound-cell superset).
+/// asserts mid-trace `pop`/`get` returns and reports mid-handler flushes),
+/// `finalize`, resolve along the event's outcome (promote / rollback / crash →
+/// sweep), advance the model — the full scratch on a commit, the last flushed
+/// snapshot otherwise — then assert the committed collection through a fresh
+/// read-back session (`assert`, which absorbs any kind-specific check such as
+/// Map's bound-cell superset).
 ///
 /// # Errors
 ///
@@ -302,7 +323,7 @@ where
     D: StateDescriptor,
     O: Copy,
     M: Clone + Default,
-    Apply: AsyncFn(&D::Handle<SuiteSession>, O, &mut M) -> Result<bool>,
+    Apply: AsyncFn(&D::Handle<SuiteSession>, O, &mut M) -> Result<OpOutcome>,
     Assert: AsyncFn(&D::Handle<SuiteSession>, &M, &Backing<'_>) -> Result<bool>,
 {
     let oracle = ScriptedOracle::default();
@@ -326,9 +347,14 @@ where
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         let mut scratch = model.clone();
+        // The scratch as of the last mid-handler flush — durable regardless of
+        // the event's outcome (the at-least-once flush contract).
+        let mut flushed: Option<M> = None;
         for op in &ev.ops {
-            if !apply_op(&handle, *op, &mut scratch).await? {
-                return Ok(false);
+            match apply_op(&handle, *op, &mut scratch).await? {
+                OpOutcome::Continue => {}
+                OpOutcome::Flushed => flushed = Some(scratch.clone()),
+                OpOutcome::Mismatch => return Ok(false),
             }
         }
 
@@ -354,9 +380,14 @@ where
         {
             return Ok(false);
         }
-        if ev.outcome.commits() {
-            model = scratch;
-        }
+        model = if ev.outcome.commits() {
+            scratch
+        } else {
+            // Abort / crash-rollback revert only the post-flush provisionals
+            // (their `prev` was captured after the flush landed); the flushed
+            // snapshot is already committed.
+            flushed.unwrap_or(model)
+        };
 
         // Read back through a fresh session (clean overlay) — pure committed.
         let read = make_session(
@@ -393,16 +424,24 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
                 let v = Value::from(b);
                 handle.push_back(v.clone()).await?;
                 scratch.push_back(v);
-                Ok(true)
+                Ok(OpOutcome::Continue)
             }
             DequeOp::PushFront(b) => {
                 let v = Value::from(b);
                 handle.push_front(v.clone()).await?;
                 scratch.push_front(v);
-                Ok(true)
+                Ok(OpOutcome::Continue)
             }
-            DequeOp::PopBack => Ok(handle.pop_back().await? == scratch.pop_back()),
-            DequeOp::PopFront => Ok(handle.pop_front().await? == scratch.pop_front()),
+            DequeOp::PopBack => Ok(mismatch_unless(
+                handle.pop_back().await? == scratch.pop_back(),
+            )),
+            DequeOp::PopFront => Ok(mismatch_unless(
+                handle.pop_front().await? == scratch.pop_front(),
+            )),
+            DequeOp::Flush => {
+                handle.flush().await?;
+                Ok(OpOutcome::Flushed)
+            }
         },
         async |handle, model, _backing: &Backing<'_>| assert_deque(handle, model).await,
     )
@@ -426,14 +465,20 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
                 let v = Value::from(b);
                 handle.set(&k, v.clone()).await?;
                 scratch.insert(k, v);
-                Ok(true)
+                Ok(OpOutcome::Continue)
             }
             MapOp::Remove(k) => {
                 handle.remove(&k).await?;
                 scratch.remove(&k);
-                Ok(true)
+                Ok(OpOutcome::Continue)
             }
-            MapOp::Get(k) => Ok(handle.get(&k).await? == scratch.get(&k).cloned()),
+            MapOp::Get(k) => Ok(mismatch_unless(
+                handle.get(&k).await? == scratch.get(&k).cloned(),
+            )),
+            MapOp::Flush => {
+                handle.flush().await?;
+                Ok(OpOutcome::Flushed)
+            }
         },
         async |handle, model, backing: &Backing<'_>| {
             Ok(assert_map(handle, model).await?
@@ -673,6 +718,15 @@ fn map_missing_max_bound_falls_back_to_full_scan() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// `Continue` when a mid-trace return matched the model, `Mismatch` otherwise.
+fn mismatch_unless(matched: bool) -> OpOutcome {
+    if matched {
+        OpOutcome::Continue
+    } else {
+        OpOutcome::Mismatch
+    }
 }
 
 /// The dedup id of a message event (the suites stage only message events).
