@@ -3,8 +3,8 @@ use super::{
     encode_absent_cell, encode_bound, encode_present_cell, index_coord_key, index_cover_key,
     index_seeded_key,
 };
-use crate::Key;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::tests::support::fixed_collection;
 use crate::state::{CollectionId, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
@@ -13,18 +13,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_128;
-
-fn key(value: &str) -> Key {
-    Arc::from(value)
-}
-
-fn collection(name: &str) -> Result<CollectionId> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::from_u128(0xA1B2_C3D4), key("user-1")),
-        StateType::Application,
-        StateName::try_new(name)?,
-    ))
-}
 
 /// An arbitrary non-`never` expiry, exercising the header round-trip.
 const EXPIRY: u64 = 1_700_000_000_000;
@@ -122,7 +110,7 @@ fn unknown_tag_byte_is_rejected() {
 
 #[test]
 fn collection_prefix_is_deterministic() -> Result<()> {
-    let id = collection("profile")?;
+    let id = fixed_collection("profile")?;
     assert_eq!(collection_prefix(&id), collection_prefix(&id));
     Ok(())
 }
@@ -304,7 +292,7 @@ fn prop_bound_frame_round_trips() {
 /// round-trips back to its `CellKey` and a cover key back to its low bound.
 #[test]
 fn frozen_warm_index_bytes() -> Result<()> {
-    let id = collection("frozen")?;
+    let id = fixed_collection("frozen")?;
     let prefix = collection_prefix(&id);
     let cell = CellKey {
         section: Section::new(7),

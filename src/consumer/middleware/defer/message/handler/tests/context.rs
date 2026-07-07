@@ -10,7 +10,7 @@ use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::event_context::StateAccessError;
 use crate::state::descriptor::{Registered, StateDescriptor};
-use crate::state::session::UnavailableState;
+use crate::state::tests::support::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use ahash::RandomState;

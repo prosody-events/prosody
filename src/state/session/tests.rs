@@ -22,25 +22,22 @@ use super::sealed::{FinalizeOutcome, StateLifecycle};
 use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
-use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::EventStateScope;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
+use crate::state::tests::cell_suite::{ScriptedOracle, value_cell};
+use crate::state::tests::support::probe;
 use crate::state::{
-    CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
-    StoreOutcome,
+    CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
-use ahash::RandomState;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -54,58 +51,6 @@ type TestBackend = PartitionBackend<
     MemoryCellStore<ScriptedOracle>,
 >;
 type Session = KeyedStateSession<TestBackend, ()>;
-
-/// The single Value cell (`ValueNs::Entries`, empty coordinate).
-fn value_cell() -> CellKey {
-    CellKey {
-        section: Section::new(0),
-        coordinate: Coordinate::empty(),
-    }
-}
-
-/// A committed-marker oracle: `record_message` writes the durable marker,
-/// `resolve` answers `Committed` for a recorded event. Shared across the
-/// session and the durable store, so a staged cell resolves against the exact
-/// record the marker flush wrote.
-#[derive(Clone, Default)]
-struct ScriptedOracle {
-    committed: Arc<scc::HashSet<Uuid, RandomState>>,
-}
-
-impl ScriptedOracle {
-    async fn is_recorded(&self, dedup_id: Uuid) -> bool {
-        self.committed.contains_async(&dedup_id).await
-    }
-
-    fn recorded_count(&self) -> usize {
-        self.committed.len()
-    }
-}
-
-impl CommitOracle for ScriptedOracle {
-    type Error = Infallible;
-
-    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
-        let _ = self.committed.insert_async(dedup_id).await;
-        Ok(())
-    }
-
-    async fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        let committed = match event {
-            EventRef::Message { dedup_id } => self.committed.contains_async(&dedup_id).await,
-            EventRef::Timer(_) => false,
-        };
-        Ok(if committed {
-            CommitDecision::Committed
-        } else {
-            CommitDecision::NotCommitted
-        })
-    }
-}
 
 /// Fixture sharing the partition-lifetime cell store across the per-event
 /// sessions it mints, so a second event reads the first's committed values.
@@ -219,9 +164,9 @@ impl Fixture {
     }
 }
 
+/// `probe(n)` plus its dedup id, for asserting against the marker store.
 fn message(n: u128) -> (EventRef, Uuid) {
-    let dedup_id = Uuid::from_u128(n);
-    (EventRef::Message { dedup_id }, dedup_id)
+    (probe(n), Uuid::from_u128(n))
 }
 
 /// Builds a session whose registry has one `ReadCommitted` value collection per

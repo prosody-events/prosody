@@ -1,15 +1,7 @@
 use super::*;
 use crate::state::cell_key::{Coordinate, Section};
-use crate::state::identity::StateKey;
+use crate::state::tests::support::fresh_collection;
 use color_eyre::eyre::Result;
-
-fn collection() -> Result<CollectionId> {
-    Ok(CollectionId::new(
-        StateKey::new(uuid::Uuid::from_u128(1), Key::from("k")),
-        StateType::Application,
-        StateName::try_new("c")?,
-    ))
-}
 
 /// Regression: a `lookup` after a same-collection drain must return `None`
 /// promptly, never hang. `remove_collection` is the mid-handler flush path
@@ -21,7 +13,7 @@ fn collection() -> Result<CollectionId> {
 #[test]
 fn lookup_after_remove_returns_none_without_spinning() -> Result<()> {
     let store = DirtyStore::new();
-    let c = collection()?;
+    let c = fresh_collection("c")?;
     let cell = CellKey {
         section: Section::new(0),
         coordinate: Coordinate::empty(),

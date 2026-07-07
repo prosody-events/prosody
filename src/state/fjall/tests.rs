@@ -11,11 +11,12 @@
 use super::codec::cell_key;
 use super::test_db;
 use super::{AssignmentEpoch, CacheRead, Clock, FjallCellCache, FjallClient, ScanHit};
+use crate::Topic;
 use crate::state::cell::Committed;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use crate::state::{CollectionId, StateKey, StateName, StateType};
+use crate::state::tests::cell_suite::value_cell;
+use crate::state::tests::support::fresh_collection;
 use crate::test_util::TEST_RUNTIME;
-use crate::{Key, Topic};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
@@ -25,24 +26,6 @@ use std::mem;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use uuid::Uuid;
-
-/// The single Value cell (`ValueNs::Entries`, empty coordinate).
-fn value_cell() -> CellKey {
-    CellKey {
-        section: Section::new(0),
-        coordinate: Coordinate::empty(),
-    }
-}
-
-fn collection(name: &str) -> Result<CollectionId> {
-    let key: Key = Arc::from("k");
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), key),
-        StateType::Application,
-        StateName::try_new(name)?,
-    ))
-}
 
 /// Read-path uniqueness invariant over the fjall cache: a present cell read
 /// back from the decode path is uniquely owned, across random non-empty
@@ -51,7 +34,7 @@ fn collection(name: &str) -> Result<CollectionId> {
 fn prop_fjall_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {
         let store = test_db::cache("value_cache")?;
-        let c = collection("uniq")?;
+        let c = fresh_collection("uniq")?;
         let cell = value_cell();
         store
             .put(&c, &cell, &Committed::new(Some(Bytes::from(payload))), 0)
@@ -94,7 +77,7 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     expected.extend_from_slice(payload);
 
     let (database, cache_partition, index_partition) = test_db::keyspace_pair("value_cache")?;
-    let c = collection("raw")?;
+    let c = fresh_collection("raw")?;
     let cell = value_cell();
 
     let cache = FjallCellCache::new(database, cache_partition.clone(), index_partition);
@@ -129,7 +112,7 @@ fn expired_entry_reads_as_miss() -> Result<()> {
 
     let now = Arc::new(AtomicU64::new(1_000));
     let cache = test_db::cache_with_clock("ttl_value", Clock::Fixed(now.clone()))?;
-    let c = collection("ttl")?;
+    let c = fresh_collection("ttl")?;
     let cell = value_cell();
     let payload = Committed::new(Some(Bytes::from_static(b"v")));
 
@@ -295,7 +278,7 @@ fn prop_scan_present_hops_match_model() {
     async fn check(fixture: ScanFixture) -> Result<bool> {
         let now = Arc::new(AtomicU64::new(FIXTURE_NOW));
         let cache = test_db::cache_with_clock("scan_hop", Clock::Fixed(now))?;
-        let c = collection("hop")?;
+        let c = fresh_collection("hop")?;
         let section = Section::new(0);
 
         // Later duplicates overwrite earlier ones, in fjall and model alike.
@@ -382,7 +365,7 @@ fn prop_index_batches_round_trip_the_snapshot() {
 
     async fn check(record: Vec<u8>, clear: Vec<u8>) -> Result<bool> {
         let cache = test_db::cache("index_batch")?;
-        let c = collection("batch")?;
+        let c = fresh_collection("batch")?;
         let recorded = cells_of(&record);
         let cleared = cells_of(&clear);
         cache.index_record_batch(&c, recorded.iter()).await?;

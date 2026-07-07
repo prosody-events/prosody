@@ -11,38 +11,19 @@
 //! collides across runs.
 
 use super::identity::{CassandraDescriptorIdentityStore, IdentityQueries};
-use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::cassandra::CassandraStore;
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
-use crate::test_util::{TEST_KEYSPACE, TEST_RUNTIME};
+use crate::test_util::{TEST_RUNTIME, integration_test_count, test_cassandra_config};
 use crate::tracing::init_test_logging;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
-/// Property-test iteration count for live-backend runs (default 25), from
-/// `INTEGRATION_TESTS`.
-fn get_test_count() -> u64 {
-    use std::env;
-    env::var("INTEGRATION_TESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(25)
-}
-
 async fn setup() -> Result<CassandraDescriptorIdentityStore> {
-    let config = CassandraConfiguration {
-        datacenter: None,
-        rack: None,
-        nodes: vec!["localhost:9042".to_owned()],
-        keyspace: TEST_KEYSPACE.to_owned(),
-        user: None,
-        password: None,
-        retention: Duration::from_mins(10),
-    };
+    let config = test_cassandra_config();
     let cassandra = CassandraStore::new(&config).await?;
     let queries = Arc::new(IdentityQueries::new(cassandra.session(), &config.keyspace).await?);
     Ok(CassandraDescriptorIdentityStore::new(cassandra, queries))
@@ -70,7 +51,7 @@ fn prop_cassandra_identity_trace() {
     }
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(IdentityTrace) -> TestResult);
 }
 
@@ -98,7 +79,7 @@ fn prop_cassandra_concurrent_identical_registration() {
     }
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(u8, u8, u8) -> TestResult);
 }
 
@@ -119,6 +100,6 @@ fn prop_cassandra_concurrent_conflicting_registration() {
     }
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(u8) -> TestResult);
 }

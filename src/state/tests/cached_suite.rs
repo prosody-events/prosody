@@ -31,7 +31,7 @@ use super::cell_suite::{
     CountingCellStore, OverlayTrace, SECTION, ScriptedOracle, Trace, bytes, cell_at,
     run_crash_equivalence_trace, run_overlay_trace,
 };
-use super::collection_id as collection;
+use super::support::{fresh_collection as collection, probe};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -58,12 +58,6 @@ fn cached_over(
         Arc::new(CollectionDefRegistry::default()),
     );
     Ok(Cached::new(test_db::cache(name)?, lower))
-}
-
-fn probe(n: u128) -> EventRef {
-    EventRef::Message {
-        dedup_id: Uuid::from_u128(n),
-    }
 }
 
 /// A memory-backed [`CellStore`] that surfaces each present row's remaining TTL

@@ -2,29 +2,21 @@ mod cached_suite;
 pub(crate) mod cell_suite;
 mod collection_suite;
 pub(crate) mod identity_suite;
+pub(crate) mod support;
 
 use self::cell_suite::{
     OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
     run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
 use self::collection_suite::{DequeTrace, MapTrace, run_deque_trace, run_map_trace};
+use self::support::fresh_collection;
+use super::CollectionRef;
 use super::memory::{MemoryCellStore, MemoryCells};
 use super::registry::CollectionDefRegistry;
-use super::{CollectionId, CollectionRef, StateKey, StateName, StateType};
 use color_eyre::eyre::Result;
 use futures::executor;
 use quickcheck::QuickCheck;
 use std::sync::Arc;
-use uuid::Uuid;
-
-/// A fresh-segment Value collection identity for the named collection.
-fn collection_id(name: &str) -> Result<CollectionId> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        StateType::Application,
-        StateName::try_new(name)?,
-    ))
-}
 
 /// `CollectionRef` equality and hashing key on the inner `CollectionId` only —
 /// the TTL is a per-write hint, not part of identity. Two refs to the same
@@ -37,7 +29,7 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let id = collection_id("profile")?;
+    let id = fresh_collection("profile")?;
     let with_ttl = CollectionRef::new(id.clone(), Some(CompactDuration::new(3_600)));
     let without_ttl = CollectionRef::new(id.clone(), None);
     let other_ttl = CollectionRef::new(id, Some(CompactDuration::new(7_200)));

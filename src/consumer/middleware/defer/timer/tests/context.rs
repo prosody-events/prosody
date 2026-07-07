@@ -12,7 +12,7 @@ use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::otel::SpanRelation;
 use crate::state::descriptor::{Registered, StateDescriptor};
-use crate::state::session::UnavailableState;
+use crate::state::tests::support::UnavailableState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;

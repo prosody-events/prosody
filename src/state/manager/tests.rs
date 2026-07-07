@@ -19,16 +19,14 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::state::cell::{Committed, ProvisionalCell};
-use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellSession;
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use crate::state::tests::cell_suite::{FailingCellStore, bytes};
-use crate::state::{
-    CommitDecision, CommitMode, EventRef, PartitionBackend, SharedStateBackend, TimerEventRef,
-};
+use crate::state::tests::cell_suite::{FailingCellStore, bytes, value_cell};
+use crate::state::tests::support::FixedOracle;
+use crate::state::{CommitMode, EventRef, PartitionBackend, SharedStateBackend, TimerEventRef};
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::adapter::TableAdapter;
@@ -42,42 +40,11 @@ use color_eyre::eyre::{Result, eyre};
 use futures::{Stream, StreamExt};
 use quickcheck::{QuickCheck, TestResult};
 use std::array::from_fn;
-use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::runtime::Builder;
 use tokio::sync::{Semaphore, watch};
 use tracing::Span;
 use uuid::Uuid;
-
-/// Oracle that returns a fixed decision for every event.
-#[derive(Clone)]
-struct FixedOracle(CommitDecision);
-
-impl FixedOracle {
-    fn committed() -> Self {
-        Self(CommitDecision::Committed)
-    }
-
-    fn not_committed() -> Self {
-        Self(CommitDecision::NotCommitted)
-    }
-}
-
-impl CommitOracle for FixedOracle {
-    type Error = Infallible;
-
-    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(self.0)
-    }
-}
 
 type MemCell = MemoryCellStore<FixedOracle>;
 type TestBackend = SharedStateBackend<MemCell, MemoryDescriptorIdentityStore, FixedOracle>;
@@ -104,14 +71,6 @@ fn wishlist() -> ValueDescriptor {
 
 fn last_seen() -> ValueDescriptor {
     value_state("last_seen")
-}
-
-/// The single Value cell (`ValueNs::Entries`, empty coordinate).
-fn value_cell() -> CellKey {
-    CellKey {
-        section: Section::new(0),
-        coordinate: Coordinate::empty(),
-    }
 }
 
 fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {

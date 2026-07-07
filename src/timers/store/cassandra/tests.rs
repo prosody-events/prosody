@@ -9,12 +9,12 @@
 //!
 //! [`CassandraTriggerStore`]: super::CassandraTriggerStore
 
-use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
+use super::{CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::otel::SpanRelation;
-use crate::test_util::TEST_KEYSPACE;
+use crate::test_util::{integration_test_count, test_cassandra_config};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -31,34 +31,9 @@ use futures::pin_mut;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::env;
 use std::ops::RangeInclusive;
-use std::time::Duration;
 use strum::VariantArray;
 use uuid::Uuid;
-
-/// Creates a test configuration for Cassandra integration tests.
-fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
-    CassandraConfiguration {
-        datacenter: None,
-        rack: None,
-        nodes: vec!["localhost:9042".to_owned()],
-        keyspace: keyspace.to_owned(),
-        user: None,
-        password: None,
-        retention: Duration::from_mins(10),
-    }
-}
-
-// Determine the number of tests to run from an environment variable,
-// defaulting to 25 if the variable is not set or invalid.
-// Uses INTEGRATION_TESTS since these tests hit a real Cassandra database.
-fn get_test_count() -> u64 {
-    env::var("INTEGRATION_TESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(25)
-}
 
 /// Creates a test store and segment, returning `(store, segment_id)`.
 async fn setup_test_store(name: &str) -> Result<(CassandraTriggerStore, SegmentId)> {
@@ -79,7 +54,7 @@ async fn setup_test_store_with_version(
         slab_size,
         version,
     };
-    let config = test_cassandra_config(TEST_KEYSPACE);
+    let config = test_cassandra_config();
     let cassandra_store = CassandraStore::new(&config).await?;
     let store = CassandraTriggerStore::with_store(
         cassandra_store,
@@ -98,7 +73,7 @@ async fn setup_test_store_with_version(
 trigger_store_tests!(
     CassandraTriggerStore,
     |slab_size| async move {
-        let config = test_cassandra_config(TEST_KEYSPACE);
+        let config = test_cassandra_config();
         let store = CassandraStore::new(&config).await?;
         let segment = Segment {
             id: Uuid::new_v4(),
@@ -111,7 +86,7 @@ trigger_store_tests!(
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
-        let config = test_cassandra_config(TEST_KEYSPACE);
+        let config = test_cassandra_config();
         let segment = Segment {
             id: Uuid::new_v4(),
             name: String::new(),
@@ -120,7 +95,7 @@ trigger_store_tests!(
         };
         cassandra_store(&config, segment, SpanRelation::default()).await
     },
-    get_test_count()
+    integration_test_count(25)
 );
 
 #[tokio::test]
@@ -1153,7 +1128,7 @@ fn test_prop_timer_state_invariant() {
         let slab_size = input.slab_size;
         let store = match runtime.block_on(
             async {
-                let config = test_cassandra_config(TEST_KEYSPACE);
+                let config = test_cassandra_config();
                 let store = CassandraStore::new(&config).await?;
                 let segment = Segment {
                     id: Uuid::new_v4(),
@@ -1185,7 +1160,7 @@ fn test_prop_timer_state_invariant() {
 
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(KeyTriggerTestInput) -> TestResult);
 }
 
@@ -1210,7 +1185,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
         slab_size,
         version: SegmentVersion::V3,
     };
-    let config = test_cassandra_config(TEST_KEYSPACE);
+    let config = test_cassandra_config();
 
     // Build store A with the chosen segment.
     let base_a = CassandraStore::new(&config).await?;
@@ -1292,7 +1267,7 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     use crate::timers::store::{TriggerStore, TriggerStoreProvider};
     init_test_logging();
 
-    let config = test_cassandra_config(TEST_KEYSPACE);
+    let config = test_cassandra_config();
     let base = CassandraStore::new(&config).await?;
     let provider =
         CassandraTriggerStoreProvider::with_store(base, &config.keyspace, SpanRelation::default())

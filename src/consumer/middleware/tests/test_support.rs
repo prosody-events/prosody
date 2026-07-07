@@ -33,9 +33,9 @@ use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{
     CellSession, KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
-    UnavailableState,
 };
 use crate::state::store::CellStore;
+use crate::state::tests::support::UnavailableState;
 use crate::state::{
     CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
 };

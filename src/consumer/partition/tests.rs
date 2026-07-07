@@ -6,11 +6,11 @@ use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::loader::MemoryLoader;
+use crate::state::SharedStateBackend;
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::{CommitDecision, EventRef, SharedStateBackend, StateKey};
+use crate::state::tests::support::FixedOracle;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
@@ -20,7 +20,6 @@ use color_eyre::eyre::eyre;
 use crossbeam_utils::CachePadded;
 use serde_json::json;
 use std::array::from_fn;
-use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -34,33 +33,6 @@ use tracing::Span;
 trait HasProcessedOffsets {
     fn processed_offsets(&self) -> &Arc<Mutex<Vec<Offset>>>;
     fn notify(&self) -> &Arc<Notify>;
-}
-
-/// Oracle returning a fixed decision; the partition tests never exercise
-/// recovery, so a committed-everything oracle suffices.
-#[derive(Clone)]
-struct FixedOracle(CommitDecision);
-
-impl FixedOracle {
-    fn committed() -> Self {
-        Self(CommitDecision::Committed)
-    }
-}
-
-impl CommitOracle for FixedOracle {
-    type Error = Infallible;
-
-    async fn record_message(&self, _dedup_id: uuid::Uuid) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(self.0)
-    }
 }
 
 /// Partition-agnostic memory keyed-state provider used by the partition

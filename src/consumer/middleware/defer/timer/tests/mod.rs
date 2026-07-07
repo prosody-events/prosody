@@ -16,7 +16,7 @@ use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferSt
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::otel::SpanRelation;
 use crate::state::descriptor::{Registered, StateDescriptor};
-use crate::state::session::UnavailableState;
+use crate::state::tests::support::UnavailableState;
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;

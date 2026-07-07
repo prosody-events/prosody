@@ -15,13 +15,10 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::oracle::CommitOracle;
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{ArmedKeys, KeyedStateSession, SessionParts, TerminationWatch};
-use crate::state::{
-    CommitDecision, CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType,
-};
+use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
 use crate::test_util::ArbJson;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
@@ -30,37 +27,13 @@ use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-/// Oracle returning a fixed decision; the session's marker flush and the
-/// store's resolution both route through it.
-#[derive(Clone)]
-pub(crate) struct FixedOracle(CommitDecision);
-
-impl FixedOracle {
-    fn committed() -> Self {
-        Self(CommitDecision::Committed)
-    }
-}
-
-impl CommitOracle for FixedOracle {
-    type Error = Infallible;
-
-    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(self.0)
-    }
-}
+// Re-exported so contexts that mount a get-out-of-the-way oracle (here and the
+// middleware tests) name one canonical type.
+pub(crate) use crate::state::tests::support::FixedOracle;
 
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing
 /// the offending input on failure.
@@ -268,7 +241,8 @@ fn key_codec_wire_contract_is_frozen() {
 }
 
 /// Binding against a context without keyed state (any context whose
-/// session is the [`UnavailableState`](crate::state::session::UnavailableState)
+/// session is the
+/// [`UnavailableState`](crate::state::tests::support::UnavailableState)
 /// stub — here the bare mock) fails with the Permanent
 /// [`StateAccessError::Unavailable`].
 #[test]

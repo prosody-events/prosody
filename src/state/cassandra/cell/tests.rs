@@ -14,7 +14,7 @@ use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, IndexUpsertRow,
     KeyRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs,
 };
-use crate::cassandra::{BatchUnit, CassandraConfiguration, CassandraStore as CassandraSession};
+use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
@@ -23,12 +23,13 @@ use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{
     OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace, value_cell,
 };
+use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
-    CollectionId, CollectionRef, EventRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
+    CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
 };
-use crate::test_util::TEST_KEYSPACE;
+use crate::test_util::{TEST_KEYSPACE, integration_test_count, test_cassandra_config};
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
@@ -37,22 +38,11 @@ use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use uuid::Uuid;
 
 /// The production committed bottom assembly: fjall write-through over the
 /// resolving Cassandra cell store.
 type Bottom = Cached<CassandraStore<ScriptedOracle>>;
-
-/// Property-test iteration count for live-backend runs (default 25), from
-/// `INTEGRATION_TESTS`. CI cranks it up; dev loops stay fast.
-fn get_test_count() -> u64 {
-    use std::env;
-    env::var("INTEGRATION_TESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(25)
-}
 
 /// The shared driver session and prepared cell statements — the
 /// partition-independent half both the bottom store and the property assemblies
@@ -64,15 +54,7 @@ struct Fixture {
 }
 
 async fn fixture() -> Result<Fixture> {
-    let config = CassandraConfiguration {
-        datacenter: None,
-        rack: None,
-        nodes: vec!["localhost:9042".to_owned()],
-        keyspace: TEST_KEYSPACE.to_owned(),
-        user: None,
-        password: None,
-        retention: Duration::from_mins(10),
-    };
+    let config = test_cassandra_config();
     let cassandra = CassandraSession::new(&config).await?;
     let queries = Arc::new(CellQueries::new(cassandra.session(), &config.keyspace).await?);
     Ok(Fixture {
@@ -94,29 +76,9 @@ impl Fixture {
     }
 }
 
-/// A fresh-segment Value cell address (`ValueNs::Entries`, empty coordinate).
-fn value_cell() -> CellKey {
-    CellKey {
-        section: Section::new(0),
-        coordinate: Coordinate::empty(),
-    }
-}
-
-/// A fresh-segment collection so concurrent runs and iterations never collide.
+/// A fresh-segment collection ref (no TTL) so concurrent runs never collide.
 fn collection(name: &str) -> Result<CollectionRef> {
-    let key: crate::Key = Arc::from("k");
-    let id = CollectionId::new(
-        StateKey::new(Uuid::new_v4(), key),
-        StateType::Application,
-        StateName::try_new(name)?,
-    );
-    Ok(CollectionRef::new(id, None))
-}
-
-fn event(n: u128) -> EventRef {
-    EventRef::Message {
-        dedup_id: Uuid::from_u128(n),
-    }
+    Ok(CollectionRef::new(fresh_collection(name)?, None))
 }
 
 /// The still-provisional cells of a collection — the public, non-resolving way
@@ -606,7 +568,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
 
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
@@ -703,7 +665,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
 
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
 }
 
@@ -928,9 +890,12 @@ fn prop_cassandra_cell_crash_equivalence() {
     }
 
     init_test_logging();
-    QuickCheck::new().tests(get_test_count()).quickcheck(
-        (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> quickcheck::TestResult,
-    );
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
+                as fn(Trace) -> quickcheck::TestResult,
+        );
 }
 
 /// Implicit-overwrite soundness over `Cached<CassandraStore>`: each overwrite
@@ -958,10 +923,12 @@ fn prop_cassandra_cell_implicit_overwrite() {
     }
 
     init_test_logging();
-    QuickCheck::new().tests(get_test_count()).quickcheck(
-        (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-            as fn(OverwriteTrace) -> quickcheck::TestResult,
-    );
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
+                as fn(OverwriteTrace) -> quickcheck::TestResult,
+        );
 }
 
 /// A single `Cached<CassandraStore>` over the shared `cassandra_overlay`
@@ -991,10 +958,12 @@ fn prop_cassandra_overlay_view() {
     }
 
     init_test_logging();
-    QuickCheck::new().tests(get_test_count()).quickcheck(
-        (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-            as fn(OverlayTrace) -> quickcheck::TestResult,
-    );
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
+                as fn(OverlayTrace) -> quickcheck::TestResult,
+        );
 }
 
 /// Scan correctness directly over `CassandraStore::scan_cells` — the live
@@ -1011,10 +980,12 @@ fn prop_cassandra_bottom_scan() {
     }
 
     init_test_logging();
-    QuickCheck::new().tests(get_test_count()).quickcheck(
-        (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-            as fn(ScanTrace) -> quickcheck::TestResult,
-    );
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
+                as fn(ScanTrace) -> quickcheck::TestResult,
+        );
 }
 
 /// `TTL(data)` surfacing for the co-expiry stamp (no cluster needed — pure

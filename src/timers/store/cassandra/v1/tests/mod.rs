@@ -15,11 +15,10 @@ pub mod prop_slab_triggers;
 mod test_runner {
     use super::super::V1Operations;
     use crate::cassandra::CassandraConfiguration;
-    use crate::test_util::TEST_KEYSPACE;
+    use crate::test_util::{TEST_KEYSPACE, integration_test_count};
     use crate::timers::store::cassandra::queries::Queries;
     use crate::tracing::init_test_logging;
     use quickcheck::{QuickCheck, TestResult};
-    use std::env;
     use std::sync::Arc;
     use tokio::runtime::Builder;
 
@@ -45,17 +44,6 @@ mod test_runner {
         let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 
         Ok(V1Operations::new(store, queries))
-    }
-
-    /// Determine the number of tests to run from an environment variable.
-    /// Returns the appropriate default based on test complexity if not set.
-    /// Uses `INTEGRATION_TESTS` since these tests hit a real Cassandra
-    /// database.
-    fn get_test_count(default: u64) -> u64 {
-        env::var("INTEGRATION_TESTS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(default)
     }
 
     use tracing::span::EnteredSpan;
@@ -107,7 +95,7 @@ mod test_runner {
 
         let _span = init_test_tracing();
         QuickCheck::new()
-            .tests(get_test_count(50))
+            .tests(integration_test_count(50))
             .quickcheck(test_wrapper as fn(V1SlabMetadataTestInput) -> TestResult);
     }
 
@@ -147,7 +135,7 @@ mod test_runner {
 
         let _span = init_test_tracing();
         QuickCheck::new()
-            .tests(get_test_count(50))
+            .tests(integration_test_count(50))
             .quickcheck(test_wrapper as fn(V1SlabTriggerTestInput) -> TestResult);
     }
 
@@ -187,7 +175,7 @@ mod test_runner {
 
         let _span = init_test_tracing();
         QuickCheck::new()
-            .tests(get_test_count(50))
+            .tests(integration_test_count(50))
             .quickcheck(test_wrapper as fn(V1KeyTriggerTestInput) -> TestResult);
     }
 
@@ -227,7 +215,7 @@ mod test_runner {
 
         let _span = init_test_tracing();
         QuickCheck::new()
-            .tests(get_test_count(25))
+            .tests(integration_test_count(25))
             .quickcheck(test_wrapper as fn(V1HighLevelTestInput) -> TestResult);
     }
 
@@ -265,7 +253,7 @@ mod test_runner {
 
         let _span = init_test_tracing();
         QuickCheck::new()
-            .tests(get_test_count(10))
+            .tests(integration_test_count(10))
             .quickcheck(test_wrapper as fn(MigrationTestInput) -> TestResult);
     }
 }

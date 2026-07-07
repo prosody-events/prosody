@@ -1,6 +1,9 @@
+use crate::cassandra::CassandraConfiguration;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::{Map, Value};
+use std::env;
 use std::sync::LazyLock;
+use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
 /// The shared, pre-migrated keyspace every Cassandra-backed test runs against.
@@ -34,6 +37,29 @@ pub struct ArbJson(pub Value);
 impl Arbitrary for ArbJson {
     fn arbitrary(g: &mut Gen) -> Self {
         Self(arbitrary_json(g, 3))
+    }
+}
+
+/// Property-test iteration count for live-backend suites: `INTEGRATION_TESTS`
+/// if set, else `default`. CI cranks it up; dev loops stay fast.
+pub(crate) fn integration_test_count(default: u64) -> u64 {
+    env::var("INTEGRATION_TESTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Configuration for the local test cluster (`localhost:9042`) over the
+/// shared, pre-migrated [`TEST_KEYSPACE`].
+pub(crate) fn test_cassandra_config() -> CassandraConfiguration {
+    CassandraConfiguration {
+        datacenter: None,
+        rack: None,
+        nodes: vec!["localhost:9042".to_owned()],
+        keyspace: TEST_KEYSPACE.to_owned(),
+        user: None,
+        password: None,
+        retention: Duration::from_mins(10),
     }
 }
 

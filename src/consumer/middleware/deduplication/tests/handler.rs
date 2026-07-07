@@ -12,7 +12,7 @@ use crate::consumer::middleware::deduplication::{
 };
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
-use crate::state::session::UnavailableState;
+use crate::state::tests::support::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
