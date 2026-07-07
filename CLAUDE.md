@@ -16,7 +16,7 @@ These come before everything else. Every change is judged against them.
 
 If a bug class can be made uncompilable, do that instead of writing a runtime check.
 
-**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Bloat compounds; aggressively prune.
+**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Bloat compounds; aggressively prune. The bar applies per change, and line count is not the only axis: a fold that buys line savings with generic machinery (GATs, trait plumbing, flag parameters) is not a simplification — plain duplicated arms are often the better reading.
 
 **Identify, document, and enforce invariants.** For every load-bearing piece of state:
 1. Name the invariant.
@@ -75,6 +75,24 @@ If you can't name the invariant, you don't yet understand the code well enough t
 - Never introduce `dyn` (trait objects, `Box<dyn ...>`, `&dyn ...`) without permission - prefer generics and associated types
 - Run: `cargo clippy`, `cargo clippy --tests`, `cargo doc`, `cargo +nightly fmt`
 
+**Redesign hygiene:**
+
+When a design is replaced, remove *all* of it in the same change — half-deleted
+designs are where bloat and bug re-introduction live:
+
+- Sweep the old design's vocabulary from every doc comment. A stale doc is
+  worse than noise: one can instruct a reader to re-introduce a fixed bug class
+  (a leftover doc describing the abandoned `unschedule_all` did exactly that).
+- Code whose only caller is its own test is dead — delete both together. Watch
+  for conversion/serde bridges (`TryFrom<iN>`, serde derives) kept alive by a
+  self-referential round-trip test; move any wire-discriminant pins that test
+  provided into a frozen-bytes test first, then delete.
+- Struct fields threaded through configs/contexts but only read at construction
+  are residue from a superseded design — remove them end-to-end.
+- Don't build surface ahead of a caller. A zero-caller, zero-test durable-write
+  path is the worst of both worlds: delete it, or make it an owner-confirmed,
+  tested feature — never leave it as-is.
+
 **JSON codec isolation:**
 
 - `serde_json`, `simd_json`, and the `json!` macro are **banned** in all production code outside `src/codec.rs`
@@ -112,6 +130,14 @@ If you can't name the invariant, you don't yet understand the code well enough t
 - Prefer `use` statements over fully qualified prefixes
 - Methods without `self` should be functions (except `new` and similar)
 - Ask before large structural changes
+- Default to `pub(crate)`/`pub(super)`; make something `pub` only as a
+  deliberate downstream-API decision. Blanket `pub` freezes internals into the
+  supported surface and silences rustc's dead-code lint.
+- When a proposed simplification is examined and rejected, record the ruling in
+  one sentence at the site (e.g. "exists for type-parameter compression") so
+  the next pass doesn't re-litigate it. The converse also holds: a trait layer
+  with a single impl is not thereby dead — confirm no planned work depends on
+  it before collapsing.
 - Keep trait constraints as local as possible. If a constraint can sit on a
   function instead of a struct, put it on the function. Include only the
   constraints that function actually needs — not a superset for the whole
@@ -190,6 +216,16 @@ fast smokes alongside the property. Copy the idioms cataloged in
 TESTING.md (trace + model oracle, backend-generic suite runners, crash
 simulation, explicit shrinking) rather than inventing new harnesses.
 
+**A test must be able to fail.** The false-pass idioms are cataloged in
+TESTING.md — `else { return; }` setup guards, discarded `Option<()>` bodies,
+tautological asserts, detectors unreachable by construction, properties that
+never call their subject. When writing or converting a test, prove it can go
+red once: inject the failure, watch it fail, revert.
+
+**Never delete a test without naming, in the commit, the surviving test that
+covers the same invariant at least as strongly** — and when a new property
+subsumes an example cluster, prune the examples in the same change.
+
 **Root-cause every property-test failure — no exceptions.** A failing
 property or quickcheck run is evidence of a bug (in the code or in the
 test's design), never noise to re-run away: a passing re-run proves
@@ -234,6 +270,12 @@ pub struct Configuration {
     max_concurrency: usize,
 }
 ```
+
+A `Validate` derive with zero rules is a false promise. Every field that can
+express a degenerate value (zero, a sub-unit duration truncating to zero) either
+gets a validation rule or the consuming code must provably tolerate it — the
+retry-jitter panic (`random_range(0..0)` on a sub-ms base delay) shipped exactly
+this way.
 
 ## Architecture
 
@@ -352,7 +394,7 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 1. **ALLOW FILTERING** - Full table scans destroy cluster
 2. **Secondary Indices** - Coordinator bottlenecks
 3. **Materialized Views** - Breaks under write load
-4. **LWTs (Lightweight Transactions / `IF [NOT] EXISTS` / `IF <cond>`)** - Paxos round-trips serialize all writes to a partition; latency and contention scale catastrophically
+4. **LWTs (Lightweight Transactions / `IF [NOT] EXISTS` / `IF <cond>`)** - Paxos round-trips serialize all writes to a partition; latency and contention scale catastrophically. Sole authorized exception: the descriptor-identity first-use registration (`INSERT … IF NOT EXISTS` in `src/state/cassandra/identity.rs`) — once per collection per group, never on the hot path. Do not "fix" it, and do not cite it to justify a new one.
 5. **`USING TIMESTAMP` / manually-set write timestamps** - The session installs a `MonotonicTimestampGenerator` (`cassandra/mod.rs`), so the **driver** stamps every write client-side. Because one handler per key and one `PartitionManager` per partition mean all writes to a partition flow through that single session, those timestamps increase monotonically in issue order — which is exactly what makes last-write-wins lost-write-free. Setting the timestamp by hand (`USING TIMESTAMP`, a per-statement timestamp override, any client-supplied value) bypasses the generator and lets a later write silently lose to an earlier one — a lost write with no error. Never set it; let the generator stamp every write.
 
 **Instead:** Proper partition keys, clustering columns for ranges, `Option<T>` for NULLs (filter in code). For "insert-if-new" semantics, prefer idempotent writes or app-level coordination over LWTs.
@@ -432,6 +474,11 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 - Dependencies: `ahash`, `parking_lot`, `simd-json` (non-ARM)
 
 ## Tracing / OpenTelemetry
+
+**Import tracing macros from `tracing` directly — never `use tracing::log::…`.**
+`tracing::log` re-exports the bare `log` crate and no `log`→`tracing` bridge is
+installed, so events logged through it silently vanish (a producer
+duplicate-suppression log never emitted for this reason).
 
 **Never cache `Span` - cache `Context` instead:**
 

@@ -19,6 +19,22 @@ Cassandra-backed tests expect a live local cluster (`localhost:9042`,
 keyspace `prosody_test`) and are **not** skip-gated — a down cluster fails
 them rather than silently passing.
 
+## Shared scaffolding: look before you write
+
+Before hand-rolling a mock handler, error type, or fixture, check the shared
+homes — per-file scaffolding clones are how this test tree once doubled:
+
+| Area | Home |
+| --- | --- |
+| Crate-wide (`integration_test_count`, `test_cassandra_config`) | `src/tests/test_util.rs` |
+| Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support.rs` |
+| Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |
+| Timer stores (trigger/segment fixtures, suite macros) | `src/timers/store/tests/` |
+| Integration | `tests/common.rs` |
+
+If the helper you need exists in a sibling test file but not a shared home,
+hoist it into one — never copy it.
+
 ## Philosophy: invariants, not paths
 
 Ask "what must remain true here?", write that down, then write the test
@@ -39,6 +55,51 @@ shapes and where to see them proven:
 A property over toy inputs is just a slow example test. Generators must
 cover what production actually sends: empty/min/max sizes, duplicate keys,
 out-of-order delivery, interleaved operations, error outcomes.
+
+## Falsifiability: a test must be able to fail
+
+A green test proves nothing unless it can go red. Every idiom below shipped
+in this repo and passed silently while asserting nothing — treat them as
+banned:
+
+- **`else { return; }` on a setup/timeout guard** — a failed arrange step or
+  expired deadline exits green. Propagate with `?`/`bail!`.
+- **Discarded `Option<()>` bodies** — `block_on(async { ….ok()?…; Some(()) })`
+  with the result dropped: any unexpected `Err` short-circuits to a silent
+  pass, skipping every downstream assertion.
+- **Tautological assertions** — `assert!(x.is_some() || x.is_none())`,
+  comparing a value against itself, or a bare `is_some()` where the value's
+  *content* is the claim.
+- **Detectors unreachable by construction** — a same-key-overlap detector fed
+  only distinct keys can never fire; the test asserts the absence of something
+  it never risks.
+- **Properties that never call their subject**, and violation branches that
+  log or count instead of asserting.
+- **Skips justified by an unverified premise**, and doc comments claiming an
+  invariant "is covered by" a sibling test — verify the named test exists
+  before writing the claim.
+- **Fabricated verification inputs** — drive assertions with the system's real
+  identifiers, never values the model invented for its own bookkeeping (a
+  fabricated segment id fed to `resolve_state` was masked by an always-warm
+  cache and would have read the wrong partition the day the cache shrank).
+
+When you write or convert a test, spot-check it: break the invariant once
+(inject an `Err`, bypass the guard), confirm the test fails, then revert.
+
+## Deleting and folding tests
+
+Delete a test only when a **named** surviving test provably covers the same
+invariant at least as strongly, and name that survivor in the commit message.
+"Looks redundant" is not enough: an early-return-structured property can miss
+facets its example smokes still pin, and hand-duplicated production paths
+(`on_message`/`on_timer`) need both halves covered even when their tests look
+like twins.
+
+The converse duty: when a new property subsumes an example cluster, prune the
+examples in the same change. Redesigns that add properties without pruning
+what they supersede are how a suite doubles.
+
+## Frozen bytes
 
 One class of invariant a round-trip property structurally **cannot** prove:
 wire-format freezing. `decode(encode(x)) == x` survives a variant rename
@@ -86,6 +147,13 @@ so failures reduce to minimal reproductions. Without shrinking, a failing
 50-op trace is nearly undebuggable. Avoid wall-clock or RNG-seeded values
 inside generators — deterministic ranges keep failures reproducible.
 
+A domain type's `Arbitrary` impl lives beside the type and covers the full
+legal domain, including boundary and saturation values (0, MAX, overflow). A
+narrowed "realistic" distribution belongs in a distinctly named wrapper —
+because trait resolution is global, a use-case-specific impl parked in an
+unrelated test module silently becomes the generator every other property in
+the crate inherits.
+
 Exemplars: `src/state/tests/cell_suite.rs` (`Trace`/`OverlayTrace`/`ScanTrace`
 and their `Arbitrary` impls) and `src/state/fjall/codec/tests.rs` (`PrefixFields`
 generator over a null-prone alphabet).
@@ -94,7 +162,7 @@ generator over a null-prone alphabet).
 
 Write the property once as a generic runner, then instantiate it from each
 backend's test module. `run_crash_equivalence_trace` / `run_overwrite_trace`
-/ `run_overlay_trace` / `run_scan_trace` in `src/state/tests/cell_suite.rs`
+/ `run_overlay_trace` / `run_bottom_scan_trace` in `src/state/tests/cell_suite.rs`
 are generic over the `CellStore` backend and run unchanged against memory
 (`Overlay<MemoryCellStore>`) and Cassandra (`Overlay<Cached<CassandraStore>>`)
 — every backend must satisfy the same invariants. New backends get the
@@ -209,6 +277,11 @@ tokio::select! {
 }
 ```
 
+Consumer startup is a signal too: wait on `wait_for_assigned_partitions`,
+never a fixed `sleep(5s)` "give it time to subscribe" — the sleep is both a
+flake source and a real record-loss race (messages sent before the
+subscription is live are silently missed).
+
 If a test only passes under low load, it is asserting on timing, not on
 behavior — fix the test.
 
@@ -224,5 +297,9 @@ grep FAILED /tmp/test_output.log
 ```
 
 Integration tests that drive a real consumer must shut the consumer down
-before propagating a failure, or rdkafka's background threads hang the
-test binary.
+(and delete the test topic) **unconditionally on every path** before
+propagating a failure, or rdkafka's background threads hang the test binary
+and the topic leaks. Don't rely on the success path reaching the trailer:
+collect the scenario body into a `Result` (`let outcome: Result<()> =
+async { … }.await;`), run shutdown + cleanup once, then return the outcome.
+An early `?` that skips shutdown turns a caught regression into a CI hang.
