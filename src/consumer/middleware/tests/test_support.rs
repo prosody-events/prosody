@@ -51,7 +51,7 @@ use crate::timers::{TimerType, Trigger};
 /// own loop retries past `retry_step`'s `Skip`).
 #[derive(Debug, Error)]
 #[error("mock timer operation failed ({0:?})")]
-pub struct MockTimerError(pub ErrorCategory);
+pub struct MockTimerError(ErrorCategory);
 
 impl ClassifyError for MockTimerError {
     fn classify_error(&self) -> ErrorCategory {
@@ -76,21 +76,6 @@ pub enum TimerOperation {
 ///
 /// Uses `tokio::sync::watch` channels (matching production `TimerContext`)
 /// to avoid race conditions between flag checks and async notifications.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Basic usage - no signals active
-/// let ctx = MockEventContext::new();
-///
-/// // Start in shutdown state
-/// let ctx = MockEventContext::new().with_shutdown();
-///
-/// // Track timer operations
-/// let ctx = MockEventContext::new().with_timer_tracking();
-/// // ... use context ...
-/// let ops = ctx.timer_operations();
-/// ```
 #[derive(Educe)]
 #[educe(Clone(bound(S: Clone)))]
 pub struct MockEventContext<P = Value, S = UnavailableState<P>> {
@@ -256,21 +241,6 @@ impl<P, S> MockEventContext<P, S> {
             .as_ref()
             .map(|ops| ops.lock().clone())
             .unwrap_or_default()
-    }
-
-    /// Check if any timer was scheduled.
-    ///
-    /// Returns false if timer tracking is not enabled.
-    #[must_use]
-    pub fn has_scheduled_timer(&self) -> bool {
-        self.timer_operations.as_ref().is_some_and(|ops| {
-            ops.lock().iter().any(|op| {
-                matches!(
-                    op,
-                    TimerOperation::Schedule(_, _) | TimerOperation::ClearAndSchedule(_, _)
-                )
-            })
-        })
     }
 
     /// Count scheduled timers of a specific type.

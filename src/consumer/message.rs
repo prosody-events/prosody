@@ -36,7 +36,7 @@ use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, T
 /// * `P` – The payload type carried by the message variant.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
-pub enum UncommittedEvent<T, P>
+pub(crate) enum UncommittedEvent<T, P>
 where
     T: TriggerStore,
 {
@@ -58,24 +58,6 @@ where
             Self::Message(message) => message.key(),
             Self::Timer(timer) => timer.key(),
         }
-    }
-}
-
-impl<T, P> From<UncommittedMessage<P>> for UncommittedEvent<T, P>
-where
-    T: TriggerStore,
-{
-    fn from(value: UncommittedMessage<P>) -> Self {
-        Self::Message(value)
-    }
-}
-
-impl<T, P> From<PendingTimer<T>> for UncommittedEvent<T, P>
-where
-    T: TriggerStore,
-{
-    fn from(value: PendingTimer<T>) -> Self {
-        Self::Timer(value)
     }
 }
 

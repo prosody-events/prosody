@@ -6,7 +6,6 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::KafkaLoaderError;
 use crate::timers::datetime::CompactDateTimeError;
 use std::error::Error as StdError;
-use std::fmt::Debug;
 use thiserror::Error;
 use validator::ValidationErrors;
 
@@ -55,25 +54,9 @@ where
     #[error("loader error: {0:#}")]
     Loader(L),
 
-    /// Configuration validation error.
-    #[error("configuration error: {0:#}")]
-    Configuration(ConfigurationError),
-
     /// Error encoding/decoding compact time values.
     #[error("compact time error: {0:#}")]
     CompactTime(CompactDateTimeError),
-}
-
-/// Configuration validation errors.
-#[derive(Debug, Error, Clone)]
-pub enum ConfigurationError {
-    /// Invalid configuration value.
-    #[error("invalid configuration: {0:#}")]
-    Invalid(String),
-
-    /// Configuration builder error.
-    #[error("failed to build configuration: {0:#}")]
-    BuildError(String),
 }
 
 /// Errors that can occur during defer middleware initialization.
@@ -116,14 +99,6 @@ impl ClassifyError for CassandraDeferStoreError {
     }
 }
 
-impl From<super::segment::CassandraSegmentStoreError> for CassandraDeferStoreError {
-    fn from(err: super::segment::CassandraSegmentStoreError) -> Self {
-        match err {
-            super::segment::CassandraSegmentStoreError::Cassandra(e) => Self::Cassandra(e),
-        }
-    }
-}
-
 impl<S, H, L> ClassifyError for DeferError<S, H, L>
 where
     S: StdError + ClassifyError + Send + Sync + 'static,
@@ -132,9 +107,6 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Configuration errors are terminal - system cannot operate
-            Self::Configuration(_) => ErrorCategory::Terminal,
-
             // Delegate to inner error classifications
             Self::Store(error) => error.classify_error(),
             Self::Handler(error) => error.classify_error(),
@@ -153,17 +125,6 @@ where
 {
     fn from(error: CompactDateTimeError) -> Self {
         Self::CompactTime(error)
-    }
-}
-
-impl<S, H, L> From<ConfigurationError> for DeferError<S, H, L>
-where
-    S: StdError + ClassifyError + Send + Sync + 'static,
-    H: StdError + ClassifyError + Send,
-    L: StdError + ClassifyError + Send + Sync + 'static,
-{
-    fn from(error: ConfigurationError) -> Self {
-        Self::Configuration(error)
     }
 }
 

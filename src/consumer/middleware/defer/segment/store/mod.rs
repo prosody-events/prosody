@@ -2,10 +2,13 @@
 
 use super::Segment;
 use crate::SegmentId;
-use crate::error::{ClassifyError, ErrorCategory};
-use std::convert::Infallible;
+use crate::error::ClassifyError;
 use std::error::Error;
 use std::future::Future;
+
+#[cfg(test)]
+use std::convert::Infallible;
+#[cfg(test)]
 use std::sync::Arc;
 
 /// Storage backend for segment metadata (topic, partition, consumer group).
@@ -30,11 +33,13 @@ pub trait SegmentStore: Clone + Send + Sync + 'static {
 }
 
 /// In-memory segment store for testing.
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct MemorySegmentStore {
     segments: Arc<scc::HashMap<SegmentId, Segment, ahash::RandomState>>,
 }
 
+#[cfg(test)]
 impl MemorySegmentStore {
     /// Creates an empty store.
     #[must_use]
@@ -43,8 +48,9 @@ impl MemorySegmentStore {
     }
 }
 
+#[cfg(test)]
 impl SegmentStore for MemorySegmentStore {
-    type Error = MemorySegmentStoreError;
+    type Error = Infallible;
 
     async fn get_or_create_segment(&self, segment: Segment) -> Result<Segment, Self::Error> {
         let segment_id = segment.id();
@@ -64,22 +70,6 @@ impl SegmentStore for MemorySegmentStore {
             .get_async(segment_id)
             .await
             .map(|entry| entry.get().clone()))
-    }
-}
-
-/// Infallible error type (store never fails).
-#[derive(Debug, thiserror::Error)]
-pub enum MemorySegmentStoreError {}
-
-impl ClassifyError for MemorySegmentStoreError {
-    fn classify_error(&self) -> ErrorCategory {
-        match *self {}
-    }
-}
-
-impl From<MemorySegmentStoreError> for Infallible {
-    fn from(err: MemorySegmentStoreError) -> Self {
-        match err {}
     }
 }
 

@@ -13,13 +13,6 @@ fn always_defer_returns_true() {
 }
 
 #[test]
-fn never_defer_returns_false() {
-    let decider = NeverDefer;
-    assert!(!decider.should_defer());
-    assert!(!decider.should_defer()); // multiple calls
-}
-
-#[test]
 fn trace_based_decider_defaults_to_true() {
     let decider = TraceBasedDecider::new();
     assert!(decider.should_defer());

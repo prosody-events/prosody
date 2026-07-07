@@ -448,7 +448,9 @@ fn create_span_from_context(context: &Context) -> Span {
 }
 ```
 
-See `CachedTimerDeferStore` for the reference implementation.
+See the write-through cache in `CassandraTimerDeferStore`
+(`src/consumer/middleware/defer/timer/store/cassandra/mod.rs`) for the
+reference implementation.
 
 ## Research
 

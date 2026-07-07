@@ -23,15 +23,6 @@ impl ClassifyError for TestPermanentError {
 }
 
 #[test]
-fn test_configuration_error_is_terminal() {
-    let error =
-        DeferError::<TestTransientError, TestTransientError, TestTransientError>::Configuration(
-            ConfigurationError::Invalid("test".to_owned()),
-        );
-    assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
-}
-
-#[test]
 fn test_store_error_delegates_transient() {
     let error = DeferError::<TestTransientError, TestTransientError, TestTransientError>::Store(
         TestTransientError,

@@ -42,9 +42,6 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub mod queries;
 
-pub use queries::DeferredNextTimer as TimerNextHint;
-pub use queries::Queries as TimerQueries;
-
 /// Cassandra-backed timer defer store with internal write-through cache.
 ///
 /// # Storage Model
@@ -105,13 +102,9 @@ impl CassandraTimerDeferStore {
         Ok(segment.id())
     }
 
-    /// Serializes span context to W3C trace format for storage.
+    /// Serializes a trigger's span context to W3C trace format for storage.
     fn inject_span_context(&self, trigger: &Trigger) -> HashMap<String, String> {
-        let span = trigger.span();
-        let context = span.context();
-        let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-        self.propagator().inject_context(&context, &mut span_map);
-        span_map
+        self.span_map_from_context(&trigger.span().context())
     }
 
     /// Deserializes span context from a span map and creates a linked span.
@@ -127,9 +120,11 @@ impl CassandraTimerDeferStore {
     }
 
     /// Creates a linked span from a stored context.
-    /// `cached` mirrors the old `CachedTimerDeferStore` attribution: `true`
-    /// when served from the in-memory write-through cache, `false` on a DB
-    /// read.
+    ///
+    /// The cache stores [`Context`], never [`tracing::Span`] — spans must
+    /// finish to flush, so a fresh span is created on every read. `cached` is
+    /// `true` when served from the in-memory write-through cache, `false` on
+    /// a DB read.
     fn create_span_from_context(
         &self,
         key: &Key,
@@ -384,7 +379,8 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         &self,
         key: &Key,
     ) -> Result<Option<(Trigger, u32)>, Self::Error> {
-        // Cache hit — span is attributed as cached (mirrors old CachedTimerDeferStore)
+        // Cache hit — a fresh span is created from the cached Context and
+        // attributed as cached
         if let Some(cached) = self.cache.get(key.as_ref()) {
             return Ok(cached.map(|entry| {
                 let span = self.create_span_from_context(key, entry.time, &entry.context, true);

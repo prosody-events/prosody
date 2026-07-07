@@ -2,16 +2,15 @@
 //!
 //! Provides [`DeferralDecider`] trait for controlling when transient failures
 //! should be deferred for retry. Production code uses [`FailureTracker`] which
-//! tracks failure rates. Tests use [`AlwaysDefer`], [`NeverDefer`], or
-//! [`TraceBasedDecider`] for deterministic control.
+//! tracks failure rates. Tests use the `cfg(test)` doubles `AlwaysDefer` and
+//! `TraceBasedDecider` for deterministic control.
 
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
-use portable_atomic::{AtomicBool, AtomicF64, Ordering};
+use portable_atomic::{AtomicF64, Ordering};
 use quanta::Instant;
 use std::collections::VecDeque;
-use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::spawn;
@@ -24,24 +23,8 @@ use tracing::warn;
 ///
 /// - [`FailureTracker`]: Production implementation - defers based on failure
 ///   rate
-/// - [`AlwaysDefer`]: Test double - always enables deferral
-/// - [`NeverDefer`]: Test double - always disables deferral
-/// - [`TraceBasedDecider`]: Test double - returns value set by test harness
-///
-/// # Thread Safety
-///
-/// All implementations must be `Clone + Send + Sync + 'static`.
-///
-/// # Example
-///
-/// ```ignore
-/// // Production usage - unchanged API
-/// let middleware = MessageDeferMiddleware::new(config, consumer_config, ...)?;
-///
-/// // Test usage - inject test double
-/// let decider = TraceBasedDecider::new();
-/// let middleware = MessageDeferMiddleware::with_decider(config, ..., decider)?;
-/// ```
+/// - `AlwaysDefer` and `TraceBasedDecider`: `cfg(test)` doubles - fixed or
+///   harness-controlled decisions
 pub trait DeferralDecider: Clone + Send + Sync + 'static {
     /// Returns `true` if messages should be deferred on transient failure.
     ///
@@ -51,9 +34,9 @@ pub trait DeferralDecider: Clone + Send + Sync + 'static {
     /// - `failure_rate` = failures / (failures + successes) in sliding window
     /// - `threshold` = configured threshold (e.g., 0.9)
     ///
-    /// # Test Behavior ([`TraceBasedDecider`])
+    /// # Test Behavior (`TraceBasedDecider`)
     ///
-    /// Returns value set by [`TraceBasedDecider::set_next`] before each message
+    /// Returns value set by `TraceBasedDecider::set_next` before each message
     /// event.
     fn should_defer(&self) -> bool;
 }
@@ -62,27 +45,20 @@ pub trait DeferralDecider: Clone + Send + Sync + 'static {
 // Test Doubles
 // ============================================================================
 
+#[cfg(test)]
+use portable_atomic::AtomicBool;
+
 /// Always enables deferral.
 ///
 /// Use for testing paths where all transient failures should be deferred.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AlwaysDefer;
 
+#[cfg(test)]
 impl DeferralDecider for AlwaysDefer {
     fn should_defer(&self) -> bool {
         true
-    }
-}
-
-/// Never enables deferral.
-///
-/// Use for testing paths where transient failures should propagate.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NeverDefer;
-
-impl DeferralDecider for NeverDefer {
-    fn should_defer(&self) -> bool {
-        false
     }
 }
 
@@ -104,12 +80,14 @@ impl DeferralDecider for NeverDefer {
 /// decider.set_next(false);
 /// harness.process_message(event);
 /// ```
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct TraceBasedDecider {
     /// Atomic bool set by test, read by middleware.
     next_decision: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl TraceBasedDecider {
     /// Creates a new decider (defaults to `true`).
     #[must_use]
@@ -125,6 +103,7 @@ impl TraceBasedDecider {
     }
 }
 
+#[cfg(test)]
 impl DeferralDecider for TraceBasedDecider {
     fn should_defer(&self) -> bool {
         self.next_decision.load(Ordering::Relaxed)
@@ -155,7 +134,7 @@ impl DeferralDecider for TraceBasedDecider {
 ///
 /// Safe to clone and use from multiple threads. Reads are lock-free via
 /// atomic operations. State updates happen in a background task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FailureTracker {
     /// Current failure rate (0.0 to 1.0).
     failure_rate: Arc<AtomicF64>,
@@ -211,15 +190,6 @@ impl FailureTracker {
     #[must_use]
     pub fn failure_rate(&self) -> f64 {
         self.failure_rate.load(Ordering::Relaxed)
-    }
-}
-
-impl Debug for FailureTracker {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_struct("FailureTracker")
-            .field("failure_rate", &self.failure_rate())
-            .field("threshold", &self.threshold)
-            .finish_non_exhaustive()
     }
 }
 

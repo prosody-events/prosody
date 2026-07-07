@@ -6,11 +6,10 @@ use crate::SegmentId;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_DEFERRED_SEGMENTS};
 use crate::cassandra_queries;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
 use crate::{ConsumerGroup, Partition, Topic};
 use scylla::client::session::Session;
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::instrument;
 
 cassandra_queries! {
@@ -45,7 +44,7 @@ impl CassandraSegmentStore {
     pub async fn new(
         store: CassandraStore,
         keyspace: &str,
-    ) -> Result<Self, CassandraSegmentStoreError> {
+    ) -> Result<Self, CassandraDeferStoreError> {
         let queries = Arc::new(SegmentQueries::new(store.session(), keyspace).await?);
         Ok(Self { store, queries })
     }
@@ -56,7 +55,7 @@ impl CassandraSegmentStore {
 }
 
 impl SegmentStore for CassandraSegmentStore {
-    type Error = CassandraSegmentStoreError;
+    type Error = CassandraDeferStoreError;
 
     #[instrument(level = "debug", skip(self), err)]
     async fn get_or_create_segment(&self, segment: Segment) -> Result<Segment, Self::Error> {
@@ -96,22 +95,6 @@ impl SegmentStore for CassandraSegmentStore {
                 Arc::from(consumer_group) as ConsumerGroup,
             )
         }))
-    }
-}
-
-/// Cassandra segment store errors.
-#[derive(Debug, Error)]
-pub enum CassandraSegmentStoreError {
-    /// Error from Cassandra operations.
-    #[error("cassandra error: {0:#}")]
-    Cassandra(#[from] CassandraStoreError),
-}
-
-impl ClassifyError for CassandraSegmentStoreError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Cassandra(error) => error.classify_error(),
-        }
     }
 }
 

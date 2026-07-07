@@ -10,13 +10,12 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::deduplication::cassandra::CassandraDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::queries::DeduplicationQueries;
+use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use crate::consumer::middleware::defer::message::store::{
     CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
 };
-use crate::consumer::middleware::defer::segment::{
-    CassandraSegmentStore, CassandraSegmentStoreError,
-};
+use crate::consumer::middleware::defer::segment::CassandraSegmentStore;
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries as TimerQueries;
 use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
@@ -37,142 +36,11 @@ use tracing::debug;
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::otel::SpanRelation;
 
-/// Unified storage backend that ensures trigger and defer stores use the same
-/// underlying storage infrastructure.
-///
-/// This type guarantees that:
-/// - Only one Cassandra session is created when using Cassandra backend
-/// - Trigger and defer stores always use matching storage types
-/// - Mock mode uses in-memory storage regardless of configuration
-///
-/// # Examples
-///
-/// ```no_run
-/// use prosody::consumer::storage::StorageBackend;
-/// use prosody::high_level::config::TriggerStoreConfiguration;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = TriggerStoreConfiguration::InMemory;
-/// let backend = StorageBackend::new(&config, false).await?;
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone)]
-pub enum StorageBackend {
-    /// In-memory storage for development and testing.
-    InMemory,
-
-    /// Cassandra-based persistent storage.
-    ///
-    /// Contains a shared `CassandraStore` instance that is cloned (via internal
-    /// Arc) when creating trigger and defer stores, ensuring only one Scylla
-    /// session exists.
-    Cassandra {
-        /// Shared Cassandra store instance.
-        store: CassandraStore,
-        /// Keyspace name for query preparation.
-        keyspace: String,
-    },
-}
-
-impl StorageBackend {
-    /// Creates a storage backend from trigger store configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Trigger store configuration
-    /// * `mock` - If true, uses in-memory storage regardless of config
-    ///
-    /// # Errors
-    ///
-    /// Returns error if Cassandra connection fails.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use prosody::consumer::storage::StorageBackend;
-    /// # use prosody::high_level::config::TriggerStoreConfiguration;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = TriggerStoreConfiguration::InMemory;
-    ///
-    /// // Normal mode
-    /// let backend = StorageBackend::new(&config, false).await?;
-    ///
-    /// // Mock mode - always uses InMemory
-    /// let mock_backend = StorageBackend::new(&config, true).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn new(
-        config: &TriggerStoreConfiguration,
-        mock: bool,
-    ) -> Result<Self, CassandraTriggerStoreError> {
-        if mock {
-            return Ok(Self::InMemory);
-        }
-
-        match config {
-            TriggerStoreConfiguration::InMemory => Ok(Self::InMemory),
-            TriggerStoreConfiguration::Cassandra(cass_config) => {
-                let store = CassandraStore::new(cass_config).await?;
-                Ok(Self::Cassandra {
-                    store,
-                    keyspace: cass_config.keyspace.clone(),
-                })
-            }
-        }
-    }
-}
-
 /// Atomically-created set of trigger and defer store providers.
 ///
 /// This enum ensures that trigger and defer stores always use matching
 /// storage types, making mismatched stores unrepresentable in the type system.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use prosody::consumer::storage::{StorageBackend, StorePair};
-/// # use prosody::otel::SpanRelation;
-/// # use prosody::high_level::config::TriggerStoreConfiguration;
-/// # use std::num::NonZeroUsize;
-/// # use std::time::Duration;
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = TriggerStoreConfiguration::InMemory;
-/// let stores = StorePair::new(
-///     &config,
-///     false,
-///     Duration::from_secs(7 * 24 * 3600),
-///     NonZeroUsize::new(8192).ok_or("cache capacity must be nonzero")?,
-///     None,
-///     SpanRelation::FollowsFrom,
-/// )
-/// .await?;
-///
-/// // Pattern match to get all providers - they're guaranteed to match storage types
-/// match stores {
-///     StorePair::Memory {
-///         trigger_provider,
-///         message_provider,
-///         timer_provider,
-///         dedup_provider,
-///     } => {
-///         // All are in-memory
-///     }
-///     StorePair::Cassandra {
-///         trigger_provider,
-///         message_provider,
-///         timer_provider,
-///         dedup_provider,
-///         cell_store,
-///         identity_store,
-///     } => {
-///         // All are Cassandra
-///     }
-/// }
-/// # Ok(())
-/// # }
-/// ```
+/// See [`StorePair::new`] for a construction example.
 #[derive(Clone)]
 pub enum StorePair {
     /// All stores use in-memory storage.
@@ -255,81 +123,94 @@ impl StorePair {
         keyed_state_ttl: Option<CompactDuration>,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
-        let backend = StorageBackend::new(config, mock).await?;
-        match &backend {
-            StorageBackend::InMemory => Ok(Self::Memory {
-                trigger_provider: InMemoryTriggerStoreProvider::new(),
-                message_provider: MemoryMessageDeferStoreProvider::new(),
-                timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
-                dedup_provider: MemoryDeduplicationStoreProvider::new(),
-            }),
+        // Pure config validation first: fail fast before any Cassandra IO
+        // (memory mode validates too, deliberately).
+        let dedup_ttl_secs = dedup_ttl_seconds(dedup_ttl)?;
+        validate_keyed_state_ttl(keyed_state_ttl)?;
 
-            StorageBackend::Cassandra { store, keyspace } => {
-                // Create trigger store provider (prepares queries once, creates
-                // per-partition stores with independent caches on demand)
-                let trigger_provider =
-                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace, timer_spans)
-                        .await?;
-
-                // Create segment store for defer stores (shared across message and timer)
-                let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
-
-                // Prepare queries for message defer stores
-                let message_queries =
-                    Arc::new(MessageQueries::new(store.session(), keyspace).await?);
-
-                // Prepare queries for timer defer stores
-                let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
-
-                let message_provider = CassandraMessageDeferStoreProvider::new(
-                    store.clone(),
-                    message_queries,
-                    segment_store.clone(),
-                );
-
-                let timer_provider = CassandraTimerDeferStoreProvider::new(
-                    store.clone(),
-                    timer_queries,
-                    segment_store,
-                    timer_spans,
-                );
-
-                let dedup_ttl_secs: i32 = dedup_ttl
-                    .as_secs()
-                    .try_into()
-                    .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
-                if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
-                    return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
-                }
-                debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
-                let dedup_queries =
-                    Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
-                let dedup_provider = CassandraDeduplicationStoreProvider::new(
-                    store.clone(),
-                    dedup_queries,
-                    dedup_ttl_secs,
-                    dedup_cache_capacity,
-                );
-
-                validate_keyed_state_ttl(keyed_state_ttl)?;
-                let cell_queries = Arc::new(CellQueries::new(store.session(), keyspace).await?);
-                let cell_store = CassandraCellResources::new(store.clone(), cell_queries);
-                let identity_queries =
-                    Arc::new(IdentityQueries::new(store.session(), keyspace).await?);
-                let identity_store =
-                    CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
-
-                Ok(Self::Cassandra {
-                    trigger_provider,
-                    message_provider,
-                    timer_provider,
-                    dedup_provider,
-                    cell_store,
-                    identity_store,
-                })
+        let cass_config = match (mock, config) {
+            (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
+                return Ok(Self::Memory {
+                    trigger_provider: InMemoryTriggerStoreProvider::new(),
+                    message_provider: MemoryMessageDeferStoreProvider::new(),
+                    timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
+                    dedup_provider: MemoryDeduplicationStoreProvider::new(),
+                });
             }
-        }
+            (false, TriggerStoreConfiguration::Cassandra(cass_config)) => cass_config,
+        };
+
+        // One shared session for every Cassandra store below.
+        let store = CassandraStore::new(cass_config).await?;
+        let keyspace = &cass_config.keyspace;
+
+        // Create trigger store provider (prepares queries once, creates
+        // per-partition stores with independent caches on demand)
+        let trigger_provider =
+            CassandraTriggerStoreProvider::with_store(store.clone(), keyspace, timer_spans).await?;
+
+        // Create segment store for defer stores (shared across message and timer)
+        let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
+
+        // Prepare queries for message defer stores
+        let message_queries = Arc::new(MessageQueries::new(store.session(), keyspace).await?);
+
+        // Prepare queries for timer defer stores
+        let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
+
+        let message_provider = CassandraMessageDeferStoreProvider::new(
+            store.clone(),
+            message_queries,
+            segment_store.clone(),
+        );
+
+        let timer_provider = CassandraTimerDeferStoreProvider::new(
+            store.clone(),
+            timer_queries,
+            segment_store,
+            timer_spans,
+        );
+
+        debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
+        let dedup_queries = Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
+        let dedup_provider = CassandraDeduplicationStoreProvider::new(
+            store.clone(),
+            dedup_queries,
+            dedup_ttl_secs,
+            dedup_cache_capacity,
+        );
+
+        let cell_queries = Arc::new(CellQueries::new(store.session(), keyspace).await?);
+        let cell_store = CassandraCellResources::new(store.clone(), cell_queries);
+        let identity_queries = Arc::new(IdentityQueries::new(store.session(), keyspace).await?);
+        let identity_store = CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
+
+        Ok(Self::Cassandra {
+            trigger_provider,
+            message_provider,
+            timer_provider,
+            dedup_provider,
+            cell_store,
+            identity_store,
+        })
     }
+}
+
+/// Converts a deduplication TTL to Cassandra's `i32` seconds representation,
+/// rejecting anything past the `USING TTL` ceiling.
+///
+/// Mirrors [`validate_keyed_state_ttl`]: an over-ceiling TTL would make every
+/// dedup-marker write fail at the coordinator, so we fail fast at store
+/// creation instead.
+fn dedup_ttl_seconds(ttl: Duration) -> Result<i32, StoreCreationError> {
+    let seconds: i32 = ttl
+        .as_secs()
+        .try_into()
+        .map_err(|_| StoreCreationError::DeduplicationTtl(ttl.as_secs()))?;
+    if i64::from(seconds) > MAX_CASSANDRA_TTL_SECS {
+        return Err(StoreCreationError::DeduplicationTtl(ttl.as_secs()));
+    }
+    Ok(seconds)
 }
 
 /// Rejects a keyed-state default TTL that exceeds Cassandra's `USING TTL`
@@ -361,7 +242,7 @@ pub enum StoreCreationError {
 
     /// Failed to create segment store.
     #[error("failed to create segment store: {0:#}")]
-    SegmentStore(Box<CassandraSegmentStoreError>),
+    SegmentStore(Box<CassandraDeferStoreError>),
 
     /// Deduplication TTL exceeds Cassandra's maximum.
     #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
@@ -384,8 +265,8 @@ impl From<CassandraStoreError> for StoreCreationError {
     }
 }
 
-impl From<CassandraSegmentStoreError> for StoreCreationError {
-    fn from(e: CassandraSegmentStoreError) -> Self {
+impl From<CassandraDeferStoreError> for StoreCreationError {
+    fn from(e: CassandraDeferStoreError) -> Self {
         Self::SegmentStore(Box::new(e))
     }
 }

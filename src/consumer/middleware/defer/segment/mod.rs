@@ -21,13 +21,13 @@ pub mod store;
 use crate::segment::partition_segment_id;
 use crate::{ConsumerGroup, Partition, SegmentId, Topic};
 
-pub use cassandra::{CassandraSegmentStore, CassandraSegmentStoreError};
+pub use cassandra::CassandraSegmentStore;
 pub use lazy::LazySegment;
 pub use store::SegmentStore;
 
 // Re-export MemorySegmentStore for testing only
 #[cfg(test)]
-pub use store::{MemorySegmentStore, MemorySegmentStoreError};
+pub use store::MemorySegmentStore;
 
 /// Segment metadata: ID plus source context (topic, partition, consumer group).
 ///

@@ -4,23 +4,9 @@
 //! outcomes specified by the test trace. This allows property tests to control
 //! exactly how the inner handler behaves for each event.
 //!
-//! In addition to recording `on_message` / `on_timer` invocations, the mock
-//! also records every `after_commit` / `after_abort` invocation it observes
-//! (via [`OutcomeHandler::applied`]). Tests use those records to assert
-//! apply-hook routing: for every dispatch that ran, at most one hook fires,
-//! and `MessageDeferOutput::Deferred(e)` must produce `after_abort(Err(e))`.
-// TODO(apply-hooks): the harness/properties tests in
-// `consumer::middleware::defer::message::handler::tests::{harness,
-// properties, integration}` do not yet inspect [`OutcomeHandler::applied`]
-// to verify the apply-hook invariant end-to-end. A follow-up should:
-//   * Drain `inner_handler.applied()` after each scenario.
-//   * For each recorded `on_message`/`on_timer` dispatch, assert exactly one
-//     matching apply-hook record is present.
-//   * For Transient outcomes that produced `MessageDeferOutput::Deferred`,
-//     assert the matching record is `AppliedHook::Abort` carrying
-//     `Err(ErrorCategory::Transient)`.
-//   * For Success / Permanent outcomes, assert the matching record is
-//     `AppliedHook::Commit` carrying `Ok(())` / `Err(Permanent)`.
+//! The apply-hook invariant (exactly one `after_commit`/`after_abort` per
+//! dispatch) is proven at the real `settle` boundary by
+//! `consumer::middleware::tests`, not from this mock.
 
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
@@ -44,30 +30,6 @@ pub struct ProcessedMessage {
     pub offset: Offset,
 }
 
-/// Which apply hook fired for a recorded dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppliedHook {
-    /// `after_commit` fired — this dispatch is final.
-    Commit,
-    /// `after_abort` fired — this dispatch is not final; a retry is coming.
-    Abort,
-}
-
-/// Record of an apply-hook invocation observed by the mock inner handler.
-#[derive(Clone, Debug)]
-pub struct AppliedRecord {
-    /// Which hook fired.
-    pub hook: AppliedHook,
-    /// Whether the recorded `Result` was `Ok` (true) or `Err` (false).
-    ///
-    /// We project to a bool because `Self::Output` is `()` and the error
-    /// is already classified by category if richer assertions are needed
-    /// (see [`AppliedRecord::error_category`]).
-    pub is_ok: bool,
-    /// The category of the recorded error, if any. `None` for `Ok`.
-    pub error_category: Option<ErrorCategory>,
-}
-
 // ============================================================================
 // HandlerOutcome - What the trace specifies
 // ============================================================================
@@ -83,6 +45,17 @@ pub enum HandlerOutcome {
     Transient,
 }
 
+impl HandlerOutcome {
+    /// The `FallibleHandler` result this outcome dictates.
+    fn into_result(self) -> Result<(), OutcomeError> {
+        match self {
+            Self::Success => Ok(()),
+            Self::Permanent => Err(OutcomeError::permanent()),
+            Self::Transient => Err(OutcomeError::transient()),
+        }
+    }
+}
+
 // ============================================================================
 // OutcomeError - The error type returned by OutcomeHandler
 // ============================================================================
@@ -91,7 +64,7 @@ pub enum HandlerOutcome {
 ///
 /// Implements [`ClassifyError`] to return the appropriate [`ErrorCategory`]
 /// for the defer middleware to handle correctly.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OutcomeError {
     /// The category of this error (Permanent or Transient).
     category: ErrorCategory,
@@ -112,14 +85,6 @@ impl OutcomeError {
         Self {
             category: ErrorCategory::Transient,
         }
-    }
-}
-
-impl Debug for OutcomeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OutcomeError")
-            .field("category", &self.category)
-            .finish()
     }
 }
 
@@ -170,9 +135,6 @@ pub struct OutcomeHandler {
     next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
     /// Record of all messages processed by this handler (in order).
     processed: Arc<scc::Queue<ProcessedMessage>>,
-    /// Apply-hook records in call order. Drained by
-    /// [`OutcomeHandler::applied`].
-    applied: Arc<scc::Queue<AppliedRecord>>,
     /// When set, triggers partition shutdown before returning the outcome.
     ///
     /// Used to simulate shutdown occurring mid-handler-execution, exercising
@@ -187,7 +149,6 @@ impl OutcomeHandler {
         Self {
             next_outcome: Arc::new(Mutex::new(None)),
             processed: Arc::new(scc::Queue::default()),
-            applied: Arc::new(scc::Queue::default()),
             shutdown_trigger: Arc::new(Mutex::new(None)),
         }
     }
@@ -225,32 +186,9 @@ impl OutcomeHandler {
         result
     }
 
-    /// Returns all apply-hook records in order (drains the queue).
-    #[must_use]
-    pub fn applied(&self) -> Vec<AppliedRecord> {
-        let mut result = Vec::with_capacity(self.applied.len());
-        while let Some(entry) = self.applied.pop() {
-            result.push((**entry).clone());
-        }
-        result
-    }
-
     /// Records a processed message.
     fn record_processed(&self, key: Key, offset: Offset) {
         self.processed.push(ProcessedMessage { key, offset });
-    }
-
-    /// Records an apply-hook invocation.
-    fn record_applied(&self, hook: AppliedHook, result: &Result<(), OutcomeError>) {
-        let (is_ok, error_category) = match result {
-            Ok(()) => (true, None),
-            Err(error) => (false, Some(error.classify_error())),
-        };
-        self.applied.push(AppliedRecord {
-            hook,
-            is_ok,
-            error_category,
-        });
     }
 
     /// Takes the next outcome, returning Success if none was set.
@@ -276,7 +214,6 @@ impl Debug for OutcomeHandler {
         f.debug_struct("OutcomeHandler")
             .field("next_outcome", &self.next_outcome.lock())
             .field("processed_count", &self.processed.len())
-            .field("applied_count", &self.applied.len())
             .field("shutdown_trigger", &self.shutdown_trigger.lock().is_some())
             .finish()
     }
@@ -311,11 +248,7 @@ impl FallibleHandler for OutcomeHandler {
         self.record_processed(key, offset);
 
         self.maybe_trigger_shutdown();
-        match outcome {
-            HandlerOutcome::Success => Ok(()),
-            HandlerOutcome::Permanent => Err(OutcomeError::permanent()),
-            HandlerOutcome::Transient => Err(OutcomeError::transient()),
-        }
+        outcome.into_result()
     }
 
     async fn on_timer<C>(
@@ -334,25 +267,7 @@ impl FallibleHandler for OutcomeHandler {
             outcome
         );
         self.maybe_trigger_shutdown();
-        match outcome {
-            HandlerOutcome::Success => Ok(()),
-            HandlerOutcome::Permanent => Err(OutcomeError::permanent()),
-            HandlerOutcome::Transient => Err(OutcomeError::transient()),
-        }
-    }
-
-    async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.record_applied(AppliedHook::Commit, &result);
-    }
-
-    async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.record_applied(AppliedHook::Abort, &result);
+        outcome.into_result()
     }
 
     async fn shutdown(self) {
@@ -378,69 +293,26 @@ mod tests {
     }
 
     #[test]
-    fn outcome_error_permanent_classifies_correctly() {
-        init_test_logging();
-
-        let error = OutcomeError::permanent();
-        assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
-    }
-
-    #[test]
-    fn outcome_error_transient_classifies_correctly() {
-        init_test_logging();
-
-        let error = OutcomeError::transient();
-        assert!(matches!(error.classify_error(), ErrorCategory::Transient));
-    }
-
-    #[test]
-    fn outcome_handler_returns_configured_success() {
+    fn outcome_handler_returns_configured_outcome() {
         init_test_logging();
 
         TEST_RUNTIME.block_on(async {
-            let handler = OutcomeHandler::new();
-            let context = MockEventContext::new();
-            let trigger = make_test_trigger("test-key");
+            for (outcome, expected_category) in [
+                (HandlerOutcome::Success, None),
+                (HandlerOutcome::Permanent, Some(ErrorCategory::Permanent)),
+                (HandlerOutcome::Transient, Some(ErrorCategory::Transient)),
+            ] {
+                let handler = OutcomeHandler::new();
+                let context = MockEventContext::new();
+                let trigger = make_test_trigger("test-key");
 
-            handler.set_outcome(HandlerOutcome::Success);
-            let result = handler.on_timer(context, trigger, DemandType::Normal).await;
-            assert!(result.is_ok());
-        });
-    }
-
-    #[test]
-    fn outcome_handler_returns_configured_permanent() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let handler = OutcomeHandler::new();
-            let context = MockEventContext::new();
-            let trigger = make_test_trigger("test-key");
-
-            handler.set_outcome(HandlerOutcome::Permanent);
-            let result = handler.on_timer(context, trigger, DemandType::Normal).await;
-            assert!(matches!(
-                result.as_ref().err().map(OutcomeError::classify_error),
-                Some(ErrorCategory::Permanent)
-            ));
-        });
-    }
-
-    #[test]
-    fn outcome_handler_returns_configured_transient() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let handler = OutcomeHandler::new();
-            let context = MockEventContext::new();
-            let trigger = make_test_trigger("test-key");
-
-            handler.set_outcome(HandlerOutcome::Transient);
-            let result = handler.on_timer(context, trigger, DemandType::Normal).await;
-            assert!(matches!(
-                result.as_ref().err().map(OutcomeError::classify_error),
-                Some(ErrorCategory::Transient)
-            ));
+                handler.set_outcome(outcome);
+                let result = handler.on_timer(context, trigger, DemandType::Normal).await;
+                assert_eq!(
+                    result.as_ref().err().map(OutcomeError::classify_error),
+                    expected_category
+                );
+            }
         });
     }
 
@@ -469,73 +341,6 @@ mod tests {
         // When no outcome is set, take_outcome should return Success
         let outcome = handler.take_outcome();
         assert!(matches!(outcome, HandlerOutcome::Success));
-    }
-
-    #[test]
-    fn after_commit_records_ok_invocation() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let handler = OutcomeHandler::new();
-            let context = MockEventContext::new();
-
-            handler.after_commit(context, Ok(())).await;
-
-            let applied = handler.applied();
-            assert_eq!(applied.len(), 1);
-            assert_eq!(applied[0].hook, AppliedHook::Commit);
-            assert!(applied[0].is_ok);
-            assert!(applied[0].error_category.is_none());
-        });
-    }
-
-    #[test]
-    fn after_abort_records_transient_err_invocation() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let handler = OutcomeHandler::new();
-            let context = MockEventContext::new();
-
-            // Mirrors the `MessageDeferOutput::Deferred(e)` contract: when
-            // the defer middleware captures a Transient inner error and
-            // enqueues a retry, the inner must observe
-            // `after_abort(Err(transient))`.
-            handler
-                .after_abort(context, Err(OutcomeError::transient()))
-                .await;
-
-            let applied = handler.applied();
-            assert_eq!(applied.len(), 1);
-            assert_eq!(applied[0].hook, AppliedHook::Abort);
-            assert!(!applied[0].is_ok);
-            assert_eq!(applied[0].error_category, Some(ErrorCategory::Transient));
-        });
-    }
-
-    #[test]
-    fn applied_drains_in_order() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let handler = OutcomeHandler::new();
-
-            handler.after_commit(MockEventContext::new(), Ok(())).await;
-            handler
-                .after_abort(MockEventContext::new(), Err(OutcomeError::permanent()))
-                .await;
-            handler.after_commit(MockEventContext::new(), Ok(())).await;
-
-            let applied = handler.applied();
-            assert_eq!(applied.len(), 3);
-            assert_eq!(applied[0].hook, AppliedHook::Commit);
-            assert_eq!(applied[1].hook, AppliedHook::Abort);
-            assert_eq!(applied[1].error_category, Some(ErrorCategory::Permanent));
-            assert_eq!(applied[2].hook, AppliedHook::Commit);
-
-            // Drained — second call should be empty.
-            assert!(handler.applied().is_empty());
-        });
     }
 }
 

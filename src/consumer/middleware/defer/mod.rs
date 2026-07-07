@@ -42,7 +42,7 @@ pub mod segment;
 pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
-pub use decider::{AlwaysDefer, DeferralDecider, FailureTracker, NeverDefer, TraceBasedDecider};
+pub use decider::{DeferralDecider, FailureTracker};
 pub use error::{CassandraDeferStoreError, DeferInitError};
 pub use message::MessageDeferMiddleware;
 pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
