@@ -4,6 +4,7 @@
 //! implementations across test modules. Supports configurable behavior for
 //! testing different middleware scenarios.
 
+use std::convert::Infallible;
 use std::future::{self, Future};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -11,17 +12,36 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use educe::Educe;
 use parking_lot::Mutex;
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::{DemandType, FallibleHandler};
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::loader::MessageLoader;
-use crate::state::descriptor::{Registered, StateDescriptor};
-use crate::state::session::{CellSession, UnavailableState};
-use crate::timers::TimerType;
+use crate::loader::{MemoryLoader, MessageLoader};
+use crate::state::cell::Committed;
+use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
+use crate::state::dirty::DirtyStore;
+use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::oracle::CommitOracle;
+use crate::state::registry::CollectionDefRegistry;
+use crate::state::session::sealed::StateLifecycle;
+use crate::state::session::{
+    CellSession, KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
+    UnavailableState,
+};
+use crate::state::store::CellStore;
+use crate::state::{
+    CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
+};
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
+use crate::timers::{TimerType, Trigger};
 
 /// Timer-operation error the mock injects on demand, carrying the category to
 /// classify as. The backstop arm is must-succeed (invariant 8), so it retries
@@ -73,7 +93,7 @@ pub enum TimerOperation {
 /// ```
 #[derive(Educe)]
 #[educe(Clone(bound(S: Clone)))]
-pub struct MockEventContext<P = serde_json::Value, S = UnavailableState<P>> {
+pub struct MockEventContext<P = Value, S = UnavailableState<P>> {
     /// Partition/consumer shutdown signal (sender for mutations).
     shutdown_tx: Arc<watch::Sender<ShutdownPhase>>,
     /// Partition/consumer shutdown signal (receiver for queries).
@@ -417,4 +437,257 @@ where
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
         future::ready(Ok(self.durable_scheduled(timer_type)))
     }
+}
+
+// =========================================================================
+// Recording-session harness for the attempt-boundary session-reset tests
+// =========================================================================
+//
+// The marker-hygiene triangle — retry between attempts, settle on the final
+// outcome, and every defer/route Err→Ok swallow — shares one observable
+// contract: a discarded attempt's buffered writes never commit and its
+// registered marker never flushes. These pieces build a **real**
+// `KeyedStateSession` whose marker flush routes through a recording oracle so
+// each seam's test can assert that contract directly. (`retry/tests.rs` keeps
+// a local copy for now; folding it here is scaffolding-dedup work.)
+
+/// Oracle that records every flushed marker and always resolves Committed, so
+/// a test can read back exactly which markers `settle` certified.
+#[derive(Clone)]
+pub struct RecordingOracle {
+    recorded: Arc<Mutex<Vec<Uuid>>>,
+}
+
+impl RecordingOracle {
+    /// A fresh oracle with an empty log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            recorded: Arc::default(),
+        }
+    }
+
+    /// The shared log this oracle pushes every flushed marker into.
+    #[must_use]
+    pub fn recorded(&self) -> Arc<Mutex<Vec<Uuid>>> {
+        self.recorded.clone()
+    }
+}
+
+impl Default for RecordingOracle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommitOracle for RecordingOracle {
+    type Error = Infallible;
+
+    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
+        self.recorded.lock().push(dedup_id);
+        Ok(())
+    }
+
+    async fn resolve<'a>(
+        &'a self,
+        _state_key: &'a StateKey,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        Ok(CommitDecision::Committed)
+    }
+}
+
+/// Backend of a [`recording_session`].
+pub type RecordingBackend = PartitionBackend<
+    RecordingOracle,
+    MemoryDescriptorIdentityStore,
+    MemoryCellStore<RecordingOracle>,
+>;
+
+/// Session type built by [`recording_session`].
+pub type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Value>>;
+
+/// What [`recording_session`] hands back: the session, its durable cell store
+/// (a clone sharing the durable `Arc`), the session's dirty store, and the
+/// shared log of every marker the oracle recorded — the surfaces the
+/// session-reset tests assert on.
+pub type RecordingParts = (
+    RecordingSession,
+    MemoryCellStore<RecordingOracle>,
+    Arc<DirtyStore>,
+    Arc<Mutex<Vec<Uuid>>>,
+);
+
+/// A real session over `registry` for `state_key`; see [`RecordingParts`]
+/// for the returned surfaces.
+#[must_use]
+pub fn recording_session(registry: CollectionDefRegistry, state_key: StateKey) -> RecordingParts {
+    let registry = Arc::new(registry);
+    let oracle = RecordingOracle::new();
+    let recorded = oracle.recorded();
+    let cell_store = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let dirty = Arc::new(DirtyStore::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let session = KeyedStateSession::new(SessionParts {
+        cell: cell_store.clone(),
+        dirty: dirty.clone(),
+        oracle,
+        loader: MemoryLoader::new(),
+        registry,
+        state_key,
+        event: EventRef::Message {
+            dedup_id: Uuid::new_v4(),
+        },
+        recovery_delay: CompactDuration::new(30),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    });
+    (session, cell_store, dirty, recorded)
+}
+
+/// The committed value at the single Value cell of `name` under `state_key`.
+///
+/// # Errors
+///
+/// Returns the store's read error or a codec error on undecodable bytes.
+pub async fn committed_value(
+    cell_store: &MemoryCellStore<RecordingOracle>,
+    state_key: StateKey,
+    name: &str,
+) -> color_eyre::Result<Option<Value>> {
+    let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
+    let cell = CellKey {
+        section: Section::new(0),
+        coordinate: Coordinate::empty(),
+    };
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    match Committed::into_inner(cell_store.get(&id, &cell, probe).await?) {
+        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Error of a [`StagingTransientHandler`] attempt, carrying its
+/// classification.
+#[derive(Debug, Error)]
+#[error("staging attempt failed ({0:?})")]
+pub struct StagingError(pub ErrorCategory);
+
+impl ClassifyError for StagingError {
+    fn classify_error(&self) -> ErrorCategory {
+        self.0
+    }
+}
+
+/// Which apply hook a [`StagingTransientHandler`] observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagingHook {
+    /// `after_commit` fired — the dispatch was final.
+    Commit,
+    /// `after_abort` fired — the attempt was rolled back; a retry is coming.
+    Abort,
+}
+
+/// Inner handler for the defer/route swallow tests: on every dispatch it
+/// binds `cart`, buffers one write, registers its marker, then fails
+/// Transient — the exact attempt whose session the swallow point must reset
+/// before absorbing the error into an `Ok`. Records its apply hooks so a test
+/// can prove the swallow path (not a surfaced error) handled the dispatch.
+#[derive(Clone)]
+pub struct StagingTransientHandler {
+    marker: Uuid,
+    hooks: Arc<Mutex<Vec<StagingHook>>>,
+}
+
+impl StagingTransientHandler {
+    /// A handler registering `marker` on every attempt.
+    #[must_use]
+    pub fn new(marker: Uuid) -> Self {
+        Self {
+            marker,
+            hooks: Arc::default(),
+        }
+    }
+
+    /// The `cart` collection every attempt writes; register it in the
+    /// session's registry.
+    #[must_use]
+    pub fn collection() -> ValueDescriptor {
+        value_state("cart")
+    }
+
+    /// The apply hooks observed so far, in order.
+    #[must_use]
+    pub fn hooks(&self) -> Vec<StagingHook> {
+        self.hooks.lock().clone()
+    }
+
+    /// One failed attempt: buffer a `cart` write, register the marker, fail
+    /// Transient.
+    async fn stage<C>(&self, context: &C) -> Result<(), StagingError>
+    where
+        C: EventContext<Payload = Value>,
+    {
+        let handle = context
+            .state(Registered::new(Self::collection()))
+            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
+        handle
+            .set(json!({ "attempt": 1_i32 }))
+            .await
+            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
+        let lifecycle = context
+            .lifecycle()
+            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
+        lifecycle.register_marker(self.marker);
+        Err(StagingError(ErrorCategory::Transient))
+    }
+}
+
+impl FallibleHandler for StagingTransientHandler {
+    type Error = StagingError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.stage(&context).await
+    }
+
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.stage(&context).await
+    }
+
+    async fn after_commit<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.hooks.lock().push(StagingHook::Commit);
+    }
+
+    async fn after_abort<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.hooks.lock().push(StagingHook::Abort);
+    }
+
+    async fn shutdown(self) {}
 }

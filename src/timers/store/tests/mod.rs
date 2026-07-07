@@ -47,11 +47,18 @@ pub type TestStoreResult = Result<(), String>;
 // Implement Arbitrary trait for test types - these should only be available
 // during testing
 
+// The trait impl means "any legal value": the full `u32` domain, so the
+// duration overflow/saturation properties actually reach their `Err` and
+// saturating branches, `MIN` (0) included. Generators that mean "a plausible
+// timer parameter" draw their own bounded value instead (see
+// [`plausible_slab_size`]).
 impl Arbitrary for CompactDuration {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate durations between 1 second and 24 hours
-        let seconds = u32::arbitrary(g) % (24 * 60 * 60) + 1;
-        CompactDuration::new(seconds)
+        CompactDuration::new(u32::arbitrary(g))
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.seconds().shrink().map(CompactDuration::new))
     }
 }
 
@@ -67,11 +74,18 @@ impl Arbitrary for CompactDateTime {
     }
 }
 
+/// A plausible slab size, 1 second to 24 hours. `Segment::arbitrary` must not
+/// draw the full `CompactDuration` domain: `0` divides by zero in the slab
+/// math and `u32::MAX` degenerates every trace to a single slab.
+fn plausible_slab_size(g: &mut Gen) -> CompactDuration {
+    CompactDuration::new(u32::arbitrary(g) % (24 * 60 * 60) + 1)
+}
+
 impl Arbitrary for Segment {
     fn arbitrary(g: &mut Gen) -> Self {
         let id = Uuid::new_v4();
         let name = format!("segment-{}", u16::arbitrary(g));
-        let slab_size = CompactDuration::arbitrary(g);
+        let slab_size = plausible_slab_size(g);
 
         Segment {
             id,

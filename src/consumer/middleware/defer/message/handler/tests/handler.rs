@@ -538,3 +538,130 @@ mod tests {
         });
     }
 }
+
+/// The first-defer swallow's session reset, end to end through the settle
+/// boundary: the inner attempt buffers a `cart` write and registers a dedup
+/// marker before failing Transient; `defer_message` swallows that error into
+/// `Ok(Deferred)` — so the offset commits — but only after
+/// `reset_state_session` discards the failed attempt's dirty ops and marker.
+/// Dropping that reset is silent data loss: the failed attempt's write would
+/// commit and its marker would dedup-filter the deferred reload.
+#[cfg(test)]
+mod defer_swallow {
+    use super::*;
+    use crate::consumer::EventHandler;
+    use crate::consumer::message::ConsumerMessageValue;
+    use crate::consumer::middleware::FallibleEventHandler;
+    use crate::consumer::middleware::defer::config::DeferConfiguration;
+    use crate::consumer::middleware::defer::decider::AlwaysDefer;
+    use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
+    use crate::consumer::middleware::defer::message::store::MessageDeferStore;
+    use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
+    use crate::consumer::middleware::tests::test_support::{
+        StagingHook, StagingTransientHandler, committed_value, recording_session,
+    };
+    use crate::consumer::partition::offsets::OffsetTracker;
+    use crate::loader::MemoryLoader;
+    use crate::state::StateKey;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::telemetry::Telemetry;
+    use crate::{Partition, Topic};
+    use color_eyre::Result;
+    use crossbeam_utils::CachePadded;
+    use serde_json::Value;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
+
+    impl FallibleEventHandler
+        for MessageDeferHandler<
+            StagingTransientHandler,
+            MemoryMessageDeferStore,
+            MemoryLoader<Value>,
+            AlwaysDefer,
+        >
+    {
+    }
+
+    #[tokio::test]
+    async fn first_defer_swallow_resets_the_state_session() -> Result<()> {
+        const MARKER: Uuid = Uuid::from_u128(0xDEF1);
+        let topic = Topic::from("test-topic");
+        let partition = Partition::from(0_i32);
+
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(
+            &StagingTransientHandler::collection(),
+            CollectionDef::new(None),
+        )?;
+        let state_key = StateKey::new(Uuid::from_u128(0xD1), Arc::from("user-1"));
+        let (session, cell_store, dirty, recorded) = recording_session(registry, state_key.clone());
+
+        let inner = StagingTransientHandler::new(MARKER);
+        let store = MemoryMessageDeferStore::new();
+        let telemetry = Telemetry::new();
+        let handler = MessageDeferHandler {
+            handler: inner.clone(),
+            loader: MemoryLoader::new(),
+            store: store.clone(),
+            decider: AlwaysDefer,
+            config: DeferConfiguration::builder()
+                .enabled(true)
+                .base(Duration::from_secs(1))
+                .max_delay(Duration::from_hours(1))
+                .failure_threshold(0.9_f64)
+                .build()?,
+            topic,
+            partition,
+            sender: telemetry.partition_sender(topic, partition),
+            source: Arc::from("test"),
+        };
+
+        let context = MockEventContext::new().with_session(session);
+        let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        let tracker =
+            OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version);
+        let uncommitted_offset = tracker.take(0).await?;
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.try_acquire_owned()?;
+        let message = ConsumerMessage::new(
+            ConsumerMessageValue::default(),
+            tracing::Span::current(),
+            permit,
+        )
+        .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+        // Positive control: the swallow path ran — the inner attempt was
+        // rolled back into a deferred retry, not surfaced as a final error.
+        assert_eq!(inner.hooks(), vec![StagingHook::Abort]);
+        assert_eq!(
+            store.is_deferred(&Key::from("test-key")).await?,
+            Some(0),
+            "the message must be deferred for timer-based retry",
+        );
+        // The reset's contract: nothing from the failed attempt survives.
+        assert_eq!(
+            committed_value(&cell_store, state_key, "cart").await?,
+            None,
+            "the failed attempt's buffered write must not commit",
+        );
+        assert!(
+            dirty.touched(&Arc::from("user-1")).is_empty(),
+            "the session's dirty buffer must be empty after the swallow",
+        );
+        assert!(
+            recorded.lock().is_empty(),
+            "the failed attempt's marker must not flush — the deferred reload must not be \
+             dedup-filtered",
+        );
+        assert_eq!(
+            tracker.shutdown().await,
+            Some(0),
+            "the swallowed dispatch commits the offset",
+        );
+        Ok(())
+    }
+}

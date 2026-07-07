@@ -245,6 +245,28 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
     Ok(())
 }
 
+/// Wire-format freeze for the key-codec tokens, pinned end to end through
+/// `structural_identity()`: the token is a durable identity column compared
+/// on every acquisition, so changing a `KEY_CODEC_ID` literal — or the map
+/// plumbing that lifts it into the identity — silently bricks existing
+/// collections. Deque carries `None`: its ordering is fixed by the kind, and
+/// that must stay frozen (like the Value `None` pinned in the identity
+/// wire-contract test) so a future `Some` cannot brick existing deques.
+#[test]
+fn key_codec_wire_contract_is_frozen() {
+    use crate::state::order_codec::{I64KeyCodec, U64KeyCodec};
+
+    let utf8: MapDescriptor<Utf8KeyCodec> = map_state("m");
+    assert_eq!(utf8.structural_identity().key_codec_id, Some("utf8.v1"));
+    let i64_keyed: MapDescriptor<I64KeyCodec> = map_state("m");
+    assert_eq!(i64_keyed.structural_identity().key_codec_id, Some("i64.v1"));
+    let u64_keyed: MapDescriptor<U64KeyCodec> = map_state("m");
+    assert_eq!(u64_keyed.structural_identity().key_codec_id, Some("u64.v1"));
+
+    let deque: DequeDescriptor = deque_state("d");
+    assert_eq!(deque.structural_identity().key_codec_id, None);
+}
+
 /// Binding against a context without keyed state (any context whose
 /// session is the [`UnavailableState`](crate::state::session::UnavailableState)
 /// stub — here the bare mock) fails with the Permanent

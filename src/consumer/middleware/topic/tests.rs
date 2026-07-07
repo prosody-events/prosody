@@ -156,9 +156,9 @@ impl FallibleHandler for Probe {
     async fn shutdown(self) {}
 }
 
-/// Constructs a `FailureTopicHandler` over a probe inner using a mock
+/// Constructs a `FailureTopicHandler` over an inner handler using a mock
 /// producer (no real Kafka connection required).
-fn make_handler(inner: Probe) -> color_eyre::Result<FailureTopicHandler<Probe, crate::JsonCodec>> {
+fn make_handler<T>(inner: T) -> color_eyre::Result<FailureTopicHandler<T, crate::JsonCodec>> {
     // The mock-flag short-circuits the bootstrap-server lookup, but the
     // builder still validates the field, so we supply a sentinel value
     // along with a non-empty source system.
@@ -368,4 +368,94 @@ fn configuration_accepts_valid_failure_topic() {
         config.validate().is_ok(),
         "Non-empty failure topic should pass validation"
     );
+}
+
+/// The routed swallow's session reset, end to end through the settle
+/// boundary: the inner attempt buffers a `cart` write and registers a dedup
+/// marker before failing Transient; the DLQ route swallows that error into
+/// `Ok(Routed)` — so the offset commits — but only after
+/// `reset_state_session` discards the failed attempt's dirty ops and marker
+/// (the same attempt-boundary reset both defer swallow points perform).
+mod routed_swallow {
+    use super::*;
+    use crate::Key;
+    use crate::consumer::EventHandler;
+    use crate::consumer::message::ConsumerMessageValue;
+    use crate::consumer::middleware::FallibleEventHandler;
+    use crate::consumer::middleware::tests::test_support::{
+        MockEventContext as SessionContext, StagingHook, StagingTransientHandler, committed_value,
+        recording_session,
+    };
+    use crate::consumer::partition::offsets::OffsetTracker;
+    use crate::state::StateKey;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crossbeam_utils::CachePadded;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
+
+    impl FallibleEventHandler for FailureTopicHandler<StagingTransientHandler, crate::JsonCodec> {}
+
+    #[tokio::test]
+    async fn routed_swallow_resets_the_state_session() -> color_eyre::Result<()> {
+        const MARKER: Uuid = Uuid::from_u128(0xDEF3);
+
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(
+            &StagingTransientHandler::collection(),
+            CollectionDef::new(None),
+        )?;
+        let state_key = StateKey::new(Uuid::from_u128(0xD3), Arc::from("user-1"));
+        let (session, cell_store, dirty, recorded) = recording_session(registry, state_key.clone());
+
+        let inner = StagingTransientHandler::new(MARKER);
+        let handler = make_handler(inner.clone())?;
+
+        let context = SessionContext::new().with_session(session);
+        let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        let tracker =
+            OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version);
+        let uncommitted_offset = tracker.take(0).await?;
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.try_acquire_owned()?;
+        let message = ConsumerMessage::new(
+            ConsumerMessageValue::default(),
+            tracing::Span::current(),
+            permit,
+        )
+        .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+        // The route is FINAL (no retry is coming), so unlike the defer
+        // swallows the inner sees `after_commit(Err)` — the routing pinned by
+        // `after_commit_routed_forwards_inner_err_to_inner`.
+        assert_eq!(inner.hooks(), vec![StagingHook::Commit]);
+        // The reset's contract: nothing from the failed attempt survives.
+        // These are also the positive control that the ROUTED swallow ran:
+        // had the error surfaced instead (no route, no reset), the buffered
+        // write would still sit in the dirty store.
+        assert_eq!(
+            committed_value(&cell_store, state_key, "cart").await?,
+            None,
+            "the failed attempt's buffered write must not commit",
+        );
+        let key: Key = Arc::from("user-1");
+        assert!(
+            dirty.touched(&key).is_empty(),
+            "the session's dirty buffer must be empty after the swallow",
+        );
+        assert!(
+            recorded.lock().is_empty(),
+            "the failed attempt's marker must not flush — a redelivery of the routed message must \
+             not be dedup-filtered",
+        );
+        assert_eq!(
+            tracker.shutdown().await,
+            Some(0),
+            "the routed dispatch commits the offset",
+        );
+        Ok(())
+    }
 }

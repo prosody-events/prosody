@@ -443,3 +443,179 @@ impl TestHarness {
         self.context.has_scheduled_timer(TimerType::DeferredTimer)
     }
 }
+
+/// The first-defer swallow's session reset, end to end through the settle
+/// boundary: the inner attempt buffers a `cart` write and registers a dedup
+/// marker before failing Transient; `defer_first_timer` swallows that error
+/// into `Ok(Deferred)` — so the trigger commits — but only after
+/// `reset_state_session` discards the failed attempt's dirty ops and marker.
+/// Dropping that reset is silent data loss: the failed attempt's write would
+/// commit and its marker would dedup-filter the deferred retry.
+mod defer_swallow {
+    use super::*;
+    use crate::consumer::middleware::FallibleEventHandler;
+    use crate::consumer::middleware::defer::decider::AlwaysDefer;
+    use crate::consumer::middleware::tests::test_support::{
+        MockEventContext, StagingHook, StagingTransientHandler, committed_value, recording_session,
+    };
+    use crate::consumer::{EventHandler, Keyed, Uncommitted};
+    use crate::state::StateKey;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::timers::UncommittedTimer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
+
+    impl FallibleEventHandler
+        for TimerDeferHandler<StagingTransientHandler, MemoryTimerDeferStore, AlwaysDefer>
+    {
+    }
+
+    /// Guard recording whether the trigger committed or aborted.
+    struct RecordingGuard {
+        committed: Arc<AtomicUsize>,
+        aborted: Arc<AtomicUsize>,
+    }
+
+    impl Uncommitted for RecordingGuard {
+        async fn commit(self) {
+            self.committed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn abort(self) {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Minimal [`UncommittedTimer`] over a fixed trigger, so the dispatch can
+    /// run through `EventHandler::on_timer` and its settle sequence.
+    struct RecordingTimer {
+        trigger: Trigger,
+        committed: Arc<AtomicUsize>,
+        aborted: Arc<AtomicUsize>,
+    }
+
+    impl Keyed for RecordingTimer {
+        type Key = Key;
+
+        fn key(&self) -> &Self::Key {
+            &self.trigger.key
+        }
+    }
+
+    impl Uncommitted for RecordingTimer {
+        async fn commit(self) {
+            self.committed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn abort(self) {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl UncommittedTimer for RecordingTimer {
+        type CommitGuard = RecordingGuard;
+
+        fn time(&self) -> CompactDateTime {
+            self.trigger.time
+        }
+
+        fn timer_type(&self) -> TimerType {
+            self.trigger.timer_type
+        }
+
+        fn span(&self) -> tracing::Span {
+            tracing::Span::current()
+        }
+
+        fn into_inner(self) -> (Trigger, Self::CommitGuard) {
+            let guard = RecordingGuard {
+                committed: self.committed.clone(),
+                aborted: self.aborted.clone(),
+            };
+            (self.trigger, guard)
+        }
+    }
+
+    #[tokio::test]
+    async fn first_defer_swallow_resets_the_state_session() -> color_eyre::Result<()> {
+        const MARKER: Uuid = Uuid::from_u128(0xDEF2);
+        let topic = Topic::from("test-topic");
+        let partition = Partition::from(0_i32);
+
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(
+            &StagingTransientHandler::collection(),
+            CollectionDef::new(None),
+        )?;
+        let state_key = StateKey::new(Uuid::from_u128(0xD2), Arc::from("user-1"));
+        let (session, cell_store, dirty, recorded) = recording_session(registry, state_key.clone());
+
+        let inner = StagingTransientHandler::new(MARKER);
+        let store = MemoryTimerDeferStore::new(SpanRelation::default());
+        let telemetry = Telemetry::new();
+        let handler = TimerDeferHandler {
+            handler: inner.clone(),
+            store: store.clone(),
+            decider: AlwaysDefer,
+            config: DeferConfiguration::builder()
+                .enabled(true)
+                .base(Duration::from_secs(1))
+                .max_delay(Duration::from_hours(1))
+                .failure_threshold(0.9_f64)
+                .build()
+                .map_err(|e| eyre!("config error: {e}"))?,
+            topic,
+            partition,
+            sender: telemetry.partition_sender(topic, partition),
+            source: Arc::from("test"),
+        };
+
+        let context = MockEventContext::new().with_session(session);
+        let key: Key = Arc::from("user-1");
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let timer = RecordingTimer {
+            trigger: Trigger::new(
+                key.clone(),
+                CompactDateTime::from(1000_u32),
+                TimerType::Application,
+                tracing::Span::current(),
+            ),
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        EventHandler::on_timer(&handler, context, timer, DemandType::Normal).await;
+
+        // Positive control: the swallow path ran — the inner attempt was
+        // rolled back into a deferred retry, not surfaced as a final error.
+        assert_eq!(inner.hooks(), vec![StagingHook::Abort]);
+        assert_eq!(
+            store.is_deferred(&key).await?,
+            Some(0),
+            "the timer must be deferred for timer-based retry",
+        );
+        // The reset's contract: nothing from the failed attempt survives.
+        assert_eq!(
+            committed_value(&cell_store, state_key, "cart").await?,
+            None,
+            "the failed attempt's buffered write must not commit",
+        );
+        assert!(
+            dirty.touched(&key).is_empty(),
+            "the session's dirty buffer must be empty after the swallow",
+        );
+        assert!(
+            recorded.lock().is_empty(),
+            "the failed attempt's marker must not flush — the deferred retry must not be \
+             dedup-filtered",
+        );
+        assert_eq!(committed.load(Ordering::SeqCst), 1, "the trigger commits");
+        assert_eq!(
+            aborted.load(Ordering::SeqCst),
+            0,
+            "the trigger never aborts"
+        );
+        Ok(())
+    }
+}

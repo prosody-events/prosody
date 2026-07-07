@@ -102,7 +102,12 @@ fn durable_identity_wire_contract_is_frozen() {
     use crate::state::descriptor::{Passthrough, ResolverId};
 
     assert_eq!(i8::from(StateType::Application), 0);
+    // `Framework` is test-only today, but its discriminant is frozen into
+    // test-written identity rows and must stay reserved.
+    assert_eq!(i8::from(StateType::Framework), 1);
     assert_eq!(i8::from(CollectionKindId::Value), 1);
+    assert_eq!(i8::from(CollectionKindId::Map), 2);
+    assert_eq!(i8::from(CollectionKindId::Deque), 3);
     assert_eq!(<Passthrough<()> as ResolverId>::RESOLVER_ID, None);
     // Value is single-cell: it has no key codec, and that must stay frozen so a
     // future `Some` does not silently brick existing Value collections.

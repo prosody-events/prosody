@@ -356,6 +356,17 @@ fn test_checked_sub() -> Result<()> {
     Ok(())
 }
 
+/// The `i32↔CompactDuration` conversions backing the Cassandra serde are
+/// bit-reinterpretations, so every duration — including the ≥ 2³¹-second
+/// region where a numeric cast would silently corrupt the persisted value —
+/// must survive the round trip. Meaningful only with the full-domain
+/// generator (a bounded draw never reaches the region where reinterpret and
+/// cast differ).
+#[quickcheck]
+fn prop_i32_round_trip(a: CompactDuration) -> bool {
+    CompactDuration::from(i32::from(a)) == a
+}
+
 #[quickcheck]
 fn prop_add_commutative(a: CompactDuration, b: CompactDuration) -> bool {
     a + b == b + a

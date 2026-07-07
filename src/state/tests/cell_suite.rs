@@ -1210,22 +1210,30 @@ where
     }
 }
 
-/// Where a [`FailingCellStore`] injects its `mark_resolved` failure.
+/// Which surface a [`FailingCellStore`] poisons, and for what target.
 #[derive(Clone)]
 enum Poison {
-    /// Every cell of one named collection fails with the given category — the
-    /// session's best-effort `commit_apply` and the manager's recovery sweep.
+    /// Promote path: `mark_resolved` fails with the given category for every
+    /// cell of one named collection — the session's best-effort `commit_apply`
+    /// and the manager's recovery sweep.
     Collection(StateName, ErrorCategory),
-    /// Chosen single-byte coordinates each fail with a fixed category — a mixed
-    /// per-cell sweep where unpoisoned siblings must still resolve.
+    /// Promote path: `mark_resolved` fails for the chosen single-byte
+    /// coordinates, each with its mapped category — a mixed per-cell sweep
+    /// where unpoisoned siblings must still resolve.
     Cells(BTreeMap<u8, ErrorCategory>),
+    /// Stage path: `write_provisional` fails with the given category for one
+    /// named collection — drives the settle boundary's permanent-finalize-skip
+    /// arm (offset still commits, marker skipped, backstop armed).
+    WriteProvisional(StateName, ErrorCategory),
 }
 
-/// A [`CellStore`] wrapper whose `mark_resolved` fails for a chosen target,
-/// delegating everything else to `inner`. Drives the session's best-effort
+/// A [`CellStore`] wrapper whose `mark_resolved` (promote path) or
+/// `write_provisional` (stage path) fails for a chosen target, delegating
+/// everything else to `inner`. Drives the session's best-effort
 /// `commit_apply` (one poisoned cell yields `Incomplete` without cancelling
 /// siblings), the manager's no-strand recovery (a failed resolution leaves the
-/// backstop armed), and the sweep's per-cell `try_fold` failure arm.
+/// backstop armed), the sweep's per-cell `try_fold` failure arm, and the
+/// settle boundary's finalize-`Skip` arm.
 #[derive(Clone)]
 pub(crate) struct FailingCellStore<S> {
     inner: S,
@@ -1258,6 +1266,19 @@ impl<S> FailingCellStore<S> {
         }
     }
 
+    /// Wraps `inner`, poisoning `write_provisional` with `category` for the
+    /// `poison` collection — the stage path (`mark_resolved` stays healthy).
+    pub(crate) fn failing_write_provisional(
+        inner: S,
+        poison: StateName,
+        category: ErrorCategory,
+    ) -> Self {
+        Self {
+            inner,
+            poison: Poison::WriteProvisional(poison, category),
+        }
+    }
+
     /// The category to inject when `mark_resolved` touches `cells`, or `None`.
     fn injected(&self, collection: &CollectionRef, cells: &[CellKey]) -> Option<ErrorCategory> {
         match &self.poison {
@@ -1267,6 +1288,18 @@ impl<S> FailingCellStore<S> {
             Poison::Cells(targets) => cells
                 .iter()
                 .find_map(|c| targets.get(&coord_of(c)).copied()),
+            Poison::WriteProvisional(..) => None,
+        }
+    }
+
+    /// The category to inject when `write_provisional` touches `collection`,
+    /// or `None`.
+    fn injected_stage(&self, collection: &CollectionRef) -> Option<ErrorCategory> {
+        match &self.poison {
+            Poison::WriteProvisional(name, category) => {
+                (*collection.id().name() == *name).then_some(*category)
+            }
+            Poison::Collection(..) | Poison::Cells(..) => None,
         }
     }
 }
@@ -1278,9 +1311,9 @@ pub(crate) enum FailCellError<E>
 where
     E: Error + 'static,
 {
-    /// `mark_resolved` touched a poisoned cell; the category is what the
-    /// wrapper was asked to inject.
-    #[error("promote poison ({0:?})")]
+    /// `mark_resolved` or `write_provisional` touched a poisoned target; the
+    /// category is what the wrapper was asked to inject.
+    #[error("cell-store poison ({0:?})")]
     Poison(ErrorCategory),
 
     /// A delegated inner-store error.
@@ -1354,6 +1387,9 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
+        if let Some(category) = self.injected_stage(collection) {
+            return Err(FailCellError::Poison(category));
+        }
         self.inner
             .write_provisional(collection, writes)
             .await

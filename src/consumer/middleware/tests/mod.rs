@@ -669,6 +669,101 @@ mod rollback_safety {
         Ok(())
     }
 
+    /// The permanent-finalize-skip arm of `settle_committed`: a **Permanent**
+    /// stage failure is the one durability step the sequence skips rather than
+    /// retries (a genuine data rejection cannot self-heal). The documented
+    /// posture is commit-defensively: the offset still commits (no livelock on
+    /// an unstageable event), the marker flush is skipped (a present marker
+    /// must certify a durable stage — invariant: marker present ⇒ stage
+    /// durable), and the backstop is armed defensively so the sweep resolves
+    /// whatever partial stage may have landed.
+    #[tokio::test]
+    async fn permanent_finalize_skip_commits_unmarked_with_backstop_armed() -> Result<()> {
+        use crate::consumer::middleware::tests::test_support::RecordingOracle;
+        use crate::consumer::partition::ShutdownPhase;
+        use crate::state::EventRef;
+        use crate::state::PartitionBackend;
+        use crate::state::dirty::DirtyStore;
+        use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+        use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
+        use crate::state::tests::cell_suite::FailingCellStore;
+        use crate::timers::duration::CompactDuration;
+        use tokio::sync::watch;
+
+        type SkipStore = FailingCellStore<MemoryCellStore<RecordingOracle>>;
+        type SkipBackend =
+            PartitionBackend<RecordingOracle, MemoryDescriptorIdentityStore, SkipStore>;
+
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&cart(), CollectionDef::new(None))?;
+        let registry = Arc::new(registry);
+        let oracle = RecordingOracle::new();
+        let recorded = oracle.recorded();
+        // Poison the STAGE path: `write_provisional` on `cart` fails
+        // Permanent, so `finalize` inside `settle` hits `StepOutcome::Skip`.
+        let cell_store = FailingCellStore::failing_write_provisional(
+            MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+            StateName::try_new("cart")?,
+            ErrorCategory::Permanent,
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let session: KeyedStateSession<SkipBackend, MemoryLoader<serde_json::Value>> =
+            KeyedStateSession::new(SessionParts {
+                cell: cell_store,
+                dirty: Arc::new(DirtyStore::new()),
+                oracle,
+                loader: MemoryLoader::new(),
+                registry,
+                state_key: StateKey::new(Uuid::from_u128(0x5C1), Arc::from("user-1")),
+                event: EventRef::Message {
+                    dedup_id: Uuid::new_v4(),
+                },
+                recovery_delay: CompactDuration::new(30),
+                armed: Arc::default(),
+                termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            });
+        let context = MockEventContext::new()
+            .with_session(session)
+            .with_timer_tracking();
+
+        // Buffer a write and register a marker; do NOT finalize — `settle`
+        // owns the stage and must hit the poison itself.
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
+        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
+        lifecycle.register_marker(Uuid::from_u128(0x5EA1));
+
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        settle(&handler, context.clone(), guard, Ok(0)).await;
+
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            1,
+            "a permanently-unstageable event still commits (no livelock)",
+        );
+        assert_eq!(aborted.load(Ordering::SeqCst), 0);
+        assert!(
+            recorded.lock().is_empty(),
+            "the marker must NOT flush over an uncertain stage",
+        );
+        assert_eq!(
+            context.count_scheduled(TimerType::StateRecovery),
+            1,
+            "the backstop must be armed defensively for the sweep",
+        );
+        Ok(())
+    }
+
     /// Abort-only-on-shutdown, end to end through `settle`'s success path: a
     /// shutdown is the *sole* thing that stops the durability sequence short of
     /// a commit — it abandons *before* the marker flush, so the staged cell
@@ -1263,6 +1358,88 @@ mod marker_flush_must_succeed {
             StateName::try_new("cart")?,
         );
         Ok((session, cell_store, cart_id))
+    }
+
+    /// The error-path marker gate, Permanent direction: a **final** Permanent
+    /// error commits with a best-effort flush of the registered marker, so
+    /// the failed-but-final message deduplicates instead of re-running its
+    /// failure on every redelivery.
+    #[tokio::test]
+    async fn err_permanent_flushes_the_registered_marker() -> Result<()> {
+        use color_eyre::eyre::eyre;
+
+        // fail_count 0: the oracle never fails; `recorded` is the assert
+        // surface.
+        let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
+        let (session, _cell_store, _cart_id) = flaky_session(oracle.clone())?;
+        let context = MockEventContext::new().with_session(session);
+        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
+        lifecycle.register_marker(Uuid::from_u128(0xFEE1));
+
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        settle(
+            &handler,
+            context,
+            guard,
+            Err(TestError(ErrorCategory::Permanent, "final")),
+        )
+        .await;
+
+        assert_eq!(
+            oracle.recorded.load(Ordering::SeqCst),
+            1,
+            "a final Permanent error must flush the marker so the failure deduplicates",
+        );
+        assert_eq!(committed.load(Ordering::SeqCst), 1, "final errors commit");
+        assert_eq!(aborted.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// The error-path marker gate, Transient direction: the flush is gated to
+    /// Permanent. A custom stack that swallows a post-success failure into a
+    /// Transient final error (without resetting the session) must not have
+    /// that attempt's marker certify never-staged state.
+    #[tokio::test]
+    async fn err_transient_never_flushes_the_registered_marker() -> Result<()> {
+        use color_eyre::eyre::eyre;
+
+        let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
+        let (session, _cell_store, _cart_id) = flaky_session(oracle.clone())?;
+        let context = MockEventContext::new().with_session(session);
+        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
+        lifecycle.register_marker(Uuid::from_u128(0xFEE2));
+
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        settle(
+            &handler,
+            context,
+            guard,
+            Err(TestError(ErrorCategory::Transient, "final")),
+        )
+        .await;
+
+        assert_eq!(
+            oracle.recorded.load(Ordering::SeqCst),
+            0,
+            "a Transient final error must NOT flush the marker over never-staged state",
+        );
+        assert_eq!(committed.load(Ordering::SeqCst), 1, "final errors commit");
+        assert_eq!(aborted.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 
     /// However many leading marker-flush failures of whatever category the
