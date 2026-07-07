@@ -30,17 +30,16 @@ use super::*;
 use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::middleware::tests::test_support::{MockEventContext, create_test_message};
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::error::ErrorCategory;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 
-/// Test error with a fixed classification. Equality compares the
-/// classification discriminant + tag, since `ErrorCategory` itself is
-/// only `Copy + Clone + Debug + Serialize`.
-#[derive(Debug, Clone)]
+/// Test error with a fixed classification and a tag naming the raising site,
+/// so expected hook logs stay distinguishable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TestError(ErrorCategory, &'static str);
 
 impl Display for TestError {
@@ -56,21 +55,6 @@ impl ClassifyError for TestError {
         self.0
     }
 }
-
-impl PartialEq for TestError {
-    fn eq(&self, other: &Self) -> bool {
-        // Compare classification discriminants + tags.
-        let cat_eq = matches!(
-            (self.0, other.0),
-            (ErrorCategory::Transient, ErrorCategory::Transient)
-                | (ErrorCategory::Permanent, ErrorCategory::Permanent)
-                | (ErrorCategory::Terminal, ErrorCategory::Terminal)
-        );
-        cat_eq && self.1 == other.1
-    }
-}
-
-impl Eq for TestError {}
 
 impl FallibleEventHandler for ProbeHandler {}
 
@@ -179,19 +163,6 @@ fn make_offset_tracker() -> OffsetTracker {
     OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version)
 }
 
-fn make_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
-    use crate::consumer::message::ConsumerMessageValue;
-    use std::sync::Arc;
-    use tokio::sync::Semaphore;
-    let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned().ok()?;
-    Some(ConsumerMessage::new(
-        ConsumerMessageValue::default(),
-        tracing::Span::current(),
-        permit,
-    ))
-}
-
 #[tokio::test]
 async fn after_commit_fires_with_ok_output_after_handler_success() -> color_eyre::Result<()> {
     let handler = ProbeHandler::ok(42);
@@ -199,9 +170,7 @@ async fn after_commit_fires_with_ok_output_after_handler_success() -> color_eyre
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let message = make_test_message()
-        .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-        .into_uncommitted(uncommitted_offset);
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
@@ -221,9 +190,7 @@ async fn after_commit_fires_with_err_after_permanent_error() -> color_eyre::Resu
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let message = make_test_message()
-        .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-        .into_uncommitted(uncommitted_offset);
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
@@ -245,9 +212,7 @@ async fn after_commit_fires_with_err_after_transient_error() -> color_eyre::Resu
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let message = make_test_message()
-        .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-        .into_uncommitted(uncommitted_offset);
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
@@ -267,9 +232,7 @@ async fn after_abort_fires_with_err_after_terminal_error() -> color_eyre::Result
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let message = make_test_message()
-        .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-        .into_uncommitted(uncommitted_offset);
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
@@ -307,9 +270,7 @@ async fn hook_1_to_1_invariant_one_apply_per_dispatch() -> color_eyre::Result<()
         let context = MockEventContext::new();
         let tracker = make_offset_tracker();
         let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
+        let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
         EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
@@ -346,21 +307,6 @@ async fn after_commit_for_timer_path_with_ok_output() {
         aborted: Arc<AtomicUsize>,
     }
 
-    struct MockGuard {
-        committed: Arc<AtomicUsize>,
-        aborted: Arc<AtomicUsize>,
-    }
-
-    impl Uncommitted for MockGuard {
-        async fn commit(self) {
-            self.committed.fetch_add(1, Ordering::SeqCst);
-        }
-
-        async fn abort(self) {
-            self.aborted.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     impl Keyed for MockUncommittedTimer {
         type Key = Key;
 
@@ -381,7 +327,7 @@ async fn after_commit_for_timer_path_with_ok_output() {
     }
 
     impl UncommittedTimer for MockUncommittedTimer {
-        type CommitGuard = MockGuard;
+        type CommitGuard = RecordingGuard;
 
         fn time(&self) -> CompactDateTime {
             CompactDateTime::from(0_u32)
@@ -397,7 +343,7 @@ async fn after_commit_for_timer_path_with_ok_output() {
 
         fn into_inner(self) -> (Trigger, Self::CommitGuard) {
             let trigger = Trigger::for_testing("test-key".into(), self.time(), self.timer_type());
-            let guard = MockGuard {
+            let guard = RecordingGuard {
                 committed: self.committed.clone(),
                 aborted: self.aborted.clone(),
             };
@@ -494,9 +440,7 @@ async fn pass_through_middleware_forwards_output_to_inner_after_commit() -> colo
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let message = make_test_message()
-        .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-        .into_uncommitted(uncommitted_offset);
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(&middleware, context, message, DemandType::Normal).await;
 
@@ -519,9 +463,7 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
-    let message = make_test_message()
-        .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-        .into_uncommitted(uncommitted_offset);
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
     EventHandler::on_message(&middleware, context, message, DemandType::Normal).await;
 

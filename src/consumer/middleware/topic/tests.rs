@@ -1,32 +1,13 @@
 use super::*;
+use crate::JsonCodec;
 use crate::codec::JsonCodecError;
-use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::middleware::tests::test_support::{MockEventContext, TestError};
 use crate::error::ErrorCategory;
 use crate::producer::ProducerConfiguration;
 use crate::telemetry::Telemetry;
 use parking_lot::Mutex;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
-
-/// Test error type with configurable classification.
-#[derive(Debug, Clone)]
-struct TestError(ErrorCategory);
-
-impl Display for TestError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "test error ({:?})", self.0)
-    }
-}
-
-impl Error for TestError {}
-
-impl ClassifyError for TestError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.0
-    }
-}
 
 // === Error Classification Tests ===
 
@@ -158,7 +139,7 @@ impl FallibleHandler for Probe {
 
 /// Constructs a `FailureTopicHandler` over an inner handler using a mock
 /// producer (no real Kafka connection required).
-fn make_handler<T>(inner: T) -> color_eyre::Result<FailureTopicHandler<T, crate::JsonCodec>> {
+fn make_handler<T>(inner: T) -> color_eyre::Result<FailureTopicHandler<T, JsonCodec>> {
     // The mock-flag short-circuits the bootstrap-server lookup, but the
     // builder still validates the field, so we supply a sentinel value
     // along with a non-empty source system.
@@ -395,7 +376,7 @@ mod routed_swallow {
     use tokio::sync::Semaphore;
     use uuid::Uuid;
 
-    impl FallibleEventHandler for FailureTopicHandler<StagingTransientHandler, crate::JsonCodec> {}
+    impl FallibleEventHandler for FailureTopicHandler<StagingTransientHandler, JsonCodec> {}
 
     #[tokio::test]
     async fn routed_swallow_resets_the_state_session() -> color_eyre::Result<()> {

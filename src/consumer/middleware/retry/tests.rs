@@ -1,197 +1,16 @@
 use super::*;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
-use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::tests::test_support::{
+    MockEventContext, ScriptedHandler, ScriptedHook, TestError, create_test_message,
+    create_test_trigger,
+};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
-use parking_lot::Mutex;
-use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tokio::time::{sleep as tokio_sleep, timeout};
 use tracing::Span;
-
-/// Test error type with configurable classification.
-#[derive(Debug, Clone)]
-struct TestError(ErrorCategory);
-
-impl Display for TestError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "test error ({:?})", self.0)
-    }
-}
-
-impl Error for TestError {}
-
-impl ClassifyError for TestError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.0
-    }
-}
-
-/// Records every lifecycle hook firing on the inner handler in order so
-/// tests can assert the per-invocation apply-hook invariant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HookEvent {
-    /// `on_message` / `on_timer` was invoked with this demand type.
-    Invoke(DemandType),
-    /// `after_commit` was fired with this `Result` shape (Ok / Err
-    /// category).
-    AfterCommit(Result<(), ErrorCategory>),
-    /// `after_abort` was fired with this `Result` shape.
-    AfterAbort(Result<(), ErrorCategory>),
-}
-
-/// Mock handler that tracks calls and can be configured to fail.
-#[derive(Clone)]
-struct MockHandler {
-    call_count: Arc<AtomicUsize>,
-    /// Sequence of results to return on successive calls.
-    /// Empty means success.
-    failure_sequence: Arc<Mutex<Vec<ErrorCategory>>>,
-    /// Recorded demand types from calls.
-    demand_types: Arc<Mutex<Vec<DemandType>>>,
-    /// Ordered log of every lifecycle hook firing (invoke + apply hooks).
-    hook_log: Arc<Mutex<Vec<HookEvent>>>,
-}
-
-impl MockHandler {
-    fn success() -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            failure_sequence: Arc::new(Mutex::new(vec![])),
-            demand_types: Arc::new(Mutex::new(vec![])),
-            hook_log: Arc::new(Mutex::new(vec![])),
-        }
-    }
-
-    fn failing_then_success(failures: Vec<ErrorCategory>) -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            failure_sequence: Arc::new(Mutex::new(failures)),
-            demand_types: Arc::new(Mutex::new(vec![])),
-            hook_log: Arc::new(Mutex::new(vec![])),
-        }
-    }
-
-    fn always_failing(category: ErrorCategory) -> Self {
-        // Create a large sequence that should outlast max_retries
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            failure_sequence: Arc::new(Mutex::new(vec![category; 100])),
-            demand_types: Arc::new(Mutex::new(vec![])),
-            hook_log: Arc::new(Mutex::new(vec![])),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.call_count.load(Ordering::Relaxed)
-    }
-
-    fn recorded_demand_types(&self) -> Vec<DemandType> {
-        self.demand_types.lock().clone()
-    }
-
-    fn hook_events(&self) -> Vec<HookEvent> {
-        self.hook_log.lock().clone()
-    }
-}
-
-/// Project a `Result<(), TestError>` onto the equality-friendly
-/// `Result<(), ErrorCategory>` carried by `HookEvent`.
-fn project_result(result: Result<(), TestError>) -> Result<(), ErrorCategory> {
-    result.map_err(|TestError(category)| category)
-}
-
-impl FallibleHandler for MockHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = serde_json::Value;
-
-    async fn on_message<C>(
-        &self,
-        _context: C,
-        _message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-        self.demand_types.lock().push(demand_type);
-        self.hook_log.lock().push(HookEvent::Invoke(demand_type));
-
-        let mut seq = self.failure_sequence.lock();
-        if seq.is_empty() {
-            Ok(())
-        } else {
-            let category = seq.remove(0);
-            Err(TestError(category))
-        }
-    }
-
-    async fn on_timer<C>(
-        &self,
-        _context: C,
-        _trigger: Trigger,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-        self.demand_types.lock().push(demand_type);
-        self.hook_log.lock().push(HookEvent::Invoke(demand_type));
-
-        let mut seq = self.failure_sequence.lock();
-        if seq.is_empty() {
-            Ok(())
-        } else {
-            let category = seq.remove(0);
-            Err(TestError(category))
-        }
-    }
-
-    async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.hook_log
-            .lock()
-            .push(HookEvent::AfterCommit(project_result(result)));
-    }
-
-    async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.hook_log
-            .lock()
-            .push(HookEvent::AfterAbort(project_result(result)));
-    }
-
-    async fn shutdown(self) {}
-}
-
-fn create_test_message() -> Result<ConsumerMessage<serde_json::Value>> {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned()?;
-    Ok(ConsumerMessage::new(
-        ConsumerMessageValue::default(),
-        Span::current(),
-        permit,
-    ))
-}
-
-fn create_test_trigger() -> Trigger {
-    Trigger::for_testing(
-        "test-key".into(),
-        CompactDateTime::from(1000_u32),
-        TimerType::default(),
-    )
-}
 
 fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
     RetryHandler {
@@ -206,7 +25,7 @@ fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
 
 #[tokio::test]
 async fn success_on_first_attempt_returns_ok_immediately() -> Result<()> {
-    let handler = MockHandler::success();
+    let handler = ScriptedHandler::success();
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -224,8 +43,10 @@ async fn success_on_first_attempt_returns_ok_immediately() -> Result<()> {
 #[tokio::test]
 async fn transient_error_retries_then_succeeds() -> Result<()> {
     // Fail twice with transient errors, then succeed
-    let handler =
-        MockHandler::failing_then_success(vec![ErrorCategory::Transient, ErrorCategory::Transient]);
+    let handler = ScriptedHandler::failing_then_success(vec![
+        ErrorCategory::Transient,
+        ErrorCategory::Transient,
+    ]);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -240,7 +61,7 @@ async fn transient_error_retries_then_succeeds() -> Result<()> {
 
 #[tokio::test]
 async fn transient_error_fails_after_max_retries() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -262,7 +83,7 @@ async fn transient_error_fails_after_max_retries() -> Result<()> {
 
 #[tokio::test]
 async fn permanent_error_fails_immediately_no_retry() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Permanent);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -279,7 +100,7 @@ async fn permanent_error_fails_immediately_no_retry() -> Result<()> {
 
 #[tokio::test]
 async fn terminal_error_fails_immediately_no_retry() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Terminal);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -297,7 +118,7 @@ async fn terminal_error_fails_immediately_no_retry() -> Result<()> {
 #[tokio::test]
 async fn first_attempt_uses_original_demand_type_retries_use_failure() -> Result<()> {
     // Fail once with transient, then succeed
-    let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
+    let handler = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -325,7 +146,7 @@ async fn first_attempt_uses_original_demand_type_retries_use_failure() -> Result
 
 #[tokio::test]
 async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     // Use longer delays to give time for shutdown signal
     let retry_handler = RetryHandler {
         base_delay_millis: 1000, // 1 second base delay
@@ -363,7 +184,7 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
 
 #[tokio::test]
 async fn timer_success_on_first_attempt() {
-    let handler = MockHandler::success();
+    let handler = ScriptedHandler::success();
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let trigger = create_test_trigger();
@@ -377,7 +198,7 @@ async fn timer_success_on_first_attempt() {
 
 #[tokio::test]
 async fn timer_transient_error_retries_then_succeeds() {
-    let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
+    let handler = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let trigger = create_test_trigger();
@@ -391,7 +212,7 @@ async fn timer_transient_error_retries_then_succeeds() {
 
 #[tokio::test]
 async fn timer_permanent_error_no_retry() {
-    let handler = MockHandler::always_failing(ErrorCategory::Permanent);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     let trigger = create_test_trigger();
@@ -407,7 +228,7 @@ async fn timer_permanent_error_no_retry() {
 
 #[test]
 fn sleep_time_has_exponential_growth_with_jitter() {
-    let handler = MockHandler::success();
+    let handler = ScriptedHandler::success();
     let retry_handler = RetryHandler {
         base_delay_millis: 100,
         max_delay_millis: 10000,
@@ -448,7 +269,7 @@ fn sleep_time_survives_zero_backoff() {
         base_delay_millis: 0,
         max_delay_millis: 0,
         max_retries: 10,
-        handler: MockHandler::success(),
+        handler: ScriptedHandler::success(),
     };
 
     assert_eq!(retry_handler.sleep_time(1), Duration::ZERO);
@@ -456,7 +277,7 @@ fn sleep_time_survives_zero_backoff() {
 
 #[test]
 fn sleep_time_capped_at_max_delay() {
-    let handler = MockHandler::success();
+    let handler = ScriptedHandler::success();
     let retry_handler = RetryHandler {
         base_delay_millis: 100,
         max_delay_millis: 500,
@@ -579,7 +400,7 @@ fn create_offset_tracker() -> OffsetTracker {
 /// `FallibleHandler::on_message` should abort on shutdown signal.
 #[tokio::test]
 async fn fallible_on_message_shutdown_aborts() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 10);
     let context = MockEventContext::new();
     context.request_shutdown();
@@ -596,7 +417,7 @@ async fn fallible_on_message_shutdown_aborts() -> Result<()> {
 /// `FallibleHandler::on_timer` should abort on shutdown signal.
 #[tokio::test]
 async fn fallible_on_timer_shutdown_aborts() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 10);
     let context = MockEventContext::new();
     context.request_shutdown();
@@ -617,7 +438,7 @@ async fn fallible_on_timer_shutdown_aborts() -> Result<()> {
 /// `EventHandler::on_message` should abort offset on shutdown signal.
 #[tokio::test]
 async fn event_on_message_shutdown_aborts() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 10);
     let context = MockEventContext::new();
     context.request_shutdown();
@@ -643,7 +464,7 @@ async fn event_on_message_shutdown_aborts() -> Result<()> {
 /// `EventHandler::on_timer` should abort on shutdown signal.
 #[tokio::test]
 async fn event_on_timer_shutdown_aborts() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 10);
     let context = MockEventContext::new();
     context.request_shutdown();
@@ -665,7 +486,7 @@ async fn event_on_timer_shutdown_aborts() -> Result<()> {
 /// `FallibleHandler::on_message` should continue retrying on cancellation.
 #[tokio::test]
 async fn fallible_on_message_cancellation_retries() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     context.request_cancellation();
@@ -682,7 +503,7 @@ async fn fallible_on_message_cancellation_retries() -> Result<()> {
 /// `FallibleHandler::on_timer` should continue retrying on cancellation.
 #[tokio::test]
 async fn fallible_on_timer_cancellation_retries() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 3);
     let context = MockEventContext::new();
     context.request_cancellation();
@@ -703,8 +524,10 @@ async fn fallible_on_timer_cancellation_retries() -> Result<()> {
 /// `EventHandler::on_message` should continue retrying on cancellation.
 #[tokio::test]
 async fn event_on_message_cancellation_retries() -> Result<()> {
-    let handler =
-        MockHandler::failing_then_success(vec![ErrorCategory::Transient, ErrorCategory::Transient]);
+    let handler = ScriptedHandler::failing_then_success(vec![
+        ErrorCategory::Transient,
+        ErrorCategory::Transient,
+    ]);
     let retry_handler = create_retry_handler(handler.clone(), 10);
     let context = MockEventContext::new();
     context.request_cancellation();
@@ -734,8 +557,10 @@ async fn event_on_message_cancellation_retries() -> Result<()> {
 /// `EventHandler::on_timer` should continue retrying on cancellation.
 #[tokio::test]
 async fn event_on_timer_cancellation_retries() -> Result<()> {
-    let handler =
-        MockHandler::failing_then_success(vec![ErrorCategory::Transient, ErrorCategory::Transient]);
+    let handler = ScriptedHandler::failing_then_success(vec![
+        ErrorCategory::Transient,
+        ErrorCategory::Transient,
+    ]);
     let retry_handler = create_retry_handler(handler.clone(), 10);
     let context = MockEventContext::new();
     context.request_cancellation();
@@ -771,8 +596,10 @@ async fn event_on_timer_cancellation_retries() -> Result<()> {
 /// blanket-impl boundary.
 #[tokio::test]
 async fn fallible_inner_sees_one_apply_hook_per_attempt_when_retries_then_succeeds() -> Result<()> {
-    let handler =
-        MockHandler::failing_then_success(vec![ErrorCategory::Transient, ErrorCategory::Transient]);
+    let handler = ScriptedHandler::failing_then_success(vec![
+        ErrorCategory::Transient,
+        ErrorCategory::Transient,
+    ]);
     let retry_handler = create_retry_handler(handler.clone(), 5);
     // Wrap in the FallibleEventHandler blanket impl by going through the
     // EventHandler path with a real durability marker. The blanket impl
@@ -796,12 +623,12 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_retries_then_succee
     assert_eq!(
         events,
         vec![
-            HookEvent::Invoke(DemandType::Normal),
-            HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
-            HookEvent::Invoke(DemandType::Failure),
-            HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
-            HookEvent::Invoke(DemandType::Failure),
-            HookEvent::AfterCommit(Ok(())),
+            ScriptedHook::Invoke(DemandType::Normal),
+            ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
+            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
+            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::AfterCommit(Ok(())),
         ],
         "each invocation must be paired with exactly one apply hook on the inner",
     );
@@ -822,7 +649,7 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_retries_then_succee
 /// classification (commit + `after_commit(Err)`).
 #[tokio::test]
 async fn fallible_inner_sees_one_apply_hook_per_attempt_when_max_retries_exhausted() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     let retry_handler = create_retry_handler(handler.clone(), 2);
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -843,12 +670,12 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_max_retries_exhaust
     assert_eq!(
         events,
         vec![
-            HookEvent::Invoke(DemandType::Normal),
-            HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
-            HookEvent::Invoke(DemandType::Failure),
-            HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
-            HookEvent::Invoke(DemandType::Failure),
-            HookEvent::AfterCommit(Err(ErrorCategory::Transient)),
+            ScriptedHook::Invoke(DemandType::Normal),
+            ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
+            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
+            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::AfterCommit(Err(ErrorCategory::Transient)),
         ],
         "max-retries-exhausted: 3 invocations, each paired with exactly one apply hook; final \
          hook is after_commit because the outer treats this as commit (DLQ takeover)",
@@ -872,7 +699,7 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_max_retries_exhaust
 /// path), never `AfterCommit`.
 #[tokio::test]
 async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
-    let handler = MockHandler::always_failing(ErrorCategory::Transient);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
     // Long sleep so we can race the shutdown signal against it.
     let retry_handler = RetryHandler {
         base_delay_millis: 1000,
@@ -915,7 +742,7 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
             bail!("uneven event chunk: {pair:?}");
         };
         assert!(
-            matches!(invoke, HookEvent::Invoke(_)),
+            matches!(invoke, ScriptedHook::Invoke(_)),
             "pair {i} expected to start with Invoke, got {invoke:?}",
         );
         let is_last = i + 1 == events.len() / 2;
@@ -925,7 +752,7 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
             // (NEVER `AfterCommit`, and NEVER duplicated).
             assert_eq!(
                 apply,
-                &HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                &ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
                 "final pair must be after_abort fired by the outer (not from the loop), got \
                  {apply:?}",
             );
@@ -934,7 +761,7 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
             // between-attempts after_abort.
             assert_eq!(
                 apply,
-                &HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                &ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
                 "intermediate pair {i} expected after_abort, got {apply:?}",
             );
         }
@@ -958,28 +785,12 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
 mod reset_between_attempts {
     use super::*;
     use crate::codec::JsonCodec;
-    use crate::consumer::partition::ShutdownPhase;
-    use crate::loader::MemoryLoader;
-    use crate::state::cell::Committed;
-    use crate::state::cell_key::{CellKey, Coordinate, Section};
+    use crate::consumer::middleware::tests::test_support::{committed_value, recording_session};
+    use crate::state::StateKey;
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
-    use crate::state::dirty::DirtyStore;
-    use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-    use crate::state::oracle::CommitOracle;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::sealed::StateLifecycle;
-    use crate::state::session::{
-        KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
-    };
-    use crate::state::store::CellStore;
-    use crate::state::{
-        CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
-    };
-    use crate::timers::duration::CompactDuration;
-    use color_eyre::eyre::Result;
+    use crate::state::session::LifecycleAccessExt;
     use serde_json::{Value, json};
-    use std::convert::Infallible;
-    use tokio::sync::watch;
     use uuid::Uuid;
 
     /// Attempt 1 stages `cart` + registers this marker, then fails Transient.
@@ -993,101 +804,6 @@ mod reset_between_attempts {
 
     fn wishlist() -> ValueDescriptor {
         value_state::<JsonCodec>("wishlist")
-    }
-
-    /// Oracle that records every flushed marker and always resolves Committed,
-    /// so a test can read back exactly which marker `settle` certified.
-    #[derive(Clone)]
-    struct RecordingOracle {
-        recorded: Arc<Mutex<Vec<Uuid>>>,
-    }
-
-    impl CommitOracle for RecordingOracle {
-        type Error = Infallible;
-
-        async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
-            self.recorded.lock().push(dedup_id);
-            Ok(())
-        }
-
-        async fn resolve<'a>(
-            &'a self,
-            _state_key: &'a StateKey,
-            _event: EventRef,
-        ) -> Result<CommitDecision, Self::Error> {
-            Ok(CommitDecision::Committed)
-        }
-    }
-
-    type RecordingBackend = PartitionBackend<
-        RecordingOracle,
-        MemoryDescriptorIdentityStore,
-        MemoryCellStore<RecordingOracle>,
-    >;
-    type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Value>>;
-
-    /// A real session, its durable cell store (for read-back), and the shared
-    /// log of every marker the oracle recorded.
-    type RecordingParts = (
-        RecordingSession,
-        MemoryCellStore<RecordingOracle>,
-        Arc<Mutex<Vec<Uuid>>>,
-    );
-
-    /// A real session over `cart` + `wishlist`, whose marker flush routes
-    /// through the returned [`RecordingOracle`], plus the durable cell store
-    /// for post-settle read-back.
-    fn recording_session() -> Result<RecordingParts> {
-        let mut registry = CollectionDefRegistry::default();
-        registry.register(&cart(), CollectionDef::new(None))?;
-        registry.register(&wishlist(), CollectionDef::new(None))?;
-        let registry = Arc::new(registry);
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let oracle = RecordingOracle {
-            recorded: recorded.clone(),
-        };
-        let cell_store = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
-        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let state_key = StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1"));
-        let session = KeyedStateSession::new(SessionParts {
-            cell: cell_store.clone(),
-            dirty: Arc::new(DirtyStore::new()),
-            oracle,
-            loader: MemoryLoader::new(),
-            registry,
-            state_key,
-            event: EventRef::Message {
-                dedup_id: Uuid::new_v4(),
-            },
-            recovery_delay: CompactDuration::new(30),
-            armed: Arc::default(),
-            termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        });
-        Ok((session, cell_store, recorded))
-    }
-
-    /// The committed value at the single Value cell of `name`.
-    async fn committed_value(
-        cell_store: &MemoryCellStore<RecordingOracle>,
-        name: &str,
-    ) -> Result<Option<Value>> {
-        let id = CollectionId::new(
-            StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1")),
-            StateType::Application,
-            StateName::try_new(name)?,
-        );
-        let cell = CellKey {
-            section: Section::new(0),
-            coordinate: Coordinate::empty(),
-        };
-        let probe = EventRef::Message {
-            dedup_id: Uuid::from_u128(u128::MAX),
-        };
-        match Committed::into_inner(cell_store.get(&id, &cell, probe).await?) {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
     }
 
     /// Fails attempt 1 (`Normal`) after staging `cart` + registering marker M1;
@@ -1172,7 +888,12 @@ mod reset_between_attempts {
     /// attempt 1's value — precisely the leak the reset exists to prevent.
     #[tokio::test]
     async fn retry_resets_session_between_attempts() -> Result<()> {
-        let (session, cell_store, recorded) = recording_session()?;
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&cart(), CollectionDef::new(None))?;
+        registry.register(&wishlist(), CollectionDef::new(None))?;
+        let state_key = StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1"));
+        let (session, cell_store, _dirty, recorded) =
+            recording_session(registry, state_key.clone());
         let calls = Arc::new(AtomicUsize::new(0));
         let handler = AttemptAwareHandler {
             calls: calls.clone(),
@@ -1199,12 +920,12 @@ mod reset_between_attempts {
             "one failed then one ok attempt"
         );
         assert_eq!(
-            committed_value(&cell_store, "wishlist").await?,
+            committed_value(&cell_store, state_key.clone(), "wishlist").await?,
             Some(json!({ "attempt": 2_i32 })),
             "attempt 2's write must be committed",
         );
         assert_eq!(
-            committed_value(&cell_store, "cart").await?,
+            committed_value(&cell_store, state_key.clone(), "cart").await?,
             None,
             "attempt 1's discarded write must NOT leak into the committed state",
         );

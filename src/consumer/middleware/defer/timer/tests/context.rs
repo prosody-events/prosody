@@ -923,8 +923,8 @@ fn context_error_classification_delegates_correctly() {
     init_test_logging();
 
     // Create errors with known classifications
-    let transient_error = OutcomeError::transient();
-    let permanent_error = OutcomeError::permanent();
+    let transient_error = OutcomeError::Transient;
+    let permanent_error = OutcomeError::Permanent;
 
     // Context errors should delegate to inner error classification
     let context_transient: TimerDeferContextError<OutcomeError, Infallible> =
@@ -943,14 +943,14 @@ fn context_error_classification_delegates_correctly() {
 
     // Store errors should delegate to inner error classification
     let store_transient: TimerDeferContextError<Infallible, OutcomeError> =
-        TimerDeferContextError::Store(OutcomeError::transient());
+        TimerDeferContextError::Store(OutcomeError::Transient);
     assert!(
         matches!(store_transient.classify_error(), ErrorCategory::Transient),
         "Store(Transient) should classify as Transient"
     );
 
     let store_permanent: TimerDeferContextError<Infallible, OutcomeError> =
-        TimerDeferContextError::Store(OutcomeError::permanent());
+        TimerDeferContextError::Store(OutcomeError::Permanent);
     assert!(
         matches!(store_permanent.classify_error(), ErrorCategory::Permanent),
         "Store(Permanent) should classify as Permanent"

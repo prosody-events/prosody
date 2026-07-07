@@ -1,136 +1,39 @@
 use super::*;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::message::ConsumerMessageValue;
 use crate::consumer::middleware::FallibleCloneProvider;
-use crate::consumer::middleware::tests::test_support::MockEventContext;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::consumer::middleware::tests::test_support::{
+    MockEventContext, ScriptedHandler, create_test_message, create_test_message_from,
+    create_test_trigger, create_test_trigger_with,
+};
+use crate::error::ErrorCategory;
 use crate::telemetry::event::{
     Data, KeyState, MessageEventType, MessageTelemetryEvent, TelemetryEvent, TimerEventType,
     TimerTelemetryEvent,
 };
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
-use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
-use tokio::time::sleep as tokio_sleep;
-use tracing::Span;
 
-/// Test error type with configurable classification.
-#[derive(Debug, Clone)]
-struct TestError(ErrorCategory);
-
-impl Display for TestError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "test error ({:?})", self.0)
+/// A [`TelemetryHandler`] over `handler`, wired to `telemetry`'s
+/// `test-topic`/0 sender and `test-group` source.
+fn telemetry_handler<T>(telemetry: &Telemetry, handler: T) -> TelemetryHandler<T> {
+    TelemetryHandler {
+        handler,
+        sender: telemetry.partition_sender("test-topic".into(), 0),
+        source: Arc::from("test-group"),
     }
-}
-
-impl Error for TestError {}
-
-impl ClassifyError for TestError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.0
-    }
-}
-
-/// Mock handler with configurable behavior.
-#[derive(Clone)]
-struct MockHandler {
-    call_count: Arc<AtomicUsize>,
-    result: Result<(), TestError>,
-}
-
-impl MockHandler {
-    fn success() -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            result: Ok(()),
-        }
-    }
-
-    fn failing(category: ErrorCategory) -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            result: Err(TestError(category)),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.call_count.load(Ordering::SeqCst)
-    }
-}
-
-impl FallibleHandler for MockHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = serde_json::Value;
-
-    async fn on_message<C>(
-        &self,
-        _context: C,
-        _message: ConsumerMessage<Self::Payload>,
-        _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.call_count.fetch_add(1, Ordering::SeqCst);
-        self.result.clone()
-    }
-
-    async fn on_timer<C>(
-        &self,
-        _context: C,
-        _trigger: Trigger,
-        _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.call_count.fetch_add(1, Ordering::SeqCst);
-        self.result.clone()
-    }
-
-    async fn shutdown(self) {}
-}
-
-fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned().ok()?;
-    Some(ConsumerMessage::new(
-        ConsumerMessageValue::default(),
-        Span::current(),
-        permit,
-    ))
-}
-
-fn create_test_trigger() -> Trigger {
-    Trigger::for_testing(
-        "test-key".into(),
-        CompactDateTime::from(1000_u32),
-        TimerType::default(),
-    )
 }
 
 // === Handler Pass-Through Tests ===
 
 #[tokio::test]
-async fn success_result_passed_through_unchanged() {
+async fn success_result_passed_through_unchanged() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler: handler.clone(),
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler.clone());
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result = telemetry_handler
         .on_message(context, message, DemandType::Normal)
@@ -138,21 +41,16 @@ async fn success_result_passed_through_unchanged() {
 
     assert!(result.is_ok());
     assert_eq!(handler.call_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]
-async fn error_result_passed_through_unchanged() {
+async fn error_result_passed_through_unchanged() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
-    let handler = MockHandler::failing(ErrorCategory::Permanent);
-    let telemetry_handler = TelemetryHandler {
-        handler: handler.clone(),
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
+    let telemetry_handler = telemetry_handler(&telemetry, handler.clone());
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result = telemetry_handler
         .on_message(context, message, DemandType::Normal)
@@ -160,17 +58,14 @@ async fn error_result_passed_through_unchanged() {
 
     assert!(result.is_err());
     assert_eq!(handler.call_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]
 async fn timer_success_passed_through() {
     let telemetry = Telemetry::new();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler: handler.clone(),
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler.clone());
     let context = MockEventContext::new();
     let trigger = create_test_trigger();
 
@@ -185,12 +80,8 @@ async fn timer_success_passed_through() {
 #[tokio::test]
 async fn timer_error_passed_through() {
     let telemetry = Telemetry::new();
-    let handler = MockHandler::failing(ErrorCategory::Transient);
-    let telemetry_handler = TelemetryHandler {
-        handler: handler.clone(),
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
+    let telemetry_handler = telemetry_handler(&telemetry, handler.clone());
     let context = MockEventContext::new();
     let trigger = create_test_trigger();
 
@@ -205,32 +96,19 @@ async fn timer_error_passed_through() {
 // === Telemetry Event Recording Tests ===
 
 #[tokio::test]
-async fn message_success_emits_invoked_and_succeeded_events() {
+async fn message_success_emits_invoked_and_succeeded_events() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let _ = telemetry_handler
         .on_message(context, message, DemandType::Normal)
         .await;
 
-    // Give events time to propagate
-    tokio_sleep(Duration::from_millis(10)).await;
-
-    // Collect events
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
+    let events = collect_events(&mut rx);
 
     // Should have invoked and succeeded events
     let has_invoked = events
@@ -242,35 +120,23 @@ async fn message_success_emits_invoked_and_succeeded_events() {
 
     assert!(has_invoked, "Should emit HandlerInvoked event");
     assert!(has_succeeded, "Should emit HandlerSucceeded event");
+    Ok(())
 }
 
 #[tokio::test]
-async fn message_failure_emits_invoked_and_failed_events() {
+async fn message_failure_emits_invoked_and_failed_events() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::failing(ErrorCategory::Permanent);
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let _ = telemetry_handler
         .on_message(context, message, DemandType::Normal)
         .await;
 
-    // Give events time to propagate
-    tokio_sleep(Duration::from_millis(10)).await;
-
-    // Collect events
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
+    let events = collect_events(&mut rx);
 
     // Should have invoked and failed events
     let has_invoked = events
@@ -282,18 +148,15 @@ async fn message_failure_emits_invoked_and_failed_events() {
 
     assert!(has_invoked, "Should emit HandlerInvoked event");
     assert!(has_failed, "Should emit HandlerFailed event");
+    Ok(())
 }
 
 #[tokio::test]
 async fn timer_success_emits_events() {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
     let trigger = create_test_trigger();
 
@@ -301,12 +164,7 @@ async fn timer_success_emits_events() {
         .on_timer(context, trigger, DemandType::Normal)
         .await;
 
-    tokio_sleep(Duration::from_millis(10)).await;
-
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
+    let events = collect_events(&mut rx);
 
     let has_invoked = events
         .iter()
@@ -325,29 +183,12 @@ async fn timer_success_emits_events() {
 fn middleware_creates_provider() {
     let telemetry = Telemetry::new();
     let middleware = TelemetryMiddleware::new(telemetry, Arc::from("test-group"));
-    let inner_provider = FallibleCloneProvider::new(MockHandler::success());
+    let inner_provider = FallibleCloneProvider::new(ScriptedHandler::success());
     let _provider = middleware.with_provider(inner_provider);
     // If this compiles, middleware composition works
 }
 
 // === Data::Message Event Tests ===
-
-fn create_test_message_with_fields(
-    key: &str,
-    offset: i64,
-) -> Option<ConsumerMessage<serde_json::Value>> {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned().ok()?;
-    Some(ConsumerMessage::new(
-        ConsumerMessageValue {
-            key: Arc::from(key),
-            offset,
-            ..ConsumerMessageValue::default()
-        },
-        Span::current(),
-        permit,
-    ))
-}
 
 fn collect_events(rx: &mut broadcast::Receiver<TelemetryEvent>) -> Vec<TelemetryEvent> {
     let mut events = Vec::new();
@@ -358,19 +199,17 @@ fn collect_events(rx: &mut broadcast::Receiver<TelemetryEvent>) -> Vec<Telemetry
 }
 
 #[tokio::test]
-async fn on_message_success_emits_message_dispatched_and_succeeded() {
+async fn on_message_success_emits_message_dispatched_and_succeeded() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message_with_fields("my-key", 42) else {
-        return;
-    };
+    let message = create_test_message_from(ConsumerMessageValue {
+        key: Arc::from("my-key"),
+        offset: 42,
+        ..Default::default()
+    })?;
 
     let _ = telemetry_handler
         .on_message(context, message, DemandType::Normal)
@@ -412,22 +251,21 @@ async fn on_message_success_emits_message_dispatched_and_succeeded() {
         ),
         "Dispatched should have Normal demand_type"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn on_message_failure_emits_message_dispatched_and_failed() {
+async fn on_message_failure_emits_message_dispatched_and_failed() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::failing(ErrorCategory::Permanent);
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message_with_fields("fail-key", 99) else {
-        return;
-    };
+    let message = create_test_message_from(ConsumerMessageValue {
+        key: Arc::from("fail-key"),
+        offset: 99,
+        ..Default::default()
+    })?;
 
     let _ = telemetry_handler
         .on_message(context, message, DemandType::Normal)
@@ -463,22 +301,21 @@ async fn on_message_failure_emits_message_dispatched_and_failed() {
     if let Some(MessageEventType::Failed { exception, .. }) = f.map(|m| &m.event_type) {
         assert!(!exception.is_empty(), "exception should be non-empty");
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn on_message_transient_error_category_correct() {
+async fn on_message_transient_error_category_correct() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::failing(ErrorCategory::Transient);
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message_with_fields("transient-key", 7) else {
-        return;
-    };
+    let message = create_test_message_from(ConsumerMessageValue {
+        key: Arc::from("transient-key"),
+        offset: 7,
+        ..Default::default()
+    })?;
 
     let _ = telemetry_handler
         .on_message(context, message, DemandType::Normal)
@@ -506,26 +343,19 @@ async fn on_message_transient_error_category_correct() {
         ),
         "ErrorCategory::Transient should be propagated in Failed event"
     );
+    Ok(())
 }
 
 // === Data::Timer Event Tests ===
-
-fn create_test_trigger_with_fields(key: &str, time: u32, timer_type: TimerType) -> Trigger {
-    Trigger::for_testing(Arc::from(key), CompactDateTime::from(time), timer_type)
-}
 
 #[tokio::test]
 async fn on_timer_success_emits_timer_dispatched_and_succeeded() {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let trigger = create_test_trigger_with_fields("timer-key", 5000, TimerType::Application);
+    let trigger = create_test_trigger_with("timer-key", 5000, TimerType::Application);
 
     let _ = telemetry_handler
         .on_timer(context, trigger, DemandType::Normal)
@@ -568,14 +398,10 @@ async fn on_timer_success_emits_timer_dispatched_and_succeeded() {
 async fn on_timer_failure_emits_timer_failed_with_error_fields() {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::failing(ErrorCategory::Transient);
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let trigger = create_test_trigger_with_fields("fail-timer", 9000, TimerType::DeferredMessage);
+    let trigger = create_test_trigger_with("fail-timer", 9000, TimerType::DeferredMessage);
 
     let _ = telemetry_handler
         .on_timer(context, trigger, DemandType::Failure)
@@ -613,19 +439,17 @@ async fn on_timer_failure_emits_timer_failed_with_error_fields() {
 }
 
 #[tokio::test]
-async fn on_message_emits_both_key_and_message_events() {
+async fn on_message_emits_both_key_and_message_events() -> color_eyre::Result<()> {
     let telemetry = Telemetry::new();
     let mut rx = telemetry.subscribe();
-    let handler = MockHandler::success();
-    let telemetry_handler = TelemetryHandler {
-        handler,
-        sender: telemetry.partition_sender("test-topic".into(), 0),
-        source: Arc::from("test-group"),
-    };
+    let handler = ScriptedHandler::success();
+    let telemetry_handler = telemetry_handler(&telemetry, handler);
     let context = MockEventContext::new();
-    let Some(message) = create_test_message_with_fields("dual-key", 10) else {
-        return;
-    };
+    let message = create_test_message_from(ConsumerMessageValue {
+        key: Arc::from("dual-key"),
+        offset: 10,
+        ..Default::default()
+    })?;
 
     let _ = telemetry_handler
         .on_message(context, message, DemandType::Normal)
@@ -677,4 +501,5 @@ async fn on_message_emits_both_key_and_message_events() {
             ),
             "Should have Message(Succeeded)"
         );
+    Ok(())
 }

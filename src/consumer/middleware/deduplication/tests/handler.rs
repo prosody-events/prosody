@@ -10,40 +10,30 @@ use crate::consumer::middleware::deduplication::{
     DeduplicationStore, MemoryDeduplicationStore, MemoryDeduplicationStoreProvider, dedup_uuid,
     dedup_uuid_for_message,
 };
-use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::middleware::tests::test_support::{
+    MockEventContext, create_test_message_from,
+};
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
 use crate::state::tests::support::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use serde_json::json;
-use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
-use tracing::Span;
+use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Error)]
 enum TestError {
+    #[error("permanent test error")]
     Permanent,
+    #[error("transient test error")]
     Transient,
+    #[error("terminal test error")]
     Terminal,
 }
-
-impl Display for TestError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            Self::Permanent => write!(f, "permanent test error"),
-            Self::Transient => write!(f, "transient test error"),
-            Self::Terminal => write!(f, "terminal test error"),
-        }
-    }
-}
-
-impl Error for TestError {}
 
 impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
@@ -62,32 +52,15 @@ struct MockHandler {
 }
 
 impl MockHandler {
+    fn new(error: Option<TestError>) -> Self {
+        Self {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            error,
+        }
+    }
+
     fn success() -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            error: None,
-        }
-    }
-
-    fn failing_permanent() -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            error: Some(TestError::Permanent),
-        }
-    }
-
-    fn failing_transient() -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            error: Some(TestError::Transient),
-        }
-    }
-
-    fn failing_terminal() -> Self {
-        Self {
-            call_count: Arc::new(AtomicUsize::new(0)),
-            error: Some(TestError::Terminal),
-        }
+        Self::new(None)
     }
 
     fn call_count(&self) -> usize {
@@ -133,13 +106,13 @@ impl FallibleHandler for MockHandler {
     async fn shutdown(self) {}
 }
 
-fn create_handler_with(
-    inner: MockHandler,
+fn create_handler_with<T>(
+    inner: T,
     version: &str,
     group_id: &str,
     topic: &str,
     partition: i32,
-) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
+) -> DeduplicationHandler<T, MemoryDeduplicationStore> {
     DeduplicationHandler {
         inner,
         store: MemoryDeduplicationStore::new(),
@@ -150,31 +123,23 @@ fn create_handler_with(
     }
 }
 
-fn create_handler(
-    inner: MockHandler,
-) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
+fn create_handler<T>(inner: T) -> DeduplicationHandler<T, MemoryDeduplicationStore> {
     create_handler_with(inner, "1", "test-group", "test-topic", 0)
 }
 
 fn create_test_message(
     key: &str,
     event_id: Option<&str>,
-) -> Option<ConsumerMessage<serde_json::Value>> {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned().ok()?;
+) -> color_eyre::Result<ConsumerMessage<serde_json::Value>> {
     let payload = match event_id {
         Some(id) => json!({ "id": id }),
         None => json!({}),
     };
-    Some(ConsumerMessage::new(
-        ConsumerMessageValue {
-            key: key.into(),
-            payload,
-            ..Default::default()
-        },
-        Span::current(),
-        permit,
-    ))
+    create_test_message_from(ConsumerMessageValue {
+        key: key.into(),
+        payload,
+        ..Default::default()
+    })
 }
 
 /// A row already present in the store (written by a prior committed
@@ -186,9 +151,7 @@ async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
     let context = MockEventContext::new();
 
-    let Some(msg) = create_test_message("key1", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let msg = create_test_message("key1", Some("evt1"))?;
     let id = handler.dedup_uuid_for_message(&msg);
     handler.store.insert(id).await?;
 
@@ -199,17 +162,16 @@ async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn cache_miss_runs_handler() {
+async fn cache_miss_runs_handler() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
     let context = MockEventContext::new();
 
-    let Some(msg) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
+    let msg = create_test_message("key1", Some("evt1"))?;
 
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
     assert!(matches!(result, Ok(Some(()))));
     assert_eq!(handler.inner.call_count(), 1);
+    Ok(())
 }
 
 /// The middleware registers the message's commit marker in the session on a
@@ -219,20 +181,18 @@ async fn cache_miss_runs_handler() {
 /// per-error-class insert tests.
 #[tokio::test]
 async fn marker_registered_for_final_outcomes_only() -> color_eyre::Result<()> {
-    let cases: [(fn() -> MockHandler, bool); 4] = [
-        (MockHandler::success, true),
-        (MockHandler::failing_permanent, true),
-        (MockHandler::failing_transient, false),
-        (MockHandler::failing_terminal, false),
+    let cases: [(Option<TestError>, bool); 4] = [
+        (None, true),
+        (Some(TestError::Permanent), true),
+        (Some(TestError::Transient), false),
+        (Some(TestError::Terminal), false),
     ];
-    for (make, expect_registered) in cases {
-        let handler = create_handler(make());
+    for (error, expect_registered) in cases {
+        let handler = create_handler(MockHandler::new(error));
         let session = UnavailableState::<serde_json::Value>::new();
         let context = MockEventContext::new().with_session(session.clone());
 
-        let Some(msg) = create_test_message("key1", Some("evt1")) else {
-            color_eyre::eyre::bail!("could not create test message");
-        };
+        let msg = create_test_message("key1", Some("evt1"))?;
         let id = handler.dedup_uuid_for_message(&msg);
 
         let _ = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
@@ -264,20 +224,17 @@ async fn marker_registered_for_final_outcomes_only() -> color_eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn different_event_ids_both_processed() {
+async fn different_event_ids_both_processed() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
     let context = MockEventContext::new();
 
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        return;
-    };
-    let Some(msg2) = create_test_message("key1", Some("evt2")) else {
-        return;
-    };
+    let msg1 = create_test_message("key1", Some("evt1"))?;
+    let msg2 = create_test_message("key1", Some("evt2"))?;
 
     let _ = FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
     let _ = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
     assert_eq!(handler.inner.call_count(), 2);
+    Ok(())
 }
 
 #[tokio::test]
@@ -298,12 +255,8 @@ async fn timer_passthrough() {
 #[test]
 fn dedup_uuid_is_deterministic() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
-    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let msg1 = create_test_message("key1", Some("evt1"))?;
+    let msg2 = create_test_message("key1", Some("evt1"))?;
     assert_eq!(
         handler.dedup_uuid_for_message(&msg1),
         handler.dedup_uuid_for_message(&msg2),
@@ -314,9 +267,7 @@ fn dedup_uuid_is_deterministic() -> color_eyre::Result<()> {
 #[test]
 fn dedup_uuid_differs_by_dimension() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
-    let Some(base_msg) = create_test_message("key1", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let base_msg = create_test_message("key1", Some("evt1"))?;
     let base = handler.dedup_uuid_for_message(&base_msg);
 
     // Different version
@@ -336,21 +287,15 @@ fn dedup_uuid_differs_by_dimension() -> color_eyre::Result<()> {
     assert_ne!(base, h.dedup_uuid_for_message(&base_msg));
 
     // Different key
-    let Some(diff_key_msg) = create_test_message("key2", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let diff_key_msg = create_test_message("key2", Some("evt1"))?;
     assert_ne!(base, handler.dedup_uuid_for_message(&diff_key_msg));
 
     // Different event_id
-    let Some(diff_evt_msg) = create_test_message("key1", Some("evt2")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let diff_evt_msg = create_test_message("key1", Some("evt2"))?;
     assert_ne!(base, handler.dedup_uuid_for_message(&diff_evt_msg));
 
     // Offset fallback (no event_id) differs from event_id path
-    let Some(offset_msg) = create_test_message("key1", None) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let offset_msg = create_test_message("key1", None)?;
     assert_ne!(base, handler.dedup_uuid_for_message(&offset_msg));
 
     Ok(())
@@ -473,15 +418,11 @@ async fn dedup_skip_does_not_invoke_inner_after_commit() -> color_eyre::Result<(
     // must fire on the first dispatch but NOT on the second.
     let inner = ApplyProbe::default();
     let log = inner.log.clone();
-    let handler = create_handler_apply(inner);
+    let handler = create_handler(inner);
     let context = MockEventContext::new();
 
-    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
-    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
-        color_eyre::eyre::bail!("could not create test message");
-    };
+    let msg1 = create_test_message("key1", Some("evt1"))?;
+    let msg2 = create_test_message("key1", Some("evt1"))?;
 
     // First dispatch: inner runs, on_message returns Ok(Some(())).
     let result1 =
@@ -512,17 +453,15 @@ async fn dedup_skip_does_not_invoke_inner_after_commit() -> color_eyre::Result<(
 }
 
 #[tokio::test]
-async fn dedup_passthrough_forwards_after_commit_for_handler_ok() {
+async fn dedup_passthrough_forwards_after_commit_for_handler_ok() -> color_eyre::Result<()> {
     // Sanity: when the handler runs, inner.after_commit must receive the Ok
     // forwarded through DeduplicationHandler::after_commit.
     let inner = ApplyProbe::default();
     let log = inner.log.clone();
-    let handler = create_handler_apply(inner);
+    let handler = create_handler(inner);
     let context = MockEventContext::new();
 
-    let Some(msg) = create_test_message("key1", Some("evt-fresh")) else {
-        return;
-    };
+    let msg = create_test_message("key1", Some("evt-fresh"))?;
 
     let result =
         FallibleHandler::on_message(&handler, context.clone(), msg, DemandType::Normal).await;
@@ -534,10 +473,11 @@ async fn dedup_passthrough_forwards_after_commit_for_handler_ok() {
         vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
         "passthrough: inner.after_commit fires when inner ran successfully",
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn dedup_passthrough_forwards_after_commit_for_handler_err() {
+async fn dedup_passthrough_forwards_after_commit_for_handler_err() -> color_eyre::Result<()> {
     // When the inner runs and returns an `Err`, the dedup middleware must
     // forward that `Err` through whichever apply hook the framework chooses.
     // Here we simulate the framework treating the dispatch as final (e.g. a
@@ -545,12 +485,10 @@ async fn dedup_passthrough_forwards_after_commit_for_handler_err() {
     // `after_commit` with the inner-typed error wrapped by the dedup layer.
     let inner = ApplyProbe::failing(TestError::Permanent);
     let log = inner.log.clone();
-    let handler = create_handler_apply(inner);
+    let handler = create_handler(inner);
     let context = MockEventContext::new();
 
-    let Some(msg) = create_test_message("key1", Some("evt-err")) else {
-        return;
-    };
+    let msg = create_test_message("key1", Some("evt-err"))?;
 
     let result =
         FallibleHandler::on_message(&handler, context.clone(), msg, DemandType::Normal).await;
@@ -562,22 +500,10 @@ async fn dedup_passthrough_forwards_after_commit_for_handler_err() {
         vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
         "inner.after_commit must receive the inner-typed Err when the dispatch is final",
     );
+    Ok(())
 }
 
-fn create_handler_apply(
-    inner: ApplyProbe,
-) -> DeduplicationHandler<ApplyProbe, MemoryDeduplicationStore> {
-    DeduplicationHandler {
-        inner,
-        store: MemoryDeduplicationStore::new(),
-        version: "1".to_owned(),
-        group_id: Arc::from("test-group"),
-        topic: Topic::from("test-topic"),
-        partition: 0,
-    }
-}
-
-/// T1: the dedup id a message's *writer* (the deduplication handler) produces
+/// The dedup id a message's *writer* (the deduplication handler) produces
 /// must equal the id any *reader* derives via the canonical
 /// [`dedup_uuid_for_message`] free function — the exact call shape the
 /// keyed-state recovery oracle uses. If these diverged, recovery would look
@@ -589,7 +515,7 @@ fn create_handler_apply(
 /// motivated this — a reader hardcoding `version=""` and `event_id=None` —
 /// is pinned by the inequality asserts against the buggy form.
 #[test]
-fn dedup_id_writer_matches_canonical_reader_derivation() {
+fn dedup_id_writer_matches_canonical_reader_derivation() -> color_eyre::Result<()> {
     const VERSION: &str = "1";
     const GROUP: &str = "test-group";
     const TOPIC: &str = "test-topic";
@@ -598,9 +524,7 @@ fn dedup_id_writer_matches_canonical_reader_derivation() {
     let handler = create_handler_with(MockHandler::success(), VERSION, GROUP, TOPIC, PARTITION);
 
     for event_id in [Some("evt-1"), None] {
-        let Some(msg) = create_test_message("key-a", event_id) else {
-            return;
-        };
+        let msg = create_test_message("key-a", event_id)?;
 
         let writer_id = handler.dedup_uuid_for_message(&msg);
         let reader_id = dedup_uuid_for_message(
@@ -637,4 +561,5 @@ fn dedup_id_writer_matches_canonical_reader_derivation() {
             );
         }
     }
+    Ok(())
 }

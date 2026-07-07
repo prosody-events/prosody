@@ -7,6 +7,7 @@ use super::*;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::error::DeferError;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::KafkaLoaderError;
 use crate::tracing::init_test_logging;
 use scylla::errors::ExecutionError;
@@ -411,7 +412,7 @@ fn store_write_failure_retries_via_retry_middleware() {
 
     // Verify permanent handler errors still propagate correctly
     let permanent_error: DeferError<CassandraDeferStoreError, OutcomeError, KafkaLoaderError> =
-        DeferError::Handler(OutcomeError::permanent());
+        DeferError::Handler(OutcomeError::Permanent);
     assert!(
         matches!(permanent_error.classify_error(), ErrorCategory::Permanent),
         "DeferError::Handler with permanent error should classify as permanent"

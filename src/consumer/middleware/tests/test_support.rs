@@ -1,8 +1,6 @@
-//! Shared test utilities for middleware tests.
-//!
-//! Provides a unified `MockEventContext` that replaces multiple duplicate
-//! implementations across test modules. Supports configurable behavior for
-//! testing different middleware scenarios.
+//! Shared scaffolding for middleware tests: the mock event context, the
+//! scripted handler double and error, message/trigger fixtures, the defer
+//! outcome trio, and the recording-session harness.
 
 use std::convert::Infallible;
 use std::future::{self, Future};
@@ -14,11 +12,12 @@ use educe::Educe;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
+use tracing::Span;
 use uuid::Uuid;
 
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::{DemandType, FallibleHandler};
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -409,6 +408,276 @@ where
     }
 }
 
+/// Test error carrying its classification. Display matches the per-file
+/// originals (`test error (Transient)`) so no assertion text changes.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("test error ({0:?})")]
+pub struct TestError(pub ErrorCategory);
+
+impl ClassifyError for TestError {
+    fn classify_error(&self) -> ErrorCategory {
+        self.0
+    }
+}
+
+/// A hook firing recorded by [`ScriptedHandler`], projected onto
+/// `ErrorCategory` so logs stay `Eq`-comparable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedHook {
+    /// `on_message`/`on_timer` was invoked with this demand type.
+    Invoke(DemandType),
+    /// `after_commit` fired with this result shape.
+    AfterCommit(Result<(), ErrorCategory>),
+    /// `after_abort` fired with this result shape.
+    AfterAbort(Result<(), ErrorCategory>),
+}
+
+/// Scripted `FallibleHandler` double: succeeds, fails a fixed sequence then
+/// succeeds, or fails every call; counts calls, records demand types and hook
+/// firings, and can request shutdown on invocation (simulating shutdown
+/// mid-handler).
+#[derive(Clone)]
+pub struct ScriptedHandler {
+    /// Remaining scripted failures, consumed front-first; empty ⇒ succeed.
+    failures: Arc<Mutex<Vec<ErrorCategory>>>,
+    /// When set, every call fails with this category — an explicit sticky
+    /// failure, never a "long enough" sequence.
+    sticky: Option<ErrorCategory>,
+    calls: Arc<AtomicUsize>,
+    demand_types: Arc<Mutex<Vec<DemandType>>>,
+    hooks: Arc<Mutex<Vec<ScriptedHook>>>,
+    /// When set, `request_shutdown()` fires on every invocation.
+    shutdown_on_call: Option<MockEventContext>,
+}
+
+impl ScriptedHandler {
+    /// A handler that succeeds on every call.
+    #[must_use]
+    pub fn success() -> Self {
+        Self {
+            failures: Arc::default(),
+            sticky: None,
+            calls: Arc::default(),
+            demand_types: Arc::default(),
+            hooks: Arc::default(),
+            shutdown_on_call: None,
+        }
+    }
+
+    /// A handler that fails `failures` front-first, then succeeds.
+    #[must_use]
+    pub fn failing_then_success(failures: Vec<ErrorCategory>) -> Self {
+        Self {
+            failures: Arc::new(Mutex::new(failures)),
+            ..Self::success()
+        }
+    }
+
+    /// A handler that fails every call with `category`.
+    #[must_use]
+    pub fn always_failing(category: ErrorCategory) -> Self {
+        Self {
+            sticky: Some(category),
+            ..Self::success()
+        }
+    }
+
+    /// Fire `request_shutdown()` on `ctx` at every invocation.
+    #[must_use]
+    pub fn with_shutdown_on_call(mut self, ctx: MockEventContext) -> Self {
+        self.shutdown_on_call = Some(ctx);
+        self
+    }
+
+    /// How many times the handler was invoked.
+    #[must_use]
+    pub fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// The demand types the handler was invoked with, in order.
+    #[must_use]
+    pub fn recorded_demand_types(&self) -> Vec<DemandType> {
+        self.demand_types.lock().clone()
+    }
+
+    /// The hook firings recorded so far, in order.
+    #[must_use]
+    pub fn hook_events(&self) -> Vec<ScriptedHook> {
+        self.hooks.lock().clone()
+    }
+
+    /// One invocation: count it, record the demand type and invoke hook, fire
+    /// any scripted shutdown, then return the scripted result.
+    fn dispatch(&self, demand_type: DemandType) -> Result<(), TestError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.demand_types.lock().push(demand_type);
+        self.hooks.lock().push(ScriptedHook::Invoke(demand_type));
+        if let Some(ctx) = &self.shutdown_on_call {
+            ctx.request_shutdown();
+        }
+        if let Some(category) = self.sticky {
+            return Err(TestError(category));
+        }
+        let mut failures = self.failures.lock();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TestError(failures.remove(0)))
+        }
+    }
+}
+
+impl FallibleHandler for ScriptedHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.dispatch(demand_type)
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _trigger: Trigger,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.dispatch(demand_type)
+    }
+
+    async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.hooks
+            .lock()
+            .push(ScriptedHook::AfterCommit(result.map_err(|TestError(c)| c)));
+    }
+
+    async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.hooks
+            .lock()
+            .push(ScriptedHook::AfterAbort(result.map_err(|TestError(c)| c)));
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Wraps `value` in a `ConsumerMessage` holding a fresh capacity permit.
+///
+/// # Errors
+///
+/// Returns the (never-in-practice) permit-acquisition failure — surfaced,
+/// never swallowed, per the testing rules.
+pub fn create_test_message_from(
+    value: ConsumerMessageValue<Value>,
+) -> color_eyre::Result<ConsumerMessage<Value>> {
+    let semaphore = Arc::new(Semaphore::new(10));
+    let permit = semaphore.try_acquire_owned()?;
+    Ok(ConsumerMessage::new(value, Span::current(), permit))
+}
+
+/// [`create_test_message_from`] over the default value (topic `test-topic`,
+/// partition 0, offset 0, key `test-key`).
+///
+/// # Errors
+///
+/// Propagates [`create_test_message_from`]'s permit-acquisition failure.
+pub fn create_test_message() -> color_eyre::Result<ConsumerMessage<Value>> {
+    create_test_message_from(ConsumerMessageValue::default())
+}
+
+/// A trigger with the given key, fire time (seconds), and type.
+#[must_use]
+pub fn create_test_trigger_with(key: &str, time: u32, timer_type: TimerType) -> Trigger {
+    Trigger::for_testing(Arc::from(key), CompactDateTime::from(time), timer_type)
+}
+
+/// [`create_test_trigger_with`] over defaults: `test-key`, t=1000, default
+/// type.
+#[must_use]
+pub fn create_test_trigger() -> Trigger {
+    create_test_trigger_with("test-key", 1000, TimerType::default())
+}
+
+/// Outcome a scripted defer `OutcomeHandler` returns for its next dispatch.
+#[derive(Clone, Copy, Debug)]
+pub enum HandlerOutcome {
+    /// Handler succeeds.
+    Success,
+    /// Handler fails with a permanent error.
+    Permanent,
+    /// Handler fails with a transient error.
+    Transient,
+}
+
+impl HandlerOutcome {
+    /// The `FallibleHandler` result this outcome dictates.
+    pub fn into_result(self) -> Result<(), OutcomeError> {
+        match self {
+            Self::Success => Ok(()),
+            Self::Permanent => Err(OutcomeError::Permanent),
+            Self::Transient => Err(OutcomeError::Transient),
+        }
+    }
+}
+
+/// Error a scripted [`HandlerOutcome`] dictates. Two variants only: the defer
+/// suites never script a Terminal failure (the old struct's dead Terminal arm
+/// was unreachable on both sides).
+#[derive(Clone, Copy, Debug, Error)]
+pub enum OutcomeError {
+    /// A permanent handler failure.
+    #[error("permanent test error")]
+    Permanent,
+    /// A transient handler failure.
+    #[error("transient test error")]
+    Transient,
+}
+
+impl ClassifyError for OutcomeError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Permanent => ErrorCategory::Permanent,
+            Self::Transient => ErrorCategory::Transient,
+        }
+    }
+}
+
+/// One-shot outcome slot shared by the defer `OutcomeHandler`s: the harness
+/// sets the next outcome before each dispatch; taking it defaults to
+/// [`HandlerOutcome::Success`].
+#[derive(Clone, Debug, Default)]
+pub struct OutcomeSlot(Arc<Mutex<Option<HandlerOutcome>>>);
+
+impl OutcomeSlot {
+    /// Queues the outcome for the next dispatch.
+    pub fn set(&self, outcome: HandlerOutcome) {
+        *self.0.lock() = Some(outcome);
+    }
+
+    /// Takes the queued outcome, defaulting to Success when none was set.
+    #[must_use]
+    pub fn take(&self) -> HandlerOutcome {
+        self.0.lock().take().unwrap_or(HandlerOutcome::Success)
+    }
+}
+
 // =========================================================================
 // Recording-session harness for the attempt-boundary session-reset tests
 // =========================================================================
@@ -418,8 +687,7 @@ where
 // contract: a discarded attempt's buffered writes never commit and its
 // registered marker never flushes. These pieces build a **real**
 // `KeyedStateSession` whose marker flush routes through a recording oracle so
-// each seam's test can assert that contract directly. (`retry/tests.rs` keeps
-// a local copy for now; folding it here is scaffolding-dedup work.)
+// each seam's test can assert that contract directly.
 
 /// Oracle that records every flushed marker and always resolves Committed, so
 /// a test can read back exactly which markers `settle` certified.

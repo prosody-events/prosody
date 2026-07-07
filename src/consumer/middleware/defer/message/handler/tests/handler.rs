@@ -12,14 +12,14 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::tests::test_support::MockEventContext;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::consumer::middleware::tests::test_support::{MockEventContext, OutcomeSlot};
 use crate::timers::Trigger;
 use crate::{Key, Offset};
 use parking_lot::Mutex;
-use std::error::Error;
-use std::fmt::{self, Debug, Display};
+use std::fmt::{self, Debug};
 use std::sync::Arc;
+
+pub use crate::consumer::middleware::tests::test_support::{HandlerOutcome, OutcomeError};
 
 /// A processed message record: (key, offset).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,82 +31,6 @@ pub struct ProcessedMessage {
 }
 
 // ============================================================================
-// HandlerOutcome - What the trace specifies
-// ============================================================================
-
-/// Outcome that the handler should return, as specified by the trace.
-#[derive(Clone, Debug)]
-pub enum HandlerOutcome {
-    /// Handler succeeds.
-    Success,
-    /// Handler fails with a permanent error.
-    Permanent,
-    /// Handler fails with a transient error.
-    Transient,
-}
-
-impl HandlerOutcome {
-    /// The `FallibleHandler` result this outcome dictates.
-    fn into_result(self) -> Result<(), OutcomeError> {
-        match self {
-            Self::Success => Ok(()),
-            Self::Permanent => Err(OutcomeError::permanent()),
-            Self::Transient => Err(OutcomeError::transient()),
-        }
-    }
-}
-
-// ============================================================================
-// OutcomeError - The error type returned by OutcomeHandler
-// ============================================================================
-
-/// Error returned by [`OutcomeHandler`] based on trace specification.
-///
-/// Implements [`ClassifyError`] to return the appropriate [`ErrorCategory`]
-/// for the defer middleware to handle correctly.
-#[derive(Clone, Debug)]
-pub struct OutcomeError {
-    /// The category of this error (Permanent or Transient).
-    category: ErrorCategory,
-}
-
-impl OutcomeError {
-    /// Creates a permanent error.
-    #[must_use]
-    pub fn permanent() -> Self {
-        Self {
-            category: ErrorCategory::Permanent,
-        }
-    }
-
-    /// Creates a transient error.
-    #[must_use]
-    pub fn transient() -> Self {
-        Self {
-            category: ErrorCategory::Transient,
-        }
-    }
-}
-
-impl Display for OutcomeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.category {
-            ErrorCategory::Permanent => write!(f, "permanent test error"),
-            ErrorCategory::Transient => write!(f, "transient test error"),
-            ErrorCategory::Terminal => write!(f, "terminal test error"),
-        }
-    }
-}
-
-impl Error for OutcomeError {}
-
-impl ClassifyError for OutcomeError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.category
-    }
-}
-
-// ============================================================================
 // OutcomeHandler - Mock handler returning trace-specified outcomes
 // ============================================================================
 
@@ -115,24 +39,10 @@ impl ClassifyError for OutcomeError {
 /// The test harness sets the next outcome before each event using
 /// [`OutcomeHandler::set_outcome`]. When the defer middleware calls
 /// `on_message()` or `on_timer()`, this handler returns the preset outcome.
-///
-/// # Example
-///
-/// ```ignore
-/// let handler = OutcomeHandler::new();
-///
-/// // Before processing a message that should succeed
-/// handler.set_outcome(HandlerOutcome::Success);
-/// defer_handler.on_message(context, message, demand_type).await?;
-///
-/// // Before processing a message that should fail transiently
-/// handler.set_outcome(HandlerOutcome::Transient);
-/// defer_handler.on_message(context, message, demand_type).await?;
-/// ```
 #[derive(Clone)]
 pub struct OutcomeHandler {
     /// Next outcome to return (set by harness before each event).
-    next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
+    outcome: OutcomeSlot,
     /// Record of all messages processed by this handler (in order).
     processed: Arc<scc::Queue<ProcessedMessage>>,
     /// When set, triggers partition shutdown before returning the outcome.
@@ -147,7 +57,7 @@ impl OutcomeHandler {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            next_outcome: Arc::new(Mutex::new(None)),
+            outcome: OutcomeSlot::default(),
             processed: Arc::new(scc::Queue::default()),
             shutdown_trigger: Arc::new(Mutex::new(None)),
         }
@@ -157,7 +67,7 @@ impl OutcomeHandler {
     ///
     /// Must be called before each `on_message()` or `on_timer()` invocation.
     pub fn set_outcome(&self, outcome: HandlerOutcome) {
-        *self.next_outcome.lock() = Some(outcome);
+        self.outcome.set(outcome);
     }
 
     /// Configures shutdown to be signaled when this handler is next called.
@@ -195,11 +105,7 @@ impl OutcomeHandler {
     ///
     /// This is called internally by `on_message()` and `on_timer()`.
     fn take_outcome(&self) -> HandlerOutcome {
-        self.next_outcome
-            .lock()
-            .take()
-            // Return Success as a safe default if no outcome was set
-            .unwrap_or(HandlerOutcome::Success)
+        self.outcome.take()
     }
 }
 
@@ -212,7 +118,7 @@ impl Default for OutcomeHandler {
 impl Debug for OutcomeHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutcomeHandler")
-            .field("next_outcome", &self.next_outcome.lock())
+            .field("outcome", &self.outcome)
             .field("processed_count", &self.processed.len())
             .field("shutdown_trigger", &self.shutdown_trigger.lock().is_some())
             .finish()
@@ -282,6 +188,7 @@ mod tests {
     use crate::consumer::middleware::defer::message::handler::tests::{
         MockEventContext, TEST_RUNTIME,
     };
+    use crate::error::{ClassifyError, ErrorCategory};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use crate::tracing::init_test_logging;

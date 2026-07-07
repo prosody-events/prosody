@@ -1,18 +1,15 @@
 use super::*;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
-use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::tests::test_support::{
+    MockEventContext, create_test_message, create_test_trigger,
+};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::timers::TimerType;
-use crate::timers::datetime::CompactDateTime;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
-use tracing::Span;
 
-/// Test error type.
 #[derive(Debug, Clone)]
 struct TestError(&'static str);
 
@@ -75,6 +72,26 @@ impl MockHandler {
     fn observed_cancellation(&self) -> bool {
         self.observed_cancellation.load(Ordering::Relaxed)
     }
+
+    /// Shared dispatch body: optional delay raced against cancellation, then
+    /// the scripted result.
+    async fn run<C>(&self, context: C) -> Result<(), TestError>
+    where
+        C: EventContext<Payload = serde_json::Value>,
+    {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(delay) = self.delay {
+            // Wait for delay or cancellation, whichever comes first.
+            select! {
+                () = sleep(delay) => {}
+                () = context.on_cancel() => {
+                    self.observed_cancellation.store(true, Ordering::Relaxed);
+                    return Err(TestError("cancelled"));
+                }
+            }
+        }
+        self.result.clone()
+    }
 }
 
 impl FallibleHandler for MockHandler {
@@ -91,18 +108,7 @@ impl FallibleHandler for MockHandler {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-        if let Some(delay) = self.delay {
-            // Wait for delay or cancellation, whichever comes first.
-            select! {
-                () = sleep(delay) => {}
-                () = context.on_cancel() => {
-                    self.observed_cancellation.store(true, Ordering::Relaxed);
-                    return Err(TestError("cancelled"));
-                }
-            }
-        }
-        self.result.clone()
+        self.run(context).await
     }
 
     async fn on_timer<C>(
@@ -114,52 +120,21 @@ impl FallibleHandler for MockHandler {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-        if let Some(delay) = self.delay {
-            // Wait for delay or cancellation, whichever comes first.
-            select! {
-                () = sleep(delay) => {}
-                () = context.on_cancel() => {
-                    self.observed_cancellation.store(true, Ordering::Relaxed);
-                    return Err(TestError("cancelled"));
-                }
-            }
-        }
-        self.result.clone()
+        self.run(context).await
     }
 
     async fn shutdown(self) {}
 }
 
-fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let permit = semaphore.try_acquire_owned().ok()?;
-    Some(ConsumerMessage::new(
-        ConsumerMessageValue::default(),
-        Span::current(),
-        permit,
-    ))
-}
-
-fn create_test_trigger() -> Trigger {
-    Trigger::for_testing(
-        "test-key".into(),
-        CompactDateTime::from(1000_u32),
-        TimerType::default(),
-    )
-}
-
 #[tokio::test]
-async fn handler_completes_before_timeout_returns_ok() {
+async fn handler_completes_before_timeout_returns_ok() -> color_eyre::Result<()> {
     let handler = MockHandler::success();
     let timeout_handler = TimeoutHandler {
         handler: handler.clone(),
         timeout: Duration::from_secs(10),
     };
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result = timeout_handler
         .on_message(context, message, DemandType::Normal)
@@ -167,19 +142,18 @@ async fn handler_completes_before_timeout_returns_ok() {
 
     assert!(result.is_ok());
     assert_eq!(handler.call_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]
-async fn handler_completes_before_timeout_returns_handler_error() {
+async fn handler_completes_before_timeout_returns_handler_error() -> color_eyre::Result<()> {
     let handler = MockHandler::failing();
     let timeout_handler = TimeoutHandler {
         handler: handler.clone(),
         timeout: Duration::from_secs(10),
     };
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result = timeout_handler
         .on_message(context, message, DemandType::Normal)
@@ -187,10 +161,12 @@ async fn handler_completes_before_timeout_returns_handler_error() {
 
     assert!(result.is_err());
     assert_eq!(handler.call_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]
-async fn handler_exceeds_timeout_signals_cancellation_and_then_uncancels() {
+async fn handler_exceeds_timeout_signals_cancellation_and_then_uncancels() -> color_eyre::Result<()>
+{
     // Handler takes 100ms but timeout is 10ms
     // After timeout, cancellation is signaled and we wait for handler
     let handler = MockHandler::with_delay(Duration::from_millis(100));
@@ -199,9 +175,7 @@ async fn handler_exceeds_timeout_signals_cancellation_and_then_uncancels() {
         timeout: Duration::from_millis(10),
     };
     let context = MockEventContext::new();
-    let Some(message) = create_test_message() else {
-        return;
-    };
+    let message = create_test_message()?;
 
     let result = timeout_handler
         .on_message(context.clone(), message, DemandType::Normal)
@@ -215,6 +189,7 @@ async fn handler_exceeds_timeout_signals_cancellation_and_then_uncancels() {
     assert!(handler.observed_cancellation());
     // Cancellation flag should be reset after operation completes
     assert!(!context.should_cancel());
+    Ok(())
 }
 
 #[tokio::test]

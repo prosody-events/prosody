@@ -1,81 +1,21 @@
 use super::*;
 use crate::Partition;
 use crate::consumer::DemandType;
-use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::consumer::middleware::tests::test_support::{ScriptedHandler, TestError};
+use crate::consumer::middleware::{FallibleHandlerProvider, HandlerMiddleware};
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
-use crate::timers::Trigger;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 
-#[derive(Clone, Debug, Error)]
-#[error("Mock error")]
-struct MockError;
-
-impl ClassifyError for MockError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
-    }
-}
-
-#[derive(Clone)]
-struct MockHandler {
-    invocations: Arc<AtomicUsize>,
-}
-
-impl MockHandler {
-    fn new() -> Self {
-        Self {
-            invocations: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl FallibleHandler for MockHandler {
-    type Error = MockError;
-    type Output = ();
-    type Payload = serde_json::Value;
-
-    async fn on_message<C>(
-        &self,
-        _context: C,
-        _message: ConsumerMessage<Self::Payload>,
-        _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.invocations.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn on_timer<C>(
-        &self,
-        _context: C,
-        _trigger: Trigger,
-        _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        self.invocations.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn shutdown(self) {}
-}
-
 #[derive(Clone)]
 struct MockProvider {
-    handler: MockHandler,
+    handler: ScriptedHandler,
 }
 
 impl FallibleHandlerProvider for MockProvider {
-    type Handler = MockHandler;
+    type Handler = ScriptedHandler;
 
     fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
         self.handler.clone()
@@ -138,7 +78,7 @@ fn test_disabled_returns_none() -> Result<()> {
 
 #[test]
 fn test_monopolization_error_classification() {
-    let error: MonopolizationError<MockError> = MonopolizationError::Monopolization {
+    let error: MonopolizationError<TestError> = MonopolizationError::Monopolization {
         topic: "test-topic".into(),
         partition: 0,
         key: "test-key".into(),
@@ -156,7 +96,7 @@ fn test_monopolization_error_classification() {
 
 #[test]
 fn test_monopolization_error_message() {
-    let error: MonopolizationError<MockError> = MonopolizationError::Monopolization {
+    let error: MonopolizationError<TestError> = MonopolizationError::Monopolization {
         topic: "orders".into(),
         partition: 3,
         key: "user-12345".into(),
@@ -201,7 +141,7 @@ async fn test_non_monopolizing_key_passes_through() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -257,7 +197,7 @@ async fn test_monopolizing_key_triggers_error() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -320,7 +260,7 @@ async fn test_multiple_keys_independent_tracking() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -404,7 +344,7 @@ async fn test_window_sliding_removes_old_intervals() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -497,7 +437,7 @@ async fn test_open_interval_closed_on_completion() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -562,7 +502,7 @@ async fn test_boundary_execution_before_window() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -620,7 +560,7 @@ async fn test_boundary_execution_crosses_window_end() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -676,7 +616,7 @@ async fn test_boundary_exact_threshold() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -733,7 +673,7 @@ async fn test_boundary_just_above_threshold() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };
@@ -789,7 +729,7 @@ async fn test_boundary_multiple_executions_in_window() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = MockHandler::new();
+    let mock_handler = ScriptedHandler::success();
     let provider = MockProvider {
         handler: mock_handler.clone(),
     };

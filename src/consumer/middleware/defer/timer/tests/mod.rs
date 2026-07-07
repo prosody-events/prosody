@@ -13,7 +13,7 @@ use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::consumer::middleware::tests::test_support::{HandlerOutcome, OutcomeError, OutcomeSlot};
 use crate::otel::SpanRelation;
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::tests::support::UnavailableState;
@@ -25,8 +25,7 @@ use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
 use parking_lot::Mutex;
 use std::convert::Infallible;
-use std::error::Error;
-use std::fmt::{self, Debug, Display};
+use std::fmt::{self, Debug};
 use std::future::{Future, pending, ready};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +33,7 @@ use std::time::Duration;
 mod context;
 mod integration;
 mod properties;
-pub mod types;
+mod types;
 
 // ============================================================================
 // MockContext - Minimal context for tests
@@ -42,7 +41,7 @@ pub mod types;
 
 /// Timer operation recorded by `MockContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimerOperation {
+enum TimerOperation {
     /// Timer was scheduled.
     Schedule(CompactDateTime, TimerType),
     /// Timer was cleared and rescheduled.
@@ -55,7 +54,7 @@ pub enum TimerOperation {
 
 /// Minimal mock context for tests.
 #[derive(Clone)]
-pub struct MockContext {
+struct MockContext {
     operations: Arc<Mutex<Vec<TimerOperation>>>,
 }
 
@@ -67,14 +66,14 @@ impl Default for MockContext {
 
 impl MockContext {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             operations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     #[must_use]
-    pub fn has_scheduled_timer(&self, timer_type: TimerType) -> bool {
+    fn has_scheduled_timer(&self, timer_type: TimerType) -> bool {
         self.operations.lock().iter().any(|op| {
             matches!(
                 op,
@@ -84,7 +83,7 @@ impl MockContext {
         })
     }
 
-    pub fn clear_operations(&self) {
+    fn clear_operations(&self) {
         self.operations.lock().clear();
     }
 }
@@ -197,95 +196,33 @@ impl EventContext for MockContext {
 // OutcomeHandler - Mock handler for tests
 // ============================================================================
 
-/// Outcome that the handler should return.
-#[derive(Clone, Debug)]
-pub enum HandlerOutcome {
-    /// Handler succeeds.
-    Success,
-    /// Handler fails with a permanent error.
-    Permanent,
-    /// Handler fails with a transient error.
-    Transient,
-}
-
-/// Error returned by [`OutcomeHandler`].
-#[derive(Clone)]
-pub struct OutcomeError {
-    category: ErrorCategory,
-}
-
-impl OutcomeError {
-    #[must_use]
-    pub fn permanent() -> Self {
-        Self {
-            category: ErrorCategory::Permanent,
-        }
-    }
-
-    #[must_use]
-    pub fn transient() -> Self {
-        Self {
-            category: ErrorCategory::Transient,
-        }
-    }
-}
-
-impl Debug for OutcomeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OutcomeError")
-            .field("category", &self.category)
-            .finish()
-    }
-}
-
-impl Display for OutcomeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.category {
-            ErrorCategory::Permanent => write!(f, "permanent test error"),
-            ErrorCategory::Transient => write!(f, "transient test error"),
-            ErrorCategory::Terminal => write!(f, "terminal test error"),
-        }
-    }
-}
-
-impl Error for OutcomeError {}
-
-impl ClassifyError for OutcomeError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.category
-    }
-}
-
 /// Handler that returns predetermined outcomes.
 #[derive(Clone)]
-pub struct OutcomeHandler {
-    next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
+struct OutcomeHandler {
+    outcome: OutcomeSlot,
     timer_calls: Arc<Mutex<Vec<Key>>>,
 }
 
 impl OutcomeHandler {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
-            next_outcome: Arc::new(Mutex::new(None)),
+            outcome: OutcomeSlot::default(),
             timer_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn set_outcome(&self, outcome: HandlerOutcome) {
-        *self.next_outcome.lock() = Some(outcome);
+    fn set_outcome(&self, outcome: HandlerOutcome) {
+        self.outcome.set(outcome);
     }
 
     #[must_use]
-    pub fn timer_calls(&self) -> Vec<Key> {
+    fn timer_calls(&self) -> Vec<Key> {
         self.timer_calls.lock().clone()
     }
 
     fn take_outcome(&self) -> HandlerOutcome {
-        self.next_outcome
-            .lock()
-            .take()
-            .unwrap_or(HandlerOutcome::Success)
+        self.outcome.take()
     }
 }
 
@@ -298,7 +235,7 @@ impl Default for OutcomeHandler {
 impl Debug for OutcomeHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutcomeHandler")
-            .field("next_outcome", &self.next_outcome.lock())
+            .field("outcome", &self.outcome)
             .finish_non_exhaustive()
     }
 }
@@ -330,12 +267,7 @@ impl FallibleHandler for OutcomeHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         self.timer_calls.lock().push(trigger.key.clone());
-
-        match self.take_outcome() {
-            HandlerOutcome::Success => Ok(()),
-            HandlerOutcome::Permanent => Err(OutcomeError::permanent()),
-            HandlerOutcome::Transient => Err(OutcomeError::transient()),
-        }
+        self.take_outcome().into_result()
     }
 
     async fn shutdown(self) {}
@@ -346,13 +278,13 @@ impl FallibleHandler for OutcomeHandler {
 // ============================================================================
 
 /// Test harness for executing timer defer tests.
-pub struct TestHarness {
+struct TestHarness {
     /// The timer defer handler under test.
-    pub handler: TimerDeferHandler<OutcomeHandler, MemoryTimerDeferStore, TraceBasedDecider>,
+    handler: TimerDeferHandler<OutcomeHandler, MemoryTimerDeferStore, TraceBasedDecider>,
     /// Inner handler for setting outcomes (shared via Arc).
-    pub inner_handler: OutcomeHandler,
+    inner_handler: OutcomeHandler,
     /// Decider for setting defer decisions (shared via Arc).
-    pub decider: TraceBasedDecider,
+    decider: TraceBasedDecider,
     /// Store for verification (shared via Arc).
     store: MemoryTimerDeferStore,
     /// Context for timer operations.
@@ -361,12 +293,12 @@ pub struct TestHarness {
 
 impl TestHarness {
     /// Creates a new test harness with default (enabled) configuration.
-    pub fn new() -> color_eyre::Result<Self> {
+    fn new() -> color_eyre::Result<Self> {
         Self::with_enabled(true)
     }
 
     /// Creates a new test harness with specified enabled state.
-    pub fn with_enabled(enabled: bool) -> color_eyre::Result<Self> {
+    fn with_enabled(enabled: bool) -> color_eyre::Result<Self> {
         let topic = Topic::from("test-topic");
         let partition = Partition::from(0_i32);
 
@@ -407,30 +339,27 @@ impl TestHarness {
     }
 
     #[must_use]
-    pub fn context(&self) -> &MockContext {
+    fn context(&self) -> &MockContext {
         &self.context
     }
 
-    #[must_use]
-    pub fn create_trigger(key: &str, time_secs: u32) -> Trigger {
+    fn trigger_of_type(key: &str, time_secs: u32, timer_type: TimerType) -> Trigger {
         let key: Key = Arc::from(key);
         let time = CompactDateTime::from(time_secs);
-        Trigger::new(key, time, TimerType::Application, tracing::Span::current())
+        Trigger::new(key, time, timer_type, tracing::Span::current())
     }
 
     #[must_use]
-    pub fn create_deferred_timer_trigger(key: &str, time_secs: u32) -> Trigger {
-        let key: Key = Arc::from(key);
-        let time = CompactDateTime::from(time_secs);
-        Trigger::new(
-            key,
-            time,
-            TimerType::DeferredTimer,
-            tracing::Span::current(),
-        )
+    fn create_trigger(key: &str, time_secs: u32) -> Trigger {
+        Self::trigger_of_type(key, time_secs, TimerType::Application)
     }
 
-    pub async fn get_retry_count(&self, key: &str) -> color_eyre::Result<Option<u32>> {
+    #[must_use]
+    fn create_deferred_timer_trigger(key: &str, time_secs: u32) -> Trigger {
+        Self::trigger_of_type(key, time_secs, TimerType::DeferredTimer)
+    }
+
+    async fn get_retry_count(&self, key: &str) -> color_eyre::Result<Option<u32>> {
         let key: Key = Arc::from(key);
         self.store
             .is_deferred(&key)
@@ -439,7 +368,7 @@ impl TestHarness {
     }
 
     #[must_use]
-    pub fn has_deferred_timer(&self) -> bool {
+    fn has_deferred_timer(&self) -> bool {
         self.context.has_scheduled_timer(TimerType::DeferredTimer)
     }
 }
