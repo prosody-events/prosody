@@ -667,7 +667,7 @@ where
         value: &[u8],
     ) -> Result<(), StateAccessError> {
         let id = self.id_for(state_type, name);
-        self.inner.overlay.buffer_set(&id, cell, value);
+        self.inner.overlay.dirty().set(&id, cell, value);
         Ok(())
     }
 
@@ -678,7 +678,7 @@ where
         cell: &CellKey,
     ) -> Result<(), StateAccessError> {
         let id = self.id_for(state_type, name);
-        self.inner.overlay.buffer_clear(&id, cell);
+        self.inner.overlay.dirty().clear(&id, cell);
         Ok(())
     }
 

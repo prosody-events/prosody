@@ -119,8 +119,9 @@ pub trait StateBackend: Send + Sync + 'static {
     /// store does **not** implement [`DescriptorIdentityStore`].
     type Identity: DescriptorIdentityStore;
 
-    /// The one uniform durable cell store (`Overlay<Cached<CassandraStore>>` in
-    /// production, `Overlay<MemoryCellStore>` in tests).
+    /// The one uniform durable cell store (`Cached<CassandraStore>` in
+    /// production, `MemoryCellStore` in tests). The session wraps it in the
+    /// per-event dirty [`Overlay`](overlay::Overlay).
     type Cell: CellStore;
 
     /// The shared commit oracle (the marker flush writes through it).

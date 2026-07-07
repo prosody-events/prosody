@@ -735,11 +735,11 @@ where
     for op in trace.ops {
         match op {
             OverlayOp::BufferSet(c, b) => {
-                overlay.buffer_set(&id, &cell_at(c), &bytes(b));
+                overlay.dirty().set(&id, &cell_at(c), &bytes(b));
                 model.dirty.insert(c, Some(bytes(b)));
             }
             OverlayOp::BufferClear(c) => {
-                overlay.buffer_clear(&id, &cell_at(c));
+                overlay.dirty().clear(&id, &cell_at(c));
                 model.dirty.insert(c, None);
             }
             OverlayOp::CommitSet(c, b) => {
