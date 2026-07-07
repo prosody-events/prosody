@@ -25,8 +25,10 @@ use std::time::Duration;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 
+use super::settle::{ArmOutcome, arm_backstop};
 use super::*;
 use crate::consumer::EventHandler;
+use crate::consumer::Uncommitted;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::offsets::OffsetTracker;
