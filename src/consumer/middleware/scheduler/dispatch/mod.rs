@@ -259,7 +259,6 @@ impl Selector {
 
                 self.increment_key_time(&tp_key, duration);
             }
-            _ => {}
         }
     }
 

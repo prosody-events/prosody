@@ -3,8 +3,8 @@
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
 use crate::telemetry::event::{
-    Data, KeyEvent, KeyState, MessageEventType, MessageTelemetryEvent, PartitionEvent,
-    PartitionState, TelemetryEvent, TimerEventType, TimerTelemetryEvent,
+    Data, KeyEvent, KeyState, MessageEventType, MessageTelemetryEvent, TelemetryEvent,
+    TimerEventType, TimerTelemetryEvent,
 };
 use crate::telemetry::injector::TelemetryInjector;
 use crate::timers::TimerType;
@@ -19,8 +19,8 @@ use tokio::sync::broadcast;
 
 /// Telemetry sender pre-configured for a specific partition.
 ///
-/// Emits telemetry events for partition and key lifecycle events
-/// without requiring topic/partition parameters.
+/// Emits key, message, and timer lifecycle events scoped to one
+/// topic/partition, so callers never pass those parameters.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct TelemetryPartitionSender {
@@ -52,73 +52,6 @@ impl TelemetryPartitionSender {
             clock,
             propagator,
         }
-    }
-
-    /// Emits a partition paused event.
-    pub fn partition_paused(&self) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Arc::new(Data::Partition(PartitionEvent {
-                state: PartitionState::Paused,
-            })),
-        });
-    }
-
-    /// Emits a partition resumed event.
-    pub fn partition_resumed(&self) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Arc::new(Data::Partition(PartitionEvent {
-                state: PartitionState::Resumed,
-            })),
-        });
-    }
-
-    /// Emits a partition assigned event.
-    pub fn partition_assigned(&self) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Arc::new(Data::Partition(PartitionEvent {
-                state: PartitionState::Assigned,
-            })),
-        });
-    }
-
-    /// Emits a partition revoked event.
-    pub fn partition_revoked(&self) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Arc::new(Data::Partition(PartitionEvent {
-                state: PartitionState::Revoked,
-            })),
-        });
-    }
-
-    /// Emits a middleware entered event for the given key.
-    pub fn middleware_entered(&self, key: Key, demand_type: DemandType) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Arc::new(Data::Key(KeyEvent {
-                key,
-                demand_type,
-                state: KeyState::MiddlewareEntered,
-            })),
-        });
     }
 
     /// Emits a handler invoked event for the given key.
@@ -162,21 +95,6 @@ impl TelemetryPartitionSender {
                 key,
                 demand_type,
                 state: KeyState::HandlerFailed,
-            })),
-        });
-    }
-
-    /// Emits a middleware exited event for the given key.
-    pub fn middleware_exited(&self, key: Key, demand_type: DemandType) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Arc::new(Data::Key(KeyEvent {
-                key,
-                demand_type,
-                state: KeyState::MiddlewareExited,
             })),
         });
     }

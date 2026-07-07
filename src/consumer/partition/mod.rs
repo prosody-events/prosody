@@ -448,7 +448,7 @@ where
             store: trigger_store.clone(),
             telemetry: ctx
                 .telemetry_sender
-                .for_partition(ctx.partition_info.topic, ctx.partition_info.partition),
+                .partition_sender(ctx.partition_info.topic, ctx.partition_info.partition),
             source: ctx.group_id.clone(),
         };
 

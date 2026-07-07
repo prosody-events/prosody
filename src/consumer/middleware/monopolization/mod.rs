@@ -518,7 +518,6 @@ async fn run_event_loop(
                     );
                 }
             }
-            _ => {}
         }
     }
 

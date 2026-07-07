@@ -22,7 +22,6 @@ use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
-use std::cell::RefCell;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio_stream::wrappers::BroadcastStream;
@@ -31,7 +30,7 @@ use tracing::warn;
 use validator::Validate;
 use whoami::hostname;
 
-use crate::codec::serialize_to_json;
+use crate::codec::{SerializeBufGuard, serialize_to_json};
 
 /// Environment variable for the telemetry Kafka topic.
 const PROSODY_TELEMETRY_TOPIC: &str = "PROSODY_TELEMETRY_TOPIC";
@@ -161,10 +160,6 @@ struct MessageSentPayload<'a> {
 // ── Serialization helpers
 // ─────────────────────────────────────────────────────
 
-thread_local! {
-    static SERIALIZE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
 fn serialize_timer(
     buf: &mut Vec<u8>,
     data: &TimerTelemetryEvent,
@@ -283,24 +278,20 @@ fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: 
     serialize_to_json(&payload, buf)
 }
 
-/// Serializes a `Data` variant into a thread-local buffer and returns
-/// the serialized bytes.
+/// Serializes a `Data` variant into the pooled [`SerializeBufGuard`] buffer
+/// and returns the serialized bytes.
 ///
 /// Returns `Some(Bytes)` for `Timer`, `Message`, and `MessageSent`
 /// variants; `None` for internal-only variants (`Partition`, `Key`).
 fn serialize_event(data: &Data, topic: &str, partition: i32, hostname: &str) -> Option<Bytes> {
-    SERIALIZE_BUF.with_borrow_mut(|buf| {
-        buf.clear();
-
-        let wrote = match data {
-            Data::Timer(t) => serialize_timer(buf, t, topic, partition, hostname),
-            Data::Message(m) => serialize_message(buf, m, topic, partition, hostname),
-            Data::MessageSent(s) => serialize_message_sent(buf, s, hostname),
-            Data::Partition(_) | Data::Key(_) => return None,
-        };
-
-        wrote.then(|| Bytes::copy_from_slice(buf))
-    })
+    let mut buf = SerializeBufGuard::acquire();
+    let wrote = match data {
+        Data::Timer(t) => serialize_timer(&mut buf, t, topic, partition, hostname),
+        Data::Message(m) => serialize_message(&mut buf, m, topic, partition, hostname),
+        Data::MessageSent(s) => serialize_message_sent(&mut buf, s, hostname),
+        Data::Partition(_) | Data::Key(_) => return None,
+    };
+    wrote.then(|| Bytes::copy_from_slice(&buf))
 }
 
 /// Returns the Kafka record key from a serializable `Data` variant,
