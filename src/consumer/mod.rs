@@ -179,7 +179,6 @@ use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendF
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::state::session::CellSession;
 use crate::telemetry::Telemetry;
-use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
@@ -245,13 +244,6 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
 type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
-
-/// Consumer runtime components returned by consumer initialization.
-///
-/// Contains the partition managers and runtime state necessary for operating
-/// a consumer instance. This type alias eliminates clippy warnings about
-/// complex return types.
-type ConsumerComponents<P> = (Arc<Managers<P>>, Arc<Mutex<Option<RuntimeState>>>);
 
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
@@ -891,7 +883,7 @@ impl PipelineMiddlewareStack {
             .layer(self.retry_middleware)
             .into_provider(handler);
 
-        initialize_consumer_with_provider::<_, _, _, C>(
+        initialize_consumer::<_, _, _, C>(
             &self.consumer_config,
             version,
             provider,
@@ -945,9 +937,9 @@ fn validate_recovery_ttl_margin(
 ///
 /// Validates `consumer_config` and `keyed_state_config` up front, before
 /// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The
-/// canonical `consumer_config.validate()` in
-/// [`initialize_consumer_with_provider`] remains the single invariant
-/// chokepoint; this early validation is the fail-fast guard.
+/// canonical `consumer_config.validate()` in [`initialize_consumer`] remains
+/// the single invariant chokepoint; this early validation is the fail-fast
+/// guard.
 async fn build_shared_state(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
@@ -1137,14 +1129,22 @@ where
     Ok(keyed_state.provider(backend, loader))
 }
 
-/// Helper function to initialize a consumer with a trigger store provider.
+/// Initializes a Prosody consumer with a trigger store provider, wiring the
+/// partition machinery to a Kafka consumer and starting its background poll
+/// loop. The provider creates per-partition stores with independent caches.
 ///
-/// The provider creates per-partition stores with independent caches.
-fn initialize_consumer_with_provider<T, S, SP, C>(
+/// # Errors
+///
+/// This function returns an error if:
+/// - The hostname cannot be retrieved for the client ID
+/// - The Kafka consumer cannot be created with the provided configuration
+/// - Topic subscription fails
+/// - The probe server cannot be started (if enabled)
+fn initialize_consumer<T, P, SP, C>(
     consumer_config: &ConsumerConfiguration,
     version: Arc<str>,
     handler_provider: T,
-    trigger_provider: S,
+    trigger_provider: P,
     state_provider: SP,
     telemetry: &Telemetry,
     heartbeats: HeartbeatRegistry,
@@ -1152,8 +1152,8 @@ fn initialize_consumer_with_provider<T, S, SP, C>(
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
-    S: TriggerStoreProvider,
-    SP: PartitionStateProvider<S::Store>,
+    P: TriggerStoreProvider,
+    SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
         CellSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
@@ -1166,22 +1166,92 @@ where
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
     let managers: Arc<Managers<C::Payload>> = Arc::default();
     let shutdown: Arc<AtomicBool> = Arc::default();
-    let telemetry_sender = telemetry.sender();
     let (assignment_tx, assignment) = watch::channel(0u32);
 
-    let (managers, runtime_state) = initialize_consumer::<T, S, SP, C>(ConsumerInitParams {
-        config: consumer_config.clone(),
-        version,
+    // Create the consumer context with the message handler and shared state
+    let context = new_context(
+        consumer_config,
         handler_provider,
-        trigger_provider,
-        state_provider,
-        watermark_version: watermark_version.clone(),
-        managers: managers.clone(),
-        assignment_tx,
-        telemetry: telemetry_sender,
-        shutdown: shutdown.clone(),
-        heartbeats: heartbeats.clone(),
-    })?;
+        PartitionProviders {
+            triggers: trigger_provider,
+            state: state_provider,
+        },
+        watermark_version.clone(),
+        ManagerRegistry {
+            managers: managers.clone(),
+            assignment_tx,
+        },
+        telemetry.sender(),
+        version,
+    )?;
+
+    // Use mock cluster for testing or real bootstrap servers
+    let bootstrap = if consumer_config.mock {
+        MOCK_CLUSTER_BOOTSTRAP.clone()
+    } else {
+        consumer_config.bootstrap_servers.join(",")
+    };
+
+    // Configure and create the Kafka consumer with optimal settings
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", bootstrap)
+        .set("client.id", hostname()?)
+        .set("group.id", &consumer_config.group_id)
+        .set("enable.auto.commit", "true")
+        .set(
+            "auto.commit.interval.ms",
+            consumer_config.commit_interval.as_millis().to_string(),
+        )
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("partition.assignment.strategy", "cooperative-sticky")
+        .set_log_level(RDKafkaLogLevel::Error);
+
+    let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
+
+    // Subscribe to the specified topics
+    let topics: Vec<&str> = consumer_config
+        .subscribed_topics
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    consumer.subscribe(&topics)?;
+
+    // Spawn the background polling task with monitoring
+    let poll_interval = consumer_config.poll_interval;
+    let heartbeat = heartbeats.register("Kafka poll loop");
+    let cloned_managers = managers.clone();
+    let cloned_heartbeat = heartbeat.clone();
+    let cloned_shutdown = shutdown.clone();
+    let max_message_count = consumer_config.max_uncommitted;
+    let message_spans = consumer_config.message_spans;
+    let poll_handle = spawn_blocking(move || {
+        poll(PollConfig {
+            poll_interval,
+            max_message_count,
+            consumer,
+            codec: C::default(),
+            watermark_version: &watermark_version,
+            managers: &cloned_managers,
+            heartbeat: &cloned_heartbeat,
+            shutdown: &cloned_shutdown,
+            message_spans,
+        });
+    });
+
+    // Start optional probe server for health monitoring
+    let probe_server = consumer_config
+        .probe_port
+        .filter(|_| !consumer_config.mock)
+        .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
+        .transpose()?;
+
+    let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
+        poll_handle,
+        probe_server,
+    })));
 
     Ok(ProsodyConsumer {
         shutdown,
@@ -1275,7 +1345,7 @@ where
                     dedup_provider,
                     MemoryLoader::<C::Payload>::new(),
                 );
-                initialize_consumer_with_provider::<_, _, _, C>(
+                initialize_consumer::<_, _, _, C>(
                     consumer_config,
                     keyed_state.version.clone(),
                     handler_provider,
@@ -1302,7 +1372,7 @@ where
                     MemoryDeduplicationStoreProvider::new(),
                     MemoryLoader::<C::Payload>::new(),
                 );
-                initialize_consumer_with_provider::<_, _, _, C>(
+                initialize_consumer::<_, _, _, C>(
                     consumer_config,
                     keyed_state.version.clone(),
                     handler_provider,
@@ -1486,7 +1556,7 @@ where
                 .layer(topic_middleware) // write to failure topic
                 .layer(retry_middleware) // retry writing to the failure topic indefinitely
                 .into_provider(handler);
-                initialize_consumer_with_provider::<_, _, _, C>(
+                initialize_consumer::<_, _, _, C>(
                     consumer_config,
                     version,
                     provider,
@@ -1522,7 +1592,7 @@ where
                 .layer(topic_middleware)
                 .layer(retry_middleware)
                 .into_provider(handler);
-                initialize_consumer_with_provider::<_, _, _, C>(
+                initialize_consumer::<_, _, _, C>(
                     consumer_config,
                     version,
                     provider,
@@ -1580,7 +1650,7 @@ where
                 )?
                 .layer(LogMiddleware::new())
                 .into_provider(handler);
-                initialize_consumer_with_provider::<_, _, _, C>(
+                initialize_consumer::<_, _, _, C>(
                     consumer_config,
                     version,
                     provider,
@@ -1614,7 +1684,7 @@ where
                 )?
                 .layer(LogMiddleware::new())
                 .into_provider(handler);
-                initialize_consumer_with_provider::<_, _, _, C>(
+                initialize_consumer::<_, _, _, C>(
                     consumer_config,
                     version,
                     provider,
@@ -1738,159 +1808,6 @@ pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
     managers: &Managers<P>,
 ) -> u32 {
     managers.read().len() as u32
-}
-
-/// Parameters passed to [`initialize_consumer`] to create a consumer instance.
-struct ConsumerInitParams<T, P, SP, PL>
-where
-    T: HandlerProvider,
-    P: TriggerStoreProvider,
-    PL: Send + Sync + 'static,
-{
-    /// Consumer configuration (Kafka settings, buffer sizes, timeouts).
-    config: ConsumerConfiguration,
-    /// Deduplication hash version, threaded into each message's
-    /// [`EventRef::Message`](crate::state::EventRef) dedup id so recovery
-    /// resolves a message by the same id the deduplication writer produces.
-    version: Arc<str>,
-    /// Factory for creating per-partition message handlers.
-    handler_provider: T,
-    /// Persistent storage backend for timer triggers.
-    trigger_provider: P,
-    /// Factory for per-partition keyed-state managers.
-    state_provider: SP,
-    /// Shared atomic counter for tracking watermark changes.
-    watermark_version: Arc<WatermarkVersion>,
-    /// Thread-safe map of active partition managers.
-    managers: Arc<Managers<PL>>,
-    /// Publishes the assigned-partition count from the rebalance callback.
-    assignment_tx: watch::Sender<u32>,
-    /// Sender for consumer-level telemetry events.
-    telemetry: TelemetrySender,
-    /// Atomic flag for coordinating consumer shutdown.
-    shutdown: Arc<AtomicBool>,
-    /// Registry for monitoring consumer-level actors for stalls.
-    heartbeats: HeartbeatRegistry,
-}
-
-/// Initializes a Prosody consumer with the provided parameters.
-///
-/// # Arguments
-///
-/// * `params` - Consumer initialization parameters
-///
-/// # Returns
-///
-/// A Result containing the initialized consumer components (managers and
-/// runtime state) or a `ConsumerError` if initialization fails.
-///
-/// # Errors
-///
-/// This function returns an error if:
-/// - The hostname cannot be retrieved for the client ID
-/// - The Kafka consumer cannot be created with the provided configuration
-/// - Topic subscription fails
-/// - The probe server cannot be started (if enabled)
-fn initialize_consumer<T, P, SP, C>(
-    params: ConsumerInitParams<T, P, SP, C::Payload>,
-) -> Result<ConsumerComponents<C::Payload>, ConsumerError>
-where
-    T: HandlerProvider,
-    T::Handler: EventHandler<Payload = C::Payload>,
-    P: TriggerStoreProvider,
-    SP: PartitionStateProvider<P::Store>,
-    <SP::Manager as PartitionStateManager>::Session:
-        CellSession<Loader: MessageLoader<Payload = C::Payload>>,
-    C: Codec,
-    C::Payload: Clone + EventType + EventIdentity,
-{
-    // Create the consumer context with the message handler and shared state
-    let context = new_context(
-        &params.config,
-        params.handler_provider,
-        PartitionProviders {
-            triggers: params.trigger_provider,
-            state: params.state_provider,
-        },
-        params.watermark_version.clone(),
-        ManagerRegistry {
-            managers: params.managers.clone(),
-            assignment_tx: params.assignment_tx,
-        },
-        params.telemetry,
-        params.version,
-    )?;
-
-    // Use mock cluster for testing or real bootstrap servers
-    let bootstrap = if params.config.mock {
-        MOCK_CLUSTER_BOOTSTRAP.clone()
-    } else {
-        params.config.bootstrap_servers.join(",")
-    };
-
-    // Configure and create the Kafka consumer with optimal settings
-    let mut client_config = ClientConfig::new();
-    client_config
-        .set("bootstrap.servers", bootstrap)
-        .set("client.id", hostname()?)
-        .set("group.id", &params.config.group_id)
-        .set("enable.auto.commit", "true")
-        .set(
-            "auto.commit.interval.ms",
-            params.config.commit_interval.as_millis().to_string(),
-        )
-        .set("enable.auto.offset.store", "false")
-        .set("auto.offset.reset", "earliest")
-        .set("partition.assignment.strategy", "cooperative-sticky")
-        .set_log_level(RDKafkaLogLevel::Error);
-
-    let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
-
-    // Subscribe to the specified topics
-    let topics: Vec<&str> = params
-        .config
-        .subscribed_topics
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    consumer.subscribe(&topics)?;
-
-    // Spawn the background polling task with monitoring
-    let poll_interval = params.config.poll_interval;
-    let heartbeat = params.heartbeats.register("Kafka poll loop");
-    let cloned_managers = params.managers.clone();
-    let cloned_heartbeat = heartbeat.clone();
-    let max_message_count = params.config.max_uncommitted;
-    let message_spans = params.config.message_spans;
-    let poll_handle = spawn_blocking(move || {
-        poll(PollConfig {
-            poll_interval,
-            max_message_count,
-            consumer,
-            codec: C::default(),
-            watermark_version: &params.watermark_version,
-            managers: &cloned_managers,
-            heartbeat: &cloned_heartbeat,
-            shutdown: &params.shutdown,
-            message_spans,
-        });
-    });
-
-    // Start optional probe server for health monitoring
-    let probe_server = params
-        .config
-        .probe_port
-        .filter(|_| !params.config.mock)
-        .map(|port| ProbeServer::new(port, params.managers.clone(), params.heartbeats.clone()))
-        .transpose()?;
-
-    let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
-        poll_handle,
-        probe_server,
-    })));
-
-    Ok((params.managers, runtime_state))
 }
 
 /// Checks if any partition is stalled.
