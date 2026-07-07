@@ -172,6 +172,26 @@ Never hardcode an iteration count in a test body.
 
 CI cranks these up; dev loops stay fast.
 
+## Isolation: match the domain to the state under test
+
+Isolate tests at the **cheapest domain the system already guarantees** for
+the state being tested — never mint heavyweight infrastructure when a
+narrower domain suffices, and especially never per quickcheck iteration:
+
+| State under test | Isolation domain | Mechanism |
+| --- | --- | --- |
+| Key-scoped (per-key ordering, defer queues, keyed state, per-key timers) | Key | Unique keys in a shared env — the one-handler-per-key invariant makes them independent |
+| Partition/offset-scoped (loader offsets, LSO truncation, watermarks) | Partition | Reuse or pool partitions; keys cannot isolate a shared offset space |
+| Consumer-group visibility (offset replay; groups consume whole topics with `earliest` reset) | Topic per env | One topic per consumer-group environment — created once per test, never per iteration |
+| Cassandra rows | Partition key | Shared `prosody_test` keyspace + unique `group_id`/`StateKey` per test; never per-test keyspaces |
+| Fjall | Keyspace name | One process-wide shared DB (`src/state/fjall/test_db.rs`); unique names only for clearing tests |
+
+The corollary for `INTEGRATION_TESTS` harnesses: build the environment
+**once per test process** and let iterations isolate by key (or pooled
+partition). Rebuilding a topic + consumer group + session per iteration
+spends multiple seconds of scaffolding on a ~1s protocol and drowns the
+signal the repetition was meant to buy.
+
 ## Synchronization: never sleep
 
 `sleep` is allowed only to simulate backpressure. Everything else waits on
