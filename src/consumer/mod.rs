@@ -1072,15 +1072,17 @@ where
 }
 
 /// Builds the keyed-state provider for a [`StorePair::Memory`] arm (and the
-/// stateless Cassandra arm): the in-memory durable store, backend factory,
-/// and in-memory message loader, wrapped in the partition state provider.
-/// The factory is store-type agnostic — the commit oracle's trigger store
-/// handle arrives per partition via
-/// [`PartitionStateProvider::acquire`] — so the concrete return type serves
-/// any trigger backend.
+/// stateless Cassandra arm): the in-memory durable store, backend factory, and
+/// the caller's in-memory message loader, wrapped in the partition state
+/// provider. The pipeline passes a `loader` it also hands to message defer; the
+/// other constructors pass a fresh one. The factory is store-type agnostic —
+/// the commit oracle's trigger store handle arrives per partition via
+/// [`PartitionStateProvider::acquire`] — so the concrete return type serves any
+/// trigger backend.
 fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,
+    loader: MemoryLoader<C::Payload>,
 ) -> StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
     MemoryLoader<C::Payload>,
@@ -1095,21 +1097,20 @@ where
         dedup_provider,
         keyed_state.group.clone(),
     );
-    keyed_state.provider(backend, MemoryLoader::<C::Payload>::new())
+    keyed_state.provider(backend, loader)
 }
 
 /// Builds the keyed-state provider for a [`StorePair::Cassandra`] arm: opens
-/// the per-consumer Kafka loader and fjall workspace, mints the backend
-/// factory, and wraps it in the partition state provider. Shared by every
-/// constructor's Cassandra arm except the pipeline, which builds its own loader
-/// to share with the message-defer middleware.
+/// the fjall workspace, mints the backend factory over the caller's Kafka
+/// loader, and wraps it in the partition state provider. Shared by every
+/// constructor's Cassandra arm; the caller owns the loader so the pipeline can
+/// hand the same one to its message-defer middleware.
 fn cassandra_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
-    consumer_config: &ConsumerConfiguration,
-    heartbeats: &HeartbeatRegistry,
     dedup_provider: CassandraDeduplicationStoreProvider,
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
+    loader: KafkaLoader<C>,
 ) -> Result<
     StateManagerProvider<
         CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
@@ -1120,8 +1121,6 @@ fn cassandra_state_provider<C: Codec>(
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
-    let loader = KafkaLoader::<C>::for_consumer(consumer_config, heartbeats)
-        .map_err(DeferInitError::from)?;
     // The fjall workspace root is wiped on restart (Cassandra is
     // authoritative), so creating the default directory here is safe.
     fs::create_dir_all(&keyed_state.config.cache_dir)?;
@@ -1271,7 +1270,11 @@ where
                 dedup_provider,
                 ..
             } => {
-                let state_provider = memory_state_provider::<C>(&keyed_state, dedup_provider);
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider,
+                    MemoryLoader::<C::Payload>::new(),
+                );
                 initialize_consumer_with_provider::<_, _, _, C>(
                     consumer_config,
                     keyed_state.version.clone(),
@@ -1297,6 +1300,7 @@ where
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     MemoryDeduplicationStoreProvider::new(),
+                    MemoryLoader::<C::Payload>::new(),
                 );
                 initialize_consumer_with_provider::<_, _, _, C>(
                     consumer_config,
@@ -1354,14 +1358,11 @@ where
                 // touch Kafka — pair it with an in-memory loader, shared by
                 // message defer and the keyed-state Kafka-message handles.
                 let loader = MemoryLoader::<C::Payload>::new();
-                let backend = MemoryStateBackendFactory::new(
-                    MemoryCells::new(),
-                    MemoryDescriptorIdentityStore::new(),
-                    keyed_state.registry.clone(),
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
                     dedup_provider.clone(),
-                    keyed_state.group.clone(),
+                    loader.clone(),
                 );
-                let state_provider = keyed_state.provider(backend, loader.clone());
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
                     &stack.consumer_config,
@@ -1395,21 +1396,13 @@ where
                 let loader =
                     KafkaLoader::<C>::for_consumer(&stack.consumer_config, &stack.heartbeats)
                         .map_err(DeferInitError::from)?;
-                // The fjall workspace root is wiped on restart (Cassandra is
-                // authoritative), so creating the default directory here is
-                // safe; mounted production paths already exist.
-                fs::create_dir_all(&keyed_state.config.cache_dir)?;
-                let fjall_client = FjallClient::open(&keyed_state.config.cache_dir)
-                    .map_err(KeyedStateInitError::from)?;
-                let backend = CassandraStateBackendFactory::new(
-                    fjall_client,
+                let state_provider = cassandra_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
                     cell_store,
                     identity_store,
-                    keyed_state.registry.clone(),
-                    dedup_provider.clone(),
-                    keyed_state.group.clone(),
-                );
-                let state_provider = keyed_state.provider(backend, loader.clone());
+                    loader.clone(),
+                )?;
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
                     &stack.consumer_config,
@@ -1478,8 +1471,11 @@ where
                 dedup_provider,
                 ..
             } => {
-                let state_provider =
-                    memory_state_provider::<C>(&keyed_state, dedup_provider.clone());
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
+                    MemoryLoader::new(),
+                );
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
                     consumer_config,
@@ -1507,13 +1503,14 @@ where
                 identity_store,
                 ..
             } => {
+                let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
+                    .map_err(DeferInitError::from)?;
                 let state_provider = cassandra_state_provider::<C>(
                     &keyed_state,
-                    consumer_config,
-                    &heartbeats,
                     dedup_provider.clone(),
                     cell_store,
                     identity_store,
+                    loader,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1570,8 +1567,11 @@ where
                 dedup_provider,
                 ..
             } => {
-                let state_provider =
-                    memory_state_provider::<C>(&keyed_state, dedup_provider.clone());
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
+                    MemoryLoader::new(),
+                );
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
                     consumer_config,
@@ -1597,13 +1597,14 @@ where
                 identity_store,
                 ..
             } => {
+                let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
+                    .map_err(DeferInitError::from)?;
                 let state_provider = cassandra_state_provider::<C>(
                     &keyed_state,
-                    consumer_config,
-                    &heartbeats,
                     dedup_provider.clone(),
                     cell_store,
                     identity_store,
+                    loader,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
