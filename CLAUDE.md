@@ -28,6 +28,30 @@ If you can't name the invariant, you don't yet understand the code well enough t
 
 **Leave the codebase better than you found it.** Drive-by simplifications are encouraged when they're scoped to the area you're already touching. Don't sprawl — but don't walk past obvious cleanup either.
 
+## Definition of Done
+
+No change is complete until every line below holds. These are acts, not
+aspirations — perform each one; do not merely agree with it:
+
+1. `cargo clippy` and `cargo clippy --tests` — zero warnings. `cargo doc` —
+   zero warnings. `cargo +nightly fmt`; stable `cargo fmt --check` must also
+   pass.
+2. `cargo nextest run <filter> 2>&1 | tee /tmp/test_output.log` — re-running
+   slow suites is expensive; grep the file, not the pipe.
+3. Every new or converted test was proved falsifiable once: inject the
+   failure, watch it go red, revert.
+4. Every deleted test names its surviving stronger test in the commit message.
+5. Everything the change replaces is gone — code, tests, config fields, doc
+   vocabulary (see Redesign hygiene). "The new thing works" is half done.
+6. Any defect fixed or convention applied was swept repo-wide by grep and
+   applied to structural twins (message/timer, memory/Cassandra) together —
+   a partial sweep is drift; finish it or record where and why it stopped.
+7. Every claim written this session — doc cross-reference, "covered by" note,
+   exemplar path, metric motivating the change — was verified to resolve, not
+   recalled from memory. Re-measure headline numbers before acting on them;
+   measurement artifacts (file moves, reclassified lines) masquerade as signal.
+8. The diff is net-negative, or each addition is individually justified.
+
 ## Critical Rules
 
 **Error Handling:**
@@ -55,9 +79,9 @@ If you can't name the invariant, you don't yet understand the code well enough t
 - **Never add a *gratuitous* allocation to satisfy the borrow checker or the
   compiler.** When a `.map(|x| ...)` closure trips a higher-ranked-lifetime
   error, reach for a **function item** (`.map(Type::method)`), an index, or a
-  borrow before you reach for a scratch `Vec`. (See `Weighed::weight`, mapped as
-  a fn item so the batch-packing boundary iterator needs **no** `Vec<u64>`
-  scratch.)
+  borrow before you reach for a scratch `Vec`. (See `BatchUnit::weight` mapped
+  as a fn item into `chunk_boundaries` in `src/cassandra/mod.rs` — the
+  batch-packing boundary iterator needs **no** `Vec<u64>` scratch.)
 - **No amortized / cached resize buffers** ("allowed to grow to the max size
   ever seen") on the hot path. If a reusable scratch buffer is truly
   unavoidable, allocate it once at construction with a fixed bound and reuse it
@@ -70,10 +94,9 @@ If you can't name the invariant, you don't yet understand the code well enough t
 
 **Code Quality:**
 
-- Clippy must pass for code and tests - zero warnings tolerated
+- Lint/doc/fmt gates live in Definition of Done — zero warnings tolerated
 - Never suppress warnings with `#[allow(...)]` without permission
 - Never introduce `dyn` (trait objects, `Box<dyn ...>`, `&dyn ...`) without permission - prefer generics and associated types
-- Run: `cargo clippy`, `cargo clippy --tests`, `cargo doc`, `cargo +nightly fmt`
 
 **Redesign hygiene:**
 
@@ -109,6 +132,10 @@ designs are where bloat and bug re-introduction live:
 - Write doc comments for a reader unfamiliar with the codebase: help them
   navigate the concept. Lead with what the reader needs — what the thing is,
   how to use it, what guarantee it gives — not the internal mechanism.
+- Docs address the future reader, never the current conversation: no
+  review-response prose, no "the reviewer/advisor said", no phrasing copied
+  from scratch plans or design docs. Restate the invariant in the code's own
+  words — a doc whose referent is an ephemeral plan rots the day the plan does.
 - Capture the key concepts and, whenever applicable, **state the invariant** —
   but at the type or function that owns it, **once**. Don't restate the same
   invariant across related items; reference the owning type instead.
@@ -190,10 +217,11 @@ trait ClassifyError {
 
 ## Testing
 
-The full testing guide — the property-test idiom catalog, invariant
-shapes, exemplar files, and how to run the suites — lives in
-[TESTING.md](TESTING.md). Read it before writing tests. The rules below
-are the non-negotiables.
+**Before writing or modifying any test, read TESTING.md** — the
+property-test idiom catalog, invariant shapes, exemplar files, shared
+scaffolding homes, and how to run the suites live there, and tests written
+without it reinvent harnesses the catalog already provides. The rules
+below are the non-negotiables.
 
 **Organization:** Integration (`tests/`), unit and property tests in
 sibling modules next to the code they check. Default to a sibling
@@ -250,10 +278,6 @@ hang-guard, never the assertion. Patterns in TESTING.md.
 **Use `assert` or `color_eyre::Result` with `?` in tests — never
 `expect`/`unwrap`, never swallow errors.**
 
-**Run tests with `cargo nextest run` and tee output to a file**
-(`cargo nextest run 2>&1 | tee /tmp/test_output.log`) — re-running slow
-suites is expensive; grep the file, not the pipe.
-
 ## API Design
 
 **Traits:** Keep generic with associated types; use type erasure only for FFI (JS/Python/Ruby)
@@ -279,7 +303,7 @@ this way.
 
 ## Architecture
 
-**Consumer:** Hierarchical (Consumer → PartitionManager → KeyedManager)
+**Consumer:** Hierarchical (Consumer → PartitionManager → KeyManager)
 
 - Partition-level parallelism with per-key ordering
 - Cross-key concurrency, capacity-based backpressure
@@ -305,75 +329,44 @@ terminates the chain with the handler as the **INNERMOST** component.
   dedup → (cancellation → scheduler → timeout → telemetry) → handler`.
 
 **The keyed-state durability sequence is NOT in the stack.** It runs once
-after the stack returns, owned by the `settle` boundary (the blanket
-`FallibleEventHandler → EventHandler` impl in `consumer::middleware`; `retry`
-routes its final outcome through the same `settle`/`abandon`). State is one
-**provisional cell** per value (`data | prev_data | event`); there is no WAL.
-Handler writes buffer in a single **in-memory** `DirtyStore` the session
-owns and rebuilds (clears in place) per event — it is **never** a durability or
-recovery source (recovery is Cassandra provisional cells + the commit oracle),
-so do not re-add a disk-backed dirty store. Fjall is retained **only** as the
-committed-value write-through cache (`FjallCellCache`, which owns its
-workspace).
-`settle` does, in straight-line code: stage provisional cells / write resolved
-(`finalize`) → arm `StateRecovery` if anything staged (a per-key singleton via
-`clear_and_schedule`, **arm-if-sooner**: re-armed only when the newly-staged fire
-is strictly earlier than the standing one, else skipped) →
-**flush the registered dedup marker, strictly after the stage** (on this
-success path the flush is must-succeed: every non-shutdown failure — permanent
-included — retries, since the marker is framework data whose absence would let
-the sweep silently roll back a committed handler's writes; the error-path flush
-stays best-effort) → commit the
-offset/trigger → promote the staged cells (best-effort, O(1) per cell) →
-`after_commit`.
-**Retry forever; abort only on shutdown; never emit Terminal.** Every internal
-durability step (`retry_step`) retries **transient _and_ terminal** store
-failures forever — a broken store self-heals when it recovers, and a genuinely
-stuck store stalls the offset until the liveness probe restarts the process (a
-visible last resort, strictly better than silently abandoning); only a
-**permanent** data-rejection is skipped, and only **shutdown** abandons (aborts
-the marker → redelivery). Arming the backstop is **must-succeed** (invariant 8):
-`arm_backstop` retries *every* non-shutdown failure — including a permanent
-timer-store error and a fire-time-computation error — and returns
-`ArmOutcome::ShuttingDown` only on shutdown, so it never gates the marker except
-by a shutdown abandon. This makes "abort in normal operation" structurally
-unwritable at the boundary.
-The per-key fire is `min(recovery_delay, tightest touched collection's
-`recovery_within`)`: `recovery_delay` is the always-on durability floor and
-per-collection `recovery_within` is a tightening-only reader-convergence bound
-(it never loosens the floor). `ArmedKeys` maps each key to its standing fire time
-so arm-if-sooner can compare; it is per-acquisition RAM, so on a miss (first arm
-for a key after reacquisition) `arm_backstop` seeds it from the durable trigger
-store before comparing — a prior epoch's sooner backstop is never loosened.
-The boundary **never** unschedules the backstop: the per-key `StateRecovery`
-timer is only ever pulled sooner (never pushed out) by each stateful commit, and
-the fired trigger (a per-`(key, TimerType)` singleton) is committed by the sweep
-arm itself — there is **no** `unschedule_all`, so one event can never
-point-clear — nor loosen — another event's still-needed backstop (finding F2).
-The sweep (`StateManager::recover`) mirrors the boundary's posture: it **never
-aborts the trigger except on shutdown**, committing it on progress (a resolved
-sweep, or a per-cell permanent skip that first-touch/the next commit recover)
-and, on a transient sweep failure, rescheduling a fresh backstop
-(`clear_and_schedule` at `recovery_delay` tightened by the registered
-collections' `recovery_within` bounds and floored at the retry cadence, retried
-until it lands or shutdown) before committing. The stage→arm→commit order also closes the
-crash-before-arm window without any acquisition-time sweep: the offset is
-uncommitted until after the arm, so a crash there redelivers and re-arms. Because the
-marker flush is textually after the stage in one
-function, "marker before durable state" is **unwritable**. The dedup middleware
-in the stack only *filters* duplicates and *registers* the marker (on `Ok` /
-`Permanent`); it never writes the dedup store. Three residual order facts remain:
+after the stack returns, owned by the `settle` boundary in
+`src/consumer/middleware/settle.rs` (called from the blanket
+`FallibleEventHandler → EventHandler` impl; `retry` routes its final outcome
+through the same `settle`/`abandon`). The full
+stage → arm-backstop → marker-flush → commit → promote order, its crash-window
+argument, and the sweep's mirrored posture are documented once on their owning
+items — `settle`/`settle_committed`, `arm_backstop`/`ArmOutcome`, and
+`StateManager::recover` — read those doc comments before touching any of it.
+The anchors code comments cite by name:
+
+- **Invariant 8:** arming the backstop is must-succeed. `arm_backstop` retries
+  every non-shutdown failure and can only report `ShuttingDown`, so "abort in
+  normal operation" is structurally unwritable at the boundary.
+- **Finding F2:** neither the boundary nor the sweep ever unschedules a
+  backstop — per-key `StateRecovery` timers are only ever pulled sooner
+  (arm-if-sooner), so one event can never clear or loosen another event's
+  still-needed backstop. There is no `unschedule_all`; do not reintroduce one.
+- **Posture:** retry transient AND terminal store failures forever; skip only
+  permanent data-rejections; abort only on shutdown; never emit Terminal.
+- **No WAL, ever.** State is one provisional cell per value. The in-memory
+  `DirtyStore` (one shared per-partition workspace; race-free per-event
+  key-range clears) is never a durability or recovery source — recovery is
+  Cassandra provisional cells + the commit oracle. Do not re-add a disk-backed
+  dirty store; fjall remains only the committed-value cache (`FjallCellCache`).
+  The marker flush sits textually after the stage inside one function, so
+  "marker before durable state" is unwritable.
+
+Three residual order facts govern middleware placement:
   - `retry` stays OUTERMOST so each attempt is a fresh dispatch that resets the
     session **and the registered marker** between attempts.
   - The defer middlewares sit OUTSIDE the common block so a defer-swallow
     `reset()`s the session *before* swallowing a transient error into
-    `Ok(Deferred)` — discarding the registered marker, so `settle` flushes no
-    marker and the deferred reload is **not** deduped (no flag, no outcome
-    inspection). The reload re-dispatches `on_message` and `settle` stages under
-    the reloading timer's `EventRef`.
-  - `dedup` stays in the stack as a duplicate **filter** so the deferred-message
-    reload dispatch still filters producer duplicates. (`monopolization` is
-    state-agnostic; its position is immaterial.)
+    `Ok(Deferred)` — discarding the registered marker, so the deferred reload
+    is **not** deduped.
+  - `dedup` stays in the stack as a duplicate **filter** that registers the
+    marker (on `Ok`/`Permanent`); it never writes the dedup store — the
+    boundary flushes the marker. (`monopolization` is state-agnostic; its
+    position is immaterial.)
 
 **Timer System:** Slab-based time partitioning (TimerManager → Store + Scheduler + SlabLoader)
 

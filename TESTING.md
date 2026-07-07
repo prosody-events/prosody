@@ -56,6 +56,13 @@ A property over toy inputs is just a slow example test. Generators must
 cover what production actually sends: empty/min/max sizes, duplicate keys,
 out-of-order delivery, interleaved operations, error outcomes.
 
+Aim coverage at risk, not at ease of writing. The paths where tests are
+cheapest (CRUD happy paths on stores) are the least likely to break; the real
+bugs and the zero-coverage holes both live at the expensive seams — swallow
+paths, error-path gating, crash windows, degenerate config values (zero,
+sub-unit truncation). Before adding another proof of an easy path, ask what
+the nearest untested failure path is and test that instead.
+
 ## Falsifiability: a test must be able to fail
 
 A green test proves nothing unless it can go red. Every idiom below shipped
