@@ -236,9 +236,11 @@ pub enum StoreCreationError {
     #[error("failed to create trigger store: {0:#}")]
     TriggerStore(Box<CassandraTriggerStoreError>),
 
-    /// Failed to create defer store queries.
-    #[error("failed to create defer store queries: {0:#}")]
-    DeferStore(Box<CassandraStoreError>),
+    /// Failed to initialize the shared Cassandra store: session creation or
+    /// statement preparation for any of the stores it backs (message/timer
+    /// defer, deduplication, keyed-state cell and identity).
+    #[error("failed to initialize cassandra store: {0:#}")]
+    Cassandra(Box<CassandraStoreError>),
 
     /// Failed to create segment store.
     #[error("failed to create segment store: {0:#}")]
@@ -261,7 +263,7 @@ impl From<CassandraTriggerStoreError> for StoreCreationError {
 
 impl From<CassandraStoreError> for StoreCreationError {
     fn from(e: CassandraStoreError) -> Self {
-        Self::DeferStore(Box::new(e))
+        Self::Cassandra(Box::new(e))
     }
 }
 

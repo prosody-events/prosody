@@ -77,12 +77,13 @@ pub enum DeferInitError {
 
 /// Unified error type for Cassandra-backed defer stores.
 ///
-/// Used by both [`CassandraMessageDeferStore`] and [`CassandraTimerDeferStore`]
-/// to provide a common error type when message and timer stores share the same
-/// segment store type.
+/// Shared by [`CassandraMessageDeferStore`], [`CassandraTimerDeferStore`], and
+/// [`CassandraSegmentStore`] so the stores that make up the defer subsystem
+/// speak one error type.
 ///
 /// [`CassandraMessageDeferStore`]: crate::consumer::middleware::defer::message::store::cassandra::CassandraMessageDeferStore
 /// [`CassandraTimerDeferStore`]: crate::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStore
+/// [`CassandraSegmentStore`]: crate::consumer::middleware::defer::segment::CassandraSegmentStore
 #[derive(Debug, Error)]
 pub enum CassandraDeferStoreError {
     /// Error from Cassandra operations.
