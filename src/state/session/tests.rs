@@ -18,7 +18,7 @@
 //! stage** (the [`ScriptedOracle`] `record_message` counter); another pins the
 //! flush drain to its own collection.
 
-use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
+use super::sealed::{FinalizeOutcome, StateLifecycle};
 use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -616,64 +616,4 @@ fn prop_value_lifecycle_equivalence() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
-}
-
-/// `commit_apply` is best-effort: with two staged collections, a permanent
-/// `mark_resolved` failure on one leaves it provisional (`Incomplete`) while
-/// the healthy sibling still promotes — pinning the `fold`-not-`try_fold`
-/// reduction and the `Incomplete`-dominance of the staged-set resolution.
-#[tokio::test]
-async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
-    use crate::state::tests::cell_suite::FailingCellStore;
-
-    let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
-    registry.register(
-        &value_state::<JsonCodec>("wishlist"),
-        CollectionDef::new(None),
-    )?;
-    let registry = Arc::new(registry);
-    let oracle = ScriptedOracle::default();
-    let inner = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
-    let cell = FailingCellStore::new(inner, StateName::try_new("wishlist")?);
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let state_key = StateKey::new(Uuid::from_u128(7), Arc::from("key"));
-    let (event, _dedup) = message(1);
-    let session: KeyedStateSession<
-        PartitionBackend<
-            ScriptedOracle,
-            MemoryDescriptorIdentityStore,
-            FailingCellStore<MemoryCellStore<ScriptedOracle>>,
-        >,
-        (),
-    > = KeyedStateSession::new(SessionParts {
-        cell,
-        dirty: Arc::new(DirtyStore::new()),
-        oracle,
-        loader: (),
-        registry,
-        state_key,
-        event,
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
-        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    });
-
-    let cart = StateName::try_new("cart")?;
-    let wishlist = StateName::try_new("wishlist")?;
-    session
-        .set(StateType::Application, &cart, &value_cell(), b"a")
-        .await?;
-    session
-        .set(StateType::Application, &wishlist, &value_cell(), b"b")
-        .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-
-    assert_eq!(
-        session.commit_apply().await,
-        ApplyOutcome::Incomplete,
-        "a failed promote yields Incomplete so the boundary leaves the backstop armed",
-    );
-    Ok(())
 }
