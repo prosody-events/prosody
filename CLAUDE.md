@@ -190,6 +190,18 @@ fast smokes alongside the property. Copy the idioms cataloged in
 TESTING.md (trace + model oracle, backend-generic suite runners, crash
 simulation, explicit shrinking) rather than inventing new harnesses.
 
+**Root-cause every property-test failure — no exceptions.** A failing
+property or quickcheck run is evidence of a bug (in the code or in the
+test's design), never noise to re-run away: a passing re-run proves
+nothing, because the failing input or schedule may simply not recur.
+Extract the reproducer — the shrunk input when the property has one; the
+failure message plus its mechanism when it doesn't (a `fn(())` repetition
+harness has nothing to shrink) — and turn it into a deterministic test at
+the lowest layer that can express it, preferring paused time
+(`start_paused(true)`) or manually driven dispatch over wall-clock waits.
+Only then decide whether the fix belongs in the code or the test, and
+land the reproducer as the regression pin.
+
 **Iteration counts come from the environment — never hardcoded:**
 `QUICKCHECK_TESTS` for in-memory property tests (quickcheck reads it
 automatically), `INTEGRATION_TESTS` for property tests against live

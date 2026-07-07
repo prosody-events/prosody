@@ -150,6 +150,15 @@ impl TimerCapture {
     pub fn active_timer_count(&self) -> usize {
         self.active_timers.len()
     }
+
+    /// Returns the number of scheduled timers for one key. Distinguishes a
+    /// `clear_and_schedule` singleton (1) from an accumulating `schedule` (>1).
+    #[must_use]
+    pub fn key_timer_count(&self, key: &Key) -> usize {
+        self.active_timers
+            .read_sync(key, |_, times| times.len())
+            .unwrap_or(0)
+    }
 }
 
 // ============================================================================

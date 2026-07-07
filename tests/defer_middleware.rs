@@ -52,6 +52,7 @@ use prosody::{
 };
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,11 +105,16 @@ enum HandlerEvent {
     MessageFailedTransient { key: String, value: i64 },
 }
 
-/// Test handler that can be configured to fail specific messages.
+/// Test handler that fails configured values a bounded number of times.
 #[derive(Clone)]
 struct DeferTestHandler {
-    /// Messages that should fail with transient errors (will be deferred).
-    fail_values: Arc<parking_lot::Mutex<Vec<i64>>>,
+    /// Remaining transient failures per value: each failing invocation
+    /// consumes one, and at zero the value succeeds. A counted budget —
+    /// rather than a flag the test body clears mid-flight — keeps the
+    /// handler's event stream deterministic: it can never race the defer
+    /// middleware's retry timers, so tests assert on event content and
+    /// order, never on timing.
+    fail_budget: Arc<parking_lot::Mutex<HashMap<i64, u64>>>,
 
     /// Channel to report events.
     event_tx: Sender<HandlerEvent>,
@@ -132,7 +138,13 @@ impl FallibleHandler for DeferTestHandler {
         let payload = message.payload();
 
         if let Some(value) = payload.get("value").and_then(Value::as_i64) {
-            let should_fail = self.fail_values.lock().contains(&value);
+            let should_fail = match self.fail_budget.lock().get_mut(&value) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    true
+                }
+                _ => false,
+            };
 
             if should_fail {
                 let _ = self
@@ -243,7 +255,7 @@ impl DeferTestEnvironment {
 
         let (event_tx, event_rx) = channel(100);
         let handler = DeferTestHandler {
-            fail_values: Arc::new(parking_lot::Mutex::new(vec![])),
+            fail_budget: Arc::default(),
             event_tx,
         };
 
@@ -332,7 +344,7 @@ impl DeferTestEnvironment {
 
         let (event_tx, event_rx) = channel(100);
         let handler = DeferTestHandler {
-            fail_values: Arc::new(parking_lot::Mutex::new(vec![])),
+            fail_budget: Arc::default(),
             event_tx,
         };
 
@@ -477,14 +489,11 @@ impl DeferTestEnvironment {
         }
     }
 
-    /// Configure which values should fail with transient errors.
-    fn set_failing_values(&self, values: Vec<i64>) {
-        *self.handler.fail_values.lock() = values;
-    }
-
-    /// Clear all failing values (all messages will succeed).
-    fn clear_failing_values(&self) {
-        self.handler.fail_values.lock().clear();
+    /// Budget `times` transient failures for `value`; once consumed, further
+    /// invocations succeed. Configured up front (never mid-flight), so the
+    /// event stream cannot race the defer middleware's retry timers.
+    fn fail_value_times(&self, value: i64, times: u64) {
+        self.handler.fail_budget.lock().insert(value, times);
     }
 
     /// Shut down the consumer.
@@ -513,10 +522,11 @@ fn prop_first_failure_defers_and_retries(_: ()) -> TestResult {
 async fn run_first_failure_defers_and_retries() -> Result<()> {
     let mut env = DeferTestEnvironment::new().await?;
 
-    // Configure handler to fail value=1 initially
-    env.set_failing_values(vec![1]);
+    // Budget exactly one failure: the first attempt fails and defers, and
+    // the immediate retry (retry_count=0) succeeds. The fixed budget makes
+    // the event stream deterministic regardless of when the retry fires.
+    env.fail_value_times(1, 1);
 
-    // Send message that will fail
     env.send_message("test-key", json!({"value": 1_i64}))
         .await?;
 
@@ -527,16 +537,12 @@ async fn run_first_failure_defers_and_retries() -> Result<()> {
         "Expected transient failure for value=1"
     );
 
-    // Clear failure condition so retry succeeds
-    env.clear_failing_values();
-
-    // Defer middleware handles timer internally and retries via on_message
-    // (on_timer is NOT called for DeferRetry timers)
-    // Should receive success event after defer delay (~1 second)
+    // Defer middleware handles the timer internally and retries via
+    // on_message (on_timer is NOT called for DeferRetry timers).
     let event = env.expect_event(10).await?;
     ensure!(
         matches!(event, HandlerEvent::MessageSuccess { ref key, value: 1 } if key == "test-key"),
-        "Expected retry to succeed after defer delay"
+        "Expected retry to succeed, got: {event:?}"
     );
 
     env.shutdown().await;
@@ -564,8 +570,13 @@ fn prop_multiple_messages_queued_in_order(_: ()) -> TestResult {
 async fn run_multiple_messages_queued_in_order() -> Result<()> {
     let mut env = DeferTestEnvironment::new().await?;
 
-    // Configure handler to fail value=1 (will be deferred)
-    env.set_failing_values(vec![1]);
+    // Budget exactly two failures for msg1: the first attempt and its
+    // immediate retry (retry_count=0) fail, the second failure re-defers
+    // with retry_count=1 (base backoff, ~1s), and that timer-driven retry
+    // succeeds. The fixed budget makes the whole event stream a
+    // deterministic sequence — no mid-flight reconfiguration racing the
+    // backoff timer, and no wall-clock assertion anywhere.
+    env.fail_value_times(1, 2);
 
     // Send all 3 messages quickly (before timer fires)
     env.send_message("test-key", json!({"value": 1_i64}))
@@ -575,31 +586,20 @@ async fn run_multiple_messages_queued_in_order() -> Result<()> {
     env.send_message("test-key", json!({"value": 3_i64}))
         .await?;
 
-    // msg1 fails on the first attempt (retry_count=0 → immediate retry).
-    let event = env.expect_event(5).await?;
-    ensure!(
-        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
-        "Expected first message to fail with transient error, got: {event:?}"
-    );
+    // msg1 fails its first attempt, then its immediate retry.
+    for attempt in 1_u32..=2 {
+        let event = env.expect_event(5).await?;
+        ensure!(
+            matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
+            "Expected transient failure {attempt} for value=1, got: {event:?}"
+        );
+    }
 
-    // The immediate retry (retry_count=0) fires right away and fails again,
-    // re-deferring with retry_count=1 (base delay = 1s). Drain this second
-    // failure so the next retry is delayed and msgs 2 and 3 remain queued.
-    let event = env.expect_event(5).await?;
-    ensure!(
-        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
-        "Expected second transient failure for value=1, got: {event:?}"
-    );
-
-    // Now msg1 is waiting for its retry_count=1 backoff (~1s). msgs 2 and 3
-    // must be queued and silent during this window.
-    env.expect_no_event(500).await?;
-
-    // Clear failure condition so the next retry succeeds.
-    env.clear_failing_values();
-
-    // Defer middleware handles timer internally and retries via on_message
-    // Wait for all 3 messages to be processed in order after defer delay
+    // msgs 2 and 3 must stay queued behind the deferred msg1. The handler
+    // emits an event for EVERY invocation, so out-of-order processing would
+    // surface here as a Success(2)/Success(3) arriving before Success(1) —
+    // the ordered drain proves the queueing invariant by content, with the
+    // deadline only as a hang-guard.
     for expected_value in 1..=3 {
         let event = env.expect_event(10).await?;
         ensure!(

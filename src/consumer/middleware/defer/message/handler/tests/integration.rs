@@ -23,6 +23,7 @@ use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDef
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::telemetry::Telemetry;
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
@@ -160,6 +161,85 @@ fn increments_retry_count_on_transient_failure() -> color_eyre::Result<()> {
             .ok_or_else(|| eyre!("expected key to still be deferred"))?;
         assert_eq!(retry_count, 1);
 
+        Ok(())
+    })
+}
+
+/// Root-cause pin for a flaky `tests/defer_middleware.rs` quiet-window
+/// failure: after a message's immediate retry fails transiently, its next
+/// dispatch is driven by exactly **one** standing retry timer scheduled no
+/// sooner than the base backoff. The integration test's former 500ms
+/// "expect no event" window started at event-*drain* time while this timer
+/// arms at *failure* time, so under load the (legal) backoff retry landed
+/// inside the window — a timing race, not a duplicate dispatch. This test
+/// replays that scenario with manually driven dispatch (no clock in the
+/// loop) and pins both halves: the retry timer is a `clear_and_schedule`
+/// singleton (a plain `schedule` regression would leave two timers here),
+/// and its fire time respects the backoff floor that dooms any sub-backoff
+/// quiet window.
+#[test]
+fn redeferred_retry_is_a_single_timer_at_the_backoff_floor() -> color_eyre::Result<()> {
+    init_test_logging();
+
+    TEST_RUNTIME.block_on(async {
+        let mut harness = TestHarness::new(1)?;
+        let key = harness.key(0).clone();
+
+        // Attempt 1 fails transiently and defers (retry_count=0 → an
+        // immediate retry timer).
+        defer_single_message(&mut harness).await?;
+        assert_eq!(harness.capture().key_timer_count(&key), 1);
+
+        // The immediate retry fires and fails transiently again.
+        let before_refire = CompactDateTime::now()?;
+        let timer = TimerEvent {
+            key_idx: 0,
+            offset: Offset::from(1_i64),
+            outcome: TimerOutcome::Transient {
+                max_backoff: CompactDuration::new(60),
+            },
+        };
+        harness.execute_timer(&timer).await?;
+
+        // Re-deferred at retry_count=1 with exactly one standing timer...
+        let retry_count = harness
+            .get_retry_count(0)
+            .await?
+            .ok_or_else(|| eyre!("expected key to remain deferred"))?;
+        assert_eq!(retry_count, 1);
+        assert_eq!(
+            harness.capture().key_timer_count(&key),
+            1,
+            "the retry timer must be a singleton"
+        );
+
+        // ...scheduled no sooner than the base backoff after the failure:
+        // the third dispatch cannot legally occur before this fire time.
+        let fire = harness
+            .capture()
+            .get_timer_time(&key)
+            .ok_or_else(|| eyre!("expected a standing retry timer"))?;
+        let floor =
+            before_refire.add_duration(CompactDuration::new(super::TEST_BASE_BACKOFF_SECS))?;
+        assert!(
+            fire >= floor,
+            "retry fire {fire} must respect the backoff floor {floor}"
+        );
+
+        // The backoff retry succeeds and fully drains the key.
+        let timer = TimerEvent {
+            key_idx: 0,
+            offset: Offset::from(1_i64),
+            outcome: TimerOutcome::Success,
+        };
+        harness.execute_timer(&timer).await?;
+        assert!(harness.get_retry_count(0).await?.is_none());
+        assert_eq!(harness.capture().key_timer_count(&key), 0);
+
+        // Exactly the three trace-driven dispatches reached the inner
+        // handler — dispatch is test-controlled, so nothing fires between
+        // the trace events.
+        assert_eq!(harness.processed_messages().len(), 3);
         Ok(())
     })
 }
