@@ -113,17 +113,6 @@
 //!   backoff
 //! - **Low latency processing**: Failed messages are sent to a failure topic
 //! - **Best effort processing**: Failed messages are logged and discarded
-//!
-//! # Modules
-//!
-//! - `context`: Manages Kafka partition assignments and revocations
-//! - `extractor`: Extracts tracing context from Kafka message headers
-//! - `message`: Core message types for Kafka message processing
-//! - `partition`: Manages per-partition message processing
-//! - `poll`: Implements the Kafka message polling loop
-//! - `failure`: Error handling strategies for message processing
-//! - `heartbeat`: Monitoring for stalled processes
-//! - `probes`: HTTP endpoints for health and readiness checking
 
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
@@ -248,8 +237,6 @@ type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
-/// Defines a type with an associated key.
-///
 /// Represents the type of demand being processed.
 ///
 /// Demand types allow the system to distinguish between normal processing
