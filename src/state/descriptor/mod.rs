@@ -226,10 +226,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy {
 #[must_use]
 pub struct Registered<D>(D);
 
-impl<D> Registered<D>
-where
-    D: StateDescriptor,
-{
+impl<D> Registered<D> {
     /// Mints the capability handle for a registered descriptor. The sole
     /// constructor, and crate-private, so a live `Registered<D>` always
     /// witnesses a registration.
@@ -358,13 +355,16 @@ impl<K> Descriptor<K> {
     /// so a consumer-layer alias can build a descriptor over a bespoke spec.
     ///
     /// `name` may be any runtime string — FFI clients register collections at
-    /// client startup from host-language names — and is interned, so the
-    /// descriptor stays `Copy`. It is not validated here; an empty name fails
-    /// loudly at registration, the fallible boundary.
+    /// client startup from host-language names — and is interned (the
+    /// [`Topic`](crate::Topic) idiom) to the pool's canonical `&'static str`,
+    /// which is what keeps the descriptor `Copy`; descriptor names are a
+    /// bounded set fixed at consumer build, so pool entries living for the
+    /// process is the intended retention. `name` is not validated here; an
+    /// empty name fails loudly at registration, the fallible boundary.
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
-            name: intern_descriptor_str(name),
+            name: Intern::<str>::from(name).as_ref(),
             def: CollectionDef::new(None),
             _marker: PhantomData,
         }
@@ -411,10 +411,10 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
 /// decoded cell becomes the exposed value). The default [`JsonCodec`] stores
 /// [`serde_json::Value`] cells — the same default as the consumer's message
 /// payload — and the default [`Passthrough`] resolver exposes the stored
-/// value directly. Declare via [`value_state`] — the name may be any
-/// runtime string (it is interned, so descriptors stay `Copy`); for a
-/// typed cell, declare a codec (`CartCodec: Codec<Payload = Cart>`) and
-/// annotate the binding `ValueDescriptor<CartCodec>`.
+/// value directly. Declare via [`value_state`] (see [`Descriptor::new`] for
+/// the `name` contract); for a typed cell, declare a codec
+/// (`CartCodec: Codec<Payload = Cart>`) and annotate the binding
+/// `ValueDescriptor<CartCodec>`.
 pub type ValueDescriptor<C = JsonCodec, R = Passthrough<<C as Codec>::Payload>> =
     Descriptor<ValueKind<C, R>>;
 
@@ -455,12 +455,7 @@ where
 /// another codec).
 ///
 /// The resolver defaults to [`Passthrough`]: the value is stored and
-/// returned verbatim.
-///
-/// `name` may be any runtime string — FFI clients register collections at
-/// client startup from host-language names — and is interned, so the
-/// descriptor stays `Copy`. It is not validated here; an empty name fails
-/// loudly at registration, the fallible boundary.
+/// returned verbatim. See [`Descriptor::new`] for the `name` contract.
 #[must_use]
 pub fn value_state<C>(name: &str) -> ValueDescriptor<C, Passthrough<C::Payload>>
 where
@@ -484,10 +479,9 @@ pub struct CellView<S> {
 }
 
 impl<S> CellView<S> {
-    /// Binds a view to one collection partition. The binding session injects
-    /// `(state_type, name)`; every cell op forwards under them, so a handle
-    /// built on this view cannot address another collection's cells
-    /// (`CollectionScopeContainment`). Bound-free — construction reads nothing.
+    /// Binds a view to one collection partition (see the type doc for the
+    /// `CollectionScopeContainment` invariant this establishes). Bound-free —
+    /// construction reads nothing.
     pub(in crate::state::descriptor) fn new(
         session: S,
         state_type: StateType,
@@ -521,7 +515,7 @@ impl<S: CellSession> CellView<S> {
     pub fn scan<'a>(
         &'a self,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), S::ScanError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         self.session.scan(self.state_type, &self.name, scan)
     }
 
@@ -667,15 +661,6 @@ fn encode_cell<C: Codec>(payload: C::Payload) -> Result<SerializeBufGuard, C::Er
     let mut buf = SerializeBufGuard::acquire();
     C::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
     Ok(buf)
-}
-
-/// Interns a descriptor string, returning the pool's canonical
-/// `&'static str` (the [`Topic`](crate::Topic) idiom). Descriptor names
-/// are a bounded set fixed at consumer build, so pool entries living for
-/// the process is the intended retention; interning is what keeps
-/// descriptors `Copy`.
-fn intern_descriptor_str(s: &str) -> &'static str {
-    Intern::<str>::from(s).as_ref()
 }
 
 /// Guards every handle operation: a session whose partition is shutting

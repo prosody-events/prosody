@@ -28,15 +28,14 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::map::bound_cells;
 use crate::state::descriptor::{DequeHandle, MapHandle, StateDescriptor, deque_state, map_state};
+use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
 use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{
-    ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch,
-};
+use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, Direction, EventRef, PartitionBackend, StateKey, StateName,
@@ -75,7 +74,7 @@ const MAX_EVENT_OPS: usize = 4;
 /// How an event resolved. Weighted toward `Commit` so state accumulates, with
 /// real coverage of the rollback and crash-recovery arms.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Outcome {
+enum Outcome {
     /// Marker recorded, promoted inline.
     Commit,
     /// No marker, rolled back inline.
@@ -495,7 +494,7 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
     .await
 }
 
-/// Inv 4 (`MetaBoundsCoverLive`, Map): the stored `META_MIN`/`META_MAX` bound a
+/// `MetaBoundsCoverLive` (Map): the stored `META_MIN`/`META_MAX` bound a
 /// loose **superset** of the live key range — every live key's coordinate lies
 /// within `[min, max]`. Read directly from the raw bound cells, so this proves
 /// the bound *values* are a correct superset, not just that `stream` happens to
@@ -622,12 +621,23 @@ where
     Ok(out)
 }
 
-/// Inv 4 (missing-bound fallback): with live entries committed but **no**
-/// `META_MIN` (exactly the post-TTL-expiry state, seeded directly), `stream`
-/// falls back to a full forward scan from the empty anchor and still yields
-/// every live entry in key order.
-#[test]
-fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
+/// A Map registered as "mp" over a fresh warm store, seeded with three
+/// committed entries and deliberately **no** `META_MIN`/`META_MAX` bounds — the
+/// shared fixture for the two missing-bound fallback tests, each of which then
+/// adds back exactly the one bound it isolates (or none).
+struct MissingBoundFixture {
+    oracle: ScriptedOracle,
+    cells: MemoryCells,
+    state_key: StateKey,
+    registry: Arc<CollectionDefRegistry>,
+    collection_ref: CollectionRef,
+    store: MemoryCellStore<ScriptedOracle>,
+    model: BTreeMap<i64, Value>,
+}
+
+/// Builds the [`MissingBoundFixture`]: registers the Map and writes three
+/// committed entries with no bound cells.
+fn seed_map_entries_without_bounds() -> Result<MissingBoundFixture> {
     use crate::state::descriptor::map::entry_cell_for;
     use bytes::Bytes;
     use futures::executor::block_on;
@@ -638,7 +648,6 @@ fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) = registry_and_ref(&descriptor, "mp", &state_key)?;
 
-    // Seed entries committed, deliberately omitting the META_MIN/MAX bounds.
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
     let seeded = [(-1_i64, 9_u8), (3, 4), (7, 1)];
     for (key, value) in seeded {
@@ -646,28 +655,48 @@ fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
         let bytes = Bytes::from(serde_json::to_vec(&Value::from(value))?);
         block_on(store.write_resolved(&collection_ref, &[(cell, Some(bytes))]))?;
     }
-
-    let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
-    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let model: BTreeMap<i64, Value> = seeded
         .into_iter()
         .map(|(key, value)| (key, Value::from(value)))
         .collect();
-    if !block_on(assert_map(&handle, &model))? {
+    Ok(MissingBoundFixture {
+        oracle,
+        cells,
+        state_key,
+        registry,
+        collection_ref,
+        store,
+        model,
+    })
+}
+
+/// Missing-bound fallback: with live entries committed but **no**
+/// `META_MIN` (exactly the post-TTL-expiry state, seeded directly), `stream`
+/// falls back to a full forward scan from the empty anchor and still yields
+/// every live entry in key order.
+#[test]
+fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
+    use futures::executor::block_on;
+
+    let fx = seed_map_entries_without_bounds()?;
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &fx.cells,
+        &fx.oracle,
+        &fx.registry,
+        &fx.state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    if !block_on(assert_map(&handle, &fx.model))? {
         return Err(eyre!("missing-bound fallback dropped a live entry"));
     }
     Ok(())
 }
 
-/// Inv 4 (backward missing-bound fallback): with live entries and `META_MIN`
+/// Backward missing-bound fallback: with live entries and `META_MIN`
 /// committed but **no** `META_MAX` (the post-TTL-expiry state of just the high
 /// bound, seeded directly), `stream(Direction::Backward)` falls back to an
 /// `Unbounded` high anchor and still yields every live entry descending. The
@@ -675,43 +704,36 @@ fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
 /// isolating the backward path while the forward bound stands.
 #[test]
 fn map_missing_max_bound_falls_back_to_full_scan() -> Result<()> {
-    use crate::state::descriptor::map::{bound_cells, entry_cell_for};
+    use crate::state::descriptor::map::bound_cells;
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
-    let cells = MemoryCells::new();
-    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let (registry, collection_ref) = registry_and_ref(&descriptor, "mp", &state_key)?;
-
-    // Seed entries plus only META_MIN, leaving META_MAX expired/absent.
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let seeded = [(-1_i64, 9_u8), (3, 4), (7, 1)];
-    for (key, value) in seeded {
-        let cell = entry_cell_for(&I64KeyCodec::encode(&key));
-        let bytes = Bytes::from(serde_json::to_vec(&Value::from(value))?);
-        block_on(store.write_resolved(&collection_ref, &[(cell, Some(bytes))]))?;
-    }
+    let fx = seed_map_entries_without_bounds()?;
+    // Seed only META_MIN, leaving META_MAX expired/absent.
     let (min_cell, _) = bound_cells();
     let min_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&-1).as_bytes());
-    block_on(store.write_resolved(&collection_ref, &[(min_cell, Some(min_bytes))]))?;
+    block_on(
+        fx.store
+            .write_resolved(&fx.collection_ref, &[(min_cell, Some(min_bytes))]),
+    )?;
 
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let armed: ArmedKeys = Arc::default();
     let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
+        &fx.cells,
+        &fx.oracle,
+        &fx.registry,
+        &fx.state_key,
         &armed,
         read_event(0),
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    let model: BTreeMap<i64, Value> = seeded
-        .into_iter()
-        .map(|(key, value)| (key, Value::from(value)))
+    let descending: Vec<(i64, Value)> = fx
+        .model
+        .iter()
+        .rev()
+        .map(|(k, v)| (*k, v.clone()))
         .collect();
-    let descending: Vec<(i64, Value)> = model.iter().rev().map(|(k, v)| (*k, v.clone())).collect();
     if block_on(collect_map(&handle, Direction::Backward))? != descending {
         return Err(eyre!(
             "backward missing-max fallback dropped or misordered a live entry"

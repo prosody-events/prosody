@@ -15,12 +15,11 @@
 //! [`CommitOracle`]: super::oracle::CommitOracle
 
 use crate::ConsumerGroup;
-use crate::cassandra::CassandraStore as CassandraSession;
 use crate::commit_manager::{CommitManager, StoreTagSource};
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::state::cached::Cached;
 use crate::state::cassandra::{
-    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore, CellQueries,
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
 };
 use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallCellCacheError, FjallClient};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -57,8 +56,7 @@ pub type ProductionOracle<DP, S> =
 #[derive(Clone)]
 pub struct CassandraStateBackendFactory<DP> {
     client: Arc<FjallClient>,
-    session: CassandraSession,
-    queries: Arc<CellQueries>,
+    cell: CassandraCellResources,
     identity: CassandraDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
     dedup: DP,
@@ -82,11 +80,9 @@ impl<DP> CassandraStateBackendFactory<DP> {
         dedup: DP,
         consumer_group: ConsumerGroup,
     ) -> Self {
-        let CassandraCellResources { session, queries } = cell;
         Self {
             client,
-            session,
-            queries,
+            cell,
             identity,
             registry,
             dedup,
@@ -131,9 +127,10 @@ where
         // `Cached` owns the fjall workspace, so its warm provisional index and
         // its scan coverage both spill to the one per-partition `index`
         // keyspace.
+        let CassandraCellResources { session, queries } = &self.cell;
         let cassandra = CassandraStore::new(
-            self.session.clone(),
-            self.queries.clone(),
+            session.clone(),
+            queries.clone(),
             oracle.clone(),
             self.registry.clone(),
         );

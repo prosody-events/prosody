@@ -113,12 +113,11 @@ pub(super) fn try_decode_keyed_cell_ttl(
     row: KeyedCellRow,
 ) -> Result<(CellKey, Cell, Option<i32>), CassandraCellStoreError> {
     let (section, coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
-    let key = CellKey {
-        section: Section::new(section),
-        coordinate: Coordinate::from_bytes(coordinate),
-    };
-    let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
-    Ok((key, cell, blob_ttl(ttl_data, ttl_prev)))
+    let key = index_cell_key((section, coordinate));
+    let (cell, ttl) = try_decode_cell_ttl((
+        data, prev_data, encoding, version, event, ttl_data, ttl_prev,
+    ))?;
+    Ok((key, cell, ttl))
 }
 
 /// Decodes a cache-fill point row into its [`Cell`] and co-expiry TTL

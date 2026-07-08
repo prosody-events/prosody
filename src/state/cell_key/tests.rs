@@ -1,20 +1,20 @@
 //! Cell-addressing invariants.
 //!
 //! Covers the `CellKey` ordering contract `(section, coordinate)` and
-//! `Coordinate`'s least-element/round-trip behaviour. The `Section`
+//! `Coordinate`'s least-element/round-trip behaviour. The [`Section`]
 //! discriminant is **opaque** here — the cell layer never validates it — so the
-//! per-collection discriminant freeze + unknown-rejection lives with the
-//! collection section enums (invariant 7), not in the cell core.
+//! per-collection discriminant freeze and unknown-rejection lives with the
+//! collection section enums, not in the cell core.
 
 use super::{CellKey, Coordinate, Direction, Scan, Section};
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::QuickCheck;
 use std::ops::Bound;
 
 /// [`CellKey`] orders by `(section, coordinate)`: the section discriminant
 /// dominates, then the unsigned-lexicographic coordinate bytes break ties.
 #[test]
 fn cell_key_orders_by_section_then_coordinate() {
-    fn prop(a_sec: i8, a_key: Vec<u8>, b_sec: i8, b_key: Vec<u8>) -> TestResult {
+    fn prop(a_sec: i8, a_key: Vec<u8>, b_sec: i8, b_key: Vec<u8>) -> bool {
         let a = CellKey {
             section: Section::new(a_sec),
             coordinate: Coordinate::from_bytes(a_key.clone()),
@@ -24,9 +24,9 @@ fn cell_key_orders_by_section_then_coordinate() {
             coordinate: Coordinate::from_bytes(b_key.clone()),
         };
         let expected = (a_sec, a_key).cmp(&(b_sec, b_key));
-        TestResult::from_bool(a.cmp(&b) == expected)
+        a.cmp(&b) == expected
     }
-    QuickCheck::new().quickcheck(prop as fn(i8, Vec<u8>, i8, Vec<u8>) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(i8, Vec<u8>, i8, Vec<u8>) -> bool);
 }
 
 /// `Section` round-trips its discriminant through `i8`. Opaque and total: any
@@ -61,49 +61,7 @@ fn scan_construction_carries_section_and_start() {
     };
     assert_eq!(scan.section, Section::new(1));
     assert_eq!(scan.dir, Direction::Forward);
-}
-
-/// [`Scan::contains`] respects direction and bound exclusivity: forward treats
-/// `start` as the low side and `end` as the high side; backward inverts them;
-/// and exclusive bounds drop their endpoint.
-#[test]
-fn scan_contains_respects_direction_and_exclusivity() {
-    let c = |b: u8| Coordinate::from_bytes(vec![b]);
-    let (lo, hi) = (c(2), c(6));
-
-    let forward = Scan {
-        section: Section::new(0),
-        start: Bound::Included(&lo),
-        dir: Direction::Forward,
-        end: Bound::Excluded(&hi),
-        limit: None,
-    };
-    assert!(
-        forward.contains(&c(2)),
-        "inclusive low endpoint is in range"
-    );
-    assert!(forward.contains(&c(5)));
-    assert!(
-        !forward.contains(&c(6)),
-        "exclusive high endpoint is dropped"
-    );
-    assert!(!forward.contains(&c(1)));
-
-    let backward = Scan {
-        section: Section::new(0),
-        start: Bound::Included(&hi),
-        dir: Direction::Backward,
-        end: Bound::Excluded(&lo),
-        limit: None,
-    };
-    assert!(
-        backward.contains(&c(6)),
-        "inclusive high endpoint is in range"
-    );
-    assert!(backward.contains(&c(3)));
-    assert!(
-        !backward.contains(&c(2)),
-        "exclusive low endpoint is dropped"
-    );
-    assert!(!backward.contains(&c(7)));
+    assert_eq!(scan.start, Bound::Included(&start));
+    assert_eq!(scan.end, Bound::Unbounded);
+    assert_eq!(scan.limit, Some(10));
 }

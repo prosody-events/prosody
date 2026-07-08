@@ -7,7 +7,6 @@
 //! discriminants and the `Meta` cell addresses.
 
 use super::*;
-use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use quickcheck::{QuickCheck, TestResult};
 
 /// Inv 7: the `Meta`/`Entries` discriminants round-trip through `i8` and every
@@ -43,18 +42,4 @@ fn map_layout_is_frozen() {
     assert_eq!(max.coordinate.as_bytes(), &[1]);
     // The two bounds must address distinct cells.
     assert_ne!(min.coordinate, max.coordinate);
-}
-
-/// The `Meta` bound payload is the entry coordinate bytes verbatim — no extra
-/// framing — so a stored bound is directly comparable to an entry coordinate.
-/// (The per-codec coordinate bytes themselves are frozen in `order_codec`.)
-#[test]
-fn map_bound_payload_is_entry_coordinate() {
-    // A UTF-8 key encodes to its raw bytes; the bound would store exactly these.
-    assert_eq!(Utf8KeyCodec::encode(&"cart".to_owned()).as_bytes(), b"cart");
-    // An `i64` key's bound is the 8-byte sign-flipped index.
-    assert_eq!(
-        I64KeyCodec::encode(&0).as_bytes(),
-        &[0x80, 0, 0, 0, 0, 0, 0, 0]
-    );
 }

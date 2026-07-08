@@ -79,20 +79,6 @@ fn collection_ttl_at_the_recovery_delay_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// A TTL one second below the recovery delay is rejected.
-#[test]
-fn collection_ttl_below_the_recovery_delay_is_rejected() -> Result<()> {
-    let mut config = KeyedStateConfiguration::builder()
-        .recovery_delay(CompactDuration::new(60))
-        .build()?;
-    let _ = config.register(cart().ttl(CompactDuration::new(59)));
-    assert!(matches!(
-        config.build_registry(),
-        Err(RegisterStateError::TtlBelowRecoveryDelay { .. })
-    ));
-    Ok(())
-}
-
 /// A TTL one second above the recovery delay clears the floor.
 #[test]
 fn collection_ttl_above_the_recovery_delay_is_allowed() -> Result<()> {

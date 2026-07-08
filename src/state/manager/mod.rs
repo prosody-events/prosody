@@ -37,9 +37,7 @@ use crate::state::dirty::DirtyStore;
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, sweep_provisional};
-use crate::state::session::{
-    ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch,
-};
+use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
@@ -50,9 +48,10 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::timers::{TimerManager, TimerRequest, TimerType};
 use crate::{Key, Partition, SegmentId, Topic};
+use ahash::RandomState;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use scc::HashMap as ConcurrentHashMap;
 use std::error::Error;
-use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +73,22 @@ const RESCHEDULE_FLOOR: CompactDuration = CompactDuration::new(1);
 
 /// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
+
+/// Shared per-partition map from a key to the fire time of its standing
+/// `StateRecovery` backstop.
+///
+/// A lock-free [`scc::HashMap`](ConcurrentHashMap) (not a `Mutex<HashMap>`):
+/// the durability boundary touches it on every stateful commit, concurrently
+/// across the partition's keys, so a single mutex would serialize unrelated
+/// keys. The stored fire lets `arm_backstop` re-arm only when a newly-staged
+/// commit's fire is *sooner* than the standing one (the tightening the
+/// per-collection `recovery_within` bound needs); the map is still
+/// self-draining ([`PartitionStateManager::recover`] removes the key when the
+/// sweep fires), so it never grows without bound. Minted empty per acquisition:
+/// an absent key means *unknown*, not *unarmed* — `arm_backstop` seeds it from
+/// the durable trigger store on a key's first arm, so a prior epoch's standing
+/// backstop is never loosened.
+pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomState>>;
 
 /// The owned, per-event lifetime of a keyed-state session.
 ///
@@ -141,6 +156,12 @@ where
 /// runs the `StateRecovery` sweep. The manager is Kafka-agnostic: building
 /// the `EventRef` (including a message's dedup id) is the partition loop's
 /// job.
+///
+/// Kept as a trait for type-parameter compression and pattern symmetry with
+/// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider): the
+/// associated `Session` type lets callers name only the manager, not its
+/// backend and loader. It is deliberately not collapsed onto its single
+/// production impl [`StateManager`].
 pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
     type Session: CellSession;
@@ -205,6 +226,10 @@ pub enum SweepResolution {
 /// `T` is the partition's trigger-store handle, threaded through to
 /// [`StateBackendFactory::for_partition`] (which owns the handle-passing
 /// rationale).
+///
+/// Like [`PartitionStateManager`], kept as a trait for type-parameter
+/// compression and symmetry with `TriggerStoreProvider`, not collapsed onto its
+/// single production impl [`StateManagerProvider`].
 pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
     /// Manager minted per partition assignment.
     type Manager: PartitionStateManager;
@@ -248,8 +273,8 @@ where
     /// Keys mapped to the fire time of their standing `StateRecovery` backstop.
     /// Sessions read it to re-arm only when a newer commit's fire is sooner
     /// (the `recovery_within` tightening); `recover` removes the key when
-    /// the sweep fires. Semantics of an absent key are owned by
-    /// [`ArmedKeys`](crate::state::session::ArmedKeys): unknown, not unarmed.
+    /// the sweep fires. Semantics of an absent key are owned by [`ArmedKeys`]:
+    /// unknown, not unarmed.
     armed: ArmedKeys,
 }
 
@@ -272,17 +297,6 @@ where
         Self {
             inner: self.inner.clone(),
         }
-    }
-}
-
-impl<B, L> fmt::Debug for StateManager<B, L>
-where
-    B: StateBackend,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StateManager")
-            .field("segment_id", &self.inner.segment_id)
-            .finish_non_exhaustive()
     }
 }
 
@@ -323,43 +337,28 @@ where
         T: TriggerStore,
     {
         let state_key = StateKey::new(self.inner.segment_id, key.clone());
-        // Sweep↔debounce ordering (invariant 4 / finding F2): clear the armed
-        // flag BEFORE reading the provisional set, so the key's next stateful
-        // commit (or the reschedule below) re-arms a fresh backstop. Per-key
-        // serialization — a key's message and timer events run through one
-        // `KeyManager` queue — means no `arm_backstop` / `mark_backstop_armed`
-        // on this key runs while this sweep does, so this clear cannot race a
-        // re-arm. The boundary never point-clears another event's backstop:
-        // only this fired sweep clears, and only its own.
+        // Sweep↔debounce ordering (finding F2): clear the armed flag BEFORE
+        // reading the provisional set, so the key's next stateful commit (or the
+        // reschedule below) re-arms a fresh backstop. Per-key serialization — a
+        // key's message and timer events run through one `KeyManager` queue —
+        // means no `arm_backstop` / `mark_backstop_armed` on this key runs while
+        // this sweep does, so this clear cannot race a re-arm. The boundary never
+        // point-clears another event's backstop: only this fired sweep clears,
+        // and only its own.
         self.inner.armed.remove_async(&key).await;
-        // Sweep every registered collection on the key through the one uniform
-        // cell store. Names come from the in-process registry (the authoritative
-        // declared set) — a collection whose descriptor was removed is dormant,
-        // not swept.
-        let collections: Vec<(StateType, StateName)> = self
-            .inner
-            .registry
-            .collections()
-            .map(|(state_type, name)| (state_type, name.clone()))
-            .collect();
         match sweep_partition(
             &self.inner.cell,
             &self.inner.oracle,
-            collections,
             &self.inner.registry,
             &state_key,
         )
         .await
         {
-            // Fully resolved, or a per-cell Permanent skip (`false`): commit the
-            // fired trigger and reschedule nothing. Rescheduling a permanent skip
-            // would only spin a refire loop on a cell that never resolves;
-            // first-touch and the key's next commit recover it. The fired trigger
-            // is a per-(key, TimerType) singleton, so committing it is the whole
-            // story — no separate unschedule needed.
-            Ok(_all_resolved) => SweepResolution::Commit,
-            // A whole-sweep permanent failure (e.g. a permanently failing scan):
-            // commit to stop refiring forever; first-touch still recovers.
+            // Resolved, or a per-cell Permanent skip: commit and reschedule
+            // nothing (see the trait doc for why).
+            Ok(()) => SweepResolution::Commit,
+            // Whole-sweep permanent failure: commit to stop refiring; first-touch
+            // still recovers.
             Err(error) if error.classify_error() == ErrorCategory::Permanent => {
                 error!(
                     key = ?key,
@@ -368,10 +367,8 @@ where
                 );
                 SweepResolution::Commit
             }
-            // A transient/terminal store failure: never abort the trigger — an
-            // abort would stall it until reassignment (possibly days). Reschedule
-            // a fresh backstop so a soon sweep retries, then commit the fired
-            // trigger for progress.
+            // Transient/terminal failure: reschedule a fresh backstop, then
+            // commit (never abort — see the trait doc).
             Err(error) => {
                 error!(
                     key = ?key,
@@ -458,6 +455,7 @@ where
 /// Process-wide [`PartitionStateProvider`] over a
 /// [`StateBackendFactory`]: acquisition mints the partition's backend and
 /// eagerly validates descriptor identities.
+#[derive(Clone)]
 pub struct StateManagerProvider<F, L> {
     backend: F,
     loader: L,
@@ -505,32 +503,6 @@ impl<F, L> StateManagerProvider<F, L> {
             recovery_delay,
             validated: Arc::new(OnceCell::new()),
         }
-    }
-}
-
-impl<F, L> Clone for StateManagerProvider<F, L>
-where
-    F: Clone,
-    L: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            backend: self.backend.clone(),
-            loader: self.loader.clone(),
-            registry: self.registry.clone(),
-            consumer_group: self.consumer_group.clone(),
-            recovery_delay: self.recovery_delay,
-            validated: self.validated.clone(),
-        }
-    }
-}
-
-impl<F, L> fmt::Debug for StateManagerProvider<F, L> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StateManagerProvider")
-            .field("consumer_group", &self.consumer_group)
-            .field("recovery_delay", &self.recovery_delay)
-            .finish_non_exhaustive()
     }
 }
 
@@ -584,46 +556,47 @@ where
     }
 }
 
-/// Sweeps the given registered collections on `(segment, key)`, resolving any
-/// provisional cell through the oracle.
+/// Sweeps every registered collection on `(segment, key)`, resolving any
+/// provisional cell through the oracle. The swept set comes from `registry` —
+/// the in-process authoritative declared set; a collection whose descriptor was
+/// removed is dormant, not swept (an accepted non-concern). TTLs come from
+/// `registry`, falling back to the middleware-wide default.
 ///
-/// `collections` is the kind's registered `(state_type, name)` set sourced from
-/// the in-process registry (the authoritative declared set). A collection whose
-/// descriptor was removed is **not** swept — its residue is dormant until the
-/// declaration returns and the key is accessed (an accepted non-concern). TTLs
-/// come from `registry`, falling back to the middleware-wide default.
-///
-/// Returns `true` iff every collection ended fully resolved. A never-touched
-/// name streams no provisional cell and resolves trivially. A per-cell
-/// Permanent failure is logged and skipped inside
-/// [`sweep_provisional`](crate::state::resolve), leaving that collection
-/// unresolved (`false`) for first-touch or a later sweep; a transient/terminal
-/// failure propagates via `Err`. [`PartitionStateManager::recover`] maps the
-/// outcome: `Ok(_)` and a permanent error both commit the fired trigger, a
-/// transient/terminal error reschedules a fresh backstop.
+/// A never-touched name streams no provisional cell and resolves trivially. A
+/// per-cell Permanent failure is logged and skipped inside
+/// [`sweep_provisional`](crate::state::resolve), left for first-touch or a
+/// later sweep; a transient/terminal failure propagates via `Err` for
+/// [`PartitionStateManager::recover`] to reschedule against.
 ///
 /// # Errors
 ///
 /// Returns [`ResolveCellError`] on a transient/terminal backend or oracle
 /// failure.
-pub(crate) async fn sweep_partition<S, O>(
+async fn sweep_partition<S, O>(
     cell: &S,
     oracle: &O,
-    collections: impl IntoIterator<Item = (StateType, StateName)>,
     registry: &CollectionDefRegistry,
     state_key: &StateKey,
-) -> Result<bool, ResolveCellError<S::Error, O::Error>>
+) -> Result<(), ResolveCellError<S::Error, O::Error>>
 where
     S: CellStore,
     O: CommitOracle,
 {
+    // Own the `(state_type, name)` set up front: streaming the borrowed
+    // `registry.collections()` items straight into the concurrent fan-out
+    // trips a higher-ranked-lifetime bound on the per-item closure, and the
+    // owned set is small (the registered collection count).
+    let collections: Vec<(StateType, StateName)> = registry
+        .collections()
+        .map(|(state_type, name)| (state_type, name.clone()))
+        .collect();
     // Each name is its own Cassandra partition, so the per-collection sweeps
-    // fan out concurrently. `try_fold` reduces to one `bool` and short-circuits
-    // on a transient/terminal error (propagated via `?`); per-cell Permanent
-    // failures are logged and skipped inside `sweep_provisional` (returning
-    // `false`). `cooperative` wraps each sweep so the fan-out yields to the
-    // runtime every ~128 collections rather than draining in one poll.
-    let all_resolved = stream::iter(collections)
+    // fan out concurrently. `try_for_each` short-circuits on a
+    // transient/terminal error (propagated via `?`); per-cell Permanent
+    // failures are logged and skipped inside `sweep_provisional`. `cooperative`
+    // wraps each sweep so the fan-out yields to the runtime every ~128
+    // collections rather than draining in one poll.
+    stream::iter(collections)
         .map(|(state_type, name)| {
             cooperative(async move {
                 let ttl = registry.ttl_for(state_type, &name);
@@ -632,9 +605,8 @@ where
             })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-        .try_fold(true, |all, resolved| async move { Ok(all && resolved) })
-        .await?;
-    Ok(all_resolved)
+        .try_for_each(|_resolved| async move { Ok(()) })
+        .await
 }
 
 /// Error raised when a [`StateManagerProvider`] cannot acquire a

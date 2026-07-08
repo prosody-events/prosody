@@ -23,6 +23,7 @@ use crate::state::StateType;
 use crate::state::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
+use crate::state::tests::cell_suite::capped_vec;
 use color_eyre::eyre::{Result, eyre};
 use futures::future::join_all;
 use quickcheck::{Arbitrary, Gen};
@@ -101,8 +102,7 @@ pub(crate) struct IdentityTrace(Vec<IdentityOp>);
 
 impl Arbitrary for IdentityTrace {
     fn arbitrary(g: &mut Gen) -> Self {
-        let len = usize::arbitrary(g) % 24;
-        Self((0..len).map(|_| IdentityOp::arbitrary(g)).collect())
+        Self(capped_vec(g, 24))
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {

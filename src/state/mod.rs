@@ -25,6 +25,15 @@
 //! * [`registry`] — per-collection operational settings ([`CommitMode`],
 //!   [`registry::CollectionDef`], …).
 //!
+//! Three things here are named *identity*; keep them distinct. [`identity`]
+//! **addresses** a collection ([`CollectionId`], [`CollectionRef`],
+//! [`StateKey`]) — pure in-process routing, local and cheap. A collection's
+//! [`StructuralIdentity`](descriptor::StructuralIdentity) is the `(kind,
+//! codec_id, …)` **shape** a descriptor asserts. The [`descriptor_identity`]
+//! durable table **freezes** that shape group-globally on first use, validated
+//! against once at partition acquisition so a later redeploy cannot silently
+//! change it.
+//!
 //! The cross-cutting backend abstraction — the [`StateBackend`] bundle trait,
 //! its one concrete [`PartitionBackend`], and the [`StateBackendFactory`] that
 //! mints it per partition — belongs to no leaf and stays here.
@@ -100,6 +109,12 @@ pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 /// The per-partition backend bundle: the one uniform durable cell store, the
 /// shared commit oracle, and the shared descriptor-identity store — behind one
 /// type parameter so the session and manager name only `B`.
+///
+/// The bundling exists for **type-parameter compression**: the three stores
+/// travel behind one `B`, so [`StateManager`](manager::StateManager) and the
+/// session name a single parameter instead of threading the
+/// [`PartitionBackend`] `<O, I, C>` shape through every generic signature. A
+/// deliberate ruling — do not inline the three back out.
 ///
 /// Minted as one unit by [`StateBackendFactory::for_partition`] so the oracle
 /// the sessions stage against (for the dedup marker) and the oracle the cell

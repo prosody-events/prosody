@@ -100,9 +100,9 @@ const MEMO_SECTIONS: usize = 1024;
 /// [`IntervalSet`] of each hot section is **memoized** ([`MEMO_SECTIONS`]
 /// capacity): reads answer from the memo with zero fjall I/O, and every
 /// mutation runs the algebra on the memoized set and rewrites the whole
-/// section range in one blocking hop (fjall is the spill + reload source, an
-/// ascending range yields intervals sorted by low bound — see the bound-frame
-/// codec).
+/// section range in one blocking hop (fjall is the spill + reload source; its
+/// stored range order is tag-first, not low-bound order — loading re-sorts
+/// the pairs into the `BTreeMap`).
 ///
 /// The one-per-partition [`FjallCellCache`] handle is a cheap `Arc` clone of
 /// the one the [`Cached`](super::Cached) cache operates, so coverage shares the
@@ -247,8 +247,7 @@ impl Coverage {
     }
 
     /// Covers `interval` in the section (union/merge). Born resolved
-    /// (`CovBuild`): the callers — the scan-drain, the write-through mutator
-    /// publishes, and cover-on-get — all carry committed projections only.
+    /// (`CovBuild` — see the module-level bullet).
     ///
     /// # Errors
     ///
@@ -418,7 +417,7 @@ impl PartialOrd for LowBound {
 /// source of truth and cannot drift from a duplicated copy. Every mutation
 /// preserves pairwise-disjointness and non-emptiness.
 #[derive(Clone, Debug, Default)]
-pub struct IntervalSet {
+struct IntervalSet {
     intervals: BTreeMap<LowBound, Bound<Coordinate>>,
 }
 
@@ -448,7 +447,7 @@ impl IntervalSet {
 
     /// Unions `interval` into the set, merging any intervals it touches or
     /// overlaps (complementary endpoints rejoin; real holes never merge).
-    pub(in crate::state::cached) fn cover(&mut self, interval: Interval) {
+    fn cover(&mut self, interval: Interval) {
         let Interval { mut lo, mut hi } = interval;
 
         // Left-merge: at most one predecessor can reach `lo`, since
@@ -490,28 +489,29 @@ impl IntervalSet {
         self.intervals.insert(LowBound(lo), hi);
     }
 
-    /// Whether `coordinate` is covered by some interval in the set.
-    fn covers(&self, coordinate: &Coordinate) -> bool {
-        // The only candidate is the interval with the greatest low `<=` the
-        // coordinate; an `Excluded(c)` low sorts after `Included(c)` and is
-        // correctly excluded.
+    /// The `(key, hi)` entry of the one interval that could contain
+    /// `coordinate` — the interval with the greatest low `<=` the coordinate;
+    /// an `Excluded(c)` low sorts after `Included(c)` and is correctly
+    /// excluded — filtered to where it actually contains it. `None` when
+    /// `coordinate` is not covered.
+    fn containing(&self, coordinate: &Coordinate) -> Option<(LowBound, Bound<Coordinate>)> {
         self.intervals
             .range(..=LowBound(Bound::Included(coordinate.clone())))
             .next_back()
-            .is_some_and(|(key, hi)| interval(key, hi).contains(coordinate))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(key, hi)| interval(key, hi).contains(coordinate))
+    }
+
+    /// Whether `coordinate` is covered by some interval in the set.
+    fn covers(&self, coordinate: &Coordinate) -> bool {
+        self.containing(coordinate).is_some()
     }
 
     /// Splits the interval containing `coordinate` into `[lo, Excluded(X))` and
     /// `(Excluded(X), hi]`, dropping either empty half. A no-op when the
     /// coordinate is not covered.
     fn punch(&mut self, coordinate: &Coordinate) {
-        let Some((key, hi)) = self
-            .intervals
-            .range(..=LowBound(Bound::Included(coordinate.clone())))
-            .next_back()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .filter(|(key, hi)| interval(key, hi).contains(coordinate))
-        else {
+        let Some((key, hi)) = self.containing(coordinate) else {
             return;
         };
         self.intervals.remove(&key);
@@ -563,18 +563,18 @@ impl IntervalSet {
             };
             // Emit the gap before this covered slice, if any.
             if cmp_low(&cov_lo, &cursor) == Ordering::Greater
-                && let Some(gap) = Interval::new(cursor.clone(), complement_low(&cov_lo))
+                && let Some(gap) = Interval::new(cursor.clone(), complement(&cov_lo))
             {
                 pieces.push(Piece::Gap(gap));
             }
             pieces.push(Piece::Covered(covered));
             // Reaching the request's high bound tiles it completely; stop before
-            // a spurious trailing gap (`complement_high(Unbounded)` would not
+            // a spurious trailing gap (`complement(Unbounded)` would not
             // otherwise signal completion).
             if cmp_high(&cov_hi, &request.hi) == Ordering::Equal {
                 return pieces;
             }
-            cursor = complement_high(&cov_hi);
+            cursor = complement(&cov_hi);
         }
         if let Some(gap) = Interval::new(cursor, request.hi.clone()) {
             pieces.push(Piece::Gap(gap));
@@ -677,23 +677,14 @@ fn min_high(a: &Bound<Coordinate>, b: &Bound<Coordinate>) -> Bound<Coordinate> {
     }
 }
 
-/// The high bound that closes the gap ending just before a covered slice's low
-/// bound: the gap stops where the covered slice starts (`Included(X)` low →
-/// gap ends `Excluded(X)`; `Excluded(X)` low → gap ends `Included(X)`).
-fn complement_low(low: &Bound<Coordinate>) -> Bound<Coordinate> {
-    match low {
-        Bound::Included(x) => Bound::Excluded(x.clone()),
-        Bound::Excluded(x) => Bound::Included(x.clone()),
-        // A covered slice's low is clamped to the request, never unbounded here.
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
-/// The low bound that opens the next piece just after a covered slice's high
-/// bound (`Included(X)` high → next starts `Excluded(X)`; `Excluded(X)` high →
-/// next starts `Included(X)`).
-fn complement_high(high: &Bound<Coordinate>) -> Bound<Coordinate> {
-    match high {
+/// Flips a bound across its own coordinate — `Included(X)` ↔ `Excluded(X)`,
+/// `Unbounded` ↔ `Unbounded` — used both ways in `query`: as a high bound it
+/// opens the next piece just after a covered slice ends; as a low bound it
+/// closes the gap just before a covered slice starts. Either reading, a
+/// covered slice's bound here is always clamped to the request, never
+/// unbounded.
+fn complement(bound: &Bound<Coordinate>) -> Bound<Coordinate> {
+    match bound {
         Bound::Included(x) => Bound::Excluded(x.clone()),
         Bound::Excluded(x) => Bound::Included(x.clone()),
         Bound::Unbounded => Bound::Unbounded,

@@ -16,7 +16,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::encoding::EncodingError;
 use thiserror::Error;
 
-/// Errors that can occur during Cassandra cell store operations.
+/// See the module doc for retry classification.
 #[derive(Debug, Error)]
 pub enum CassandraCellStoreError {
     /// Wrapped Cassandra driver error.
@@ -28,12 +28,8 @@ pub enum CassandraCellStoreError {
     Encoding(#[from] EncodingError),
 
     /// The cell row columns formed a shape the cell decoder rejects.
-    #[error("Cassandra cell row is corrupt: {reason}")]
-    CorruptCell {
-        /// Specific corruption shape; also the `source()` of this error.
-        #[from]
-        reason: CellCorruptReason,
-    },
+    #[error("Cassandra cell row is corrupt: {0}")]
+    CorruptCell(#[from] CellCorruptReason),
 
     /// The `event_ref` UDT was not in a shape this build understands.
     #[error("Cassandra event_ref UDT is corrupt: {0}")]
@@ -57,7 +53,7 @@ impl ClassifyError for CassandraCellStoreError {
         match self {
             Self::Database(e) => e.classify_error(),
             Self::Encoding(_)
-            | Self::CorruptCell { .. }
+            | Self::CorruptCell(_)
             | Self::CorruptUdt(_)
             | Self::VersionMismatch { .. } => ErrorCategory::Permanent,
         }

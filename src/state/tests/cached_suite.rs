@@ -632,9 +632,9 @@ fn coverage_scan_isolation() -> Result<()> {
     })
 }
 
-/// Coop-budget smoke: a fully covered scan over more than the ~128-item coop
-/// threshold drives to completion, guarding the `cooperative` wrap on the
-/// covered (fjall) serve.
+/// Wide covered scan: a fully covered scan over more than the ~128-item coop
+/// threshold drives to completion and yields all N cells from the covered
+/// (fjall) serve.
 #[test]
 fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -676,10 +676,8 @@ fn prop_memory_cached_crash_equivalence() {
         // oracle, so a crash drops coverage but not durable state.
         // `test_db::cold_cache` reuses the `crash` keyspace pair on the shared
         // database and CLEARS it (a cheap journal marker, no fsync) — modeling a
-        // fresh epoch without a ~128 ms keyspace creation. Measured ~3× faster
-        // than a fresh database/keyspace per make (682 s → 222 s at 256
-        // iterations). Distinct v4 segments per iteration keep the shared
-        // keyspace's crashes disjoint.
+        // fresh epoch without a keyspace creation per make. Distinct v4 segments
+        // per iteration keep the shared keyspace's crashes disjoint.
         let make = || {
             let lower = MemoryCellStore::new(
                 cells.clone(),
@@ -1308,9 +1306,9 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
     QuickCheck::new().quickcheck(property as fn(TtlMutTrace) -> Result<bool>);
 }
 
-/// The covered-SCAN expired-refill path (the plan's critical adversarial
-/// finding, previously unproven): under FLOOR rounding a fjall entry expires
-/// slightly before its durable row, so a covered scan that meets an expired
+/// The covered-SCAN expired-refill path (previously unproven): under FLOOR
+/// rounding a fjall entry expires slightly before its durable row, so a covered
+/// scan that meets an expired
 /// entry must REFILL that sub-range from the lower store — never read the
 /// expired coordinate as absent. Warms a covered scan, advances the clock past
 /// the floor expiry to a **sub-second** instant, asserts the re-scan still

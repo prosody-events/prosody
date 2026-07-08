@@ -22,6 +22,7 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
 use scylla::client::session::Session;
+use scylla::response::query_result::ColumnSpecs;
 use scylla::value::{CqlValue, Row};
 use std::sync::Arc;
 use thiserror::Error;
@@ -102,96 +103,24 @@ impl DescriptorIdentityStore for CassandraDescriptorIdentityStore {
             .map_err(CassandraStoreError::from)?;
         // Read the `[applied]` flag and any echoed columns by name: the result
         // column order is the driver's, not the schema's, so never positional.
-        let specs: Vec<String> = result
-            .column_specs()
-            .iter()
-            .map(|c| c.name().to_owned())
-            .collect();
+        let specs = result.column_specs();
         let lwt = result
             .maybe_first_row::<Row>()
             .map_err(CassandraStoreError::from)?
             .ok_or(CassandraDescriptorIdentityError::MalformedLwtResult)?;
-        if column_bool(&specs, &lwt, "[applied]")? {
+        if column_bool(specs, &lwt, "[applied]")? {
             Ok(RegisterOutcome::Applied)
         } else {
             Ok(RegisterOutcome::Conflict(conflict_identity(
-                &specs, &lwt, row,
+                specs, &lwt, row,
             )?))
         }
     }
 }
 
-/// Decodes the existing identity a failed `INSERT … IF NOT EXISTS` echoes.
-///
-/// `state_type` and `name` are the key we registered under (`asserted`), so the
-/// conflict shares them by construction — only the contested
-/// `kind`/`codec_id`/`resolver_id` are read from the echoed columns, by name
-/// (the result column order is the driver's, not the schema's).
-fn conflict_identity(
-    specs: &[String],
-    row: &Row,
-    asserted: &DurableDescriptorIdentity,
-) -> Result<DurableDescriptorIdentity, CassandraDescriptorIdentityError> {
-    Ok(DurableDescriptorIdentity {
-        state_type: asserted.state_type,
-        name: asserted.name.clone(),
-        kind: column_tinyint(specs, row, "kind")?,
-        resolver_id: column_text_opt(specs, row, "resolver_id"),
-        codec_id: column_text(specs, row, "codec_id")?,
-        key_codec_id: column_text_opt(specs, row, "key_codec_id"),
-    })
-}
-
-/// The value of `name` in `row`, positioned via `specs` (name-matched), or
-/// `None` when the column is absent or NULL.
-fn column_value<'a>(specs: &[String], row: &'a Row, name: &str) -> Option<&'a CqlValue> {
-    let idx = specs.iter().position(|c| c == name)?;
-    row.columns.get(idx)?.as_ref()
-}
-
-fn column_bool(
-    specs: &[String],
-    row: &Row,
-    name: &str,
-) -> Result<bool, CassandraDescriptorIdentityError> {
-    match column_value(specs, row, name) {
-        Some(CqlValue::Boolean(b)) => Ok(*b),
-        _ => Err(CassandraDescriptorIdentityError::MalformedLwtResult),
-    }
-}
-
-fn column_tinyint(
-    specs: &[String],
-    row: &Row,
-    name: &str,
-) -> Result<i8, CassandraDescriptorIdentityError> {
-    match column_value(specs, row, name) {
-        Some(CqlValue::TinyInt(v)) => Ok(*v),
-        _ => Err(CassandraDescriptorIdentityError::MalformedLwtResult),
-    }
-}
-
-fn column_text(
-    specs: &[String],
-    row: &Row,
-    name: &str,
-) -> Result<String, CassandraDescriptorIdentityError> {
-    match column_value(specs, row, name) {
-        Some(CqlValue::Text(s)) => Ok(s.clone()),
-        _ => Err(CassandraDescriptorIdentityError::MalformedLwtResult),
-    }
-}
-
-fn column_text_opt(specs: &[String], row: &Row, name: &str) -> Option<String> {
-    match column_value(specs, row, name) {
-        Some(CqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 /// The non-key identity columns a [`IdentityQueries::read_identity`] point-read
-/// returns, deserialized as raw integers so an unknown future discriminant
-/// compares unequal rather than tearing the row down.
+/// returns. `kind` is deserialized as a raw integer so an unknown future
+/// discriminant compares unequal rather than tearing the row down.
 #[derive(scylla::DeserializeRow)]
 struct IdentityColumns {
     kind: i8,
@@ -210,6 +139,72 @@ impl IdentityColumns {
             codec_id: self.codec_id,
             key_codec_id: self.key_codec_id,
         }
+    }
+}
+
+/// Decodes the existing identity a failed `INSERT … IF NOT EXISTS` echoes.
+///
+/// `state_type` and `name` are the key we registered under (`asserted`), so the
+/// conflict shares them by construction — only the contested
+/// `kind`/`codec_id`/`resolver_id`/`key_codec_id` are read from the echoed
+/// columns, by name (the result column order is the driver's, not the
+/// schema's).
+fn conflict_identity(
+    specs: ColumnSpecs<'_, '_>,
+    row: &Row,
+    asserted: &DurableDescriptorIdentity,
+) -> Result<DurableDescriptorIdentity, CassandraDescriptorIdentityError> {
+    Ok(DurableDescriptorIdentity {
+        state_type: asserted.state_type,
+        name: asserted.name.clone(),
+        kind: column_tinyint(specs, row, "kind")?,
+        resolver_id: column_text_opt(specs, row, "resolver_id"),
+        codec_id: column_text(specs, row, "codec_id")?,
+        key_codec_id: column_text_opt(specs, row, "key_codec_id"),
+    })
+}
+
+/// The value of `name` in `row`, positioned via `specs` (name-matched), or
+/// `None` when the column is absent or NULL.
+fn column_value<'a>(specs: ColumnSpecs<'_, '_>, row: &'a Row, name: &str) -> Option<&'a CqlValue> {
+    let (idx, _) = specs.get_by_name(name)?;
+    row.columns.get(idx)?.as_ref()
+}
+
+fn column_bool(
+    specs: ColumnSpecs<'_, '_>,
+    row: &Row,
+    name: &str,
+) -> Result<bool, CassandraDescriptorIdentityError> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::Boolean(b)) => Ok(*b),
+        _ => Err(CassandraDescriptorIdentityError::MalformedLwtResult),
+    }
+}
+
+fn column_tinyint(
+    specs: ColumnSpecs<'_, '_>,
+    row: &Row,
+    name: &str,
+) -> Result<i8, CassandraDescriptorIdentityError> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::TinyInt(v)) => Ok(*v),
+        _ => Err(CassandraDescriptorIdentityError::MalformedLwtResult),
+    }
+}
+
+fn column_text(
+    specs: ColumnSpecs<'_, '_>,
+    row: &Row,
+    name: &str,
+) -> Result<String, CassandraDescriptorIdentityError> {
+    column_text_opt(specs, row, name).ok_or(CassandraDescriptorIdentityError::MalformedLwtResult)
+}
+
+fn column_text_opt(specs: ColumnSpecs<'_, '_>, row: &Row, name: &str) -> Option<String> {
+    match column_value(specs, row, name) {
+        Some(CqlValue::Text(s)) => Some(s.clone()),
+        _ => None,
     }
 }
 

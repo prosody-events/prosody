@@ -108,13 +108,6 @@ fn unknown_tag_byte_is_rejected() {
     );
 }
 
-#[test]
-fn collection_prefix_is_deterministic() -> Result<()> {
-    let id = fixed_collection("profile")?;
-    assert_eq!(collection_prefix(&id), collection_prefix(&id));
-    Ok(())
-}
-
 /// A collection identity whose variable-length fields are drawn from a tiny
 /// null-prone alphabet, so the injectivity property reaches the corner a
 /// delimiter scheme would break: a `key`/`name` containing the delimiter

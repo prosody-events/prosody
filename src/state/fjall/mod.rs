@@ -22,15 +22,12 @@
 //! # Three-valued reads and TTL co-expiry
 //!
 //! Unlike the durable stores (Memory/Cassandra) whose `get` returns only
-//! `Present`/`Absent`, the cache observes a third state: an entry that
-//! has never been populated. That state is encoded as the **absence of an
-//! entry** in the fjall keyspace, and decodes as the codec's three-valued
-//! `Read::Unknown`. Tag byte `0x00` is
-//! `Absent` (known cleared); tag byte `0x01` is `Present`. Each frame carries
-//! an absolute expiry header (`[tag][expiry: u64 BE millis][payload]`, `0` =
-//! never) mirroring the durable row's TTL death — fjall has no native per-entry
-//! TTL, so the cache enforces it on read against its [`Clock`] (an expired
-//! entry reads as a miss). The payload is stored verbatim — fjall
+//! `Present`/`Absent`, the cache observes a third state: an entry that has
+//! never been populated. That state is encoded as the **absence of an entry**
+//! in the fjall keyspace, and decodes as the codec's three-valued
+//! `Read::Unknown` (see the `codec` module's cell-frame doc for the tag/expiry
+//! wire layout). The cache enforces the TTL on read against its [`Clock`] (an
+//! expired entry reads as a miss). The payload is stored verbatim — fjall
 //! block-compresses the on-disk data block via LZ4, so there is no per-cell
 //! codec layer.
 //!
@@ -109,6 +106,44 @@ impl Clock {
             Self::Fixed(now) => now.load(Ordering::Relaxed),
         }
     }
+}
+
+/// The three-state result of a [`FjallCellCache::get`].
+#[derive(Clone, Debug)]
+pub enum CacheRead {
+    /// An unexpired entry (a `Present` value or an authoritative `Absent`).
+    Hit(Committed),
+    /// An entry exists but its stamped expiry has passed; the caller falls
+    /// through to the lower store and re-publishes a fresh entry.
+    Expired,
+    /// No entry exists (never written, or a gap within a covered scan range).
+    Miss,
+}
+
+/// One item of a [`FjallCellCache::scan_present`] covered serve: a live present
+/// cell, or an expired covered coordinate the caller must re-fetch from the
+/// lower store (FLOOR rounding can expire a fjall entry just before its durable
+/// row, so an expired covered coordinate is a gap, not an absence).
+#[derive(Clone, Debug)]
+pub enum ScanHit {
+    /// An unexpired present cell, served straight from the cache.
+    Present(CellKey, Bytes),
+    /// A covered coordinate whose fjall entry expired; fall through to the
+    /// lower store for it.
+    Expired(CellKey),
+}
+
+/// The per-cell outcome [`FjallCellCache::commit_batch`] reports: whether the
+/// re-published committed value now **covers** the coordinate, or the
+/// coordinate must be **uncovered** (its stage entry was missing/unreadable,
+/// or the atomic batch commit failed) so the next read falls through and
+/// self-heals.
+#[derive(Clone, Copy, Debug)]
+pub enum CoverDecision {
+    /// The committed value was re-published; cover the coordinate.
+    Cover,
+    /// Uncover the coordinate; the next read re-publishes from the lower store.
+    Punch,
 }
 
 /// Fjall-backed cell cache.
@@ -325,8 +360,7 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<CacheRead, FjallCellCacheError> {
-        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
-        let (expiry, read) = codec::decode_cell(raw.as_deref())?;
+        let (expiry, read) = self.read_decoded(collection, cell).await?;
         Ok(match read {
             Read::Unknown => CacheRead::Miss,
             _ if expired(expiry, self.clock.now_ms()) => CacheRead::Expired,
@@ -353,12 +387,23 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
-        let (expiry, read) = codec::decode_cell(raw.as_deref())?;
+        let (expiry, read) = self.read_decoded(collection, cell).await?;
         Ok(match read {
             Read::Unknown => None,
             _ => Some(expiry),
         })
+    }
+
+    /// Reads and decodes one cell's raw fjall frame: the shared prologue
+    /// behind [`get`](Self::get) and [`stored_expiry`](Self::stored_expiry),
+    /// which differ only in how they treat an expired stamp.
+    async fn read_decoded(
+        &self,
+        collection: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
+        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        codec::decode_cell(raw.as_deref())
     }
 
     /// Write-through: publishes one cell's committed projection with an
@@ -381,10 +426,7 @@ impl FjallCellCache {
         if self.fail_puts.load(Ordering::Relaxed) {
             return Err(FjallCellCacheError::Injected);
         }
-        let frame = match value.get() {
-            Some(payload) => codec::encode_present_cell(payload, expiry),
-            None => codec::encode_absent_cell(expiry),
-        };
+        let frame = encode_frame(value.get(), expiry);
         write_cell(
             self.inner.handle(),
             codec::cell_key(collection, cell),
@@ -394,7 +436,8 @@ impl FjallCellCache {
     }
 
     /// Write-through publish of a *batch* of committed cell projections in a
-    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`].
+    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`]
+    /// (the shared `run_batch` ceremony).
     ///
     /// Each `(cell, projection, expiry)` is encoded to a frame and inserted;
     /// `commit` lands the whole set as one fjall mutation, so a multi-cell
@@ -406,7 +449,8 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Returns [`FjallCellCacheError`] when the batch commit fails; the caller
-    /// then uncovers every coordinate (Cov3).
+    /// then uncovers every coordinate (Cov3 — see
+    /// [`Cached`](crate::state::cached::Cached)'s module doc).
     pub async fn put_batch(
         &self,
         collection: &CollectionId,
@@ -420,23 +464,18 @@ impl FjallCellCache {
         // closure only touches fjall; the owned key/frame pairs move into it.
         let mut framed: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(cells.len());
         for (cell, value, expiry) in cells {
-            let frame = match value.get() {
-                Some(payload) => codec::encode_present_cell(payload, *expiry),
-                None => codec::encode_absent_cell(*expiry),
-            };
+            let frame = encode_frame(value.get(), *expiry);
             framed.push((codec::cell_key(collection, cell), frame));
         }
-        let database = self.inner.database().clone();
         let handle = self.inner.handle().clone();
-        spawn_blocking(move || {
-            let mut batch = OwnedWriteBatch::with_capacity(database, framed.len());
+        let capacity = framed.len();
+        self.run_batch(handle, capacity, move |batch, handle| {
             for (key, frame) in &framed {
-                batch.insert(&handle, key.as_slice(), frame.as_ref());
+                batch.insert(handle, key.as_slice(), frame.as_ref());
             }
-            batch.commit()
+            Ok(())
         })
-        .await??;
-        Ok(())
+        .await
     }
 
     /// Promotes a batch of staged cells into committed cache entries in a
@@ -445,14 +484,16 @@ impl FjallCellCache {
     /// re-publishes `data` at that **same** expiry, then commits the whole set
     /// at once. Reusing the stage expiry is load-bearing — the lower promote
     /// keeps `data`'s death set at stage time, so a fresh `now + ttl` would
-    /// overhang it (Cov1).
+    /// overhang it (Cov1 — see [`Cached`](crate::state::cached::Cached)'s
+    /// module doc).
     ///
     /// Returns one [`CoverDecision`] per write, aligned to `writes` order:
     /// [`Cover`](CoverDecision::Cover) when the cell was re-published,
     /// [`Punch`](CoverDecision::Punch) when its stage entry was missing or
     /// unreadable, or — for **every** write — when the batch commit failed.
     /// Best-effort: it never returns an error, so the caller can return the
-    /// lower promote's `Result` verbatim (the Incomplete trap).
+    /// lower promote's `Result` verbatim (the Incomplete trap — likewise
+    /// defined there).
     pub async fn commit_batch(
         &self,
         collection: &CollectionId,
@@ -476,10 +517,7 @@ impl FjallCellCache {
             for (key, data) in &inputs {
                 match stage_expiry(&handle, key) {
                     Some(expiry) => {
-                        let frame = match data {
-                            Some(payload) => codec::encode_present_cell(payload, expiry),
-                            None => codec::encode_absent_cell(expiry),
-                        };
+                        let frame = encode_frame(data.as_ref(), expiry);
                         batch.insert(&handle, key.as_slice(), frame.as_ref());
                         decisions.push(CoverDecision::Cover);
                     }
@@ -642,11 +680,10 @@ impl FjallCellCache {
     ///
     /// Propagates a fjall write failure.
     pub async fn index_unseed(&self, collection: &CollectionId) -> Result<(), FjallCellCacheError> {
-        remove_index(
-            self.inner.index_handle(),
-            codec::index_seeded_key(collection),
-        )
-        .await
+        let handle = self.inner.index_handle().clone();
+        let key = codec::index_seeded_key(collection);
+        spawn_blocking(move || handle.remove(key.as_slice())).await??;
+        Ok(())
     }
 
     /// Records `cell` as a live provisional coordinate of `collection`.
@@ -693,17 +730,15 @@ impl FjallCellCache {
             return Err(FjallCellCacheError::Injected);
         }
         let keys = index_keys(collection, cells);
-        let database = self.inner.database().clone();
         let handle = self.inner.index_handle().clone();
-        spawn_blocking(move || {
-            let mut batch = OwnedWriteBatch::with_capacity(database, keys.len());
+        let capacity = keys.len();
+        self.run_batch(handle, capacity, move |batch, handle| {
             for key in &keys {
-                batch.insert(&handle, key.as_slice(), [].as_slice());
+                batch.insert(handle, key.as_slice(), [].as_slice());
             }
-            batch.commit()
+            Ok(())
         })
-        .await??;
-        Ok(())
+        .await
     }
 
     /// Clears a batch of resolved provisional coordinates from `collection` in
@@ -722,17 +757,15 @@ impl FjallCellCache {
         I: ExactSizeIterator<Item = &'a CellKey>,
     {
         let keys = index_keys(collection, cells);
-        let database = self.inner.database().clone();
         let handle = self.inner.index_handle().clone();
-        spawn_blocking(move || {
-            let mut batch = OwnedWriteBatch::with_capacity(database, keys.len());
+        let capacity = keys.len();
+        self.run_batch(handle, capacity, move |batch, handle| {
             for key in &keys {
-                batch.remove(&handle, key.as_slice());
+                batch.remove(handle, key.as_slice());
             }
-            batch.commit()
+            Ok(())
         })
-        .await??;
-        Ok(())
+        .await
     }
 
     /// Snapshots `collection`'s live provisional coordinates — the recovery
@@ -824,7 +857,6 @@ impl FjallCellCache {
         {
             return Err(FjallCellCacheError::Injected);
         }
-        let database = self.inner.database().clone();
         let handle = self.inner.index_handle().clone();
         let prefix = codec::index_cover_prefix(collection, section);
         // Encode every key/value frame up front (bounded, sized once) so the
@@ -836,8 +868,8 @@ impl FjallCellCache {
                 codec::encode_bound(hi),
             ));
         }
-        spawn_blocking(move || {
-            let mut batch = OwnedWriteBatch::with_capacity(database, framed.len() + 1);
+        let capacity = framed.len() + 1;
+        self.run_batch(handle, capacity, move |batch, handle| {
             // Clear the section's whole existing range, then re-insert the merged
             // set. `remove_range`-by-prefix has no batch primitive, so stale keys
             // are removed by first collecting them in the same guard scan.
@@ -846,11 +878,31 @@ impl FjallCellCache {
                 .map(|guard| guard.into_inner().map(|(key, _)| key))
                 .collect::<Result<_, _>>()?;
             for key in &stale {
-                batch.remove(&handle, key.as_ref());
+                batch.remove(handle, key.as_ref());
             }
             for (key, value) in &framed {
-                batch.insert(&handle, key.as_slice(), value.as_slice());
+                batch.insert(handle, key.as_slice(), value.as_slice());
             }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Runs `fill` over a fresh [`OwnedWriteBatch`] against `handle` and
+    /// commits it, all in a single blocking hop — the shared ceremony behind
+    /// every all-or-nothing batch mutator except
+    /// [`commit_batch`](Self::commit_batch), which reports a per-cell
+    /// [`CoverDecision`] instead of a bare result.
+    async fn run_batch(
+        &self,
+        handle: Keyspace,
+        capacity: usize,
+        fill: impl FnOnce(&mut OwnedWriteBatch, &Keyspace) -> fjall::Result<()> + Send + 'static,
+    ) -> Result<(), FjallCellCacheError> {
+        let database = self.inner.database().clone();
+        spawn_blocking(move || {
+            let mut batch = OwnedWriteBatch::with_capacity(database, capacity);
+            fill(&mut batch, &handle)?;
             batch.commit()
         })
         .await??;
@@ -908,6 +960,15 @@ fn scan_hop(
     Ok((hits, None))
 }
 
+/// Encodes a cell's presence/absence into its stored frame at `expiry`: a
+/// present `payload` writes the payload cell, `None` writes the `Absent` tag.
+fn encode_frame(payload: Option<&Bytes>, expiry: u64) -> Bytes {
+    match payload {
+        Some(payload) => codec::encode_present_cell(payload, expiry),
+        None => codec::encode_absent_cell(expiry),
+    }
+}
+
 /// The encoded warm-index keys of a batch of coordinates — built up front
 /// (bounded, sized once) so the blocking batch closure only touches fjall.
 fn index_keys<'a>(
@@ -945,51 +1006,6 @@ async fn write_index_empty(handle: &Keyspace, key: Vec<u8>) -> Result<(), FjallC
     let handle = handle.clone();
     spawn_blocking(move || handle.insert(key.as_slice(), [].as_slice())).await??;
     Ok(())
-}
-
-/// Removes a warm-index key, one blocking hop.
-async fn remove_index(handle: &Keyspace, key: Vec<u8>) -> Result<(), FjallCellCacheError> {
-    let handle = handle.clone();
-    spawn_blocking(move || handle.remove(key.as_slice())).await??;
-    Ok(())
-}
-
-/// The three-state result of a [`FjallCellCache::get`].
-#[derive(Clone, Debug)]
-pub enum CacheRead {
-    /// An unexpired entry (a `Present` value or an authoritative `Absent`).
-    Hit(Committed),
-    /// An entry exists but its stamped expiry has passed; the caller falls
-    /// through to the lower store and re-publishes a fresh entry.
-    Expired,
-    /// No entry exists (never written, or a gap within a covered scan range).
-    Miss,
-}
-
-/// One item of a [`FjallCellCache::scan_present`] covered serve: a live present
-/// cell, or an expired covered coordinate the caller must re-fetch from the
-/// lower store (FLOOR rounding can expire a fjall entry just before its durable
-/// row, so an expired covered coordinate is a gap, not an absence).
-#[derive(Clone, Debug)]
-pub enum ScanHit {
-    /// An unexpired present cell, served straight from the cache.
-    Present(CellKey, Bytes),
-    /// A covered coordinate whose fjall entry expired; fall through to the
-    /// lower store for it.
-    Expired(CellKey),
-}
-
-/// The per-cell outcome [`FjallCellCache::commit_batch`] reports: whether the
-/// re-published committed value now **covers** the coordinate, or the
-/// coordinate must be **uncovered** (its stage entry was missing/unreadable,
-/// or the atomic batch commit failed) so the next read falls through and
-/// self-heals.
-#[derive(Clone, Copy, Debug)]
-pub enum CoverDecision {
-    /// The committed value was re-published; cover the coordinate.
-    Cover,
-    /// Uncover the coordinate; the next read re-publishes from the lower store.
-    Punch,
 }
 
 /// Whether an absolute `expiry` (millis; `0` = never) has passed at `now`.

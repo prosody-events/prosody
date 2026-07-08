@@ -3,9 +3,7 @@
 //! [`CassandraStore`] implements the untyped [`CellStore`] over the
 //! `keyed_state_cell` table provisioned by migration
 //! `20260522_create_keyed_state.cql`. Every durable mutation writes one
-//! self-consistent cell-column shape in a single statement, so the
-//! applied-triple desync class the write-ahead-log design fought is unwritable
-//! here.
+//! self-consistent cell-column shape in a single statement.
 //!
 //! It is the **bottom** store: it owns the commit oracle (via the composed
 //! [`Resolver`]) and oracle-resolves any in-flight provisional cell inside
@@ -83,6 +81,7 @@ use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;
 use scylla::statement::prepared::PreparedStatement;
 use smallvec::smallvec;
+use std::error::Error;
 use std::ops::Bound;
 use std::sync::Arc;
 #[cfg(test)]
@@ -123,7 +122,7 @@ const PER_STATEMENT_OVERHEAD: u64 = 512;
 /// this build writes version 1 and rejects any other at decode
 /// ([`decode::validate_version`]). Per-key identity migration is future work —
 /// the stamp is the dormant hook it would build on.
-pub const INITIAL_VERSION: i32 = 1;
+const INITIAL_VERSION: i32 = 1;
 
 /// The leading clustering discriminator that splits a collection's partition
 /// into two disjoint front-to-back ranges.
@@ -136,14 +135,14 @@ pub const INITIAL_VERSION: i32 = 1;
 /// serialize-only ([`SerializeValue`] in [`super::serialize`]), with no
 /// `TryFrom`/`DeserializeValue`.
 ///
-/// # Reserved-`kind` safety (invariant 6)
+/// # Reserved-`kind` safety
 ///
 /// `kind` is **cell-store-internal**: it splits the physical partition into the
 /// data slice and the recovery-marker slice, and no collection may address the
 /// marker slice. This is enforced structurally, not by a runtime check:
 ///
-/// * `CellKind` and its `Index` variant are private to this module — never
-///   re-exported, never reachable from a collection.
+/// * `CellKind` and its `Index` variant are private to the Cassandra state
+///   backend — never re-exported, never reachable from a collection.
 /// * A collection addresses a cell only through a [`CellKey`], which carries
 ///   **only** `(section, coordinate)` — it has no `kind` field, so the marker
 ///   slice is unnameable from the collection layer.
@@ -157,8 +156,8 @@ pub const INITIAL_VERSION: i32 = 1;
 /// [`CellKey`]: crate::state::cell_key::CellKey
 /// [`SerializeValue`]: scylla::serialize::value::SerializeValue
 #[repr(i8)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum CellKind {
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CellKind {
     /// A cell row: the full `data | prev_data | encoding | version | event`
     /// column shape.
     Cell = 0,
@@ -292,180 +291,18 @@ impl<O> CassandraStore<O> {
         Ok(row)
     }
 
-    async fn write_provisional_raw(
+    /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
+    /// mutation — the shared tail of the three cell mutators. Each
+    /// [`BatchUnit`] is one cell's indivisible row pair (its `kind=Cell`
+    /// mutation and its `kind=Index` marker), packed into the fewest
+    /// batches under the byte and statement budgets.
+    async fn run_batches(
         &self,
-        collection: &CollectionRef,
-        writes: &[(CellKey, ProvisionalWrite)],
+        units: &[BatchUnit<CellBatchRow<'_>>],
     ) -> Result<(), CassandraCellStoreError> {
-        let pk = Pk::of(collection.id());
-        // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
-        // bound rows borrow into it and into each input cell's coordinate slice,
-        // so the whole batch is one `blobs` allocation with no per-cell copy.
-        let mut blobs = Vec::with_capacity(writes.len());
-        for (_, write) in writes {
-            blobs.push(encode_cell_blobs(write.data(), write.prev())?);
-        }
-
-        // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
-        // hence which statement each row carries — is made once for the whole
-        // batch, never per cell.
-        let ttl = collection.ttl().map(ttl_to_i32);
-        let (cell_stmt, index_stmt) = if ttl.is_some() {
-            (&self.queries.write_provisional, &self.queries.index_insert)
-        } else {
-            (
-                &self.queries.write_provisional_no_ttl,
-                &self.queries.index_insert_no_ttl,
-            )
-        };
-        // One unit per cell holds the cell mutation and its index marker as an
-        // indivisible pair, so `chunk_boundaries` never tears a cell's two rows
-        // into separate batches. Weight = blob bytes + one overhead for the cell
-        // row + one for the bare index row.
-        let units: Vec<BatchUnit<CellBatchRow>> = blobs
-            .iter()
-            .zip(writes)
-            .map(|(blob, (cell, write))| {
-                let addr = CellAddr::new(pk, cell);
-                BatchUnit::new(
-                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
-                    smallvec![
-                        CellBatchRow {
-                            statement: cell_stmt,
-                            row: RowShape::Stage(StageRow {
-                                ttl,
-                                data: blob.data.as_deref(),
-                                prev_data: blob.prev_data.as_deref(),
-                                encoding: blob.encoding,
-                                version: blob.version,
-                                event: write.event(),
-                                addr,
-                            }),
-                        },
-                        CellBatchRow {
-                            statement: index_stmt,
-                            row: RowShape::IndexUpsert(IndexUpsertRow { ttl, addr }),
-                        },
-                    ],
-                )
-            })
-            .collect();
         self.session
             .execute_unlogged_batches(
-                &units,
-                MAX_BATCH_BYTES,
-                MAX_BATCH_STATEMENTS,
-                SHARD_FANOUT_CONCURRENCY,
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn write_resolved_raw(
-        &self,
-        collection: &CollectionRef,
-        cells: &[(CellKey, Option<Bytes>)],
-    ) -> Result<(), CassandraCellStoreError> {
-        let pk = Pk::of(collection.id());
-        // Encode each cell's committed `data` up front (owns the `Bytes`); no
-        // `prev`, so the blobs carry only `data` + its encoding/version.
-        let mut blobs = Vec::with_capacity(cells.len());
-        for (_, data) in cells {
-            blobs.push(encode_cell_blobs(data.as_ref(), None)?);
-        }
-
-        let ttl = collection.ttl().map(ttl_to_i32);
-        let cell_stmt = if ttl.is_some() {
-            &self.queries.write_resolved
-        } else {
-            &self.queries.write_resolved_no_ttl
-        };
-        // Each unit pairs the resolved-value write with an `index_delete`. On the
-        // rollback path (resolving a provisional cell to its `prev`) this clears
-        // the cell's provisional-coordinate marker. On a fresh committed write (a
-        // ReadUncommitted direct write / mid-handler flush that was never staged)
-        // no marker exists, so the delete is a harmless no-op tombstone in the
-        // `kind=Index` slice. Pairing unconditionally keeps a cell's rows one
-        // atomic unit; differentiating rollback from fresh-commit to skip the
-        // no-op is future work — `write_resolved` carries no provisional signal.
-        let units: Vec<BatchUnit<CellBatchRow>> = blobs
-            .iter()
-            .zip(cells)
-            .map(|(blob, (cell, _))| {
-                let addr = CellAddr::new(pk, cell);
-                BatchUnit::new(
-                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
-                    smallvec![
-                        CellBatchRow {
-                            statement: cell_stmt,
-                            row: RowShape::Resolved(ResolvedRow {
-                                ttl,
-                                data: blob.data.as_deref(),
-                                encoding: blob.encoding,
-                                version: blob.version,
-                                addr,
-                            }),
-                        },
-                        CellBatchRow {
-                            statement: &self.queries.index_delete,
-                            row: RowShape::Key(KeyRow {
-                                kind: CellKind::Index,
-                                addr,
-                            }),
-                        },
-                    ],
-                )
-            })
-            .collect();
-        self.session
-            .execute_unlogged_batches(
-                &units,
-                MAX_BATCH_BYTES,
-                MAX_BATCH_STATEMENTS,
-                SHARD_FANOUT_CONCURRENCY,
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn mark_resolved_raw(
-        &self,
-        collection: &CollectionRef,
-        cells: &[CellKey],
-    ) -> Result<(), CassandraCellStoreError> {
-        let pk = Pk::of(collection.id());
-        // Promotes carry no blob — only key columns — so every unit weighs a
-        // fixed overhead per member row (the cell promote + its index-marker
-        // delete) and the byte budget never bites; the count budget alone splits
-        // an enormous promote set.
-        let units: Vec<BatchUnit<CellBatchRow>> = cells
-            .iter()
-            .map(|cell| {
-                let addr = CellAddr::new(pk, cell);
-                BatchUnit::new(
-                    2 * PER_STATEMENT_OVERHEAD,
-                    smallvec![
-                        CellBatchRow {
-                            statement: &self.queries.mark_resolved,
-                            row: RowShape::Key(KeyRow {
-                                kind: CellKind::Cell,
-                                addr,
-                            }),
-                        },
-                        CellBatchRow {
-                            statement: &self.queries.index_delete,
-                            row: RowShape::Key(KeyRow {
-                                kind: CellKind::Index,
-                                addr,
-                            }),
-                        },
-                    ],
-                )
-            })
-            .collect();
-        self.session
-            .execute_unlogged_batches(
-                &units,
+                units,
                 MAX_BATCH_BYTES,
                 MAX_BATCH_STATEMENTS,
                 SHARD_FANOUT_CONCURRENCY,
@@ -539,10 +376,10 @@ where
             };
             let stream = pager
                 .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O>)?
+                .map_err(into_store_err::<O::Error>)?
                 .rows_stream::<KeyedCellRow>()
                 .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O>)?;
+                .map_err(into_store_err::<O::Error>)?;
             pin_mut!(stream);
 
             let mut yielded = 0usize;
@@ -558,7 +395,7 @@ where
             while let Some(row) = cooperative(stream.try_next())
                 .await
                 .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O>)?
+                .map_err(into_store_err::<O::Error>)?
             {
                 // The limit bounds *yielded* (present) cells; check it before
                 // processing the next row so `Some(0)` yields nothing (an absent
@@ -596,25 +433,10 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
-        let raw = match self
-            .point_read::<RawCellRow>(&self.queries.read_cell, collection, cell)
-            .await
-            .map_err(ResolveCellError::Store)?
-        {
-            Some(row) => decode::try_decode_cell(row).map_err(ResolveCellError::Store)?,
-            None => Cell::Resolved(Committed::new(None)),
-        };
-        let collection_ref = self.resolver.collection_ref(collection);
-        resolve_read(
-            self,
-            self.resolver.oracle(),
-            &collection_ref,
-            cell,
-            own,
-            raw,
-        )
-        .await
-        .map_err(flatten_resolve)
+        // The committed value is exactly the cache-fill read minus its co-expiry
+        // TTL; production only ever calls this via `Cached` (which uses
+        // `get_for_cache`), so `get` is a thin convenience for direct callers.
+        Ok(self.get_for_cache(collection, cell, own).await?.0)
     }
 
     async fn get_for_cache<'a>(
@@ -693,10 +515,10 @@ where
                     )
                     .await
                     .map_err(CassandraStoreError::from)
-                    .map_err(into_store_err::<O>)?
+                    .map_err(into_store_err::<O::Error>)?
                     .rows_stream::<decode::IndexRow>()
                     .map_err(CassandraStoreError::from)
-                    .map_err(into_store_err::<O>)?;
+                    .map_err(into_store_err::<O::Error>)?;
                 pin_mut!(index);
                 // N (= #provisional) is bounded-small, so the drain stays
                 // sequential behind the `cooperative` checkpoint that yields a
@@ -705,7 +527,7 @@ where
                 while let Some(row) = cooperative(index.try_next())
                     .await
                     .map_err(CassandraStoreError::from)
-                    .map_err(into_store_err::<O>)?
+                    .map_err(into_store_err::<O::Error>)?
                 {
                     coords.push(decode::index_cell_key(row));
                 }
@@ -779,7 +601,62 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        self.write_provisional_raw(collection, writes)
+        let pk = Pk::of(collection.id());
+        // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
+        // bound rows borrow into it and into each input cell's coordinate slice,
+        // so the whole batch is one `blobs` allocation with no per-cell copy.
+        let mut blobs = Vec::with_capacity(writes.len());
+        for (_, write) in writes {
+            blobs.push(
+                encode_cell_blobs(write.data(), write.prev()).map_err(ResolveCellError::Store)?,
+            );
+        }
+
+        // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
+        // hence which statement each row carries — is made once for the whole
+        // batch, never per cell.
+        let ttl = collection.ttl().map(ttl_to_i32);
+        let (cell_stmt, index_stmt) = if ttl.is_some() {
+            (&self.queries.write_provisional, &self.queries.index_insert)
+        } else {
+            (
+                &self.queries.write_provisional_no_ttl,
+                &self.queries.index_insert_no_ttl,
+            )
+        };
+        // One unit per cell holds the cell mutation and its index marker as an
+        // indivisible pair, so `chunk_boundaries` never tears a cell's two rows
+        // into separate batches. Weight = blob bytes + one overhead for the cell
+        // row + one for the bare index row.
+        let units: Vec<BatchUnit<CellBatchRow>> = blobs
+            .iter()
+            .zip(writes)
+            .map(|(blob, (cell, write))| {
+                let addr = CellAddr::new(pk, cell);
+                BatchUnit::new(
+                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
+                    smallvec![
+                        CellBatchRow {
+                            statement: cell_stmt,
+                            row: RowShape::Stage(StageRow {
+                                ttl,
+                                data: blob.data.as_deref(),
+                                prev_data: blob.prev_data.as_deref(),
+                                encoding: blob.encoding,
+                                version: blob.version,
+                                event: write.event(),
+                                addr,
+                            }),
+                        },
+                        CellBatchRow {
+                            statement: index_stmt,
+                            row: RowShape::IndexUpsert(IndexUpsertRow { ttl, addr }),
+                        },
+                    ],
+                )
+            })
+            .collect();
+        self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)
     }
@@ -789,7 +666,58 @@ where
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
     ) -> Result<(), Self::Error> {
-        self.write_resolved_raw(collection, cells)
+        let pk = Pk::of(collection.id());
+        // Encode each cell's committed `data` up front (owns the `Bytes`); no
+        // `prev`, so the blobs carry only `data` + its encoding/version.
+        let mut blobs = Vec::with_capacity(cells.len());
+        for (_, data) in cells {
+            blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
+        }
+
+        let ttl = collection.ttl().map(ttl_to_i32);
+        let cell_stmt = if ttl.is_some() {
+            &self.queries.write_resolved
+        } else {
+            &self.queries.write_resolved_no_ttl
+        };
+        // Each unit pairs the resolved-value write with an `index_delete`. On the
+        // rollback path (resolving a provisional cell to its `prev`) this clears
+        // the cell's provisional-coordinate marker. On a fresh committed write (a
+        // ReadUncommitted direct write / mid-handler flush that was never staged)
+        // no marker exists, so the delete is a harmless no-op tombstone in the
+        // `kind=Index` slice. Pairing unconditionally keeps a cell's rows one
+        // atomic unit; differentiating rollback from fresh-commit to skip the
+        // no-op is future work — `write_resolved` carries no provisional signal.
+        let units: Vec<BatchUnit<CellBatchRow>> = blobs
+            .iter()
+            .zip(cells)
+            .map(|(blob, (cell, _))| {
+                let addr = CellAddr::new(pk, cell);
+                BatchUnit::new(
+                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
+                    smallvec![
+                        CellBatchRow {
+                            statement: cell_stmt,
+                            row: RowShape::Resolved(ResolvedRow {
+                                ttl,
+                                data: blob.data.as_deref(),
+                                encoding: blob.encoding,
+                                version: blob.version,
+                                addr,
+                            }),
+                        },
+                        CellBatchRow {
+                            statement: &self.queries.index_delete,
+                            row: RowShape::Key(KeyRow {
+                                kind: CellKind::Index,
+                                addr,
+                            }),
+                        },
+                    ],
+                )
+            })
+            .collect();
+        self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)
     }
@@ -799,7 +727,37 @@ where
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
     ) -> Result<(), Self::Error> {
-        self.mark_resolved_raw(collection, cells)
+        let pk = Pk::of(collection.id());
+        // Promotes carry no blob — only key columns — so every unit weighs a
+        // fixed overhead per member row (the cell promote + its index-marker
+        // delete) and the byte budget never bites; the count budget alone splits
+        // an enormous promote set.
+        let units: Vec<BatchUnit<CellBatchRow>> = cells
+            .iter()
+            .map(|cell| {
+                let addr = CellAddr::new(pk, cell);
+                BatchUnit::new(
+                    2 * PER_STATEMENT_OVERHEAD,
+                    smallvec![
+                        CellBatchRow {
+                            statement: &self.queries.mark_resolved,
+                            row: RowShape::Key(KeyRow {
+                                kind: CellKind::Cell,
+                                addr,
+                            }),
+                        },
+                        CellBatchRow {
+                            statement: &self.queries.index_delete,
+                            row: RowShape::Key(KeyRow {
+                                kind: CellKind::Index,
+                                addr,
+                            }),
+                        },
+                    ],
+                )
+            })
+            .collect();
+        self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)
     }
@@ -1102,11 +1060,9 @@ impl SerializeRow for KeyRow<'_> {
     }
 }
 
-/// Maps a raw Cassandra error into the resolving store error.
-fn into_store_err<O>(error: CassandraStoreError) -> CellStoreError<O::Error>
-where
-    O: CommitOracle,
-{
+/// Maps a raw Cassandra error into the resolving store error, generic only over
+/// the oracle error type `E` the caller's stream carries.
+fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreError<E> {
     ResolveCellError::Store(CassandraCellStoreError::from(error))
 }
 

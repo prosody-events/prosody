@@ -47,11 +47,9 @@
 //! # TTL co-expiry
 //!
 //! Cassandra cells expire (`USING TTL`); fjall has no native per-entry TTL, so
-//! the cache mirrors the expiry. Cassandra anchors a row's death on the
-//! **coordinator wall clock at whole-second resolution** and ignores the write
-//! timestamp for TTL, so each path floors its anchor DOWN to the second to
-//! match that resolution — shedding the sub-second remainder that would
-//! otherwise deterministically overhang the row:
+//! the cache mirrors the expiry. Every path anchors a clock read and floors it
+//! to Cassandra's whole-second TTL resolution — see `expiry_at` for why and
+//! how — but each picks a different anchor:
 //!
 //! * A direct write ([`write_resolved`](CellStore::write_resolved) /
 //!   [`write_provisional`](CellStore::write_provisional) /
@@ -68,14 +66,12 @@
 //!   which the Cassandra store backs with `TTL(data)`) → stamps `floor(now) +
 //!   remaining` (whole seconds).
 //!
-//! We do **not** synchronize the client and coordinator clocks; any residual
-//! difference after flooring is clock skew, which no client-side arithmetic can
-//! remove. Cov1 is therefore best-effort co-expiry — floor-to-second plus
-//! self-heal — not an absolute cross-node guarantee. Because flooring makes an
-//! entry expire slightly *early*, an expired entry on a covered coordinate is
-//! treated as a **gap, not absence**: a covered `get` on an expiry-miss falls
-//! through and re-publishes, and a covered scan refills the expired sub-range
-//! (see the `coverage` module, Cov1).
+//! Cov1 is therefore best-effort co-expiry — floor-to-second plus self-heal —
+//! not an absolute cross-node guarantee: flooring makes an entry expire
+//! slightly *early* (never late), so an expired entry on a covered coordinate
+//! is treated as a **gap, not absence** — a covered `get` on an expiry-miss
+//! falls through and re-publishes, and a covered scan refills the expired
+//! sub-range (see the `coverage` module, Cov1).
 //!
 //! The cache is a **hint**: every fjall failure is logged and degraded (a miss,
 //! a skipped publish leaving the coordinate uncovered, a fall-through scan),
@@ -235,62 +231,69 @@ impl<L> Cached<L> {
         }
     }
 
-    /// Publishes one cell's committed `projection` into fjall with an absolute
-    /// `expiry` (`0` = never), then **covers** the coordinate on success or
-    /// **punches** it on a `fjall.put` failure (Cov3: the only mutator
-    /// uncover). Called only after the lower write succeeded.
+    /// Best-effort fjall publish of a present cell's `projection`, stamped with
+    /// `remaining`'s co-expiry (Cov1), returning whether it landed. A failure
+    /// logs and degrades: the caller leaves the coordinate uncovered so the
+    /// next read falls through and re-publishes.
+    async fn try_put(
+        &self,
+        collection: &CollectionId,
+        cell: &CellKey,
+        projection: &Committed,
+        remaining: Option<CompactDuration>,
+    ) -> bool {
+        let expiry = self.expiry_for(remaining);
+        match self.fjall.put(collection, cell, projection, expiry).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn_skip("populate", &error);
+                false
+            }
+        }
+    }
+
+    /// Publishes one cell's committed `projection` (cover-on-get fill), then
+    /// **covers** the coordinate on success or **punches** it on failure
+    /// (Cov3: the only mutator uncover). Called only after the lower write
+    /// succeeded.
     ///
     /// The punch here may degrade (unlike the write-path punches): this
-    /// publish is the cover-on-get fill, which runs only on an uncovered or
-    /// expired-covered coordinate — a lost punch leaves at worst an expired
-    /// covered entry, and an expired covered read falls through (Cov1), never
-    /// serving it.
+    /// publish runs only on an uncovered or expired-covered coordinate — a
+    /// lost punch leaves at worst an expired covered entry, and an expired
+    /// covered read falls through (Cov1), never serving it.
     async fn publish(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
         projection: &Committed,
-        expiry: u64,
-    ) where
-        L: CellStore,
-    {
-        match self.fjall.put(collection, cell, projection, expiry).await {
-            Ok(()) => {
-                degrade_cover_mut(
-                    "cover",
-                    self.coverage
-                        .cover_points(collection, cell.section, slice::from_ref(&cell.coordinate))
-                        .await,
-                );
-            }
-            Err(error) => {
-                warn_skip("publish", &error);
-                degrade_cover_mut(
-                    "punch",
-                    self.coverage
-                        .punch_many(collection, cell.section, slice::from_ref(&cell.coordinate))
-                        .await,
-                );
-            }
+        remaining: Option<CompactDuration>,
+    ) {
+        if self.try_put(collection, cell, projection, remaining).await {
+            degrade_cover_mut(
+                "cover",
+                self.coverage
+                    .cover_points(collection, cell.section, slice::from_ref(&cell.coordinate))
+                    .await,
+            );
+        } else {
+            degrade_cover_mut(
+                "punch",
+                self.coverage
+                    .punch_many(collection, cell.section, slice::from_ref(&cell.coordinate))
+                    .await,
+            );
         }
     }
-}
 
-impl<L> Cached<L>
-where
-    L: CellStore,
-{
     /// Publishes each touched cell's `projection` after a successful
     /// `lower.write` (Cov3) in **one** atomic fjall batch
     /// ([`FjallCellCache::put_batch`]), then covers every coordinate (or
     /// uncovers them all if the batch failed). `stamped_at` is a clock reading
-    /// taken **before** the lower write; [`expiry_at`] floors it DOWN to the
-    /// second to match Cassandra's whole-second TTL resolution, so the
-    /// co-expiry stamp sheds the sub-second remainder that would otherwise
-    /// overhang the row (Cov1; residual clock skew self-heals via
-    /// fall-through). The collection's write TTL is the full TTL (the value was
-    /// just written). `project` computes each cell's committed projection from
-    /// its batch entry.
+    /// taken **before** the lower write; [`expiry_at`] floors it to match
+    /// Cassandra's TTL resolution (see the module's TTL co-expiry doc). The
+    /// collection's write TTL is the full TTL (the value was just written).
+    /// `project` computes each cell's committed projection from its batch
+    /// entry.
     async fn publish_written<T>(
         &self,
         collection: &CollectionRef,
@@ -303,10 +306,10 @@ where
         // multi-cell update is never torn, and the whole settle is one blocking
         // thread-hop instead of N. The coverage update after it is likewise
         // grouped — one section rewrite per touched section, not per cell.
-        let mut batch: Vec<(CellKey, Committed, u64)> = Vec::with_capacity(cells.len());
-        for (cell, value) in cells {
-            batch.push((cell.clone(), project(value), expiry));
-        }
+        let batch: Vec<(CellKey, Committed, u64)> = cells
+            .iter()
+            .map(|(cell, value)| (cell.clone(), project(value), expiry))
+            .collect();
         match self.fjall.put_batch(collection.id(), &batch).await {
             Ok(()) => {
                 self.cover_cells(collection.id(), batch.iter().map(|(cell, ..)| cell))
@@ -323,6 +326,37 @@ where
         }
     }
 
+    /// Covers the consumed prefix of a gap up to `coordinate`: `[gap_lo, X]`
+    /// forward, `[X, gap_hi]` backward (the side already drained).
+    async fn cover_consumed(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        piece: &Interval,
+        dir: Direction,
+        coordinate: &Coordinate,
+    ) {
+        let consumed = match dir {
+            Direction::Forward => {
+                Interval::new(piece.low().cloned(), Bound::Included(coordinate.clone()))
+            }
+            Direction::Backward => {
+                Interval::new(Bound::Included(coordinate.clone()), piece.high().cloned())
+            }
+        };
+        if let Some(consumed) = consumed {
+            degrade_cover_mut(
+                "cover",
+                self.coverage.cover(collection, section, consumed).await,
+            );
+        }
+    }
+}
+
+impl<L> Cached<L>
+where
+    L: CellStore,
+{
     /// Serves one covered piece from fjall, falling through to the lower store
     /// for the remainder when a covered cell is missing-expired (a gap under
     /// floor rounding) or a fjall read errors — degradation is always a slower
@@ -448,52 +482,6 @@ where
             }
         }
     }
-
-    /// Best-effort fjall publish of a present cell, returning whether it landed
-    /// (a failure logs and degrades, leaving the coordinate uncovered so the
-    /// next read falls through).
-    async fn try_put(
-        &self,
-        collection: &CollectionId,
-        cell: &CellKey,
-        projection: &Committed,
-        remaining: Option<CompactDuration>,
-    ) -> bool {
-        let expiry = self.expiry_for(remaining);
-        match self.fjall.put(collection, cell, projection, expiry).await {
-            Ok(()) => true,
-            Err(error) => {
-                warn_skip("populate", &error);
-                false
-            }
-        }
-    }
-
-    /// Covers the consumed prefix of a gap up to `coordinate`: `[gap_lo, X]`
-    /// forward, `[X, gap_hi]` backward (the side already drained).
-    async fn cover_consumed(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        piece: &Interval,
-        dir: Direction,
-        coordinate: &Coordinate,
-    ) {
-        let consumed = match dir {
-            Direction::Forward => {
-                Interval::new(piece.low().cloned(), Bound::Included(coordinate.clone()))
-            }
-            Direction::Backward => {
-                Interval::new(Bound::Included(coordinate.clone()), piece.high().cloned())
-            }
-        };
-        if let Some(consumed) = consumed {
-            degrade_cover_mut(
-                "cover",
-                self.coverage.cover(collection, section, consumed).await,
-            );
-        }
-    }
 }
 
 impl<L> CellStore for Cached<L>
@@ -541,8 +529,7 @@ where
         // current event staged (GetNeverReadsOwnStaged), so the lower read is a
         // settled committed projection.
         let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
-        let expiry = self.expiry_for(remaining);
-        self.publish(collection, cell, &committed, expiry).await;
+        self.publish(collection, cell, &committed, remaining).await;
         Ok(committed)
     }
 
@@ -573,9 +560,7 @@ where
                 .await
                 .unwrap_or_else(|error| {
                     warn_skip("query", &error);
-                    let mut single = SmallVec::new();
-                    single.push(Piece::Gap(request.clone()));
-                    single
+                    SmallVec::from_iter([Piece::Gap(request.clone())])
                 });
             // `query` yields pieces ascending; walk them in the scan direction.
             if dir == Direction::Backward {
@@ -653,14 +638,12 @@ where
                 }
             };
             if let Some(coords) = warm_coords {
-                // Warm: the local fjall snapshot answers with ZERO Cassandra
-                // queries; an empty snapshot yields nothing. The `kind=Cell`
-                // point-reads run concurrently — the sweep resolves cells
-                // independently and order-free — with each per-item future
-                // coop-wrapped so a large drain still yields to the runtime. A
-                // concurrently-resolved or absent coordinate reads `None` and
-                // is dropped (over-report-safe, matching the cold path's
-                // filter).
+                // The `kind=Cell` point-reads run concurrently — the sweep
+                // resolves cells independently and order-free — with each
+                // per-item future coop-wrapped so a large drain still yields
+                // to the runtime. A concurrently-resolved or absent
+                // coordinate reads `None` and is dropped (over-report-safe,
+                // matching the cold path's filter).
                 let reads = stream::iter(coords)
                     .map(|cell| {
                         cooperative(async move {
@@ -677,9 +660,7 @@ where
                     }
                 }
             } else {
-                // Cold (fresh epoch, or a warm read failed): the lower store's
-                // unconditional bounded `kind=Index` seed runs; each coordinate
-                // is recorded into fjall as it streams.
+                // Cold path taken (fresh epoch, or a warm read failed above).
                 let inner = self.lower.provisional_cells(collection);
                 pin_mut!(inner);
                 let mut all_recorded = true;
@@ -719,11 +700,9 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        // Anchor the co-expiry on a clock read taken BEFORE the lower write;
-        // `expiry_at` floors it to the second to match Cassandra's whole-second
-        // TTL resolution, so the stamp sheds the sub-second remainder that would
-        // overhang the row (Cov1/FLOOR). Establish first (Cov3): a failed lower
-        // write leaves coverage untouched.
+        // Anchor the co-expiry on a clock read taken BEFORE the lower write
+        // (see the module's TTL co-expiry doc and `expiry_at`). Establish
+        // first (Cov3): a failed lower write leaves coverage untouched.
         let stamped_at = self.fjall.clock().now_ms();
         if let Err(error) = self.lower.write_provisional(collection, writes).await {
             // A partial durable stage may have landed `kind=Index` markers the
@@ -819,36 +798,29 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        // Promote in the lower store (the authoritative settle). The result is
-        // returned VERBATIM below; the fjall publish is best-effort so a cache
-        // failure never folds into `ApplyOutcome::Incomplete` (the Incomplete
-        // trap).
-        let mut keys: Vec<CellKey> = Vec::with_capacity(writes.len());
-        keys.extend(writes.iter().map(|(cell, _)| cell.clone()));
+        // Promote in the lower store (the authoritative settle); see the
+        // module doc's Incomplete trap for why the result below is returned
+        // verbatim.
+        let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
         let result = self.lower.mark_resolved(collection, &keys).await;
         if result.is_ok() {
             // The provisional `data` is now the committed value; re-publish it.
-            // `mark_resolved` does NOT re-stamp the durable TTL — `data` keeps
-            // the death set by `write_provisional` at stage time — so the
+            // `mark_resolved` does NOT re-stamp the durable TTL, so the
             // co-expiry must REUSE the stage-anchored expiry already on the
-            // cell's fjall entry, never a fresh `now + ttl` (which would overhang
-            // the durable death by the whole stage→commit gap; Cov1). The
+            // cell's fjall entry (see the module's TTL co-expiry doc). The
             // combined read-expiry → re-publish runs as one atomic batch in a
             // single blocking thread-hop ([`commit_batch`]); it returns a
             // [`CoverDecision`] per write — `Cover` when re-published, `Punch`
             // when the stage entry was missing/unreadable or the batch failed
             // (the next covered read then re-publishes via the floored read-back
-            // path). The lower promote above stays a single batched call before
-            // the cache work, and `result` is returned verbatim so the
-            // best-effort republish never folds into `ApplyOutcome::Incomplete`
-            // (the Incomplete trap).
+            // path).
             let decisions = self.fjall.commit_batch(collection.id(), writes).await;
             // Split the per-write decisions, then apply each side as grouped
             // coverage rewrites (one per touched section, not per cell). The
             // punches guard a promote that landed while fjall still holds
             // `prev` — a lost punch would serve it verbatim forever, so they
-            // are must-succeed; that retries the cache only, and `result` is
-            // still returned verbatim (the Incomplete trap).
+            // are must-succeed (the retry stays within the cache; `result` was
+            // already latched above).
             let mut cover: SmallVec<[&CellKey; 8]> = SmallVec::new();
             let mut punch: SmallVec<[&CellKey; 8]> = SmallVec::new();
             for ((cell, _), decision) in writes.iter().zip(decisions) {
@@ -893,14 +865,22 @@ where
                     .index_clear_batch(collection.id(), cells.iter().map(|(cell, _)| cell))
                     .await,
             );
-            self.publish_written(collection, writes, stamped_at, |write| {
-                Committed::new(write.prev().cloned())
+            // `cells` already holds each cell's rolled-back `prev`, so reuse it
+            // rather than re-deriving from `writes`.
+            self.publish_written(collection, &cells, stamped_at, |data| {
+                Committed::new(data.clone())
             })
             .await;
         }
         result
     }
 }
+
+/// One batch's coordinates grouped by section. Coverage mutations are
+/// per-`(collection, section)`; a settle batch typically spans one or two
+/// sections (e.g. a Map's Meta + Entries) with a handful of cells each, so
+/// both levels stay inline.
+type SectionGroups = SmallVec<[(Section, SmallVec<[Coordinate; 8]>); 2]>;
 
 /// The absolute fjall expiry (millis; `0` = never) for a cell whose durable row
 /// was (or is about to be) written at `stamped_at` with `remaining` whole
@@ -925,12 +905,6 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
         None => 0,
     }
 }
-
-/// One batch's coordinates grouped by section. Coverage mutations are
-/// per-`(collection, section)`; a settle batch typically spans one or two
-/// sections (e.g. a Map's Meta + Entries) with a handful of cells each, so
-/// both levels stay inline.
-type SectionGroups = SmallVec<[(Section, SmallVec<[Coordinate; 8]>); 2]>;
 
 /// Groups `cells` by section for the grouped coverage mutations
 /// ([`Cached::cover_cells`] / [`Cached::punch_cells_must_succeed`]): one

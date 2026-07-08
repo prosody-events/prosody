@@ -206,17 +206,10 @@ where
     }
 
     /// Streams the live elements in index order — front to back for
-    /// [`Direction::Forward`], back to front for [`Direction::Backward`].
-    ///
-    /// # Invariant
-    ///
-    /// The scan yields the dense `[head, tail)` window (see the type's
-    /// dense-window invariant) in `dir` order. It anchors at that window's
-    /// leading edge — `head` for `Forward`, `tail − 1` for `Backward` — and
-    /// stops after `len` cells, so popped tombstones (below `head` or at/above
-    /// `tail`) are never yielded. [`order_preserving_i64`] makes byte order the
-    /// signed-index order, so the backward scan walks back-to-front across the
-    /// sign boundary correctly.
+    /// [`Direction::Forward`], back to front for [`Direction::Backward`]. See
+    /// the module's dense-window invariant: the scan anchors at the window's
+    /// leading edge and stops after `len` cells, so a popped tombstone is
+    /// never yielded.
     pub fn stream(
         &self,
         dir: Direction,
@@ -245,8 +238,7 @@ where
             let inner = self.view.scan(scan);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
-                let (key, bytes) = item.map_err(|e| DequeStateError::Access(StateAccessError::store(&e)))?;
-                entry_section_guard(key.section)?;
+                let (_, bytes) = item.map_err(DequeStateError::Access)?;
                 yield decode_cell::<C>(bytes).map_err(DequeStateError::Codec)?;
             }
         }
@@ -375,9 +367,7 @@ where
 
 /// Declares a codec-backed deque collection named `name` (JSON by default —
 /// annotate the binding `DequeDescriptor<MyCodec>` to pick another codec).
-///
-/// `name` may be any runtime string and is interned (it stays `Copy`); an empty
-/// name fails loudly at registration, the fallible boundary.
+/// See [`Descriptor::new`](super::Descriptor::new) for the `name` contract.
 #[must_use]
 pub fn deque_state<C>(name: &str) -> DequeDescriptor<C>
 where
@@ -444,17 +434,6 @@ fn decode_bounds(bytes: &[u8]) -> Result<(i64, i64), MetaDecodeError> {
         return Err(MetaDecodeError::Disordered { head, tail });
     }
     Ok((head, tail))
-}
-
-/// Asserts a scanned cell sits in the `Entries` section — a defensive,
-/// forward-compatible guard (today's scan is already section-scoped). Drives
-/// the [`DequeNs`] `TryFrom` so a stale cell carrying an unknown or `Meta`
-/// section fails loudly rather than being decoded as an element.
-fn entry_section_guard(section: Section) -> Result<(), MetaDecodeError> {
-    match DequeNs::try_from(i8::from(section))? {
-        DequeNs::Entries => Ok(()),
-        DequeNs::Meta => Err(MetaDecodeError::UnexpectedSection(i8::from(section))),
-    }
 }
 
 /// Error decoding or deriving the deque's `Meta` bookkeeping. Always

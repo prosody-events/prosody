@@ -22,6 +22,9 @@ use tokio::task::coop::cooperative;
 /// Group-global identity key: `(group_id, state_type discriminator, name)`.
 type IdentityKey = (String, i8, String);
 
+/// The in-memory cell map: cells keyed by `(CollectionId, CellKey)`.
+type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
+
 /// A process-wide shareable in-memory cell map.
 ///
 /// The oracle-independent half of [`MemoryCellStore`]: the cells themselves,
@@ -31,7 +34,7 @@ type IdentityKey = (String, i8, String);
 /// [`MemoryCellStore`] carrying that partition's oracle.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCells {
-    inner: Arc<CellInner>,
+    inner: Arc<CellMap>,
 }
 
 impl MemoryCells {
@@ -42,7 +45,7 @@ impl MemoryCells {
     }
 }
 
-/// In-memory, uniform [`CellStore`] — the mock/test bottom store.
+/// In-memory, uniform [`CellStore`] — the in-memory (and mock-mode) backend.
 ///
 /// The provisional-cell durable backend keyed by `(CollectionId, CellKey)`:
 /// each cell is either resolved or provisional. Resolution of in-flight
@@ -53,13 +56,10 @@ impl MemoryCells {
 pub struct MemoryCellStore<O> {
     cells: MemoryCells,
     resolver: Resolver<O>,
-    /// The in-RAM provisional-coordinate index gating the recovery sweep
-    /// (memory-backed runs have no fjall workspace, so the disk-backed index
-    /// the Cassandra path uses is kept in RAM here). Minted fresh per store
-    /// (per partition acquisition) even though `cells` is process-shared,
-    /// so a re-acquired partition sees its collections unseeded and
-    /// re-seeds from `cells` — the memory analog of a fresh fjall epoch.
-    /// `Arc` so the per-event store clones share one instance.
+    /// The in-RAM provisional-coordinate index gating the recovery sweep — see
+    /// [`WarmIndex`] for its seed/re-seed semantics. `Arc` so the per-event
+    /// store clones share one instance, minted fresh per store so a re-acquired
+    /// partition re-seeds from the process-shared `cells`.
     warm: Arc<WarmIndex>,
 }
 
@@ -91,8 +91,8 @@ where
     }
 
     /// The shared cell map.
-    fn map(&self) -> &scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState> {
-        &self.cells.inner.cells
+    fn map(&self) -> &CellMap {
+        &self.cells.inner
     }
 }
 
@@ -336,11 +336,6 @@ impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
             Entry::Occupied(existing) => Ok(RegisterOutcome::Conflict(existing.get().clone())),
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct CellInner {
-    cells: scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>,
 }
 
 /// The memory backend's in-RAM provisional-coordinate index gating the recovery

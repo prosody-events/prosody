@@ -59,9 +59,8 @@ const META_SECTION: Section = Section::new(MapNs::Meta as i8);
 const ENTRY_SECTION: Section = Section::new(MapNs::Entries as i8);
 
 /// Map's section enum, lowered to the opaque [`Section`]. Frozen: the
-/// discriminants are a durable wire contract (the `section tinyint` column), so
-/// the [`TryFrom`] guard rejects any other value as
-/// [`MapStateError::Section`] (`Permanent`).
+/// discriminants are a durable wire contract (the `section tinyint` column),
+/// pinned by `map_layout_is_frozen` and the [`TryFrom`] round-trip.
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MapNs {
@@ -179,32 +178,20 @@ where
     }
 
     /// Streams the live entries in key order — ascending for
-    /// [`Direction::Forward`], descending for [`Direction::Backward`].
-    ///
-    /// # Invariant
-    ///
-    /// The scan yields exactly the live entries in key order for `dir`. It
-    /// anchors at the bound on its leading edge — `META_MIN` for `Forward`,
-    /// `META_MAX` for `Backward` — falling back to the section edge
-    /// (`Unbounded`) when that bound is missing or expired, and skips cleared
-    /// cells. So a stale bound never drops a live entry (the loose-superset
-    /// invariant): a live key can never sit beyond its bound, a residue past a
-    /// since-removed extreme is hidden by the store, and the missing-bound
-    /// fallback scans from the edge.
+    /// [`Direction::Forward`], descending for [`Direction::Backward`]. See the
+    /// module's loose-superset invariant: a stale bound never drops a live
+    /// entry, it only ever costs an extra scanned-but-cleared cell.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapEntry<KC, VC>> + '_ {
         try_stream! {
             ensure_live(self.view.session())?;
-            // Anchor at the leading-edge bound; the symmetric fallback is the
-            // empty coordinate (the low edge) for forward, `Unbounded` (the
-            // high edge) for backward.
-            let anchor = match dir {
-                Direction::Forward => Some(
-                    self.read_bound(&meta_min_cell())
-                        .await?
-                        .unwrap_or_else(Coordinate::empty),
-                ),
-                Direction::Backward => self.read_bound(&meta_max_cell()).await?,
+            // Anchor at the bound on the scan's leading edge — `META_MIN` for
+            // `Forward`, `META_MAX` for `Backward` — falling back to the
+            // section edge (`Unbounded`) when that bound is missing or expired.
+            let bound_cell = match dir {
+                Direction::Forward => meta_min_cell(),
+                Direction::Backward => meta_max_cell(),
             };
+            let anchor = self.read_bound(&bound_cell).await?;
             let scan = Scan {
                 section: ENTRY_SECTION,
                 start: anchor.as_ref().map_or(Bound::Unbounded, Bound::Included),
@@ -215,8 +202,7 @@ where
             let inner = self.view.scan(scan);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
-                let (key, bytes) = item.map_err(|e| MapStateError::Access(StateAccessError::store(&e)))?;
-                entry_section_guard(key.section)?;
+                let (key, bytes) = item.map_err(MapStateError::Access)?;
                 let logical = KC::decode(key.coordinate.as_bytes()).map_err(MapStateError::Key)?;
                 let value = decode_cell::<VC>(bytes).map_err(MapStateError::Codec)?;
                 yield (logical, value);
@@ -224,7 +210,10 @@ where
         }
     }
 
-    /// Reads a bound cell's stored entry coordinate (`None` when absent).
+    /// Reads a bound cell's stored entry coordinate (`None` when absent). A
+    /// bound stores the entry coordinate bytes verbatim, with no extra framing
+    /// — `assert_map_bounds` in the collection suite pins that over the
+    /// real write path at quickcheck scale.
     async fn read_bound(
         &self,
         cell: &CellKey,
@@ -299,10 +288,8 @@ where
 }
 
 /// Declares a codec-backed ordered map collection named `name` over key codec
-/// `KC` and value codec `VC` (JSON values by default).
-///
-/// `name` may be any runtime string and is interned (it stays `Copy`); an empty
-/// name fails loudly at registration, the fallible boundary.
+/// `KC` and value codec `VC` (JSON values by default). See
+/// [`Descriptor::new`](super::Descriptor::new) for the `name` contract.
 #[must_use]
 pub fn map_state<KC, VC>(name: &str) -> MapDescriptor<KC, VC>
 where
@@ -348,21 +335,6 @@ fn meta_max_cell() -> CellKey {
     CellKey {
         section: META_SECTION,
         coordinate: Coordinate::from_bytes(vec![1u8]),
-    }
-}
-
-/// Asserts a scanned cell sits in the `Entries` section — a defensive,
-/// forward-compatible guard (today's scan is already section-scoped). Drives
-/// the [`MapNs`] `TryFrom` so a stale cell carrying an unknown or `Meta`
-/// section fails loudly rather than being decoded as an entry.
-fn entry_section_guard<E>(section: Section) -> Result<(), MapStateError<E>>
-where
-    E: Error + Send + Sync + 'static,
-{
-    let raw = i8::from(section);
-    match MapNs::try_from(raw) {
-        Ok(MapNs::Entries) => Ok(()),
-        Ok(MapNs::Meta) | Err(UnknownMapSection(_)) => Err(MapStateError::Section(raw)),
     }
 }
 

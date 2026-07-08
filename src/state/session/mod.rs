@@ -46,18 +46,17 @@
 //! 4. At attempt boundaries (retry, defer), `reset` discards the dirty overlay
 //!    and staged set plus the registered marker.
 
-use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::ClassifyError;
 use crate::state::access::StateAccessError;
 use crate::state::cell::ProvisionalWrite;
-use crate::state::cell_key::{CellKey, Coordinate, Scan};
+use crate::state::cell_key::{CellKey, Scan};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
 };
 use crate::state::dirty::{DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
+use crate::state::manager::ArmedKeys;
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -68,17 +67,13 @@ use crate::state::{
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
-use scc::HashMap as ConcurrentHashMap;
 use sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
@@ -87,22 +82,6 @@ use uuid::Uuid;
 
 #[cfg(test)]
 mod tests;
-
-/// Shared per-partition map from a key to the fire time of its standing
-/// `StateRecovery` backstop.
-///
-/// A lock-free [`scc::HashMap`](ConcurrentHashMap) (not a `Mutex<HashMap>`):
-/// the durability boundary touches it on every stateful commit, concurrently
-/// across the partition's keys, so a single mutex would serialize unrelated
-/// keys. The stored fire lets `arm_backstop` re-arm only when a newly-staged
-/// commit's fire is *sooner* than the standing one (the tightening the
-/// per-collection `recovery_within` bound needs); the map is still
-/// self-draining (`recover` removes the key when the sweep fires), so it never
-/// grows without bound. Minted empty per acquisition: an absent key means
-/// *unknown*, not *unarmed* — `arm_backstop` seeds it from the durable trigger
-/// store on a key's first arm, so a prior epoch's standing backstop is never
-/// loosened.
-pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomState>>;
 
 /// The provisional cells `finalize` staged, grouped by collection (its ref
 /// carries the TTL). Only `ReadCommitted` collections appear; `ReadUncommitted`
@@ -126,9 +105,6 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// [`CellResolver`](crate::state::descriptor::CellResolver)
     /// living outside `src/state` reads it from the session at resolve time.
     type Loader: Clone + Send + Sync + 'static;
-
-    /// Error a `scan` stream may yield (the cell store's error).
-    type ScanError: ClassifyError + Error + Send + Sync + 'static;
 
     /// Returns the session's capability slot for a resolver to read.
     fn loader(&self) -> &Self::Loader;
@@ -175,14 +151,13 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a;
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
 
     /// Buffers a set of the cell's bytes.
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session.
     fn set(
         &self,
         state_type: StateType,
@@ -195,8 +170,7 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session.
     fn clear(
         &self,
         state_type: StateType,
@@ -521,13 +495,6 @@ where
         CollectionId::new(self.inner.state_key.clone(), state_type, name.clone())
     }
 
-    /// The collection ref (id + registry TTL) for `(state_type, name)`.
-    fn ref_for(&self, state_type: StateType, name: &StateName) -> CollectionRef {
-        let id = self.id_for(state_type, name);
-        let ttl = self.inner.registry.ttl_for(state_type, name);
-        CollectionRef::new(id, ttl)
-    }
-
     /// Resolves the recorded staged set after the event's outcome is known:
     /// `committed` ⇒ promote each cell's `data`, otherwise roll each back to
     /// its `prev`. The cell store's
@@ -581,7 +548,6 @@ where
     L: Clone + Send + Sync + 'static,
 {
     type Loader = L;
-    type ScanError = <B::Cell as CellStore>::Error;
 
     fn loader(&self) -> &L {
         &self.inner.loader
@@ -630,29 +596,18 @@ where
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         let id = self.id_for(state_type, name);
         let event = self.inner.event;
-        // Own the scan's coordinates so the stream borrows nothing from the
-        // caller's `Scan<'_>`.
-        let section = scan.section;
-        let start: Bound<Coordinate> = scan.start.cloned();
-        let end: Bound<Coordinate> = scan.end.cloned();
-        let dir = scan.dir;
-        let limit = scan.limit;
+        // `id` is local to the generator, so `scan_cells` unifies its lifetime
+        // with an owned overlay; the caller's `Copy` `Scan<'a>` rides in
+        // directly (it is covariant, so it coerces to that shorter scope).
         let overlay = self.inner.overlay.clone();
         try_stream! {
-            let scan = Scan {
-                section,
-                start: start.as_ref(),
-                dir,
-                end: end.as_ref(),
-                limit,
-            };
             let inner = overlay.scan_cells(&id, scan, event);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
-                yield item?;
+                yield item.map_err(|e| StateAccessError::store(&e))?;
             }
         }
     }
@@ -690,7 +645,8 @@ where
         if resolved.is_empty() {
             return Ok(StoreOutcome::NoOp);
         }
-        let collection_ref = self.ref_for(state_type, name);
+        let ttl = self.inner.registry.ttl_for(state_type, name);
+        let collection_ref = CollectionRef::new(id.clone(), ttl);
         self.inner
             .overlay
             .lower()

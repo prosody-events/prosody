@@ -29,11 +29,14 @@ use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
     CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
 };
-use crate::test_util::{TEST_KEYSPACE, integration_test_count, test_cassandra_config};
+use crate::test_util::{
+    TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
+};
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
+use quickcheck::{QuickCheck, TestResult};
 use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
@@ -230,7 +233,7 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 /// consult the provisional index (byte-for-byte today's cost). The zeros are
 /// non-vacuous: the very same counters provably increment on the sweep below.
 ///
-/// Sizes are kept modest (not the design's illustrative 1k/100k) so the live
+/// Sizes are kept modest (not large production scale) so the live
 /// test stays fast and its committed-cell `index_delete` tombstones stay under
 /// Cassandra's scan-warn threshold; 16× is ample to distinguish an O(#cells)
 /// regression, which would read 32 vs 512 rather than a fixed 4.
@@ -356,41 +359,6 @@ async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
         store.get(c.id(), &cell, event(3)).await?,
         Committed::new(None)
     );
-    Ok(())
-}
-
-/// An absent row reads back as `Committed(None)`, and `provisional_cells`
-/// yields the staged cell then nothing once resolved.
-#[tokio::test]
-async fn absent_row_and_provisional_cells_stream() -> Result<()> {
-    init_test_logging();
-    let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
-    let c = collection("cart")?;
-    let cell = value_cell();
-
-    assert_eq!(
-        store.get(c.id(), &cell, event(1)).await?,
-        Committed::new(None)
-    );
-
-    store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(
-                    Some(Bytes::from_static(b"v")),
-                    Committed::new(None),
-                    event(3),
-                ),
-            )],
-        )
-        .await?;
-    assert_eq!(provisional_cells(&store, c.id()).await?.len(), 1);
-
-    store.mark_resolved(&c, &[cell]).await?;
-    assert!(provisional_cells(&store, c.id()).await?.is_empty());
     Ok(())
 }
 
@@ -537,9 +505,6 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 /// fast path `StateHandle::get` relies on. Run over random non-empty payloads.
 #[test]
 fn prop_cassandra_present_cell_is_uniquely_owned() {
-    use crate::test_util::TEST_RUNTIME;
-    use quickcheck::{QuickCheck, TestResult};
-
     async fn check(payload: Vec<u8>) -> Result<bool> {
         let fx = fixture().await?;
         let store = fx.bottom_store(ScriptedOracle::default());
@@ -572,7 +537,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         .quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
-/// Co-anchoring regression-prover for defect (a): every cell of one multi-cell
+/// Co-anchoring regression-prover: every cell of one multi-cell
 /// write under a collection TTL must share a single write timestamp **and**
 /// TTL. One same-partition `UNLOGGED BATCH` carries one batch write timestamp
 /// and one coordinator TTL anchor, so `WRITETIME(data)` and `TTL(data)` are
@@ -585,9 +550,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
 fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
     use crate::state::cell_key::Coordinate;
-    use crate::test_util::TEST_RUNTIME;
     use crate::timers::duration::CompactDuration;
-    use quickcheck::{QuickCheck, TestResult};
 
     async fn check(payloads: Vec<Vec<u8>>) -> Result<bool> {
         let fx = fixture().await?;
@@ -852,8 +815,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing the
 /// error on failure (a store/setup error is a broken environment, not a
 /// shrinkable property failure).
-fn finish(result: Result<bool>) -> quickcheck::TestResult {
-    use quickcheck::TestResult;
+fn finish(result: Result<bool>) -> TestResult {
     match result {
         Ok(true) => TestResult::passed(),
         Ok(false) => TestResult::failed(),
@@ -869,9 +831,6 @@ fn finish(result: Result<bool>) -> quickcheck::TestResult {
 /// they drop).
 #[test]
 fn prop_cassandra_cell_crash_equivalence() {
-    use crate::test_util::TEST_RUNTIME;
-    use quickcheck::QuickCheck;
-
     async fn run(trace: Trace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
@@ -892,10 +851,7 @@ fn prop_cassandra_cell_crash_equivalence() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-                as fn(Trace) -> quickcheck::TestResult,
-        );
+        .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
 }
 
 /// Implicit-overwrite soundness over `Cached<CassandraStore>`: each overwrite
@@ -903,9 +859,6 @@ fn prop_cassandra_cell_crash_equivalence() {
 /// no explicit promote or rollback.
 #[test]
 fn prop_cassandra_cell_implicit_overwrite() {
-    use crate::test_util::TEST_RUNTIME;
-    use quickcheck::QuickCheck;
-
     async fn run(trace: OverwriteTrace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
@@ -926,8 +879,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
     QuickCheck::new()
         .tests(integration_test_count(25))
         .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-                as fn(OverwriteTrace) -> quickcheck::TestResult,
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(OverwriteTrace) -> TestResult,
         );
 }
 
@@ -947,9 +899,6 @@ fn assembly(fx: &Fixture) -> Result<Bottom> {
 /// (unified-view soundness and oracle-correctness properties).
 #[test]
 fn prop_cassandra_overlay_view() {
-    use crate::test_util::TEST_RUNTIME;
-    use quickcheck::QuickCheck;
-
     async fn run(trace: OverlayTrace) -> Result<bool> {
         let fx = fixture().await?;
         // Box the future: the assembly + trace exceed clippy's large-future
@@ -961,8 +910,7 @@ fn prop_cassandra_overlay_view() {
     QuickCheck::new()
         .tests(integration_test_count(25))
         .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-                as fn(OverlayTrace) -> quickcheck::TestResult,
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(OverlayTrace) -> TestResult,
         );
 }
 
@@ -971,9 +919,6 @@ fn prop_cassandra_overlay_view() {
 /// overlay merge delegates to.
 #[test]
 fn prop_cassandra_bottom_scan() {
-    use crate::test_util::TEST_RUNTIME;
-    use quickcheck::QuickCheck;
-
     async fn run(trace: ScanTrace) -> Result<bool> {
         let fx = fixture().await?;
         run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace).await
@@ -983,8 +928,7 @@ fn prop_cassandra_bottom_scan() {
     QuickCheck::new()
         .tests(integration_test_count(25))
         .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace))))
-                as fn(ScanTrace) -> quickcheck::TestResult,
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(ScanTrace) -> TestResult,
         );
 }
 

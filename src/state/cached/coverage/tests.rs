@@ -133,9 +133,6 @@ fn set_covers(set: &IntervalSet, coordinate: &Coordinate) -> bool {
         .any(|(lo, hi)| interval(lo, hi).contains(coordinate))
 }
 
-/// Asserts `query(request)` returns ordered, disjoint pieces that exactly tile
-/// the request, and that a Covered piece's points are exactly the model-covered
-/// points within the request.
 /// The interval underlying a piece, regardless of kind.
 fn interval_of(piece: &Piece) -> &Interval {
     match piece {
@@ -143,6 +140,9 @@ fn interval_of(piece: &Piece) -> &Interval {
     }
 }
 
+/// Asserts `query(request)` returns ordered, disjoint pieces that exactly tile
+/// the request, and that a Covered piece's points are exactly the model-covered
+/// points within the request.
 fn query_partitions_exactly(set: &IntervalSet, model: &BTreeSet<u8>, request: &Interval) -> bool {
     let pieces = set.query(request);
     if pieces.is_empty() {
@@ -161,7 +161,7 @@ fn query_partitions_exactly(set: &IntervalSet, model: &BTreeSet<u8>, request: &I
     for w in pieces.windows(2) {
         let prev = interval_of(&w[0]);
         let next = interval_of(&w[1]);
-        if next.lo != complement_high(&prev.hi) {
+        if next.lo != complement(&prev.hi) {
             return false;
         }
     }
@@ -308,20 +308,14 @@ impl Arbitrary for LiveOp {
 #[test]
 fn prop_coverage_memo_matches_durable_spill() {
     use crate::state::fjall::test_db;
-    use crate::state::identity::{StateKey, StateName, StateType};
+    use crate::state::tests::support::fresh_collection;
     use crate::test_util::TEST_RUNTIME;
-    use std::sync::Arc;
-    use uuid::Uuid;
 
     fn property(ops: Vec<LiveOp>) -> Result<bool> {
         TEST_RUNTIME.block_on(async move {
             let fjall = test_db::cache("cover_memo")?;
             let warm = Coverage::new(fjall.clone());
-            let id = CollectionId::new(
-                StateKey::new(Uuid::new_v4(), Arc::from("k")),
-                StateType::Application,
-                StateName::try_new("memo")?,
-            );
+            let id = fresh_collection("memo")?;
             let section = Section::new(0);
             let mut model: BTreeSet<u8> = BTreeSet::new();
 
@@ -382,11 +376,9 @@ fn prop_coverage_memo_matches_durable_spill() {
 #[test]
 fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
     use crate::state::fjall::test_db;
-    use crate::state::identity::{StateKey, StateName, StateType};
+    use crate::state::tests::support::fresh_collection;
     use crate::test_util::TEST_RUNTIME;
     use std::slice::from_ref;
-    use std::sync::Arc;
-    use uuid::Uuid;
 
     /// Race repetitions: each round is one full interleaving opportunity.
     const ROUNDS: u32 = 64;
@@ -398,11 +390,7 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
 
     TEST_RUNTIME.block_on(async {
         let coverage = Coverage::new(test_db::cache("cover_race")?);
-        let id = CollectionId::new(
-            StateKey::new(Uuid::new_v4(), Arc::from("k")),
-            StateType::Application,
-            StateName::try_new("race")?,
-        );
+        let id = fresh_collection("race")?;
         let section = Section::new(0);
         let iv = |a: u8, b: u8| {
             Interval::new(Bound::Included(coord(a)), Bound::Included(coord(b)))
@@ -430,4 +418,125 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// **`GAP_COVER_STRIDE` frontier invariant.** A gap scan dropped after
+/// consuming `consumed` of `total` uncovered cells persists coverage only for
+/// the stride-aligned prefix it completed: a re-scan of that prefix issues zero
+/// lower scans, while a full re-scan still yields every cell (the tail past the
+/// frontier falls through to the lower store). Under-covers on an early drop,
+/// never over-covers. Generalizes the single fixed `(total, consumed)` scenario
+/// the `gap_frontier_persists_mid_stream_and_never_over_covers` smoke pins.
+#[test]
+fn prop_gap_cover_stride_frontier() {
+    use super::super::{Cached, GAP_COVER_STRIDE};
+    use crate::state::cell_key::{CellKey, Direction, Scan};
+    use crate::state::event_ref::EventRef;
+    use crate::state::fjall::test_db;
+    use crate::state::identity::CollectionRef;
+    use crate::state::memory::{MemoryCellStore, MemoryCells};
+    use crate::state::registry::CollectionDefRegistry;
+    use crate::state::store::CellStore;
+    use crate::state::tests::cell_suite::{CountingCellStore, ScriptedOracle, bytes};
+    use crate::state::tests::support::fresh_collection;
+    use crate::test_util::TEST_RUNTIME;
+    use ::bytes::Bytes;
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Drains up to `take` cells of a forward section-0 scan over `[0, end]`,
+    /// returning the count yielded (`take` bounds an early drop).
+    async fn drain<L: CellStore>(
+        cached: &Cached<L>,
+        id: &CollectionId,
+        end: Bound<u8>,
+        take: usize,
+    ) -> Result<usize> {
+        let start = Coordinate::from_bytes(vec![0]);
+        let end = match end {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(b) => Bound::Included(Coordinate::from_bytes(vec![b])),
+            Bound::Excluded(b) => Bound::Excluded(Coordinate::from_bytes(vec![b])),
+        };
+        let scan = Scan {
+            section: Section::new(0),
+            start: Bound::Included(&start),
+            dir: Direction::Forward,
+            end: end.as_ref(),
+            limit: None,
+        };
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(9),
+        };
+        let stream = cached.scan_cells(id, scan, probe);
+        futures::pin_mut!(stream);
+        let mut n = 0usize;
+        while n < take
+            && let Some(item) = stream.next().await
+        {
+            item?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn property(total_seed: u8, drop_seed: u8) -> Result<bool> {
+        TEST_RUNTIME.block_on(async move {
+            // At least two strides so the frontier advances more than once, and
+            // < 256 total so coordinates stay single bytes.
+            let total = 2 * GAP_COVER_STRIDE + 1 + usize::from(total_seed % 64);
+            let consumed = usize::from(drop_seed) % (total + 1);
+            let covered = (consumed / GAP_COVER_STRIDE) * GAP_COVER_STRIDE;
+
+            let counting = CountingCellStore::new(MemoryCellStore::new(
+                MemoryCells::new(),
+                ScriptedOracle::default(),
+                Arc::new(CollectionDefRegistry::default()),
+            ));
+            let id = fresh_collection("stride-frontier")?;
+            let cref = CollectionRef::new(id.clone(), None);
+
+            // Seed the LOWER store directly so the whole section is one gap.
+            let mut seed: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(total);
+            for i in 0..total {
+                let cell = CellKey {
+                    section: Section::new(0),
+                    coordinate: Coordinate::from_bytes(vec![u8::try_from(i)?]),
+                };
+                seed.push((cell, Some(bytes(1))));
+            }
+            counting.write_resolved(&cref, &seed).await?;
+
+            let cached = Cached::new(test_db::cache("stride-frontier")?, counting.clone());
+
+            // Drop the gap scan after `consumed` cells.
+            if drain(&cached, &id, Bound::Unbounded, consumed).await? != consumed {
+                return Ok(false);
+            }
+
+            // The stride-persisted prefix serves covered: zero lower scans.
+            if covered > 0 {
+                counting.reset();
+                let end = u8::try_from(covered - 1)?;
+                let prefix = drain(&cached, &id, Bound::Included(end), usize::MAX).await?;
+                if prefix != covered || counting.lower_scans() != 0 {
+                    return Ok(false);
+                }
+            }
+
+            // Never over-covered: the full re-scan still yields EVERY cell, and
+            // the unpersisted tail (if any) falls through to the lower store.
+            counting.reset();
+            let all = drain(&cached, &id, Bound::Unbounded, usize::MAX).await?;
+            if all != total {
+                return Ok(false);
+            }
+            if covered < total && counting.lower_scans() == 0 {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(u8, u8) -> Result<bool>);
 }

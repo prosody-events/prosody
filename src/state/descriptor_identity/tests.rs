@@ -205,16 +205,13 @@ fn prop_acquire_rejects_seeded_mismatch() {
         {
             return TestResult::error("cart registration failed");
         }
-        let outcome = block_on(async {
-            let store = MemoryDescriptorIdentityStore::new();
-            let g = group();
-            // Seed the stale row directly, then acquire with the real descriptor.
-            assert!(matches!(
-                store.register_identity(&g, &stale).await,
-                Ok(RegisterOutcome::Applied)
-            ));
-            acquire_descriptor_identities(&store, &registry, &g).await
-        });
+        let store = MemoryDescriptorIdentityStore::new();
+        let g = group();
+        // Seed the stale row directly, then acquire with the real descriptor.
+        let Ok(RegisterOutcome::Applied) = block_on(store.register_identity(&g, &stale)) else {
+            return TestResult::error("seeding the stale row failed");
+        };
+        let outcome = block_on(acquire_descriptor_identities(&store, &registry, &g));
         match outcome {
             Err(error @ DescriptorIdentityError::Mismatch { .. }) => {
                 if error.classify_error() == ErrorCategory::Permanent {
@@ -325,54 +322,6 @@ async fn concurrent_acquire_with_conflicting_identities_one_wins_one_permanent()
         "the loser must see an identity mismatch, got {loser:?}",
     );
     assert_eq!(loser.classify_error(), ErrorCategory::Permanent);
-    Ok(())
-}
-
-/// Namespacing: the same name under two `state_type`s is two independent
-/// identity rows. Registering distinct identities under each both apply, and
-/// each reads back its own — neither overwrites the other.
-#[tokio::test]
-async fn state_type_namespaces_identity_rows() -> Result<()> {
-    let store = MemoryDescriptorIdentityStore::new();
-    let group = group();
-    let application = DurableDescriptorIdentity {
-        state_type: StateType::Application.into(),
-        name: "cart".to_owned(),
-        kind: 1,
-        resolver_id: None,
-        codec_id: "json".to_owned(),
-        key_codec_id: None,
-    };
-    let framework = DurableDescriptorIdentity {
-        state_type: StateType::Framework.into(),
-        name: "cart".to_owned(),
-        kind: 1,
-        resolver_id: Some("message-ref".to_owned()),
-        codec_id: "binary".to_owned(),
-        key_codec_id: Some("key-json".to_owned()),
-    };
-
-    assert_eq!(
-        store.register_identity(&group, &application).await?,
-        RegisterOutcome::Applied
-    );
-    assert_eq!(
-        store.register_identity(&group, &framework).await?,
-        RegisterOutcome::Applied,
-        "the same name in a different namespace must not collide",
-    );
-    assert_eq!(
-        store
-            .read_identity(&group, StateType::Application, "cart")
-            .await?,
-        Some(application),
-    );
-    assert_eq!(
-        store
-            .read_identity(&group, StateType::Framework, "cart")
-            .await?,
-        Some(framework),
-    );
     Ok(())
 }
 

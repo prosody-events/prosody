@@ -6,7 +6,7 @@
 //! ([`Overlay<Cached<CassandraStore>>`]) prove the *same* invariants from one
 //! body — backend parity by transitivity through a deliberately simple model.
 //!
-//! The flagship is **crash-recovery equivalence** (invariant 1): a generated
+//! The flagship is **crash-recovery equivalence**: a generated
 //! trace stages provisional writes and resolves them one of five ways — clean
 //! promote, clean inline rollback, or a crash at one of three points followed
 //! by recovery through the sweep *or* first-touch. After every event the
@@ -778,11 +778,11 @@ where
                     // follow-up full scan still yields the complete result
                     // (dropping a scan mid-stream corrupts nothing).
                     let k = (k as usize).min(expected.len());
-                    if collect_scan_prefix(&overlay, &id, &req, own, k).await? != expected[..k] {
+                    if collect_scan(&overlay, &id, &req, own, Some(k)).await? != expected[..k] {
                         return Ok(false);
                     }
                 }
-                if collect_scan(&overlay, &id, &req, own).await? != expected {
+                if collect_scan(&overlay, &id, &req, own, None).await? != expected {
                     return Ok(false);
                 }
             }
@@ -957,11 +957,14 @@ fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: Option<&'a Coordinate>)
 }
 
 /// Collects an overlay scan, mapping each cell to `(coordinate byte, bytes)`.
+/// `take` caps how many items are drained before the stream is dropped (`None`
+/// drains to exhaustion); an early `Some(k)` drop must corrupt nothing.
 async fn collect_scan<S>(
     overlay: &Overlay<S>,
     id: &CollectionId,
     req: &ScanReq,
     own: EventRef,
+    take: Option<usize>,
 ) -> Result<Vec<(u8, Bytes)>>
 where
     S: CellStore,
@@ -971,37 +974,12 @@ where
     let stream = overlay.scan_cells(id, scan_of(*req, &start, end.as_ref()), own);
     futures::pin_mut!(stream);
     let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
+    while take.is_none_or(|k| out.len() < k)
+        && let Some(item) = stream.next().await
+    {
         let (key, value) = item?;
         out.push((coord_of(&key), value));
     }
-    Ok(out)
-}
-
-/// Collects only the first `k` items of an overlay scan, then drops the stream.
-async fn collect_scan_prefix<S>(
-    overlay: &Overlay<S>,
-    id: &CollectionId,
-    req: &ScanReq,
-    own: EventRef,
-    k: usize,
-) -> Result<Vec<(u8, Bytes)>>
-where
-    S: CellStore,
-{
-    let start = Coordinate::from_bytes(vec![req.start]);
-    let end = req.end.map(|e| Coordinate::from_bytes(vec![e]));
-    let stream = overlay.scan_cells(id, scan_of(*req, &start, end.as_ref()), own);
-    futures::pin_mut!(stream);
-    let mut out = Vec::new();
-    while out.len() < k {
-        let Some(item) = stream.next().await else {
-            break;
-        };
-        let (key, value) = item?;
-        out.push((coord_of(&key), value));
-    }
-    // Stream dropped here — dropping mid-scan must corrupt nothing.
     Ok(out)
 }
 
@@ -1686,9 +1664,9 @@ mod sweep {
     /// **cold** store over the same backing that enumerates the durable
     /// provisional cells from scratch. Equality proves the set neither
     /// under-reports (a provisional cell it missed → a strand) nor over-reports
-    /// beyond what the point-read filter drops (invariant 1: set ⟺ durable
-    /// provisional). O6: minting the cold store fresh over the shared cells is
-    /// the memory cold-window.
+    /// beyond what the point-read filter drops (the incremental set must stay
+    /// ⟺ the durable provisional cells). Minting the cold store fresh over the
+    /// shared cells is the memory cold-window.
     async fn run_set_agreement(SetOps(ops): SetOps) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();

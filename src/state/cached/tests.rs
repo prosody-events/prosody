@@ -18,7 +18,7 @@ use crate::state::identity::{CollectionId, CollectionRef, StateKey, StateName, S
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
-use crate::state::tests::cell_suite::{CountingCellStore, ScriptedOracle, bytes};
+use crate::state::tests::cell_suite::{CountingCellStore, ScriptedOracle, bytes, cell_at};
 use crate::test_util::TEST_RUNTIME;
 use ::bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
@@ -90,14 +90,6 @@ fn error_at_the_far_endpoint_leaves_no_remainder() -> Result<()> {
         None
     );
     Ok(())
-}
-
-/// The cell at single-byte coordinate `b` in section 0.
-fn cell_at(b: u8) -> CellKey {
-    CellKey {
-        section: Section::new(0),
-        coordinate: c(b),
-    }
 }
 
 /// Drains up to `take` cells of a forward scan over `[0, end]`, mapping each

@@ -59,7 +59,7 @@ fn resolved_present() -> Result<()> {
 
 /// The promote-of-clear residue: `data`/`prev_data` both NULL but
 /// `encoding`/`version` still populated → `Resolved(None)`,
-/// NOT corruption. This is the case the advisor flagged.
+/// NOT corruption.
 #[test]
 fn resolved_clear_residue_is_not_corrupt() -> Result<()> {
     let row: RawCellRow = (None, None, Some(enc()), Some(ver()), None);
@@ -164,9 +164,9 @@ fn prev_without_event_is_corrupt() -> Result<()> {
     let row: RawCellRow = (None, Some(blob("old")?), Some(enc()), Some(ver()), None);
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraCellStoreError::CorruptCell {
-            reason: CellCorruptReason::PrevWithoutEvent
-        })
+        Err(CassandraCellStoreError::CorruptCell(
+            CellCorruptReason::PrevWithoutEvent
+        ))
     ));
     Ok(())
 }
@@ -177,9 +177,9 @@ fn blob_without_encoding_is_corrupt() -> Result<()> {
     let row: RawCellRow = (Some(blob("v")?), None, None, Some(ver()), None);
     assert!(matches!(
         try_decode_cell(row),
-        Err(CassandraCellStoreError::CorruptCell {
-            reason: CellCorruptReason::BlobWithoutEncoding
-        })
+        Err(CassandraCellStoreError::CorruptCell(
+            CellCorruptReason::BlobWithoutEncoding
+        ))
     ));
     Ok(())
 }

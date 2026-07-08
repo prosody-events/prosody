@@ -105,7 +105,6 @@ where
     P: Clone + Send + Sync + 'static,
 {
     type Loader = MemoryLoader<P>;
-    type ScanError = StateAccessError;
 
     fn loader(&self) -> &Self::Loader {
         &self.loader
@@ -138,7 +137,7 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::ScanError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
 

@@ -19,11 +19,12 @@
 //! flush drain to its own collection.
 
 use super::sealed::{FinalizeOutcome, StateLifecycle};
-use super::{ArmedKeys, CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
+use crate::state::manager::ArmedKeys;
 use crate::state::manager::EventStateScope;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};

@@ -87,11 +87,7 @@ impl OrderedKeyCodec for I64KeyCodec {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
-        let array = <[u8; 8]>::try_from(bytes).map_err(|_| KeyCodecError::BadLength {
-            expected: 8,
-            actual: bytes.len(),
-        })?;
-        Ok(order_preserving_i64_decode(array))
+        Ok(order_preserving_i64_decode(fixed_width_8(bytes)?))
     }
 }
 
@@ -109,12 +105,17 @@ impl OrderedKeyCodec for U64KeyCodec {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
-        let array = <[u8; 8]>::try_from(bytes).map_err(|_| KeyCodecError::BadLength {
-            expected: 8,
-            actual: bytes.len(),
-        })?;
-        Ok(u64::from_be_bytes(array))
+        Ok(u64::from_be_bytes(fixed_width_8(bytes)?))
     }
+}
+
+/// Validates `bytes` is exactly 8 bytes wide, as required by the fixed-width
+/// codecs ([`I64KeyCodec`], [`U64KeyCodec`]).
+fn fixed_width_8(bytes: &[u8]) -> Result<[u8; 8], KeyCodecError> {
+    <[u8; 8]>::try_from(bytes).map_err(|_| KeyCodecError::BadLength {
+        expected: 8,
+        actual: bytes.len(),
+    })
 }
 
 /// Error decoding order-preserving key bytes.

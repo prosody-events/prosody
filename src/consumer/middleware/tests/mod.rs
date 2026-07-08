@@ -724,9 +724,10 @@ mod backstop_amortization {
     use crate::state::StateKey;
     use crate::state::descriptor::tests::test_session_with_armed;
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
+    use crate::state::manager::ArmedKeys;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::StateLifecycle;
-    use crate::state::session::{ArmedKeys, LifecycleAccessExt};
     use color_eyre::eyre::{Result, eyre};
     use serde_json::json;
     use uuid::Uuid;
@@ -835,9 +836,10 @@ mod arm_backstop {
     use crate::state::StateKey;
     use crate::state::descriptor::tests::{TestSession, test_session_with_armed};
     use crate::state::descriptor::{Registered, value_state};
+    use crate::state::manager::ArmedKeys;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::StateLifecycle;
-    use crate::state::session::{ArmedKeys, LifecycleAccessExt};
     use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::{Result, eyre};
     use futures::executor;
