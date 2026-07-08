@@ -1,8 +1,10 @@
-//! In-memory message loader for testing defer middleware.
+//! In-memory [`MessageLoader`] implementation, used for tests and the
+//! mock-mode (`StorePair::Memory`) consumer path — wherever a
+//! [`MessageLoader`] is needed without touching Kafka.
 //!
-//! Provides a [`MemoryLoader`] that stores messages in memory and loads them by
-//! offset coordinates. Unlike the Kafka loader, this loader requires explicit
-//! message storage via [`MemoryLoader::store_message`].
+//! [`MemoryLoader`] loads messages by exact offset coordinates. Unlike the
+//! Kafka loader, it requires explicit message storage via
+//! [`MemoryLoader::store_message`].
 
 use super::MessageLoader;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
@@ -58,14 +60,6 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
     ///
     /// Messages must be stored before they can be loaded via
     /// [`MessageLoader::load_message`].
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic of the message
-    /// * `partition` - The partition of the message
-    /// * `offset` - The offset of the message
-    /// * `key` - The message key
-    /// * `payload` - The message payload
     pub fn store_message(
         &self,
         topic: Topic,
@@ -114,7 +108,6 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
         self.messages.read().is_empty()
     }
 
-    /// Implementation of message loading.
     async fn load_message_impl(
         &self,
         topic: Topic,

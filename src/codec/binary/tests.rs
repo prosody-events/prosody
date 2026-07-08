@@ -97,21 +97,10 @@ fn serialize_appends_when_buffer_non_empty() -> color_eyre::Result<()> {
 
 #[test]
 fn missing_event_id_yields_none() -> color_eyre::Result<()> {
-    #[derive(Default)]
-    struct NoMetadataExtractor;
-    impl BinaryExtractor for NoMetadataExtractor {
-        type Error = Infallible;
-
-        fn extract<'a>(&mut self, _buf: &'a mut [u8]) -> Result<BinaryMetadata<'a>, Self::Error> {
-            Ok(BinaryMetadata::default())
-        }
-
-        fn with_cached_local<R>(f: impl FnOnce(Self) -> (Self, R)) -> R {
-            f(Self).1
-        }
-    }
-    let mut wire = b"\x00\x00\x00\x00payload".to_vec();
-    let mut codec = BinaryCodec::<NoMetadataExtractor>::default();
+    // Buffer shorter than the length prefix — PrefixExtractor's short-circuit
+    // branch returns BinaryMetadata::default().
+    let mut wire = b"ab".to_vec();
+    let mut codec = BinaryCodec::<PrefixExtractor>::default();
     let payload = codec.deserialize(&mut wire)?;
     assert!(payload.event_id().is_none());
     assert!(payload.event_type().is_none());
@@ -135,52 +124,31 @@ fn json_type(input: &[u8]) -> Result<Option<String>, JsonExtractError> {
 }
 
 #[test]
-fn json_id_first_field() -> Result<(), JsonExtractError> {
+fn json_id_finds_top_level_field_regardless_of_noise() -> Result<(), JsonExtractError> {
     assert_eq!(json_id(br#"{"id":"abc"}"#)?.as_deref(), Some("abc"));
-    Ok(())
-}
-
-#[test]
-fn json_id_with_whitespace() -> Result<(), JsonExtractError> {
-    let input = b"  {\n  \"id\" : \"abc-123\"  ,\n  \"x\": 1\n}";
-    assert_eq!(json_id(input)?.as_deref(), Some("abc-123"));
-    Ok(())
-}
-
-#[test]
-fn json_id_after_other_fields() -> Result<(), JsonExtractError> {
-    let input = br#"{"name":"Alice","kind":"user","id":"42"}"#;
-    assert_eq!(json_id(input)?.as_deref(), Some("42"));
-    Ok(())
-}
-
-#[test]
-fn json_id_skips_string_value_containing_id_token() -> Result<(), JsonExtractError> {
+    assert_eq!(
+        json_id(b"  {\n  \"id\" : \"abc-123\"  ,\n  \"x\": 1\n}")?.as_deref(),
+        Some("abc-123")
+    );
+    assert_eq!(
+        json_id(br#"{"name":"Alice","kind":"user","id":"42"}"#)?.as_deref(),
+        Some("42")
+    );
     // Earlier value contains the literal characters `"id":` — must not
     // false-match.
-    let input = br#"{"note":"\"id\": fake","id":"real"}"#;
-    assert_eq!(json_id(input)?.as_deref(), Some("real"));
-    Ok(())
-}
-
-#[test]
-fn json_id_ignores_nested_id() -> Result<(), JsonExtractError> {
-    let input = br#"{"data":{"id":"nested"},"id":"top"}"#;
-    assert_eq!(json_id(input)?.as_deref(), Some("top"));
-    Ok(())
-}
-
-#[test]
-fn json_id_no_top_level_id_returns_none() -> Result<(), JsonExtractError> {
-    let input = br#"{"data":{"id":"nested"}}"#;
-    assert_eq!(json_id(input)?, None);
-    Ok(())
-}
-
-#[test]
-fn json_id_skips_arrays_and_numbers() -> Result<(), JsonExtractError> {
-    let input = br#"{"a":[1,2,{"id":"inner"}],"b":3.14,"c":true,"d":null,"id":"x"}"#;
-    assert_eq!(json_id(input)?.as_deref(), Some("x"));
+    assert_eq!(
+        json_id(br#"{"note":"\"id\": fake","id":"real"}"#)?.as_deref(),
+        Some("real")
+    );
+    assert_eq!(
+        json_id(br#"{"data":{"id":"nested"},"id":"top"}"#)?.as_deref(),
+        Some("top")
+    );
+    assert_eq!(json_id(br#"{"data":{"id":"nested"}}"#)?, None);
+    assert_eq!(
+        json_id(br#"{"a":[1,2,{"id":"inner"}],"b":3.14,"c":true,"d":null,"id":"x"}"#)?.as_deref(),
+        Some("x")
+    );
     Ok(())
 }
 

@@ -8,27 +8,7 @@
 use super::chunk_boundaries;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
-use std::iter::repeat_n;
 use std::ops::Range;
-
-/// Mirrors [`super::CassandraStore::execute_unlogged_batches`]' unit→row
-/// flatten: pack per-**unit** weights, then within each chunk expand every unit
-/// to its `row_count` rows (each tagged with its unit index). The production
-/// flatten is `units[range].flat_map(|u| u.rows.iter())`, so a chunk always
-/// holds **whole** units — this is the offline witness of that.
-fn flatten_units_to_batches(
-    units: &[(u64, usize)],
-    max_bytes: u64,
-    max_count: usize,
-) -> Vec<Vec<usize>> {
-    chunk_boundaries(units.iter().map(|(w, _)| *w), max_bytes, max_count)
-        .map(|range| {
-            (range.start..range.end)
-                .flat_map(|unit_idx| repeat_n(unit_idx, units[unit_idx].1))
-                .collect()
-        })
-        .collect()
-}
 
 /// The packer yields the **fewest contiguous** chunks within both limits — the
 /// "as few batches as possible" invariant, proven offline.
@@ -48,6 +28,12 @@ fn flatten_units_to_batches(
 ///   extension is provably the minimum number of parts — `ceil(sum /
 ///   max_bytes)` is **not** the right formula, since e.g. `[3,3,3]` with
 ///   `max_bytes = 5` needs 3 parts, not 2.)
+///
+/// `chunk_boundaries` treats each weight as an atomic, unsplittable element, so
+/// this cover+contiguity clause is exactly the guarantee a unit-based caller —
+/// [`super::CassandraStore::execute_unlogged_batches`], where one weight is a
+/// whole cell (data row plus index marker) — relies on to keep a unit's rows in
+/// one batch: a contiguous index partition never splits an index.
 #[quickcheck]
 fn chunk_boundaries_are_minimal_and_within_limits(
     sizes: Vec<u32>,
@@ -104,48 +90,4 @@ fn chunk_boundaries_are_minimal_and_within_limits(
     }
 
     TestResult::passed()
-}
-
-/// A cell's rows are **never split across batches** — the whole-cell atomicity
-/// the per-cell batch unit enforces structurally. Over random per-unit weights
-/// (some heavier than `max_bytes`, exercising the oversized arm) and row
-/// counts:
-///
-/// * **whole units** — every row of a given unit lands in exactly one batch,
-///   contiguously (a split would place a unit's rows in two batches);
-/// * **cover + order** — concatenating the batches reproduces the full row list
-///   (unit `0` fully, then unit `1`, …) with none dropped or reordered.
-///
-/// Generalizes the old single-example multi-chunk smoke: it proves the flatten
-/// keeps cells whole for *any* packing, not one hand-picked split.
-#[quickcheck]
-fn chunk_boundaries_never_split_a_unit(
-    units_raw: Vec<(u16, u8)>,
-    max_bytes_raw: u16,
-    max_count_raw: u8,
-) -> TestResult {
-    // `+ 1`: both limits ≥ 1, and every unit has ≥ 1 row.
-    let max_bytes = u64::from(max_bytes_raw) + 1;
-    let max_count = usize::from(max_count_raw) + 1;
-    let units: Vec<(u64, usize)> = units_raw
-        .into_iter()
-        .map(|(w, r)| (u64::from(w), usize::from(r) + 1))
-        .collect();
-
-    let batches = flatten_units_to_batches(&units, max_bytes, max_count);
-
-    // Whole units: each unit index occupies one contiguous run in one batch.
-    for unit_idx in 0..units.len() {
-        let batches_with = batches.iter().filter(|b| b.contains(&unit_idx)).count();
-        if batches_with != 1 {
-            return TestResult::failed();
-        }
-    }
-
-    // Cover + order: the batches concatenate to the full flattened row list.
-    let expected: Vec<usize> = (0..units.len())
-        .flat_map(|i| repeat_n(i, units[i].1))
-        .collect();
-    let actual: Vec<usize> = batches.into_iter().flatten().collect();
-    TestResult::from_bool(actual == expected)
 }

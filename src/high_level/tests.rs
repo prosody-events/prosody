@@ -2,19 +2,12 @@ use super::*;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::defer::DeferConfigurationBuilder;
-use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
-use crate::consumer::middleware::retry::RetryConfiguration;
-use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
-use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
-use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
-use crate::consumer::{ConsumerConfiguration, DemandType, KeyedStateConfiguration};
+use crate::consumer::{ConsumerConfiguration, DemandType};
 use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
 use crate::telemetry::Telemetry;
-use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use color_eyre::Result;
@@ -171,41 +164,29 @@ fn test_missing_topics_edge_cases() -> Result<()> {
     Ok(())
 }
 
-/// Owns the helper-produced mock cluster alongside the
-/// `HighLevelClient` so the cluster's Drop runs at end of test.
-struct ClientFixture {
-    client: HighLevelClient<()>,
+/// Owns the helper-produced mock cluster alongside the `HighLevelClient` so
+/// the cluster's Drop runs at end of test (no `mem::forget` leaks).
+struct ClientFixture<T> {
+    client: HighLevelClient<T>,
     _cluster: MockCluster<'static, DefaultProducerContext>,
 }
 
-/// Helper function to create a `HighLevelClient` for source system testing.
-///
-/// # Arguments
-///
-/// * `group_id` - The consumer group ID to use.
-/// * `source_system` - Optional explicit source system for the producer.
-///
-/// # Returns
-///
-/// A configured `HighLevelClient` instance plus the underlying mock
-/// cluster (kept alive for the test).
-fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<ClientFixture> {
+/// Builds a mock-mode pipeline `HighLevelClient<T>`, ready to `register`
+/// (Configured) and `subscribe`/`unsubscribe`. Optionally overrides the
+/// producer's source system (default: derived from `group_id`).
+fn create_test_client<T>(group_id: &str, source_system: Option<&str>) -> Result<ClientFixture<T>> {
     let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
     let bootstrap = cluster.bootstrap_servers();
     cluster.create_topic("test-topic", 1, 1)?;
 
-    // Create producer configuration
     let mut producer_builder = ProducerConfiguration::builder();
     producer_builder
         .bootstrap_servers(vec![bootstrap.clone()])
         .mock(true);
-
-    // Set source system if provided
     if let Some(source) = source_system {
         producer_builder.source_system(source);
     }
 
-    // Create consumer configuration
     let mut consumer_builder = ConsumerConfiguration::builder();
     consumer_builder
         .bootstrap_servers(vec![bootstrap])
@@ -215,15 +196,7 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Cli
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
-        retry: RetryConfiguration::builder(),
-        failure_topic: FailureTopicConfigurationBuilder::default(),
-        scheduler: SchedulerConfigurationBuilder::default(),
-        monopolization: MonopolizationConfigurationBuilder::default(),
-        defer: DeferConfigurationBuilder::default(),
-        dedup: DeduplicationConfigurationBuilder::default(),
-        timeout: TimeoutConfigurationBuilder::default(),
-        keyed_state: KeyedStateConfiguration::default(),
-        emitter: TelemetryEmitterConfiguration::default(),
+        ..Default::default()
     };
     let cassandra_builder = CassandraConfigurationBuilder::default();
 
@@ -244,7 +217,7 @@ fn test_source_system_defaults_to_consumer_group() -> Result<()> {
     let group_id = "my-test-group";
 
     // Create client WITHOUT specifying source_system
-    let fixture = create_test_client(group_id, None)?;
+    let fixture = create_test_client::<()>(group_id, None)?;
 
     // Verify that source_system() returns the consumer group_id
     assert_eq!(fixture.client.source_system(), group_id);
@@ -257,7 +230,7 @@ fn test_source_system_explicit_value_preserved() -> Result<()> {
     let group_id = "my-test-group";
 
     // Create client WITH explicit source_system
-    let fixture = create_test_client(group_id, Some(explicit_source))?;
+    let fixture = create_test_client::<()>(group_id, Some(explicit_source))?;
 
     // Verify that source_system() returns the explicit value, NOT group_id
     assert_eq!(fixture.client.source_system(), explicit_source);
@@ -302,54 +275,10 @@ impl FallibleHandler for NoOpHandler {
     async fn shutdown(self) {}
 }
 
-/// Owns the mock cluster alongside a handler-typed client so the cluster's
-/// Drop runs at end of test.
-struct HandlerClientFixture {
-    client: HighLevelClient<NoOpHandler>,
-    _cluster: MockCluster<'static, DefaultProducerContext>,
-}
-
-/// Builds a mock-mode pipeline client typed for [`NoOpHandler`], ready to
-/// `register` (Configured) and `subscribe`/`unsubscribe`.
-fn create_handler_client(group_id: &str) -> Result<HandlerClientFixture> {
-    let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
-    let bootstrap = cluster.bootstrap_servers();
-    cluster.create_topic("test-topic", 1, 1)?;
-
-    let mut producer_builder = ProducerConfiguration::builder();
-    producer_builder
-        .bootstrap_servers(vec![bootstrap.clone()])
-        .mock(true);
-
-    let mut consumer_builder = ConsumerConfiguration::builder();
-    consumer_builder
-        .bootstrap_servers(vec![bootstrap])
-        .group_id(group_id)
-        .subscribed_topics(&["test-topic".to_owned()])
-        .mock(true);
-
-    let consumer_builders = ConsumerBuilders {
-        consumer: consumer_builder,
-        ..Default::default()
-    };
-    let cassandra_builder = CassandraConfigurationBuilder::default();
-
-    let client = HighLevelClient::new(
-        Mode::Pipeline,
-        &mut producer_builder,
-        &consumer_builders,
-        &cassandra_builder,
-    )?;
-    Ok(HandlerClientFixture {
-        client,
-        _cluster: cluster,
-    })
-}
-
 /// In the `Configured` state, `register` mints a capability handle.
 #[test]
 fn register_in_configured_state_binds() -> Result<()> {
-    let fixture = create_test_client("register-configured", None)?;
+    let fixture = create_test_client::<()>("register-configured", None)?;
     let registered =
         TEST_RUNTIME.block_on(fixture.client.register(value_state::<JsonCodec>("cart")));
     assert!(registered.is_ok(), "register must succeed while Configured");
@@ -360,7 +289,7 @@ fn register_in_configured_state_binds() -> Result<()> {
 /// `AlreadySubscribed` rather than mutating a running consumer's collections.
 #[test]
 fn register_after_subscribe_is_rejected() -> Result<()> {
-    let fixture = create_handler_client("register-after-subscribe")?;
+    let fixture = create_test_client::<NoOpHandler>("register-after-subscribe", None)?;
     TEST_RUNTIME.block_on(async {
         fixture.client.subscribe(NoOpHandler).await?;
         let late = fixture
@@ -384,7 +313,7 @@ fn register_after_subscribe_is_rejected() -> Result<()> {
 /// registered before re-subscribing.
 #[test]
 fn registrations_survive_resubscribe_cycle() -> Result<()> {
-    let fixture = create_handler_client("resubscribe-cycle")?;
+    let fixture = create_test_client::<NoOpHandler>("resubscribe-cycle", None)?;
     TEST_RUNTIME.block_on(async {
         // Register, then run the full bidirectional cycle without
         // re-registering — a drained config would rebuild an empty registry,

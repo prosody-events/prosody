@@ -12,44 +12,66 @@ use chrono::Utc;
 use color_eyre::eyre::{Result, ensure, eyre};
 use std::sync::Arc;
 
-fn timer_event(key: &str) -> Data {
+fn timer_event_with(event_type: TimerEventType, timer_type: TimerType, key: &str) -> Data {
     Data::Timer(TimerTelemetryEvent {
-        event_type: TimerEventType::Scheduled,
+        event_type,
         event_time: Utc::now(),
-        scheduled_time: CompactDateTime::from(1000_u32),
-        timer_type: TimerType::Application,
+        scheduled_time: CompactDateTime::from(1_700_000_000_u32),
+        timer_type,
         key: Arc::from(key),
-        source: Arc::from("src"),
+        source: Arc::from("grp"),
+        trace_parent: None,
+        trace_state: None,
+    })
+}
+
+fn timer_event(key: &str) -> Data {
+    timer_event_with(TimerEventType::Scheduled, TimerType::Application, key)
+}
+
+fn message_event_with(event_type: MessageEventType, offset: i64, key: &str) -> Data {
+    Data::Message(MessageTelemetryEvent {
+        event_type,
+        event_time: Utc::now(),
+        offset,
+        key: Arc::from(key),
+        source: Arc::from("grp"),
         trace_parent: None,
         trace_state: None,
     })
 }
 
 fn message_event(key: &str) -> Data {
-    Data::Message(MessageTelemetryEvent {
-        event_type: MessageEventType::Dispatched {
+    message_event_with(
+        MessageEventType::Dispatched {
             demand_type: DemandType::Normal,
         },
+        0,
+        key,
+    )
+}
+
+fn message_sent_event_with(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    key: &str,
+    source: &str,
+) -> Data {
+    Data::MessageSent(MessageSentEvent {
         event_time: Utc::now(),
-        offset: 0,
+        topic: topic.into(),
+        partition,
+        offset,
         key: Arc::from(key),
-        source: Arc::from("src"),
+        source: Arc::from(source),
         trace_parent: None,
         trace_state: None,
     })
 }
 
 fn message_sent_event(key: &str) -> Data {
-    Data::MessageSent(MessageSentEvent {
-        event_time: Utc::now(),
-        topic: "t".into(),
-        partition: 0,
-        offset: 0,
-        key: Arc::from(key),
-        source: Arc::from("src"),
-        trace_parent: None,
-        trace_state: None,
-    })
+    message_sent_event_with("t", 0, 0, key, "src")
 }
 
 #[test]
@@ -100,22 +122,15 @@ fn parse_serialized(data: &Data) -> Result<serde_json::Value> {
 
 #[test]
 fn serialize_timer_scheduled_omits_optional_fields() -> Result<()> {
-    let data = Data::Timer(TimerTelemetryEvent {
-        event_type: TimerEventType::Scheduled,
-        event_time: Utc::now(),
-        scheduled_time: CompactDateTime::from(1_700_000_000_u32),
-        timer_type: TimerType::Application,
-        key: Arc::from("t-key"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let data = timer_event("t-key");
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.timer.scheduled");
     assert_eq!(v["timerType"], "application");
     assert_eq!(v["key"], "t-key");
     assert_eq!(v["hostname"], "test-host");
+    assert_eq!(v["topic"], "src-topic");
+    assert_eq!(v["partition"], 7_i32);
     ensure!(
         DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
         "eventTime not RFC 3339"
@@ -133,16 +148,11 @@ fn serialize_timer_scheduled_omits_optional_fields() -> Result<()> {
 
 #[test]
 fn serialize_timer_cancelled_omits_optional_fields() -> Result<()> {
-    let data = Data::Timer(TimerTelemetryEvent {
-        event_type: TimerEventType::Cancelled,
-        event_time: Utc::now(),
-        scheduled_time: CompactDateTime::from(1_700_000_000_u32),
-        timer_type: TimerType::Application,
-        key: Arc::from("cancel-key"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let data = timer_event_with(
+        TimerEventType::Cancelled,
+        TimerType::Application,
+        "cancel-key",
+    );
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.timer.cancelled");
@@ -160,20 +170,12 @@ fn serialize_timer_cancelled_omits_optional_fields() -> Result<()> {
 
 #[test]
 fn serialize_timer_failed_includes_error_fields() -> Result<()> {
-    let data = Data::Timer(TimerTelemetryEvent {
-        event_type: TimerEventType::Failed {
-            demand_type: DemandType::Failure,
-            error_category: ErrorCategory::Permanent,
-            exception: "boom".into(),
-        },
-        event_time: Utc::now(),
-        scheduled_time: CompactDateTime::from(1_700_000_000_u32),
-        timer_type: TimerType::DeferredTimer,
-        key: Arc::from("t-fail"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let event_type = TimerEventType::Failed {
+        demand_type: DemandType::Failure,
+        error_category: ErrorCategory::Permanent,
+        exception: "boom".into(),
+    };
+    let data = timer_event_with(event_type, TimerType::DeferredTimer, "t-fail");
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.timer.failed");
@@ -185,23 +187,37 @@ fn serialize_timer_failed_includes_error_fields() -> Result<()> {
 }
 
 #[test]
-fn serialize_message_dispatched_omits_error_fields() -> Result<()> {
-    let data = Data::Message(MessageTelemetryEvent {
-        event_type: MessageEventType::Dispatched {
-            demand_type: DemandType::Normal,
-        },
+fn serialize_timer_includes_trace_context_when_present() -> Result<()> {
+    let data = Data::Timer(TimerTelemetryEvent {
+        event_type: TimerEventType::Scheduled,
         event_time: Utc::now(),
-        offset: 42,
-        key: Arc::from("m-key"),
+        scheduled_time: CompactDateTime::from(1_700_000_000_u32),
+        timer_type: TimerType::Application,
+        key: Arc::from("trace-key"),
         source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
+        trace_parent: Some("00-trace-id-span-id-01".into()),
+        trace_state: Some("vendor=value".into()),
     });
+    let v = parse_serialized(&data)?;
+
+    assert_eq!(v["traceParent"], "00-trace-id-span-id-01");
+    assert_eq!(v["traceState"], "vendor=value");
+    Ok(())
+}
+
+#[test]
+fn serialize_message_dispatched_omits_error_fields() -> Result<()> {
+    let event_type = MessageEventType::Dispatched {
+        demand_type: DemandType::Normal,
+    };
+    let data = message_event_with(event_type, 42, "m-key");
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.message.dispatched");
     assert_eq!(v["demandType"], "normal");
     assert_eq!(v["offset"], 42_i32);
+    assert_eq!(v["topic"], "src-topic");
+    assert_eq!(v["partition"], 7_i32);
     assert!(v.get("errorCategory").is_none());
     assert!(v.get("exception").is_none());
     Ok(())
@@ -209,19 +225,12 @@ fn serialize_message_dispatched_omits_error_fields() -> Result<()> {
 
 #[test]
 fn serialize_message_failed_includes_error_fields() -> Result<()> {
-    let data = Data::Message(MessageTelemetryEvent {
-        event_type: MessageEventType::Failed {
-            demand_type: DemandType::Normal,
-            error_category: ErrorCategory::Transient,
-            exception: "oops".into(),
-        },
-        event_time: Utc::now(),
-        offset: 99,
-        key: Arc::from("m-fail"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let event_type = MessageEventType::Failed {
+        demand_type: DemandType::Normal,
+        error_category: ErrorCategory::Transient,
+        exception: "oops".into(),
+    };
+    let data = message_event_with(event_type, 99, "m-fail");
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.message.failed");
@@ -233,17 +242,10 @@ fn serialize_message_failed_includes_error_fields() -> Result<()> {
 
 #[test]
 fn serialize_message_succeeded_omits_error_fields() -> Result<()> {
-    let data = Data::Message(MessageTelemetryEvent {
-        event_type: MessageEventType::Succeeded {
-            demand_type: DemandType::Normal,
-        },
-        event_time: Utc::now(),
-        offset: 10,
-        key: Arc::from("m-ok"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let event_type = MessageEventType::Succeeded {
+        demand_type: DemandType::Normal,
+    };
+    let data = message_event_with(event_type, 10, "m-ok");
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.message.succeeded");
@@ -261,16 +263,7 @@ fn serialize_message_succeeded_omits_error_fields() -> Result<()> {
 
 #[test]
 fn serialize_message_sent_fields() -> Result<()> {
-    let data = Data::MessageSent(MessageSentEvent {
-        event_time: Utc::now(),
-        topic: "dest-topic".into(),
-        partition: 3,
-        offset: 77,
-        key: Arc::from("s-key"),
-        source: Arc::from("producer-src"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let data = message_sent_event_with("dest-topic", 3, 77, "s-key", "producer-src");
     let v = parse_serialized(&data)?;
 
     assert_eq!(v["type"], "prosody.message.sent");
@@ -376,16 +369,7 @@ fn assert_secs_format(raw: &str, field: &str) -> Result<()> {
 
 #[test]
 fn event_time_has_millisecond_precision_and_z_suffix_timer() -> Result<()> {
-    let data = Data::Timer(TimerTelemetryEvent {
-        event_type: TimerEventType::Scheduled,
-        event_time: Utc::now(),
-        scheduled_time: CompactDateTime::from(1_700_000_000_u32),
-        timer_type: TimerType::Application,
-        key: Arc::from("prec-key"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let data = timer_event("prec-key");
     let v = parse_serialized(&data)?;
 
     let event_time = v["eventTime"]
@@ -401,17 +385,7 @@ fn event_time_has_millisecond_precision_and_z_suffix_timer() -> Result<()> {
 
 #[test]
 fn event_time_has_millisecond_precision_and_z_suffix_message() -> Result<()> {
-    let data = Data::Message(MessageTelemetryEvent {
-        event_type: MessageEventType::Dispatched {
-            demand_type: DemandType::Normal,
-        },
-        event_time: Utc::now(),
-        offset: 1,
-        key: Arc::from("prec-msg-key"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let data = message_event("prec-msg-key");
     let v = parse_serialized(&data)?;
 
     let event_time = v["eventTime"]
@@ -423,16 +397,7 @@ fn event_time_has_millisecond_precision_and_z_suffix_message() -> Result<()> {
 
 #[test]
 fn event_time_has_millisecond_precision_and_z_suffix_message_sent() -> Result<()> {
-    let data = Data::MessageSent(MessageSentEvent {
-        event_time: Utc::now(),
-        topic: "t".into(),
-        partition: 0,
-        offset: 0,
-        key: Arc::from("prec-sent-key"),
-        source: Arc::from("grp"),
-        trace_parent: None,
-        trace_state: None,
-    });
+    let data = message_sent_event("prec-sent-key");
     let v = parse_serialized(&data)?;
 
     let event_time = v["eventTime"]

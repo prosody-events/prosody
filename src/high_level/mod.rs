@@ -186,16 +186,8 @@ where
 
         let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
             mode,
-            consumer_builder: &consumer_builders.consumer,
-            retry_builder: &consumer_builders.retry,
-            failure_topic_builder: &consumer_builders.failure_topic,
-            scheduler_builder: &consumer_builders.scheduler,
-            monopolization_builder: &consumer_builders.monopolization,
-            defer_builder: &consumer_builders.defer,
-            dedup_builder: &consumer_builders.dedup,
-            timeout_builder: &consumer_builders.timeout,
+            consumer_builders,
             cassandra_builder,
-            keyed_state: &consumer_builders.keyed_state,
         });
 
         // Check for topic existence only if not in mock mode
@@ -308,12 +300,6 @@ where
                 common,
                 trigger_store,
             } => {
-                // `common` (carrying the registered keyed-state config) is
-                // passed by reference and cloned inside the constructor, so the
-                // intact `ModeConfiguration` is retained in `Running` and moved
-                // back to `Configured` on `unsubscribe`: a re-subscribe rebuilds
-                // the registry from the same registrations and existing
-                // `Registered<_>` tokens stay valid.
                 ProsodyConsumer::<C>::pipeline_consumer(
                     consumer,
                     trigger_store,

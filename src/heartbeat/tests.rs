@@ -1,8 +1,8 @@
 use super::*;
 use tokio::time::{Duration, Instant as TokioInstant, sleep};
 
-#[tokio::test]
-async fn test_heartbeat_initially_active() {
+#[test]
+fn test_heartbeat_initially_active() {
     let threshold = Duration::from_millis(100);
     let heartbeat = Heartbeat::new("test_initial", threshold);
     heartbeat.beat();
@@ -26,6 +26,12 @@ async fn test_heartbeat_becomes_stalled() {
     assert!(
         heartbeat.is_stalled(),
         "Heartbeat should be stalled after inactivity exceeds the threshold"
+    );
+
+    heartbeat.beat();
+    assert!(
+        !heartbeat.is_stalled(),
+        "Heartbeat should recover to active after a fresh beat"
     );
 }
 

@@ -4,11 +4,16 @@ use crate::telemetry::event::Data;
 use chrono::Utc;
 use color_eyre::eyre::{Result, bail, ensure};
 
+/// Builds a fresh sender and its subscribed receiver for a test.
+fn harness() -> (TelemetrySender, broadcast::Receiver<TelemetryEvent>) {
+    let telemetry = Telemetry::new();
+    let rx = telemetry.subscribe();
+    (telemetry.sender(), rx)
+}
+
 #[test]
 fn message_sent_emits_correct_variant() -> Result<()> {
-    let telemetry = Telemetry::new();
-    let mut rx = telemetry.subscribe();
-    let sender = telemetry.sender();
+    let (sender, mut rx) = harness();
 
     let topic: Topic = "test-topic".into();
     let partition: Partition = 3;
@@ -35,9 +40,7 @@ fn message_sent_emits_correct_variant() -> Result<()> {
 
 #[test]
 fn message_sent_event_time_is_recent() -> Result<()> {
-    let telemetry = Telemetry::new();
-    let mut rx = telemetry.subscribe();
-    let sender = telemetry.sender();
+    let (sender, mut rx) = harness();
 
     let topic: Topic = "time-topic".into();
     let key: Key = Arc::from("time-key");

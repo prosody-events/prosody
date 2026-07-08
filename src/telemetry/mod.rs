@@ -93,10 +93,9 @@ impl Telemetry {
         self.sender().partition_sender(topic, partition)
     }
 
-    /// Emits a raw telemetry event with custom timestamp.
-    ///
-    /// This method is intended for testing and allows full control
-    /// over event timing for testing purposes.
+    /// Emits a raw telemetry event with a caller-supplied timestamp,
+    /// bypassing the normal emission path — for tests that need to control
+    /// event timing.
     #[doc(hidden)]
     pub fn test_emit(&self, event: TelemetryEvent) {
         let _ = self.tx.send(event);

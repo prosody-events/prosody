@@ -10,33 +10,23 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
-use crate::consumer::middleware::deduplication::{
-    DeduplicationConfigurationBuilder, DeduplicationConfigurationBuilderError,
-};
-use crate::consumer::middleware::defer::{
-    DeferConfigError, DeferConfiguration, DeferConfigurationBuilder,
-};
+use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilderError;
+use crate::consumer::middleware::defer::{DeferConfigError, DeferConfiguration};
 use crate::consumer::middleware::monopolization::{
-    MonopolizationConfiguration, MonopolizationConfigurationBuilder,
-    MonopolizationConfigurationBuilderError,
+    MonopolizationConfiguration, MonopolizationConfigurationBuilderError,
 };
-use crate::consumer::middleware::retry::{
-    RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
-};
+use crate::consumer::middleware::retry::{RetryConfiguration, RetryConfigurationBuilderError};
 use crate::consumer::middleware::scheduler::{
-    SchedulerConfigurationBuilder, SchedulerConfigurationBuilderError, SchedulerInitError,
+    SchedulerConfigurationBuilderError, SchedulerInitError,
 };
-use crate::consumer::middleware::timeout::{
-    TimeoutConfigurationBuilder, TimeoutConfigurationBuilderError,
-};
+use crate::consumer::middleware::timeout::TimeoutConfigurationBuilderError;
 use crate::consumer::middleware::topic::{
-    FailureTopicConfiguration, FailureTopicConfigurationBuilder,
-    FailureTopicConfigurationBuilderError,
+    FailureTopicConfiguration, FailureTopicConfigurationBuilderError,
 };
 use crate::consumer::{
-    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
-    ConsumerConfigurationBuilderError, KeyedStateConfiguration,
+    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilderError,
 };
+use crate::high_level::ConsumerBuilders;
 use crate::high_level::mode::Mode;
 use crate::state::descriptor::{Registered, StateDescriptor};
 use thiserror::Error;
@@ -45,26 +35,10 @@ use thiserror::Error;
 pub(crate) struct ModeConfigurationBuildParams<'a> {
     /// The operational mode.
     pub mode: Mode,
-    /// Builder for the consumer configuration.
-    pub consumer_builder: &'a ConsumerConfigurationBuilder,
-    /// Builder for the retry configuration.
-    pub retry_builder: &'a RetryConfigurationBuilder,
-    /// Builder for the failure topic configuration.
-    pub failure_topic_builder: &'a FailureTopicConfigurationBuilder,
-    /// Builder for the scheduler configuration.
-    pub scheduler_builder: &'a SchedulerConfigurationBuilder,
-    /// Builder for the monopolization configuration.
-    pub monopolization_builder: &'a MonopolizationConfigurationBuilder,
-    /// Builder for the defer configuration.
-    pub defer_builder: &'a DeferConfigurationBuilder,
-    /// Builder for the deduplication configuration.
-    pub dedup_builder: &'a DeduplicationConfigurationBuilder,
-    /// Builder for the timeout configuration.
-    pub timeout_builder: &'a TimeoutConfigurationBuilder,
+    /// Bundled consumer and middleware configuration builders.
+    pub consumer_builders: &'a ConsumerBuilders,
     /// Builder for the Cassandra configuration.
     pub cassandra_builder: &'a CassandraConfigurationBuilder,
-    /// The keyed-state configuration (mode-independent; carries registrations).
-    pub keyed_state: &'a KeyedStateConfiguration,
 }
 
 /// Configuration for timer storage backends.
@@ -119,31 +93,23 @@ pub enum ModeConfiguration {
 }
 
 impl ModeConfiguration {
-    /// Builds a new `ModeConfiguration` based on the provided parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `params` - The build parameters containing all required configuration
-    ///   builders.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the built `ModeConfiguration` if successful, or a
-    /// `ModeConfigurationError` if any of the builds fail.
+    /// Builds a `ModeConfiguration` from the bundled configuration builders.
     ///
     /// # Errors
     ///
-    /// Returns an error if any of the configuration builds fail.
+    /// Returns a `ModeConfigurationError` if any of the configuration builds
+    /// fail.
     pub(crate) fn build(
         params: &ModeConfigurationBuildParams,
     ) -> Result<Self, ModeConfigurationError> {
-        let consumer = params.consumer_builder.build()?;
-        let retry = params.retry_builder.build()?;
-        let scheduler = params.scheduler_builder.build()?;
-        let timeout = params.timeout_builder.build()?;
+        let builders = params.consumer_builders;
+        let consumer = builders.consumer.build()?;
+        let retry = builders.retry.build()?;
+        let scheduler = builders.scheduler.build()?;
+        let timeout = builders.timeout.build()?;
         // Deduplication is the commit oracle for every mode, so it lives in the
         // common configuration rather than pipeline-only.
-        let dedup = params.dedup_builder.build()?;
+        let dedup = builders.dedup.build()?;
 
         // Build the common configuration shared by every mode. Keyed state is
         // mode-independent (it carries the registrations), so it lives here
@@ -152,7 +118,7 @@ impl ModeConfiguration {
             scheduler,
             timeout,
             dedup,
-            keyed_state: params.keyed_state.clone(),
+            keyed_state: builders.keyed_state.clone(),
         };
 
         // Create trigger store configuration based on mock mode
@@ -165,8 +131,8 @@ impl ModeConfiguration {
 
         Ok(match params.mode {
             Mode::Pipeline => {
-                let monopolization = params.monopolization_builder.build()?;
-                let defer = params.defer_builder.clone().build()?;
+                let monopolization = builders.monopolization.build()?;
+                let defer = builders.defer.clone().build()?;
                 Self::Pipeline {
                     consumer,
                     retry,
@@ -177,7 +143,7 @@ impl ModeConfiguration {
                 }
             }
             Mode::LowLatency => {
-                let failure_topic = params.failure_topic_builder.build()?;
+                let failure_topic = builders.failure_topic.build()?;
                 Self::LowLatency {
                     consumer,
                     retry,

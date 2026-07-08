@@ -1,4 +1,8 @@
 use opentelemetry::propagation::Injector;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing::subscriber::with_default;
+use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::TelemetryInjector;
 use crate::propagator::new_propagator;
@@ -37,4 +41,21 @@ fn extract_without_active_span_returns_none() {
     let (trace_parent, trace_state) = injector.into_parts();
     assert_eq!(trace_parent, None);
     assert_eq!(trace_state, None);
+}
+
+#[test]
+fn extract_with_active_span_returns_traceparent() {
+    let tracer = SdkTracerProvider::builder().build().tracer("test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+    with_default(subscriber, || {
+        let span = tracing::info_span!("test-span");
+        let _guard = span.enter();
+
+        let propagator = new_propagator();
+        let injector = TelemetryInjector::extract(&propagator);
+        let (trace_parent, _trace_state) = injector.into_parts();
+        assert!(trace_parent.is_some());
+    });
 }

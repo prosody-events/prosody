@@ -295,29 +295,18 @@ impl<C: Codec> ProsodyProducer<C> {
 
     /// Creates a new `ProsodyProducer` instance optimized for best-effort.
     ///
-    /// This configuration ensures a send timeout is set, defaulting to 1 second
-    /// if not specified.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
+    /// Best-effort construction has the same send-timeout defaulting as
+    /// [`Self::low_latency_producer`]; the two modes are distinguished
+    /// elsewhere (retry/monopolization wiring), not at producer construction.
     ///
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
     pub(crate) fn best_effort_producer(
-        mut config: ProducerConfiguration,
+        config: ProducerConfiguration,
         telemetry: TelemetrySender,
     ) -> Result<Self, ProducerError<C::Error>> {
-        if config.send_timeout.is_none() {
-            config.send_timeout = Some(Duration::from_secs(1));
-        }
-        Self::new(&config, telemetry)
+        Self::low_latency_producer(config, telemetry)
     }
 
     /// Sends a message to a Kafka topic.
@@ -327,7 +316,7 @@ impl<C: Codec> ProsodyProducer<C> {
     /// * `headers` - An iterator of key-value pairs to be added as headers.
     /// * `topic` - The topic to send the message to.
     /// * `key` - The message key.
-    /// * `payload` - The message payload as a JSON Value.
+    /// * `payload` - The message payload, encoded by `C`.
     ///
     /// # Returns
     ///

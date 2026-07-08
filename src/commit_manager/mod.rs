@@ -18,10 +18,8 @@
 //! # Timer side
 //!
 //! `is_timer_committed(key, type, time, wal_tag)` compares the WAL-recorded
-//! tag against the current tag in storage:
-//! - row absent → committed (fired-and-removed)
-//! - `Some(cur) == wal_tag` → not committed
-//! - `Some(cur) != wal_tag` → committed-and-rescheduled (returns `true`)
+//! tag against the current tag in storage — see its doc comment for the
+//! three-state decision.
 //!
 //! The timer side is read-only here: a trigger's tag row is written by the
 //! timer manager's own commit machinery, never through this type. See
@@ -36,10 +34,8 @@ use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::oracle::CommitOracle;
 use crate::state::{CommitDecision, EventRef, StateKey, TimerEventRef};
-use crate::timers::TimerManager;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
 use std::error::Error;
 use std::fmt;
@@ -50,14 +46,11 @@ use uuid::Uuid;
 /// Source of the current tag for a timer row — the timer half of the
 /// commit oracle.
 ///
-/// Two implementations exist: [`TimerManager`] (consults its in-memory
-/// scheduler before the store; used where a live manager is in hand, e.g.
-/// tests that drive the full timer lifecycle) and [`StoreTagSource`] (a
-/// bare [`TriggerStore`] read over a clone of the partition's own writing
-/// store; production keyed-state wiring, where the partition's live manager
-/// is not reachable and the oracle is only ever consulted for events that
-/// have fully completed — per-key serialization guarantees their durability
-/// markers landed before recovery runs).
+/// The implementation is [`StoreTagSource`]: a bare [`TriggerStore`] read
+/// over a clone of the partition's own writing store. No scheduler-aware
+/// source is needed — the oracle is only ever consulted for events that
+/// have fully completed, and per-key serialization guarantees their
+/// durability markers landed before recovery runs.
 pub trait TimerTagSource: Clone + Send + Sync + 'static {
     /// Error type for tag reads.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -72,27 +65,10 @@ pub trait TimerTagSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
 }
 
-impl<T> TimerTagSource for TimerManager<T>
-where
-    T: TriggerStore,
-    T::Error: ClassifyError,
-{
-    type Error = TimerManagerError<T::Error>;
-
-    async fn current_timer_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Result<Option<i32>, Self::Error> {
-        self.current_tag(key, time, timer_type).await
-    }
-}
-
 /// [`TimerTagSource`] over a bare [`TriggerStore`].
 ///
-/// A newtype rather than a blanket impl so it cannot overlap with the
-/// [`TimerManager`] impl.
+/// A newtype rather than a blanket impl over every [`TriggerStore`], so a
+/// store must be wrapped explicitly to serve as the oracle's tag source.
 #[derive(Clone)]
 pub struct StoreTagSource<T>(pub T);
 
@@ -128,11 +104,7 @@ pub struct CommitManager<D, TS> {
     timers: TS,
 }
 
-impl<D, TS> fmt::Debug for CommitManager<D, TS>
-where
-    D: DeduplicationStore,
-    TS: TimerTagSource,
-{
+impl<D, TS> fmt::Debug for CommitManager<D, TS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CommitManager").finish_non_exhaustive()
     }

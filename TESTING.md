@@ -233,7 +233,7 @@ time manually. A paused-time runtime cannot be shared across iterations
 (state leaks between cases). Ordinary suites share the multi-threaded
 `TEST_RUNTIME` in `tests/common.rs`.
 
-Exemplars: `src/commit_manager/tests.rs`,
+Exemplars: `src/timers/manager/tests.rs`,
 `src/consumer/partition/offsets/test.rs`.
 
 ### Iteration counts from the environment

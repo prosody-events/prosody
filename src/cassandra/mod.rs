@@ -200,7 +200,7 @@ impl CassandraStore {
     /// Executes an unpaged mutation and discards the result.
     ///
     /// Fire-and-forget wrapper for mutations that need only error
-    /// propagation; shared by the timer and keyed-state stores.
+    /// propagation; used by the Cassandra timer store for single-row writes.
     ///
     /// # Errors
     ///
