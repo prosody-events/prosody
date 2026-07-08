@@ -60,7 +60,7 @@ fn dlq_send_failed_classifies_by_producer_error() {
 // `Result<inner::Output, inner::Error>` to the inner handler.
 
 /// Records the inner-result a probe handler observes in each apply hook.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InnerHookEvent {
     Commit(Result<u64, TestError>),
     Abort(Result<u64, TestError>),
@@ -167,110 +167,103 @@ fn dlq_send_failed_err(category: ErrorCategory) -> FailureTopicError<TestError, 
     }
 }
 
+/// Exhaustive routing matrix: every combination of apply hook
+/// (`after_commit` / `after_abort`) and result variant (`Inner`, `Routed`,
+/// `Handler`, `DlqSendFailed`) must forward exactly one
+/// `Result<inner::Output, inner::Error>` call to the inner handler, per the
+/// work-centric invariant documented on `FailureTopicHandler::after_commit`
+/// / `after_abort`. Each row's `expected` makes a failing combination
+/// self-identifying.
 #[tokio::test]
-async fn after_commit_routed_forwards_inner_err_to_inner() -> color_eyre::Result<()> {
-    // DLQ accepted: marker commits, the inner will not be re-dispatched,
-    // so the inner's apply hook MUST fire as `after_commit(Err(inner))`.
-    let inner = Probe::new();
-    let log = inner.log.clone();
-    let handler = make_handler(inner)?;
+async fn apply_hook_routing_matrix() -> color_eyre::Result<()> {
+    enum Hook {
+        Commit,
+        Abort,
+    }
 
-    let result: Result<
-        FailureTopicOutput<u64, TestError>,
-        FailureTopicError<TestError, JsonCodecError>,
-    > = Ok(FailureTopicOutput::Routed(TestError(
-        ErrorCategory::Permanent,
-    )));
-    handler.after_commit(MockEventContext::new(), result).await;
+    type HandlerResult =
+        Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError, JsonCodecError>>;
 
-    let events = log.lock().clone();
-    assert_eq!(events.len(), 1, "exactly one inner hook should fire");
-    assert!(
-        matches!(
-            &events[0],
+    let rows: Vec<(&str, Hook, HandlerResult, InnerHookEvent)> = vec![
+        (
+            "commit x Inner(Ok): dispatch is final, forward Ok",
+            Hook::Commit,
+            Ok(FailureTopicOutput::Inner(42)),
+            InnerHookEvent::Commit(Ok(42)),
+        ),
+        (
+            "commit x Routed(Err): DLQ accepted, marker commits, inner will not be re-dispatched",
+            Hook::Commit,
+            Ok(FailureTopicOutput::Routed(TestError(
+                ErrorCategory::Permanent,
+            ))),
             InnerHookEvent::Commit(Err(TestError(ErrorCategory::Permanent))),
         ),
-        "expected Commit(Err(Permanent)), got {:?}",
-        events[0],
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn after_commit_inner_ok_forwards_inner_output() -> color_eyre::Result<()> {
-    let inner = Probe::new();
-    let log = inner.log.clone();
-    let handler = make_handler(inner)?;
-
-    let result: Result<
-        FailureTopicOutput<u64, TestError>,
-        FailureTopicError<TestError, JsonCodecError>,
-    > = Ok(FailureTopicOutput::Inner(42));
-    handler.after_commit(MockEventContext::new(), result).await;
-
-    let events = log.lock().clone();
-    assert_eq!(events.len(), 1);
-    assert!(
-        matches!(&events[0], InnerHookEvent::Commit(Ok(42))),
-        "inner Ok output should be forwarded to inner.after_commit",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn after_commit_dlq_send_failed_forwards_inner_err() -> color_eyre::Result<()> {
-    // Even though `DlqSendFailed` would normally route through the outer
-    // retry layer (and thus surface to the inner via `after_abort`),
-    // when the framework decides the marker commits anyway, we still
-    // owe the inner a typed `Err(inner)` here.
-    let inner = Probe::new();
-    let log = inner.log.clone();
-    let handler = make_handler(inner)?;
-
-    let result: Result<
-        FailureTopicOutput<u64, TestError>,
-        FailureTopicError<TestError, JsonCodecError>,
-    > = Err(dlq_send_failed_err(ErrorCategory::Transient));
-    handler.after_commit(MockEventContext::new(), result).await;
-
-    let events = log.lock().clone();
-    assert_eq!(events.len(), 1);
-    assert!(
-        matches!(
-            &events[0],
+        (
+            "commit x Handler(Err): terminal error the framework chose to commit rather than abort",
+            Hook::Commit,
+            Err(FailureTopicError::Handler(TestError(
+                ErrorCategory::Terminal,
+            ))),
+            InnerHookEvent::Commit(Err(TestError(ErrorCategory::Terminal))),
+        ),
+        (
+            "commit x DlqSendFailed(Err): outer treats the producer error as final (no retry), \
+             inner error still forwarded",
+            Hook::Commit,
+            Err(dlq_send_failed_err(ErrorCategory::Transient)),
             InnerHookEvent::Commit(Err(TestError(ErrorCategory::Transient))),
         ),
-        "expected Commit(Err(Transient)), got {:?}",
-        events[0],
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn after_abort_dlq_send_failed_forwards_inner_err() -> color_eyre::Result<()> {
-    // Outer retry path: the producer error fired the outer retry, the
-    // whole stack will be re-dispatched, so the inner sees
-    // `after_abort(Err(inner))`.
-    let inner = Probe::new();
-    let log = inner.log.clone();
-    let handler = make_handler(inner)?;
-
-    let result: Result<
-        FailureTopicOutput<u64, TestError>,
-        FailureTopicError<TestError, JsonCodecError>,
-    > = Err(dlq_send_failed_err(ErrorCategory::Permanent));
-    handler.after_abort(MockEventContext::new(), result).await;
-
-    let events = log.lock().clone();
-    assert_eq!(events.len(), 1);
-    assert!(
-        matches!(
-            &events[0],
+        (
+            "abort x Inner(Ok): inner succeeded but the outer aborted (e.g. shutdown intervened)",
+            Hook::Abort,
+            Ok(FailureTopicOutput::Inner(7)),
+            InnerHookEvent::Abort(Ok(7)),
+        ),
+        (
+            "abort x Routed(Err): rare path, outer aborted despite the DLQ accepting the routed \
+             message, re-dispatch is coming",
+            Hook::Abort,
+            Ok(FailureTopicOutput::Routed(TestError(
+                ErrorCategory::Permanent,
+            ))),
             InnerHookEvent::Abort(Err(TestError(ErrorCategory::Permanent))),
         ),
-        "expected Abort(Err(Permanent)), got {:?}",
-        events[0],
-    );
+        (
+            "abort x Handler(Err): terminal error, marker aborted",
+            Hook::Abort,
+            Err(FailureTopicError::Handler(TestError(
+                ErrorCategory::Terminal,
+            ))),
+            InnerHookEvent::Abort(Err(TestError(ErrorCategory::Terminal))),
+        ),
+        (
+            "abort x DlqSendFailed(Err): outer retry will re-drive the whole stack including the \
+             inner",
+            Hook::Abort,
+            Err(dlq_send_failed_err(ErrorCategory::Permanent)),
+            InnerHookEvent::Abort(Err(TestError(ErrorCategory::Permanent))),
+        ),
+    ];
+
+    for (label, hook, result, expected) in rows {
+        let inner = Probe::new();
+        let log = inner.log.clone();
+        let handler = make_handler(inner)?;
+
+        match hook {
+            Hook::Commit => handler.after_commit(MockEventContext::new(), result).await,
+            Hook::Abort => handler.after_abort(MockEventContext::new(), result).await,
+        }
+
+        let events = log.lock().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "{label}: exactly one inner hook should fire"
+        );
+        assert_eq!(events[0], expected, "{label}: unexpected inner hook event");
+    }
     Ok(())
 }
 
@@ -411,7 +404,7 @@ mod routed_swallow {
 
         // The route is FINAL (no retry is coming), so unlike the defer
         // swallows the inner sees `after_commit(Err)` — the routing pinned by
-        // `after_commit_routed_forwards_inner_err_to_inner`.
+        // the "commit x Routed(Err)" row of `apply_hook_routing_matrix`.
         assert_eq!(inner.hooks(), vec![StagingHook::Commit]);
         // The reset's contract: nothing from the failed attempt survives.
         // These are also the positive control that the ROUTED swallow ran:

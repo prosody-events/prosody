@@ -49,20 +49,3 @@ async fn test_lazy_segment_clone_shares_state() -> color_eyre::Result<()> {
     assert_eq!(seg1.id(), seg2.id());
     Ok(())
 }
-
-#[tokio::test]
-async fn test_lazy_segment_idempotent() -> color_eyre::Result<()> {
-    let store = MemorySegmentStore::new();
-    let segment = LazySegment::new(
-        store,
-        Topic::from("test-topic"),
-        Partition::from(0_i32),
-        Arc::from("test-group") as ConsumerGroup,
-    );
-
-    // Multiple calls return same segment
-    let seg1 = segment.get().await?;
-    let seg2 = segment.get().await?;
-    assert_eq!(seg1.id(), seg2.id());
-    Ok(())
-}

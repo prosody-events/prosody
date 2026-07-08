@@ -254,6 +254,3 @@ impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

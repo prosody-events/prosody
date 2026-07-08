@@ -6,9 +6,11 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
+use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::runtime::Builder;
 use tokio::time::{sleep as tokio_sleep, timeout};
 use tracing::Span;
 
@@ -21,44 +23,110 @@ fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
     }
 }
 
-// === Success Tests ===
+// === Classification Property ===
+//
+// `RetryHandler::run` makes one decision per attempt: retry (Transient,
+// attempts left), stop-with-error (Permanent/Terminal, or Transient with
+// attempts exhausted), or stop-with-success. `expected_outcome` walks a
+// scripted failure sequence through that same decision and predicts the
+// call count, the final Ok/Err, and the demand-type sequence
+// (`Normal` on attempt 1, `Failure` on every retry) — one property replaces
+// five single-path examples (success-first-try, transient-then-succeeds,
+// permanent-immediate, terminal-immediate, first-attempt-demand-type).
+// `transient_error_fails_after_max_retries` stays as a literal anchor.
 
-#[tokio::test]
-async fn success_on_first_attempt_returns_ok_immediately() -> Result<()> {
-    let handler = ScriptedHandler::success();
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let message = create_test_message()?;
+#[test]
+fn prop_retry_classification_arithmetic() {
+    /// Predicts `(call_count, is_err, demand_types)` for a scripted
+    /// `failures` sequence and `max_retries`, mirroring `RetryHandler::run`'s
+    /// per-attempt classification exactly.
+    fn expected_outcome(
+        failures: &[ErrorCategory],
+        max_retries: u32,
+    ) -> (usize, bool, Vec<DemandType>) {
+        let mut demand_types = Vec::new();
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            demand_types.push(if attempt == 1 {
+                DemandType::Normal
+            } else {
+                DemandType::Failure
+            });
+            let Some(&category) = failures.get((attempt - 1) as usize) else {
+                return (attempt as usize, false, demand_types);
+            };
+            match category {
+                ErrorCategory::Transient if attempt <= max_retries => {}
+                _ => return (attempt as usize, true, demand_types),
+            }
+        }
+    }
 
-    let result =
-        FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+    fn property(raw_failures: Vec<u8>, max_retries_raw: u8) -> TestResult {
+        // Bound both axes so each iteration's paused-clock retry loop stays
+        // fast while still crossing the zero/non-zero and
+        // exhausted/not-exhausted boundaries.
+        let failures: Vec<ErrorCategory> = raw_failures
+            .into_iter()
+            .take(6)
+            .map(|b| match b % 3 {
+                0 => ErrorCategory::Transient,
+                1 => ErrorCategory::Permanent,
+                _ => ErrorCategory::Terminal,
+            })
+            .collect();
+        let max_retries = u32::from(max_retries_raw % 4);
+        let (expected_calls, expected_err, expected_demand_types) =
+            expected_outcome(&failures, max_retries);
 
-    assert!(result.is_ok());
-    assert_eq!(handler.call_count(), 1, "Should only call handler once");
-    Ok(())
+        let runtime = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build();
+        let Ok(runtime) = runtime else {
+            return TestResult::error("failed to build paused runtime");
+        };
+        runtime.block_on(async move {
+            let handler = ScriptedHandler::failing_then_success(failures);
+            let retry_handler = create_retry_handler(handler.clone(), max_retries);
+            let context = MockEventContext::new();
+            let message = match create_test_message() {
+                Ok(message) => message,
+                Err(error) => return TestResult::error(format!("create_test_message: {error}")),
+            };
+
+            let result =
+                FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal)
+                    .await;
+
+            if result.is_err() != expected_err {
+                return TestResult::error(format!(
+                    "result.is_err()={} expected={expected_err}",
+                    result.is_err(),
+                ));
+            }
+            if handler.call_count() != expected_calls {
+                return TestResult::error(format!(
+                    "call_count={} expected={expected_calls}",
+                    handler.call_count(),
+                ));
+            }
+            let demand_types = handler.recorded_demand_types();
+            if demand_types != expected_demand_types {
+                return TestResult::error(format!(
+                    "demand_types={demand_types:?} expected={expected_demand_types:?}",
+                ));
+            }
+            TestResult::passed()
+        })
+    }
+
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, u8) -> TestResult);
 }
 
-// === Transient Error Tests ===
-
-#[tokio::test]
-async fn transient_error_retries_then_succeeds() -> Result<()> {
-    // Fail twice with transient errors, then succeed
-    let handler = ScriptedHandler::failing_then_success(vec![
-        ErrorCategory::Transient,
-        ErrorCategory::Transient,
-    ]);
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let message = create_test_message()?;
-
-    let result =
-        FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
-
-    assert!(result.is_ok(), "Should succeed after retries");
-    assert_eq!(handler.call_count(), 3, "Should retry twice then succeed");
-    Ok(())
-}
-
+/// Named anchor: pins the exact "1 + `max_retries`" call count as a literal,
+/// independent of `prop_retry_classification_arithmetic`'s model.
 #[tokio::test]
 async fn transient_error_fails_after_max_retries() -> Result<()> {
     let handler = ScriptedHandler::always_failing(ErrorCategory::Transient);
@@ -75,69 +143,6 @@ async fn transient_error_fails_after_max_retries() -> Result<()> {
         handler.call_count(),
         4,
         "Should attempt 1 + max_retries times"
-    );
-    Ok(())
-}
-
-// === Permanent Error Tests ===
-
-#[tokio::test]
-async fn permanent_error_fails_immediately_no_retry() -> Result<()> {
-    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let message = create_test_message()?;
-
-    let result =
-        FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
-
-    assert!(result.is_err());
-    assert_eq!(handler.call_count(), 1, "Should not retry permanent errors");
-    Ok(())
-}
-
-// === Terminal Error Tests ===
-
-#[tokio::test]
-async fn terminal_error_fails_immediately_no_retry() -> Result<()> {
-    let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let message = create_test_message()?;
-
-    let result =
-        FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
-
-    assert!(result.is_err());
-    assert_eq!(handler.call_count(), 1, "Should not retry terminal errors");
-    Ok(())
-}
-
-// === Demand Type Tests ===
-
-#[tokio::test]
-async fn first_attempt_uses_original_demand_type_retries_use_failure() -> Result<()> {
-    // Fail once with transient, then succeed
-    let handler = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let message = create_test_message()?;
-
-    let result =
-        FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
-
-    assert!(result.is_ok());
-    let demand_types = handler.recorded_demand_types();
-    assert_eq!(demand_types.len(), 2);
-    assert_eq!(
-        demand_types[0],
-        DemandType::Normal,
-        "First attempt should use original"
-    );
-    assert_eq!(
-        demand_types[1],
-        DemandType::Failure,
-        "Retry should use Failure"
     );
     Ok(())
 }
@@ -180,21 +185,12 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
     Ok(())
 }
 
-// === Timer Path Tests ===
-
-#[tokio::test]
-async fn timer_success_on_first_attempt() {
-    let handler = ScriptedHandler::success();
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let trigger = create_test_trigger();
-
-    let result =
-        FallibleHandler::on_timer(&retry_handler, context, trigger, DemandType::Normal).await;
-
-    assert!(result.is_ok());
-    assert_eq!(handler.call_count(), 1);
-}
+// === Timer Path Smoke ===
+//
+// The timer path shares `RetryHandler::run` verbatim with the message path
+// (`on_timer` differs only in what it invokes); the classification
+// arithmetic is proved once above. This smoke just confirms the timer
+// dispatch wires into that shared loop at all.
 
 #[tokio::test]
 async fn timer_transient_error_retries_then_succeeds() {
@@ -208,20 +204,6 @@ async fn timer_transient_error_retries_then_succeeds() {
 
     assert!(result.is_ok());
     assert_eq!(handler.call_count(), 2);
-}
-
-#[tokio::test]
-async fn timer_permanent_error_no_retry() {
-    let handler = ScriptedHandler::always_failing(ErrorCategory::Permanent);
-    let retry_handler = create_retry_handler(handler.clone(), 3);
-    let context = MockEventContext::new();
-    let trigger = create_test_trigger();
-
-    let result =
-        FallibleHandler::on_timer(&retry_handler, context, trigger, DemandType::Normal).await;
-
-    assert!(result.is_err());
-    assert_eq!(handler.call_count(), 1);
 }
 
 // === Backoff Calculation Tests ===

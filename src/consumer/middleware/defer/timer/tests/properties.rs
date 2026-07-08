@@ -12,7 +12,9 @@ use super::{HandlerOutcome, TEST_RUNTIME, TestHarness};
 use crate::Key;
 use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::defer::calculate_backoff;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
 use ahash::HashMap;
@@ -232,14 +234,14 @@ fn prop_timer_coverage(trace: TimerTrace) -> color_eyre::Result<()> {
             execute_event(&harness, event).await?;
             update_model(&mut model, event);
 
-            // Verify coverage: every deferred key should have DeferredTimer scheduled
+            // Verify coverage: once the model believes any key is deferred, a
+            // `DeferredTimer` must have been scheduled to cover it.
             let deferred_keys = model.deferred_keys();
-            // After any deferral, there should be at least one timer scheduled
-            // if there are deferred keys
             if !deferred_keys.is_empty() && !harness.has_deferred_timer() {
-                // This would be a coverage violation, but context may have been
-                // cleared between operations. The integration
-                // tests verify this more precisely.
+                return Err(color_eyre::eyre::eyre!(
+                    "coverage violation: model has deferred keys {deferred_keys:?} but no \
+                     DeferredTimer has been scheduled"
+                ));
             }
         }
 
@@ -484,16 +486,17 @@ fn is_expected_error(error: &color_eyre::Report) -> bool {
 
 /// Property: Backoff delays are within configured bounds.
 ///
-/// **Invariant**: For any `retry_count` > 0, the scheduled retry time must be:
-/// - At least 1 second from now (minimum bound)
-/// - At most now + min(base * 2^(retry_count-1), `max_delay`) (maximum bound)
+/// **Invariant**: For any `retry_count` > 0, [`calculate_backoff`] returns a
+/// delay in `[1, min(base * 2^(retry_count-1), max_delay)]` seconds. For
+/// `retry_count == 0` (first deferral), it returns zero — the timer is
+/// scheduled at `original_time`, not after a backoff.
 ///
-/// For `retry_count` == 0 (first deferral), the timer is scheduled at
-/// `original_time`.
+/// This drives the production `calculate_backoff` (the exact function
+/// `TimerDeferHandler::next_retry_time` calls) against an independently
+/// derived bound, rather than re-deriving the formula and checking it
+/// against itself.
 #[quickcheck]
 fn prop_backoff_bounds(retry_count_raw: u8) -> color_eyre::Result<()> {
-    use std::cmp::min;
-
     init_test_logging();
 
     // Test with retry_count 0-15 (practical range)
@@ -501,55 +504,37 @@ fn prop_backoff_bounds(retry_count_raw: u8) -> color_eyre::Result<()> {
 
     TEST_RUNTIME.block_on(async {
         let harness = TestHarness::new()?;
+        let config = &harness.handler.config;
 
-        // Skip retry_count=0 (no backoff, uses original_time)
         if retry_count == 0 {
+            assert_eq!(
+                calculate_backoff(config, 0),
+                CompactDuration::MIN,
+                "retry_count=0 must not apply backoff"
+            );
             return Ok(());
         }
 
-        // Configuration values (must match TestHarness config)
-        let base_seconds: u64 = 1; // base = 1 second
-        let max_delay_seconds: u64 = 3600; // max_delay = 1 hour
+        // Independent model of the expected ceiling: base * 2^(retry_count-1),
+        // capped at max_delay, floored at 1 second.
+        let base_seconds = u32::try_from(config.base.as_secs()).unwrap_or(u32::MAX);
+        let max_delay_seconds = u32::try_from(config.max_delay.as_secs()).unwrap_or(u32::MAX);
+        let multiplier = 2_u32.saturating_pow(retry_count - 1);
+        let expected_max = base_seconds
+            .saturating_mul(multiplier)
+            .min(max_delay_seconds)
+            .max(1);
 
-        // Calculate expected bounds using the formula:
-        // backoff(n) = random(1, min(base × 2^(n-1), max_delay))
-        let multiplier = 2_u64.saturating_pow(retry_count - 1);
-        let max_backoff = min(base_seconds.saturating_mul(multiplier), max_delay_seconds);
-
-        // Verify bounds are reasonable
-        // Minimum: 1 second (jitter lower bound)
-        // Maximum: calculated max_backoff
-        assert!(max_backoff >= 1, "Max backoff must be at least 1 second");
-        assert!(
-            max_backoff <= max_delay_seconds,
-            "Max backoff must not exceed max_delay"
-        );
-
-        // For retry_count=1: base=1, multiplier=2^0=1, max_backoff=min(1,3600)=1
-        // For retry_count=2: base=1, multiplier=2^1=2, max_backoff=min(2,3600)=2
-        // For retry_count=10: base=1, multiplier=2^9=512, max_backoff=min(512,3600)=512
-        // For retry_count=15: base=1, multiplier=2^14=16384,
-        // max_backoff=min(16384,3600)=3600
-
-        // Verify the backoff cap kicks in at high retry counts
-        if retry_count >= 13 {
-            // 2^12 = 4096 > 3600, so max_delay should cap it
-            assert_eq!(
-                max_backoff, max_delay_seconds,
-                "High retry counts should be capped at max_delay"
+        // Sample repeatedly: calculate_backoff applies full jitter, so a
+        // single call cannot expose an out-of-bounds ceiling or floor.
+        for _ in 0..32_u32 {
+            let sampled = calculate_backoff(config, retry_count).seconds();
+            assert!(
+                (1..=expected_max).contains(&sampled),
+                "backoff(retry_count={retry_count}) = {sampled}s outside [1, {expected_max}]"
             );
         }
 
-        // Verify low retry counts use exponential growth
-        if retry_count <= 10 {
-            let expected = base_seconds.saturating_mul(multiplier);
-            assert_eq!(
-                max_backoff, expected,
-                "Low retry counts should use exponential backoff"
-            );
-        }
-
-        let _ = harness; // Used for potential future direct handler testing
         Ok(())
     })
 }

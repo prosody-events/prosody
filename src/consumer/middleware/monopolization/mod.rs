@@ -300,20 +300,8 @@ where
             .map_err(MonopolizationError::Handler)
     }
 
-    /// Forwards the FINAL apply hook to the inner handler iff the inner
-    /// handler actually ran.
-    ///
-    /// Work-centric reasoning, per the `FallibleHandler` invariant:
-    ///
-    /// - `Ok(_)` — inner ran and succeeded. Forward `Ok` so the inner handler
-    ///   observes its own success exactly once.
-    /// - `Err(Handler(inner))` — inner ran and returned an error. Unwrap and
-    ///   forward the inner-typed error so the inner handler sees its own
-    ///   failure exactly once.
-    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer before
-    ///   delegation; the inner handler did not run. Suppress its apply hook
-    ///   entirely; firing it would violate the invariant by reporting an
-    ///   outcome for work that never happened.
+    /// Forwards the final apply hook to the inner handler iff the inner
+    /// handler actually ran — see the module-level apply-hook contract.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext<Payload = Self::Payload>,
@@ -323,26 +311,14 @@ where
             Err(MonopolizationError::Handler(inner)) => {
                 self.handler.after_commit(context, Err(inner)).await;
             }
-            // Monopolization rejection happened at this layer; the inner
-            // handler did not run, so there is no inner-typed error to
-            // forward and no apply hook is owed to it.
+            // Rejected at this layer before delegation; no hook owed inner.
             Err(MonopolizationError::Monopolization { .. }) => {}
         }
     }
 
-    /// Forwards the non-final apply hook to the inner handler iff the inner
-    /// handler actually ran (a retry of the same logical event is coming).
-    ///
-    /// Work-centric reasoning, per the `FallibleHandler` invariant:
-    ///
-    /// - `Ok(_)` / `Err(Handler(_))` — inner ran. Forward the inner-typed
-    ///   result so the inner handler can observe the abort and prepare for the
-    ///   upcoming retry.
-    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer before
-    ///   delegation; the inner handler did not run. Suppress its apply hook.
-    ///   The retry will reach this layer again and either be admitted (and then
-    ///   dispatched to the inner) or rejected once more here, and the inner
-    ///   handler must not see a phantom abort for work it never performed.
+    /// Forwards the non-final apply hook (a retry of the same logical event is
+    /// coming) to the inner handler iff the inner handler actually ran — see
+    /// the module-level apply-hook contract.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext<Payload = Self::Payload>,

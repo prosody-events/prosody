@@ -12,6 +12,14 @@ use crate::loader::KafkaLoaderError;
 use crate::tracing::init_test_logging;
 use scylla::errors::ExecutionError;
 
+/// Returns the retry count for `key`, failing the test if it isn't deferred.
+async fn expect_deferred(harness: &TestHarness, key: &str) -> color_eyre::Result<u32> {
+    harness
+        .get_retry_count(key)
+        .await?
+        .ok_or_else(|| color_eyre::eyre::eyre!("Key `{key}` should be deferred"))
+}
+
 #[test]
 fn simple_defer_and_retry_succeeds() -> color_eyre::Result<()> {
     init_test_logging();
@@ -38,11 +46,7 @@ fn simple_defer_and_retry_succeeds() -> color_eyre::Result<()> {
         assert!(result.is_ok(), "Defer should absorb transient error");
 
         // Key should be deferred with retry_count = 0
-        let retry_count = harness
-            .get_retry_count("test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0);
+        assert_eq!(expect_deferred(&harness, "test-key").await?, 0);
 
         // DeferredTimer should be scheduled
         assert!(
@@ -115,6 +119,20 @@ fn queues_timers_while_key_deferred() -> color_eyre::Result<()> {
         // Should succeed (queued behind first)
         assert!(result.is_ok(), "Second timer should queue");
 
+        // Queueing behind an already-deferred key short-circuits before the
+        // is_deferred check reaches config.enabled or the inner handler: the
+        // retry_count is untouched and the inner handler is not invoked.
+        assert_eq!(
+            expect_deferred(&harness, "test-key").await?,
+            0,
+            "Queueing should not change the original retry_count"
+        );
+        assert_eq!(
+            harness.inner_handler.timer_calls().len(),
+            1,
+            "Inner handler should not be called for a queued timer"
+        );
+
         // First timer's retry succeeds
         harness.inner_handler.set_outcome(HandlerOutcome::Success);
         let retry_trigger = TestHarness::create_deferred_timer_trigger("test-key", 1001);
@@ -156,11 +174,7 @@ fn increments_retry_count_on_transient_failure() -> color_eyre::Result<()> {
             .await?;
 
         // Verify initial retry count
-        let retry_count = harness
-            .get_retry_count("test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0);
+        assert_eq!(expect_deferred(&harness, "test-key").await?, 0);
 
         // Retry fires, handler fails transiently again
         harness.inner_handler.set_outcome(HandlerOutcome::Transient);
@@ -174,70 +188,10 @@ fn increments_retry_count_on_transient_failure() -> color_eyre::Result<()> {
         assert!(result.is_ok(), "Re-defer should succeed");
 
         // Retry count should be incremented
-        let retry_count = harness
-            .get_retry_count("test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 1, "Retry count should be incremented");
-
-        Ok(())
-    })
-}
-
-#[test]
-fn permanent_error_advances_queue() -> color_eyre::Result<()> {
-    init_test_logging();
-
-    TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::new()?;
-
-        // First timer defers
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        harness.decider.set_next(true);
-
-        let trigger1 = TestHarness::create_trigger("test-key", 1000);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                trigger1.clone(),
-                DemandType::Normal,
-            )
-            .await?;
-
-        // Second timer queues
-        let trigger2 = TestHarness::create_trigger("test-key", 2000);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                trigger2.clone(),
-                DemandType::Normal,
-            )
-            .await?;
-
-        // Retry fires with permanent failure
-        harness.inner_handler.set_outcome(HandlerOutcome::Permanent);
-        let retry_trigger = TestHarness::create_deferred_timer_trigger("test-key", 1001);
-        let result = harness
-            .handler
-            .on_timer(harness.context().clone(), retry_trigger, DemandType::Normal)
-            .await;
-
-        // Should fail (permanent errors propagate)
-        assert!(result.is_err(), "Permanent error should propagate");
-
-        // Key should still be deferred (has second timer)
-        let retry_count = harness.get_retry_count("test-key").await?;
-        assert!(
-            retry_count.is_some(),
-            "Key should still be deferred with queued timer"
-        );
-        // Retry count should be reset to 0 for next timer
         assert_eq!(
-            retry_count,
-            Some(0),
-            "Retry count should be reset for next timer"
+            expect_deferred(&harness, "test-key").await?,
+            1,
+            "Retry count should be incremented"
         );
 
         Ok(())
@@ -343,12 +297,9 @@ fn re_deferral_ignores_decider() -> color_eyre::Result<()> {
         );
 
         // Key should still be deferred
-        let retry_count = harness
-            .get_retry_count("test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
         assert_eq!(
-            retry_count, 1,
+            expect_deferred(&harness, "test-key").await?,
+            1,
             "Key should be re-deferred with incremented retry count"
         );
 
@@ -471,6 +422,13 @@ fn permanent_error_schedules_timer_for_next() -> color_eyre::Result<()> {
         assert!(
             result.is_err(),
             "Permanent error should propagate after queue advancement"
+        );
+
+        // Retry count resets to 0 for the next timer in queue.
+        assert_eq!(
+            harness.get_retry_count("perm-error-key").await?,
+            Some(0),
+            "Retry count should be reset for next timer"
         );
 
         // DeferredTimer should be scheduled for the NEXT timer in queue
@@ -611,11 +569,11 @@ fn span_restored_on_retry() -> color_eyre::Result<()> {
         assert!(result.is_ok(), "Deferral should succeed");
 
         // Verify the timer is deferred
-        let retry_count = harness
-            .get_retry_count("span-test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0, "Initial retry count should be 0");
+        assert_eq!(
+            expect_deferred(&harness, "span-test-key").await?,
+            0,
+            "Initial retry count should be 0"
+        );
 
         // Now trigger the retry - set handler to succeed
         harness.inner_handler.set_outcome(HandlerOutcome::Success);
@@ -726,205 +684,6 @@ fn span_extraction_failure_fallback() -> color_eyre::Result<()> {
 }
 
 #[test]
-fn first_deferral_schedules_at_original_time() -> color_eyre::Result<()> {
-    // When a timer is deferred for the first time (retry_count=0), the
-    // DeferredTimer is scheduled at the original fire time, NOT using backoff.
-    // This preserves the semantic meaning of the timer's intended fire time.
-    //
-    // Application timers carry semantic meaning - a timer scheduled for midnight
-    // should fire at midnight, not immediately when deferral occurs.
-    init_test_logging();
-
-    TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::new()?;
-
-        // Set handler to return transient error, decider to defer
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        harness.decider.set_next(true);
-
-        // Use a specific original time (far in the future to be distinctive)
-        let original_time_secs = 999_999_u32;
-        let trigger = TestHarness::create_trigger("backoff-test-key", original_time_secs);
-
-        // Process the application timer - should be deferred
-        let result = harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                trigger.clone(),
-                DemandType::Normal,
-            )
-            .await;
-
-        // Should succeed (error absorbed, timer deferred)
-        assert!(
-            result.is_ok(),
-            "First deferral should absorb transient error"
-        );
-
-        // Verify the timer was scheduled
-        assert!(
-            harness.has_deferred_timer(),
-            "DeferredTimer should be scheduled after first deferral"
-        );
-
-        // Verify retry_count is 0 (first deferral)
-        let retry_count = harness
-            .get_retry_count("backoff-test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0, "First deferral should have retry_count=0");
-
-        // Note: We cannot directly verify the scheduled time from MockContext as it
-        // records operations but not timestamps from the handler. The handler's
-        // calculate_backoff(0) returns CompactDuration::MIN (0), so the scheduled
-        // time will be `now`, not `original_time`. However, the design intent is
-        // that first deferral schedules "at original_time" for immediate retry
-        // if past, or at the intended time if future.
-        //
-        // The implementation uses `next_retry_time(0)` which returns `now + 0`,
-        // effectively scheduling immediately. This is consistent with the design's
-        // note: "If original_time has passed, the timer fires immediately."
-
-        Ok(())
-    })
-}
-
-#[test]
-fn subsequent_retry_uses_backoff() -> color_eyre::Result<()> {
-    // After a deferred timer retry fails (retry_count > 0), the next DeferredTimer
-    // is scheduled using exponential backoff with jitter.
-    //
-    // Backoff formula: backoff(n) = random(1, min(base × 2^(n-1), max_delay))
-    init_test_logging();
-
-    TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::new()?;
-
-        // Initial defer
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        harness.decider.set_next(true);
-
-        let trigger = TestHarness::create_trigger("backoff-test-key-2", 1000);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                trigger.clone(),
-                DemandType::Normal,
-            )
-            .await?;
-
-        // Verify initial retry_count = 0
-        let retry_count = harness
-            .get_retry_count("backoff-test-key-2")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0, "Initial deferral should have retry_count=0");
-
-        // Clear context operations to track new scheduling
-        harness.context().clear_operations();
-
-        // First retry fires, fails transiently again
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        let retry_trigger = TestHarness::create_deferred_timer_trigger("backoff-test-key-2", 1001);
-        let result = harness
-            .handler
-            .on_timer(harness.context().clone(), retry_trigger, DemandType::Normal)
-            .await;
-
-        // Should succeed (re-deferred)
-        assert!(result.is_ok(), "Re-deferral should succeed");
-
-        // Verify retry_count was incremented
-        let retry_count = harness
-            .get_retry_count("backoff-test-key-2")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(
-            retry_count, 1,
-            "After first retry failure, retry_count should be 1"
-        );
-
-        // Another DeferredTimer should be scheduled (with backoff)
-        assert!(
-            harness.has_deferred_timer(),
-            "DeferredTimer should be scheduled with backoff"
-        );
-
-        // Clear and retry again - verify retry_count continues incrementing
-        harness.context().clear_operations();
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        let retry_trigger2 = TestHarness::create_deferred_timer_trigger("backoff-test-key-2", 1002);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                retry_trigger2,
-                DemandType::Normal,
-            )
-            .await?;
-
-        let retry_count = harness
-            .get_retry_count("backoff-test-key-2")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(
-            retry_count, 2,
-            "After second retry failure, retry_count should be 2"
-        );
-
-        // Third retry - verify exponential backoff bounds
-        // With base=1s, max_delay=3600s:
-        // retry_count=1: backoff in [1, min(1*2^0, 3600)] = [1, 1]
-        // retry_count=2: backoff in [1, min(1*2^1, 3600)] = [1, 2]
-        // retry_count=3: backoff in [1, min(1*2^2, 3600)] = [1, 4]
-        harness.context().clear_operations();
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        let retry_trigger3 = TestHarness::create_deferred_timer_trigger("backoff-test-key-2", 1003);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                retry_trigger3,
-                DemandType::Normal,
-            )
-            .await?;
-
-        let retry_count = harness
-            .get_retry_count("backoff-test-key-2")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(
-            retry_count, 3,
-            "After third retry failure, retry_count should be 3"
-        );
-
-        // Finally succeed - verify retry_count resets
-        harness.context().clear_operations();
-        harness.inner_handler.set_outcome(HandlerOutcome::Success);
-        let retry_trigger4 = TestHarness::create_deferred_timer_trigger("backoff-test-key-2", 1004);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                retry_trigger4,
-                DemandType::Normal,
-            )
-            .await?;
-
-        // Key should not be deferred anymore (queue is empty)
-        let retry_count = harness.get_retry_count("backoff-test-key-2").await?;
-        assert!(
-            retry_count.is_none(),
-            "After success, key should not be deferred"
-        );
-
-        Ok(())
-    })
-}
-
-#[test]
 fn disabled_config_propagates_errors_no_deferral() -> color_eyre::Result<()> {
     // When `enabled: false`, transient errors propagate to the caller instead of
     // being absorbed by deferral. No deferral occurs.
@@ -985,182 +744,6 @@ fn disabled_config_propagates_errors_no_deferral() -> color_eyre::Result<()> {
             harness.inner_handler.timer_calls().len(),
             1,
             "Inner handler should be called once"
-        );
-
-        Ok(())
-    })
-}
-
-#[test]
-fn disabled_config_still_queues_existing_deferred_keys() -> color_eyre::Result<()> {
-    // When `enabled: false` but a key is ALREADY deferred, new timers for that
-    // key still queue behind the existing deferred timers. This maintains
-    // ordering guarantees for already-deferred keys.
-    //
-    // The check order is critical:
-    // 1. First: Check is_deferred(key) - if already deferred, queue new event
-    // 2. Then: Check config.enabled - only gate initial deferral
-    init_test_logging();
-
-    TEST_RUNTIME.block_on(async {
-        // First, create an ENABLED harness to defer a timer
-        let enabled_harness = TestHarness::new()?;
-
-        // Set handler to return transient error and defer
-        enabled_harness
-            .inner_handler
-            .set_outcome(HandlerOutcome::Transient);
-        enabled_harness.decider.set_next(true);
-
-        let trigger1 = TestHarness::create_trigger("queue-test-key", 1000);
-        enabled_harness
-            .handler
-            .on_timer(
-                enabled_harness.context().clone(),
-                trigger1.clone(),
-                DemandType::Normal,
-            )
-            .await?;
-
-        // Verify the key is deferred
-        let retry_count = enabled_harness
-            .get_retry_count("queue-test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0, "Key should be deferred with retry_count=0");
-
-        // Now create a DISABLED harness that shares the same store
-        // For this test, we'll simulate the behavior using the same harness
-        // but by examining what happens when is_deferred is true
-        //
-        // Since we can't easily swap configs, we'll verify the code path by:
-        // 1. Using the enabled harness to defer a timer
-        // 2. Sending another timer for the same key - it should queue regardless of
-        //    what enabled would do for a NEW key
-
-        // Reset handler outcome - this second timer should queue
-        enabled_harness
-            .inner_handler
-            .set_outcome(HandlerOutcome::Transient);
-
-        // Second timer for the same key
-        let trigger2 = TestHarness::create_trigger("queue-test-key", 2000);
-        let result = enabled_harness
-            .handler
-            .on_timer(
-                enabled_harness.context().clone(),
-                trigger2.clone(),
-                DemandType::Normal,
-            )
-            .await;
-
-        // Should succeed - queued behind first timer
-        assert!(
-            result.is_ok(),
-            "Second timer should queue behind existing deferred timer"
-        );
-
-        // Key should still be deferred (now has 2 timers in queue)
-        let retry_count = enabled_harness
-            .get_retry_count("queue-test-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(
-            retry_count, 0,
-            "Key should still be deferred with original retry_count"
-        );
-
-        // The inner handler should NOT have been called for the second timer
-        // because it was queued directly
-        assert_eq!(
-            enabled_harness.inner_handler.timer_calls().len(),
-            1,
-            "Inner handler should be called once (first timer only)"
-        );
-
-        Ok(())
-    })
-}
-
-#[test]
-fn is_deferred_check_precedes_enabled_check() -> color_eyre::Result<()> {
-    // Explicitly verifies the order of checks: is_deferred BEFORE enabled.
-    //
-    // Following the existing message defer pattern, the check order is critical:
-    // 1. First: Check is_deferred(key) - if already deferred, queue new event
-    // 2. Then: If not deferred and handler fails with transient error, check
-    //    config.enabled
-    // 3. If disabled: Propagate error to retry middleware (no new deferral)
-    //
-    // This test verifies that when:
-    // - config.enabled = false
-    // - key IS already deferred
-    // - a new Application timer arrives for that key
-    // The timer should be queued (because is_deferred is checked first)
-    init_test_logging();
-
-    TEST_RUNTIME.block_on(async {
-        // Use an enabled harness to create the initial deferred state
-        let harness = TestHarness::new()?;
-
-        // First timer defers successfully
-        harness.inner_handler.set_outcome(HandlerOutcome::Transient);
-        harness.decider.set_next(true);
-
-        let trigger1 = TestHarness::create_trigger("check-order-key", 1000);
-        harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                trigger1.clone(),
-                DemandType::Normal,
-            )
-            .await?;
-
-        // Verify key is deferred
-        let retry_count = harness
-            .get_retry_count("check-order-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(retry_count, 0);
-
-        // Now the key IS deferred. Even if config.enabled were false,
-        // the is_deferred check comes first and queues the new timer.
-        // This test verifies the handler doesn't even try to run the inner
-        // handler for the second timer - it goes straight to queue.
-
-        // Second timer arrives - should be queued without calling inner handler
-        let initial_call_count = harness.inner_handler.timer_calls().len();
-
-        let trigger2 = TestHarness::create_trigger("check-order-key", 2000);
-        let result = harness
-            .handler
-            .on_timer(
-                harness.context().clone(),
-                trigger2.clone(),
-                DemandType::Normal,
-            )
-            .await;
-
-        // Should succeed (queued)
-        assert!(result.is_ok(), "Second timer should queue successfully");
-
-        // Inner handler should NOT have been called
-        let final_call_count = harness.inner_handler.timer_calls().len();
-        assert_eq!(
-            initial_call_count, final_call_count,
-            "Inner handler should NOT be called when key is already deferred - the is_deferred \
-             check should short-circuit before trying the handler"
-        );
-
-        // The key is still deferred with the original retry_count
-        let retry_count = harness
-            .get_retry_count("check-order-key")
-            .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("Key should be deferred"))?;
-        assert_eq!(
-            retry_count, 0,
-            "Retry count should remain unchanged when queueing"
         );
 
         Ok(())

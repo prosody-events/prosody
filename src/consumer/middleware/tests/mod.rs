@@ -164,108 +164,41 @@ fn make_offset_tracker() -> OffsetTracker {
 }
 
 #[tokio::test]
-async fn after_commit_fires_with_ok_output_after_handler_success() -> color_eyre::Result<()> {
-    let handler = ProbeHandler::ok(42);
-    let log = handler.log.clone();
-    let context = MockEventContext::new();
-    let tracker = make_offset_tracker();
-    let uncommitted_offset = tracker.take(0).await?;
-    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
+async fn after_commit_or_abort_fires_with_expected_log_per_outcome() -> color_eyre::Result<()> {
+    // One row per `on_message` outcome category the blanket impl
+    // distinguishes; each row's exact-log assertion also proves the
+    // 1:1 invariant (exactly one apply hook fires per dispatch) for
+    // that category, since the expected log contains exactly one
+    // `AfterCommit`/`AfterAbort` entry.
+    let permanent = TestError(ErrorCategory::Permanent, "permanent");
+    let transient = TestError(ErrorCategory::Transient, "transient");
+    let terminal = TestError(ErrorCategory::Terminal, "terminal");
+    let cases: [(ProbeHandler, Vec<HookEvent>, &str); 4] = [
+        (
+            ProbeHandler::ok(42),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(42))],
+            "handler runs first, then after_commit with Ok(sentinel)",
+        ),
+        (
+            ProbeHandler::err(0, permanent.clone()),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Err(permanent))],
+            "Permanent error commits the marker; after_commit fires with Err",
+        ),
+        (
+            // Transient (when no retry middleware is in front) commits
+            // like Permanent at the blanket-impl level.
+            ProbeHandler::err(0, transient.clone()),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Err(transient))],
+            "Transient error at the blanket-impl level commits + fires after_commit",
+        ),
+        (
+            ProbeHandler::err(0, terminal.clone()),
+            vec![HookEvent::Handler, HookEvent::AfterAbort(Err(terminal))],
+            "Terminal error aborts the marker; after_abort fires with Err",
+        ),
+    ];
 
-    EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(42))],
-        "handler runs first, then after_commit with Ok(sentinel)",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn after_commit_fires_with_err_after_permanent_error() -> color_eyre::Result<()> {
-    let err = TestError(ErrorCategory::Permanent, "permanent");
-    let handler = ProbeHandler::err(0, err.clone());
-    let log = handler.log.clone();
-    let context = MockEventContext::new();
-    let tracker = make_offset_tracker();
-    let uncommitted_offset = tracker.take(0).await?;
-    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
-
-    EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![HookEvent::Handler, HookEvent::AfterCommit(Err(err))],
-        "Permanent error commits the marker; after_commit fires with Err",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn after_commit_fires_with_err_after_transient_error() -> color_eyre::Result<()> {
-    // Transient (when no retry middleware is in front) commits like
-    // Permanent at the blanket-impl level.
-    let err = TestError(ErrorCategory::Transient, "transient");
-    let handler = ProbeHandler::err(0, err.clone());
-    let log = handler.log.clone();
-    let context = MockEventContext::new();
-    let tracker = make_offset_tracker();
-    let uncommitted_offset = tracker.take(0).await?;
-    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
-
-    EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![HookEvent::Handler, HookEvent::AfterCommit(Err(err))],
-        "Transient error at the blanket-impl level commits + fires after_commit",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn after_abort_fires_with_err_after_terminal_error() -> color_eyre::Result<()> {
-    let err = TestError(ErrorCategory::Terminal, "terminal");
-    let handler = ProbeHandler::err(0, err.clone());
-    let log = handler.log.clone();
-    let context = MockEventContext::new();
-    let tracker = make_offset_tracker();
-    let uncommitted_offset = tracker.take(0).await?;
-    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
-
-    EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![HookEvent::Handler, HookEvent::AfterAbort(Err(err))],
-        "Terminal error aborts the marker; after_abort fires with Err",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn hook_1_to_1_invariant_one_apply_per_dispatch() -> color_eyre::Result<()> {
-    // The load-bearing invariant, stated **per inner invocation**:
-    // for every individual call to the inner `on_message` /
-    // `on_timer` that ran and returned, exactly one apply hook
-    // (after_commit OR after_abort) fires — not both, not neither,
-    // and never coalesced across multiple invocations. This is what
-    // 2PC handlers and rescue middleware rely on to know they are
-    // guaranteed a single finalization signal per inner invocation.
-    //
-    // At this default boundary the blanket impl performs exactly one
-    // inner invocation per outer call, so this test exercises the
-    // 1:1 case directly. Wrapping middleware that re-invokes the
-    // inner (e.g. a retry loop) must preserve the same invariant
-    // per invocation; that is verified in the `retry` module's
-    // tests.
-    for category in [
-        ErrorCategory::Permanent,
-        ErrorCategory::Transient,
-        ErrorCategory::Terminal,
-    ] {
-        let handler = ProbeHandler::err(0, TestError(category, "x"));
+    for (handler, expected_log, description) in cases {
         let log = handler.log.clone();
         let context = MockEventContext::new();
         let tracker = make_offset_tracker();
@@ -274,20 +207,7 @@ async fn hook_1_to_1_invariant_one_apply_per_dispatch() -> color_eyre::Result<()
 
         EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
-        let recorded = log.lock().clone();
-        let commit_count = recorded
-            .iter()
-            .filter(|e| matches!(e, HookEvent::AfterCommit(_)))
-            .count();
-        let abort_count = recorded
-            .iter()
-            .filter(|e| matches!(e, HookEvent::AfterAbort(_)))
-            .count();
-        assert_eq!(
-            commit_count + abort_count,
-            1,
-            "{category:?}: exactly one apply hook should fire per dispatch ({recorded:?})",
-        );
+        assert_eq!(log.lock().clone(), expected_log, "{description}");
     }
     Ok(())
 }

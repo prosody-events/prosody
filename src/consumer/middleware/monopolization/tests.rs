@@ -6,12 +6,34 @@ use crate::consumer::middleware::{FallibleHandlerProvider, HandlerMiddleware};
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
+use color_eyre::eyre::eyre;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::time::Duration;
 use tokio::time::sleep;
+
+const TEST_TOPIC: &str = "test-topic";
+const TEST_PARTITION: Partition = 0;
+const NANOS_PER_MS: u64 = 1_000_000;
 
 #[derive(Clone)]
 struct MockProvider {
     handler: ScriptedHandler,
+}
+
+/// One generated `check_monopolization` scenario: a window, an
+/// integer-percent threshold, a check instant, and 1-3 keys' worth of
+/// execution intervals. Everything is millisecond-granular so occupancies
+/// land below, on, and above the threshold boundary.
+#[derive(Clone, Debug)]
+struct WindowedCase {
+    window_ms: u64,
+    threshold_pct: u8,
+    now_ms: u64,
+    /// Per-key `(start_ms, len_ms)` execution intervals; a key with no
+    /// intervals is never inserted, exercising the untracked-key fast path.
+    /// Start+length (not start/end) keeps every shrunk pair a valid,
+    /// non-inverted interval.
+    keys: Vec<Vec<(u64, u64)>>,
 }
 
 impl FallibleHandlerProvider for MockProvider {
@@ -22,8 +44,44 @@ impl FallibleHandlerProvider for MockProvider {
     }
 }
 
-const TEST_TOPIC: &str = "test-topic";
-const TEST_PARTITION: Partition = 0;
+impl Arbitrary for WindowedCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let window_ms = u64::arbitrary(g) % 991_u64 + 10_u64;
+        // The check instant lands before, inside, or well past the first full
+        // window, so `window_start` both saturates to zero and does not.
+        let now_ms = u64::arbitrary(g) % (3_u64 * window_ms);
+        let key_count = usize::arbitrary(g) % 3_usize + 1_usize;
+        let keys = (0..key_count)
+            .map(|_| {
+                let interval_count = usize::arbitrary(g) % 5_usize;
+                (0..interval_count)
+                    .map(|_| {
+                        // Starts range past `now` and lengths up to a full
+                        // window, so intervals fall before, across, and after
+                        // both window edges.
+                        let start = u64::arbitrary(g) % (now_ms + window_ms);
+                        let len = u64::arbitrary(g) % (window_ms + 1_u64);
+                        (start, len)
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            window_ms,
+            threshold_pct: u8::arbitrary(g) % 99_u8 + 1_u8,
+            now_ms,
+            keys,
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let base = self.clone();
+        Box::new(self.keys.shrink().map(move |keys| Self {
+            keys,
+            ..base.clone()
+        }))
+    }
+}
 
 fn test_tp_key(key: &str) -> TopicPartitionKey {
     TopicPartitionKey::new(TEST_TOPIC.into(), TEST_PARTITION, key.into())
@@ -46,6 +104,120 @@ fn create_key_event(
             state,
         })),
     }
+}
+
+/// A handler over a directly seeded interval cache: the property and the
+/// boundary pin drive `check_monopolization` synchronously, with no telemetry
+/// event loop involved.
+fn seeded_handler(threshold: f64, window: Duration) -> MonopolizationHandler<ScriptedHandler> {
+    MonopolizationHandler {
+        handler: ScriptedHandler::success(),
+        topic: TEST_TOPIC.into(),
+        partition: TEST_PARTITION,
+        reference_instant: Instant::now(),
+        key_intervals: Arc::new(Cache::new(16_usize)),
+        monopolization_threshold: threshold,
+        window_duration: window,
+    }
+}
+
+/// Folds `(lower, upper)` pairs into an `IntervalSet`; `None` when empty.
+fn interval_set(pairs: &[(u64, u64)]) -> Option<IntervalSet<u64>> {
+    let (&first, rest) = pairs.split_first()?;
+    Some(rest.iter().fold([first].to_interval_set(), |set, &pair| {
+        set.union(&[pair].to_interval_set())
+    }))
+}
+
+/// Windowed-occupancy oracle: measures a stored interval set inside the
+/// window `[window_start, now]` with the interval library's own
+/// `intersection` — the allocating form the production clamp-and-sum
+/// replaced, kept here as the reference it must stay equivalent to.
+fn model_windowed_nanos(intervals: &IntervalSet<u64>, window_start: u64, now: u64) -> u64 {
+    intervals
+        .intersection(&[(window_start, now)].to_interval_set())
+        .iter()
+        .map(|iv| iv.upper().saturating_sub(iv.lower()))
+        .sum()
+}
+
+/// Property body: for every key, `check_monopolization` rejects exactly when
+/// the oracle's windowed occupancy strictly exceeds `threshold * window`, and
+/// keys never observe each other's intervals.
+///
+/// The integer comparison below is the exact form of the production float
+/// comparison: at millisecond granularity the smallest nonzero gap between
+/// `occupied / window` and `pct / 100` is ~1e-8, far above f64 rounding
+/// error, so the two decisions always agree.
+fn matches_model(case: WindowedCase) -> bool {
+    let WindowedCase {
+        window_ms,
+        threshold_pct,
+        now_ms,
+        keys,
+    } = case;
+    let window = Duration::from_millis(window_ms);
+    let handler = seeded_handler(f64::from(threshold_pct) / 100.0_f64, window);
+
+    let window_nanos = window_ms * NANOS_PER_MS;
+    let now_nanos = now_ms * NANOS_PER_MS;
+    let window_start = now_nanos.saturating_sub(window_nanos);
+    let now = handler.reference_instant + Duration::from_nanos(now_nanos);
+
+    for (i, pairs) in keys.iter().enumerate() {
+        let nanos: Vec<(u64, u64)> = pairs
+            .iter()
+            .map(|&(start, len)| (start * NANOS_PER_MS, (start + len) * NANOS_PER_MS))
+            .collect();
+        if let Some(set) = interval_set(&nanos) {
+            handler
+                .key_intervals
+                .insert(test_tp_key(&format!("key-{i}")), set);
+        }
+    }
+
+    (0..keys.len()).all(|i| {
+        let tp_key = test_tp_key(&format!("key-{i}"));
+        let expected = handler.key_intervals.get(&tp_key).is_some_and(|set| {
+            let occupied = model_windowed_nanos(&set, window_start, now_nanos);
+            u128::from(occupied) * 100_u128 > u128::from(threshold_pct) * u128::from(window_nanos)
+        });
+        handler.check_monopolization(&tp_key, now).is_some() == expected
+    })
+}
+
+#[test]
+fn check_monopolization_matches_windowed_overlap_model() {
+    init_test_logging();
+    // Iteration count comes from the `QUICKCHECK_TESTS` env var.
+    QuickCheck::new().quickcheck(matches_model as fn(WindowedCase) -> bool);
+}
+
+/// Pins the strict `>` in `check_monopolization`: occupancy of exactly
+/// `threshold * window` is not monopolizing; one more nanosecond is.
+#[test]
+fn exact_threshold_occupancy_is_not_monopolizing() -> Result<()> {
+    let handler = seeded_handler(0.9_f64, Duration::from_secs(100));
+    let tp_key = test_tp_key("exact-threshold");
+    let now = handler.reference_instant + Duration::from_secs(100);
+    let ninety_secs = Duration::from_secs(90).as_nanos() as u64;
+
+    let exact = interval_set(&[(0_u64, ninety_secs)]).ok_or_else(|| eyre!("non-empty pairs"))?;
+    handler.key_intervals.insert(tp_key.clone(), exact);
+    assert!(
+        handler.check_monopolization(&tp_key, now).is_none(),
+        "exactly 90% of the window must pass (threshold is strict >, not >=)"
+    );
+
+    let just_above =
+        interval_set(&[(0_u64, ninety_secs + 1_u64)]).ok_or_else(|| eyre!("non-empty pairs"))?;
+    handler.key_intervals.insert(tp_key.clone(), just_above);
+    assert!(
+        handler.check_monopolization(&tp_key, now).is_some(),
+        "one nanosecond above 90% must reject"
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -129,329 +301,84 @@ fn test_monopolization_error_message() {
     );
 }
 
+/// `run_event_loop` trims a key's stored intervals to the rolling window on
+/// every completion event, bounding per-key memory.
+///
+/// Driven directly: the events are buffered in the channel, the sender is
+/// dropped, and the loop is awaited to completion — it drains every event and
+/// exits on channel close, so awaiting it IS the synchronization.
 #[tokio::test]
-async fn test_non_monopolizing_key_passes_through() -> Result<()> {
+async fn window_sliding_removes_old_intervals() -> Result<()> {
     init_test_logging();
 
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_mins(5))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
+    let reference = Instant::now();
+    let key_intervals = Arc::new(Cache::new(16_usize));
+    let window = Duration::from_secs(10);
     let tp_key = test_tp_key("test-key");
-    let reference_instant = handler.reference_instant;
+    let (tx, rx) = broadcast::channel(8_usize);
 
-    let start_time = reference_instant;
-    let end_time = start_time + Duration::from_secs(10);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        start_time,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        end_time,
-    ));
-
-    sleep(Duration::from_millis(10)).await;
-
-    let result = handler.check_monopolization(&tp_key, end_time);
-    assert!(
-        result.is_none(),
-        "Key using 10s of 300s window should not monopolize"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_monopolizing_key_triggers_error() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let tp_key = test_tp_key("monopolizer");
-    let reference_instant = handler.reference_instant;
-
-    let start_time = reference_instant;
-    let end_time = start_time + Duration::from_secs(95);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        start_time,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        end_time,
-    ));
-
-    sleep(Duration::from_millis(10)).await;
-
-    let result = handler.check_monopolization(&tp_key, end_time);
-    assert!(
-        result.is_some(),
-        "Key using 95s of 100s window (95%) should monopolize"
-    );
-
-    if let Some(MonopolizationError::Monopolization { percentage, .. }) = result {
-        assert!(
-            percentage > 90.0_f64,
-            "Monopolization percentage should be > 90%"
-        );
+    // First execution occupies [0s, 9.1s]; the second runs [20.1s, 20.2s].
+    // The completion at 20.2s trims everything before the window start
+    // (10.2s), leaving only the second interval.
+    for (state, at_ms) in [
+        (KeyState::HandlerInvoked, 0_u64),
+        (KeyState::HandlerSucceeded, 9_100_u64),
+        (KeyState::HandlerInvoked, 20_100_u64),
+        (KeyState::HandlerSucceeded, 20_200_u64),
+    ] {
+        tx.send(create_key_event(
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
+            state,
+            reference + Duration::from_millis(at_ms),
+        ))
+        .map_err(|_| eyre!("event loop receiver dropped"))?;
     }
+    drop(tx);
+    run_event_loop(reference, Arc::clone(&key_intervals), window, rx).await;
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_multiple_keys_independent_tracking() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let tp_key1 = test_tp_key("key-1");
-    let tp_key2 = test_tp_key("key-2");
-    let reference_instant = handler.reference_instant;
-
-    let start1 = reference_instant;
-    let end1 = start1 + Duration::from_secs(95);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key1.key.clone(),
-        KeyState::HandlerInvoked,
-        start1,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key1.key.clone(),
-        KeyState::HandlerSucceeded,
-        end1,
-    ));
-
-    let start2 = reference_instant + Duration::from_millis(100);
-    let end2 = start2 + Duration::from_secs(2);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key2.key.clone(),
-        KeyState::HandlerInvoked,
-        start2,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key2.key.clone(),
-        KeyState::HandlerSucceeded,
-        end2,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    // Check key1 at the time it finished (end1 = 95s)
-    let result1 = handler.check_monopolization(&tp_key1, end1);
-    assert!(
-        result1.is_some(),
-        "Key 1 should be monopolizing (95s of 100s)"
-    );
-
-    // Check key2 at the time it finished (end2 = 2.1s)
-    let result2 = handler.check_monopolization(&tp_key2, end2);
-    assert!(
-        result2.is_none(),
-        "Key 2 should not be monopolizing (2s of 100s)"
+    let intervals = key_intervals
+        .get(&tp_key)
+        .ok_or_else(|| eyre!("expected a trimmed interval set for the key"))?;
+    let stored: Vec<(u64, u64)> = intervals
+        .iter()
+        .map(|iv| (iv.lower(), iv.upper()))
+        .collect();
+    assert_eq!(
+        stored,
+        vec![(20_100_u64 * NANOS_PER_MS, 20_200_u64 * NANOS_PER_MS)],
+        "completion must trim intervals outside the rolling window"
     );
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_window_sliding_removes_old_intervals() -> Result<()> {
+/// End-to-end through `MonopolizationMiddleware::new`'s spawned telemetry
+/// loop: `HandlerInvoked` opens an interval reaching the far future (the key
+/// reads as monopolizing arbitrarily far ahead), and the completion event
+/// closes it at the completion timestamp (far-future checks come back clean).
+#[tokio::test(start_paused = true)]
+async fn open_interval_closed_on_completion() -> Result<()> {
     init_test_logging();
 
     let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(10))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let tp_key = test_tp_key("test-key");
-    let reference_instant = handler.reference_instant;
-
-    let start1 = reference_instant;
-    let end1 = start1 + Duration::from_millis(9100); // 9.1 seconds to exceed 90% threshold
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        start1,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        end1,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    let result = handler.check_monopolization(&tp_key, end1);
-    assert!(result.is_some(), "Should monopolize right after execution");
-
-    let start2 = end1 + Duration::from_secs(11);
-    let end2 = start2 + Duration::from_millis(100);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        start2,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        end2,
-    ));
-
-    sleep(Duration::from_millis(10)).await;
-
-    if let Some(intervals) = handler.key_intervals.get(&tp_key) {
-        let now_nanos = end2
-            .saturating_duration_since(handler.reference_instant)
-            .as_nanos() as u64;
-        let window_nanos = Duration::from_secs(10).as_nanos() as u64;
-        let window_start = now_nanos.saturating_sub(window_nanos);
-        let window_interval_set = [(window_start, now_nanos)].to_interval_set();
-        let windowed = intervals.intersection(&window_interval_set);
-
-        let total_time: u64 = windowed
-            .iter()
-            .map(|iv| iv.upper().saturating_sub(iv.lower()))
-            .sum();
-
-        assert!(
-            total_time < Duration::from_secs(1).as_nanos() as u64,
-            "Old interval should be outside window"
-        );
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_open_interval_closed_on_completion() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
     let config = MonopolizationConfiguration::builder()
         .window_duration(Duration::from_secs(100))
         .build()?;
-
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
+    let provider = middleware.with_provider(MockProvider {
+        handler: ScriptedHandler::success(),
+    });
     let handler = provider
         .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
         .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
+        .ok_or_else(|| eyre!("expected enabled handler"))?;
 
     let tp_key = test_tp_key("test-key");
-    let reference_instant = handler.reference_instant;
-
-    let start = reference_instant;
+    let start = handler.reference_instant;
+    let end = start + Duration::from_secs(50);
+    let far_future = end + Duration::from_secs(1_000);
 
     telemetry.test_emit(create_key_event(
         TEST_TOPIC.into(),
@@ -460,16 +387,12 @@ async fn test_open_interval_closed_on_completion() -> Result<()> {
         KeyState::HandlerInvoked,
         start,
     ));
+    drain_telemetry().await;
 
-    sleep(Duration::from_millis(10)).await;
-
-    let intervals_before = handler.key_intervals.get(&tp_key);
     assert!(
-        intervals_before.is_some(),
-        "Should have open interval after invocation"
+        handler.check_monopolization(&tp_key, far_future).is_some(),
+        "an open interval extends to the far future, so the key reads as monopolizing there"
     );
-
-    let end = start + Duration::from_secs(50);
 
     telemetry.test_emit(create_key_event(
         TEST_TOPIC.into(),
@@ -478,321 +401,24 @@ async fn test_open_interval_closed_on_completion() -> Result<()> {
         KeyState::HandlerSucceeded,
         end,
     ));
+    drain_telemetry().await;
 
-    sleep(Duration::from_millis(10)).await;
-
-    let intervals_after = handler.key_intervals.get(&tp_key);
     assert!(
-        intervals_after.is_some(),
-        "Should have closed interval after completion"
+        handler.check_monopolization(&tp_key, far_future).is_none(),
+        "completion must close the interval at the completion time, not leave it open"
+    );
+    assert!(
+        handler.check_monopolization(&tp_key, end).is_none(),
+        "50s of a 100s window is below the 90% threshold"
     );
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_boundary_execution_before_window() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let reference_instant = handler.reference_instant;
-
-    let tp_key = test_tp_key("key-before-window");
-    let execution_start = reference_instant;
-    let execution_end = execution_start + Duration::from_secs(50);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        execution_start,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        execution_end,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    // Check at time that puts execution_start before the window
-    let check_time = reference_instant + Duration::from_mins(2);
-    let result = handler.check_monopolization(&tp_key, check_time);
-    assert!(
-        result.is_none(),
-        "Execution that started before window should only count time within window"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_boundary_execution_crosses_window_end() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let reference_instant = handler.reference_instant;
-
-    let tp_key = test_tp_key("key-crosses-boundary");
-    let execution_start = reference_instant + Duration::from_secs(10);
-    let execution_end = execution_start + Duration::from_secs(95);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        execution_start,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        execution_end,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    let result = handler.check_monopolization(&tp_key, execution_end);
-    assert!(
-        result.is_some(),
-        "Key using 95s of 100s window should monopolize at window end"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_boundary_exact_threshold() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let reference_instant = handler.reference_instant;
-
-    let tp_key = test_tp_key("key-exact-threshold");
-    let execution_start = reference_instant;
-    let execution_end = execution_start + Duration::from_secs(90);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        execution_start,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        execution_end,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    let result = handler.check_monopolization(&tp_key, execution_end);
-    assert!(
-        result.is_none(),
-        "Key using exactly 90s of 100s window (90.0%) should not monopolize (threshold is >90%, \
-         not >=90%)"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_boundary_just_above_threshold() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let reference_instant = handler.reference_instant;
-
-    let tp_key = test_tp_key("key-above-threshold");
-    let execution_start = reference_instant;
-    let execution_end = execution_start + Duration::from_millis(90_100);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        execution_start,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        execution_end,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    let result = handler.check_monopolization(&tp_key, execution_end);
-    assert!(
-        result.is_some(),
-        "Key using 90.1s of 100s window (90.1%) should monopolize"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_boundary_multiple_executions_in_window() -> Result<()> {
-    init_test_logging();
-
-    let telemetry = Telemetry::new();
-
-    let config = MonopolizationConfiguration::builder()
-        .monopolization_threshold(0.9)
-        .window_duration(Duration::from_secs(100))
-        .build()?;
-
-    let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    let mock_handler = ScriptedHandler::success();
-    let provider = MockProvider {
-        handler: mock_handler.clone(),
-    };
-
-    let provider = middleware.with_provider(provider);
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
-
-    let reference_instant = handler.reference_instant;
-    let tp_key = test_tp_key("key-multiple-at-boundary");
-
-    // First execution: 20s at start of window
-    let first_start = reference_instant;
-    let first_end = first_start + Duration::from_secs(20);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        first_start,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        first_end,
-    ));
-
-    // Second execution: 72s that ends at window boundary
-    let second_start = first_start + Duration::from_secs(28);
-    let second_end = first_start + Duration::from_secs(100);
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerInvoked,
-        second_start,
-    ));
-
-    telemetry.test_emit(create_key_event(
-        TEST_TOPIC.into(),
-        TEST_PARTITION,
-        tp_key.key.clone(),
-        KeyState::HandlerSucceeded,
-        second_end,
-    ));
-
-    sleep(Duration::from_millis(50)).await;
-
-    // Check at end of window - should capture both executions (20s + 72s = 92s >
-    // 90s)
-    let check_time = first_start + Duration::from_secs(100);
-    let result = handler.check_monopolization(&tp_key, check_time);
-    assert!(
-        result.is_some(),
-        "Multiple executions totaling >90s in window should monopolize"
-    );
-
-    Ok(())
+/// Deterministic barrier for the spawned telemetry loop: under paused time,
+/// tokio only advances the clock once every task is idle, so this virtual
+/// sleep resumes only after the loop has drained all pending events — it is
+/// never a wall-clock wait.
+async fn drain_telemetry() {
+    sleep(Duration::from_millis(1)).await;
 }

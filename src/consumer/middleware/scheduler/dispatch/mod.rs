@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 /// Coordinates with telemetry to track per-key execution times and prioritizes
 /// tasks to prevent starvation and monopolization.
 #[derive(Clone, Debug)]
-pub struct Dispatcher {
+pub(super) struct Dispatcher {
     tx: mpsc::Sender<Task>,
 }
 
@@ -368,6 +368,10 @@ fn update_min_priority(
 }
 
 /// Errors that can occur when requesting a permit from the dispatcher.
+///
+/// Stays `pub` (in this private module) rather than `pub(super)`: the public
+/// `SchedulerError::PermitAcquisition` variant exposes it, and a narrower
+/// visibility trips the `private_interfaces` lint.
 #[derive(Debug, Error)]
 pub enum DispatchError {
     /// The dispatcher event loop has terminated, no more permits will be

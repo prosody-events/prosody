@@ -69,18 +69,62 @@ fn message_for_testing(payload: Value) -> Result<ConsumerMessage<Value>> {
     ConsumerMessage::for_testing(topic, partition, offset, key, payload)
 }
 
-/// The `MsgPack` serde of [`MessageRef`] round-trips exactly — this is
-/// the [`MessageRefCodec`] cell format.
+/// The [`MessageRefCodec`] round-trips every [`MessageRef`] exactly, driven
+/// through the same `serialize`/`deserialize` calls the cell store uses —
+/// not a raw `rmp_serde` call standing in for the codec.
 #[test]
 fn prop_kafka_message_ref_msgpack_roundtrip() {
     fn prop(message_ref: ArbMessageRef) -> bool {
         let ArbMessageRef(message_ref) = message_ref;
-        let Ok(cell) = rmp_serde::to_vec_named(&message_ref) else {
+        let mut codec = MessageRefCodec;
+        let mut buf = Vec::new();
+        let Ok(()) = codec.serialize(message_ref.clone(), &mut buf) else {
             return false;
         };
-        rmp_serde::from_slice::<MessageRef>(&cell).is_ok_and(|decoded| decoded == message_ref)
+        codec
+            .deserialize(&mut buf)
+            .is_ok_and(|decoded| decoded == message_ref)
     }
     QuickCheck::new().quickcheck(prop as fn(ArbMessageRef) -> bool);
+}
+
+/// The [`MessageRefCodec`] wire encoding of a fixed [`MessageRef`] is
+/// frozen: a `MsgPack` named-map of `topic`/`partition`/`offset`. The
+/// round-trip property above proves `decode(encode(x)) == x` inside one
+/// binary, which survives an encoding change as long as encoder and decoder
+/// move together; this test pins the literal bytes so a wire-incompatible
+/// change is caught even though both sides of the round-trip still agree
+/// with each other.
+#[test]
+fn frozen_message_ref_bytes() -> Result<()> {
+    let value = MessageRef {
+        topic: Topic::from("orders.v1"),
+        partition: 3,
+        offset: 42,
+    };
+    let mut codec = MessageRefCodec;
+    let mut buf = Vec::new();
+    codec
+        .serialize(value.clone(), &mut buf)
+        .map_err(|error| eyre!("encode failed: {error}"))?;
+
+    #[rustfmt::skip]
+    let expected: Vec<u8> = vec![
+        0x83, // fixmap, 3 entries
+        0xa5, b't', b'o', b'p', b'i', b'c',                         // "topic"
+        0xa9, b'o', b'r', b'd', b'e', b'r', b's', b'.', b'v', b'1', // "orders.v1"
+        0xa9, b'p', b'a', b'r', b't', b'i', b't', b'i', b'o', b'n', // "partition"
+        0x03,                                                       // 3
+        0xa6, b'o', b'f', b'f', b's', b'e', b't',                   // "offset"
+        0x2a,                                                       // 42
+    ];
+    assert_eq!(buf, expected);
+
+    let decoded = codec
+        .deserialize(&mut buf.clone())
+        .map_err(|error| eyre!("decode failed: {error}"))?;
+    assert_eq!(decoded, value);
+    Ok(())
 }
 
 /// The ref derived from a message carries the message's exact Kafka
