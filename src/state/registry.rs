@@ -2,7 +2,9 @@
 
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::{DescriptorIdentity, StructuralIdentity};
+#[cfg(test)]
+use crate::state::descriptor::DescriptorIdentity;
+use crate::state::descriptor::StructuralIdentity;
 use crate::state::{StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
@@ -45,7 +47,7 @@ pub enum CommitMode {
 /// bound. `ttl` is `None` for
 /// "do not bind a TTL" (explicit indefinite retention); a `Some(ttl)` over
 /// Cassandra's `USING TTL` ceiling is rejected at
-/// [`CollectionDefRegistry::register`] time, never silently collapsed.
+/// `CollectionDefRegistry::register` time, never silently collapsed.
 /// `commit_mode` decides whether handler-side dirty ops stage a provisional
 /// cell that promotes to committed after the event commit
 /// ([`CommitMode::ReadCommitted`]) or apply straight to the committed value
@@ -67,7 +69,7 @@ pub enum CommitMode {
 ///
 /// Operational settings are deliberately separate from the collection's
 /// frozen [`StructuralIdentity`]: the identity comes only from the
-/// descriptor at [`CollectionDefRegistry::register`] time, so a definition
+/// descriptor at `CollectionDefRegistry::register` time, so a definition
 /// cannot assert an identity its descriptor does not have.
 ///
 /// Core Invariant #6: "A collection has one `CommitMode` while a handler
@@ -119,7 +121,7 @@ pub(crate) struct RegisteredCollection {
 /// no durable-name union, so a collection whose descriptor was removed is
 /// simply dormant until it returns.
 #[derive(Clone, Debug)]
-pub struct CollectionDefRegistry {
+pub(crate) struct CollectionDefRegistry {
     defs: HashMap<StateType, HashMap<StateName, RegisteredCollection>>,
     default_ttl: Option<CompactDuration>,
 }
@@ -133,7 +135,7 @@ impl Default for CollectionDefRegistry {
 impl CollectionDefRegistry {
     /// Creates a registry with the supplied middleware-wide default TTL.
     #[must_use]
-    pub fn new(default_ttl: Option<CompactDuration>) -> Self {
+    pub(crate) fn new(default_ttl: Option<CompactDuration>) -> Self {
         Self {
             defs: HashMap::new(),
             default_ttl,
@@ -154,7 +156,12 @@ impl CollectionDefRegistry {
     /// Cassandra's `USING TTL` ceiling, or
     /// [`RegisterStateError::IdentityConflict`] when the name is already
     /// registered with a different structural identity.
-    pub fn register<D>(
+    ///
+    /// Test-only: production builds the registry through `register_identity`
+    /// (fed by the config's stored registrations); the typed descriptor form
+    /// is a suite convenience.
+    #[cfg(test)]
+    pub(crate) fn register<D>(
         &mut self,
         descriptor: &D,
         def: CollectionDef,
@@ -236,7 +243,11 @@ impl CollectionDefRegistry {
     /// Returns the TTL bound to `(state_type, name)`, falling back to the
     /// middleware-wide default.
     #[must_use]
-    pub fn ttl_for(&self, state_type: StateType, name: &StateName) -> Option<CompactDuration> {
+    pub(crate) fn ttl_for(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Option<CompactDuration> {
         self.lookup_collection(state_type, name)
             .map_or(self.default_ttl, |c| c.def.ttl)
     }
@@ -244,7 +255,7 @@ impl CollectionDefRegistry {
     /// Returns the commit mode bound to `(state_type, name)`, falling back to
     /// [`CommitMode::ReadCommitted`] for names not in the registry.
     #[must_use]
-    pub fn commit_mode_for(&self, state_type: StateType, name: &StateName) -> CommitMode {
+    pub(crate) fn commit_mode_for(&self, state_type: StateType, name: &StateName) -> CommitMode {
         self.lookup_collection(state_type, name)
             .map_or(CommitMode::ReadCommitted, |c| c.def.commit_mode)
     }
@@ -254,7 +265,7 @@ impl CollectionDefRegistry {
     /// The durability boundary folds this against the `recovery_delay`
     /// floor, so `None` means "use the floor"; see [`CollectionDef`].
     #[must_use]
-    pub fn recovery_within_for(
+    pub(crate) fn recovery_within_for(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -272,7 +283,7 @@ impl CollectionDefRegistry {
     }
 }
 
-/// Error returned by [`CollectionDefRegistry::register`].
+/// Error returned by `CollectionDefRegistry::register`.
 #[derive(Debug, Error)]
 pub enum RegisterStateError {
     /// The descriptor's collection name was empty.

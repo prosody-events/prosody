@@ -118,7 +118,7 @@ impl KeyedStateConfiguration {
 
     /// Returns whether any collections are registered.
     #[must_use]
-    pub fn has_registrations(&self) -> bool {
+    pub(crate) fn has_registrations(&self) -> bool {
         !self.registrations.is_empty()
     }
 

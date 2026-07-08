@@ -51,9 +51,13 @@
 //! LWTs or distributed locks.
 
 mod decode;
+mod encoding;
 
 #[cfg(test)]
 mod tests;
+
+pub(in crate::state::cassandra) use encoding::Encoding;
+pub use encoding::EncodingError;
 
 use crate::cassandra::CassandraStore as CassandraSession;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
@@ -62,7 +66,6 @@ use crate::cassandra::{BatchRow, BatchUnit};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan};
-use crate::state::encoding::{Encoding, encode_payload};
 use crate::state::event_ref::EventRef;
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
@@ -73,6 +76,7 @@ use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
+use encoding::encode_payload;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
 use scylla::client::session::Session;
 use scylla::deserialize::row::DeserializeRow;
@@ -228,7 +232,7 @@ impl<O> CassandraStore<O> {
     /// [`CellQueries`] set, the commit oracle it resolves provisional cells
     /// through, and the registry that supplies per-collection TTLs.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         session: CassandraSession,
         queries: Arc<CellQueries>,
         oracle: O,

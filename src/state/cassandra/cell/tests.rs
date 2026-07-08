@@ -368,8 +368,8 @@ async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
 /// decompression cannot mask a regression to raw storage.
 #[tokio::test]
 async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
+    use super::encoding::{Encoding, decode_payload};
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
-    use crate::state::encoding::{Encoding, decode_payload};
 
     init_test_logging();
     let fx = fixture().await?;

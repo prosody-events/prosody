@@ -22,7 +22,7 @@ const ZSTD_LEVEL: i32 = 0;
 /// (Permanent).
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum Encoding {
+pub(in crate::state::cassandra) enum Encoding {
     /// Raw codec bytes compressed with zstd.
     RawZstdV1 = 4,
 }
@@ -52,7 +52,10 @@ impl TryFrom<i16> for Encoding {
 /// # Errors
 ///
 /// Returns [`EncodingError`] when zstd compression fails.
-pub fn encode_payload(payload: &Bytes, encoding: Encoding) -> Result<Bytes, EncodingError> {
+pub(in crate::state::cassandra) fn encode_payload(
+    payload: &Bytes,
+    encoding: Encoding,
+) -> Result<Bytes, EncodingError> {
     match encoding {
         Encoding::RawZstdV1 => compress(payload),
     }
@@ -63,7 +66,10 @@ pub fn encode_payload(payload: &Bytes, encoding: Encoding) -> Result<Bytes, Enco
 /// # Errors
 ///
 /// Returns [`EncodingError`] when zstd decompression fails.
-pub fn decode_payload(bytes: &[u8], encoding: Encoding) -> Result<Bytes, EncodingError> {
+pub(in crate::state::cassandra) fn decode_payload(
+    bytes: &[u8],
+    encoding: Encoding,
+) -> Result<Bytes, EncodingError> {
     match encoding {
         Encoding::RawZstdV1 => decompress(bytes).map(Bytes::from),
     }

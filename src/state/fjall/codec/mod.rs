@@ -345,7 +345,7 @@ pub(super) fn collection_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN
 
 /// Encodes an `Absent` cache cell with its absolute `expiry` (`0` = never).
 #[must_use]
-pub fn encode_absent_cell(expiry: u64) -> Bytes {
+pub(super) fn encode_absent_cell(expiry: u64) -> Bytes {
     let mut buf = Vec::with_capacity(1 + EXPIRY_LEN);
     buf.push(CACHE_TAG_ABSENT);
     buf.extend_from_slice(&expiry.to_be_bytes());
@@ -361,7 +361,7 @@ pub fn encode_absent_cell(expiry: u64) -> Bytes {
 /// flush/compaction, so a redundant per-cell codec layer is neither needed nor
 /// applied.
 #[must_use]
-pub fn encode_present_cell(payload: &[u8], expiry: u64) -> Bytes {
+pub(super) fn encode_present_cell(payload: &[u8], expiry: u64) -> Bytes {
     let mut buf = Vec::with_capacity(1 + EXPIRY_LEN + payload.len());
     buf.push(CACHE_TAG_PRESENT);
     buf.extend_from_slice(&expiry.to_be_bytes());
@@ -391,7 +391,7 @@ pub fn encode_present_cell(payload: &[u8], expiry: u64) -> Bytes {
 /// # Errors
 ///
 /// Returns a [`FjallCellCacheError`] when the cell is malformed.
-pub fn decode_cell(bytes: Option<&[u8]>) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
+pub(super) fn decode_cell(bytes: Option<&[u8]>) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
     let Some(bytes) = bytes else {
         return Ok((NEVER_EXPIRES, Read::Unknown));
     };

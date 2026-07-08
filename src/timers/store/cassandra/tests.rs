@@ -1240,8 +1240,8 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
 #[tokio::test]
 async fn oracle_reads_through_the_writers_store() -> Result<()> {
     use super::CassandraTriggerStoreProvider;
-    use crate::commit_manager::{CommitManager, StoreTagSource};
     use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
+    use crate::state::commit::{CommitManager, StoreTagSource};
     use crate::timers::store::{TriggerStore, TriggerStoreProvider};
     init_test_logging();
 

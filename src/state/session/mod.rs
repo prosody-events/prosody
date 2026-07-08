@@ -7,7 +7,7 @@
 //!
 //! [`KeyedStateSession`] is the sole implementation — the real session, minted
 //! per event by the partition's state manager. It holds **one uniform
-//! [`Overlay`]** (the per-event [`DirtyStore`] over the partition's committed
+//! `Overlay`** (the per-event `DirtyStore` over the partition's committed
 //! cell store) plus the cross-event singletons (the commit oracle, the
 //! registered marker, the armed backstop, the event, the registry, …). Clones
 //! share the per-event state, so repeated descriptor binds of one collection
@@ -361,7 +361,7 @@ where
     B: StateBackend,
 {
     /// The partition's uniform committed cell store (the session wraps it in a
-    /// per-event [`Overlay`]).
+    /// per-event `Overlay`).
     pub cell: B::Cell,
 
     /// Per-partition shared dirty workspace; this event's `key` sub-range is
@@ -379,7 +379,7 @@ where
     pub loader: L,
 
     /// Registered collection definitions and middleware-wide defaults.
-    pub registry: Arc<CollectionDefRegistry>,
+    pub(crate) registry: Arc<CollectionDefRegistry>,
 
     /// Segment-qualified key this session's collections live under.
     pub state_key: StateKey,
@@ -458,7 +458,7 @@ where
     B: StateBackend,
 {
     /// Creates a session for one event, wrapping the partition's cell store in
-    /// a per-event [`Overlay`] over the shared dirty workspace.
+    /// a per-event `Overlay` over the shared dirty workspace.
     #[must_use]
     pub fn new(parts: SessionParts<B, L>) -> Self {
         let SessionParts {

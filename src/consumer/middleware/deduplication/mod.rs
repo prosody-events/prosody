@@ -27,7 +27,7 @@
 pub mod cassandra;
 pub mod config;
 pub mod memory;
-pub mod queries;
+pub(crate) mod queries;
 pub mod store;
 #[cfg(test)]
 pub mod tests;

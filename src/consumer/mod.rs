@@ -206,7 +206,7 @@ use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::hostname;
 
-pub mod decode;
+pub(crate) mod decode;
 pub mod event_context;
 mod extractor;
 mod kafka_context;

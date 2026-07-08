@@ -2,7 +2,7 @@
 //! lifecycle the partition loop drives.
 //!
 //! The per-collection resolution (`resolve_cell`), sweep idempotence, and the
-//! commit oracle are covered in the cell suite and `commit_manager::tests`.
+//! commit oracle are covered in the cell suite and `state::commit::tests`.
 //! These pin the glue `recover` and the real session add on top: resolving a
 //! provisional cell staged under a real [`EventRef`] through the oracle (commit
 //! **and** abort arms), clearing the per-key armed flag, unscheduling the

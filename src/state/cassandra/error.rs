@@ -13,7 +13,7 @@
 use super::cell::CellCorruptReason;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::encoding::EncodingError;
+use crate::state::cassandra::cell::EncodingError;
 use thiserror::Error;
 
 /// See the module doc for retry classification.

@@ -7,7 +7,7 @@
 //! partition-lifetime pieces — the uniform cell store
 //! ([`StateBackend::Cell`]), the commit oracle, the shared dirty workspace, and
 //! the message loader — while each session gets `Arc`-clones and wraps the cell
-//! store in its own per-event [`Overlay`](crate::state::overlay::Overlay). The
+//! store in its own per-event `Overlay`. The
 //! recovery sweep resolves provisional cells through the *same* cell store and
 //! oracle.
 //!
@@ -488,7 +488,7 @@ impl<F, L> StateManagerProvider<F, L> {
     /// `EventRef` by `(key, timer_type, time)` against the per-partition
     /// trigger store, never by the state segment id — don't join them in code.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         backend: F,
         loader: L,
         registry: Arc<CollectionDefRegistry>,

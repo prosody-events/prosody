@@ -31,13 +31,12 @@
 //! UDT classifiable as `Permanent` (skip the row) instead of `Terminal` (tear
 //! the partition down).
 
-use crate::state::Encoding;
+use super::encoding::{Encoding, decode_payload};
 use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::encoding::decode_payload;
 use bytes::Bytes;
 use thiserror::Error;
 

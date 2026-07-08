@@ -67,7 +67,7 @@ impl<O> MemoryCellStore<O> {
     /// Wraps a shared cell map, resolving through `oracle` and binding
     /// per-collection TTLs from `registry` on resolution write-backs.
     #[must_use]
-    pub fn new(cells: MemoryCells, oracle: O, registry: Arc<CollectionDefRegistry>) -> Self {
+    pub(crate) fn new(cells: MemoryCells, oracle: O, registry: Arc<CollectionDefRegistry>) -> Self {
         Self {
             cells,
             resolver: Resolver::new(oracle, registry),

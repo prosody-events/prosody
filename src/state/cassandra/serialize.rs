@@ -18,7 +18,7 @@
 
 use crate::state::StateType;
 use crate::state::cassandra::cell::CellKind;
-use crate::state::encoding::Encoding;
+use crate::state::cassandra::cell::Encoding;
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;

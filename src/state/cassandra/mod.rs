@@ -23,6 +23,7 @@ mod udt;
 
 pub use cell::{
     CassandraCellResources, CassandraStore, CellCorruptReason, CellQueries, CellStoreError,
+    EncodingError,
 };
 pub use error::{CassandraCellStoreError, CorruptUdtError};
 pub use identity::{

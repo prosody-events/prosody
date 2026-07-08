@@ -3,8 +3,8 @@
 //! [`FjallCellCache`] stores one tagged cell per [`CellKey`] in a fjall
 //! keyspace. It is the committed-value cache the
 //! [`Cached`](crate::state::cached::Cached) coverage combinator serves from:
-//! point [`get`](FjallCellCache::get)s and, over a covered scan sub-range,
-//! ordered [`scan_present`](FjallCellCache::scan_present) range reads. It does
+//! point `get`s and, over a covered scan sub-range,
+//! ordered `scan_present` range reads. It does
 //! **not** implement [`CellStore`](crate::state::store::CellStore): it is a
 //! concrete *partial* upper (it can only answer what it has mirrored), so a
 //! bare cache view can never be mistaken for a complete store — completeness is
@@ -26,7 +26,7 @@
 //! never been populated. That state is encoded as the **absence of an entry**
 //! in the fjall keyspace, and decodes as the codec's three-valued
 //! `Read::Unknown` (see the `codec` module's cell-frame doc for the tag/expiry
-//! wire layout). The cache enforces the TTL on read against its [`Clock`] (an
+//! wire layout). The cache enforces the TTL on read against its `Clock` (an
 //! expired entry reads as a miss). The payload is stored verbatim — fjall
 //! block-compresses the on-disk data block via LZ4, so there is no per-cell
 //! codec layer.
@@ -61,8 +61,7 @@ use futures::{Stream, StreamExt};
 use std::ops::Bound;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::coop::cooperative;
 use tokio::task::spawn_blocking;
@@ -86,10 +85,11 @@ const SCAN_HOP_ROWS: usize = 256;
 /// against, so the two never disagree.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub enum Clock {
+pub(crate) enum Clock {
     /// The system wall clock.
     Wall,
     /// A test-controlled clock over a shared millisecond counter.
+    #[cfg(test)]
     Fixed(#[educe(Debug(ignore))] Arc<AtomicU64>),
 }
 
@@ -103,6 +103,7 @@ impl Clock {
             Self::Wall => SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            #[cfg(test)]
             Self::Fixed(now) => now.load(Ordering::Relaxed),
         }
     }
@@ -110,7 +111,7 @@ impl Clock {
 
 /// The three-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
-pub enum CacheRead {
+pub(crate) enum CacheRead {
     /// An unexpired entry (a `Present` value or an authoritative `Absent`).
     Hit(Committed),
     /// An entry exists but its stamped expiry has passed; the caller falls
@@ -120,7 +121,7 @@ pub enum CacheRead {
     Miss,
 }
 
-/// One item of a [`FjallCellCache::scan_present`] covered serve: a live present
+/// One item of a `FjallCellCache::scan_present` covered serve: a live present
 /// cell, or an expired covered coordinate the caller must re-fetch from the
 /// lower store (FLOOR rounding can expire a fjall entry just before its durable
 /// row, so an expired covered coordinate is a gap, not an absence).
@@ -139,7 +140,7 @@ pub enum ScanHit {
 /// or the atomic batch commit failed) so the next read falls through and
 /// self-heals.
 #[derive(Clone, Copy, Debug)]
-pub enum CoverDecision {
+pub(crate) enum CoverDecision {
     /// The committed value was re-published; cover the coordinate.
     Cover,
     /// Uncover the coordinate; the next read re-publishes from the lower store.
@@ -260,7 +261,12 @@ impl FjallCellCache {
     /// expiry deterministically.
     #[cfg(test)]
     #[must_use]
-    pub fn with_clock(database: Database, cache: Keyspace, index: Keyspace, clock: Clock) -> Self {
+    pub(crate) fn with_clock(
+        database: Database,
+        cache: Keyspace,
+        index: Keyspace,
+        clock: Clock,
+    ) -> Self {
         Self::from_parts(
             Inner::Bare {
                 database,
@@ -337,7 +343,7 @@ impl FjallCellCache {
     /// [`Cached`](crate::state::cached::Cached) cache's expiry stamping so the
     /// two never disagree.
     #[must_use]
-    pub fn clock(&self) -> &Clock {
+    pub(crate) fn clock(&self) -> &Clock {
         &self.clock
     }
 
@@ -355,7 +361,7 @@ impl FjallCellCache {
     ///
     /// Returns [`FjallCellCacheError`] when the cache read or cell decode
     /// fails.
-    pub async fn get(
+    pub(crate) async fn get(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
@@ -370,7 +376,7 @@ impl FjallCellCache {
     }
 
     /// The absolute expiry (millis; `0` = never) stamped on the cell's current
-    /// fjall entry, or `None` when no entry exists. Unlike [`get`](Self::get),
+    /// fjall entry, or `None` when no entry exists. Unlike `get`,
     /// it does **not** treat a passed stamp as a miss: the caller is about to
     /// **re-publish** the cell and wants to *preserve* its existing co-expiry
     /// anchor. The promote (`commit_provisional`) uses this so the committed
@@ -382,7 +388,11 @@ impl FjallCellCache {
     ///
     /// Returns [`FjallCellCacheError`] when the cache read or cell decode
     /// fails.
-    pub async fn stored_expiry(
+    ///
+    /// Test-only: the sole caller is the `#[cfg(test)]`
+    /// `Cached::stored_expiry` co-expiry probe.
+    #[cfg(test)]
+    pub(crate) async fn stored_expiry(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
@@ -415,7 +425,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Returns [`FjallCellCacheError`] when the cache write fails.
-    pub async fn put(
+    pub(crate) async fn put(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
@@ -451,7 +461,7 @@ impl FjallCellCache {
     /// Returns [`FjallCellCacheError`] when the batch commit fails; the caller
     /// then uncovers every coordinate (Cov3 — see
     /// [`Cached`](crate::state::cached::Cached)'s module doc).
-    pub async fn put_batch(
+    pub(crate) async fn put_batch(
         &self,
         collection: &CollectionId,
         cells: &[(CellKey, Committed, u64)],
@@ -494,7 +504,7 @@ impl FjallCellCache {
     /// Best-effort: it never returns an error, so the caller can return the
     /// lower promote's `Result` verbatim (the Incomplete trap — likewise
     /// defined there).
-    pub async fn commit_batch(
+    pub(crate) async fn commit_batch(
         &self,
         collection: &CollectionId,
         writes: &[(CellKey, ProvisionalWrite)],
@@ -565,7 +575,7 @@ impl FjallCellCache {
     /// unbounded high bound stops at the section's upper boundary, never
     /// bleeding into the next section or another collection. A per-row prefix
     /// check guards the same invariant defensively (see `scan_hop`).
-    pub fn scan_present<'a>(
+    pub(crate) fn scan_present<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
@@ -644,7 +654,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall read failure.
-    pub async fn index_seeded(
+    pub(crate) async fn index_seeded(
         &self,
         collection: &CollectionId,
     ) -> Result<bool, FjallCellCacheError> {
@@ -661,7 +671,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn index_mark_seeded(
+    pub(crate) async fn index_mark_seeded(
         &self,
         collection: &CollectionId,
     ) -> Result<(), FjallCellCacheError> {
@@ -679,7 +689,10 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn index_unseed(&self, collection: &CollectionId) -> Result<(), FjallCellCacheError> {
+    pub(crate) async fn index_unseed(
+        &self,
+        collection: &CollectionId,
+    ) -> Result<(), FjallCellCacheError> {
         let handle = self.inner.index_handle().clone();
         let key = codec::index_seeded_key(collection);
         spawn_blocking(move || handle.remove(key.as_slice())).await??;
@@ -691,7 +704,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn index_record(
+    pub(crate) async fn index_record(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
@@ -717,7 +730,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn index_record_batch<'a, I>(
+    pub(crate) async fn index_record_batch<'a, I>(
         &self,
         collection: &CollectionId,
         cells: I,
@@ -748,7 +761,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn index_clear_batch<'a, I>(
+    pub(crate) async fn index_clear_batch<'a, I>(
         &self,
         collection: &CollectionId,
         cells: I,
@@ -776,7 +789,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall read failure.
-    pub async fn index_snapshot(
+    pub(crate) async fn index_snapshot(
         &self,
         collection: &CollectionId,
     ) -> Result<Vec<CellKey>, FjallCellCacheError> {
@@ -814,7 +827,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall read or bound-frame decode failure.
-    pub async fn cover_load(
+    pub(crate) async fn cover_load(
         &self,
         collection: &CollectionId,
         section: Section,
@@ -843,7 +856,7 @@ impl FjallCellCache {
     /// # Errors
     ///
     /// Propagates a fjall write failure.
-    pub async fn cover_store(
+    pub(crate) async fn cover_store(
         &self,
         collection: &CollectionId,
         section: Section,

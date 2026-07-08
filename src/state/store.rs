@@ -9,7 +9,7 @@
 //!
 //! Its currency is the resolved [`Committed`] cell: `get` and `scan_cells`
 //! oracle-resolve any in-flight provisional cell **inside the backend** before
-//! yielding, so callers above it (the [`Overlay`](super::overlay::Overlay)
+//! yielding, so callers above it (the `Overlay`
 //! dirty overlay, the [`Cached`](super::cached::Cached) write-through cache)
 //! are oracle-free and merely delegate down. The `own: EventRef` argument lets
 //! the bottom store short-circuit to `prev` for the running handler's own

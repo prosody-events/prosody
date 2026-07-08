@@ -94,11 +94,9 @@ impl HeartbeatRegistry {
     }
 
     /// Creates a test heartbeat registry with default settings.
-    ///
-    /// Only intended for use in tests and examples.
     #[cfg(test)]
     #[must_use]
-    pub fn test() -> Self {
+    pub(crate) fn test() -> Self {
         Self::new("test".to_owned(), Duration::from_secs(30))
     }
 }

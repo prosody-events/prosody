@@ -235,7 +235,6 @@ pub mod admin;
 pub mod cassandra;
 /// Wire-format abstraction for pluggable message encoding and decoding.
 pub mod codec;
-pub mod commit_manager;
 pub mod consumer;
 pub mod error;
 pub mod heartbeat;

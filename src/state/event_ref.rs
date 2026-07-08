@@ -25,10 +25,10 @@ pub enum EventRef {
 impl EventRef {
     /// Wire discriminator for the message variant in the Cassandra
     /// `event_ref` UDT `kind` column.
-    pub(crate) const MESSAGE_KIND: i8 = 0;
+    pub(in crate::state) const MESSAGE_KIND: i8 = 0;
     /// Wire discriminator for the timer variant in the Cassandra
     /// `event_ref` UDT `kind` column.
-    pub(crate) const TIMER_KIND: i8 = 1;
+    pub(in crate::state) const TIMER_KIND: i8 = 1;
 }
 
 /// Durable timer identity stored in a provisional cell.

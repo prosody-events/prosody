@@ -15,8 +15,6 @@
 //!   [`Coordinate`], [`Scan`]).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
-//! * [`encoding`] — payload encoding selectors ([`Encoding`],
-//!   [`EncodingError`]).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
 //!   [`ProvisionalCell`], [`ProvisionalWrite`]).
 //! * [`store`] — the uniform [`CellStore`] backend trait.
@@ -57,11 +55,11 @@ pub mod cached;
 pub mod cassandra;
 pub mod cell;
 pub mod cell_key;
+pub(crate) mod commit;
 pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
-pub mod dirty;
-pub mod encoding;
+pub(crate) mod dirty;
 pub mod event_ref;
 pub mod fjall;
 pub mod identity;
@@ -69,7 +67,7 @@ pub mod manager;
 pub mod memory;
 pub mod oracle;
 pub mod order_codec;
-pub mod overlay;
+pub(crate) mod overlay;
 pub mod production;
 pub mod registry;
 pub mod resolve;
@@ -81,7 +79,6 @@ pub(crate) mod tests;
 
 pub use access::StateAccessError;
 pub use cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-pub use encoding::{Encoding, EncodingError};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,
@@ -121,9 +118,8 @@ pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 /// store resolves provisional cells through are the *same* instance, and the
 /// fjall workspace backing the committed-value cache is opened once. The
 /// per-event dirty workspace is not part of the backend — it is the in-memory
-/// [`DirtyStore`](dirty::DirtyStore) the session's
-/// [`Overlay`](overlay::Overlay) owns and clears per event, never a durability
-/// or recovery source.
+/// `DirtyStore` the session's `Overlay` owns and clears per event, never a
+/// durability or recovery source.
 pub trait StateBackend: Send + Sync + 'static {
     /// The commit oracle, shared with the cell store, so a provisional cell
     /// resolves against the exact commit record the one marker certifies.
@@ -136,7 +132,7 @@ pub trait StateBackend: Send + Sync + 'static {
 
     /// The one uniform durable cell store (`Cached<CassandraStore>` in
     /// production, `MemoryCellStore` in tests). The session wraps it in the
-    /// per-event dirty [`Overlay`](overlay::Overlay).
+    /// per-event dirty `Overlay`.
     type Cell: CellStore;
 
     /// The shared commit oracle (the marker flush writes through it).

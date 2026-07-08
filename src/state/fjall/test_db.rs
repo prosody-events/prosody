@@ -22,10 +22,10 @@
 //! not a leak); nextest's short-lived test processes leave it to the OS
 //! reclaimer.
 
+use super::workspace::keyspace_options;
 use super::{Clock, FjallCellCache};
 use color_eyre::eyre::{Result, eyre};
-use fjall::config::CompressionPolicy;
-use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
+use fjall::{Database, Keyspace};
 use std::sync::LazyLock;
 use tempfile::TempDir;
 
@@ -38,14 +38,8 @@ static SHARED_DB: LazyLock<Result<(Database, TempDir), String>> = LazyLock::new(
     Ok((database, dir))
 });
 
-/// LZ4 block compression, matching the production workspace's keyspace options.
-fn keyspace_options() -> KeyspaceCreateOptions {
-    KeyspaceCreateOptions::default()
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
-}
-
 /// The process-shared [`Database`] (see the module docs).
-pub fn shared_database() -> Result<Database> {
+fn shared_database() -> Result<Database> {
     match &*SHARED_DB {
         Ok((db, _)) => Ok(db.clone()),
         Err(e) => Err(eyre!("shared fjall database init failed: {e}")),

@@ -42,12 +42,12 @@ use thiserror::Error;
 use tracing::warn;
 use xxhash_rust::xxh3::xxh3_128;
 
-/// Source of process-monotonic [`AssignmentEpoch`] values.
-static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
-
 const PARTITION_NAME_PREFIX: &str = "value_";
 const CACHE_ROLE: &str = "cache";
 const INDEX_ROLE: &str = "index";
+
+/// Source of process-monotonic [`AssignmentEpoch`] values.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Per-Kafka-partition workspace creation epoch.
 ///
@@ -247,7 +247,7 @@ fn sweep_orphaned(database: &Database) -> Result<(), FjallClientError> {
 /// rather than a single type; pinning every level to LZ4 preserves the prior
 /// behavior, documents the intent, and guards against a future change to
 /// fjall's default policy.
-fn keyspace_options() -> KeyspaceCreateOptions {
+pub(super) fn keyspace_options() -> KeyspaceCreateOptions {
     KeyspaceCreateOptions::default()
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }

@@ -192,7 +192,7 @@ impl CollectionId {
 /// storage.
 ///
 /// The per-collection TTL is sourced from the shared
-/// [`CollectionDefRegistry`](super::registry::CollectionDefRegistry): the
+/// `CollectionDefRegistry`: the
 /// session builds a `CollectionRef` at stage time, and the bottom store builds
 /// one for its resolution write-backs, so both bind the same TTL. `None` is a
 /// deliberate value (indefinite retention), not a forgotten one. Reads do not

@@ -42,29 +42,29 @@ use crate::{EventIdentity, EventType, Partition, Topic};
 /// The shared partition-manager map paired with the channel that republishes
 /// its size after each rebalance, so assignment readiness can be awaited rather
 /// than polled.
-pub struct ManagerRegistry<PL> {
+pub(super) struct ManagerRegistry<PL> {
     /// Thread-safe storage for partition managers.
-    pub managers: Arc<Managers<PL>>,
+    pub(super) managers: Arc<Managers<PL>>,
     /// Publishes the assigned-partition count after each rebalance.
-    pub assignment_tx: watch::Sender<u32>,
+    pub(super) assignment_tx: watch::Sender<u32>,
 }
 
 /// The per-partition factories the context threads into each
 /// [`PartitionConfiguration`]: trigger stores for the timer system and
 /// keyed-state managers for the state system.
-pub struct PartitionProviders<P, SP> {
+pub(super) struct PartitionProviders<P, SP> {
     /// Factory for per-partition trigger stores.
-    pub triggers: P,
+    pub(super) triggers: P,
 
     /// Factory for per-partition keyed-state managers.
-    pub state: SP,
+    pub(super) state: SP,
 }
 
 /// The partition-manager factory a [`Context`] holds: builds a fresh
 /// [`PartitionManager`] for each newly assigned partition. Implemented
 /// automatically for any matching closure, so the context can name its factory
 /// bound once instead of spelling the full `Fn` signature at every use.
-pub trait MakeManager<PL>:
+pub(super) trait MakeManager<PL>:
     Fn(Topic, Partition) -> PartitionManager<PL> + Send + Sync + 'static
 {
 }
@@ -93,7 +93,7 @@ impl<PL, F> MakeManager<PL> for F where
 /// * `F` - The partition-manager factory closure (`Fn(Topic, Partition) ->
 ///   PartitionManager<PL>`)
 /// * `PL` - The payload type carried by consumed messages
-pub struct Context<F, PL> {
+pub(super) struct Context<F, PL> {
     /// Builds a fresh partition manager for a newly assigned partition.
     make_manager: F,
 
@@ -127,7 +127,7 @@ pub struct Context<F, PL> {
 ///
 /// Returns a [`BuildError`] if the configured `allowed_events` prefixes
 /// cannot be compiled into a filter automaton.
-pub fn new_context<T, P, SP, PL>(
+pub(super) fn new_context<T, P, SP, PL>(
     config: &ConsumerConfiguration,
     handler_provider: T,
     providers: PartitionProviders<P, SP>,

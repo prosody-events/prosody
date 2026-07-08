@@ -14,14 +14,23 @@
 //! The id type and its derivation live in the crate-internal `segment`
 //! module; this module only names a partition through that shared source.
 
-pub mod cassandra;
-pub mod lazy;
-pub mod store;
+mod cassandra;
+mod lazy;
+mod store;
 
 use crate::segment::partition_segment_id;
 use crate::{ConsumerGroup, Partition, SegmentId, Topic};
 
+// `CassandraSegmentStore` stays `pub`: `tests/defer_middleware.rs` constructs
+// it directly as an integration test, so it must remain reachable outside the
+// crate even though nothing else outside `defer::segment` needs it.
 pub use cassandra::CassandraSegmentStore;
+// `LazySegment`/`SegmentStore` also stay `pub` (and `Segment` below stays
+// `pub` because `SegmentStore`'s methods return it): demoting `SegmentStore`
+// turns its `get_segment` method (and the `Segment::with_id`/`LazySegment::
+// is_initialized`/`SegmentQueries::get_segment` chain it pulls in) into
+// production dead code whose only callers are its own tests — deleting it
+// would mean deleting those tests, out of scope for a visibility-only wave.
 pub use lazy::LazySegment;
 pub use store::SegmentStore;
 

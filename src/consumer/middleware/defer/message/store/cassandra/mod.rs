@@ -22,7 +22,7 @@ use std::fmt;
 use std::sync::Arc;
 use tracing::{debug, instrument};
 
-pub mod queries;
+pub(crate) mod queries;
 
 pub use queries::Queries as MessageQueries;
 

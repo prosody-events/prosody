@@ -174,7 +174,7 @@ pub struct PartitionConfiguration<S, SP, P> {
 
     /// Phantom marker for the payload type, used to keep `P` consistent
     /// between [`PartitionConfiguration`] and [`PartitionManager`].
-    pub _payload: PhantomData<fn() -> P>,
+    pub(crate) _payload: PhantomData<fn() -> P>,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.

@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tracing::{debug, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-pub mod queries;
+pub(crate) mod queries;
 
 /// Cassandra-backed timer defer store with internal write-through cache.
 ///

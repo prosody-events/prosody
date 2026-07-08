@@ -6,6 +6,7 @@
 //! the shape-table regressions a live-Cassandra run would otherwise be the
 //! first to catch.
 
+use super::super::encoding::{Encoding, EncodingError, decode_payload, encode_payload};
 use super::{CellCorruptReason, RawCellRow, blob_ttl, try_decode_cell};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::EventRef;
@@ -13,7 +14,6 @@ use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
-use crate::state::encoding::{Encoding, EncodingError, decode_payload, encode_payload};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
 use quickcheck::{QuickCheck, TestResult};

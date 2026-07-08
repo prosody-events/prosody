@@ -5,7 +5,7 @@
 //! committed". [`CommitOracle::record_message`] writes that row at the
 //! durability boundary (the marker flush, strictly after the provisional
 //! stage); [`CommitOracle::resolve`] reads it back during recovery, bridging
-//! the existing [`crate::commit_manager::CommitManager`] bool API into an
+//! the existing `CommitManager` bool API into an
 //! [`EventRef`]-shaped [`CommitDecision`] consumed by the cell store's
 //! resolution path ([`resolve_cell`](crate::state::resolve)).
 //!

@@ -8,19 +8,19 @@
 //!   and the partition's commit oracle.
 //! * [`MemoryStateBackendFactory`] mints the in-memory equivalents over a
 //!   process-wide shared [`MemoryCellStore`].
-//! * [`ProductionOracle`] names the commit oracle ([`CommitManager`]) that
+//! * [`ProductionOracle`] names the commit oracle (`CommitManager`) that
 //!   answers "did this event commit?" while the recovery sweep resolves
 //!   provisional cells.
 //!
 //! [`CommitOracle`]: super::oracle::CommitOracle
 
 use crate::ConsumerGroup;
-use crate::commit_manager::{CommitManager, StoreTagSource};
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::state::cached::Cached;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
 };
+use crate::state::commit::{CommitManager, StoreTagSource};
 use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallCellCacheError, FjallClient};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
@@ -30,7 +30,7 @@ use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::sync::Arc;
 
-/// The oracle both production backend factories mint: a [`CommitManager`]
+/// The oracle both production backend factories mint: a `CommitManager`
 /// whose timer half reads tags through the partition's own trigger store
 /// handle `S` (`mint_oracle` documents why the handle must be shared) and
 /// whose message half reads the dedup marker through a provider-minted
@@ -72,7 +72,7 @@ impl<DP> CassandraStateBackendFactory<DP> {
     /// the per-partition cell store binds the same per-collection TTLs on its
     /// resolution write-backs as the session does at stage time.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         client: Arc<FjallClient>,
         cell: CassandraCellResources,
         identity: CassandraDescriptorIdentityStore,
@@ -160,7 +160,7 @@ impl<DP> MemoryStateBackendFactory<DP> {
     /// See [`CassandraStateBackendFactory::new`] for the `dedup`/`registry`
     /// contract.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         cells: MemoryCells,
         identity: MemoryDescriptorIdentityStore,
         registry: Arc<CollectionDefRegistry>,
