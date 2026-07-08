@@ -561,7 +561,7 @@ where
     /// # Errors
     ///
     /// Returns [`TimerManagerError::Store`] if the store read fails.
-    pub async fn current_tag(
+    pub(crate) async fn current_tag(
         &self,
         key: &Key,
         time: CompactDateTime,
