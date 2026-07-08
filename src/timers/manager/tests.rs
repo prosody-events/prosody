@@ -6,6 +6,7 @@ use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::test_support::{
     create_test_trigger, setup_timer_manager, test_segment, test_semaphores,
 };
@@ -13,6 +14,7 @@ use crate::timers::uncommitted::UncommittedTriggerGuard;
 use color_eyre::eyre::{Result, eyre};
 use futures::{StreamExt, pin_mut};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -84,260 +86,6 @@ async fn test_new_timer_manager_creation() -> Result<()> {
     assert_eq!(stored.id, segment.id);
     assert_eq!(stored.name, segment.name);
     assert_eq!(stored.slab_size, segment.slab_size);
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_schedule_timer_basic() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let trigger = create_test_trigger("test-key", 60, TimerType::Application)?;
-
-    let result = manager.schedule_trigger(trigger.clone()).await;
-    assert!(result.is_ok(), "Scheduling should succeed");
-
-    // Verify the timer is stored
-    let scheduled_times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert_eq!(scheduled_times.len(), 1);
-    assert!(scheduled_times.contains(&trigger.time));
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_schedule_multiple_timers_same_key() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let key = Key::from("multi-timer-key");
-
-    // Schedule multiple timers for the same key
-    let triggers = vec![
-        create_test_trigger("multi-timer-key", 60, TimerType::Application)?,
-        create_test_trigger("multi-timer-key", 120, TimerType::Application)?,
-        create_test_trigger("multi-timer-key", 180, TimerType::Application)?,
-    ];
-
-    for trigger in &triggers {
-        manager.schedule_trigger(trigger.clone()).await?;
-    }
-
-    let scheduled_times = manager
-        .scheduled_times(&key, TimerType::Application)
-        .await?;
-    assert_eq!(scheduled_times.len(), 3);
-
-    for trigger in &triggers {
-        assert!(scheduled_times.contains(&trigger.time));
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_schedule_multiple_keys() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-
-    let trigger1 = create_test_trigger("key-1", 60, TimerType::Application)?;
-    let trigger2 = create_test_trigger("key-2", 120, TimerType::Application)?;
-
-    manager.schedule_trigger(trigger1.clone()).await?;
-    manager.schedule_trigger(trigger2.clone()).await?;
-
-    // Verify each key has its timer
-    let times1 = manager
-        .scheduled_times(&trigger1.key, TimerType::Application)
-        .await?;
-    let times2 = manager
-        .scheduled_times(&trigger2.key, TimerType::Application)
-        .await?;
-
-    assert_eq!(times1.len(), 1);
-    assert_eq!(times2.len(), 1);
-    assert!(times1.contains(&trigger1.time));
-    assert!(times2.contains(&trigger2.time));
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_scheduled_times_empty_key() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let nonexistent_key = Key::from("nonexistent");
-
-    let scheduled_times = manager
-        .scheduled_times(&nonexistent_key, TimerType::Application)
-        .await?;
-    assert!(scheduled_times.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_unschedule_timer() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let trigger = create_test_trigger("unschedule-key", 60, TimerType::Application)?;
-
-    // Schedule then unschedule
-    manager.schedule_trigger(trigger.clone()).await?;
-    let result = manager
-        .unschedule(&trigger.key, trigger.time, TimerType::Application)
-        .await;
-    assert!(result.is_ok(), "Unscheduling should succeed");
-
-    // Verify timer is removed
-    let scheduled_times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert!(scheduled_times.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_unschedule_nonexistent_timer() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let key = Key::from("nonexistent-key");
-    let time = CompactDateTime::now()?;
-
-    // Unscheduling non-existent timer should succeed (idempotent)
-    let result = manager.unschedule(&key, time, TimerType::Application).await;
-    assert!(
-        result.is_ok(),
-        "Unscheduling nonexistent timer should succeed"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_unschedule_all_timers() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let key = Key::from("unschedule-all-key");
-
-    // Schedule multiple timers
-    let triggers = vec![
-        create_test_trigger("unschedule-all-key", 60, TimerType::Application)?,
-        create_test_trigger("unschedule-all-key", 120, TimerType::Application)?,
-        create_test_trigger("unschedule-all-key", 180, TimerType::Application)?,
-    ];
-
-    for trigger in &triggers {
-        manager.schedule_trigger(trigger.clone()).await?;
-    }
-
-    // Verify all are scheduled
-    let scheduled_times = manager
-        .scheduled_times(&key, TimerType::Application)
-        .await?;
-    assert_eq!(scheduled_times.len(), 3);
-
-    // Unschedule all
-    let result = manager.unschedule_all(&key, TimerType::Application).await;
-    assert!(result.is_ok(), "Unschedule all should succeed");
-
-    // Verify all are removed
-    let scheduled_times = manager
-        .scheduled_times(&key, TimerType::Application)
-        .await?;
-    assert!(scheduled_times.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_unschedule_all_empty_key() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let empty_key = Key::from("empty-key");
-
-    // Unschedule all on empty key should succeed
-    let result = manager
-        .unschedule_all(&empty_key, TimerType::Application)
-        .await;
-    assert!(result.is_ok(), "Unschedule all on empty key should succeed");
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_complete_timer() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let trigger = create_test_trigger("complete-key", 60, TimerType::Application)?;
-
-    // Schedule timer
-    manager.schedule_trigger(trigger.clone()).await?;
-
-    // Complete timer
-    let result = manager
-        .complete(&trigger.key, trigger.time, TimerType::Application)
-        .await;
-    assert!(result.is_ok(), "Complete should succeed");
-
-    // Verify timer is removed from storage
-    let scheduled_times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert!(scheduled_times.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_complete_nonexistent_timer() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let key = Key::from("nonexistent");
-    let time = CompactDateTime::now()?;
-
-    // Completing nonexistent timer should succeed (idempotent)
-    let result = manager.complete(&key, time, TimerType::Application).await;
-    assert!(result.is_ok(), "Complete nonexistent timer should succeed");
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_abort_timer() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let trigger = create_test_trigger("abort-key", 60, TimerType::Application)?;
-
-    // Schedule timer
-    manager.schedule_trigger(trigger.clone()).await?;
-
-    // Abort timer (should deactivate but leave in storage)
-    manager
-        .abort(&trigger.key, trigger.time, TimerType::Application)
-        .await;
-
-    // Timer should still be in storage after abort
-    let scheduled_times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert_eq!(scheduled_times.len(), 1);
-    assert!(scheduled_times.contains(&trigger.time));
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_abort_nonexistent_timer() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let key = Key::from("nonexistent");
-    let time = CompactDateTime::now()?;
-
-    // Aborting nonexistent timer should succeed without error
-    manager.abort(&key, time, TimerType::Application).await;
     Ok(())
 }
 
@@ -414,122 +162,6 @@ async fn test_concurrent_operations() -> Result<()> {
             .await?;
         assert_eq!(times.len(), 1, "Timer {i} should be scheduled");
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_timer_lifecycle() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let trigger = create_test_trigger("lifecycle-key", 60, TimerType::Application)?;
-
-    // 1. Schedule timer
-    manager.schedule_trigger(trigger.clone()).await?;
-    let times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert_eq!(times.len(), 1);
-
-    // 2. Verify timer exists
-    assert!(times.contains(&trigger.time));
-
-    // 3. Complete timer
-    manager
-        .complete(&trigger.key, trigger.time, TimerType::Application)
-        .await?;
-    let times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert!(times.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_edge_case_same_time_different_keys() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let base_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
-
-    // Schedule multiple timers for the same time but different keys
-    let triggers = vec![
-        Trigger::new(
-            Key::from("key-1"),
-            base_time,
-            TimerType::Application,
-            Span::current(),
-        ),
-        Trigger::new(
-            Key::from("key-2"),
-            base_time,
-            TimerType::Application,
-            Span::current(),
-        ),
-        Trigger::new(
-            Key::from("key-3"),
-            base_time,
-            TimerType::Application,
-            Span::current(),
-        ),
-    ];
-
-    for trigger in &triggers {
-        manager.schedule_trigger(trigger.clone()).await?;
-    }
-
-    // Verify each key has exactly one timer at the same time
-    for trigger in &triggers {
-        let times = manager
-            .scheduled_times(&trigger.key, TimerType::Application)
-            .await?;
-        assert_eq!(times.len(), 1);
-        assert!(times.contains(&base_time));
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_time_boundary_conditions() -> Result<()> {
-    time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-
-    // Test with minimum time (current time)
-    let now = CompactDateTime::now()?;
-    let trigger_now = Trigger::new(
-        Key::from("boundary-now"),
-        now,
-        TimerType::Application,
-        Span::current(),
-    );
-
-    let result = manager.schedule_trigger(trigger_now.clone()).await;
-    assert!(result.is_ok(), "Scheduling at current time should succeed");
-
-    // Test with far future time
-    let far_future = now.add_duration(CompactDuration::new(86400 * 365))?; // 1 year
-    let trigger_future = Trigger::new(
-        Key::from("boundary-future"),
-        far_future,
-        TimerType::Application,
-        Span::current(),
-    );
-
-    let result = manager.schedule_trigger(trigger_future.clone()).await;
-    assert!(result.is_ok(), "Scheduling far in future should succeed");
-
-    // Verify both timers are stored
-    let times_now = manager
-        .scheduled_times(&trigger_now.key, TimerType::Application)
-        .await?;
-
-    let times_future = manager
-        .scheduled_times(&trigger_future.key, TimerType::Application)
-        .await?;
-
-    assert_eq!(times_now.len(), 1);
-    assert_eq!(times_future.len(), 1);
     Ok(())
 }
 
@@ -702,56 +334,8 @@ async fn test_timer_type_unschedule_isolation() -> Result<()> {
 // =========================================================================
 
 #[tokio::test]
-async fn test_reschedule_firing_timer() -> Result<()> {
-    // T049: Schedule same timer while firing transitions to FiringRescheduled
-    time::pause();
-
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("reschedule-key", 1, TimerType::Application)?;
-
-    // Schedule and wait for timer to fire
-    manager.schedule_trigger(trigger.clone()).await?;
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-
-    // Fire the timer (transition to FIRING state)
-    let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
-
-    // Reschedule same timer while firing - should succeed (FIRING →
-    // FIRING_RESCHEDULED)
-    let reschedule_result = manager.schedule_trigger(trigger.clone()).await;
-    assert!(reschedule_result.is_ok(), "Reschedule should succeed");
-
-    // Verify state is FiringRescheduled via is_scheduled
-    let is_scheduled = manager
-        .0
-        .scheduler
-        .active_triggers()
-        .is_scheduled(&trigger.key, trigger.time, trigger.timer_type)
-        .await;
-    assert!(is_scheduled, "Timer should be scheduled after reschedule");
-
-    // Commit and verify timer is still scheduled (FiringRescheduled → Scheduled)
-    let (_, guard) = firing.into_inner();
-    guard.commit().await;
-
-    let times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert_eq!(
-        times.len(),
-        1,
-        "Timer should still be scheduled after commit"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_reschedule_idempotent() -> Result<()> {
-    // T050: Multiple reschedules while firing are no-op (idempotent)
+    // Multiple reschedules while firing are no-op (idempotent)
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -806,7 +390,7 @@ async fn test_reschedule_idempotent() -> Result<()> {
 
 #[tokio::test]
 async fn test_commit_deletes_when_not_rescheduled() -> Result<()> {
-    // T051: Commit from FIRING state deletes DB row
+    // Commit from FIRING state deletes DB row
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -845,40 +429,8 @@ async fn test_commit_deletes_when_not_rescheduled() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_commit_keeps_when_rescheduled() -> Result<()> {
-    // T052: Commit from FIRING_RESCHEDULED state keeps DB row
-    time::pause();
-
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("keep-key", 1, TimerType::Application)?;
-
-    // Schedule, fire, and reschedule
-    manager.schedule_trigger(trigger.clone()).await?;
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-
-    let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
-    manager.schedule_trigger(trigger.clone()).await?;
-
-    // Commit with reschedule (FIRING_RESCHEDULED → SCHEDULED)
-    let (_, guard) = firing.into_inner();
-    guard.commit().await;
-
-    // Verify timer is still scheduled
-    let times = manager
-        .scheduled_times(&trigger.key, TimerType::Application)
-        .await?;
-    assert_eq!(times.len(), 1, "Timer should remain in DB");
-    assert!(times.contains(&trigger.time));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_abort_rescheduled_stays_scheduled() -> Result<()> {
-    // T053: Abort from FIRING_RESCHEDULED transitions to SCHEDULED
+    // Abort from FIRING_RESCHEDULED transitions to SCHEDULED
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -913,7 +465,7 @@ async fn test_abort_rescheduled_stays_scheduled() -> Result<()> {
 
 #[tokio::test]
 async fn test_reschedule_same_time_fires_again() -> Result<()> {
-    // T054: End-to-end integration test: schedule, fire, reschedule, commit, fires
+    // End-to-end integration test: schedule, fire, reschedule, commit, fires
     // again
     time::pause();
 
@@ -979,7 +531,7 @@ async fn test_reschedule_same_time_fires_again() -> Result<()> {
 
 #[tokio::test]
 async fn test_unschedule_firing_noop() -> Result<()> {
-    // T058: Verify unschedule when firing (not rescheduled) is a no-op
+    // Verify unschedule when firing (not rescheduled) is a no-op
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -1039,7 +591,7 @@ async fn test_unschedule_firing_noop() -> Result<()> {
 
 #[tokio::test]
 async fn test_unschedule_cancels_reschedule() -> Result<()> {
-    // T059: Verify unschedule when firing+rescheduled cancels the reschedule
+    // Verify unschedule when firing+rescheduled cancels the reschedule
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -1119,7 +671,7 @@ async fn test_unschedule_cancels_reschedule() -> Result<()> {
 
 #[tokio::test]
 async fn test_scheduled_times_excludes_firing() -> Result<()> {
-    // T061: Verify firing timers are excluded from scheduled_times()
+    // Verify firing timers are excluded from scheduled_times()
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -1312,7 +864,7 @@ async fn test_fire_cancelled_timer() -> Result<()> {
 
 #[tokio::test]
 async fn test_reschedule_abort_fires_again() -> Result<()> {
-    // T069: End-to-end integration test: reschedule then abort, timer fires again
+    // End-to-end integration test: reschedule then abort, timer fires again
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -1441,7 +993,7 @@ async fn test_abort_firing_preserves_db() -> Result<()> {
 
 #[tokio::test]
 async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
-    // Issue #7: clear_and_schedule with Firing state at same time as new timer.
+    // clear_and_schedule with Firing state at same time as new timer.
     // Schedule T at time X → fire → clear_and_schedule at same time X →
     // verify FiringRescheduled → commit → verify timer fires again.
     time::pause();
@@ -1468,7 +1020,7 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
 
     // Step 3: clear_and_schedule with a new timer at the SAME time X.
     // This exercises the Firing → FiringRescheduled path in clear_and_schedule
-    // (manager.rs line 507) and the skip in unschedule_replaced_timers (line 731).
+    // and the skip in unschedule_replaced_timers.
     manager
         .clear_and_schedule(TimerRequest::new(
             trigger.key.clone(),
@@ -1656,36 +1208,6 @@ async fn tag_inv3_firing_commit_removes_row() -> Result<()> {
     Ok(())
 }
 
-/// Inv #10: FiringTimer.trigger().tag equals the canonical tag at dispatch,
-/// even if a complete()-from-FiringRescheduled rotation ran while the entry
-/// sat in the delay queue.
-#[tokio::test]
-async fn tag_inv10_firing_timer_tag_frozen_at_dispatch() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("k", 1, TimerType::Application)?;
-    manager.schedule_trigger(trigger.clone()).await?;
-    let dispatch_tag = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?
-        .ok_or_else(|| eyre!("no tag"))?;
-
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-    let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
-
-    // Tag on FiringTimer must equal the pre-dispatch canonical tag.
-    assert_eq!(
-        firing.trigger().tag,
-        dispatch_tag,
-        "inv #10: FiringTimer.trigger().tag must be the canonical tag at dispatch"
-    );
-    firing.commit().await;
-    Ok(())
-}
-
 /// Inv #8 (reload parity): after `complete()`-from-`FiringRescheduled`,
 /// the tag persisted in the store equals the tag held in
 /// `ActiveTriggers`, and both equal the rotated post-commit value.
@@ -1864,7 +1386,6 @@ async fn apply_oracle_op(
                 manager.abort(key, current.time, timer_type).await;
             }
         }
-        ManagerOracleOp::CrashObserve => {}
     }
 
     Ok(())
@@ -1941,7 +1462,6 @@ enum ManagerOracleOp {
     DifferentCoordinateClear,
     Commit,
     Abort,
-    CrashObserve,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1955,16 +1475,170 @@ impl Arbitrary for ManagerOracleTrace {
     fn arbitrary(g: &mut Gen) -> Self {
         let len = usize::from(u8::arbitrary(g) % 24);
         let ops = (0..len)
-            .map(|_| match u8::arbitrary(g) % 7 {
+            .map(|_| match u8::arbitrary(g) % 6 {
                 0 => ManagerOracleOp::Schedule,
                 1 => ManagerOracleOp::Fire,
                 2 => ManagerOracleOp::SameCoordinateClear,
                 3 => ManagerOracleOp::DifferentCoordinateClear,
                 4 => ManagerOracleOp::Commit,
-                5 => ManagerOracleOp::Abort,
-                _ => ManagerOracleOp::CrashObserve,
+                _ => ManagerOracleOp::Abort,
             })
             .collect();
         Self(ops)
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        // Strictly shorter prefixes only, so shrinking always terminates.
+        let ops = self.0.clone();
+        Box::new(
+            (0..ops.len())
+                .rev()
+                .map(move |len| Self(ops[..len].to_vec())),
+        )
+    }
+}
+
+// =========================================================================
+// prop_crud_scheduled_times_oracle: non-firing CRUD ops vs. a set model
+// =========================================================================
+
+/// Second offsets the CRUD trace draws from: the current instant, two short
+/// offsets that collide across keys, and ~1 year out — the boundary values
+/// production sends.
+const CRUD_OFFSETS: [u32; 4] = [0, 60, 120, 86_400 * 365];
+
+/// Invariant: for timers that never fire, `scheduled_times` reports exactly
+/// the set a trivial model predicts — `schedule` inserts, `unschedule` and
+/// `complete` remove, `unschedule_all` clears the key, and `abort` preserves
+/// visibility (the row is kept for recovery). All five ops are idempotent
+/// no-ops on absent coordinates. Parity is asserted for every key after
+/// every op, over random interleavings on a small key/time pool.
+#[test]
+fn prop_crud_scheduled_times_oracle() {
+    QuickCheck::new()
+        .quickcheck(prop_crud_scheduled_times_oracle_inner as fn(CrudTrace) -> TestResult);
+}
+
+fn prop_crud_scheduled_times_oracle_inner(trace: CrudTrace) -> TestResult {
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => return TestResult::error(format!("runtime build failed: {error}")),
+    };
+
+    runtime.block_on(async {
+        match run_crud_trace(trace).await {
+            Ok(()) => TestResult::passed(),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    })
+}
+
+async fn run_crud_trace(trace: CrudTrace) -> Result<()> {
+    time::pause();
+
+    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+    let timer_type = TimerType::Application;
+    let now = CompactDateTime::now()?;
+    let times = CRUD_OFFSETS
+        .iter()
+        .map(|&offset| now.add_duration(CompactDuration::new(offset)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys: Vec<Key> = KEY_POOL.iter().copied().map(Key::from).collect();
+
+    // Model: the set of times `scheduled_times` must report, per key.
+    let mut model = vec![BTreeSet::new(); keys.len()];
+
+    for (step, &(key_idx, time_idx, op)) in trace.0.iter().enumerate() {
+        let key = &keys[key_idx];
+        let time = times[time_idx];
+        match op {
+            CrudOp::Schedule => {
+                manager
+                    .schedule(TimerRequest::new(
+                        key.clone(),
+                        time,
+                        timer_type,
+                        Span::current(),
+                    ))
+                    .await?;
+                model[key_idx].insert(time);
+            }
+            CrudOp::Unschedule => {
+                manager.unschedule(key, time, timer_type).await?;
+                model[key_idx].remove(&time);
+            }
+            CrudOp::UnscheduleAll => {
+                manager.unschedule_all(key, timer_type).await?;
+                model[key_idx].clear();
+            }
+            CrudOp::Complete => {
+                manager.complete(key, time, timer_type).await?;
+                model[key_idx].remove(&time);
+            }
+            // Abort never removes the durable row (it is preserved for
+            // recovery), so `scheduled_times` visibility is unchanged.
+            CrudOp::Abort => manager.abort(key, time, timer_type).await,
+        }
+
+        for (idx, key) in keys.iter().enumerate() {
+            let actual: BTreeSet<CompactDateTime> = manager
+                .scheduled_times(key, timer_type)
+                .await?
+                .into_iter()
+                .collect();
+            assert_eq!(
+                actual, model[idx],
+                "scheduled_times diverged from the CRUD model at step {step} ({op:?} on key \
+                 {key_idx}, time {time_idx}) for key index {idx}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// A trace of `(key index, time index, op)` over the pools above.
+#[derive(Clone, Debug)]
+struct CrudTrace(Vec<(usize, usize, CrudOp)>);
+
+#[derive(Clone, Copy, Debug)]
+enum CrudOp {
+    Schedule,
+    Unschedule,
+    UnscheduleAll,
+    Complete,
+    Abort,
+}
+
+impl Arbitrary for CrudTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::from(u8::arbitrary(g) % 40);
+        let ops = (0..len)
+            .map(|_| {
+                let key_idx = usize::from(u8::arbitrary(g)) % KEY_POOL.len();
+                let time_idx = usize::from(u8::arbitrary(g)) % CRUD_OFFSETS.len();
+                // Schedule is weighted at half so traces keep timers around
+                // for the removal ops to hit.
+                let op = match u8::arbitrary(g) % 8 {
+                    0..=3 => CrudOp::Schedule,
+                    4 => CrudOp::Unschedule,
+                    5 => CrudOp::UnscheduleAll,
+                    6 => CrudOp::Complete,
+                    _ => CrudOp::Abort,
+                };
+                (key_idx, time_idx, op)
+            })
+            .collect();
+        Self(ops)
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        // Strictly shorter prefixes only, so shrinking always terminates.
+        let ops = self.0.clone();
+        Box::new(
+            (0..ops.len())
+                .rev()
+                .map(move |len| Self(ops[..len].to_vec())),
+        )
     }
 }
