@@ -21,7 +21,10 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
-use crate::timers::active::{TimerSnapshot, TimerState};
+use crate::timers::active::{
+    Announce, MemoryEffects, QueueEffect, StoreEffect, TimerOp, TimerSnapshot, TimerState,
+    Transition, transition,
+};
 use crate::timers::datetime::CompactDateTime;
 use rand::RngExt;
 use std::error::Error;
@@ -175,25 +178,9 @@ where
         Ok((timer_stream, manager))
     }
 
-    /// Retrieves all scheduled execution times for a given key.
-    ///
-    /// **State-aware filtering:**
-    /// - Excludes timers in `Firing` state (being processed, not scheduled to
-    ///   fire again).
-    /// - Includes timers in `Scheduled` state (waiting to fire).
-    /// - Includes timers in `FiringRescheduled` state (will fire again after
-    ///   current handler completes).
-    /// - Includes timers in `Aborted` state (persisted for recovery, but not
-    ///   currently queued in this process).
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key whose timers to list.
-    /// * `timer_type` - The [`TimerType`] classification to filter by.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec` of scheduled times for `key` that will fire in the future.
+    /// Retrieves all scheduled execution times for a given key and timer
+    /// type: every persisted time except those currently `Firing` (being
+    /// processed and not scheduled to fire again).
     ///
     /// # Errors
     ///
@@ -206,16 +193,9 @@ where
     ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         let active_triggers = self.0.scheduler.active_triggers();
 
-        // Stream from storage and filter in a single pass — no intermediate Vec.
-        //
-        // Include if:
-        // - Not in ActiveTriggers (timer not loaded yet, will fire when slab loads)
-        // - In Scheduled state (waiting to fire)
-        // - In FiringRescheduled state (will fire again after commit)
-        // - In Aborted state (persisted for recovery/requeue)
-        // Exclude if:
-        // - In Firing state (currently being processed, won't fire again unless
-        //   rescheduled)
+        // Stream from storage and filter in a single pass — no intermediate
+        // Vec. Firing is the only excluded state; times absent from
+        // ActiveTriggers (slab not yet loaded) still count as scheduled.
         let stream = self
             .0
             .store
@@ -244,16 +224,9 @@ where
     /// Schedules a new timer for future execution.
     ///
     /// Inserts the timer into persistent storage and, if its slab is currently
-    /// owned, enqueues it in the in-memory scheduler.
-    ///
-    /// **State-aware behavior:**
-    /// - If the timer is in `Firing` state (same key, time, type), transitions
-    ///   to `FiringRescheduled` and adds to `DelayQueue` without DB write.
-    /// - If the timer is in `FiringRescheduled` state, this is idempotent
-    ///   (no-op).
-    /// - If the timer is in `Aborted` state, transitions to `Scheduled` and
-    ///   re-adds only to the in-memory queue, preserving the stored tag.
-    /// - Otherwise, performs normal scheduling with DB write.
+    /// owned, enqueues it in the in-memory scheduler. Prior-state handling
+    /// (re-fire after commit for a firing timer, requeue for an aborted one)
+    /// is resolved by the state machine in `timers::active::transition`.
     ///
     /// **Singleton vs Overflow routing:**
     /// - First timer for a key/type → written to singleton slot (via store
@@ -262,16 +235,10 @@ where
     /// - Use [`clear_and_schedule`](Self::clear_and_schedule) for
     ///   tombstone-free singleton overwrites
     ///
-    /// # Arguments
-    ///
-    /// * `request` - The timer identity and span to schedule.
-    ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The time is in the past.
-    /// - The storage insert fails.
-    /// - The scheduler enqueue fails.
+    /// Returns [`TimerManagerError`] if the storage insert or the scheduler
+    /// enqueue fails.
     pub async fn schedule(&self, request: TimerRequest) -> Result<(), TimerManagerError<T::Error>> {
         self.schedule_trigger(request.into_trigger()).await
     }
@@ -281,166 +248,31 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        // Check current state for state-aware transitions.
-        let current_state = self
-            .0
-            .scheduler
-            .active_triggers()
-            .get_state(&trigger.key, trigger.time, trigger.timer_type)
-            .await;
-
-        match current_state {
-            // FIRING → FIRING_RESCHEDULED: transition state and add to queue
-            Some(TimerState::Firing) => {
-                self.0
-                    .scheduler
-                    .active_triggers()
-                    .set_state(
-                        &trigger.key,
-                        trigger.time,
-                        trigger.timer_type,
-                        TimerState::FiringRescheduled,
-                    )
-                    .await;
-                self.0.scheduler.add_to_queue(trigger).await?;
-                Ok(())
-            }
-
-            // Already FIRING_RESCHEDULED: idempotent no-op
-            Some(TimerState::FiringRescheduled) => Ok(()),
-
-            // ABORTED → SCHEDULED: DB row and active tag are already present;
-            // only requeue the timer.
-            Some(TimerState::Aborted) => {
-                self.0
-                    .scheduler
-                    .active_triggers()
-                    .set_state(
-                        &trigger.key,
-                        trigger.time,
-                        trigger.timer_type,
-                        TimerState::Scheduled,
-                    )
-                    .await;
-                self.0.scheduler.add_to_queue(trigger.clone()).await?;
-                self.0.telemetry.timer_scheduled(
-                    trigger.key.clone(),
-                    trigger.time,
-                    trigger.timer_type,
-                    self.0.source.clone(),
-                );
-                Ok(())
-            }
-
-            // SCHEDULED or UNSCHEDULED: normal scheduling path.
-            //
-            // The trigger row writes happen before the scheduler is told
-            // about the slab. If a concurrent `load_step` scans the slab
-            // between the two awaits, the trigger row is already in storage
-            // and the scan picks it up; the scheduler's `Add` then sees the
-            // slab is owned and just inserts the in-memory entry.
-            _ => {
-                self.0
-                    .store
-                    .add_trigger(trigger.clone())
-                    .await
-                    .map_err(TimerManagerError::Store)?;
-
-                self.0.scheduler.schedule(trigger.clone()).await?;
-
-                self.0.telemetry.timer_scheduled(
-                    trigger.key.clone(),
-                    trigger.time,
-                    trigger.timer_type,
-                    self.0.source.clone(),
-                );
-
-                Ok(())
-            }
-        }
+        self.drive(&trigger, TimerOp::Schedule).await
     }
 
     /// Cancels a specific scheduled timer.
     ///
     /// Removes the timer from persistent storage and, if owned, from the
-    /// in-memory scheduler. If already delivered, the delivery is not reversed.
-    ///
-    /// **State-aware behavior:**
-    /// - If the timer is in `Firing` state (being processed), this is a no-op.
-    ///   The handler is already processing it; unschedule has no effect.
-    /// - If the timer is in `FiringRescheduled` state, transitions back to
-    ///   `Firing` and removes from `DelayQueue`. The timer will complete
-    ///   normally without firing again.
-    /// - If the timer is in `Aborted` state, removes from `ActiveTriggers` and
-    ///   persistent storage through the normal unschedule path.
-    /// - Otherwise, performs normal unscheduling with DB and scheduler removal.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key of the timer.
-    /// * `time` - The scheduled execution time to cancel.
+    /// in-memory scheduler. If already delivered, the delivery is not
+    /// reversed; prior-state handling (no-op mid-fire, cancelling a pending
+    /// reschedule) is resolved by the state machine in
+    /// `timers::active::transition`. The scheduler removal is idempotent: if
+    /// the slab is not owned in-memory, the actor has nothing to remove and
+    /// returns success.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The scheduler removal fails.
-    /// - The storage removal fails.
+    /// Returns [`TimerManagerError`] if the scheduler or storage removal
+    /// fails.
     pub async fn unschedule(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        // Check current state for state-aware transitions.
-        let current_state = self
-            .0
-            .scheduler
-            .active_triggers()
-            .get_state(key, time, timer_type)
-            .await;
-
-        match current_state {
-            // FIRING: no-op - timer is being processed, unschedule has no effect
-            Some(TimerState::Firing) => Ok(()),
-
-            // FIRING_RESCHEDULED → FIRING: cancel the reschedule
-            Some(TimerState::FiringRescheduled) => {
-                self.0
-                    .scheduler
-                    .active_triggers()
-                    .set_state(key, time, timer_type, TimerState::Firing)
-                    .await;
-
-                let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
-                self.0.scheduler.remove_from_queue(trigger).await?;
-                Ok(())
-            }
-
-            // SCHEDULED, ABORTED, or UNSCHEDULED: normal unscheduling path.
-            //
-            // The scheduler's `unschedule` is idempotent: if the slab is not
-            // owned in-memory, the actor has nothing to remove and returns
-            // success.
-            _ => {
-                let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
-                self.0.scheduler.unschedule(trigger).await?;
-
-                self.0
-                    .store
-                    .remove_trigger(key, time, timer_type)
-                    .await
-                    .map_err(TimerManagerError::Store)?;
-
-                self.0.telemetry.timer_cancelled(
-                    key.clone(),
-                    time,
-                    timer_type,
-                    self.0.source.clone(),
-                );
-
-                Ok(())
-            }
-        }
+        let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
+        self.drive(&trigger, TimerOp::Unschedule).await
     }
 
     /// Cancels all timers for a specific key concurrently.
@@ -448,10 +280,6 @@ where
     /// Queries all scheduled times for `key` and issues
     /// [`unschedule`](Self::unschedule) for each in parallel, controlled by
     /// [`DELETE_CONCURRENCY`].
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key whose timers to cancel.
     ///
     /// # Errors
     ///
@@ -477,31 +305,17 @@ where
 
     /// Atomically clears existing timers and schedules a new one.
     ///
-    /// This is the optimized path for singleton timer overwrites. It:
-    /// 1. Reads existing triggers to determine which slabs need cleanup
-    /// 2. Updates the in-memory scheduler state (unschedule old, schedule new)
-    /// 3. Calls the store's `clear_and_schedule` for atomic persistence
-    ///
-    /// # State-aware behavior
-    ///
-    /// For each existing timer at a different time:
-    /// - `Firing` → no-op (timer is being processed)
-    /// - `FiringRescheduled` → transitions to `Firing` (cancels reschedule)
-    /// - `Scheduled`/`Aborted` → unscheduled from active state/`DelayQueue`
-    ///
-    /// For the new timer:
-    /// - If same time as existing `Firing` → transitions to `FiringRescheduled`
-    /// - Otherwise → schedules in `DelayQueue`
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The new timer identity and span.
+    /// This is the optimized path for singleton timer overwrites: existing
+    /// triggers are read to determine which slabs need cleanup, the
+    /// in-memory scheduler is updated (unschedule old, schedule new), and
+    /// the store's `clear_and_schedule` persists everything in one atomic
+    /// write. Prior-state handling for the new and replaced timers is
+    /// resolved by the state machine in `timers::active::transition`.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - Storage operations fail
-    /// - Scheduler operations fail
+    /// Returns [`TimerManagerError`] if storage or scheduler operations
+    /// fail.
     pub async fn clear_and_schedule(
         &self,
         request: TimerRequest,
@@ -529,153 +343,40 @@ where
             .try_collect()
             .await?;
 
-        debug!(
-            key = %trigger.key,
-            timer_type = ?trigger.timer_type,
-            new_time = ?trigger.time,
-            existing_count = existing_times.len(),
-            "clear_and_schedule: read existing times, preparing state transitions"
-        );
-
-        let prior_state = self
+        let prior = self
             .0
             .scheduler
             .active_triggers()
             .get_state(&trigger.key, trigger.time, trigger.timer_type)
             .await;
-
-        // In-memory transitions that don't depend on the new store row being
-        // visible: the new timer's `ActiveTriggers` state and the
-        // unscheduling of old timers from the queue.
-        self.apply_clear_pre_persist(&trigger, prior_state).await?;
-        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
+        let (pre, post) = transition(prior, TimerOp::ClearSchedule).phases();
 
         debug!(
             key = %trigger.key,
             timer_type = ?trigger.timer_type,
             new_time = ?trigger.time,
-            "clear_and_schedule: persisting to store"
+            existing_count = existing_times.len(),
+            prior_state = ?prior,
+            "clear_and_schedule: resolved transition, applying"
         );
+
+        // In-memory effects that must precede the atomic write: the new
+        // timer's pre-persist half, then the removal of every replaced time.
+        apply_memory(&self.0.scheduler, &trigger, pre).await?;
+        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
+
+        // The single durable write: atomically inserts the new row and
+        // clears the replaced ones (`ClearSchedule` transitions carry no
+        // store effect of their own).
         self.0
             .store
             .clear_and_schedule(trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
-        // Post-persistence transitions that require the new store row to
-        // be visible — tag rotation for Aborted→Scheduled and the scheduler
-        // `Add` for states that deferred it.
-        self.apply_clear_post_persist(&trigger, prior_state).await?;
+        apply_memory(&self.0.scheduler, &trigger, post).await?;
         self.emit_clear_telemetry(&trigger, &existing_times);
 
-        Ok(())
-    }
-
-    /// In-memory state transitions to run before the atomic store write.
-    ///
-    /// Each prior state has its own forward move:
-    /// - `Firing` → `FiringRescheduled` and re-queue (the store row already
-    ///   exists; we only need the queue update).
-    /// - `Aborted` → `Scheduled` (the new schedule revives a previously aborted
-    ///   slot; the actor's `Add` call will run post-persistence).
-    /// - `FiringRescheduled` is idempotent.
-    /// - `Scheduled` and absent both defer to the post-persistence `Add`.
-    async fn apply_clear_pre_persist(
-        &self,
-        trigger: &Trigger,
-        prior_state: Option<TimerState>,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        let active = self.0.scheduler.active_triggers();
-        match prior_state {
-            Some(TimerState::Firing) => {
-                debug!(
-                    key = %trigger.key,
-                    timer_type = ?trigger.timer_type,
-                    time = ?trigger.time,
-                    "clear_and_schedule: new timer is Firing, transitioning to FiringRescheduled"
-                );
-                active
-                    .set_state(
-                        &trigger.key,
-                        trigger.time,
-                        trigger.timer_type,
-                        TimerState::FiringRescheduled,
-                    )
-                    .await;
-                self.0.scheduler.add_to_queue(trigger.clone()).await?;
-            }
-            Some(TimerState::FiringRescheduled) => {
-                debug!(
-                    key = %trigger.key,
-                    timer_type = ?trigger.timer_type,
-                    time = ?trigger.time,
-                    "clear_and_schedule: new timer already FiringRescheduled, no-op"
-                );
-            }
-            Some(TimerState::Aborted) => {
-                debug!(
-                    key = %trigger.key,
-                    timer_type = ?trigger.timer_type,
-                    time = ?trigger.time,
-                    "clear_and_schedule: new timer is Aborted, transitioning to Scheduled"
-                );
-                active
-                    .set_state(
-                        &trigger.key,
-                        trigger.time,
-                        trigger.timer_type,
-                        TimerState::Scheduled,
-                    )
-                    .await;
-            }
-            Some(TimerState::Scheduled) | None => {}
-        }
-        Ok(())
-    }
-
-    /// In-memory state transitions to run after the store row is written.
-    ///
-    /// - `Aborted`: revive the cached tag (so the oracle's reload check is
-    ///   coherent with the new trigger) and run the deferred `Add`.
-    /// - `Scheduled` / absent: just the deferred `Add`.
-    /// - `Firing` / `FiringRescheduled`: pre-persistence already handled the
-    ///   in-memory side; nothing left to do here.
-    async fn apply_clear_post_persist(
-        &self,
-        trigger: &Trigger,
-        prior_state: Option<TimerState>,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        match prior_state {
-            Some(TimerState::Aborted) => {
-                self.0
-                    .scheduler
-                    .active_triggers()
-                    .set_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
-                    .await;
-                self.schedule_after_clear(trigger, prior_state).await
-            }
-            Some(TimerState::Scheduled) | None => {
-                self.schedule_after_clear(trigger, prior_state).await
-            }
-            Some(TimerState::Firing | TimerState::FiringRescheduled) => Ok(()),
-        }
-    }
-
-    /// Runs the scheduler `Add` deferred from `apply_clear_pre_persist` and
-    /// logs the dispatch reason for diagnostic traces.
-    async fn schedule_after_clear(
-        &self,
-        trigger: &Trigger,
-        prior_state: Option<TimerState>,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        debug!(
-            key = %trigger.key,
-            timer_type = ?trigger.timer_type,
-            time = ?trigger.time,
-            state = ?prior_state,
-            "clear_and_schedule: scheduling new timer via actor"
-        );
-        self.0.scheduler.schedule(trigger.clone()).await?;
         Ok(())
     }
 
@@ -726,25 +427,17 @@ where
 
     /// Marks a timer as completed.
     ///
-    /// **State-aware behavior:**
-    /// - From `Firing`: deletes from DB and removes from `ActiveTriggers`.
-    /// - From `FiringRescheduled`: transitions to `Scheduled` (keeps DB row,
-    ///   timer will fire again).
-    /// - From `Aborted`: deletes from DB and removes from `ActiveTriggers`,
-    ///   matching existing non-firing idempotent completion behavior.
+    /// A completion from `FiringRescheduled` keeps the DB row (the timer
+    /// fires again) and rotates the oracle tag; from any other state it
+    /// deletes the row. Resolved by the state machine in
+    /// `timers::active::transition`.
     ///
     /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
     /// [`crate::consumer::Uncommitted::commit()`] impl.
     ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key of the completed timer.
-    /// * `time` - The execution time of the completed timer.
-    /// * `timer_type` - The timer type classification.
-    ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError::Store`] if the storage removal fails.
+    /// Returns [`TimerManagerError::Store`] if the storage write fails.
     pub async fn complete(
         &self,
         key: &Key,
@@ -752,38 +445,21 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let active = self.0.scheduler.active_triggers();
-        let current_state = active.get_state(key, time, timer_type).await;
+        let prior = active.get_state(key, time, timer_type).await;
+        let t = transition(prior, TimerOp::Complete);
 
-        // FIRING_RESCHEDULED → SCHEDULED: keep DB row, rotate tag, timer fires
-        // again. The read-modify-write here is per-key linearised by
-        // KeyManager — no TOCTOU window.
-        if current_state == Some(TimerState::FiringRescheduled) {
-            let current_tag = active.get_tag(key, time, timer_type).await.unwrap_or(0_i32);
-            let new_tag = fresh_tag_distinct_from(current_tag);
-
-            self.0
-                .store
-                .update_tag(key, time, timer_type, new_tag)
-                .await
-                .map_err(TimerManagerError::Store)?;
-
-            active
-                .set_state(key, time, timer_type, TimerState::Scheduled)
-                .await;
-            active.set_tag(key, time, timer_type, new_tag).await;
-            return Ok(());
-        }
-
-        // FIRING or anything else: delete from DB and remove from ActiveTriggers.
-        self.0.scheduler.deactivate(key, time, timer_type).await;
-
-        self.0
-            .store
-            .remove_trigger(key, time, timer_type)
-            .await
-            .map_err(TimerManagerError::Store)?;
-
-        Ok(())
+        // A tag-rotating completion writes a tag provably distinct from the
+        // current one; baking it into the trigger keeps the store write and
+        // the registry adoption agreeing on one value. The read-modify-write
+        // is per-key linearised by KeyManager — no TOCTOU window.
+        let tag = if matches!(t.store(), StoreEffect::UpdateTag) {
+            let current = active.get_tag(key, time, timer_type).await.unwrap_or(0_i32);
+            fresh_tag_distinct_from(current)
+        } else {
+            0_i32
+        };
+        let trigger = Trigger::with_tag(key.clone(), time, timer_type, tag, Span::current());
+        self.apply(&trigger, t).await
     }
 
     /// Returns a point-in-time [`TimerSnapshot`] of the in-memory scheduler.
@@ -797,53 +473,82 @@ where
 
     /// Aborts a timer delivery.
     ///
-    /// **State-aware behavior:**
-    /// - From `Firing`: transitions to `Aborted` (DB row preserved; not
-    ///   queued).
-    /// - From `FiringRescheduled`: transitions to `Scheduled` (timer already in
-    ///   `DelayQueue`, will fire again without restart).
-    /// - From `Scheduled`: transitions to `Aborted` and removes from
-    ///   `DelayQueue` (DB row preserved).
-    ///
-    /// Does not delete the timer from persistent storage; aborted timers can be
-    /// requeued explicitly or recovered as `Scheduled` after scheduler restart.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key of the timer.
-    /// * `time` - The scheduled execution time to abort.
-    /// * `timer_type` - The timer type classification.
+    /// Never deletes the timer from persistent storage: aborted timers can
+    /// be requeued explicitly or recover as `Scheduled` after scheduler
+    /// restart. Resolved by the state machine in
+    /// `timers::active::transition`; abort transitions carry no store
+    /// effect, so the only fallible step is the queue removal, which is
+    /// deliberately best-effort — abort has no error path.
     pub async fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        let active = self.0.scheduler.active_triggers();
-        let current_state = active.get_state(key, time, timer_type).await;
+        let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
+        let _ = self.drive(&trigger, TimerOp::Abort).await;
+    }
 
-        match current_state {
-            // FIRING_RESCHEDULED → SCHEDULED: timer already in DelayQueue, fires again
-            Some(TimerState::FiringRescheduled) => {
-                active
-                    .set_state(key, time, timer_type, TimerState::Scheduled)
-                    .await;
-            }
+    /// Resolves the state-machine transition for `trigger` and applies it.
+    async fn drive(
+        &self,
+        trigger: &Trigger,
+        op: TimerOp,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let prior = self
+            .0
+            .scheduler
+            .active_triggers()
+            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        self.apply(trigger, transition(prior, op)).await
+    }
 
-            // SCHEDULED → ABORTED: DB row preserved, queue entry removed.
-            Some(TimerState::Scheduled) => {
-                active
-                    .set_state(key, time, timer_type, TimerState::Aborted)
-                    .await;
-                let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
-                let _ = self.0.scheduler.remove_from_queue(trigger).await;
-            }
+    /// Applies a resolved [`Transition`]: pre-persist in-memory effects, the
+    /// durable write, post-persist in-memory effects, then telemetry.
+    async fn apply(
+        &self,
+        trigger: &Trigger,
+        t: Transition,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let (pre, post) = t.phases();
+        apply_memory(&self.0.scheduler, trigger, pre).await?;
 
-            // FIRING → ABORTED: delivery was already removed from DelayQueue.
-            Some(TimerState::Firing) => {
-                active
-                    .set_state(key, time, timer_type, TimerState::Aborted)
-                    .await;
-            }
-
-            // Already aborted, or absent: idempotent no-op. DB is preserved.
-            Some(TimerState::Aborted) | None => {}
+        match t.store() {
+            StoreEffect::None => {}
+            StoreEffect::Insert => self
+                .0
+                .store
+                .add_trigger(trigger.clone())
+                .await
+                .map_err(TimerManagerError::Store)?,
+            StoreEffect::Delete => self
+                .0
+                .store
+                .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
+                .await
+                .map_err(TimerManagerError::Store)?,
+            StoreEffect::UpdateTag => self
+                .0
+                .store
+                .update_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
+                .await
+                .map_err(TimerManagerError::Store)?,
         }
+
+        apply_memory(&self.0.scheduler, trigger, post).await?;
+
+        match t.announce() {
+            Some(Announce::Scheduled) => self.0.telemetry.timer_scheduled(
+                trigger.key.clone(),
+                trigger.time,
+                trigger.timer_type,
+                self.0.source.clone(),
+            ),
+            Some(Announce::Cancelled) => self.0.telemetry.timer_cancelled(
+                trigger.key.clone(),
+                trigger.time,
+                trigger.timer_type,
+                self.0.source.clone(),
+            ),
+            None => {}
+        }
+        Ok(())
     }
 
     /// Returns the current `tag` for a timer, consulting `ActiveTriggers` first
@@ -893,15 +598,48 @@ pub(crate) fn fresh_tag_distinct_from(current: i32) -> i32 {
     }
 }
 
-/// Unschedules old timers from the in-memory scheduler during a
-/// `clear_and_schedule` operation.
+/// Applies one side of a transition's in-memory effects: the registry state
+/// flip, the tag adoption, then the scheduler queue effect, in that order.
+async fn apply_memory<E>(
+    scheduler: &TriggerScheduler<E>,
+    trigger: &Trigger,
+    effects: MemoryEffects,
+) -> Result<(), TimerManagerError<E>>
+where
+    E: ClassifyError + Error + Debug + Send + Sync + 'static,
+{
+    let active = scheduler.active_triggers();
+    if let Some(state) = effects.next_state {
+        active
+            .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
+            .await;
+    }
+    if effects.adopt_tag {
+        active
+            .set_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
+            .await;
+    }
+    match effects.queue {
+        QueueEffect::None => {}
+        QueueEffect::Enqueue => scheduler.add_to_queue(trigger.clone()).await?,
+        QueueEffect::Dequeue => scheduler.remove_from_queue(trigger.clone()).await?,
+        QueueEffect::Insert => scheduler.schedule(trigger.clone()).await?,
+        QueueEffect::Remove => scheduler.unschedule(trigger.clone()).await?,
+        QueueEffect::Deactivate => {
+            scheduler
+                .deactivate(&trigger.key, trigger.time, trigger.timer_type)
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Unschedules every replaced (old-time) timer during a `clear_and_schedule`
+/// operation, resolving each through the state machine's `ClearReplaced` op.
 ///
-/// STATE MACHINE PRESERVATION: Reuses the same state-aware transitions as
-/// `TimerManager::unschedule()`. Each old timer is handled according to its
-/// current state without introducing new transition paths:
-/// - `Firing` → no-op (being processed)
-/// - `FiringRescheduled` → `Firing` (cancels reschedule)
-/// - `Scheduled`/`Aborted`/absent → removed from active state/`DelayQueue`
+/// All effects are in-memory: the caller's atomic store write subsumes the
+/// per-row deletes. The scheduler removal is idempotent — the actor finds
+/// nothing when the slab isn't loaded.
 async fn unschedule_replaced_timers<E>(
     scheduler: &TriggerScheduler<E>,
     new_trigger: &Trigger,
@@ -912,65 +650,29 @@ where
 {
     for &old_time in existing_times {
         if old_time == new_trigger.time {
-            continue; // Same time as new - already handled by caller
+            continue; // Same time as new — resolved by the caller's ClearSchedule op.
         }
 
-        let active = scheduler.active_triggers();
-        let old_state = active
-            .get_state(&new_trigger.key, old_time, new_trigger.timer_type)
+        let old = Trigger::new(
+            new_trigger.key.clone(),
+            old_time,
+            new_trigger.timer_type,
+            Span::current(),
+        );
+        let prior = scheduler
+            .active_triggers()
+            .get_state(&old.key, old.time, old.timer_type)
             .await;
-
-        match old_state {
-            Some(TimerState::Firing) => {
-                debug!(
-                    key = %new_trigger.key,
-                    timer_type = ?new_trigger.timer_type,
-                    old_time = ?old_time,
-                    "clear_and_schedule: old timer is Firing, skipping (no-op)"
-                );
-            }
-            Some(TimerState::FiringRescheduled) => {
-                debug!(
-                    key = %new_trigger.key,
-                    timer_type = ?new_trigger.timer_type,
-                    old_time = ?old_time,
-                    "clear_and_schedule: old timer FiringRescheduled, cancelling reschedule"
-                );
-                active
-                    .set_state(
-                        &new_trigger.key,
-                        old_time,
-                        new_trigger.timer_type,
-                        TimerState::Firing,
-                    )
-                    .await;
-                let trigger = Trigger::new(
-                    new_trigger.key.clone(),
-                    old_time,
-                    new_trigger.timer_type,
-                    Span::current(),
-                );
-                scheduler.remove_from_queue(trigger).await?;
-            }
-            _ => {
-                // Always issue the unschedule — actor finds nothing if slab
-                // isn't loaded, equivalent to the old `is_owned` no-op gate.
-                debug!(
-                    key = %new_trigger.key,
-                    timer_type = ?new_trigger.timer_type,
-                    old_time = ?old_time,
-                    state = ?old_state,
-                    "clear_and_schedule: unscheduling old timer from DelayQueue"
-                );
-                let trigger = Trigger::new(
-                    new_trigger.key.clone(),
-                    old_time,
-                    new_trigger.timer_type,
-                    Span::current(),
-                );
-                scheduler.unschedule(trigger).await?;
-            }
-        }
+        let (pre, post) = transition(prior, TimerOp::ClearReplaced).phases();
+        debug!(
+            key = %old.key,
+            timer_type = ?old.timer_type,
+            old_time = ?old.time,
+            prior_state = ?prior,
+            "clear_and_schedule: unscheduling replaced timer"
+        );
+        apply_memory(scheduler, &old, pre).await?;
+        apply_memory(scheduler, &old, post).await?;
     }
     Ok(())
 }
