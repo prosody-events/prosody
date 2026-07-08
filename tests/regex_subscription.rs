@@ -15,12 +15,6 @@ use prosody::{
     cassandra::config::CassandraConfigurationBuilder,
     codec::JsonCodecError,
     consumer::ConsumerConfigurationBuilder,
-    consumer::middleware::{
-        deduplication::DeduplicationConfigurationBuilder, defer::DeferConfigurationBuilder,
-        monopolization::MonopolizationConfigurationBuilder, retry::RetryConfigurationBuilder,
-        scheduler::SchedulerConfigurationBuilder, timeout::TimeoutConfigurationBuilder,
-        topic::FailureTopicConfigurationBuilder,
-    },
     high_level::{ConsumerBuilders, HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
     telemetry::emitter::TelemetryEmitterConfiguration,
@@ -46,36 +40,26 @@ struct TestTopic {
     should_match_pattern: bool,
 }
 
-impl TestTopic {
-    fn new(name: Topic, source_id: &'static str, should_match_pattern: bool) -> Self {
-        Self {
-            name,
-            source_id,
-            should_match_pattern,
-        }
-    }
-}
-
 /// Creates test topics for regex subscription testing.
 async fn create_test_topics(
     topic_prefix: &str,
 ) -> Result<(Vec<TestTopic>, &'static ProsodyAdminClient)> {
     let topics = vec![
-        TestTopic::new(
-            format!("{topic_prefix}_events").as_str().into(),
-            "topic1",
-            true,
-        ),
-        TestTopic::new(
-            format!("{topic_prefix}_logs").as_str().into(),
-            "topic2",
-            true,
-        ),
-        TestTopic::new(
-            format!("other_{topic_prefix}_data").as_str().into(),
-            "topic3",
-            false,
-        ),
+        TestTopic {
+            name: format!("{topic_prefix}_events").as_str().into(),
+            source_id: "topic1",
+            should_match_pattern: true,
+        },
+        TestTopic {
+            name: format!("{topic_prefix}_logs").as_str().into(),
+            source_id: "topic2",
+            should_match_pattern: true,
+        },
+        TestTopic {
+            name: format!("other_{topic_prefix}_data").as_str().into(),
+            source_id: "topic3",
+            should_match_pattern: false,
+        },
     ];
 
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
@@ -118,13 +102,6 @@ fn create_high_level_client(
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
-        retry: RetryConfigurationBuilder::default(),
-        failure_topic: FailureTopicConfigurationBuilder::default(),
-        scheduler: SchedulerConfigurationBuilder::default(),
-        monopolization: MonopolizationConfigurationBuilder::default(),
-        defer: DeferConfigurationBuilder::default(),
-        dedup: DeduplicationConfigurationBuilder::default(),
-        timeout: TimeoutConfigurationBuilder::default(),
         emitter: TelemetryEmitterConfiguration {
             enabled: false,
             ..Default::default()
@@ -147,8 +124,6 @@ async fn send_test_messages(
     client: &HighLevelClient<FallibleTestHandler>,
     topics: &[TestTopic],
 ) -> Result<usize> {
-    let mut expected_messages = 0;
-
     for topic in topics {
         let payload = json!({
             "source": topic.source_id,
@@ -156,13 +131,9 @@ async fn send_test_messages(
         });
 
         client.send(topic.name, TEST_KEY, payload).await?;
-
-        if topic.should_match_pattern {
-            expected_messages += 1;
-        }
     }
 
-    Ok(expected_messages)
+    Ok(topics.iter().filter(|t| t.should_match_pattern).count())
 }
 
 /// Verifies that received messages match expectations.

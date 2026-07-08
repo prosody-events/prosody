@@ -29,7 +29,7 @@ use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::state::descriptor::{Registered, ValueDescriptor, ValueStateError, value_state};
 use prosody::telemetry::Telemetry;
-use prosody::timers::datetime::CompactDateTime;
+use prosody::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use prosody::timers::duration::CompactDuration;
 use prosody::timers::{TimerType, Trigger};
 use prosody::tracing::init_test_logging;
@@ -121,9 +121,8 @@ impl CartHandler {
         // reads the accumulated state back. Per-key serialization
         // guarantees the fire dispatches only after this event commits.
         if full {
-            let fire = CompactDateTime::now()
-                .and_then(|now| now.add_duration(CompactDuration::new(2)))
-                .map_err(|e| CartHandlerError::Schedule(e.to_string()))?;
+            let fire =
+                CompactDateTime::now().and_then(|now| now.add_duration(CompactDuration::new(2)))?;
             ctx.schedule(fire, TimerType::Application)
                 .await
                 .map_err(|e| CartHandlerError::Schedule(e.to_string()))?;
@@ -219,7 +218,11 @@ enum CartHandlerError {
     #[error("unexpected cart cell: {0}")]
     UnexpectedCell(Value),
 
-    /// Computing or scheduling the read-back timer failed.
+    /// Computing the read-back timer's fire time failed.
+    #[error(transparent)]
+    FireTime(#[from] CompactDateTimeError),
+
+    /// Scheduling the read-back timer failed.
     #[error("failed to schedule the read-back timer: {0}")]
     Schedule(String),
 

@@ -4,12 +4,11 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::TestHandler;
+use crate::common::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    JsonCodec,
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, KeyedStateConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
@@ -18,7 +17,6 @@ use prosody::{
 use serde_json::json;
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
-use uuid::Uuid;
 
 mod common;
 
@@ -36,21 +34,9 @@ async fn test_allowed_events_filtering() -> Result<()> {
     // Initialize logging
     init_test_logging();
 
-    // Create a unique topic to isolate the test environment
-    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    // Create a unique single-partition topic to isolate the test environment
+    let (topic, admin_client) = common::create_single_partition_topic().await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
-
-    // Create a Kafka topic using the admin client for testing
-    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-    admin_client
-        .create_topic(
-            &TopicConfiguration::builder()
-                .name(topic.to_string())
-                .partition_count(1_u16)
-                .replication_factor(1_u16)
-                .build()?,
-        )
-        .await?;
 
     // Configure the consumer to filter allowed events only
     let consumer_config = ConsumerConfiguration::builder()
@@ -75,7 +61,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         KeyedStateConfiguration::default(),
-        CloneProvider::new(TestHandler { messages_tx }),
+        CloneProvider::new(ChannelHandler::new(messages_tx)),
         Telemetry::new(),
     )
     .await?;

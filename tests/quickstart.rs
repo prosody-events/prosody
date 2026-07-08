@@ -2,8 +2,10 @@
 //!
 //! The handler and client setup below mirror the README's High-Level Client
 //! Example exactly. The only differences are a channel added to `MyHandler`
-//! for observability, a unique topic and group ID for test isolation, and
-//! a disabled probe server to avoid port conflicts with parallel tests.
+//! for observability, a unique topic and group ID for test isolation, a
+//! disabled probe server to avoid port conflicts with parallel tests, and
+//! the ephemeral topic this test creates and deletes around the example
+//! (the README assumes the topic already exists).
 
 #![recursion_limit = "256"]
 

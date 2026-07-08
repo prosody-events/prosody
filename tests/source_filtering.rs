@@ -8,12 +8,11 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::TestHandler;
+use crate::common::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    JsonCodec,
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, KeyedStateConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
@@ -22,7 +21,6 @@ use prosody::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
-use uuid::Uuid;
 
 mod common;
 
@@ -58,20 +56,9 @@ async fn run_scenario(
     expect_messages: bool,
     event_suffix: &'static str,
 ) -> Result<()> {
-    // Create a unique Kafka topic for the test.
-    let topic_string = Uuid::new_v4().to_string();
-    let topic: Topic = topic_string.as_str().into();
+    // Create a unique single-partition Kafka topic for the test.
+    let (topic, admin_client) = common::create_single_partition_topic().await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-    admin_client
-        .create_topic(
-            &TopicConfiguration::builder()
-                .name(topic.to_string())
-                .partition_count(1_u16)
-                .replication_factor(1_u16)
-                .build()?,
-        )
-        .await?;
 
     // Build producer and consumer configurations.
     let producer_config = ProducerConfiguration::builder()
@@ -92,7 +79,7 @@ async fn run_scenario(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         KeyedStateConfiguration::default(),
-        CloneProvider::new(TestHandler { messages_tx: tx }),
+        CloneProvider::new(ChannelHandler::new(tx)),
         Telemetry::new(),
     )
     .await?;

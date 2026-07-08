@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 mod common;
 
-use common::{TestHandler, create_cassandra_trigger_store_config};
+use common::{ChannelHandler, create_cassandra_trigger_store_config};
 
 #[tokio::test]
 async fn stateless_cassandra_consumer_does_not_create_the_fjall_cache_dir() -> Result<()> {
@@ -44,7 +44,7 @@ async fn stateless_cassandra_consumer_does_not_create_the_fjall_cache_dir() -> R
         &consumer_config,
         &create_cassandra_trigger_store_config(),
         keyed_state,
-        CloneProvider::new(TestHandler { messages_tx }),
+        CloneProvider::new(ChannelHandler::new(messages_tx)),
         Telemetry::new(),
     )
     .await?;

@@ -2,51 +2,45 @@
 //!
 //! This module provides shared structures, functions, and test handlers used
 //! across various test cases for the Prosody system. It includes utility
-//! functions for setting up topics and configurations, managing producer and
-//! consumer tasks, and verifying message integrity and order in property-based
-//! tests.
+//! functions for creating topics and trigger-store configurations, test event
+//! handlers, and helpers for collecting messages off a channel.
 
 #![allow(
     dead_code,
-    clippy::implicit_hasher,
-    reason = "Shared test utilities: not all helpers used by every test binary; HashMap uses \
-              ahash for crate consistency"
+    reason = "Shared test utilities: each tests/*.rs binary compiles this module separately, so a \
+              helper used by only some binaries is dead in the rest"
 )]
 
-use std::cmp::max;
-use std::collections::{BTreeSet, HashSet};
+use std::env;
 use std::error::Error;
-use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 
-use ahash::{HashMap, HashMapExt};
-use color_eyre::eyre::{Result, eyre};
-use derive_quickcheck_arbitrary::Arbitrary;
-use itertools::Itertools;
+use std::fmt::Debug;
+
+use color_eyre::eyre::{Result, bail, eyre};
+use prosody::JsonCodec;
+use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::cassandra::config::CassandraConfiguration;
-use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::middleware::{CloneProvider, FallibleHandler};
+use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::{
-    ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+    ConsumerConfiguration, DemandType, EventHandler, HandlerProvider, Keyed,
+    KeyedStateConfiguration, ProsodyConsumer, Uncommitted,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::timers::{Trigger, UncommittedTimer};
-use prosody::{JsonCodec, Topic};
-use quickcheck::{Arbitrary as QCArbitrary, Gen};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::watch;
-use tokio::task::JoinSet;
-use tokio::time::sleep;
-use tracing::{error, info, instrument};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{sleep, timeout};
+use tracing::{error, info};
 use uuid::Uuid;
 
 /// The shared, pre-migrated keyspace every integration test runs against.
@@ -74,77 +68,38 @@ pub static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .expect("Failed to create tokio runtime")
 });
 
-/// A small, non-zero count used in tests.
+/// Number of times to repeat a property test against a live backend.
 ///
-/// Provides a way to ensure small non-zero values are used within test cases,
-/// particularly in property-based testing scenarios.
-#[derive(Copy, Clone)]
-pub struct SmallCount(u8);
-
-impl SmallCount {
-    /// Retrieves the underlying value of `SmallCount` as a `usize`.
-    #[must_use]
-    pub fn value(self) -> usize {
-        self.0 as usize
-    }
+/// Read from `INTEGRATION_TESTS` (default 25, matching TESTING.md). CI cranks
+/// this up; dev loops stay fast.
+#[must_use]
+pub fn integration_test_count() -> u64 {
+    integration_test_count_or(25)
 }
 
-impl QCArbitrary for SmallCount {
-    fn arbitrary(g: &mut Gen) -> Self {
-        // Provide a constant array of sequential non-zero values and
-        // ensure we always select at least 1 as a fallback.
-        const VALUES: [u8; 12] = const_array();
-        Self(*g.choose(&VALUES).unwrap_or(&1))
-    }
-}
-
-impl Debug for SmallCount {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Generates a constant array of sequential u8 values.
-const fn const_array<const N: usize>() -> [u8; N] {
-    let mut arr = [0; N];
-    let mut i = 0;
-    while i < N {
-        arr[i] = i as u8 + 1;
-        i += 1;
-    }
-    arr
-}
-
-/// Represents test input parameters for property-based tests.
-#[derive(Clone, Debug, Arbitrary)]
-pub struct TestInput {
-    /// A map from a key to a set of messages associated with the key.
-    pub messages: HashMap<u64, BTreeSet<u64>>,
-
-    /// The number of partitions each test topic should have.
-    pub partition_count: SmallCount,
-
-    /// The number of producers that should be spawned for the test.
-    pub producer_count: SmallCount,
-
-    /// The number of consumers that should be spawned for the test.
-    pub consumer_count: SmallCount,
-}
-
-/// Creates a test topic with a specified partition count.
+/// [`integration_test_count`] with a caller-chosen default for when
+/// `INTEGRATION_TESTS` is unset.
 ///
-/// # Arguments
+/// For properties whose per-iteration cost is intrinsically heavy (multiple
+/// seconds of live-broker protocol per iteration), a lower local default
+/// keeps dev loops fast; the environment variable still overrides it.
+#[must_use]
+pub fn integration_test_count_or(default: u64) -> u64 {
+    env::var("INTEGRATION_TESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Creates a test topic with the given number of partitions.
 ///
-/// * `partition_count` - The number of partitions for the test topic.
-///
-/// Returns a tuple containing the created topic and an admin client for cleanup
-/// tasks.
+/// Returns the created topic and an admin client for cleanup tasks.
 ///
 /// # Errors
 ///
 /// Returns an error if the topic creation fails.
-pub async fn create_test_topic(
-    partition_count: SmallCount,
+pub async fn create_topic_with_partitions(
+    partition_count: u16,
 ) -> Result<(Topic, &'static ProsodyAdminClient)> {
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
@@ -154,7 +109,7 @@ pub async fn create_test_topic(
         .create_topic(
             &TopicConfiguration::builder()
                 .name(topic.to_string())
-                .partition_count(partition_count.value() as u16)
+                .partition_count(partition_count)
                 .replication_factor(1_u16)
                 .build()?,
         )
@@ -164,259 +119,15 @@ pub async fn create_test_topic(
     Ok((topic, admin_client))
 }
 
-/// Creates producer and consumer configurations for a specified topic.
+/// Creates a single-partition test topic.
 ///
-/// # Arguments
-///
-/// * `topic` - The topic for which configurations are created.
-///
-/// Returns producer and consumer configurations.
+/// Returns the created topic and an admin client for cleanup tasks.
 ///
 /// # Errors
 ///
-/// Returns an error if configuration creation fails.
-pub fn create_configs(topic: &Topic) -> Result<(ProducerConfiguration, ConsumerConfiguration)> {
-    let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
-
-    // Configure the producer settings
-    let producer_config = ProducerConfiguration::builder()
-        .bootstrap_servers(bootstrap.clone())
-        .source_system("test-producer")
-        .build()?;
-
-    // Configure the consumer settings
-    let consumer_config = ConsumerConfiguration::builder()
-        .bootstrap_servers(bootstrap)
-        .group_id("test-consumer")
-        .subscribed_topics(&[topic.to_string()])
-        .commit_interval(StdDuration::from_secs(1))
-        .stall_threshold(StdDuration::from_mins(1))
-        .probe_port(None)
-        .build()?;
-
-    Ok((producer_config, consumer_config))
-}
-
-/// Spawns producer tasks for property-based testing.
-///
-/// # Arguments
-///
-/// * `tasks` - A set of tasks to manage spawned producers.
-/// * `input` - Contains the messages and number of producers to spawn.
-/// * `producer_config` - Configuration used for the producer.
-/// * `topic` - The topic to which producers send messages.
-pub fn spawn_producers(
-    tasks: &mut JoinSet<Result<()>>,
-    input: &TestInput,
-    producer_config: &ProducerConfiguration,
-    topic: &Topic,
-) {
-    let message_count = input.messages.len();
-    let producer_message_count = max(message_count / input.producer_count.value(), 1);
-
-    for producer_messages in input
-        .messages
-        .clone()
-        .into_iter()
-        .chunks(producer_message_count)
-        .into_iter()
-        .map(Iterator::collect::<Vec<_>>)
-    {
-        let producer_config = producer_config.clone();
-        let topic = *topic;
-
-        tasks.spawn(async move {
-            let producer =
-                ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
-            for (key, messages) in producer_messages {
-                let key = key.to_string();
-                for message in messages {
-                    producer.send([], topic, &key, json!(message)).await?; // Send each message
-                }
-                producer.send([], topic, &key, Value::Null).await?; // Send the end-of-stream marker
-            }
-            Ok(())
-        });
-    }
-}
-
-/// Spawns consumer tasks for property-based testing.
-///
-/// # Arguments
-///
-/// * `tasks` - A set of tasks to manage spawned consumers.
-/// * `consumer_count` - Number of consumers to spawn.
-/// * `consumer_config` - Configuration used for the consumer.
-/// * `messages_tx` - Channel for transmitting received messages.
-/// * `shutdown_rx` - Receiver for shutdown signals.
-pub fn spawn_consumers(
-    tasks: &mut JoinSet<Result<()>>,
-    consumer_count: SmallCount,
-    consumer_config: &ConsumerConfiguration,
-    messages_tx: &Sender<(String, Value)>,
-    shutdown_rx: &watch::Receiver<bool>,
-) {
-    for _ in 0..consumer_count.value() {
-        let consumer_config = consumer_config.clone();
-        let messages_tx = messages_tx.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-
-        let handler = TestHandler { messages_tx };
-        let handler_provider = CloneProvider::new(handler);
-
-        tasks.spawn(async move {
-            let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
-                &consumer_config,
-                &create_cassandra_trigger_store_config(),
-                KeyedStateConfiguration::default(),
-                handler_provider,
-                Telemetry::new(),
-            )
-            .await?;
-            shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal
-            consumer.shutdown().await; // Shut down consumer gracefully
-            Ok(())
-        });
-    }
-}
-
-/// Spawns a task to receive and verify messages for property-based testing.
-///
-/// # Arguments
-///
-/// * `tasks` - A set of tasks to manage message verification.
-/// * `messages_rx` - Channel for receiving messages.
-/// * `shutdown_tx` - Channel for sending shutdown signals.
-/// * `expected_messages` - Map of expected key-value message pairs.
-pub fn spawn_message_verifier(
-    tasks: &mut JoinSet<Result<()>>,
-    mut messages_rx: Receiver<(String, Value)>,
-    shutdown_tx: watch::Sender<bool>,
-    expected_messages: HashMap<u64, BTreeSet<u64>>,
-) {
-    tasks.spawn(async move {
-        // Track keys and received messages to verify against expected results
-        let mut keys: HashSet<String> = expected_messages.keys().map(ToString::to_string).collect();
-        let mut received: HashMap<String, Vec<u64>> =
-            HashMap::with_capacity(expected_messages.len());
-
-        info!("receiving messages");
-
-        // Receive messages and collect them
-        while let Some((key, payload)) = messages_rx.recv().await {
-            match payload {
-                Value::Number(number) => {
-                    let number = number.as_u64().ok_or_else(|| eyre!("invalid number"))?;
-                    received.entry(key).or_default().push(number);
-                }
-                Value::Null => {
-                    keys.remove(&key);
-                    // Break loop if all keys are processed
-                    if keys.is_empty() {
-                        break;
-                    }
-                }
-                _ => return Err(eyre!("unexpected payload type")),
-            }
-        }
-
-        // Verify received messages
-        verify_results(&expected_messages, received)?;
-
-        info!("sending shutdown signal");
-        shutdown_tx.send(true)?; // Send shutdown signal
-
-        Ok(())
-    });
-}
-
-/// Verifies that the received messages align with the expected ones.
-///
-/// # Arguments
-///
-/// * `expected` - Map of expected key-value message pairs.
-/// * `received` - Map of actually received message data.
-///
-/// # Errors
-///
-/// Returns an error if the verification process reveals a mismatch.
-pub fn verify_results(
-    expected: &HashMap<u64, BTreeSet<u64>>,
-    received: HashMap<String, Vec<u64>>,
-) -> Result<()> {
-    // Prepare actual data map from received messages for comparison
-    let mut actual: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(expected.len());
-
-    for (key, received_messages) in received {
-        let key: u64 = key.parse()?;
-        let received_set: BTreeSet<u64> = received_messages.iter().copied().collect();
-        actual.insert(key, received_set);
-
-        // Verify order of messages
-        let mut sorted = received_messages.clone();
-        sorted.sort_unstable();
-
-        if received_messages != sorted {
-            return Err(eyre!(
-                "invalid order for key {key}; expected: {sorted:?}, actual: {received_messages:?}"
-            ));
-        }
-    }
-
-    // Compare expected and actual results
-    if *expected != actual {
-        return Err(eyre!(
-            "all messages were not received; expected: {expected:?}, actual: {actual:?}"
-        ));
-    }
-
-    Ok(())
-}
-
-/// Executes the core logic for a property-based test.
-///
-/// # Arguments
-///
-/// * `input` - Test input containing message and configuration data.
-///
-/// # Errors
-///
-/// Returns an error if any part of the test setup, execution, or verification
-/// fails.
-pub async fn run_test(input: TestInput) -> Result<()> {
-    // Create test topic and configuration settings
-    let (topic, admin_client) = create_test_topic(input.partition_count).await?;
-    let (producer_config, consumer_config) = create_configs(&topic)?;
-
-    // Setup channels and task management
-    let (messages_tx, messages_rx) = channel(input.partition_count.value());
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    let mut tasks = JoinSet::new();
-
-    // Spawn producers and consumers, and start message verification
-    spawn_producers(&mut tasks, &input, &producer_config, &topic);
-    spawn_consumers(
-        &mut tasks,
-        input.consumer_count,
-        &consumer_config,
-        &messages_tx,
-        &shutdown_rx,
-    );
-    spawn_message_verifier(&mut tasks, messages_rx, shutdown_tx, input.messages);
-
-    // Wait for all tasks to complete
-    while let Some(result) = tasks.join_next().await {
-        result??;
-    }
-
-    info!("test passed");
-
-    // Clean up the test topic
-    admin_client.delete_topic(&topic).await?;
-    info!("deleted test topic: {topic}");
-
-    Ok(())
+/// Returns an error if the topic creation fails.
+pub async fn create_single_partition_topic() -> Result<(Topic, &'static ProsodyAdminClient)> {
+    create_topic_with_partitions(1).await
 }
 
 /// Creates a Cassandra trigger store configuration for integration tests.
@@ -442,15 +153,38 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
     TriggerStoreConfiguration::Cassandra(cassandra_config)
 }
 
-/// A simple test implementation of the `EventHandler` trait that forwards
-/// messages to a channel.
+/// The generic forward-to-channel [`EventHandler`]: sends every received
+/// `(key, payload)` pair to a channel and commits.
+///
+/// This is the one plain-forwarder handler shared by the integration suite;
+/// specialized handlers (error injection, timer scheduling, context capture)
+/// stay file-local. An optional per-message `delay` simulates backpressure —
+/// the only sanctioned use of `sleep` in tests.
 #[derive(Clone, Debug)]
-pub struct TestHandler {
+pub struct ChannelHandler {
     /// A channel for transmitting received messages.
-    pub messages_tx: Sender<(String, Value)>,
+    messages_tx: Sender<(String, Value)>,
+
+    /// Per-message processing delay (backpressure simulation); zero for none.
+    delay: StdDuration,
 }
 
-impl EventHandler for TestHandler {
+impl ChannelHandler {
+    /// A handler that forwards immediately.
+    #[must_use]
+    pub fn new(messages_tx: Sender<(String, Value)>) -> Self {
+        Self::with_delay(messages_tx, StdDuration::ZERO)
+    }
+
+    /// A handler that sleeps `delay` before forwarding, simulating a slow
+    /// consumer for backpressure tests.
+    #[must_use]
+    pub fn with_delay(messages_tx: Sender<(String, Value)>, delay: StdDuration) -> Self {
+        Self { messages_tx, delay }
+    }
+}
+
+impl EventHandler for ChannelHandler {
     type Payload = Value;
 
     async fn on_message<C>(
@@ -462,6 +196,11 @@ impl EventHandler for TestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         let (msg, uncommitted) = message.into_inner();
+
+        if !self.delay.is_zero() {
+            // Simulate backpressure with a delay
+            sleep(self.delay).await;
+        }
 
         // Forward the message to the channel
         if let Err(error) = self
@@ -483,57 +222,12 @@ impl EventHandler for TestHandler {
     }
 
     async fn shutdown(self) {
-        info!("TestHandler shutdown");
+        info!("ChannelHandler shutdown");
     }
 }
 
-/// A handler implementation that simulates backpressure by introducing a delay
-/// in processing.
-#[derive(Clone, Debug)]
-pub struct SlowTestHandler {
-    /// A channel for transmitting received messages.
-    pub messages_tx: Sender<(String, Value)>,
-}
-
-impl EventHandler for SlowTestHandler {
-    type Payload = Value;
-
-    #[instrument(skip(self, context, demand_type))]
-    async fn on_message<C>(
-        &self,
-        context: C,
-        message: UncommittedMessage<Value>,
-        demand_type: DemandType,
-    ) where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        let _ = (context, demand_type);
-        let (msg, uncommitted) = message.into_inner();
-        let key = msg.key().to_string();
-        let payload: Value = msg.payload().clone();
-
-        // Simulate backpressure with a delay
-        sleep(StdDuration::from_secs(1)).await;
-
-        if let Err(e) = self.messages_tx.send((key.clone(), payload)).await {
-            error!("failed to send message for key {}: {e:#}", key);
-        }
-        uncommitted.commit().await; // Commit message to mark as processed
-    }
-
-    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
-    where
-        C: EventContext<Payload = Self::Payload>,
-        U: UncommittedTimer,
-    {
-    }
-
-    async fn shutdown(self) {
-        info!("SlowTestHandler shutdown");
-    }
-}
-
-/// A test error type for `FallibleHandler` implementations.
+/// A test error type for `FallibleHandler` implementations that classifies as
+/// permanent.
 #[derive(Debug, Clone)]
 pub struct TestError;
 
@@ -548,6 +242,25 @@ impl Error for TestError {}
 impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Permanent
+    }
+}
+
+/// A test error type for `FallibleHandler` implementations that classifies as
+/// transient.
+#[derive(Debug, Clone)]
+pub struct TransientError;
+
+impl Display for TransientError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "transient test error")
+    }
+}
+
+impl Error for TransientError {}
+
+impl ClassifyError for TransientError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Transient
     }
 }
 
@@ -601,6 +314,140 @@ impl FallibleHandler for FallibleTestHandler {
 
     async fn shutdown(self) {
         // No cleanup needed for test handler
+    }
+}
+
+/// A live single-partition consumer + producer pair with a dedicated topic.
+///
+/// Owns the shared per-test infrastructure every direct-`ProsodyConsumer`
+/// integration harness used to duplicate: topic lifecycle (created in
+/// [`ConsumerEnv::new`], deleted in [`ConsumerEnv::shutdown`]), a uniquely
+/// named consumer group, the producer, and the wait for the consumer's
+/// partition assignment. Per-file harnesses wrap this and add only their
+/// handler, event channels, and assertions.
+pub struct ConsumerEnv {
+    topic: Topic,
+    admin: &'static ProsodyAdminClient,
+    consumer: ProsodyConsumer<JsonCodec>,
+    producer: ProsodyProducer<JsonCodec>,
+}
+
+impl ConsumerEnv {
+    /// Creates a fresh topic and consumer group named after `test_name`,
+    /// builds the handler provider from the consumer configuration via
+    /// `build_provider`, starts the consumer and producer, and waits for the
+    /// partition assignment before returning — so a message sent immediately
+    /// after `new` can never race the subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any component fails to start or the consumer does
+    /// not receive its partition assignment within the hang-guard.
+    pub async fn new<P, F>(test_name: &str, build_provider: F) -> Result<Self>
+    where
+        P: HandlerProvider,
+        P::Handler: EventHandler<Payload = Value>,
+        F: AsyncFnOnce(&ConsumerConfiguration) -> Result<P>,
+    {
+        let (topic, admin) = create_single_partition_topic().await?;
+
+        let consumer_config = ConsumerConfiguration::builder()
+            .bootstrap_servers(vec!["localhost:9094".to_owned()])
+            .group_id(format!("{test_name}-consumer-{}", Uuid::new_v4()))
+            .subscribed_topics(&[topic.to_string()])
+            .probe_port(None) // Disable probe server to allow parallel test execution
+            .build()?;
+
+        let handler_provider = build_provider(&consumer_config).await?;
+
+        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
+            &consumer_config,
+            &create_cassandra_trigger_store_config(),
+            KeyedStateConfiguration::default(),
+            handler_provider,
+            Telemetry::new(),
+        )
+        .await?;
+
+        let producer = ProsodyProducer::<JsonCodec>::new(
+            &ProducerConfiguration::builder()
+                .bootstrap_servers(vec!["localhost:9094".to_owned()])
+                .source_system(test_name.to_owned())
+                .build()?,
+            Telemetry::new().sender(),
+        )?;
+
+        // Wait until Kafka has assigned the consumer its partition before
+        // producing — records sent before the subscription is live can be
+        // missed. Awaits the assignment signal the rebalance callback
+        // publishes (not a poll) under a generous hang-guard, rather than
+        // guessing a fixed startup delay that is sensitive to load.
+        timeout(
+            StdDuration::from_secs(30),
+            consumer.wait_for_assigned_partitions(1),
+        )
+        .await
+        .map_err(|_| eyre!("consumer did not receive a partition assignment in time"))?;
+
+        Ok(Self {
+            topic,
+            admin,
+            consumer,
+            producer,
+        })
+    }
+
+    /// The topic this environment produces to and consumes from.
+    #[must_use]
+    pub fn topic(&self) -> Topic {
+        self.topic
+    }
+
+    /// Sends a message with the given key and payload to the test topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the send fails.
+    pub async fn send_message(&self, key: &str, payload: Value) -> Result<()> {
+        self.producer.send([], self.topic, key, payload).await?;
+        Ok(())
+    }
+
+    /// Shuts down the consumer, then deletes the test topic.
+    ///
+    /// Callers must invoke this before propagating a test failure — dropping
+    /// a live consumer leaves rdkafka threads hanging.
+    pub async fn shutdown(self) {
+        self.consumer.shutdown().await;
+        if let Err(e) = self.admin.delete_topic(&self.topic).await {
+            error!("Failed to clean up topic {}: {e}", self.topic);
+        }
+    }
+}
+
+/// Receives the next event from `rx`, failing if none arrives within
+/// `hang_guard`. The deadline is a hang-guard, never the assertion.
+///
+/// # Errors
+///
+/// Returns an error on timeout or if the channel closed.
+pub async fn expect_event<T>(rx: &mut Receiver<T>, hang_guard: StdDuration) -> Result<T> {
+    timeout(hang_guard, rx.recv())
+        .await
+        .map_err(|_| eyre!("timed out waiting for event after {hang_guard:?}"))?
+        .ok_or_else(|| eyre!("event channel closed unexpectedly"))
+}
+
+/// Verifies that no event arrives on `rx` within `window`.
+///
+/// # Errors
+///
+/// Returns an error if an event arrives or the channel closed.
+pub async fn expect_no_event<T: Debug>(rx: &mut Receiver<T>, window: StdDuration) -> Result<()> {
+    match timeout(window, rx.recv()).await {
+        Err(_) => Ok(()),
+        Ok(Some(event)) => bail!("expected no event within {window:?} but received: {event:?}"),
+        Ok(None) => bail!("event channel closed unexpectedly"),
     }
 }
 

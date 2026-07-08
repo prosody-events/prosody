@@ -9,56 +9,21 @@ use color_eyre::eyre::{self, ensure};
 use eyre::Result;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::consumer::KeyedStateConfiguration;
-use prosody::consumer::event_context::EventContext;
-use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::middleware::CloneProvider;
-use prosody::consumer::{
-    ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
-};
+use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
-use prosody::timers::UncommittedTimer;
 use prosody::tracing::init_test_logging;
 use prosody::{JsonCodec, Topic};
 use serde_json::{Value, json};
 
 type Payload = Value;
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::{Receiver, channel};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 mod common;
-
-/// Handler that forwards messages to a channel for test verification.
-#[derive(Clone)]
-struct TestHandler {
-    tx: Sender<(String, Value)>,
-}
-
-impl EventHandler for TestHandler {
-    type Payload = Value;
-
-    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage<Value>, _demand_type: DemandType)
-    where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        let (inner, uncommitted) = msg.into_inner();
-        let key = inner.key().to_string();
-        let payload = inner.payload().clone();
-        let _ = self.tx.send((key, payload)).await;
-        uncommitted.commit().await;
-    }
-
-    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
-    where
-        C: EventContext<Payload = Self::Payload>,
-        U: UncommittedTimer,
-    {
-    }
-
-    async fn shutdown(self) {}
-}
 
 /// Asserts that a message with the expected key and payload is received.
 async fn expect_message(
@@ -298,7 +263,7 @@ async fn test_producer_deduplication() -> Result<()> {
             &cfg,
             &common::create_cassandra_trigger_store_config(),
             KeyedStateConfiguration::default(),
-            CloneProvider::new(TestHandler { tx }),
+            CloneProvider::new(common::ChannelHandler::new(tx)),
             Telemetry::new(),
         )
         .await?;

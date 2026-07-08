@@ -9,20 +9,20 @@
 
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
-use prosody::consumer::KeyedStateConfiguration;
+use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
+use prosody::high_level::mode::Mode;
+use prosody::high_level::{ConsumerBuilders, HighLevelClient};
+use prosody::producer::ProducerConfigurationBuilder;
+use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
-    consumer::message::UncommittedMessage,
-    consumer::middleware::CloneProvider,
-    consumer::{
-        ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
-    },
-    producer::{ProducerConfiguration, ProsodyProducer},
-    telemetry::Telemetry,
+    consumer::ConsumerConfigurationBuilder,
+    consumer::message::{ConsumerMessage, UncommittedMessage},
+    consumer::middleware::{CloneProvider, FallibleHandler},
+    consumer::{DemandType, EventHandler, Keyed, Uncommitted},
     timers::TimerType,
+    timers::Trigger,
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
     timers::duration::CompactDuration,
@@ -31,10 +31,24 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
-use tracing::{error, info};
+use tracing::info;
 use uuid::Uuid;
 
 mod common;
+use common::{ConsumerEnv, TestError};
+
+/// Hang-guard for an individual wait on an event that *must* arrive (a message
+/// reaching the handler, a timer firing). These tests assert on event
+/// *content* — keys, payloads, scheduled times — which is deterministic; the
+/// wait itself only guards against a genuine hang, so it is sized generously.
+/// A slow or degraded cluster must never trip it.
+const RECEIVE_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Generous outer hang-guard: bounds total test runtime while staying well
+/// above the per-event waits inside the harness, so a genuinely hung step
+/// surfaces its own granular error before this fires. Sized so a slow or
+/// degraded cluster never trips it on mere slowness.
+const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Test handler that schedules timers based on incoming messages and tracks
 /// timer events.
@@ -84,7 +98,7 @@ impl EventHandler for TimerTestHandler {
             })
             .await
         {
-            error!("Failed to send message event: {e}");
+            tracing::error!("Failed to send message event: {e}");
             uncommitted.commit().await;
             return;
         }
@@ -103,7 +117,7 @@ impl EventHandler for TimerTestHandler {
                             .schedule(schedule_time, TimerType::Application)
                             .await
                         {
-                            error!("Failed to schedule timer for key {key}: {e}");
+                            tracing::error!("Failed to schedule timer for key {key}: {e}");
                         } else {
                             info!("Scheduled timer for key {key} at time {schedule_time}");
                         }
@@ -118,13 +132,13 @@ impl EventHandler for TimerTestHandler {
                                     .schedule(schedule_time, TimerType::Application)
                                     .await
                                 {
-                                    error!("Failed to schedule timer for key {key}: {e}");
+                                    tracing::error!("Failed to schedule timer for key {key}: {e}");
                                 } else {
                                     info!("Scheduled timer for key {key} at time {schedule_time}");
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to calculate schedule time: {e}");
+                                tracing::error!("Failed to calculate schedule time: {e}");
                             }
                         }
                     }
@@ -132,7 +146,7 @@ impl EventHandler for TimerTestHandler {
                 "cancel_timer" => {
                     // Clear all scheduled timers for this key
                     if let Err(e) = context.clear_scheduled(TimerType::Application).await {
-                        error!("Failed to cancel timers for key {key}: {e}");
+                        tracing::error!("Failed to cancel timers for key {key}: {e}");
                     } else {
                         info!("Canceled all timers for key {key}");
                     }
@@ -162,7 +176,7 @@ impl EventHandler for TimerTestHandler {
             time,
         };
         if let Err(e) = self.timer_tx.send(timer_event).await {
-            error!("Failed to send timer event: {e}");
+            tracing::error!("Failed to send timer event: {e}");
         }
 
         timer.commit().await;
@@ -173,12 +187,79 @@ impl EventHandler for TimerTestHandler {
     }
 }
 
-/// Test environment that encapsulates common setup and provides helper methods
+/// Handler that schedules a timer on first message, then calls
+/// `clear_and_schedule` on second message and reports both the replacement
+/// time and the actual trigger time so the test can verify the inline
+/// replacement path.
+#[derive(Clone)]
+struct InlineReplacementHandler {
+    messages: Sender<String>,
+    replacement_time: Sender<CompactDateTime>,
+    timer_fired: Sender<CompactDateTime>,
+}
+
+impl FallibleHandler for InlineReplacementHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage<Value>,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let key = msg.key().to_string();
+        let step = msg
+            .payload()
+            .get("step")
+            .and_then(Value::as_i64)
+            .ok_or(TestError)?;
+
+        if step == 1 {
+            let schedule_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(3)))
+                .map_err(|_| TestError)?;
+            ctx.schedule(schedule_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+        } else {
+            let new_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(5)))
+                .map_err(|_| TestError)?;
+            ctx.clear_and_schedule(new_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+            let _ = self.replacement_time.send(new_time).await;
+        }
+
+        let _ = self.messages.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let _ = self.timer_fired.send(trigger.time).await;
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Test environment wrapping [`ConsumerEnv`] with the timer handler's event
+/// channels and timer-specific assertion helpers.
 struct TestEnvironment {
-    topic: Topic,
-    admin_client: &'static ProsodyAdminClient,
-    consumer: ProsodyConsumer<JsonCodec>,
-    producer: ProsodyProducer<JsonCodec>,
+    env: ConsumerEnv,
     timer_rx: Receiver<TimerEvent>,
     message_rx: Receiver<MessageEvent>,
 }
@@ -186,73 +267,19 @@ struct TestEnvironment {
 impl TestEnvironment {
     /// Create a new test environment with all necessary components
     async fn new(test_name: &str) -> Result<Self> {
-        let topic: Topic = format!("{}-{}", test_name, Uuid::new_v4()).as_str().into();
-        let bootstrap = vec!["localhost:9094".to_owned()];
-        let admin_client =
-            ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-        admin_client
-            .create_topic(
-                &TopicConfiguration::builder()
-                    .name(topic.to_string())
-                    .partition_count(1_u16)
-                    .replication_factor(1_u16)
-                    .build()?,
-            )
-            .await?;
-
         // Set up channels for test events
         let (timer_tx, timer_rx) = channel(50);
         let (message_tx, message_rx) = channel(50);
 
-        // Create handler and consumer
         let handler = TimerTestHandler {
             timer_tx,
             message_tx,
         };
-        let handler_provider = CloneProvider::new(handler);
-
-        let group_id = format!("{}-consumer-{}", test_name, Uuid::new_v4());
-        let consumer_config = ConsumerConfiguration::builder()
-            .bootstrap_servers(bootstrap.clone())
-            .group_id(&group_id)
-            .subscribed_topics(&[topic.to_string()])
-            .probe_port(None)
-            .build()?;
-
-        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
-            &consumer_config,
-            &common::create_cassandra_trigger_store_config(),
-            KeyedStateConfiguration::default(),
-            handler_provider,
-            Telemetry::new(),
-        )
-        .await?;
-
-        // Create producer
-        let producer_config = ProducerConfiguration::builder()
-            .bootstrap_servers(bootstrap.clone())
-            .source_system("test-producer")
-            .build()?;
-        let producer =
-            ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
-
-        // Wait until Kafka has assigned the consumer its partition before
-        // producing — records sent before the subscription is live can be
-        // missed. Awaits the assignment signal the rebalance callback
-        // publishes (not a poll) under a generous hang-guard, rather than
-        // guessing a fixed startup delay that is sensitive to load.
-        timeout(
-            Duration::from_secs(30),
-            consumer.wait_for_assigned_partitions(1),
-        )
-        .await
-        .map_err(|_| eyre!("consumer did not receive a partition assignment in time"))?;
+        let env =
+            ConsumerEnv::new(test_name, async move |_| Ok(CloneProvider::new(handler))).await?;
 
         Ok(Self {
-            topic,
-            admin_client,
-            consumer,
-            producer,
+            env,
             timer_rx,
             message_rx,
         })
@@ -260,10 +287,7 @@ impl TestEnvironment {
 
     /// Send a message with the given key and payload
     async fn send_message(&self, key: &str, payload: Value) -> Result<()> {
-        self.producer
-            .send([], self.topic, key, payload)
-            .await
-            .map_err(|e| eyre!("Failed to send message: {}", e))
+        self.env.send_message(key, payload).await
     }
 
     /// Send a timer scheduling message
@@ -292,68 +316,25 @@ impl TestEnvironment {
         self.send_message(key, message).await
     }
 
-    /// Wait for a message event with timeout
-    async fn expect_message(&mut self, timeout_secs: u64) -> Result<MessageEvent> {
-        timeout(
-            Duration::from_secs(timeout_secs.max(60)),
-            self.message_rx.recv(),
-        )
-        .await
-        .map_err(|_| {
-            eyre!(
-                "Timeout waiting for message event after {} seconds",
-                timeout_secs
-            )
-        })?
-        .ok_or_else(|| eyre!("Message channel closed unexpectedly"))
+    /// Wait for a message event under the receive hang-guard
+    async fn expect_message(&mut self) -> Result<MessageEvent> {
+        common::expect_event(&mut self.message_rx, RECEIVE_TIMEOUT).await
     }
 
-    /// Wait for a timer event with timeout
-    async fn expect_timer(&mut self, timeout_secs: u64) -> Result<TimerEvent> {
-        timeout(
-            Duration::from_secs(timeout_secs.max(60)),
-            self.timer_rx.recv(),
-        )
-        .await
-        .map_err(|_| {
-            eyre!(
-                "Timeout waiting for timer event after {} seconds",
-                timeout_secs
-            )
-        })?
-        .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))
+    /// Wait for a timer event under the receive hang-guard
+    async fn expect_timer(&mut self) -> Result<TimerEvent> {
+        common::expect_event(&mut self.timer_rx, RECEIVE_TIMEOUT).await
     }
 
-    /// Wait for exact number of timer events with timeout
-    async fn expect_timers(&mut self, count: usize, timeout_secs: u64) -> Result<Vec<TimerEvent>> {
-        let mut received_timers = Vec::new();
+    /// Wait for exactly `count` timer events, then verify no extras arrive
+    async fn expect_timers(&mut self, count: usize) -> Result<Vec<TimerEvent>> {
+        let mut received_timers = Vec::with_capacity(count);
 
         for i in 0..count {
-            match timeout(
-                Duration::from_secs(timeout_secs.max(60)),
-                self.timer_rx.recv(),
-            )
-            .await
-            {
-                Ok(Some(timer_event)) => {
-                    received_timers.push(timer_event);
-                }
-                Ok(None) => {
-                    return Err(eyre!(
-                        "Timer channel closed after receiving {} of {} expected timers",
-                        i,
-                        count
-                    ));
-                }
-                Err(_) => {
-                    return Err(eyre!(
-                        "Timeout waiting for timer {} of {} after {} seconds",
-                        i + 1,
-                        count,
-                        timeout_secs
-                    ));
-                }
-            }
+            let timer_event = common::expect_event(&mut self.timer_rx, RECEIVE_TIMEOUT)
+                .await
+                .map_err(|e| eyre!("waiting for timer {} of {}: {e}", i + 1, count))?;
+            received_timers.push(timer_event);
         }
 
         // Verify no extra timers are received
@@ -369,18 +350,13 @@ impl TestEnvironment {
         Ok(received_timers)
     }
 
-    /// Verify that no timer event occurs within the given timeout
-    async fn expect_no_timer(&mut self, timeout_secs: u32) -> Result<()> {
-        let timer_result = timeout(
-            Duration::from_secs(u64::from(timeout_secs)),
-            self.timer_rx.recv(),
+    /// Verify that no timer event occurs within the given window
+    async fn expect_no_timer(&mut self, window_secs: u32) -> Result<()> {
+        common::expect_no_event(
+            &mut self.timer_rx,
+            Duration::from_secs(u64::from(window_secs)),
         )
-        .await;
-        ensure!(
-            timer_result.is_err(),
-            "Expected no timer event, but one was received"
-        );
-        Ok(())
+        .await
     }
 
     /// Verify a message event matches expected key and payload
@@ -447,16 +423,8 @@ impl TestEnvironment {
     }
 
     /// Clean up resources (consumer shutdown, topic deletion)
-    async fn cleanup(self) -> Result<()> {
-        // Shutdown consumer first
-        self.consumer.shutdown().await;
-
-        // Then delete the topic
-        if let Err(e) = self.admin_client.delete_topic(&self.topic).await {
-            error!("Failed to clean up topic {}: {}", self.topic, e);
-        }
-
-        Ok(())
+    async fn cleanup(self) {
+        self.env.shutdown().await;
     }
 }
 
@@ -468,19 +436,54 @@ where
 {
     init_test_logging();
 
-    // Generous outer hang-guard: bounds total test runtime while staying well
-    // above the per-event waits inside the harness, so a genuinely hung step
-    // surfaces its own granular error before this fires. Sized so a slow or
-    // degraded cluster never trips it on mere slowness.
-    let timeout_dur = Duration::from_mins(3);
-    let result = timeout(timeout_dur, async {
+    let result = timeout(TIMER_TEST_TIMEOUT, async {
         let env = TestEnvironment::new(test_name).await?;
 
         test_fn(env).await
     })
     .await;
 
-    result.map_err(|_| eyre!("Test '{test_name}' timed out after {timeout_dur:?}"))?
+    result.map_err(|_| eyre!("Test '{test_name}' timed out after {TIMER_TEST_TIMEOUT:?}"))?
+}
+
+/// Build a `HighLevelClient` for the inline-replacement test — the one test
+/// in this file that must drive `clear_and_schedule` through the full
+/// pipeline-mode middleware stack rather than the direct-consumer harness.
+fn build_inline_replacement_client(
+    source_topic: &str,
+    telemetry_topic: &str,
+) -> Result<HighLevelClient<InlineReplacementHandler>> {
+    let mut producer_builder = ProducerConfigurationBuilder::default();
+    producer_builder
+        .bootstrap_servers(vec!["localhost:9094".to_owned()])
+        .source_system("timer-inline-replacement-test");
+
+    let mut consumer_builder = ConsumerConfigurationBuilder::default();
+    consumer_builder
+        .bootstrap_servers(vec!["localhost:9094".to_owned()])
+        .group_id(Uuid::new_v4().to_string())
+        .subscribed_topics(vec![source_topic.to_owned()])
+        .probe_port(None);
+
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_builder,
+        emitter: TelemetryEmitterConfiguration {
+            topic: telemetry_topic.to_owned(),
+            enabled: true,
+        },
+        ..Default::default()
+    };
+
+    let mut cassandra_builder = CassandraConfigurationBuilder::default();
+    cassandra_builder.nodes(vec!["localhost:9042".to_owned()]);
+
+    let client = HighLevelClient::new(
+        Mode::Pipeline,
+        &mut producer_builder,
+        &consumer_builders,
+        &cassandra_builder,
+    )?;
+    Ok(client)
 }
 
 /// Tests basic timer scheduling and triggering functionality.
@@ -498,15 +501,15 @@ async fn test_timer_scheduling_and_triggering() -> Result<()> {
         env.schedule_timer(key, delay_secs).await?;
 
         // Verify message was received
-        let message_event = env.expect_message(5).await?;
+        let message_event = env.expect_message().await?;
         TestEnvironment::verify_message_event(&message_event, key, &schedule_message)?;
 
         // Wait for timer to trigger
-        let timer_event = env.expect_timer(5).await?;
+        let timer_event = env.expect_timer().await?;
         TestEnvironment::verify_timer_event(&timer_event, key)?;
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
@@ -526,13 +529,13 @@ async fn test_same_key_multiple_timers() -> Result<()> {
 
         // Verify all schedule messages were received
         for i in 0..delays.len() {
-            env.expect_message(3)
+            env.expect_message()
                 .await
                 .map_err(|e| eyre!("Failed to receive schedule message {}: {}", i + 1, e))?;
         }
 
         // Wait for all timer events
-        let received_timers = env.expect_timers(delays.len(), 6).await?;
+        let received_timers = env.expect_timers(delays.len()).await?;
 
         // Verify all timers are for the same key
         for timer_event in &received_timers {
@@ -543,7 +546,7 @@ async fn test_same_key_multiple_timers() -> Result<()> {
         TestEnvironment::verify_timer_order(&received_timers)?;
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
@@ -562,10 +565,10 @@ async fn test_immediate_timer() -> Result<()> {
         env.schedule_timer(key, delay_secs).await?;
 
         // Verify message was received
-        env.expect_message(3).await?;
+        env.expect_message().await?;
 
         // Wait for timer to trigger
-        let timer_event = env.expect_timer(3).await?;
+        let timer_event = env.expect_timer().await?;
         TestEnvironment::verify_timer_event(&timer_event, key)?;
 
         // Verify timing accuracy (should trigger within 1-2 seconds)
@@ -578,7 +581,7 @@ async fn test_immediate_timer() -> Result<()> {
         );
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
@@ -608,11 +611,11 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
         env.schedule_timer_at(key, target_time_secs).await?;
 
         // Verify message was received
-        let message_event = env.expect_message(5).await?;
+        let message_event = env.expect_message().await?;
         TestEnvironment::verify_message_event(&message_event, key, &schedule_message)?;
 
         // Wait for timer to trigger
-        let timer_event = env.expect_timer(6).await?;
+        let timer_event = env.expect_timer().await?;
         TestEnvironment::verify_timer_event(&timer_event, key)?;
 
         // Verify timer accuracy - should match exactly
@@ -643,7 +646,7 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
         );
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
@@ -660,7 +663,7 @@ async fn test_timer_cancellation() -> Result<()> {
         env.schedule_timer(key, delay_secs).await?;
 
         // Verify schedule message was received
-        let message_event = env.expect_message(5).await?;
+        let message_event = env.expect_message().await?;
         let expected_schedule_message = json!({
             "action": "schedule_timer",
             "delay_secs": delay_secs
@@ -671,7 +674,7 @@ async fn test_timer_cancellation() -> Result<()> {
         env.cancel_timer(key).await?;
 
         // Verify cancellation message was received
-        let cancel_message_event = env.expect_message(5).await?;
+        let cancel_message_event = env.expect_message().await?;
         let expected_cancel_message = json!({
             "action": "cancel_timer"
         });
@@ -685,7 +688,7 @@ async fn test_timer_cancellation() -> Result<()> {
         env.expect_no_timer(delay_secs + 2).await?;
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
@@ -704,13 +707,13 @@ async fn test_multiple_timers() -> Result<()> {
 
         // Verify all schedule messages were received
         for i in 0..timers_data.len() {
-            env.expect_message(5)
+            env.expect_message()
                 .await
                 .map_err(|e| eyre!("Failed to receive schedule message {}: {}", i, e))?;
         }
 
         // Collect timer events as they trigger
-        let received_timers = env.expect_timers(timers_data.len(), 8).await?;
+        let received_timers = env.expect_timers(timers_data.len()).await?;
 
         // Verify timers are in chronological order
         TestEnvironment::verify_timer_order(&received_timers)?;
@@ -729,7 +732,7 @@ async fn test_multiple_timers() -> Result<()> {
         }
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
@@ -749,13 +752,13 @@ async fn test_timer_different_keys() -> Result<()> {
 
         // Verify schedule messages were received
         for i in 0..timers.len() {
-            env.expect_message(5)
+            env.expect_message()
                 .await
                 .map_err(|e| eyre!("Failed to receive schedule message {}: {}", i, e))?;
         }
 
         // Wait for timers to trigger
-        let received_timers = env.expect_timers(2, 6).await?;
+        let received_timers = env.expect_timers(2).await?;
 
         // Verify timers are in chronological order
         TestEnvironment::verify_timer_order(&received_timers)?;
@@ -765,8 +768,77 @@ async fn test_timer_different_keys() -> Result<()> {
         TestEnvironment::verify_timer_keys(&received_timers, &expected_keys)?;
 
         // Clean up
-        env.cleanup().await?;
+        env.cleanup().await;
         Ok(())
     })
     .await
+}
+
+/// Verifies the Inline→Inline tombstone-free timer replacement path:
+/// `schedule` followed by `clear_and_schedule` on the same key results in
+/// exactly one timer firing at the replacement time.
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let (source, admin) = common::create_single_partition_topic().await?;
+        let (telemetry_topic, _) = common::create_single_partition_topic().await?;
+        let source_topic = source.to_string();
+
+        let client: HighLevelClient<InlineReplacementHandler> =
+            build_inline_replacement_client(&source_topic, telemetry_topic.as_ref())?;
+
+        let (messages, mut msg_rx) = channel(16);
+        let (replacement_time, mut replacement_time_rx) = channel(16);
+        let (timer_fired, mut timer_rx) = channel(16);
+        client
+            .subscribe(InlineReplacementHandler {
+                messages,
+                replacement_time,
+                timer_fired,
+            })
+            .await?;
+
+        // Step 1: schedule at t+3s
+        client
+            .send(source, "replace-key", json!({"step": 1_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Step 2: clear_and_schedule at t+5s (replaces the original)
+        client
+            .send(source, "replace-key", json!({"step": 2_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Capture the replacement time the handler recorded
+        let replacement_time = timeout(RECEIVE_TIMEOUT, replacement_time_rx.recv())
+            .await
+            .map_err(|_| eyre!("timeout waiting for replacement time"))?
+            .ok_or_else(|| eyre!("replacement_time channel closed"))?;
+
+        // Wait for the timer to fire (should be ~5s from step 2)
+        let trigger_time = timeout(RECEIVE_TIMEOUT, timer_rx.recv())
+            .await
+            .map_err(|_| eyre!("timeout waiting for on_timer — timer never fired"))?
+            .ok_or_else(|| eyre!("timer_fired channel closed"))?;
+
+        // The timer must fire at the replacement time, not the original
+        ensure!(
+            trigger_time == replacement_time,
+            "timer fired at {trigger_time:?} but expected replacement time {replacement_time:?}"
+        );
+
+        // Verify no second timer fires (the original t+3s was replaced)
+        let second = timeout(Duration::from_secs(5), timer_rx.recv()).await;
+        ensure!(second.is_err(), "expected no second timer but received one");
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
 }
