@@ -28,10 +28,6 @@ impl CompactDuration {
 
     /// Creates a new `CompactDuration` from the specified number of seconds.
     ///
-    /// # Arguments
-    ///
-    /// * `seconds` - The number of seconds for this duration.
-    ///
     /// # Examples
     ///
     /// ```
@@ -53,10 +49,6 @@ impl CompactDuration {
 
     /// Adds two durations with overflow checking.
     ///
-    /// # Arguments
-    ///
-    /// * `other` - The [`CompactDuration`] to add.
-    ///
     /// # Errors
     ///
     /// Returns [`CompactDurationError::OutOfRange`] if the result exceeds
@@ -71,10 +63,6 @@ impl CompactDuration {
     }
 
     /// Adds two durations with saturation at [`Self::MAX`].
-    ///
-    /// # Arguments
-    ///
-    /// * `other` - The [`CompactDuration`] to add.
     ///
     /// # Examples
     ///
@@ -98,10 +86,6 @@ impl CompactDuration {
 
     /// Subtracts two durations with overflow checking.
     ///
-    /// # Arguments
-    ///
-    /// * `other` - The [`CompactDuration`] to subtract.
-    ///
     /// # Errors
     ///
     /// Returns [`CompactDurationError::OutOfRange`] if `other` is greater than
@@ -116,10 +100,6 @@ impl CompactDuration {
     }
 
     /// Subtracts two durations with saturation at [`Self::MIN`].
-    ///
-    /// # Arguments
-    ///
-    /// * `other` - The [`CompactDuration`] to subtract.
     ///
     /// # Examples
     ///
@@ -211,10 +191,6 @@ impl TryFrom<Duration> for CompactDuration {
     ///
     /// Rounds sub-second nanoseconds to the nearest whole second.
     /// Nanoseconds >= 500,000,000 round up to the next second.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The [`Duration`] to convert.
     ///
     /// # Errors
     ///

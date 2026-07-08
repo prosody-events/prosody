@@ -4,7 +4,6 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use color_eyre::eyre::{Result, bail};
-use tokio::task::coop::cooperative;
 use tokio::time::{Duration, advance, pause};
 
 #[tokio::test]
@@ -24,7 +23,7 @@ async fn test_insert_and_next() -> Result<()> {
     advance(Duration::from_secs(1)).await;
 
     // Retrieve the next expired trigger
-    let Some(expired_trigger) = cooperative(triggers.next()).await else {
+    let Some(expired_trigger) = triggers.next().await else {
         bail!("No expired trigger found");
     };
     assert_eq!(expired_trigger, trigger);
@@ -33,7 +32,7 @@ async fn test_insert_and_next() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_remove_trigger() -> Result<()> {
+async fn test_remove_clears_active_registry() -> Result<()> {
     pause();
 
     let mut triggers = TriggerQueue::new();
@@ -42,13 +41,17 @@ async fn test_remove_trigger() -> Result<()> {
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?; // 5 seconds in the future
     let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
 
-    // Insert the trigger
+    // Insert the trigger; it is active immediately.
     triggers.insert(trigger.clone()).await;
+    assert!(
+        triggers
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+    );
 
-    // Remove the trigger
+    // Case 1: remove while still queued.
     triggers.remove(&trigger).await;
-
-    // Verify the trigger is no longer active
     assert!(
         !triggers
             .active_triggers()
@@ -56,11 +59,47 @@ async fn test_remove_trigger() -> Result<()> {
             .await
     );
 
-    // Advance time by 5 seconds to simulate the trigger's original expiration time
+    // Advance past the original expiration time; nothing fires.
     advance(Duration::from_secs(5)).await;
-
-    // Ensure that no trigger is emitted
     assert!(triggers.next().await.is_none());
+
+    // Re-insert, then let it fire via `next()` — this pops the delay-queue
+    // entry (`queue_keys`) but leaves the `ActiveTriggers` entry Scheduled,
+    // reproducing the "delivered but not yet transitioned to Firing" case
+    // `remove`'s doc names as case 2.
+    let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
+    let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
+    triggers.insert(trigger.clone()).await;
+    advance(Duration::from_secs(5)).await;
+    let Some(delivered) = triggers.next().await else {
+        bail!("No expired trigger found");
+    };
+    assert_eq!(delivered, trigger);
+    assert!(
+        triggers
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+    );
+
+    // Case 2: remove after delivery — clears ActiveTriggers without
+    // panicking on the already-absent queue key.
+    triggers.remove(&trigger).await;
+    assert!(
+        !triggers
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+    );
+
+    // Idempotent: removing an already-removed trigger is a no-op.
+    triggers.remove(&trigger).await;
+    assert!(
+        !triggers
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+    );
 
     Ok(())
 }
@@ -108,41 +147,6 @@ async fn test_multiple_triggers() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_active_triggers() -> Result<()> {
-    pause();
-
-    let mut triggers = TriggerQueue::new();
-
-    let key = Key::from("active-key");
-    let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?; // 5 seconds in the future
-    let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
-
-    // Insert the trigger
-    triggers.insert(trigger.clone()).await;
-
-    // Verify the trigger is active
-    assert!(
-        triggers
-            .active_triggers()
-            .contains(&key, time, TimerType::Application)
-            .await
-    );
-
-    // Remove the trigger
-    triggers.remove(&trigger).await;
-
-    // Verify the trigger is no longer active
-    assert!(
-        !triggers
-            .active_triggers()
-            .contains(&key, time, TimerType::Application)
-            .await
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_insert_duplicate_refreshes_span() -> Result<()> {
     pause();
 
@@ -165,7 +169,7 @@ async fn test_insert_duplicate_refreshes_span() -> Result<()> {
 
     // Expire and pop the trigger
     advance(Duration::from_secs(5)).await;
-    let Some(expired) = cooperative(triggers.next()).await else {
+    let Some(expired) = triggers.next().await else {
         bail!("No expired trigger found");
     };
 

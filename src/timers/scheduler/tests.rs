@@ -73,42 +73,25 @@ fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
 // ===================================================================
 
 #[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_future() -> Result<()> {
+async fn test_calculate_wait_time() -> Result<()> {
     let now = CompactDateTime::now()?;
-    let future = now.add_duration(CompactDuration::new(120))?;
-    let preload = CompactDuration::new(30);
-    // 120s out minus 30s preload = 90s wait.
-    assert_eq!(
-        calculate_wait_time(future, preload),
-        CompactDuration::new(90)
-    );
-    Ok(())
-}
+    // (offset_secs, preload_secs, expected_wait_secs)
+    for (offset, preload, expected) in [
+        (120, 30, 90), // future: 120s out minus 30s preload
+        (15, 30, 0),   // within preload window: saturates to zero
+        (30, 30, 0),   // exact preload boundary: saturates to zero
+    ] {
+        let target = now.add_duration(CompactDuration::new(offset))?;
+        assert_eq!(
+            calculate_wait_time(target, CompactDuration::new(preload)),
+            CompactDuration::new(expected)
+        );
+    }
 
-#[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_within_preload_window() -> Result<()> {
-    let now = CompactDateTime::now()?;
-    let near = now.add_duration(CompactDuration::new(15))?;
-    // 15s out minus 30s preload saturates at zero — load immediately.
-    assert!(calculate_wait_time(near, CompactDuration::new(30)).is_zero());
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_past_time() -> Result<()> {
+    // Past time: advance the clock past a previously-computed load time.
     let load_time = CompactDateTime::now()?;
     advance(StdDuration::from_mins(1)).await;
-    // Load time is now in the past — return zero.
     assert!(calculate_wait_time(load_time, CompactDuration::new(30)).is_zero());
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_exact_preload_boundary() -> Result<()> {
-    let now = CompactDateTime::now()?;
-    let boundary = now.add_duration(CompactDuration::new(30))?;
-    // Exactly at the preload boundary — load immediately.
-    assert!(calculate_wait_time(boundary, CompactDuration::new(30)).is_zero());
     Ok(())
 }
 

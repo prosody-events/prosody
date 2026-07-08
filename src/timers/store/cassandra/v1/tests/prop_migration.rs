@@ -307,7 +307,8 @@ async fn setup_v3_state(
         let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
         // Slab metadata is normally written by the scheduler actor; this
         // fixture writes it directly so the migration test sees the slabs.
-        Box::pin(store.insert_slab(slab))
+        store
+            .insert_slab(slab)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 slab: {e:?}"))?;
 
@@ -316,7 +317,8 @@ async fn setup_v3_state(
             trigger_data.time,
             trigger_data.timer_type,
         );
-        Box::pin(store.add_trigger(trigger))
+        store
+            .add_trigger(trigger)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to add V3 trigger: {e:?}"))?;
     }
@@ -372,6 +374,43 @@ async fn verify_segment_metadata(
     Ok(())
 }
 
+/// Collects every trigger the key index holds for each distinct key in the
+/// model, flattened into `(key, time, timer_type)` tuples.
+///
+/// The key index is the authoritative surface after migration; both the
+/// data-preservation and dual-index checks read it the same way.
+async fn collect_key_index_triggers(
+    store: &TableAdapter<CassandraTriggerStore>,
+    model: &MigrationModel,
+) -> color_eyre::Result<HashSet<(Key, CompactDateTime, TimerType)>> {
+    let mut triggers = HashSet::default();
+    let mut seen_keys = HashSet::default();
+
+    for (key, ..) in &model.triggers {
+        if !seen_keys.insert(key.clone()) {
+            continue;
+        }
+
+        for &timer_type in TimerType::VARIANTS {
+            let found: Vec<Trigger> = store
+                .get_key_triggers(timer_type, key)
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!(
+                        "Failed to get key triggers for {key} {timer_type:?}: {e:?}"
+                    )
+                })?;
+
+            for trigger in found {
+                triggers.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
+            }
+        }
+    }
+
+    Ok(triggers)
+}
+
 /// Verifies invariant 2: All triggers are preserved with correct `timer_type`.
 ///
 /// Builds actual trigger set from store and compares to model.
@@ -383,36 +422,7 @@ async fn verify_data_preservation(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
 ) -> color_eyre::Result<()> {
-    let mut actual_triggers = HashSet::default();
-
-    // Collect all triggers from key index (authoritative)
-    let mut seen_keys = HashSet::default();
-
-    for (key, ..) in &model.triggers {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        seen_keys.insert(key.clone());
-
-        // Get triggers for all timer types
-        for &timer_type in TimerType::VARIANTS {
-            let triggers: Vec<Trigger> = store
-                .get_key_triggers(timer_type, key)
-                .try_collect()
-                .await
-                .map_err(|e| {
-                    color_eyre::eyre::eyre!(
-                        "Failed to get key triggers for {} {:?}: {e:?}",
-                        key,
-                        timer_type
-                    )
-                })?;
-
-            for trigger in triggers {
-                actual_triggers.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
-            }
-        }
-    }
+    let actual_triggers = collect_key_index_triggers(store, model).await?;
 
     if actual_triggers != model.triggers {
         let missing: Vec<_> = model.triggers.difference(&actual_triggers).collect();
@@ -506,31 +516,7 @@ async fn verify_dual_index_consistency(
     }
 
     // Collect from key index
-    let mut key_triggers = HashSet::default();
-    let mut seen_keys = HashSet::default();
-
-    for (key, ..) in &model.triggers {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        seen_keys.insert(key.clone());
-
-        for &timer_type in TimerType::VARIANTS {
-            let triggers: Vec<Trigger> = store
-                .get_key_triggers(timer_type, key)
-                .try_collect()
-                .await
-                .map_err(|e| {
-                    color_eyre::eyre::eyre!(
-                        "Failed to get key triggers for dual-index check: {e:?}"
-                    )
-                })?;
-
-            for trigger in triggers {
-                key_triggers.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
-            }
-        }
-    }
+    let key_triggers = collect_key_index_triggers(store, model).await?;
 
     if slab_triggers != key_triggers {
         let missing_in_key: Vec<_> = slab_triggers.difference(&key_triggers).collect();

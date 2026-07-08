@@ -9,15 +9,17 @@ async fn test_get_or_create_segment_new() -> Result<()> {
     let test_segment = test_segment("test-segment", 60_u32);
     let store = memory_store(test_segment.clone());
 
-    let segment = get_or_create_segment(&store, "test-segment").await?;
+    let segment = get_or_create_segment(&store).await?;
     assert_eq!(segment.id, test_segment.id);
     assert_eq!(segment.name, test_segment.name);
     assert_eq!(segment.slab_size, test_segment.slab_size);
+    assert_eq!(segment.version, test_segment.version);
 
     let retrieved = store.get_segment().await?;
     let retrieved = retrieved.ok_or_else(|| eyre::eyre!("Expected segment to be stored"))?;
     assert_eq!(retrieved.id, test_segment.id);
     assert_eq!(retrieved.name, test_segment.name);
+    assert_eq!(retrieved.version, test_segment.version);
     Ok(())
 }
 
@@ -26,12 +28,13 @@ async fn test_get_or_create_segment_existing() -> Result<()> {
     let test_segment = test_segment("test-segment", 60_u32);
     let store = memory_store(test_segment.clone());
 
-    let segment1 = get_or_create_segment(&store, "first-segment").await?;
-    let segment2 = get_or_create_segment(&store, "second-segment").await?;
+    let segment1 = get_or_create_segment(&store).await?;
+    let segment2 = get_or_create_segment(&store).await?;
 
-    // Should return the first segment (existing one; name unchanged).
+    // Second call returns the existing segment unchanged.
     assert_eq!(segment1.id, segment2.id);
     assert_eq!(segment1.name, segment2.name);
+    assert_eq!(segment1.version, segment2.version);
     Ok(())
 }
 
@@ -43,7 +46,7 @@ async fn test_get_or_create_segment_concurrent() -> Result<()> {
     let futures: Vec<_> = (0_i32..10_i32)
         .map(|_| {
             let store_clone = store.clone();
-            async move { get_or_create_segment(&store_clone, "concurrent-test").await }
+            async move { get_or_create_segment(&store_clone).await }
         })
         .collect();
 

@@ -73,7 +73,6 @@ pub(crate) async fn setup_timer_manager() -> Result<(
     let telemetry = Telemetry::new();
 
     let config = TimerManagerConfig {
-        name: "test-manager".to_owned(),
         store,
         telemetry: telemetry.partition_sender(Topic::from("test"), 0),
         source: Arc::from(""),

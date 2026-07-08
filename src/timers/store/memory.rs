@@ -686,13 +686,6 @@ impl TriggerOperations for InMemoryTriggerStore {
 ///
 /// Returns an implementation of `TriggerStore` backed by in-memory data
 /// structures. This is the recommended way to create an in-memory store.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let store = memory_store(segment);
-/// let manager = TimerManager::new(..., store);
-/// ```
 #[must_use]
 pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
     TableAdapter::new(InMemoryTriggerStore::new(segment))

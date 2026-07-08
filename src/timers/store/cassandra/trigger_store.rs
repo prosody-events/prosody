@@ -133,103 +133,36 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    // Note: This method handles a complex edge case due to the mismatch between
-    // SlabId (u32) and the database storage (i32).
-    //
-    // Problem: SlabId is u32 (0 to 4,294,967,295) but Cassandra stores slab_id as
-    // int (i32). When we convert u32 to i32 using byte reinterpretation:
-    // - u32 values 0 to 2,147,483,647 → positive i32 values
-    // - u32 values 2,147,483,648 to 4,294,967,295 → negative i32 values
-    //
-    // This causes "wrap-around" where a range like [2,147,483,640, 2,147,483,660]
-    // becomes [2,147,483,640, -2,147,483,636] in signed representation.
-    // A single SQL query "WHERE slab_id >= start AND slab_id <= end" fails when
-    // start > end.
-    //
-    // Solution: Detect wrap-around and split into two queries:
-    // 1. slab_id >= start AND slab_id <= i32::MAX (for low u32 values, positive
-    //    i32)
-    // 2. slab_id >= i32::MIN AND slab_id <= end (for high u32 values, negative i32)
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
         let segment_id = self.segment.id;
         try_stream! {
-            // First, validate that this is a proper range in u32 space
-            // If start > end in u32 terms, this is an invalid range and we should return
-            // nothing
+            // An invalid range (start > end in u32 terms) yields nothing.
             if range.start() > range.end() {
-                // Invalid range - return empty stream
                 return;
             }
 
             let start = i32::from_le_bytes(range.start().to_le_bytes());
             let end = i32::from_le_bytes(range.end().to_le_bytes());
 
-            // Detect wrap-around: start > end in signed representation means the range
-            // crosses the u32/i32 boundary (around 2^31), not that it's an invalid range
-            if start > end {
-                // Wrap-around case: split into two queries to cover the full range
-
-                // Query 1: Handle the "low" u32 values that remain as positive i32 values
-                // This covers slab_id >= start up to the maximum i32 value
-                let stream1 = self
-                    .session()
-                    .execute_iter(
-                        self.queries().get_slab_range.clone(),
-                        (segment_id, start, i32::MAX),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                    .rows_stream::<(Option<i32>,)>()
-                    .map_err(CassandraStoreError::from)?;
-
-                pin_mut!(stream1);
-                while let Some((value,)) = cooperative(stream1.try_next())
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                {
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    yield SlabId::from_le_bytes(value.to_le_bytes())
-                }
-
-                // Query 2: Handle the "high" u32 values that appear as negative i32 values
-                // This covers from minimum i32 value up to slab_id <= end
-                let stream2 = self
-                    .session()
-                    .execute_iter(
-                        self.queries().get_slab_range.clone(),
-                        (segment_id, i32::MIN, end),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                    .rows_stream::<(Option<i32>,)>()
-                    .map_err(CassandraStoreError::from)?;
-
-                pin_mut!(stream2);
-                while let Some((value,)) = cooperative(stream2.try_next())
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                {
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    yield SlabId::from_le_bytes(value.to_le_bytes())
-                }
+            // Reinterpreting a u32 range as i32 bytes can flip `start > end`
+            // even though the u32 range above was valid: u32 values at or
+            // past 2^31 become negative i32 values, so a range straddling
+            // that boundary needs two queries — one for the (still
+            // positive) low half up to `i32::MAX`, one for the (now
+            // negative) high half from `i32::MIN`.
+            let bounds: [Option<(i32, i32)>; 2] = if start > end {
+                [Some((start, i32::MAX)), Some((i32::MIN, end))]
             } else {
-                // Normal case: no wrap-around, single query is sufficient
-                // Both start and end have the same sign in i32 representation
+                [Some((start, end)), None]
+            };
+
+            for (lo, hi) in bounds.into_iter().flatten() {
                 let stream = self
                     .session()
-                    .execute_iter(
-                        self.queries().get_slab_range.clone(),
-                        (segment_id, start, end),
-                    )
+                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, lo, hi))
                     .await
                     .map_err(CassandraStoreError::from)?
                     .rows_stream::<(Option<i32>,)>()
@@ -240,11 +173,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     .await
                     .map_err(CassandraStoreError::from)?
                 {
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    yield SlabId::from_le_bytes(value.to_le_bytes())
+                    let Some(value) = value else { continue };
+                    yield SlabId::from_le_bytes(value.to_le_bytes());
                 }
             }
         }
@@ -1313,7 +1243,7 @@ fn advance_inline<'a>(
 }
 
 /// Returns the next clustering trigger, skipping NULL static-only rows.
-pub(super) async fn advance_clustering(
+async fn advance_clustering(
     key: &Key,
     stream: &mut (
              impl Stream<

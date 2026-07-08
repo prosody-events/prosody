@@ -20,7 +20,7 @@ pub mod common;
 pub mod contention;
 /// Tests for operations spanning multiple slabs.
 pub mod cross_slab;
-/// Property-based tests for V2 high-level dual-index operations.
+/// Property-based tests for the high-level dual-index trigger operations.
 pub mod prop_high_level;
 /// Property-based tests for key trigger table operations.
 pub mod prop_key_triggers;
@@ -36,8 +36,6 @@ pub mod prop_slab_triggers;
 pub mod sequential_interleavings;
 /// Tests for slab-related functionality in the trigger store.
 pub mod slabs;
-/// Tests verifying trigger consistency across operations.
-pub mod trigger_consistency;
 /// Tests for basic trigger add/remove/clear operations.
 pub mod trigger_operations;
 
@@ -296,15 +294,6 @@ macro_rules! trigger_store_tests {
         }
 
         #[test]
-        fn test_trigger_consistency() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new()$(.tests($test_count))?.quickcheck(
-                prop_trigger_consistency
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
         fn test_operation_sequences() {
             let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new()$(.tests($test_count))?.quickcheck(
@@ -547,33 +536,6 @@ macro_rules! trigger_store_tests {
             };
 
             match runtime.block_on(tests::trigger_operations::test_trigger_operations(
-                &store, &input,
-            ).instrument(span)) {
-                Ok(()) => TestResult::passed(),
-                Err(e) => TestResult::error(e),
-            }
-        }
-
-        fn prop_trigger_consistency(input: tests::TriggerTestInput) -> TestResult {
-            use tracing::Instrument;
-
-            if input.triggers.is_empty() {
-                return TestResult::discard();
-            }
-
-            let runtime = &*TEST_RUNTIME;
-
-            // Capture the current span to propagate into async runtime
-            let span = tracing::Span::current();
-
-            // Create store instance with segment's slab_size
-            let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
-                Ok(s) => s,
-                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
-            };
-
-            match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
                 &store, &input,
             ).instrument(span)) {
                 Ok(()) => TestResult::passed(),

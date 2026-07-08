@@ -183,9 +183,10 @@ impl Segment {
     /// Canonical per-Kafka-partition segment: id derived from
     /// `{group}:{topic}/{partition}`, schema V3.
     ///
-    /// Single source of the formula so every reader of a partition's timer
-    /// rows — the partition loop and the keyed-state commit oracle — names
-    /// the same segment.
+    /// Single source of the formula; the partition loop calls it once per
+    /// acquisition, and the keyed-state commit oracle shares the resulting
+    /// segment by holding a clone of the same store handle (never by
+    /// re-deriving the id).
     #[must_use]
     pub fn for_partition(
         group_id: &str,
@@ -206,13 +207,11 @@ impl Segment {
 /// Factory for segment-scoped [`TriggerStore`] instances.
 ///
 /// Holds shared resources and creates per-segment stores; store creation is
-/// synchronous. For Cassandra the shared resources are the session and
-/// prepared statements; for the in-memory store they are the shared maps —
-/// the durable substrate memory mode keeps across store mints, so stores
-/// created for the same segment observe the same rows. The keyed-state
-/// commit oracle never mints its own store here: it receives a clone of the
-/// partition's store handle (see
-/// [`StateBackendFactory::for_partition`](crate::state::StateBackendFactory::for_partition)).
+/// synchronous. Implementations must ensure that stores minted for the same
+/// segment observe each other's durable writes — see each provider's own
+/// doc for how (e.g.
+/// [`InMemoryTriggerStoreProvider`](memory::InMemoryTriggerStoreProvider),
+/// [`CassandraTriggerStoreProvider`](cassandra::CassandraTriggerStoreProvider)).
 pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
     /// The store type created by this provider.
     type Store: TriggerStore;

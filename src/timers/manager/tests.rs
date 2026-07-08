@@ -59,7 +59,6 @@ async fn test_new_timer_manager_creation() -> Result<()> {
 
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let config = TimerManagerConfig {
-        name: "test-creation".to_owned(),
         store,
         telemetry: telemetry.partition_sender(Topic::from("test"), 0),
         source: Arc::from(""),

@@ -71,8 +71,9 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 
     /// Decompose into the raw [`Trigger`] and the commit guard.
     ///
-    /// Useful for advanced scenarios needing direct control over commit
-    /// or abort without consuming the wrapper.
+    /// Useful for advanced scenarios that need the `Trigger` and the
+    /// commit/abort capability as two independent values (e.g. moving the
+    /// `Trigger` into a WAL record while retaining the guard).
     ///
     /// # Returns
     ///
@@ -117,9 +118,9 @@ where
     uncommitted: UncommittedTrigger<T>,
 }
 
-/// A wrapper around [`UncommittedTrigger`] that implements [`Uncommitted`].
+/// A wrapper around `UncommittedTrigger` that implements [`Uncommitted`].
 ///
-/// This wrapper is necessary because [`UncommittedTrigger`] implements [`Drop`]
+/// This wrapper is necessary because `UncommittedTrigger` implements [`Drop`]
 /// and [`Uncommitted`] requires consuming `self`.
 pub struct UncommittedTriggerGuard<T>
 where
@@ -133,7 +134,7 @@ where
 ///
 /// Tracks whether the timer has been completed and delegates commit/abort
 /// operations to the [`TimerManager`].
-pub struct UncommittedTrigger<T>
+struct UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
@@ -155,6 +156,12 @@ where
     /// Global timer semaphore permit; released when this trigger is dropped.
     _permit: OwnedSemaphorePermit,
 }
+
+/// RAII guard that releases timer processing resources (spans) on drop.
+///
+/// Ensures deterministic cleanup when timer processing completes, rather than
+/// waiting for unpredictable garbage collection timing.
+pub struct TriggerProcessGuard(Arc<ArcSwap<Span>>);
 
 impl<T> PendingTimer<T>
 where
@@ -234,8 +241,8 @@ where
 {
     /// Returns a reference to the underlying [`Trigger`].
     ///
-    /// The trigger's `tag` field carries the canonical commit-oracle identity
-    /// at the moment this timer was dispatched via [`PendingTimer::fire()`].
+    /// See [`PendingTimer::fire`] for what the trigger's `tag` field means
+    /// here.
     #[must_use]
     pub fn trigger(&self) -> &Trigger {
         &self.trigger
@@ -340,12 +347,12 @@ where
     T: TriggerStore,
 {
     /// Attempt to transition the timer from `Scheduled` to `Firing` state,
-    /// returning the canonical tag if successful.
+    /// returning the value observed at the transition; see
+    /// [`PendingTimer::fire`] for what "canonical" means here.
     ///
     /// Returns `None` if the transition failed (timer was cancelled or is not
-    /// in `Scheduled` state). The returned tag is the value stored in
-    /// `ActiveTriggers` at the moment of the state transition.
-    pub async fn fire_with_tag(&self) -> Option<i32> {
+    /// in `Scheduled` state).
+    async fn fire_with_tag(&self) -> Option<i32> {
         self.manager
             .fire_with_tag(&self.key, self.time, self.timer_type)
             .await
@@ -355,7 +362,7 @@ where
     ///
     /// Retries indefinitely on failures, waiting `RETRY_DURATION` between
     /// attempts. Multiple commits or aborts are ignored.
-    pub async fn commit(&mut self) {
+    async fn commit(&mut self) {
         if self.completed {
             warn!("timer already marked as completed; ignoring commit");
             return;
@@ -383,7 +390,7 @@ where
     ///
     /// The timer can fire again if reloaded. Multiple aborts or commits
     /// are ignored.
-    pub async fn abort(&mut self) {
+    async fn abort(&mut self) {
         if self.completed {
             warn!("timer already marked as completed; ignoring abort");
             return;
@@ -438,12 +445,6 @@ where
         }
     }
 }
-
-/// RAII guard that releases timer processing resources (spans) on drop.
-///
-/// Ensures deterministic cleanup when timer processing completes, rather than
-/// waiting for unpredictable garbage collection timing.
-pub struct TriggerProcessGuard(Arc<ArcSwap<Span>>);
 
 impl Drop for TriggerProcessGuard {
     fn drop(&mut self) {

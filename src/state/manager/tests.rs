@@ -235,7 +235,6 @@ async fn timer_manager() -> Result<(
     let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let telemetry = Telemetry::new();
     let config = TimerManagerConfig {
-        name: "test".to_owned(),
         store,
         telemetry: telemetry.partition_sender(Topic::from("test"), 0),
         source: Arc::from(""),

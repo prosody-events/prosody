@@ -422,7 +422,6 @@ impl<P: Send + 'static> PartitionManager<P> {
 /// Returns `None` if shutdown is signaled before initialization succeeds.
 /// Arguments for [`init_timer_manager`] that don't depend on the store type.
 struct TimerInitContext<'a> {
-    name: &'a str,
     telemetry_sender: &'a TelemetrySender,
     group_id: &'a Arc<str>,
     timer_semaphores: &'a Arc<TimerSemaphores>,
@@ -444,7 +443,6 @@ where
         }
 
         let timer_config = TimerManagerConfig {
-            name: ctx.name.to_owned(),
             store: trigger_store.clone(),
             telemetry: ctx
                 .telemetry_sender
@@ -515,7 +513,6 @@ struct PartitionParams {
     allowed_events: Option<AhoCorasick>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
-    name: String,
     timer_spans: SpanRelation,
 }
 
@@ -556,7 +553,6 @@ async fn handle_messages<T, S, SP, P>(
         partition_info.partition,
         timer_slab_size,
     );
-    let name = segment.name.clone();
     let trigger_store = trigger_provider.create_store(segment);
 
     let Some(state_manager) = init_state_manager(
@@ -577,7 +573,6 @@ async fn handle_messages<T, S, SP, P>(
         allowed_events,
         timer_semaphores,
         telemetry_sender,
-        name,
         timer_spans,
     };
 
@@ -613,7 +608,6 @@ async fn run_partition<T, S, M, P>(
         allowed_events,
         timer_semaphores,
         telemetry_sender,
-        name,
         timer_spans,
     } = params;
     let PartitionContext {
@@ -634,7 +628,6 @@ async fn run_partition<T, S, M, P>(
     );
 
     let timer_ctx = TimerInitContext {
-        name: &name,
         telemetry_sender: &telemetry_sender,
         group_id: &group_id,
         timer_semaphores: &timer_semaphores,

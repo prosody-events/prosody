@@ -37,12 +37,12 @@ use std::sync::Arc;
 /// Per-key linearization (`KeyManager`) makes this coherent: no two
 /// `EventContext` operations for the same key run concurrently.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ActiveTriggerEntry {
+pub(crate) struct ActiveTriggerEntry {
     /// Lifecycle state of the timer.
-    pub state: TimerState,
+    pub(crate) state: TimerState,
     /// Random 32-bit identity; `0` for legacy/inline timers without a stored
     /// tag.
-    pub tag: i32,
+    pub(crate) tag: i32,
 }
 
 /// Point-in-time counts of active timers for metrics reporting.

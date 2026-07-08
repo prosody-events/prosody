@@ -47,17 +47,14 @@ use tracing::{Instrument, Span, debug};
 
 /// Configuration for a [`TimerManager`] instance.
 ///
-/// Bundles all stable configuration parameters — segment identity, storage
-/// backend, and telemetry context — so they can be passed as a single value to
-/// [`TimerManager::new`].
+/// Bundles all stable configuration parameters — storage backend and telemetry
+/// context — so they can be passed as a single value to [`TimerManager::new`].
 ///
 /// # Type Parameters
 ///
 /// * `T`: The [`TriggerStore`] backend for persistent timer data.
 #[derive(Clone)]
 pub struct TimerManagerConfig<T> {
-    /// Human-readable name for the segment.
-    pub name: String,
     /// Persistent storage backend for timer triggers.
     pub store: T,
     /// Partition-scoped telemetry sender for timer lifecycle events.
@@ -111,8 +108,7 @@ where
     ///
     /// # Arguments
     ///
-    /// * `config` - Stable configuration: segment identity, store, and
-    ///   telemetry context.
+    /// * `config` - Stable configuration: store and telemetry context.
     /// * `heartbeats` - Registry for monitoring timer scheduler liveness.
     /// * `shutdown_rx` - Watch channel signaling partition shutdown; the
     ///   scheduler actor exits at `>= ShutdownPhase::Draining`.
@@ -138,7 +134,7 @@ where
         semaphores: Arc<TimerSemaphores>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
-        let segment = get_or_create_segment(&config.store, &config.name).await?;
+        let segment = get_or_create_segment(&config.store).await?;
 
         // Initialize the unified scheduler actor — it owns slab metadata,
         // loading, cleanup, and the trigger queue. The manager keeps its

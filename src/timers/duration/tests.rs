@@ -10,28 +10,6 @@ fn test_new() {
 }
 
 #[test]
-fn test_add() {
-    let duration1 = CompactDuration::new(1000);
-    let duration2 = CompactDuration::new(2000);
-
-    // Adding two durations within range
-    let result = duration1.checked_add(duration2);
-    assert!(result.is_ok(), "Addition failed unexpectedly");
-    assert_eq!(
-        result.unwrap_or_else(|_| CompactDuration::new(0)).seconds(),
-        3000
-    );
-
-    // Adding durations that exceed the maximum range
-    let max_duration = CompactDuration::MAX;
-    let result = max_duration.checked_add(CompactDuration::new(1));
-    assert!(
-        matches!(result, Err(CompactDurationError::OutOfRange)),
-        "Expected OutOfRange error"
-    );
-}
-
-#[test]
 fn test_from_compact_duration_to_duration() {
     let compact_duration = CompactDuration::new(12345);
     let duration: Duration = compact_duration.into();
@@ -39,35 +17,11 @@ fn test_from_compact_duration_to_duration() {
 }
 
 #[test]
-fn test_try_from_duration_to_compact_duration() {
+fn test_try_from_duration_to_compact_duration() -> Result<()> {
     let duration = Duration::from_secs(12345);
-    let compact_duration = CompactDuration::try_from(duration);
-    assert!(compact_duration.is_ok(), "Conversion failed unexpectedly");
-    assert_eq!(
-        compact_duration
-            .unwrap_or_else(|_| CompactDuration::new(0))
-            .seconds(),
-        12345
-    );
-
-    // Test with a duration that exceeds the maximum range
-    let large_duration = Duration::from_secs(u64::from(u32::MAX) + 1);
-    let result = CompactDuration::try_from(large_duration);
-    assert!(
-        matches!(result, Err(CompactDurationError::OutOfRange)),
-        "Expected OutOfRange error"
-    );
-
-    // Test rounding up when nanoseconds are >= 500_000_000
-    let duration_with_nanos = Duration::new(12345, 500_000_000);
-    let compact_duration = CompactDuration::try_from(duration_with_nanos);
-    assert!(compact_duration.is_ok(), "Rounding failed unexpectedly");
-    assert_eq!(
-        compact_duration
-            .unwrap_or_else(|_| CompactDuration::new(0))
-            .seconds(),
-        12346
-    );
+    let compact_duration = CompactDuration::try_from(duration)?;
+    assert_eq!(compact_duration.seconds(), 12345);
+    Ok(())
 }
 
 #[test]
@@ -88,17 +42,6 @@ fn test_debug() {
 fn test_constants() {
     assert_eq!(CompactDuration::MAX.seconds(), u32::MAX);
     assert_eq!(CompactDuration::MIN.seconds(), u32::MIN);
-}
-
-#[test]
-fn test_edge_cases() {
-    // Test with zero duration
-    let zero_duration = CompactDuration::new(0);
-    assert_eq!(zero_duration.seconds(), 0);
-
-    // Test with maximum duration
-    let max_duration = CompactDuration::MAX;
-    assert_eq!(max_duration.seconds(), u32::MAX);
 }
 
 #[test]
@@ -176,18 +119,12 @@ fn test_hash_trait() {
 }
 
 #[test]
-fn test_copy_clone_behavior() {
+fn test_copy_behavior() {
     let original = CompactDuration::new(1234);
 
-    // Test Copy trait (implicit)
     let copied = original;
     assert_eq!(copied.seconds(), 1234);
     assert_eq!(original.seconds(), 1234); // Original should still be usable
-
-    // Test Clone trait (explicit)
-    let cloned = original;
-    assert_eq!(cloned.seconds(), 1234);
-    assert_eq!(original.seconds(), 1234);
 }
 
 #[test]
@@ -195,6 +132,14 @@ fn test_checked_add_edge_cases() -> Result<()> {
     let zero = CompactDuration::new(0);
     let some_duration = CompactDuration::new(1000);
     let max_duration = CompactDuration::MAX;
+
+    // Basic non-boundary sum
+    assert_eq!(
+        CompactDuration::new(1000)
+            .checked_add(CompactDuration::new(2000))?
+            .seconds(),
+        3000
+    );
 
     // Adding zero should not change the value
     assert_eq!(some_duration.checked_add(zero)?.seconds(), 1000);
@@ -271,12 +216,6 @@ fn test_add_operator() {
     let b = CompactDuration::new(2000);
     let result = a + b;
     assert_eq!(result.seconds(), 3000);
-
-    // Test overflow saturation
-    let max = CompactDuration::MAX;
-    let one = CompactDuration::new(1);
-    let result = max + one;
-    assert_eq!(result, CompactDuration::MAX);
 }
 
 #[test]
@@ -368,6 +307,11 @@ fn prop_i32_round_trip(a: CompactDuration) -> bool {
 }
 
 #[quickcheck]
+fn prop_is_zero_iff_seconds_zero(a: CompactDuration) -> bool {
+    a.is_zero() == (a.seconds() == 0)
+}
+
+#[quickcheck]
 fn prop_add_commutative(a: CompactDuration, b: CompactDuration) -> bool {
     a + b == b + a
 }
@@ -444,7 +388,6 @@ fn test_edge_case_operations() {
     assert_eq!(min + one, one);
 
     // MAX operations
-    assert_eq!(max + one, max); // Saturates
     assert_eq!(max - one, CompactDuration::new(u32::MAX - 1));
     assert_eq!(max - max, min);
 
@@ -454,14 +397,12 @@ fn test_edge_case_operations() {
     assert_eq!(min + max, max);
 }
 
-#[test]
-fn test_operator_equivalence() {
-    let a = CompactDuration::new(1000);
-    let b = CompactDuration::new(500);
-
-    // Add operator should be equivalent to saturating_add
-    assert_eq!(a + b, a.saturating_add(b));
-
-    // Sub operator should be equivalent to saturating_sub
-    assert_eq!(a - b, a.saturating_sub(b));
+/// The `+`/`-` operators are defined as `saturating_add`/`saturating_sub`.
+/// Proving that delegation over the full domain pins the saturating boundary
+/// (`MAX + x`, `MIN - x`, reached about half the time by the full-`u32`
+/// generator) for both operators — a `wrapping_add`/`wrapping_sub` regression
+/// would diverge from the method and fail here.
+#[quickcheck]
+fn prop_operators_delegate_to_saturating(a: CompactDuration, b: CompactDuration) -> bool {
+    a + b == a.saturating_add(b) && a - b == a.saturating_sub(b)
 }

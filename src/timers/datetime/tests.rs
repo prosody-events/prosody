@@ -19,12 +19,6 @@ fn test_now() {
 }
 
 #[test]
-fn test_epoch_seconds() {
-    let dt = compact_datetime_from_epoch(12345_u32);
-    assert_eq!(dt.epoch_seconds(), 12345_u32);
-}
-
-#[test]
 fn test_duration_since() {
     let earlier = compact_datetime_from_epoch(1000_u32);
     let later = compact_datetime_from_epoch(2000_u32);
@@ -72,10 +66,6 @@ fn test_add_duration() {
     if let Ok(new_dt) = new_dt {
         assert_eq!(new_dt.epoch_seconds(), 1500_u32);
     }
-
-    let max_dt = CompactDateTime::MAX;
-    let result = max_dt.add_duration(duration);
-    assert!(matches!(result, Err(CompactDateTimeError::OutOfRange)));
 }
 
 #[test]
@@ -89,18 +79,6 @@ fn test_try_from_datetime() {
 
         if let Ok(compact_dt) = compact_dt {
             assert_eq!(compact_dt.epoch_seconds(), 12345_u32);
-        }
-    }
-
-    let datetime_with_nanos = Utc.timestamp_opt(12345, 500_000_000).single();
-    assert!(datetime_with_nanos.is_some(), "Failed to create datetime");
-
-    if let Some(datetime_with_nanos) = datetime_with_nanos {
-        let compact_dt = CompactDateTime::try_from(datetime_with_nanos);
-        assert!(compact_dt.is_ok(), "Failed to convert from DateTime");
-
-        if let Ok(compact_dt) = compact_dt {
-            assert_eq!(compact_dt.epoch_seconds(), 12346_u32);
         }
     }
 
@@ -201,16 +179,11 @@ fn test_from_u32() {
 }
 
 #[test]
-fn test_from_i32() {
-    let compact_dt = CompactDateTime::from(12345_i32);
-    assert_eq!(compact_dt.epoch_seconds(), 12345_u32);
-}
-
-#[test]
-fn test_from_compact_datetime_to_i32() {
-    let compact_dt = compact_datetime_from_epoch(12345_u32);
-    let value: i32 = compact_dt.into();
-    assert_eq!(value, 12345_i32);
+fn test_from_i32_negative_wraps_to_max_u32() {
+    // Illustrates the little-endian byte-reinterpretation: a negative i32
+    // becomes a large u32, not a saturated/clamped value.
+    let compact_dt = CompactDateTime::from(-1_i32);
+    assert_eq!(compact_dt.epoch_seconds(), u32::MAX);
 }
 
 #[test]
@@ -225,36 +198,6 @@ fn test_debug() {
     let compact_dt = compact_datetime_from_epoch(12345_u32);
     let debug = format!("{compact_dt:?}");
     assert_eq!(debug, "1970-01-01T03:25:45Z");
-}
-
-#[test]
-fn test_subtract_duration() {
-    let dt = compact_datetime_from_epoch(2000_u32);
-    let duration = CompactDuration::new(500_u32);
-
-    let new_dt = dt.subtract_duration(duration);
-    assert!(new_dt.is_ok(), "Failed to subtract duration");
-
-    if let Ok(new_dt) = new_dt {
-        assert_eq!(new_dt.epoch_seconds(), 1500_u32);
-    }
-
-    // Test underflow
-    let min_dt = CompactDateTime::MIN;
-    let result = min_dt.subtract_duration(duration);
-    assert!(matches!(result, Err(CompactDateTimeError::OutOfRange)));
-
-    // Test edge case: subtract from exact minimum
-    let one_sec_dt = compact_datetime_from_epoch(1_u32);
-    let one_sec_duration = CompactDuration::new(1_u32);
-    let result = one_sec_dt.subtract_duration(one_sec_duration);
-    assert!(
-        result.is_ok(),
-        "Should be able to subtract 1 second from epoch + 1"
-    );
-    if let Ok(result_dt) = result {
-        assert_eq!(result_dt.epoch_seconds(), 0_u32);
-    }
 }
 
 #[test]
@@ -320,59 +263,6 @@ fn test_try_from_datetime_error_cases() {
 }
 
 #[test]
-fn test_from_i32_edge_cases() {
-    // Test positive i32 value
-    let positive_compact_dt = CompactDateTime::from(12345_i32);
-    assert_eq!(positive_compact_dt.epoch_seconds(), 12345_u32);
-
-    // Test negative i32 value (should be interpreted as large u32 due to byte
-    // conversion)
-    let negative_compact_dt = CompactDateTime::from(-1_i32);
-    assert_eq!(negative_compact_dt.epoch_seconds(), u32::MAX);
-
-    // Test max positive i32
-    let max_positive_i32 = CompactDateTime::from(i32::MAX);
-    assert_eq!(max_positive_i32.epoch_seconds(), i32::MAX as u32);
-
-    // Test min negative i32 (most negative value)
-    let min_negative_i32 = CompactDateTime::from(i32::MIN);
-    assert_eq!(min_negative_i32.epoch_seconds(), 2_147_483_648_u32); // 2^31
-}
-
-#[test]
-fn test_from_compact_datetime_to_i32_edge_cases() {
-    // Test conversion of large u32 values to i32
-    let large_compact_dt = compact_datetime_from_epoch(u32::MAX);
-    let converted: i32 = large_compact_dt.into();
-    assert_eq!(converted, -1_i32);
-
-    // Test roundtrip conversion
-    let original_i32 = -12345_i32;
-    let compact_dt = CompactDateTime::from(original_i32);
-    let converted_back: i32 = compact_dt.into();
-    assert_eq!(converted_back, original_i32);
-}
-
-#[test]
-fn test_boundary_dates() {
-    // Test Unix epoch (1970-01-01 00:00:00 UTC)
-    let epoch = compact_datetime_from_epoch(0_u32);
-    let epoch_datetime: DateTime<Utc> = epoch.into();
-    assert_eq!(epoch_datetime.timestamp(), 0);
-
-    // Test year 2038 boundary (famous 32-bit timestamp limit for signed integers)
-    let y2038_timestamp = 2_147_483_647_u32; // 2038-01-19 03:14:07 UTC
-    let y2038 = compact_datetime_from_epoch(y2038_timestamp);
-    let y2038_datetime: DateTime<Utc> = y2038.into();
-    assert_eq!(y2038_datetime.timestamp(), i64::from(y2038_timestamp));
-
-    // Test maximum representable date (2106-02-07 06:28:15 UTC)
-    let max = CompactDateTime::MAX;
-    let max_datetime: DateTime<Utc> = max.into();
-    assert_eq!(max_datetime.timestamp(), i64::from(u32::MAX));
-}
-
-#[test]
 fn test_duration_edge_cases() {
     // Test duration between MIN and MAX
     let duration = CompactDateTime::MAX.duration_since(CompactDateTime::MIN);
@@ -426,6 +316,11 @@ fn prop_compact_datetime_roundtrip(epoch_seconds: u32) -> bool {
 }
 
 #[quickcheck]
+fn prop_i32_roundtrip(value: i32) -> bool {
+    i32::from(CompactDateTime::from(value)) == value
+}
+
+#[quickcheck]
 fn prop_add_duration_increases_time(epoch_seconds: u32, duration_seconds: u32) -> bool {
     let compact_dt = CompactDateTime::from(epoch_seconds);
     let duration = CompactDuration::new(duration_seconds);
@@ -434,40 +329,13 @@ fn prop_add_duration_increases_time(epoch_seconds: u32, duration_seconds: u32) -
     if let Some(expected_sum) = epoch_seconds.checked_add(duration_seconds) {
         // If addition does not overflow, ensure the result matches
         match compact_dt.add_duration(duration) {
-            Ok(new_dt) => {
-                new_dt.epoch_seconds() == expected_sum
-                    && (duration_seconds == 0 || new_dt.epoch_seconds() >= epoch_seconds)
-            }
+            Ok(new_dt) => new_dt.epoch_seconds() == expected_sum,
             Err(_) => false, // Unexpected error
         }
     } else {
         // If addition would overflow, ensure an error is returned
         matches!(
             compact_dt.add_duration(duration),
-            Err(CompactDateTimeError::OutOfRange)
-        )
-    }
-}
-
-#[quickcheck]
-fn prop_subtract_duration_decreases_time(epoch_seconds: u32, duration_seconds: u32) -> bool {
-    let compact_dt = CompactDateTime::from(epoch_seconds);
-    let duration = CompactDuration::new(duration_seconds);
-
-    // Simulate the expected behavior of CompactDateTime::subtract_duration
-    if let Some(expected_diff) = epoch_seconds.checked_sub(duration_seconds) {
-        // If subtraction does not underflow, ensure the result matches
-        match compact_dt.subtract_duration(duration) {
-            Ok(new_dt) => {
-                new_dt.epoch_seconds() == expected_diff
-                    && (duration_seconds == 0 || new_dt.epoch_seconds() <= epoch_seconds)
-            }
-            Err(_) => false, // Unexpected error
-        }
-    } else {
-        // If subtraction would underflow, ensure an error is returned
-        matches!(
-            compact_dt.subtract_duration(duration),
             Err(CompactDateTimeError::OutOfRange)
         )
     }

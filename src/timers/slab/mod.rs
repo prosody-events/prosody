@@ -29,28 +29,15 @@ pub struct Slab {
 }
 
 impl Slab {
-    /// Creates a new slab with explicit parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The numeric slab identifier.
-    /// * `size` - The duration each slab covers.
+    /// Creates a new slab with the given ID and size.
     #[must_use]
     pub fn new(id: SlabId, size: CompactDuration) -> Self {
         Slab { id, size }
     }
 
-    /// Calculates which slab contains the specified time.
+    /// Calculates which slab contains `time`, for a given slab `size`.
     ///
-    /// # Arguments
-    ///
-    /// * `size` - The duration each slab covers.
-    /// * `time` - The timestamp to locate.
-    ///
-    /// # Returns
-    ///
-    /// A [`Slab`] whose time range includes `time`. If `size.seconds() == 0`,
-    /// returns slab ID 0 to avoid division by zero.
+    /// Returns slab ID `0` if `size.seconds() == 0`, to avoid division by zero.
     #[must_use]
     pub fn from_time(size: CompactDuration, time: CompactDateTime) -> Self {
         let epoch_secs = time.epoch_seconds();
@@ -91,54 +78,14 @@ impl Slab {
         start.into()..end.into()
     }
 
-    /// Advances the slab ID by the given amount.
-    ///
-    /// # Arguments
-    ///
-    /// * `number` - Amount to add to the current slab ID.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Slab)` with `id = self.id + number` if no overflow occurs.
-    /// - `None` if the addition would overflow [`u32`].
-    #[must_use]
-    pub fn add(&self, number: u32) -> Option<Slab> {
-        let mut slab = self.clone();
-        slab.id = self.id.checked_add(number)?;
-        Some(slab)
-    }
-
-    /// Moves the slab ID backward by the given amount.
-    ///
-    /// # Arguments
-    ///
-    /// * `number` - Amount to subtract from the current slab ID.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Slab)` with `id = self.id - number` if no underflow occurs.
-    /// - `None` if the subtraction would underflow [`u32`].
-    #[must_use]
-    pub fn sub(&self, number: u32) -> Option<Slab> {
-        let mut slab = self.clone();
-        slab.id = self.id.checked_sub(number)?;
-        Some(slab)
-    }
-
-    /// Returns the slab immediately following this one.
-    ///
-    /// Equivalent to `self.add(1)`.
+    /// Returns the slab immediately following this one, or `None` if the
+    /// slab ID would overflow [`u32`].
     #[must_use]
     pub fn next(&self) -> Option<Slab> {
-        self.add(1)
-    }
-
-    /// Returns the slab immediately preceding this one.
-    ///
-    /// Equivalent to `self.sub(1)`.
-    #[must_use]
-    pub fn previous(&self) -> Option<Slab> {
-        self.sub(1)
+        Some(Slab {
+            id: self.id.checked_add(1)?,
+            size: self.size,
+        })
     }
 }
 
