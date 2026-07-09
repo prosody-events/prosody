@@ -45,29 +45,20 @@ fn key_for(seed: u8) -> (StateType, &'static str) {
 }
 
 /// Builds the wire identity row a `(key, identity)` seed pair names. The
-/// `kind`/`codec_id`/`resolver_id`/`key_codec_id` axes vary independently
-/// (including unknown discriminants and a present/absent resolver and key
-/// codec) so collisions on a key carry genuinely different identities — and the
-/// populated `key_codec_id` column path gets coverage over both backends.
+/// `kind`/`format_id`/`key_format_id` axes vary independently (including
+/// unknown discriminants) so collisions on a key carry genuinely different
+/// identities.
 fn row_for(key_seed: u8, ident_seed: u8) -> DurableDescriptorIdentity {
     let (state_type, name) = key_for(key_seed);
     let kind = [1_i8, 2, 7][usize::from(ident_seed) % 3];
-    let codec_id = ["json", "binary", "message-ref"][usize::from(ident_seed >> 2_u8) % 3];
-    let resolver_id = match (ident_seed >> 4_u8) % 3 {
-        0 => None,
-        1 => Some("message-ref".to_owned()),
-        _ => Some("other".to_owned()),
-    };
-    // A spare seed bit toggles the key codec present/absent, so both backends
-    // exercise the populated and the NULL `key_codec_id` column.
-    let key_codec_id = ((ident_seed >> 6_u8) & 1 == 1).then(|| "key-json".to_owned());
+    let format_id = ["json", "binary", "message-ref"][usize::from(ident_seed >> 2_u8) % 3];
+    let key_format_id = ["unit.v1", "utf8.v1"][usize::from((ident_seed >> 6_u8) & 1)];
     DurableDescriptorIdentity {
         state_type: state_type.into(),
         name: name.to_owned(),
         kind,
-        resolver_id,
-        codec_id: codec_id.to_owned(),
-        key_codec_id,
+        format_id: format_id.to_owned(),
+        key_format_id: key_format_id.to_owned(),
     }
 }
 
@@ -209,7 +200,7 @@ where
     // Two rows on the same key with deliberately different identities.
     let a = row_for(key_seed, 0);
     let b = DurableDescriptorIdentity {
-        codec_id: "deliberately-different".to_owned(),
+        format_id: "deliberately-different".to_owned(),
         ..a.clone()
     };
     if a == b {

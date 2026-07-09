@@ -22,7 +22,7 @@ impl Codec for JsonCodec {
     type Error = JsonCodecError;
     type Payload = serde_json::Value;
 
-    const CODEC_ID: &'static str = "json";
+    const FORMAT_ID: &'static str = "json";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         #[cfg(target_arch = "arm")]

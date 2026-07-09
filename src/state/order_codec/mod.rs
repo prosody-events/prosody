@@ -19,7 +19,7 @@ use thiserror::Error;
 /// equalities pin `Payload = Key` — under the **byte-identity law**:
 /// `serialize` writes exactly `encode`'s bytes and `deserialize` is `decode`.
 /// A key can therefore ride as a cell *payload* (a map bound cell stores the
-/// extreme entry's key) with no adapter, and [`Codec::CODEC_ID`] is the one
+/// extreme entry's key) with no adapter, and [`Codec::FORMAT_ID`] is the one
 /// durable token a key encoding freezes into a collection's identity.
 ///
 /// The invariants every impl must satisfy (enforced by the per-codec
@@ -63,10 +63,9 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
 /// keyed kind pins to a fixed address) is addressed the same way a keyed kind
 /// is — through the typed cell view — without a key of its own. The empty
 /// coordinate is byte-identical to a Value cell's historical fixed address, so
-/// adopting it changes no durable bytes. Its [`CODEC_ID`](Codec::CODEC_ID)
-/// rides a collection's identity only where a kind's own key-codec token names
-/// it — Value reports no key codec because its one cell is unit-addressed,
-/// Deque because the kind itself pins its index encoding.
+/// adopting it changes no durable bytes. Like every key axis, its
+/// [`FORMAT_ID`](Codec::FORMAT_ID) rides a single-cell collection's identity as
+/// the key-codec token.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnitKey;
 
@@ -95,7 +94,7 @@ impl Codec for UnitKey {
     type Error = KeyCodecError;
     type Payload = ();
 
-    const CODEC_ID: &'static str = "unit.v1";
+    const FORMAT_ID: &'static str = "unit.v1";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
         Self::decode(buf)
@@ -150,7 +149,7 @@ impl Codec for Utf8KeyCodec {
     type Error = KeyCodecError;
     type Payload = String;
 
-    const CODEC_ID: &'static str = "utf8.v1";
+    const FORMAT_ID: &'static str = "utf8.v1";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
         Self::decode(buf)
@@ -188,7 +187,7 @@ impl Codec for I64KeyCodec {
     type Error = KeyCodecError;
     type Payload = i64;
 
-    const CODEC_ID: &'static str = "i64.v1";
+    const FORMAT_ID: &'static str = "i64.v1";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
         Self::decode(buf)
@@ -226,7 +225,7 @@ impl Codec for U64KeyCodec {
     type Error = KeyCodecError;
     type Payload = u64;
 
-    const CODEC_ID: &'static str = "u64.v1";
+    const FORMAT_ID: &'static str = "u64.v1";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
         Self::decode(buf)

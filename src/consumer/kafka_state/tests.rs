@@ -44,7 +44,7 @@ fn kafka_message_identity_tokens_are_frozen() {
     use crate::codec::Codec;
     use crate::state::descriptor::CellResolver;
 
-    assert_eq!(MessageRefCodec::CODEC_ID, "message-ref");
+    assert_eq!(MessageRefCodec::FORMAT_ID, "message-ref");
     assert_eq!(
         <MessageResolver<MemoryLoader<Value>> as CellResolver>::RESOLVER_ID,
         Some("message-ref")
@@ -489,7 +489,7 @@ mod message_cell_in_every_kind {
 
     /// The message cell carries the same durable identity — codec
     /// `"message-ref"`, resolver `Some("message-ref")` — in every kind;
-    /// only the Map's key codec rides alongside it. This is what lets
+    /// only the key axis varies with the kind. This is what lets
     /// cross-language consumers share a message collection regardless of
     /// the kind it is stored in.
     #[test]
@@ -497,20 +497,20 @@ mod message_cell_in_every_kind {
         let map: MapDescriptor<Utf8KeyCodec, MessageCell<MemoryLoader<Value>>> =
             message_map_state("m");
         let map_id = map.structural_identity();
-        assert_eq!(map_id.codec_id, "message-ref");
+        assert_eq!(map_id.format_id, "message-ref");
         assert_eq!(map_id.resolver_id, Some("message-ref"));
-        assert_eq!(map_id.key_codec_id, Some("utf8.v1"));
+        assert_eq!(map_id.key_format_id, "utf8.v1");
 
         let deque: DequeDescriptor<MessageCell<MemoryLoader<Value>>> = message_deque_state("d");
         let deque_id = deque.structural_identity();
-        assert_eq!(deque_id.codec_id, "message-ref");
+        assert_eq!(deque_id.format_id, "message-ref");
         assert_eq!(deque_id.resolver_id, Some("message-ref"));
-        assert_eq!(deque_id.key_codec_id, None);
+        assert_eq!(deque_id.key_format_id, "i64.v1");
 
         let value: MessageDescriptor<MemoryLoader<Value>> = message_state("v");
         let value_id = value.structural_identity();
-        assert_eq!(value_id.codec_id, "message-ref");
+        assert_eq!(value_id.format_id, "message-ref");
         assert_eq!(value_id.resolver_id, Some("message-ref"));
-        assert_eq!(value_id.key_codec_id, None);
+        assert_eq!(value_id.key_format_id, "unit.v1");
     }
 }

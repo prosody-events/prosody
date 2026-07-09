@@ -1,14 +1,23 @@
 //! Group-global descriptor-identity validation.
 //!
-//! A collection's identity — its `(kind, codec, resolver)` triple — is an
-//! application-global fact compiled into the binary. The
+//! A collection's durable identity — its kind plus its key-format and
+//! payload-format tokens — is a complete description of the collection's
+//! bytes, compiled into the binary as an application-global fact. The
 //! `keyed_state_identity` table exists for exactly one purpose: to make that
 //! identity **immutable**. Once a collection has been used, a user can never
-//! silently change its kind, codec, or resolver; a process carrying an
-//! incompatible descriptor fails loudly (`Permanent`) instead of misreading
-//! cells. It is **not** a sweep index, a migration ledger, or an enumeration
-//! source — the recovery sweep sources names from the in-process registry, the
+//! silently change any of those axes; a process carrying an incompatible
+//! descriptor fails loudly (`Permanent`) instead of misreading cells. It is
+//! **not** a sweep index, a migration ledger, or an enumeration source — the
+//! recovery sweep sources names from the in-process registry, the
 //! authoritative declared set.
+//!
+//! The resolver is deliberately absent: it is application *behavior* over
+//! decoded payloads, not a property of the data, and
+//! [`Codec::FORMAT_ID`](crate::codec::Codec::FORMAT_ID)'s completeness law
+//! forbids a resolver from changing what stored bytes mean. Resolver
+//! consistency is checked in-process at bind time
+//! (`verify_state_registration` compares the full
+//! [`StructuralIdentity`], resolver token included).
 //!
 //! Each `(group_id, state_type, name)` has one frozen
 //! [`DurableDescriptorIdentity`] row. `acquire_descriptor_identities`
@@ -44,7 +53,7 @@ use thiserror::Error;
 /// One durable identity row in wire form.
 ///
 /// Comparison happens on the wire encoding (the discriminator integers and the
-/// codec/resolver tokens) rather than on decoded enums, so a row written by a
+/// format/resolver tokens) rather than on decoded enums, so a row written by a
 /// *future* build with discriminants this build does not know simply compares
 /// unequal — acquisition fails `Permanent` instead of silently coercing it.
 /// The raw-`i8` discriminator fields are also what keeps this DTO
@@ -61,22 +70,21 @@ pub struct DurableDescriptorIdentity {
     /// [`CollectionKindId`](crate::state::CollectionKindId) discriminator.
     pub kind: i8,
 
-    /// Resolver token
-    /// ([`CellResolver::RESOLVER_ID`](crate::state::descriptor::CellResolver::RESOLVER_ID));
-    /// `None` for the passthrough resolver.
-    pub resolver_id: Option<String>,
+    /// Payload-format token
+    /// ([`Codec::FORMAT_ID`](crate::codec::Codec::FORMAT_ID))
+    /// — always present, every cell is codec-produced.
+    pub format_id: String,
 
-    /// Codec token ([`Codec::CODEC_ID`](crate::codec::Codec::CODEC_ID)) —
-    /// always present, every cell is codec-produced.
-    pub codec_id: String,
-
-    /// Key-codec token for keyed kinds (Map); `None` for kinds without a key
-    /// codec (Value).
-    pub key_codec_id: Option<String>,
+    /// Key-format token — the
+    /// [`Codec::FORMAT_ID`](crate::codec::Codec::FORMAT_ID) of the cell's key
+    /// axis. Always present: single-cell kinds carry the unit codec's token.
+    pub key_format_id: String,
 }
 
 impl DurableDescriptorIdentity {
     /// Wire form of a registered descriptor identity for `(state_type, name)`.
+    /// The resolver token is deliberately not projected — behavior, not data
+    /// (see the module doc).
     pub(crate) fn from_identity(
         state_type: StateType,
         name: &str,
@@ -86,9 +94,8 @@ impl DurableDescriptorIdentity {
             state_type: state_type.into(),
             name: name.to_owned(),
             kind: identity.kind.into(),
-            resolver_id: identity.resolver_id.map(str::to_owned),
-            codec_id: identity.codec_id.to_owned(),
-            key_codec_id: identity.key_codec_id.map(str::to_owned),
+            format_id: identity.format_id.to_owned(),
+            key_format_id: identity.key_format_id.to_owned(),
         }
     }
 }

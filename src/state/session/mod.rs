@@ -849,9 +849,9 @@ impl DescriptorIdentity for LifecycleAccess {
     fn structural_identity(&self) -> StructuralIdentity {
         StructuralIdentity {
             kind: CollectionKindId::Value,
-            codec_id: "\u{0}framework-lifecycle",
+            format_id: "\u{0}framework-lifecycle",
             resolver_id: None,
-            key_codec_id: None,
+            key_format_id: "\u{0}framework-lifecycle",
         }
     }
 }

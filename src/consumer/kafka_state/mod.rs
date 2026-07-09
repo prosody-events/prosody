@@ -78,7 +78,7 @@ impl Codec for MessageRefCodec {
     type Error = MessageRefCodecError;
     type Payload = MessageRef;
 
-    const CODEC_ID: &'static str = "message-ref";
+    const FORMAT_ID: &'static str = "message-ref";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         rmp_serde::from_slice(buf).map_err(MessageRefCodecError::Decode)

@@ -27,7 +27,7 @@
 //! **addresses** a collection ([`CollectionId`], [`CollectionRef`],
 //! [`StateKey`]) — pure in-process routing, local and cheap. A collection's
 //! [`StructuralIdentity`](descriptor::StructuralIdentity) is the `(kind,
-//! codec_id, …)` **shape** a descriptor asserts. The [`descriptor_identity`]
+//! format_id, …)` **shape** a descriptor asserts. The [`descriptor_identity`]
 //! durable table **freezes** that shape group-globally on first use, validated
 //! against once at partition acquisition so a later redeploy cannot silently
 //! change it.

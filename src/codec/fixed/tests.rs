@@ -4,11 +4,11 @@
 use super::*;
 use quickcheck::{QuickCheck, TestResult};
 
-/// The composed [`Codec::CODEC_ID`] is `"(a,b)"` from the components' ids, and
+/// The composed [`Codec::FORMAT_ID`] is `"(a,b)"` from the components' ids, and
 /// the composed width is the sum — both derived at compile time.
 #[test]
-fn pair_codec_id_and_width_are_derived() {
-    assert_eq!(<(I64Codec, I64Codec)>::CODEC_ID, "(i64-be,i64-be)");
+fn pair_format_id_and_width_are_derived() {
+    assert_eq!(<(I64Codec, I64Codec)>::FORMAT_ID, "(i64-be,i64-be)");
     assert_eq!(<(I64Codec, I64Codec) as FixedCodec>::WIDTH, 16);
 }
 

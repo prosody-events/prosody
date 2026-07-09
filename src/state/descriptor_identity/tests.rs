@@ -90,17 +90,14 @@ fn prop_memory_concurrent_conflicting_registration() {
     QuickCheck::new().quickcheck(prop as fn(u8) -> TestResult);
 }
 
-/// Wire-format freeze: the `keyed_state_identity` row's discriminants and the
-/// passthrough resolver token are a durable contract compared on every read, so
-/// changing any value silently bricks existing collections (a renamed variant
-/// still round-trips). Pin the literals so such a change fails loudly here, not
-/// in production. The codec tokens are frozen in their own codecs' tests; the
-/// Kafka resolver token in `consumer::kafka_state`.
+/// Wire-format freeze: the `keyed_state_identity` row's discriminants are a
+/// durable contract compared on every read, so changing any value silently
+/// bricks existing collections (a renamed variant still round-trips). Pin the
+/// literals so such a change fails loudly here, not in production. The format
+/// tokens are frozen in their own codecs' tests.
 #[test]
 fn durable_identity_wire_contract_is_frozen() {
-    use crate::codec::JsonCodec;
     use crate::state::CollectionKindId;
-    use crate::state::descriptor::CellResolver;
 
     assert_eq!(i8::from(StateType::Application), 0);
     // `Framework` is test-only today, but its discriminant is frozen into
@@ -109,10 +106,9 @@ fn durable_identity_wire_contract_is_frozen() {
     assert_eq!(i8::from(CollectionKindId::Value), 1);
     assert_eq!(i8::from(CollectionKindId::Map), 2);
     assert_eq!(i8::from(CollectionKindId::Deque), 3);
-    assert_eq!(<JsonCodec as CellResolver>::RESOLVER_ID, None);
-    // Value is single-cell: it has no key codec, and that must stay frozen so a
-    // future `Some` does not silently brick existing Value collections.
-    assert_eq!(cart().structural_identity().key_codec_id, None);
+    // Value is single-cell: its key axis is the unit codec, and that token must
+    // stay frozen or existing Value collections silently brick.
+    assert_eq!(cart().structural_identity().key_format_id, "unit.v1");
 }
 
 /// An empty registry does no identity I/O and succeeds — the inert state layer.
@@ -161,32 +157,24 @@ async fn acquire_registers_first_use_then_validates() -> Result<()> {
 }
 
 /// Seed-stale-state: a frozen row that disagrees with the registered
-/// descriptor (in any of `kind` / `codec_id` / `resolver_id`) makes acquisition
-/// fail `Permanent` — the row is written through the low-level store API, the
-/// way normal execution could not produce it. Property over the differing axis.
+/// descriptor (in any of `kind` / `format_id` / `key_format_id`) makes
+/// acquisition fail `Permanent` — the row is written through the low-level
+/// store API, the way normal execution could not produce it. Property over the
+/// differing axis.
 #[test]
 fn prop_acquire_rejects_seeded_mismatch() {
-    fn prop(kind: i8, codec_sel: u8, resolver_sel: u8, key_codec_sel: u8) -> TestResult {
-        // cart's real identity is kind=1 (Value), codec="json", resolver=None,
-        // key_codec=None.
-        let codec_id = ["json", "binary", "legacy"][usize::from(codec_sel) % 3].to_owned();
-        let resolver_id = match resolver_sel % 3 {
-            0 => None,
-            1 => Some("message-ref".to_owned()),
-            _ => Some("other".to_owned()),
-        };
-        let key_codec_id = match key_codec_sel % 3 {
-            0 => None,
-            1 => Some("key-json".to_owned()),
-            _ => Some("key-binary".to_owned()),
-        };
+    fn prop(kind: i8, format_sel: u8, key_format_sel: u8) -> TestResult {
+        // cart's real identity is kind=1 (Value), format="json",
+        // key format="unit.v1".
+        let format_id = ["json", "binary", "legacy"][usize::from(format_sel) % 3].to_owned();
+        let key_format_id =
+            ["unit.v1", "utf8.v1", "i64.v1"][usize::from(key_format_sel) % 3].to_owned();
         let stale = DurableDescriptorIdentity {
             state_type: StateType::Application.into(),
             name: "cart".to_owned(),
             kind,
-            resolver_id,
-            codec_id,
-            key_codec_id,
+            format_id,
+            key_format_id,
         };
         // Skip the (rare) case where the generated row equals cart's identity:
         // then there is no mismatch to detect.
@@ -225,36 +213,34 @@ fn prop_acquire_rejects_seeded_mismatch() {
             Ok(()) => TestResult::error("a stale identity row must fail acquisition"),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(i8, u8, u8, u8) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(i8, u8, u8) -> TestResult);
 }
 
-/// `key_codec_id` is part of the frozen identity: two rows identical but for it
-/// (`None` vs `Some`) are distinct. The first registrant freezes its row; a
-/// later registration of the differing row sees the *original* in its
-/// `Conflict`, and validating the asserted-`Some` identity against the
-/// frozen-`None` row is a `Permanent` mismatch. This isolates the
-/// derived-`PartialEq` pickup of the new field at the `validate` locus — a
-/// property varying many axes at once cannot prove this one field alone moves
-/// the needle.
+/// `key_format_id` is part of the frozen identity: two rows identical but for
+/// it are distinct. The first registrant freezes its row; a later registration
+/// of the differing row sees the *original* in its `Conflict`, and validating
+/// the differing asserted identity against the frozen row is a `Permanent`
+/// mismatch. This isolates the derived-`PartialEq` pickup of the field at the
+/// `validate` locus — a property varying many axes at once cannot prove this
+/// one field alone moves the needle.
 #[tokio::test]
-async fn key_codec_id_alone_is_an_identity_mismatch() -> Result<()> {
+async fn key_format_id_alone_is_an_identity_mismatch() -> Result<()> {
     let store = MemoryDescriptorIdentityStore::new();
     let group = group();
     let frozen = DurableDescriptorIdentity {
         state_type: StateType::Application.into(),
         name: "cart".to_owned(),
         kind: 1,
-        resolver_id: None,
-        codec_id: "json".to_owned(),
-        key_codec_id: None,
+        format_id: "json".to_owned(),
+        key_format_id: "unit.v1".to_owned(),
     };
     let asserted = DurableDescriptorIdentity {
-        key_codec_id: Some("key-json".to_owned()),
+        key_format_id: "utf8.v1".to_owned(),
         ..frozen.clone()
     };
     assert_ne!(
         frozen, asserted,
-        "key_codec_id alone must distinguish two identities",
+        "key_format_id alone must distinguish two identities",
     );
 
     // The first registrant freezes `frozen`; the second sees it in the conflict.
@@ -265,13 +251,13 @@ async fn key_codec_id_alone_is_an_identity_mismatch() -> Result<()> {
     assert_eq!(
         store.register_identity(&group, &asserted).await?,
         RegisterOutcome::Conflict(frozen.clone()),
-        "the conflict must carry the first-frozen row, key_codec_id and all",
+        "the conflict must carry the first-frozen row, key_format_id and all",
     );
 
-    // Validating the asserted-`Some` identity against the frozen-`None` row is a
-    // Permanent mismatch — the validate locus picks up the new field.
+    // Validating the differing asserted identity against the frozen row is a
+    // Permanent mismatch — the validate locus picks up the field.
     let Err(mismatch) = validate::<Infallible>(frozen, &asserted) else {
-        return Err(eyre!("differing key_codec_id must fail validation"));
+        return Err(eyre!("differing key_format_id must fail validation"));
     };
     assert!(matches!(mismatch, DescriptorIdentityError::Mismatch { .. }));
     assert_eq!(mismatch.classify_error(), ErrorCategory::Permanent);
@@ -287,34 +273,31 @@ async fn key_codec_id_alone_is_an_identity_mismatch() -> Result<()> {
 /// seeded-mismatch property cannot reach via the read-present path.
 #[tokio::test]
 async fn concurrent_acquire_with_conflicting_identities_one_wins_one_permanent() -> Result<()> {
-    use crate::codec::{JsonBinaryCodec, JsonCodec};
+    use crate::codec::{I64Codec, JsonCodec};
 
     let store = MemoryDescriptorIdentityStore::new();
     let group = group();
 
-    // Same name, different codec ("json" vs "binary") ⇒ different identity.
+    // Same name, different format ("json" vs "i64-be") ⇒ different identity.
     let mut json_registry = CollectionDefRegistry::default();
     json_registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
-    let mut binary_registry = CollectionDefRegistry::default();
-    binary_registry.register(
-        &value_state::<JsonBinaryCodec>("cart"),
-        CollectionDef::new(None),
-    )?;
+    let mut i64_registry = CollectionDefRegistry::default();
+    i64_registry.register(&value_state::<I64Codec>("cart"), CollectionDef::new(None))?;
 
     // Race both acquires against the shared store — concurrency by joining, no
     // sleep. Whichever registers first wins; the loser reads its conflict.
-    let (json_result, binary_result) = futures::join!(
+    let (json_result, i64_result) = futures::join!(
         acquire_descriptor_identities(&store, &json_registry, &group),
-        acquire_descriptor_identities(&store, &binary_registry, &group),
+        acquire_descriptor_identities(&store, &i64_registry, &group),
     );
 
-    let oks = [&json_result, &binary_result]
+    let oks = [&json_result, &i64_result]
         .into_iter()
         .filter(|r| r.is_ok())
         .count();
     assert_eq!(oks, 1, "exactly one deploy may freeze the identity");
 
-    let loser = [json_result, binary_result]
+    let loser = [json_result, i64_result]
         .into_iter()
         .find_map(Result::err)
         .ok_or_else(|| eyre!("one deploy must lose"))?;

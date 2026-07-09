@@ -185,7 +185,7 @@ impl Codec for CartCodec {
     type Error = JsonCodecError;
     type Payload = Cart;
 
-    const CODEC_ID: &'static str = "test-cart";
+    const FORMAT_ID: &'static str = "test-cart";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Cart, JsonCodecError> {
         serde_json::from_slice(buf).map_err(JsonCodecError::Serde)
@@ -208,7 +208,7 @@ impl Codec for CartCodec {
 #[tokio::test]
 async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
     let typed_cart: ValueDescriptor<CartCodec> = value_state("typed_cart");
-    assert_eq!(typed_cart.structural_identity().codec_id, "test-cart");
+    assert_eq!(typed_cart.structural_identity().format_id, "test-cart");
 
     let handle = bind_registered(typed_cart, MemoryLoader::new())?;
     let cart = Cart {
@@ -221,24 +221,26 @@ async fn custom_codec_cell_roundtrips_typed_payload() -> Result<()> {
 
 /// Wire-format freeze for the key-codec tokens, pinned end to end through
 /// `structural_identity()`: the token is a durable identity column compared
-/// on every acquisition, so changing a key codec's `CODEC_ID` literal — or
-/// the map plumbing that lifts it into the identity — silently bricks existing
-/// collections. Deque carries `None`: its ordering is fixed by the kind, and
-/// that must stay frozen (like the Value `None` pinned in the identity
-/// wire-contract test) so a future `Some` cannot brick existing deques.
+/// on every acquisition, so changing a key codec's `FORMAT_ID` literal — or
+/// the derivation that lifts it off the cell type — silently bricks existing
+/// collections. Deque and Value carry kind-pinned key axes (`I64KeyCodec`,
+/// [`UnitKey`](crate::state::order_codec::UnitKey)); their tokens must stay
+/// frozen just like the user-chosen ones.
 #[test]
 fn key_codec_wire_contract_is_frozen() {
     use crate::state::order_codec::{I64KeyCodec, U64KeyCodec};
 
     let utf8: MapDescriptor<Utf8KeyCodec> = map_state("m");
-    assert_eq!(utf8.structural_identity().key_codec_id, Some("utf8.v1"));
+    assert_eq!(utf8.structural_identity().key_format_id, "utf8.v1");
     let i64_keyed: MapDescriptor<I64KeyCodec> = map_state("m");
-    assert_eq!(i64_keyed.structural_identity().key_codec_id, Some("i64.v1"));
+    assert_eq!(i64_keyed.structural_identity().key_format_id, "i64.v1");
     let u64_keyed: MapDescriptor<U64KeyCodec> = map_state("m");
-    assert_eq!(u64_keyed.structural_identity().key_codec_id, Some("u64.v1"));
+    assert_eq!(u64_keyed.structural_identity().key_format_id, "u64.v1");
 
     let deque: DequeDescriptor = deque_state("d");
-    assert_eq!(deque.structural_identity().key_codec_id, None);
+    assert_eq!(deque.structural_identity().key_format_id, "i64.v1");
+    let value: ValueDescriptor = value_state("v");
+    assert_eq!(value.structural_identity().key_format_id, "unit.v1");
 }
 
 /// Binding against a context without keyed state (any context whose
@@ -292,7 +294,7 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 }
 
 /// Re-registering the same name with a *different* structural identity
-/// is rejected — both for a differing `codec_id` (a Kafka descriptor over a
+/// is rejected — both for a differing `format_id` (a Kafka descriptor over a
 /// name registered as a JSON value) and for a differing collection `kind` (a
 /// Map, then a Deque, over a name registered as a Value).
 #[test]

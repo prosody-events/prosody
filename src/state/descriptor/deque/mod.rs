@@ -102,13 +102,14 @@ impl TryFrom<i8> for DequeNs {
 /// Descriptor for a codec-backed deque collection. Generic over an element
 /// [`CellType`] `T` — a plain [`Codec`](crate::codec::Codec) (JSON by default)
 /// or a codec paired with a resolver via [`WithResolver`](super::WithResolver).
-/// There is no key codec: the index encoding is fixed by the kind. Declare via
-/// [`deque_state`].
+/// There is no key-codec parameter: the index encoding is fixed by the kind.
+/// Declare via [`deque_state`].
 pub type DequeDescriptor<T = JsonCodec> = Descriptor<DequeKind<T>>;
 
 /// The Deque [`CollectionSpec`]: a dense index window plus the head/tail bounds
-/// cell. `KEY_CODEC_ID` is `None` — the kind pins the index encoding
-/// ([`I64KeyCodec`]), so it is never a registration choice.
+/// cell. The index encoding is pinned by the kind ([`I64KeyCodec`]) — never a
+/// registration choice — and rides the identity's key-codec token like any
+/// other key axis.
 pub struct DequeKind<T>(PhantomData<fn() -> T>);
 
 impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {

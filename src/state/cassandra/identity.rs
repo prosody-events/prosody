@@ -92,9 +92,8 @@ impl DescriptorIdentityStore for CassandraDescriptorIdentityStore {
                     row.state_type,
                     row.name.as_str(),
                     row.kind,
-                    row.resolver_id.as_deref(),
-                    row.codec_id.as_str(),
-                    row.key_codec_id.as_deref(),
+                    row.format_id.as_str(),
+                    row.key_format_id.as_str(),
                 ),
             )
             .await
@@ -124,9 +123,8 @@ impl DescriptorIdentityStore for CassandraDescriptorIdentityStore {
 #[derive(scylla::DeserializeRow)]
 struct IdentityColumns {
     kind: i8,
-    resolver_id: Option<String>,
-    codec_id: String,
-    key_codec_id: Option<String>,
+    format_id: String,
+    key_format_id: String,
 }
 
 impl IdentityColumns {
@@ -135,9 +133,8 @@ impl IdentityColumns {
             state_type: state_type.into(),
             name: name.to_owned(),
             kind: self.kind,
-            resolver_id: self.resolver_id,
-            codec_id: self.codec_id,
-            key_codec_id: self.key_codec_id,
+            format_id: self.format_id,
+            key_format_id: self.key_format_id,
         }
     }
 }
@@ -146,9 +143,8 @@ impl IdentityColumns {
 ///
 /// `state_type` and `name` are the key we registered under (`asserted`), so the
 /// conflict shares them by construction — only the contested
-/// `kind`/`codec_id`/`resolver_id`/`key_codec_id` are read from the echoed
-/// columns, by name (the result column order is the driver's, not the
-/// schema's).
+/// `kind`/`format_id`/`key_format_id` are read from the echoed columns, by
+/// name (the result column order is the driver's, not the schema's).
 fn conflict_identity(
     specs: ColumnSpecs<'_, '_>,
     row: &Row,
@@ -158,9 +154,8 @@ fn conflict_identity(
         state_type: asserted.state_type,
         name: asserted.name.clone(),
         kind: column_tinyint(specs, row, "kind")?,
-        resolver_id: column_text_opt(specs, row, "resolver_id"),
-        codec_id: column_text(specs, row, "codec_id")?,
-        key_codec_id: column_text_opt(specs, row, "key_codec_id"),
+        format_id: column_text(specs, row, "format_id")?,
+        key_format_id: column_text(specs, row, "key_format_id")?,
     })
 }
 
@@ -198,13 +193,9 @@ fn column_text(
     row: &Row,
     name: &str,
 ) -> Result<String, CassandraDescriptorIdentityError> {
-    column_text_opt(specs, row, name).ok_or(CassandraDescriptorIdentityError::MalformedLwtResult)
-}
-
-fn column_text_opt(specs: ColumnSpecs<'_, '_>, row: &Row, name: &str) -> Option<String> {
     match column_value(specs, row, name) {
-        Some(CqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
+        Some(CqlValue::Text(s)) => Ok(s.clone()),
+        _ => Err(CassandraDescriptorIdentityError::MalformedLwtResult),
     }
 }
 
@@ -215,7 +206,7 @@ cassandra_queries! {
         /// Point-reads the frozen identity row for one
         /// `(group_id, state_type, name)` — the steady-state validation path.
         read_identity: (
-            "SELECT kind, resolver_id, codec_id, key_codec_id \
+            "SELECT kind, format_id, key_format_id \
              FROM $keyspace.{} WHERE group_id = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_IDENTITY
         ),
@@ -226,8 +217,8 @@ cassandra_queries! {
         /// validates without a re-read.
         register_identity: (
             "INSERT INTO $keyspace.{} \
-             (group_id, state_type, name, kind, resolver_id, codec_id, key_codec_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS",
+             (group_id, state_type, name, kind, format_id, key_format_id) \
+             VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS",
             TABLE_KEYED_STATE_IDENTITY
         ),
     }

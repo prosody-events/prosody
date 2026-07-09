@@ -6,6 +6,7 @@ use serde::Deserialize;
 use simd_json::serde::from_slice_with_buffers;
 use std::cell::RefCell;
 use std::error::Error as StdError;
+use std::marker::PhantomData;
 
 use crate::codec::Codec;
 use crate::{EventIdentity, EventType};
@@ -94,8 +95,32 @@ impl EventType for BinaryPayload {
     }
 }
 
+/// Declares the durable byte format a [`BinaryCodec`] speaks.
+///
+/// `BinaryCodec` copies bytes verbatim, so the format of those bytes is the
+/// application's contract, not the codec's — this marker forces the codec
+/// definition to state it. The declared token is held to every
+/// [`Codec::FORMAT_ID`] law: claim `"json"` only if every payload written
+/// through the codec is a JSON document.
+pub trait BinaryFormat: 'static {
+    /// The [`Codec::FORMAT_ID`] the composed codec asserts.
+    const FORMAT_ID: &'static str;
+}
+
+/// The JSON document format, declared by [`JsonBinaryCodec`]. Format-equal
+/// with [`JsonCodec`](crate::codec::JsonCodec): both speak `"json"`, so
+/// collections written through either validate against the same frozen
+/// identity — this is what lets differently-implemented consumers share a
+/// collection.
+pub struct JsonFormat;
+
+impl BinaryFormat for JsonFormat {
+    const FORMAT_ID: &'static str = "json";
+}
+
 /// Codec that performs a verbatim byte copy and delegates metadata extraction
-/// to `E`.
+/// to `E`. `F` declares the byte format the application commits to writing —
+/// the codec itself cannot know it.
 ///
 /// On `deserialize`, the input slice is first copied into
 /// [`BinaryPayload::bytes`] and then [`BinaryExtractor::extract`] is invoked
@@ -103,16 +128,25 @@ impl EventType for BinaryPayload {
 /// owns one extractor instance for its lifetime, so any state the extractor
 /// keeps (parser buffers, lookup tables) is reused across calls. On
 /// `serialize`, the stored bytes are appended to the output buffer.
-#[derive(Default)]
-pub struct BinaryCodec<E: BinaryExtractor> {
+pub struct BinaryCodec<E: BinaryExtractor, F: BinaryFormat> {
     extractor: E,
+    _format: PhantomData<fn() -> F>,
 }
 
-impl<E: BinaryExtractor> Codec for BinaryCodec<E> {
+impl<E: BinaryExtractor, F: BinaryFormat> Default for BinaryCodec<E, F> {
+    fn default() -> Self {
+        Self {
+            extractor: E::default(),
+            _format: PhantomData,
+        }
+    }
+}
+
+impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
     type Error = BinaryCodecError<E::Error>;
     type Payload = BinaryPayload;
 
-    const CODEC_ID: &'static str = "binary";
+    const FORMAT_ID: &'static str = F::FORMAT_ID;
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         let bytes = buf.to_vec();
@@ -138,13 +172,16 @@ impl<E: BinaryExtractor> Codec for BinaryCodec<E> {
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        // A generic `BinaryCodec<E>` can't host a `thread_local!` of itself,
-        // because statics can't depend on a generic parameter. Delegate the
-        // cache to `E`, which is concrete at the implementor site and can back
-        // its `with_cached_local` with a real `thread_local!` when it owns
-        // expensive state.
+        // A generic `BinaryCodec<E, F>` can't host a `thread_local!` of
+        // itself, because statics can't depend on a generic parameter.
+        // Delegate the cache to `E`, which is concrete at the implementor site
+        // and can back its `with_cached_local` with a real `thread_local!`
+        // when it owns expensive state.
         E::with_cached_local(|extractor| {
-            let mut codec = BinaryCodec { extractor };
+            let mut codec = BinaryCodec {
+                extractor,
+                _format: PhantomData,
+            };
             let result = f(&mut codec);
             (codec.extractor, result)
         })
@@ -174,8 +211,10 @@ pub struct JsonExtractor {
 }
 
 /// [`BinaryCodec`] preconfigured with [`JsonExtractor`] for metadata
-/// extraction.
-pub type JsonBinaryCodec = BinaryCodec<JsonExtractor>;
+/// extraction and the declared [`JsonFormat`]: the application commits to
+/// writing JSON documents, and the codec is format-equal with
+/// [`JsonCodec`](crate::codec::JsonCodec).
+pub type JsonBinaryCodec = BinaryCodec<JsonExtractor, JsonFormat>;
 
 #[derive(Deserialize)]
 struct JsonMetaView<'a> {

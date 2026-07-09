@@ -59,26 +59,25 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (
 
 -- Frozen structural identity per (consumer group, state_type, collection name).
 -- This table exists solely to make a collection's identity immutable: once a
--- collection has been used, its (kind, codec, key_codec, resolver) can never
+-- collection has been used, its (kind, key format, payload format) can never
 -- silently change. Validated by point-read; registered on first use with
 -- `INSERT … IF NOT EXISTS` (the one authorized keyed-state LWT — once per
 -- collection per group, never on the hot path). A registered descriptor that
 -- disagrees with the stored row refuses to dispatch (Permanent), so an
 -- incompatible deploy fails loudly instead of silently misreading cells.
--- `codec_id` (value codec) is always present (every cell is codec-produced);
--- `key_codec_id` is the order-preserving Map key codec, NULL for Value/Deque;
--- `resolver_id` is NULL for the passthrough resolver, a token otherwise. `kind`
--- is validated, not part of the key, so a name pins exactly one kind per
--- state_type.
+-- `format_id` (the payload byte format) and `key_format_id` (the cell address
+-- byte format — the unit codec's token for single-cell kinds) are always
+-- present and together fully describe the collection's bytes; resolvers are
+-- application behavior, deliberately not recorded. `kind` is validated, not
+-- part of the key, so a name pins exactly one kind per state_type.
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_IDENTITY}} (
-    group_id     text,
-    state_type   tinyint,
-    name         text,
+    group_id      text,
+    state_type    tinyint,
+    name          text,
 
-    kind         tinyint,
-    resolver_id  text,
-    codec_id     text,
-    key_codec_id text,
+    kind          tinyint,
+    format_id     text,
+    key_format_id text,
 
     PRIMARY KEY ((group_id, state_type, name))
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }

@@ -36,7 +36,7 @@
 //! the session via [`FromSession`]. Passing the whole session to a resolver was
 //! the complection that once forced its durable token onto a separate trait;
 //! with the context split out, [`CellResolver::RESOLVER_ID`] sits on the one
-//! resolver trait as a plain const, symmetric with [`Codec::CODEC_ID`].
+//! resolver trait as a plain const, symmetric with [`Codec::FORMAT_ID`].
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
 //! `(kind, codec id, resolver id, key codec id)` tuple. Codec, resolver, and
@@ -104,9 +104,15 @@ const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 /// static. It is **session-free** — it never sees the session. Instead it
 /// declares the capability [`Self::resolve`] borrows as [`Self::Context`]
 /// (`()` for none, `&'s L` for a loader); the framework extracts that context
-/// from the session through [`FromSession`]. This keeps the resolver's durable
-/// token ([`Self::RESOLVER_ID`]) a plain const on the one trait, symmetric with
-/// [`Codec::CODEC_ID`].
+/// from the session through [`FromSession`]. This keeps the resolver's token
+/// ([`Self::RESOLVER_ID`]) a plain const on the one trait, symmetric with
+/// [`Codec::FORMAT_ID`].
+///
+/// A resolver is *behavior over* decoded payloads — it must never change what
+/// stored bytes mean ([`Codec::FORMAT_ID`]'s completeness law). Storage whose
+/// payload denotes something the format doesn't imply (a reference, a
+/// pointer) belongs in a dedicated codec, the way the message cell's
+/// `"message-ref"` format is its own codec and its resolver merely fetches.
 pub trait CellResolver {
     /// The decoded cell type this resolver maps from — pinned to the codec's
     /// payload by [`CellType`].
@@ -126,10 +132,12 @@ pub trait CellResolver {
     /// by [`FromSession`], so the resolver itself stays session-free.
     type Context<'s>: Send;
 
-    /// The resolver's stable durable token, or `None` for a passthrough (the
-    /// stored value *is* the exposed value). Rides [`StructuralIdentity`]
-    /// exactly like [`Codec::CODEC_ID`]; changing it once cells exist is an
-    /// incompatible identity change.
+    /// The resolver's token, or `None` for a passthrough (the stored value
+    /// *is* the exposed value). Rides [`StructuralIdentity`] for the
+    /// **in-process** bind-time check (`verify_state_registration`), catching
+    /// two same-named descriptors with different resolvers in one binary. It
+    /// is deliberately not part of the durable identity — resolvers are
+    /// behavior, not data (see the trait doc).
     const RESOLVER_ID: Option<&'static str>;
 
     /// Resolves a decoded cell into the exposed value, using only the borrowed
@@ -263,41 +271,47 @@ pub type ContextOf<'s, T> = <<T as CellType>::Resolver as CellResolver>::Context
 /// value, or the error that ended the stream.
 pub(crate) type ScanItem<T> = Result<(KeyOf<T>, ResolvedOf<T>), CellStateError<CellCodecError<T>>>;
 
-/// The frozen structural identity a descriptor asserts for its collection:
-/// collection kind, codec token, resolver token, and (for keyed kinds) key
-/// codec token.
+/// The structural identity a descriptor asserts for its collection:
+/// collection kind plus the cell's key-format, payload-format, and resolver
+/// tokens.
 ///
-/// Operational settings (TTL, commit mode) are deliberately *not* part of
-/// the identity — they may change between deploys; the identity may not.
+/// The kind and format tokens are frozen durably (the
+/// [`DurableDescriptorIdentity`](crate::state::descriptor_identity::DurableDescriptorIdentity)
+/// row); the resolver token is checked in-process only, at bind time —
+/// behavior, not data. Operational settings (TTL, commit mode) are
+/// deliberately not part of the identity at all — they may change between
+/// deploys; the identity may not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuralIdentity {
     /// Collection kind discriminator.
     pub kind: CollectionKindId,
 
-    /// Codec token ([`Codec::CODEC_ID`]). Always present — every cell is
-    /// codec-produced.
-    pub codec_id: &'static str,
+    /// Payload-format token ([`Codec::FORMAT_ID`]). Always present — every
+    /// cell is codec-produced.
+    pub format_id: &'static str,
 
     /// Resolver token ([`CellResolver::RESOLVER_ID`]); `None` for passthrough.
+    /// In-process only — never persisted.
     pub resolver_id: Option<&'static str>,
 
-    /// Key-codec token for keyed kinds (Map); `None` for kinds without a key
-    /// codec (Value). Frozen into the durable identity the same way `codec_id`
-    /// is, so a keyed collection's key encoding can never silently change.
-    pub key_codec_id: Option<&'static str>,
+    /// Key-format token ([`Codec::FORMAT_ID`] of the cell's key axis) —
+    /// [`UnitKey`]'s for single-cell kinds (Value), the kind's pinned index
+    /// codec for Deque, the user's chosen key codec for Map. Frozen into the
+    /// durable identity the same way `format_id` is, so a collection's key
+    /// encoding can never silently change.
+    pub key_format_id: &'static str,
 }
 
 impl StructuralIdentity {
-    /// Derives the identity a `kind` asserts for cell type `T`: the framework
-    /// reads the codec and resolver tokens straight off `T`, so a kind cannot
-    /// lie about the cell it stores. `key_codec_id` defaults to `None`; keyed
-    /// kinds overwrite it from their [`CollectionSpec::KEY_CODEC_ID`].
+    /// Derives the identity a `kind` asserts for cell type `T`: every token is
+    /// read straight off `T`'s axes, so a kind cannot lie about the cell it
+    /// stores.
     pub(crate) fn of<T: CellType>(kind: CollectionKindId) -> Self {
         Self {
             kind,
-            codec_id: <T::Codec as Codec>::CODEC_ID,
+            format_id: <T::Codec as Codec>::FORMAT_ID,
             resolver_id: <T::Resolver as CellResolver>::RESOLVER_ID,
-            key_codec_id: None,
+            key_format_id: <T::Key as Codec>::FORMAT_ID,
         }
     }
 }
@@ -439,10 +453,8 @@ impl<D> Registered<D> {
 /// pick the spec, so every descriptor shares one `new`, `name`,
 /// `collection_def`/`with_collection_def`, and `bind` body.
 ///
-/// The framework reads [`StructuralIdentity`]'s codec and resolver tokens
-/// straight off `Cell`, so a kind cannot misstate them; `KEY_CODEC_ID` is the
-/// kind's own assertion of its user-chosen key axis (`None` when the kind
-/// pins the key encoding itself, as Deque does).
+/// The framework reads every [`StructuralIdentity`] token straight off
+/// `Cell`'s axes, so a kind cannot misstate the identity it registers.
 ///
 /// # Exposure
 ///
@@ -457,11 +469,8 @@ pub trait CollectionSpec {
     /// This kind's durable discriminator.
     const KIND: CollectionKindId;
 
-    /// The key-codec token for a keyed kind (Map); `None` otherwise.
-    const KEY_CODEC_ID: Option<&'static str> = None;
-
     /// The cell type stored in this kind's data cells. The framework reads its
-    /// codec/resolver tokens for the identity.
+    /// identity tokens off it.
     type Cell: CellType;
 
     /// The typed handle [`Descriptor::bind`] returns over session `S`.
@@ -521,9 +530,7 @@ impl<K: CollectionSpec> DescriptorIdentity for Descriptor<K> {
     }
 
     fn structural_identity(&self) -> StructuralIdentity {
-        let mut identity = StructuralIdentity::of::<K::Cell>(K::KIND);
-        identity.key_codec_id = K::KEY_CODEC_ID;
-        identity
+        StructuralIdentity::of::<K::Cell>(K::KIND)
     }
 }
 
@@ -567,7 +574,7 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
 pub type ValueDescriptor<T = JsonCodec> = Descriptor<ValueKind<T>>;
 
 /// The Value [`CollectionSpec`]: a single [`UnitKey`]-addressed cell of type
-/// `T`, no key codec.
+/// `T`.
 pub struct ValueKind<T>(PhantomData<fn() -> T>);
 
 impl<T: CellType<Key = UnitKey>> CollectionSpec for ValueKind<T> {

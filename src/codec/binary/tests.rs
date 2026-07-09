@@ -4,6 +4,13 @@ use std::str;
 
 use super::*;
 
+/// Test format marker: an opaque token for the prefix-framed test payloads.
+struct PrefixFormat;
+
+impl BinaryFormat for PrefixFormat {
+    const FORMAT_ID: &'static str = "test-prefix";
+}
+
 /// Test extractor: reads the first 4 bytes as a big-endian length, then
 /// returns the next `len` bytes interpreted as UTF-8 as the event id. The
 /// `event_type` is left unset.
@@ -47,7 +54,7 @@ fn deserialize_preserves_verbatim_bytes() -> color_eyre::Result<()> {
     let original = frame(b"abc")?;
     let mut wire = original.clone();
 
-    let mut codec = BinaryCodec::<PrefixExtractor>::default();
+    let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
     let payload = codec.deserialize(&mut wire)?;
 
     assert_eq!(payload.bytes, original, "Vec must hold the verbatim copy");
@@ -63,7 +70,7 @@ fn serialize_round_trips_bytes() -> color_eyre::Result<()> {
         None::<String>,
     );
     let mut buf = Vec::new();
-    let mut codec = BinaryCodec::<PrefixExtractor>::default();
+    let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
     codec.serialize(payload, &mut buf)?;
     assert_eq!(buf, b"hello world");
     Ok(())
@@ -75,7 +82,7 @@ fn serialize_swaps_into_empty_buffer_without_copy() -> color_eyre::Result<()> {
     let bytes_ptr = bytes.as_ptr();
     let payload = BinaryPayload::new(bytes, None::<String>, None::<String>);
     let mut buf = Vec::new();
-    let mut codec = BinaryCodec::<PrefixExtractor>::default();
+    let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
     codec.serialize(payload, &mut buf)?;
     assert_eq!(buf, b"zero-copy payload");
     assert!(
@@ -89,7 +96,7 @@ fn serialize_swaps_into_empty_buffer_without_copy() -> color_eyre::Result<()> {
 fn serialize_appends_when_buffer_non_empty() -> color_eyre::Result<()> {
     let payload = BinaryPayload::new(b" world".to_vec(), None::<String>, None::<String>);
     let mut buf = b"hello".to_vec();
-    let mut codec = BinaryCodec::<PrefixExtractor>::default();
+    let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
     codec.serialize(payload, &mut buf)?;
     assert_eq!(buf, b"hello world");
     Ok(())
@@ -100,7 +107,7 @@ fn missing_event_id_yields_none() -> color_eyre::Result<()> {
     // Buffer shorter than the length prefix — PrefixExtractor's short-circuit
     // branch returns BinaryMetadata::default().
     let mut wire = b"ab".to_vec();
-    let mut codec = BinaryCodec::<PrefixExtractor>::default();
+    let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
     let payload = codec.deserialize(&mut wire)?;
     assert!(payload.event_id().is_none());
     assert!(payload.event_type().is_none());
@@ -188,7 +195,7 @@ fn json_id_non_object_propagates_error() {
 fn json_id_via_binary_codec() -> color_eyre::Result<()> {
     let mut wire = br#"{"id":"evt-1","payload":{"x":1}}"#.to_vec();
     let original = wire.clone();
-    let mut codec = BinaryCodec::<JsonExtractor>::default();
+    let mut codec = JsonBinaryCodec::default();
     let payload = codec.deserialize(&mut wire)?;
     assert_eq!(payload.bytes, original);
     assert_eq!(payload.event_id(), Some("evt-1"));
@@ -222,7 +229,7 @@ fn json_type_missing_returns_none() -> Result<(), JsonExtractError> {
 fn json_type_via_binary_codec() -> color_eyre::Result<()> {
     let mut wire = br#"{"id":"evt-1","type":"user.created","data":{}}"#.to_vec();
     let original = wire.clone();
-    let mut codec = BinaryCodec::<JsonExtractor>::default();
+    let mut codec = JsonBinaryCodec::default();
     let payload = codec.deserialize(&mut wire)?;
     assert_eq!(payload.bytes, original);
     assert_eq!(payload.event_id(), Some("evt-1"));

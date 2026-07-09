@@ -5,7 +5,7 @@
 //! tuple codec with no framing: the pair's bytes are the two halves
 //! back-to-back, split at the known first width. [`I64Codec`] is the primitive;
 //! the blanket `impl Codec for (A, B)` is the composer, and its
-//! [`CODEC_ID`](Codec::CODEC_ID) is derived at compile time from the
+//! [`FORMAT_ID`](Codec::FORMAT_ID) is derived at compile time from the
 //! components' ids so a composed codec names its own durable identity.
 
 use crate::codec::Codec;
@@ -42,7 +42,7 @@ impl Codec for I64Codec {
     type Error = I64CodecError;
     type Payload = i64;
 
-    const CODEC_ID: &'static str = "i64-be";
+    const FORMAT_ID: &'static str = "i64-be";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<i64, I64CodecError> {
         let bytes = <[u8; 8]>::try_from(&*buf).map_err(|_| I64CodecError { actual: buf.len() })?;
@@ -61,10 +61,10 @@ impl FixedCodec for I64Codec {
 
 /// A fixed-width pair codec: `(A, B)` writes `A`'s bytes followed by `B`'s, and
 /// reads them back by splitting at [`A::WIDTH`](FixedCodec::WIDTH). Its
-/// [`CODEC_ID`](Codec::CODEC_ID) is `"(a,b)"` from the components' ids, derived
-/// at compile time (see `ConstId`) so a composed codec asserts a durable
-/// identity distinct from either component's. Arity 2 only; a wider tuple is a
-/// macro away when a caller needs one.
+/// [`FORMAT_ID`](Codec::FORMAT_ID) is `"(a,b)"` from the components' ids,
+/// derived at compile time (see `ConstId`) so a composed codec asserts a
+/// durable identity distinct from either component's. Arity 2 only; a wider
+/// tuple is a macro away when a caller needs one.
 impl<A, B> Codec for (A, B)
 where
     A: FixedCodec,
@@ -73,13 +73,13 @@ where
     type Error = PairCodecError<A::Error, B::Error>;
     type Payload = (A::Payload, B::Payload);
 
-    const CODEC_ID: &'static str = {
+    const FORMAT_ID: &'static str = {
         const fn build(a: &str, b: &str) -> ConstId {
             ConstId::new().raw("(").push(a).raw(",").push(b).raw(")")
         }
         // Reference-to-const promotion inside a const initializer promotes the
         // temporary to `'static` — stable Rust, no macros.
-        build(A::CODEC_ID, B::CODEC_ID).as_static_str()
+        build(A::FORMAT_ID, B::FORMAT_ID).as_static_str()
     };
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
@@ -118,7 +118,7 @@ where
     const WIDTH: usize = A::WIDTH + B::WIDTH;
 }
 
-/// Compile-time builder for a composed [`Codec::CODEC_ID`] such as `"(a,b)"`.
+/// Compile-time builder for a composed [`Codec::FORMAT_ID`] such as `"(a,b)"`.
 ///
 /// Component ids are appended through [`Self::push`], which rejects the
 /// composition delimiters `(`, `)`, `,` — a `const` panic, so it is a compile

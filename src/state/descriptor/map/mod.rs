@@ -109,7 +109,7 @@ enum MapBound {
 
 /// Address codec for the two [`MapBound`] cells. Module-fixed by the Map kind
 /// (the section byte already pins the meta cells), so its
-/// [`CODEC_ID`](Codec::CODEC_ID) never rides a collection's durable identity.
+/// [`FORMAT_ID`](Codec::FORMAT_ID) never rides a collection's durable identity.
 /// The meta cells are only ever read at their two fixed addresses, so `decode`
 /// is a defensive round-trip, never a scan step.
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,7 +143,7 @@ impl Codec for MapBoundKey {
     type Error = KeyCodecError;
     type Payload = MapBound;
 
-    const CODEC_ID: &'static str = "map-bound.v1";
+    const FORMAT_ID: &'static str = "map-bound.v1";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<MapBound, KeyCodecError> {
         Self::decode(buf)
@@ -179,7 +179,6 @@ where
     type Cell = Keyed<KC, V>;
     type Handle<S: CellSession> = MapHandle<S, KC, V>;
 
-    const KEY_CODEC_ID: Option<&'static str> = Some(KC::CODEC_ID);
     const KIND: CollectionKindId = CollectionKindId::Map;
 
     fn handle<S: CellSession>(scope: CellScope<S>) -> MapHandle<S, KC, V> {

@@ -8,8 +8,8 @@ mod json;
 mod serialize_buf;
 
 pub use binary::{
-    BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryMetadata, BinaryPayload, JsonBinaryCodec,
-    JsonExtractError, JsonExtractor,
+    BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryFormat, BinaryMetadata, BinaryPayload,
+    JsonBinaryCodec, JsonExtractError, JsonExtractor, JsonFormat,
 };
 pub use fixed::{FixedCodec, I64Codec, I64CodecError, PairCodecError};
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
@@ -22,11 +22,27 @@ pub(crate) use serialize_buf::SerializeBufGuard;
 /// Implement this trait to plug in a custom serialization format. The codec
 /// is stateful to allow implementations to reuse internal buffers across calls.
 pub trait Codec: Default + Send + Sync + 'static {
-    /// Stable open-dispatch token persisted in keyed-state identity rows.
-    /// Never change it once cells exist: the group-global descriptor-identity
-    /// table records the token, and a deploy whose codec asserts a different
-    /// one refuses to dispatch (Permanent).
-    const CODEC_ID: &'static str;
+    /// Stable token naming the durable byte format this codec speaks,
+    /// persisted in keyed-state identity rows. Three laws govern it:
+    ///
+    /// - **Stability:** never change it once cells exist. The group-global
+    ///   descriptor-identity table freezes the token, and a deploy whose codec
+    ///   asserts a different one refuses to dispatch (Permanent).
+    /// - **Compatibility:** equal tokens promise mutually decodable bytes — any
+    ///   conforming codec asserting this token must decode bytes written by any
+    ///   other. Key codecs ([`OrderedKeyCodec`](crate::state::OrderedKeyCodec))
+    ///   tighten this to byte-identical encoding.
+    /// - **Completeness:** the token fully describes what stored bytes mean. A
+    ///   [`CellResolver`](crate::state::descriptor::CellResolver) must never
+    ///   add meaning the format doesn't imply — storage that denotes references
+    ///   or pointers gets its own codec and token.
+    ///
+    /// Name the format, not the implementation: a token like `"json"` lets a
+    /// differently-implemented reader of the same format validate against the
+    /// frozen identity. [`BinaryCodec`] copies bytes verbatim, so it cannot
+    /// name a format itself — its [`BinaryFormat`] parameter makes the user
+    /// declare one at definition.
+    const FORMAT_ID: &'static str;
 
     /// The deserialized payload type produced and consumed by this codec.
     type Payload: Send + Sync + 'static;
@@ -60,7 +76,7 @@ pub trait Codec: Default + Send + Sync + 'static {
     /// Runs `f` with an instance of this codec.
     ///
     /// The default constructs a fresh codec via `Default` per call — all a
-    /// user codec needs is `CODEC_ID`, `Payload`, `Error`, and the two
+    /// user codec needs is `FORMAT_ID`, `Payload`, `Error`, and the two
     /// serialize/deserialize methods. Override it to reuse internal buffers
     /// (such as `simd_json::Buffers`) across calls by backing it with a
     /// `thread_local!` of the concrete codec type so dispatch stays static;
@@ -85,7 +101,7 @@ pub trait Codec: Default + Send + Sync + 'static {
 ///
 /// # Invariant: the recovered codec must match the registration
 ///
-/// The recovered codec's [`Codec::CODEC_ID`] rides the collection's
+/// The recovered codec's [`Codec::FORMAT_ID`] rides the collection's
 /// `structural_identity`, which `verify_state_registration` checks at access:
 /// this map only *infers* a codec, that check *enforces* it. A consumer whose
 /// real codec differs self-rejects with a Permanent identity mismatch rather
