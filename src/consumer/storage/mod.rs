@@ -79,16 +79,9 @@ impl StorePair {
     ///
     /// This is an atomic operation - both stores are created or the operation
     /// fails. The stores are guaranteed to use the same underlying storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Trigger store configuration (`InMemory` or `Cassandra`)
-    /// * `mock` - If true, uses in-memory storage regardless of config
-    /// * `dedup_ttl` - TTL for deduplication records
-    /// * `dedup_cache_capacity` - Capacity of the deduplication cache.
-    ///   `NonZeroUsize`, since deduplication is always wired (it is the
-    ///   keyed-state commit oracle) and a zero capacity is meaningless.
-    /// * `timer_spans` - How timer spans relate to their producer span
+    /// `dedup_cache_capacity` is a `NonZeroUsize` because deduplication is
+    /// always wired (it is the keyed-state commit oracle) and a zero
+    /// capacity is meaningless.
     ///
     /// # Errors
     ///

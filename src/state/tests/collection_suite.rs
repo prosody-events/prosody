@@ -307,10 +307,6 @@ struct Backing<'a> {
 /// snapshot otherwise — then assert the committed collection through a fresh
 /// read-back session (`assert`, which absorbs any kind-specific check such as
 /// Map's bound-cell superset).
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
 async fn run_collection_trace<D, O, M, Apply, Assert>(
     trace: Trace<O>,
     descriptor: D,
@@ -409,10 +405,6 @@ where
 
 /// Drives a deque trace, asserting the handle equals a `VecDeque` model after
 /// every event and that each `pop` returns the model's value.
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
 pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
     run_collection_trace(
         trace,
@@ -450,10 +442,6 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
 /// Drives a map trace, asserting the handle equals a `BTreeMap` model after
 /// every event, that each mid-trace `get` returns the model's value, and that
 /// the stored bounds cover a loose superset of the live key range.
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
 pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
     run_collection_trace(
         trace,

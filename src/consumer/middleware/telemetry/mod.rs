@@ -87,12 +87,8 @@ pub struct TelemetryHandler<T> {
 }
 
 impl TelemetryMiddleware {
-    /// Creates a new `TelemetryMiddleware` with the provided telemetry system.
-    ///
-    /// # Arguments
-    ///
-    /// * `telemetry` - The telemetry system for creating partition senders
-    /// * `source` - The consumer `group_id` used as source identifier in events
+    /// Creates a new `TelemetryMiddleware` from the telemetry system and the
+    /// consumer `group_id` used as the source identifier in emitted events.
     #[must_use]
     pub fn new(telemetry: Telemetry, source: Arc<str>) -> Self {
         Self { telemetry, source }
@@ -143,21 +139,13 @@ where
     type Output = T::Output;
     type Payload = T::Payload;
 
-    /// Processes a message and records telemetry events for handler lifecycle.
+    /// Processes a message and records telemetry events for handler lifecycle,
+    /// passing through the wrapped handler's result (and error) unchanged.
     ///
     /// Records the following events:
     /// - `HandlerInvoked` when the handler is called
     /// - `HandlerSucceeded` when the handler completes successfully
     /// - `HandlerFailed` when the handler returns an error
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The context of the message being processed
-    /// * `message` - The message to process
-    ///
-    /// # Errors
-    ///
-    /// Returns the original error from the wrapped handler
     async fn on_message<C>(
         &self,
         context: C,
@@ -203,21 +191,13 @@ where
         result
     }
 
-    /// Processes a timer and records telemetry events for handler lifecycle.
+    /// Processes a timer and records telemetry events for handler lifecycle,
+    /// passing through the wrapped handler's result (and error) unchanged.
     ///
     /// Records the following events:
     /// - `HandlerInvoked` when the handler is called
     /// - `HandlerSucceeded` when the handler completes successfully
     /// - `HandlerFailed` when the handler returns an error
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The context for timer processing
-    /// * `trigger` - The timer trigger to process
-    ///
-    /// # Errors
-    ///
-    /// Returns the original error from the wrapped handler
     async fn on_timer<C>(
         &self,
         context: C,

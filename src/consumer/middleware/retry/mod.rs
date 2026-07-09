@@ -127,10 +127,6 @@ pub struct RetryConfiguration {
 
 impl RetryConfiguration {
     /// Creates a new `RetryConfigurationBuilder`.
-    ///
-    /// # Returns
-    ///
-    /// A `RetryConfigurationBuilder` instance.
     #[must_use]
     pub fn builder() -> RetryConfigurationBuilder {
         RetryConfigurationBuilder::default()
@@ -145,15 +141,6 @@ pub struct RetryMiddleware {
 
 impl RetryMiddleware {
     /// Creates a new `RetryMiddleware` with the given configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The configuration for the retry middleware.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `RetryMiddleware` if the configuration is
-    /// valid, or `ValidationErrors` if the configuration is invalid.
     ///
     /// # Errors
     ///

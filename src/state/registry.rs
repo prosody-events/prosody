@@ -143,15 +143,10 @@ impl CollectionDefRegistry {
     /// The frozen [`StructuralIdentity`] is derived from the descriptor —
     /// the single source of identity. Re-registering the same name with the
     /// same identity is idempotent (the operational `def` is updated);
-    /// a different identity for the same name is rejected.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegisterStateError::Name`] when the descriptor's name is
-    /// empty, [`RegisterStateError::Ttl`] when its TTL exceeds
-    /// Cassandra's `USING TTL` ceiling, or
-    /// [`RegisterStateError::IdentityConflict`] when the name is already
-    /// registered with a different structural identity.
+    /// a different identity for the same name is rejected
+    /// ([`RegisterStateError::IdentityConflict`]). Also rejects an empty name
+    /// ([`RegisterStateError::Name`]) or a TTL over Cassandra's `USING TTL`
+    /// ceiling ([`RegisterStateError::Ttl`]).
     ///
     /// Test-only: production builds the registry through `register_identity`
     /// (fed by the config's stored registrations); the typed descriptor form

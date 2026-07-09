@@ -36,17 +36,7 @@ async fn test_probe_server_endpoints_respond() -> Result<()> {
     Ok(())
 }
 
-/// Checks if an endpoint responds to HTTP requests.
-///
-/// # Arguments
-///
-/// * `client` - HTTP client to use for requests
-/// * `address` - Server address to connect to
-/// * `path` - Endpoint path to test
-///
-/// # Returns
-///
-/// `true` if the endpoint responds within the timeout, `false` otherwise
+/// Checks if an endpoint responds to HTTP requests within the timeout.
 async fn check_endpoint(client: &Client, address: SocketAddr, path: &str) -> bool {
     let url = format!("http://localhost:{}{}", address.port(), path);
 

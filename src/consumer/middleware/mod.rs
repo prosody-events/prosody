@@ -196,16 +196,6 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
     type Handler: FallibleHandler + Send + Sync + 'static;
 
     /// Creates a fallible handler for a specific topic and partition.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic of the partition.
-    /// * `partition` - The partition number.
-    ///
-    /// # Returns
-    ///
-    /// A handler instance for processing messages from the specified
-    /// topic-partition.
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
 }
 
@@ -247,15 +237,6 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
         T::Handler: FallibleHandler<Payload = P>;
 
     /// Wraps a handler provider with this middleware.
-    ///
-    /// # Arguments
-    ///
-    /// * `provider` - The fallible handler provider to wrap with this
-    ///   middleware.
-    ///
-    /// # Returns
-    ///
-    /// A new provider that implements `FallibleHandlerProvider`.
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
@@ -268,15 +249,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// This method converts the middleware stack (which implements
     /// `HandlerMiddleware`) into a provider (which implements
     /// `FallibleHandlerProvider`) by terminating the stack with the given
-    /// handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `handler` - The fallible handler to use as the innermost component.
-    ///
-    /// # Returns
-    ///
-    /// A provider that implements `FallibleHandlerProvider`.
+    /// handler as the innermost component.
     ///
     /// See the [module-level usage example](crate::consumer::middleware) for a
     /// full composition; a single middleware terminates the chain the same way,
@@ -312,14 +285,6 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     ///
     /// Each middleware can transform the request, short-circuit execution,
     /// handle errors, and add side effects on both phases.
-    ///
-    /// # Arguments
-    ///
-    /// * `outer_middleware` - The middleware to add as the outermost layer.
-    ///
-    /// # Returns
-    ///
-    /// A `ComposedMiddleware` with the new middleware as the outer layer.
     ///
     /// # Example
     ///
@@ -749,17 +714,9 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// pairs with exactly one `after_commit` / `after_abort` firing.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error that occurred during processing
     fn on_message_error(&self, _error: &Self::Error) {}
 
     /// Called when timer processing fails.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error that occurred during processing
     fn on_timer_error(&self, _error: &Self::Error) {}
 }
 

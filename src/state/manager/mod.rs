@@ -567,11 +567,6 @@ where
 /// [`sweep_provisional`](crate::state::resolve), left for first-touch or a
 /// later sweep; a transient/terminal failure propagates via `Err` for
 /// [`PartitionStateManager::recover`] to reschedule against.
-///
-/// # Errors
-///
-/// Returns [`ResolveCellError`] on a transient/terminal backend or oracle
-/// failure.
 async fn sweep_partition<S, O>(
     cell: &S,
     oracle: &O,

@@ -78,10 +78,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     ///
     /// Cancellation includes both message-level cancellation and partition
     /// shutdown.
-    ///
-    /// # Returns
-    ///
-    /// A future that completes with `()` once cancellation is triggered.
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static;
 
     /// Trigger cancellation for this context.
@@ -103,11 +99,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
 
     /// Schedule a new timer at the given execution time for this key.
     ///
-    /// # Arguments
-    ///
-    /// * `time` – The `CompactDateTime` at which the timer should fire.
-    /// * `timer_type` – The `TimerType` of the timer to schedule.
-    ///
     /// # Errors
     ///
     /// Returns `Err(Self::Error)` if scheduling in the persistent store
@@ -123,11 +114,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// All prior timers for this key are removed in parallel before a new
     /// timer at `time` is added.
     ///
-    /// # Arguments
-    ///
-    /// * `time` – The time for the new, sole scheduled timer.
-    /// * `timer_type` – The `TimerType` of the timer to schedule.
-    ///
     /// # Errors
     ///
     /// Returns `Err(Self::Error)` if any unschedule or the final schedule
@@ -140,11 +126,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
 
     /// Unschedule a single timer for this key at the specified time.
     ///
-    /// # Arguments
-    ///
-    /// * `time` – The execution time of the timer to remove.
-    /// * `timer_type` – The `TimerType` of the timer to remove.
-    ///
     /// # Errors
     ///
     /// Returns `Err(Self::Error)` if the unschedule operation fails.
@@ -155,10 +136,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unschedule *all* timers for this key of the specified type.
-    ///
-    /// # Arguments
-    ///
-    /// * `timer_type` – The `TimerType` of timers to clear.
     ///
     /// # Errors
     ///
@@ -181,14 +158,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
 
     /// List all scheduled execution times for timers on this key of the
     /// specified type.
-    ///
-    /// # Arguments
-    ///
-    /// * `timer_type` – The `TimerType` to filter by.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec` of all scheduled times on success.
     ///
     /// # Errors
     ///
@@ -342,16 +311,10 @@ where
     /// Create a new `PartitionEventContext` binding a message key to timer
     /// operations and the event's keyed-state session.
     ///
-    /// # Arguments
-    ///
-    /// * `key` – The message key for affinity and timer scoping.
-    /// * `shutdown_rx` – Watch channel signaling partition shutdown; operations
-    ///   short-circuit at `>= ShutdownPhase::Cancelling`.
-    /// * `message_cancel` – The per-event cancellation channel, created by the
-    ///   partition loop so the session's termination watch shares the same
-    ///   receiver.
-    /// * `timers` – The `TimerManager<T>` instance.
-    /// * `session` – The per-event keyed-state session.
+    /// `shutdown_rx` short-circuits operations once it reaches
+    /// `>= ShutdownPhase::Cancelling`. `message_cancel` is the per-event
+    /// cancellation channel created by the partition loop, so the session's
+    /// termination watch shares the same receiver.
     pub(crate) fn new(
         key: Key,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
@@ -652,10 +615,6 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
 
     /// Schedule a timer for the current key.
     ///
-    /// # Arguments
-    ///
-    /// * `time` – The execution time to schedule.
-    ///
     /// # Errors
     ///
     /// Returns an error if scheduling fails.
@@ -666,11 +625,6 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     ) -> Result<(), BoxEventContextError>;
 
     /// Unschedule all existing timers and schedule a new one.
-    ///
-    /// # Arguments
-    ///
-    /// * `time` – The new execution time.
-    /// * `timer_type` – The timer type.
     async fn clear_and_schedule(
         &self,
         time: CompactDateTime,
@@ -678,11 +632,6 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     ) -> Result<(), BoxEventContextError>;
 
     /// Unschedule a specific timer.
-    ///
-    /// # Arguments
-    ///
-    /// * `time` – The time to unschedule.
-    /// * `timer_type` – The timer type.
     async fn unschedule(
         &self,
         time: CompactDateTime,
@@ -690,17 +639,9 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     ) -> Result<(), BoxEventContextError>;
 
     /// Unschedule all timers of the specified type.
-    ///
-    /// # Arguments
-    ///
-    /// * `timer_type` – The timer type.
     async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxEventContextError>;
 
     /// List scheduled execution times for the specified type.
-    ///
-    /// # Arguments
-    ///
-    /// * `timer_type` – The timer type.
     async fn scheduled(
         &self,
         timer_type: TimerType,

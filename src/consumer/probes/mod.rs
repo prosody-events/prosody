@@ -74,16 +74,6 @@ struct ProbeState<P: Send + Sync + 'static> {
 impl ProbeServer {
     /// Creates a new HTTP server for health check endpoints.
     ///
-    /// # Arguments
-    ///
-    /// * `port` - Port number to bind the server to
-    /// * `managers` - Reference to partition managers for status checks
-    /// * `heartbeats` - Registry for monitoring consumer-level actors
-    ///
-    /// # Returns
-    ///
-    /// A new `ProbeServer` instance if binding succeeds
-    ///
     /// # Errors
     ///
     /// Returns an `io::Error` if the server fails to bind to the specified port
@@ -172,19 +162,9 @@ impl ProbeServer {
 ///
 /// A consumer is considered ready when it has partitions assigned by Kafka.
 /// If no partitions are assigned, the consumer is not yet ready to process
-/// messages.
-///
-/// # Arguments
-///
-/// * `State(ProbeState { managers, .. })` - Shared state containing partition
-///   managers
-///
-/// # Returns
-///
-/// A tuple containing:
-/// - `StatusCode::OK` (200) if partitions are assigned, or
-///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
-/// - A message describing the current assignment status
+/// messages. Responds `StatusCode::OK` if partitions are assigned, or
+/// `StatusCode::SERVICE_UNAVAILABLE` otherwise, paired with a message
+/// describing the current assignment status.
 async fn readiness_probe<P: Send + Sync + 'static>(
     State(ProbeState { managers, .. }): State<ProbeState<P>>,
 ) -> (StatusCode, Cow<'static, str>) {
@@ -209,19 +189,9 @@ async fn readiness_probe<P: Send + Sync + 'static>(
 ///
 /// A consumer is considered live when no consumer-level actors or partition
 /// processing has stalled. Stalls indicate that the consumer is no longer
-/// making progress and may need to be restarted.
-///
-/// # Arguments
-///
-/// * `State(ProbeState { managers, heartbeats })` - Shared state containing
-///   partition managers and consumer-level heartbeat registry
-///
-/// # Returns
-///
-/// A tuple containing:
-/// - `StatusCode::OK` (200) if no stalls are detected, or
-///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
-/// - A message describing the current stall status
+/// making progress and may need to be restarted. Responds `StatusCode::OK`
+/// if no stalls are detected, or `StatusCode::SERVICE_UNAVAILABLE` otherwise,
+/// paired with a message describing the current stall status.
 async fn liveness_probe<P: Send + Sync + 'static>(
     State(ProbeState {
         managers,

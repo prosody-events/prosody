@@ -106,10 +106,6 @@ impl CassandraTriggerStore {
     ///
     /// Uses `SELECT state[?]` to read only the requested type. Both a missing
     /// partition (no row) and a `NULL` map entry resolve to `Absent`.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn fetch_state(
         &self,
@@ -151,10 +147,6 @@ impl CassandraTriggerStore {
     ///
     /// Post-V3, a NULL/missing MAP entry unambiguously means "new key, 0
     /// timers," so all states (including `Absent`) are cached.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the DB read fails on a cache miss.
     pub(super) async fn resolve_state(
         &self,
         segment_id: &SegmentId,
@@ -186,10 +178,6 @@ impl CassandraTriggerStore {
     ///
     /// This is the safe path for Overflow→Inline and DB-Absent→Inline
     /// transitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_clear_and_set_inline(
         &self,
@@ -240,10 +228,6 @@ impl CassandraTriggerStore {
     /// unlogged batch is correct and carries no cross-partition overhead.
     /// This is the Overflow→Inline demotion path when exactly 1 clustering
     /// row remains after a delete.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_demote_to_inline(
         &self,
@@ -293,10 +277,6 @@ impl CassandraTriggerStore {
     /// This is the fast path for Inline→Inline replacement: no BATCH,
     /// no DELETE, no range tombstone. Safe because the caller knows the state
     /// is `Inline` (no clustering rows for this key/type).
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn set_state_inline(
         &self,
@@ -322,10 +302,6 @@ impl CassandraTriggerStore {
     /// A TTL is applied (derived from `ttl_time`) so the marker expires no
     /// later than the clustering rows it describes, preventing zombie Overflow
     /// entries if those rows expire via TTL without an explicit deletion.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn set_state_overflow(
         &self,
@@ -389,10 +365,6 @@ impl CassandraTriggerStore {
     }
 
     /// Removes a state entry for a single timer type (returns to Absent).
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn remove_state_entry(
         &self,
@@ -422,10 +394,6 @@ impl CassandraTriggerStore {
     /// the clustering row.
     ///
     /// Fetches only `time` — no span — to keep the result small.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn peek_trigger_times(
         &self,
@@ -462,10 +430,6 @@ impl CassandraTriggerStore {
     ///
     /// Used in the `1`-remaining demotion branch of `delete_key_trigger` and
     /// `backfill_key_state` to retrieve the span needed to build inline state.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn peek_first_key_trigger(
         &self,
@@ -493,10 +457,6 @@ impl CassandraTriggerStore {
     /// read: the caller filters the target time out and inspects what remains
     /// to choose between three post-delete states (Absent / Inline / Overflow).
     /// Returning a third row signals "≥2 survivors" without needing its data.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn peek_three_key_triggers(
         &self,
@@ -533,10 +493,6 @@ impl CassandraTriggerStore {
     /// read shows zero non-target rows. Both statements target the same
     /// `(segment_id, key)` partition so the unlogged batch carries no
     /// cross-partition coordination overhead and is atomic on the replica.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_delete_to_absent(
         &self,
@@ -569,10 +525,6 @@ impl CassandraTriggerStore {
     /// time/span/tag has already been captured into `state` so the UPDATE
     /// writes Inline state in the same round-trip, avoiding a separate
     /// target DELETE and a separate demote BATCH.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_delete_to_inline(
         &self,
@@ -635,10 +587,6 @@ impl CassandraTriggerStore {
     /// - 1 clustering row: normalize to inline state (concurrent
     ///   `set_state_inline` + delete clustering row).
     /// - ≥2 clustering rows: set overflow marker.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if any DB operation fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn backfill_key_state(
         &self,
@@ -710,10 +658,6 @@ impl CassandraTriggerStore {
     /// expires together with the last clustering row it describes — preventing
     /// zombie markers if those rows later expire via TTL without explicit
     /// deletion.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_promote_and_set_overflow(
         &self,
@@ -782,10 +726,6 @@ impl CassandraTriggerStore {
     ///
     /// Used when multiple timers exist for a key/type. Does not touch the
     /// state column.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database insert fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn add_key_trigger_clustering(
         &self,

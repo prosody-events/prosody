@@ -177,10 +177,6 @@ impl MigrationModel {
 ///    `insert_segment_v1()`
 /// 2. Register slabs with `insert_slab()`
 /// 3. Add triggers with `add_trigger()` (no `timer_type`)
-///
-/// # Errors
-///
-/// Returns error if V1 operations fail.
 async fn setup_v1_state(
     operations: &V1Operations,
     input: &MigrationTestInput,
@@ -237,10 +233,6 @@ async fn setup_v1_state(
 /// This faithfully reproduces the on-disk layout of a real V2 segment before
 /// V2→V3 migration runs. The state column is left absent so that
 /// `migrate_key_states` / `backfill_key_state` must populate it from scratch.
-///
-/// # Errors
-///
-/// Returns error if any write fails.
 async fn setup_v2_state(
     store: &CassandraTriggerStore,
     input: &MigrationTestInput,
@@ -290,10 +282,6 @@ async fn setup_v2_state(
 
 /// Sets up V3 initial state: segment row + triggers written through the full
 /// state-aware path so that state MAP entries are populated on creation.
-///
-/// # Errors
-///
-/// Returns error if any write fails.
 async fn setup_v3_state(
     store: &TableAdapter<CassandraTriggerStore>,
     input: &MigrationTestInput,
@@ -330,10 +318,6 @@ async fn setup_v3_state(
 ///
 /// Expected: version=V2, `slab_size=target_slab_size`, name preserved (for V2
 /// only).
-///
-/// # Errors
-///
-/// Returns error if segment metadata doesn't match expectations.
 async fn verify_segment_metadata(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -414,10 +398,6 @@ async fn collect_key_index_triggers(
 /// Verifies that all triggers are preserved with correct `timer_type`.
 ///
 /// Builds actual trigger set from store and compares to model.
-///
-/// # Errors
-///
-/// Returns error if triggers don't match model.
 async fn verify_data_preservation(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -438,10 +418,6 @@ async fn verify_data_preservation(
 
 /// Verifies that triggers are in correct slabs based on target slab
 /// size.
-///
-/// # Errors
-///
-/// Returns error if triggers are in wrong slabs.
 async fn verify_correct_indexing(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -489,10 +465,6 @@ async fn verify_correct_indexing(
 /// Verifies that the slab index matches the key index exactly.
 ///
 /// Both indices must contain the same triggers (dual-index consistency).
-///
-/// # Errors
-///
-/// Returns error if indices don't match.
 async fn verify_dual_index_consistency(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -532,10 +504,6 @@ async fn verify_dual_index_consistency(
 }
 
 /// Verifies that ONLY expected slabs exist (no extra slabs).
-///
-/// # Errors
-///
-/// Returns error if extra slabs are found.
 async fn verify_no_extra_slabs(
     operations: &CassandraTriggerStore,
     model: &MigrationModel,
@@ -569,10 +537,6 @@ async fn verify_no_extra_slabs(
 }
 
 /// Verifies that old V1 data and obsolete slabs are cleaned up.
-///
-/// # Errors
-///
-/// Returns error if cleanup didn't happen.
 async fn verify_cleanup(
     v1_operations: &V1Operations,
     operations: &CassandraTriggerStore,
@@ -654,10 +618,6 @@ async fn verify_cleanup(
 /// Applies to both V1-initial (V1→V2→V3) and V2-initial (V2→V3) segments.
 /// V3-initial segments already have correct state; they are skipped here since
 /// the state column was populated by the original write path, not by backfill.
-///
-/// # Errors
-///
-/// Returns error if key state invariant is violated.
 async fn verify_key_state_invariant(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,

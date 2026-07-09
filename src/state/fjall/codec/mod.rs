@@ -260,11 +260,8 @@ pub(super) fn index_cover_key(
 }
 
 /// Decodes the low bound stored in a coverage key's frame tail (the bytes after
-/// the `[hash][Cover][section]` prefix).
-///
-/// # Errors
-///
-/// Returns [`FjallCellCacheError`] when the frame tag is unknown.
+/// the `[hash][Cover][section]` prefix). Fails with [`FjallCellCacheError`]
+/// when the frame tag is unknown.
 pub(super) fn cover_low_bound(key: &[u8]) -> Result<Bound<Coordinate>, FjallCellCacheError> {
     decode_bound(&key[COLLECTION_PREFIX_LEN + 2..])
 }
@@ -289,12 +286,9 @@ pub(super) fn encode_bound(bound: &Bound<Coordinate>) -> Vec<u8> {
     }
 }
 
-/// Decodes a [`Bound<Coordinate>`] frame produced by [`encode_bound`].
-///
-/// # Errors
-///
-/// Returns [`FjallCellCacheError::UnknownBoundTag`] when the leading tag byte
-/// is unrecognized, or [`FjallCellCacheError::EmptyCacheCell`] on a truncated
+/// Decodes a [`Bound<Coordinate>`] frame produced by [`encode_bound`]. Fails
+/// with [`FjallCellCacheError::UnknownBoundTag`] when the leading tag byte is
+/// unrecognized, or [`FjallCellCacheError::EmptyCacheCell`] on a truncated
 /// frame (both are our own writes into a fresh keyspace, so either is a bug).
 pub(super) fn decode_bound(frame: &[u8]) -> Result<Bound<Coordinate>, FjallCellCacheError> {
     let (tag, rest) = frame
@@ -387,10 +381,6 @@ pub(super) fn encode_present_cell(payload: &[u8], expiry: u64) -> Bytes {
 /// The returned `Bytes` is a fresh `copy_from_slice` of the payload tail, so
 /// it is uniquely owned — preserving the `try_into_mut` read fast path the
 /// handle relies on.
-///
-/// # Errors
-///
-/// Returns a [`FjallCellCacheError`] when the cell is malformed.
 pub(super) fn decode_cell(bytes: Option<&[u8]>) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
     let Some(bytes) = bytes else {
         return Ok((NEVER_EXPIRES, Read::Unknown));

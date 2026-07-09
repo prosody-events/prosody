@@ -45,14 +45,6 @@ pub struct FallibleCloneProvider<T>(T);
 
 impl<T> FallibleCloneProvider<T> {
     /// Creates a new `FallibleCloneProvider` that wraps the given handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` - The fallible handler to wrap.
-    ///
-    /// # Returns
-    ///
-    /// A new `FallibleCloneProvider` instance.
     pub fn new(inner: T) -> Self {
         Self(inner)
     }
@@ -79,14 +71,6 @@ pub struct CloneProvider<T>(T);
 
 impl<T> CloneProvider<T> {
     /// Creates a new `CloneProvider` that wraps the given handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` - The handler to wrap.
-    ///
-    /// # Returns
-    ///
-    /// A new `CloneProvider` instance.
     pub fn new(inner: T) -> Self {
         Self(inner)
     }

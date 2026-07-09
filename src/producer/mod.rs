@@ -109,11 +109,7 @@ pub struct ProducerConfiguration {
 }
 
 impl ProducerConfigurationBuilder {
-    /// Currently configured source system
-    ///
-    /// # Returns
-    ///
-    /// An option containing the source system if configured
+    /// Currently configured source system, if any.
     #[must_use]
     pub(crate) fn configured_source_system(&self) -> Option<String> {
         self.source_system
@@ -124,10 +120,6 @@ impl ProducerConfigurationBuilder {
 
 impl ProducerConfiguration {
     /// Creates a new `ProducerConfigurationBuilder`.
-    ///
-    /// # Returns
-    ///
-    /// A new instance of `ProducerConfigurationBuilder`.
     #[must_use]
     pub fn builder() -> ProducerConfigurationBuilder {
         ProducerConfigurationBuilder::default()
@@ -189,14 +181,6 @@ impl<C: Codec> Clone for ProsodyProducer<C> {
 impl<C: Codec> ProsodyProducer<C> {
     /// Creates a new `ProsodyProducer` instance.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance if successful.
-    ///
     /// # Errors
     ///
     /// Returns a `ProducerError` if:
@@ -246,15 +230,6 @@ impl<C: Codec> ProsodyProducer<C> {
     /// This configuration sets the send timeout to `None`, allowing for
     /// indefinite retries.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
-    ///
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
@@ -270,19 +245,6 @@ impl<C: Codec> ProsodyProducer<C> {
     ///
     /// This configuration ensures a send timeout is set, defaulting to 1 second
     /// if not specified.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `ProducerError` if the producer creation fails.
     pub(crate) fn low_latency_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
@@ -298,10 +260,6 @@ impl<C: Codec> ProsodyProducer<C> {
     /// Best-effort construction has the same send-timeout defaulting as
     /// [`Self::low_latency_producer`]; the two modes are distinguished
     /// elsewhere (retry/monopolization wiring), not at producer construction.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `ProducerError` if the producer creation fails.
     pub(crate) fn best_effort_producer(
         config: ProducerConfiguration,
         telemetry: TelemetrySender,
@@ -310,17 +268,6 @@ impl<C: Codec> ProsodyProducer<C> {
     }
 
     /// Sends a message to a Kafka topic.
-    ///
-    /// # Arguments
-    ///
-    /// * `headers` - An iterator of key-value pairs to be added as headers.
-    /// * `topic` - The topic to send the message to.
-    /// * `key` - The message key.
-    /// * `payload` - The message payload, encoded by `C`.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or failure of the send operation.
     ///
     /// # Errors
     ///
@@ -438,10 +385,6 @@ impl<C: Codec> ProsodyProducer<C> {
     ///
     /// This method is primarily used for internal purposes like checking topic
     /// existence.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the underlying Kafka client.
     pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
         self.producer.client()
     }

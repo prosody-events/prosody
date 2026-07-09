@@ -143,18 +143,11 @@ pub struct FailureTracker {
 }
 
 impl FailureTracker {
-    /// Creates a new failure tracker.
+    /// Creates a new failure tracker with the given failure-rate `threshold`
+    /// (0.0 to 1.0) above which deferral is disabled.
     ///
     /// Spawns a background task to process telemetry events and registers
     /// a heartbeat with the provided registry for stall detection.
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - Time window for tracking events
-    /// * `threshold` - Failure rate threshold (0.0 to 1.0) above which deferral
-    ///   is disabled
-    /// * `telemetry` - Telemetry system for subscribing to handler events
-    /// * `heartbeats` - Registry to register the heartbeat for monitoring
     #[must_use]
     pub fn new(
         window: Duration,
@@ -179,14 +172,11 @@ impl FailureTracker {
         }
     }
 
-    /// Gets current failure rate for monitoring/metrics.
+    /// Gets current failure rate for monitoring/metrics, as a value between
+    /// 0.0 (no failures) and 1.0 (all failures); 0.0 if there are no events
+    /// in the window.
     ///
     /// Lock-free read from atomic.
-    ///
-    /// # Returns
-    ///
-    /// Failure rate as a value between 0.0 (no failures) and 1.0 (all
-    /// failures). Returns 0.0 if there are no events in the window.
     #[must_use]
     pub fn failure_rate(&self) -> f64 {
         self.failure_rate.load(Ordering::Relaxed)

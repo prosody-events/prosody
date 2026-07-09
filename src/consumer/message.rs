@@ -75,10 +75,6 @@ pub struct UncommittedMessage<P> {
 
 impl<P> UncommittedMessage<P> {
     /// Returns the optional source system identifier from message headers.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing the source system if present.
     #[must_use]
     pub fn source_system(&self) -> Option<&SourceSystem> {
         self.inner.source_system()
@@ -124,10 +120,6 @@ impl<P> UncommittedMessage<P> {
 
     /// Decomposes into its inner `ConsumerMessage` and the offset-tracking
     /// guard.
-    ///
-    /// # Returns
-    ///
-    /// A tuple `(ConsumerMessage<P>, UncommittedOffset)`.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage<P>, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
@@ -275,13 +267,6 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
 impl<P> ConsumerMessage<P> {
     /// Create a new `ConsumerMessage` from a message value and processing state
     /// components.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` – The message data (topic, partition, offset, key, timestamp,
-    ///   payload, etc.).
-    /// * `span` – Tracing span for distributed context.
-    /// * `permit` – Semaphore permit for backpressure management.
     #[must_use]
     pub fn new(value: ConsumerMessageValue<P>, span: Span, permit: OwnedSemaphorePermit) -> Self {
         let value = Arc::new(value);
@@ -297,12 +282,6 @@ impl<P> ConsumerMessage<P> {
     ///
     /// This is used after `decode_message` returns a `DecodedMessage` to
     /// attach the semaphore permit and span for the processing phase.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - Shared immutable message data
-    /// * `span` - Tracing span for this processing phase
-    /// * `permit` - Semaphore permit for backpressure management
     #[must_use]
     pub fn from_decoded(
         value: Arc<ConsumerMessageValue<P>>,
@@ -365,10 +344,6 @@ impl<P> ConsumerMessage<P> {
     }
 
     /// Convert into `UncommittedMessage` by attaching offset-tracking state.
-    ///
-    /// # Arguments
-    ///
-    /// * `uncommitted_offset` – The offset guard to manage commit/abort.
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage<P> {
         UncommittedMessage {
@@ -381,14 +356,6 @@ impl<P> ConsumerMessage<P> {
     ///
     /// Creates a `ConsumerMessage` suitable for unit testing without requiring
     /// complex setup. Each message gets its own semaphore permit.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - Kafka topic
-    /// * `partition` - Partition index
-    /// * `offset` - Message offset
-    /// * `key` - Message key
-    /// * `payload` - Message payload
     ///
     /// # Errors
     ///

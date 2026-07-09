@@ -115,10 +115,6 @@ pub struct TestHarness {
 
 impl TestHarness {
     /// Creates a new test harness with the given key count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the defer handler construction fails.
     pub fn new(key_count: usize) -> color_eyre::Result<Self> {
         let keys: Vec<Key> = (0..key_count)
             .map(|i| Arc::from(format!("key-{i}")))

@@ -54,13 +54,6 @@ pub struct HeartbeatRegistry {
 impl HeartbeatRegistry {
     /// Creates a new heartbeat registry with the specified base name and stall
     /// threshold.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_name` - Base name prefix for all heartbeats registered with this
-    ///   registry
-    /// * `stall_threshold` - Duration of inactivity before considering
-    ///   components stalled
     #[must_use]
     pub fn new(base_name: String, stall_threshold: Duration) -> Self {
         Self {
@@ -71,10 +64,6 @@ impl HeartbeatRegistry {
     }
 
     /// Registers a new heartbeat with the configured stall threshold.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Name suffix for this specific heartbeat
     #[must_use]
     pub fn register(&self, name: &str) -> Heartbeat {
         let mut registry = self.heartbeats.lock();
@@ -83,12 +72,8 @@ impl HeartbeatRegistry {
         heartbeat
     }
 
-    /// Checks if any registered heartbeat is currently stalled.
-    ///
-    /// # Returns
-    ///
-    /// `true` if at least one heartbeat exceeds its stall threshold, `false`
-    /// otherwise
+    /// Returns `true` if at least one registered heartbeat exceeds its stall
+    /// threshold.
     pub fn any_stalled(&self) -> bool {
         self.heartbeats.lock().iter().any(Heartbeat::is_stalled)
     }
@@ -143,12 +128,6 @@ struct Inner {
 impl Heartbeat {
     /// Creates a new heartbeat monitor with the specified name and stall
     /// threshold.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - A name identifier for this heartbeat, used in logging
-    /// * `stall_threshold` - The maximum allowed duration of inactivity before
-    ///   considering the component stalled
     pub fn new<T>(name: T, stall_threshold: Duration) -> Self
     where
         T: Into<Cow<'static, str>>,
@@ -183,15 +162,9 @@ impl Heartbeat {
         sleep(self.inner.stall_threshold / HEARTBEAT_MARGIN).await;
     }
 
-    /// Checks if the monitored component has stalled.
-    ///
     /// Returns `true` if the time since the last heartbeat exceeds the
     /// stall threshold. This method also logs state transitions between
     /// stalled and active states.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the component is considered stalled, `false` otherwise
     pub fn is_stalled(&self) -> bool {
         let heartbeat_millis = self.inner.last_heartbeat.load(Ordering::Acquire);
         let heartbeat_duration = Duration::from_millis(heartbeat_millis);

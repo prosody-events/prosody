@@ -162,11 +162,6 @@ impl MonopolizationMiddleware {
     /// The returned `Option<Self>` implements `HandlerMiddleware` directly,
     /// passing through to the inner handler when `None`.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration for monopolization detection
-    /// * `telemetry` - Telemetry instance for event subscription
-    ///
     /// # Errors
     ///
     /// Returns an error if the configuration validation fails.

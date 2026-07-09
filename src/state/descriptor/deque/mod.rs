@@ -389,11 +389,8 @@ fn index_coordinate(index: i64) -> Coordinate {
     Coordinate::from_bytes(order_preserving_i64(index).to_vec())
 }
 
-/// The live-window length `tail − head` as a `usize`.
-///
-/// # Errors
-///
-/// Returns [`MetaDecodeError::Disordered`] when `tail < head` and
+/// The live-window length `tail − head` as a `usize`. Fails with
+/// [`MetaDecodeError::Disordered`] when `tail < head` and
 /// [`MetaDecodeError::IndexOverflow`] when the count exceeds `usize`.
 fn window_len(head: i64, tail: i64) -> Result<usize, MetaDecodeError> {
     let span = tail
@@ -411,11 +408,8 @@ fn encode_bounds(head: i64, tail: i64) -> [u8; META_LEN] {
     out
 }
 
-/// Decodes the bounds cell payload, validating `head ≤ tail`.
-///
-/// # Errors
-///
-/// Returns [`MetaDecodeError::BadLength`] for a wrong-width payload and
+/// Decodes the bounds cell payload, validating `head ≤ tail`. Fails with
+/// [`MetaDecodeError::BadLength`] for a wrong-width payload and
 /// [`MetaDecodeError::Disordered`] when `tail < head`.
 fn decode_bounds(bytes: &[u8]) -> Result<(i64, i64), MetaDecodeError> {
     if bytes.len() != META_LEN {

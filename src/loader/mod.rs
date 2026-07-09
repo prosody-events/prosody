@@ -60,12 +60,6 @@ pub trait MessageLoader: Send + Sync + Clone {
     /// Returns a [`ConsumerMessage`] ready for processing, with appropriate
     /// permit and span context.
     ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic containing the message
-    /// * `partition` - The partition containing the message
-    /// * `offset` - The exact offset of the message
-    ///
     /// # Errors
     ///
     /// Returns an error if the message cannot be loaded (deleted, network

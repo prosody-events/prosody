@@ -211,11 +211,6 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// Returns the old trigger times that were cleared (excluding the new
     /// trigger's own time). Callers use these to clean up the slab index
     /// without a separate pre-read.
-    ///
-    /// # Arguments
-    ///
-    /// * `trigger` - The new trigger to schedule (replaces all existing for
-    ///   key/type)
     fn clear_and_schedule_key(
         &self,
         trigger: Trigger,

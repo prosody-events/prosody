@@ -35,28 +35,12 @@ struct SimpleMessages(Vec<u8>);
 
 /// Verifies that `KeyManager` prevents concurrent execution of messages with
 /// the same key.
-///
-/// # Arguments
-///
-/// * `messages` - A `SimpleMessages` instance containing the test messages.
-///
-/// # Returns
-///
-/// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
 fn prevents_concurrent_key_execution(messages: SimpleMessages) -> TestResult {
     TEST_RUNTIME.block_on(prevents_concurrent_key_execution_impl(messages))
 }
 
 /// Verifies that `KeyManager` processes messages for each key in order.
-///
-/// # Arguments
-///
-/// * `messages` - A `Messages` instance containing the test messages.
-///
-/// # Returns
-///
-/// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
 fn processes_messages_in_order(messages: Messages) -> TestResult {
     TEST_RUNTIME.block_on(processes_messages_in_order_impl(messages))
@@ -64,14 +48,6 @@ fn processes_messages_in_order(messages: Messages) -> TestResult {
 
 /// Implements the test for preventing concurrent execution of messages with the
 /// same key.
-///
-/// # Arguments
-///
-/// * `messages` - A `SimpleMessages` instance containing the test messages.
-///
-/// # Returns
-///
-/// A `TestResult` indicating whether the test passed or failed.
 async fn prevents_concurrent_key_execution_impl(
     SimpleMessages(messages): SimpleMessages,
 ) -> TestResult {
@@ -116,14 +92,6 @@ async fn prevents_concurrent_key_execution_impl(
 
 /// Implements the test for verifying that messages for each key are processed
 /// in order.
-///
-/// # Arguments
-///
-/// * `messages` - A `Messages` instance containing the test messages.
-///
-/// # Returns
-///
-/// A `TestResult` indicating whether the test passed or failed.
 async fn processes_messages_in_order_impl(Messages(messages): Messages) -> TestResult {
     let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
@@ -259,10 +227,6 @@ async fn drain_prevents_queued_work_from_starting() {
 
 impl Arbitrary for Messages {
     /// Generates an arbitrary `Messages` instance for `QuickCheck` tests.
-    ///
-    /// # Arguments
-    ///
-    /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         let count = g.size();
         let messages = (0..count)
@@ -274,10 +238,6 @@ impl Arbitrary for Messages {
 
 impl Arbitrary for SimpleMessages {
     /// Generates an arbitrary `SimpleMessages` instance for `QuickCheck` tests.
-    ///
-    /// # Arguments
-    ///
-    /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         let mut messages: Vec<u8> = Vec::arbitrary(g);
         for message in &mut messages {

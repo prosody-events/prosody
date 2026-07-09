@@ -84,21 +84,6 @@ use tracing::{debug, info, instrument, warn};
 ///
 /// Each phase is performed atomically and independently. If no migrations are
 /// needed, the segment is returned unchanged.
-///
-/// # Arguments
-///
-/// * `store` - The Cassandra trigger store
-/// * `segment` - The segment to potentially migrate
-/// * `desired_slab_size` - The target slab size for Phase 2 migration
-///
-/// # Returns
-///
-/// The segment with updated version and/or `slab_size` if migrations were
-/// performed.
-///
-/// # Errors
-///
-/// Returns an error if any migration phase fails.
 #[instrument(level = "debug", skip(store), err)]
 pub(crate) async fn migrate_segment_if_needed(
     store: &CassandraTriggerStore,
@@ -124,14 +109,6 @@ pub(crate) async fn migrate_segment_if_needed(
 }
 
 /// Checks if a segment needs migration from v1 to v2.
-///
-/// # Arguments
-///
-/// * `segment` - The segment to check
-///
-/// # Returns
-///
-/// `true` if the segment is v1 and needs migration, `false` otherwise.
 #[must_use]
 pub(crate) fn needs_migration(segment: &Segment) -> bool {
     matches!(segment.version, SegmentVersion::V1)
@@ -141,15 +118,6 @@ pub(crate) fn needs_migration(segment: &Segment) -> bool {
 ///
 /// V3 guarantees that all keys with clustering rows have a state MAP entry,
 /// making NULL state unambiguously mean "new key, 0 timers."
-///
-/// # Arguments
-///
-/// * `segment` - The segment to check
-///
-/// # Returns
-///
-/// `true` if the segment is V2 and needs key state backfill, `false`
-/// otherwise.
 #[must_use]
 pub(crate) fn needs_key_state_migration(segment: &Segment) -> bool {
     matches!(segment.version, SegmentVersion::V2)
@@ -163,19 +131,6 @@ pub(crate) fn needs_key_state_migration(segment: &Segment) -> bool {
 ///
 /// **Note**: This function is Cassandra-specific since V1 schema only exists
 /// for Cassandra storage.
-///
-/// # Arguments
-///
-/// * `store` - The Cassandra trigger store wrapped in `TableAdapter`
-/// * `segment` - The segment to migrate
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Reading v1 triggers fails
-/// - Writing v2 triggers fails
-/// - Updating segment version fails
-/// - Cleaning up v1 data fails
 #[instrument(level = "info", skip(store), err)]
 pub(crate) async fn migrate_segment_version(
     store: &CassandraTriggerStore,
@@ -277,17 +232,6 @@ pub(crate) async fn migrate_segment_version(
 /// This function removes V1 trigger data from `timer_slabs` and `timer_keys`
 /// tables. Slab metadata in `timer_segments` is left intact as it is shared
 /// between V1 and V2 and does not need to be cleaned up.
-///
-/// # Arguments
-///
-/// * `v1_ops` - V1 operations interface
-/// * `segment_id` - The segment being migrated
-/// * `slab_ids` - List of V1 slab IDs to clean up
-///
-/// # Errors
-///
-/// Returns an error if any cleanup operations fail. Processing continues for
-/// all slabs even if some fail, but the first error encountered is returned.
 async fn cleanup_v1_data(
     v1_ops: &super::v1::V1Operations,
     segment_id: &SegmentId,
@@ -344,10 +288,6 @@ async fn cleanup_v1_data(
 /// The version is bumped to V3 only after all backfills complete (commit
 /// point). If migration crashes before the version bump, the next access
 /// will re-run it — all writes are idempotent.
-///
-/// # Errors
-///
-/// Returns error if DB reads or writes fail.
 #[instrument(level = "info", skip(store), err)]
 pub(crate) async fn migrate_key_states(
     store: &CassandraTriggerStore,
@@ -419,16 +359,6 @@ pub(crate) async fn migrate_key_states(
 }
 
 /// Checks if a segment needs slab size migration.
-///
-/// # Arguments
-///
-/// * `segment` - The segment to check
-/// * `desired_slab_size` - The target slab size
-///
-/// # Returns
-///
-/// `true` if the segment's `slab_size` differs from `desired_slab_size`,
-/// `false` otherwise.
 #[must_use]
 pub(crate) fn needs_slab_size_migration(
     segment: &Segment,
@@ -442,21 +372,6 @@ pub(crate) fn needs_slab_size_migration(
 /// Processes slabs concurrently (bounded by [`MIGRATION_SLAB_CONCURRENCY`]),
 /// streaming triggers within each slab sequentially. Returns the set of new
 /// slab IDs created during migration.
-///
-/// # Arguments
-///
-/// * `store` - The Cassandra trigger store
-/// * `segment` - The segment being migrated
-/// * `old_slab_ids` - Slab IDs with the old `slab_size`
-/// * `desired_slab_size` - Target slab size for recalculation
-///
-/// # Returns
-///
-/// Set of all new slab IDs created during migration
-///
-/// # Errors
-///
-/// Returns [`CassandraTriggerStoreError`] if reading or writing triggers fails
 async fn migrate_triggers_to_new_slabs(
     store: &CassandraTriggerStore,
     segment: &Segment,
@@ -527,13 +442,6 @@ async fn migrate_triggers_to_new_slabs(
 /// - Old partition: `(segment_id, slab_size=100, id=2)` ← DELETE
 /// - New partition: `(segment_id, slab_size=30, id=2)` ← Keep
 /// - Metadata row: `(segment_id, slab_id=2)` ← Shared, don't delete
-///
-/// # Arguments
-///
-/// * `store` - The Cassandra trigger store
-/// * `segment` - The segment being migrated
-/// * `old_slab_ids` - Original slab IDs before migration
-/// * `new_slab_ids` - New slab IDs created during migration
 async fn cleanup_old_slabs_with_overlap_protection(
     store: &CassandraTriggerStore,
     segment: &Segment,
@@ -609,22 +517,9 @@ async fn cleanup_old_slabs_with_overlap_protection(
 /// **IMPORTANT:** This function requires the segment to be v2. Phase 1 version
 /// migration must be completed before calling this function.
 ///
-/// **Note**: This function is Cassandra-specific.
-///
-/// # Arguments
-///
-/// * `store` - The Cassandra trigger store wrapped in `TableAdapter`
-/// * `segment` - The v2 segment to migrate
-/// * `desired_slab_size` - The target slab size
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Segment is not v2 (must run version migration first)
-/// - Reading old triggers fails
-/// - Writing new triggers fails
-/// - Updating segment `slab_size` fails
-/// - Cleaning up old slabs fails
+/// **Note**: This function is Cassandra-specific. If the segment is not v2
+/// or v3, migration is skipped and the segment is returned unchanged rather
+/// than erroring — see the version check below.
 #[instrument(level = "info", skip(store), err)]
 pub(crate) async fn migrate_slab_size(
     store: &CassandraTriggerStore,

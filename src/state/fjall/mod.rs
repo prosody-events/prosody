@@ -356,11 +356,6 @@ impl FjallCellCache {
     /// with no entry (genuine absence) — a `Miss` — or an entry that floor-
     /// expired (a gap to re-fetch) — an `Expired`. Both differ from a present
     /// `Absent` tag (`Hit(Committed(None))`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FjallCellCacheError`] when the cache read or cell decode
-    /// fails.
     pub(crate) async fn get(
         &self,
         collection: &CollectionId,
@@ -383,11 +378,6 @@ impl FjallCellCache {
     /// value inherits the death set at stage time (`mark_resolved` does not
     /// re-stamp the durable TTL), rather than overhanging it with a fresh
     /// stamp.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FjallCellCacheError`] when the cache read or cell decode
-    /// fails.
     ///
     /// Test-only: the sole caller is the `#[cfg(test)]`
     /// `Cached::stored_expiry` co-expiry probe.
@@ -421,10 +411,6 @@ impl FjallCellCache {
     /// cell; a known-absent value writes the `Absent` tag. The expiry
     /// mirrors the durable row's TTL death so the entry co-expires
     /// (FLOOR-rounded, so it never outlives the durable value).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FjallCellCacheError`] when the cache write fails.
     pub(crate) async fn put(
         &self,
         collection: &CollectionId,
@@ -454,12 +440,8 @@ impl FjallCellCache {
     /// cache update is never torn (mirroring the same-partition `UNLOGGED
     /// BATCH` the Cassandra side uses). This collapses the per-cell settle
     /// writes from N blocking thread-hops to one. The single-cell write-through
-    /// paths keep [`put`](Self::put).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FjallCellCacheError`] when the batch commit fails; the caller
-    /// then uncovers every coordinate (Cov3 — see
+    /// paths keep [`put`](Self::put). On a batch commit failure, the caller
+    /// uncovers every coordinate (Cov3 — see
     /// [`Cached`](crate::state::cached::Cached)'s module doc).
     pub(crate) async fn put_batch(
         &self,
@@ -650,10 +632,6 @@ impl FjallCellCache {
     // authoritative cold-recovery source (a fresh epoch re-seeds from them).
 
     /// Whether `collection`'s one-time cold seed has run (the seeded latch).
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read failure.
     pub(crate) async fn index_seeded(
         &self,
         collection: &CollectionId,
@@ -667,10 +645,6 @@ impl FjallCellCache {
     }
 
     /// Marks `collection` seeded once its bounded cold seed read completes.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall write failure.
     pub(crate) async fn index_mark_seeded(
         &self,
         collection: &CollectionId,
@@ -685,10 +659,6 @@ impl FjallCellCache {
     /// Drops `collection`'s seeded latch, forcing the next sweep to re-seed
     /// from the durable index (used when a stage write fails and a
     /// coordinate may have landed durably that the coords set now misses).
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall write failure.
     pub(crate) async fn index_unseed(
         &self,
         collection: &CollectionId,
@@ -700,10 +670,6 @@ impl FjallCellCache {
     }
 
     /// Records `cell` as a live provisional coordinate of `collection`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall write failure.
     pub(crate) async fn index_record(
         &self,
         collection: &CollectionId,
@@ -726,10 +692,6 @@ impl FjallCellCache {
     /// blocking hops to one. All-or-nothing: on a failure the caller cannot
     /// know which coordinates landed durably, so it drops the seeded latch
     /// ([`index_unseed`](Self::index_unseed)) and the next sweep re-seeds.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall write failure.
     pub(crate) async fn index_record_batch<'a, I>(
         &self,
         collection: &CollectionId,
@@ -757,10 +719,6 @@ impl FjallCellCache {
     /// Clears a batch of resolved provisional coordinates from `collection` in
     /// one atomic [`OwnedWriteBatch`]. A failure is a harmless over-report:
     /// the sweep's point-read filter drops already-resolved coordinates.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall write failure.
     pub(crate) async fn index_clear_batch<'a, I>(
         &self,
         collection: &CollectionId,
@@ -785,10 +743,6 @@ impl FjallCellCache {
     /// drain buffer, sized to `#provisional`. Empty ⟹ the warm sweep issues no
     /// Cassandra reads. Collected in one [`spawn_blocking`] over the bounded
     /// `Coord` prefix range (the guard cannot cross an `.await`).
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read failure.
     pub(crate) async fn index_snapshot(
         &self,
         collection: &CollectionId,
@@ -823,10 +777,6 @@ impl FjallCellCache {
     /// tag-first and **not** `cmp_low` — the caller re-sorts via
     /// `IntervalSet::from_pairs`. Bounded by the section's merged interval
     /// count.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read or bound-frame decode failure.
     pub(crate) async fn cover_load(
         &self,
         collection: &CollectionId,
@@ -852,10 +802,6 @@ impl FjallCellCache {
     /// [`OwnedWriteBatch`]. Rewriting the whole section (never incremental key
     /// edits) means a merge that shifts a low bound can never leave a stale
     /// interval key behind.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall write failure.
     pub(crate) async fn cover_store(
         &self,
         collection: &CollectionId,

@@ -261,10 +261,6 @@ pub trait Keyed {
     type Key;
 
     /// Retrieves the key of the item.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the key.
     fn key(&self) -> &Self::Key;
 }
 
@@ -315,15 +311,6 @@ pub trait HandlerProvider: Send + Sync + 'static {
     type Handler: EventHandler + Send + Sync + 'static;
 
     /// Creates a handler for a specific topic and partition.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic of the partition.
-    /// * `partition` - The partition number.
-    ///
-    /// # Returns
-    ///
-    /// A handler for the specified topic and partition.
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
 }
 
@@ -339,17 +326,6 @@ pub trait EventHandler {
     ///
     /// This method should contain the business logic for message processing.
     /// It should commit or abort the message when processing is complete.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The message context providing metadata and shutdown
-    ///   notification.
-    /// * `message` - The uncommitted message to process.
-    /// * `demand_type` - Whether this is normal processing or failure retry.
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves when the message is handled.
     fn on_message<C>(
         &self,
         context: C,
@@ -364,25 +340,14 @@ pub trait EventHandler {
     /// This method is called when a scheduled timer reaches its execution time
     /// and is delivered to the application for processing. The timer must be
     /// explicitly committed or aborted after processing to ensure proper
-    /// resource cleanup.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The event processing context with access to timer
-    ///   management
-    /// * `timer` - The uncommitted timer event that fired
-    /// * `demand_type` - Whether this is normal processing or failure retry.
+    /// resource cleanup. The returned future completing does not itself
+    /// commit the timer.
     ///
     /// # Processing Requirements
     ///
     /// Implementations must ensure that the timer is properly acknowledged:
     /// - Call `timer.commit()` after successful processing
     /// - Call `timer.abort()` if processing fails or should be retried
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves when timer processing is complete. Note that
-    /// this future completing does not automatically commit the timer.
     fn on_timer<C, T>(
         &self,
         context: C,
@@ -397,10 +362,6 @@ pub trait EventHandler {
     ///
     /// This method is called when the consumer is shutting down.
     /// It should clean up any resources used by the handler.
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves when the shutdown is complete.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
 }
 
@@ -618,10 +579,6 @@ impl ConsumerConfiguration {
     ///
     /// This method provides a convenient way to start building a
     /// `ConsumerConfiguration` using the builder pattern.
-    ///
-    /// # Returns
-    ///
-    /// A default `ConsumerConfigurationBuilder` instance.
     #[must_use]
     pub fn builder() -> ConsumerConfigurationBuilder {
         ConsumerConfigurationBuilder::default()
@@ -645,10 +602,6 @@ impl ConsumerConfigurationBuilder {
     ///
     /// Checks both the explicitly configured group ID and the environment
     /// variable.
-    ///
-    /// # Returns
-    ///
-    /// An option containing the consumer group if configured.
     #[must_use]
     pub(crate) fn configured_consumer_group(&self) -> Option<String> {
         self.group_id.clone().or_else(|| var(PROSODY_GROUP_ID).ok())
@@ -897,9 +850,6 @@ const MIN_RECOVERY_EVIDENCE_TTL_SECONDS: u64 = 3_600;
 /// max(48 × recovery_delay, 1h)`. The dedup marker is the commit oracle a
 /// provisional cell is resolved against, so if the marker expires first the
 /// cell can no longer be resolved correctly and a committed write is lost.
-///
-/// # Errors
-///
 /// Returns [`RecoveryTtlMarginError`] when the dedup TTL is below the margin.
 fn validate_recovery_ttl_margin(
     dedup_ttl: Duration,
@@ -1120,14 +1070,9 @@ where
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
 /// partition machinery to a Kafka consumer and starting its background poll
 /// loop. The provider creates per-partition stores with independent caches.
-///
-/// # Errors
-///
-/// This function returns an error if:
-/// - The hostname cannot be retrieved for the client ID
-/// - The Kafka consumer cannot be created with the provided configuration
-/// - Topic subscription fails
-/// - The probe server cannot be started (if enabled)
+/// Fails if the hostname can't be retrieved for the client ID, the Kafka
+/// consumer can't be created with the provided configuration, topic
+/// subscription fails, or the probe server can't be started (if enabled).
 fn initialize_consumer<T, P, SP, C>(
     consumer_config: &ConsumerConfiguration,
     version: Arc<str>,
@@ -1692,10 +1637,6 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// This method is useful for monitoring how many partitions have been
     /// assigned to this consumer instance by Kafka's partition assignment
     /// strategy.
-    ///
-    /// # Returns
-    ///
-    /// The number of partitions currently assigned to this consumer.
     #[must_use]
     pub fn assigned_partition_count(&self) -> u32 {
         get_assigned_partition_count(&self.managers)
@@ -1726,11 +1667,6 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// A partition is considered stalled if it hasn't processed messages
     /// within the configured stall threshold duration. Consumer-level actors
     /// (main poll loop, defer middleware) are also monitored for stalls.
-    ///
-    /// # Returns
-    ///
-    /// `true` if any partition or consumer-level actor is stalled, `false`
-    /// otherwise.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
         get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
@@ -1784,14 +1720,6 @@ impl<C: Codec> Drop for ProsodyConsumer<C> {
 }
 
 /// Returns the number of assigned partitions.
-///
-/// # Arguments
-///
-/// * `managers` - The map of partition managers.
-///
-/// # Returns
-///
-/// The number of partitions currently assigned to this consumer.
 pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
     managers: &Managers<P>,
 ) -> u32 {
@@ -1803,14 +1731,6 @@ pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
 /// A partition is considered stalled if it hasn't processed messages within
 /// the configured stall threshold duration or if its processing loop is
 /// blocked.
-///
-/// # Arguments
-///
-/// * `managers` - The map of partition managers.
-///
-/// # Returns
-///
-/// `true` if any partition is stalled, `false` otherwise.
 pub(crate) fn get_is_stalled<P: Send + Sync + 'static>(managers: &Managers<P>) -> bool {
     managers.read().values().any(PartitionManager::is_stalled)
 }

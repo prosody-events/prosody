@@ -257,10 +257,6 @@ impl KeyTriggerModel {
 }
 
 /// Verifies key times for a specific timer type and key.
-///
-/// # Errors
-///
-/// Returns an error if times don't match or ordering is wrong.
 async fn verify_key_times<T>(
     operations: &T,
     model: &KeyTriggerModel,
@@ -298,11 +294,6 @@ where
 }
 
 /// Verifies key triggers for a specific timer type and key.
-///
-/// # Errors
-///
-/// Returns an error if triggers don't match, ordering is wrong, or type
-/// filtering fails.
 async fn verify_key_triggers<T>(
     operations: &T,
     model: &KeyTriggerModel,
@@ -367,11 +358,6 @@ where
 }
 
 /// Verifies all trigger types for a specific key.
-///
-/// # Errors
-///
-/// Returns an error if triggers don't match, ordering is wrong, or keys don't
-/// match.
 async fn verify_all_types<T>(
     operations: &T,
     model: &KeyTriggerModel,

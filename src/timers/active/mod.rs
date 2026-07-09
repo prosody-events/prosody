@@ -306,11 +306,8 @@ impl ActiveTriggers {
         }
     }
 
-    /// Returns the state of a given trigger time and type for a key.
-    ///
-    /// # Returns
-    ///
-    /// `Some(TimerState)` if the registry contains the entry, `None` otherwise.
+    /// Returns the state of a given trigger time and type for a key, or
+    /// `None` if the registry contains no such entry.
     pub async fn get_state(
         &self,
         key: &Key,
@@ -325,11 +322,8 @@ impl ActiveTriggers {
             .flatten()
     }
 
-    /// Returns the tag of a given trigger time and type for a key.
-    ///
-    /// # Returns
-    ///
-    /// `Some(tag)` if the registry contains the entry, `None` if absent.
+    /// Returns the tag of a given trigger time and type for a key, or
+    /// `None` if absent.
     pub async fn get_tag(
         &self,
         key: &Key,
@@ -385,11 +379,8 @@ impl ActiveTriggers {
             })
     }
 
-    /// Atomically sets the state of a timer (preserves tag).
-    ///
-    /// # Returns
-    ///
-    /// `true` if the state was set (timer exists), `false` otherwise.
+    /// Atomically sets the state of a timer (preserves tag). Returns `true`
+    /// if the state was set (timer exists), `false` otherwise.
     pub async fn set_state(
         &self,
         key: &Key,

@@ -113,20 +113,8 @@ pub(super) struct Context<F, PL> {
 /// configuration and captures the handler provider and per-partition factories
 /// into a partition-manager factory closure. This discharges the provider
 /// trait bounds in one place; the returned [`Context`] carries only the
-/// payload-erased factory.
-///
-/// # Arguments
-///
-/// * `config` - Consumer configuration including buffer sizes and timeouts
-/// * `handler_provider` - Creates message handlers for partitions
-/// * `providers` - Per-partition trigger-store and keyed-state factories
-/// * `watermark_version` - Shared counter tracking watermark updates
-/// * `registry` - Partition-manager map plus its assignment-count publisher
-///
-/// # Errors
-///
-/// Returns a [`BuildError`] if the configured `allowed_events` prefixes
-/// cannot be compiled into a filter automaton.
+/// payload-erased factory. Fails with a [`BuildError`] if the configured
+/// `allowed_events` prefixes cannot be compiled into a filter automaton.
 pub(super) fn new_context<T, P, SP, PL>(
     config: &ConsumerConfiguration,
     handler_provider: T,
@@ -220,12 +208,6 @@ where
     ///   assigned partitions
     /// - For revocations: Shuts down `PartitionManager` instances for revoked
     ///   partitions
-    ///
-    /// # Arguments
-    ///
-    /// * `consumer` - The Kafka consumer instance
-    /// * `rebalance` - The rebalance event details containing partition
-    ///   assignments or revocations
     fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         debug!("rebalance is starting");
 
@@ -309,11 +291,6 @@ where
     /// completed. For assignment events, it resumes consumption on the newly
     /// assigned partitions. For all events, it logs that the rebalance has
     /// completed.
-    ///
-    /// # Arguments
-    ///
-    /// * `consumer` - The Kafka consumer instance
-    /// * `rebalance` - The completed rebalance event details
     fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         if let Rebalance::Assign(partitions) = rebalance {
             debug!("resuming assigned partitions: {partitions:#?}");

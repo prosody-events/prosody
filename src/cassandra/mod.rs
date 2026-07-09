@@ -114,10 +114,6 @@ impl CassandraStore {
     /// Initializes the connection to Cassandra and runs schema migrations
     /// for all registered components.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - Cassandra connection and TTL configuration
-    ///
     /// # Errors
     ///
     /// Returns [`CassandraStoreError`] if:
@@ -171,16 +167,8 @@ impl CassandraStore {
     ///
     /// Computes a TTL by adding the base retention period to the time
     /// remaining until the target time, with overflow protection for
-    /// Cassandra's maximum TTL limit.
-    ///
-    /// # Arguments
-    ///
-    /// * `target_time` - The target time for the data
-    ///
-    /// # Returns
-    ///
-    /// * `Some(ttl_seconds)` if a valid TTL can be calculated
-    /// * `None` if the TTL would exceed Cassandra's limits or calculation fails
+    /// Cassandra's maximum TTL limit. Returns `None` if the TTL would exceed
+    /// Cassandra's limits or the calculation fails.
     #[must_use]
     pub fn calculate_ttl(&self, target_time: CompactDateTime) -> Option<i32> {
         let Ok(duration) = target_time.compact_duration_from_now() else {
@@ -274,11 +262,6 @@ impl CassandraStore {
     /// `UPDATE`s / `INSERT`s / `DELETE`s, and batch idempotency does **not**
     /// inherit from the member statements — so the `DefaultRetryPolicy` may
     /// retry it on timeout.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CassandraStoreError`] when the driver fails to execute a
-    /// batch.
     pub(crate) async fn execute_unlogged_batches<R>(
         &self,
         units: &[BatchUnit<R>],

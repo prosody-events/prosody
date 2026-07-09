@@ -104,10 +104,7 @@ pub(super) fn index_cell_key(row: IndexRow) -> CellKey {
 
 /// Decodes a keyed cell row into its [`CellKey`], [`Cell`], and cache-fill
 /// co-expiry TTL ([`blob_ttl`], whole seconds), for the cache-fill scan.
-///
-/// # Errors
-///
-/// Returns the same corruption errors as [`try_decode_cell`].
+/// Fails with the same corruption errors as [`try_decode_cell`].
 pub(super) fn try_decode_keyed_cell_ttl(
     row: KeyedCellRow,
 ) -> Result<(CellKey, Cell, Option<i32>), CassandraCellStoreError> {
@@ -120,11 +117,8 @@ pub(super) fn try_decode_keyed_cell_ttl(
 }
 
 /// Decodes a cache-fill point row into its [`Cell`] and co-expiry TTL
-/// ([`blob_ttl`]).
-///
-/// # Errors
-///
-/// Returns the same corruption errors as [`try_decode_cell`].
+/// ([`blob_ttl`]). Fails with the same corruption errors as
+/// [`try_decode_cell`].
 pub(super) fn try_decode_cell_ttl(
     row: CellTtlRow,
 ) -> Result<(Cell, Option<i32>), CassandraCellStoreError> {
@@ -150,15 +144,11 @@ fn blob_ttl(ttl_data: Option<i32>, ttl_prev: Option<i32>) -> Option<i32> {
     ttl_data.or(ttl_prev)
 }
 
-/// Decodes a cell row into a [`Cell`].
-///
-/// # Errors
-///
-/// Returns [`CassandraCellStoreError::CorruptCell`] for a forbidden column
-/// shape, [`CassandraCellStoreError::CorruptUdt`] for a bad `event` UDT,
-/// [`CassandraCellStoreError::VersionMismatch`] for an unknown
-/// version stamp, or [`CassandraCellStoreError::Encoding`] when a blob fails
-/// to deserialize.
+/// Decodes a cell row into a [`Cell`]. Fails with
+/// [`CassandraCellStoreError::CorruptCell`] for a forbidden column shape,
+/// [`CassandraCellStoreError::CorruptUdt`] for a bad `event` UDT,
+/// [`CassandraCellStoreError::VersionMismatch`] for an unknown version stamp,
+/// or [`CassandraCellStoreError::Encoding`] when a blob fails to deserialize.
 pub(super) fn try_decode_cell(row: RawCellRow) -> Result<Cell, CassandraCellStoreError> {
     let (data, prev_data, encoding, version, event) = row;
     validate_version(version)?;

@@ -75,10 +75,6 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// commit/abort capability as two independent values (e.g. moving the
     /// `Trigger` into a staged provisional-cell record while retaining the
     /// guard).
-    ///
-    /// # Returns
-    ///
-    /// Tuple `(Trigger, Self::CommitGuard)`.
     fn into_inner(self) -> (Trigger, Self::CommitGuard);
 }
 
@@ -170,16 +166,8 @@ where
 {
     /// Create a new pending timer from a delivered trigger.
     ///
-    /// # Arguments
-    ///
-    /// * `trigger` - The timer event with key, time, and tracing context.
-    /// * `manager` - The [`TimerManager`] that will handle commit and abort.
-    /// * `permit` - Semaphore permit bounding global timer concurrency; held
-    ///   until this timer is dropped.
-    ///
-    /// # Returns
-    ///
-    /// A new [`PendingTimer`] in the pending state.
+    /// Holds `permit`, which bounds global timer concurrency, until this
+    /// timer is dropped.
     #[must_use]
     pub fn new(trigger: Trigger, manager: TimerManager<T>, permit: OwnedSemaphorePermit) -> Self {
         let key = trigger.key.clone();
@@ -210,11 +198,6 @@ where
     /// the tag on the queue-popped trigger if a `complete()`-from-
     /// `FiringRescheduled` rotation occurred while this entry was in the
     /// delay queue.
-    ///
-    /// # Returns
-    ///
-    /// `Some(FiringTimer)` if the timer is still active and can be processed,
-    /// `None` if the timer was cancelled while waiting in the queue.
     pub async fn fire(mut self) -> Option<FiringTimer<T>> {
         // Attempt to transition from Scheduled → Firing, reading the canonical
         // tag from ActiveTriggers under the trigger-lock.

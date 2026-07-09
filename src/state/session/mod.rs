@@ -256,12 +256,8 @@ pub(crate) mod sealed {
         /// staged set is recorded), `ReadUncommitted` collections write
         /// a resolved value. Stages all collections before returning,
         /// so a stage error returns before the textually-later marker
-        /// flush.
-        ///
-        /// # Errors
-        ///
-        /// Returns a type-erased store error when staging fails; nothing is
-        /// recorded in that case.
+        /// flush; a staging failure is a type-erased store error with
+        /// nothing recorded.
         fn finalize(
             &self,
         ) -> impl Future<Output = Result<FinalizeOutcome, StateAccessError>> + Send;
@@ -287,10 +283,6 @@ pub(crate) mod sealed {
         /// Writes the registered marker through the commit oracle, clearing the
         /// slot only on success so the boundary can retry a transient failure.
         /// A no-op when no marker is registered (returns `Ok`).
-        ///
-        /// # Errors
-        ///
-        /// Returns a type-erased store error when the oracle write fails.
         fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
         /// Discards the per-event dirty overlay and staged set, plus the
@@ -887,11 +879,8 @@ impl StateDescriptor for LifecycleAccess {
 /// returned session exposes the sealed [`StateLifecycle`] the durability
 /// boundary drives.
 pub(crate) trait LifecycleAccessExt: EventContext {
-    /// Binds the event's session through the lifecycle tunnel.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError`] only when the context is terminated;
+    /// Binds the event's session through the lifecycle tunnel. Fails with
+    /// [`StateAccessError`] only when the context is terminated;
     /// [`LifecycleAccess`] is otherwise registration-independent.
     fn lifecycle(&self) -> Result<Self::State, StateAccessError> {
         self.state(Registered::new(LifecycleAccess))

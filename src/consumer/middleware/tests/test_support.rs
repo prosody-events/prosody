@@ -580,10 +580,8 @@ impl FallibleHandler for ScriptedHandler {
 
 /// Wraps `value` in a `ConsumerMessage` holding a fresh capacity permit.
 ///
-/// # Errors
-///
-/// Returns the (never-in-practice) permit-acquisition failure — surfaced,
-/// never swallowed, per the testing rules.
+/// Surfaces the (never-in-practice) permit-acquisition failure rather than
+/// swallowing it, per the testing rules.
 pub fn create_test_message_from(
     value: ConsumerMessageValue<Value>,
 ) -> color_eyre::Result<ConsumerMessage<Value>> {
@@ -594,10 +592,6 @@ pub fn create_test_message_from(
 
 /// [`create_test_message_from`] over the default value (topic `test-topic`,
 /// partition 0, offset 0, key `test-key`).
-///
-/// # Errors
-///
-/// Propagates [`create_test_message_from`]'s permit-acquisition failure.
 pub fn create_test_message() -> color_eyre::Result<ConsumerMessage<Value>> {
     create_test_message_from(ConsumerMessageValue::default())
 }
@@ -784,11 +778,8 @@ pub fn recording_session(registry: CollectionDefRegistry, state_key: StateKey) -
     (session, cell_store, dirty, recorded)
 }
 
-/// The committed value at the single Value cell of `name` under `state_key`.
-///
-/// # Errors
-///
-/// Returns the store's read error or a codec error on undecodable bytes.
+/// The committed value at the single Value cell of `name` under `state_key`,
+/// failing on a store read error or undecodable bytes.
 pub async fn committed_value(
     cell_store: &MemoryCellStore<RecordingOracle>,
     state_key: StateKey,

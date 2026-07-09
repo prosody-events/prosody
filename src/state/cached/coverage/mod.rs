@@ -230,13 +230,9 @@ impl Coverage {
     }
 
     /// Partitions `request` over the section's coverage into ordered, disjoint
-    /// covered/gap pieces. An unseen section is one whole-request gap.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read/decode failure; the caller degrades a failure to
-    /// "the whole request is a gap" (a slower fall-through, never a wrong
-    /// answer).
+    /// covered/gap pieces. An unseen section is one whole-request gap; a fjall
+    /// read/decode failure degrades the same way (a slower fall-through, never
+    /// a wrong answer).
     pub async fn query(
         &self,
         collection: &CollectionId,
@@ -247,12 +243,8 @@ impl Coverage {
     }
 
     /// Covers `interval` in the section (union/merge). Born resolved
-    /// (`CovBuild` — see the module-level bullet).
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read/write failure; the caller degrades a failure to
-    /// leaving the interval uncovered (the next read falls through).
+    /// (`CovBuild` — see the module-level bullet). A fjall read/write failure
+    /// leaves the interval uncovered (the next read falls through).
     pub(in crate::state::cached) async fn cover(
         &self,
         collection: &CollectionId,
@@ -266,12 +258,9 @@ impl Coverage {
     /// Covers each coordinate's singleton interval `[X, X]` in one
     /// load→mutate→store cycle — the batch counterpart of
     /// [`cover`](Self::cover) for a settle batch's cells, N in-memory unions
-    /// for one section rewrite. Born resolved (`CovBuild`), same as `cover`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read/write failure; the caller degrades a failure to
-    /// leaving the points uncovered (the next read falls through).
+    /// for one section rewrite. Born resolved (`CovBuild`), same as `cover`. A
+    /// fjall read/write failure leaves the points uncovered (the next read
+    /// falls through).
     pub(in crate::state::cached) async fn cover_points(
         &self,
         collection: &CollectionId,
@@ -289,12 +278,9 @@ impl Coverage {
     /// Whether `coordinate`'s committed value is already covered — a covered
     /// fjall hit serves with no lower read (Cov1/Cov2). A covered fjall *miss*
     /// means the entry expired (write-through always leaves an entry), so the
-    /// caller falls through and re-publishes.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read/decode failure; the caller degrades a failure to
-    /// "uncovered" (`false`), falling through to the lower store.
+    /// caller falls through and re-publishes. A fjall read/decode failure
+    /// degrades to "uncovered" (`false`), also falling through to the lower
+    /// store.
     pub async fn covers(
         &self,
         collection: &CollectionId,
@@ -308,9 +294,7 @@ impl Coverage {
     /// containing interval) in one load→mutate→store cycle. A no-op for
     /// coordinates that were not covered.
     ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read/write failure. A covered hit is served verbatim
+    /// A fjall read/write failure propagates. A covered hit is served verbatim
     /// — there is **no** read-side mismatch detection — so where the punch
     /// guards a moved durable value the caller must not swallow the failure:
     /// `Cached::punch_cells_must_succeed` retries it until it lands. Only the

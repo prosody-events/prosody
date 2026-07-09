@@ -190,12 +190,9 @@ impl TryFrom<Duration> for CompactDuration {
     /// Converts a standard [`Duration`] into [`CompactDuration`].
     ///
     /// Rounds sub-second nanoseconds to the nearest whole second.
-    /// Nanoseconds >= 500,000,000 round up to the next second.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactDurationError::OutOfRange`] if the computed seconds
-    /// exceed [`u32::MAX`] or if rounding causes overflow.
+    /// Nanoseconds >= 500,000,000 round up to the next second. Returns
+    /// [`CompactDurationError::OutOfRange`] if the computed seconds exceed
+    /// [`u32::MAX`] or if rounding causes overflow.
     fn try_from(value: Duration) -> Result<Self, Self::Error> {
         let seconds = value.as_secs();
         let nanos = value.subsec_nanos();

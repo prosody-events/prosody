@@ -94,11 +94,6 @@ pub enum ModeConfiguration {
 
 impl ModeConfiguration {
     /// Builds a `ModeConfiguration` from the bundled configuration builders.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `ModeConfigurationError` if any of the configuration builds
-    /// fail.
     pub(crate) fn build(
         params: &ModeConfigurationBuildParams,
     ) -> Result<Self, ModeConfigurationError> {
@@ -161,10 +156,6 @@ impl ModeConfiguration {
     }
 
     /// Returns topics mentioned in the configuration.
-    ///
-    /// # Returns
-    ///
-    /// A vector of `Topic`s configured for the current mode.
     #[must_use]
     pub(crate) fn configured_topics(&self) -> Vec<Topic> {
         match self {
@@ -185,10 +176,6 @@ impl ModeConfiguration {
     }
 
     /// Returns the mode of the configuration.
-    ///
-    /// # Returns
-    ///
-    /// The `Mode` corresponding to this configuration.
     #[must_use]
     pub fn mode(&self) -> Mode {
         match self {
@@ -199,10 +186,6 @@ impl ModeConfiguration {
     }
 
     /// Returns a reference to the consumer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the `ConsumerConfiguration` for this mode.
     #[must_use]
     pub fn consumer_config(&self) -> &ConsumerConfiguration {
         match self {
@@ -275,14 +258,6 @@ pub enum ModeConfigurationError {
 }
 
 /// Creates an iterator over the subscribed topics in a consumer configuration.
-///
-/// # Arguments
-///
-/// * `consumer` - The consumer configuration to extract topics from.
-///
-/// # Returns
-///
-/// An iterator that yields `Topic`s from the consumer's subscribed topics.
 fn subscription(consumer: &ConsumerConfiguration) -> impl Iterator<Item = Topic> + '_ {
     consumer
         .subscribed_topics

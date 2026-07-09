@@ -158,10 +158,6 @@ impl<L> Cached<L> {
     /// The absolute expiry stamped on a cell's current fjall entry (`None` if
     /// absent) — the co-expiry-anchor property asserts this equals the modeled
     /// durable death after every mutation (Cov1).
-    ///
-    /// # Errors
-    ///
-    /// Propagates a fjall read/decode failure.
     #[cfg(test)]
     pub(crate) async fn stored_expiry(
         &self,

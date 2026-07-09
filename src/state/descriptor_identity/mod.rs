@@ -142,11 +142,9 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
 /// is group-global), so the state manager runs it once and coalesces
 /// concurrent first-acquires.
 ///
-/// # Errors
-///
-/// Returns [`DescriptorIdentityError::Mismatch`] when a durable row disagrees
-/// with the registered identity, or [`DescriptorIdentityError::Store`] when
-/// the store fails.
+/// Fails with [`DescriptorIdentityError::Mismatch`] when a durable row
+/// disagrees with the registered identity, or
+/// [`DescriptorIdentityError::Store`] when the store fails.
 pub(crate) async fn acquire_descriptor_identities<St>(
     store: &St,
     registry: &CollectionDefRegistry,

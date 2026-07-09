@@ -60,15 +60,6 @@ pub struct OffsetTracker {
 
 impl OffsetTracker {
     /// Creates a new offset tracker.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The Kafka topic
-    /// * `partition` - The topic partition
-    /// * `max_uncommitted` - Maximum number of uncommitted offsets allowed
-    /// * `stall_threshold` - Duration after which processing is considered
-    ///   stalled
-    /// * `watermark_version` - Shared counter tracking watermark changes
     pub fn new(
         topic: Topic,
         partition: Partition,
@@ -101,14 +92,6 @@ impl OffsetTracker {
 
     /// Reserves an offset for future commitment.
     ///
-    /// # Arguments
-    ///
-    /// * `offset` - The offset to reserve
-    ///
-    /// # Returns
-    ///
-    /// The reserved offset handle if successful
-    ///
     /// # Errors
     ///
     /// Returns `OffsetTrackerError::Shutdown` if the tracker is shutting down
@@ -130,20 +113,13 @@ impl OffsetTracker {
         Ok(UncommittedOffset { offset, permit })
     }
 
-    /// Returns the current highest contiguous committed offset.
-    ///
-    /// # Returns
-    ///
-    /// The current watermark if any offsets have been committed
+    /// Returns the current highest contiguous committed offset, or `None` if
+    /// no offsets have been committed.
     pub fn watermark(&self) -> Option<Offset> {
         fetch_watermark(&self.watermark)
     }
 
     /// Checks if message processing has stalled.
-    ///
-    /// # Returns
-    ///
-    /// `true` if processing has stalled, `false` otherwise
     pub fn is_stalled(&self) -> bool {
         *self.stalled.borrow()
     }
@@ -172,11 +148,9 @@ impl OffsetTracker {
 
     /// Shuts down the offset tracker.
     ///
-    /// Closes the action channel and waits for the background task to complete.
-    ///
-    /// # Returns
-    ///
-    /// The final watermark value if any offsets were committed
+    /// Closes the action channel and waits for the background task to
+    /// complete. Returns the final watermark value, or `None` if no offsets
+    /// were committed.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
@@ -278,15 +252,8 @@ pub enum OffsetTrackerError {
     Shutdown,
 }
 
-/// Retrieves the current watermark value.
-///
-/// # Arguments
-///
-/// * `watermark` - The atomic watermark value
-///
-/// # Returns
-///
-/// The watermark if it contains a valid offset
+/// Retrieves the current watermark value, or `None` if it does not yet
+/// contain a valid offset.
 fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
     let watermark = watermark.load(Ordering::Acquire);
     (watermark >= 0).then_some(watermark)
@@ -297,16 +264,6 @@ fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
 /// Maintains an ordered map of offset operations and advances the watermark
 /// when contiguous ranges of offsets are committed. Also monitors for stalled
 /// message processing.
-///
-/// # Arguments
-///
-/// * `topic` - The Kafka topic
-/// * `partition` - The topic partition
-/// * `action_rx` - Channel receiving offset actions
-/// * `watermark` - The shared watermark value
-/// * `watermark_version` - Counter tracking watermark changes
-/// * `stall_threshold` - Duration after which processing is considered stalled
-/// * `stalled` - Publishes the stall state at each transition
 async fn track_watermark(
     topic: Topic,
     partition: Partition,
@@ -381,17 +338,8 @@ async fn track_watermark(
     debug!("watermark tracking shutdown");
 }
 
-/// Monitors for stalled message processing.
-///
-/// # Arguments
-///
-/// * `stall_threshold` - Duration after which processing is considered stalled
-/// * `stalled` - Current stall state
-/// * `watermarks` - Current offset operations map
-///
-/// # Returns
-///
-/// The stalled offset and its take timestamp if stalled
+/// Monitors for stalled message processing. Returns the stalled offset and
+/// its take timestamp, or `None` if nothing is stalled.
 async fn wait_for_stall(
     stall_threshold: Duration,
     stalled: &watch::Sender<bool>,

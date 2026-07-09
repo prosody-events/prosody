@@ -220,15 +220,19 @@ impl Arbitrary for TriggerSequence {
 /// # Usage
 ///
 /// ```rust,ignore
-/// trigger_store_tests!(MyStore, MyStore::new(), 100);
+/// trigger_store_tests!(
+///     LowLevelStore, low_level_constructor,
+///     HighLevelStore, high_level_constructor,
+/// );
 /// ```
 ///
-/// # Arguments
-///
-/// * `$store_type` - The type implementing `TriggerStore`
-/// * `$store_constructor` - Async expression that creates a new instance of the
-///   store and returns `Result<$store_type, Error>`
-/// * `$test_count` - Number of property tests to run for each test function
+/// `$operations_type`/`$operations_constructor` build the store used for the
+/// low-level (single-table) suite; `$store_type`/`$store_constructor` build
+/// the store used for the high-level (dual-index) suite, typically
+/// `TableAdapter<$operations_type>`. Each constructor is an async
+/// `|slab_size| -> Result<_, Error>` expression. An optional trailing
+/// `$test_count` sets the number of property-test iterations per test
+/// function; omit it to use `QuickCheck`'s default.
 #[macro_export]
 macro_rules! trigger_store_tests {
     // Variant without test_count - uses QuickCheck's default

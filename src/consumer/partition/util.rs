@@ -27,15 +27,6 @@ pub struct WithValue<T, F> {
 
 impl<T, F> WithValue<T, F> {
     /// Creates a new `WithValue` instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The value to be returned once the future completes.
-    /// * `future` - The future to be awaited.
-    ///
-    /// # Returns
-    ///
-    /// A new `WithValue` instance.
     pub fn new(value: T, future: F) -> Self {
         WithValue { value, future }
     }
@@ -49,15 +40,6 @@ where
     type Output = T;
 
     /// Polls the future, returning the value once the future completes.
-    ///
-    /// # Arguments
-    ///
-    /// * `cx` - The task context to poll with.
-    ///
-    /// # Returns
-    ///
-    /// `Poll::Ready` with the value if the future completes, otherwise
-    /// `Poll::Pending`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Project the fields to handle pinning safely.
         let mut projection = self.project();

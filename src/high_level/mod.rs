@@ -116,10 +116,6 @@ where
     /// The source system is used to identify the originating service or
     /// component in produced messages, enabling message tracing and loop
     /// detection.
-    ///
-    /// # Returns
-    ///
-    /// A string slice containing the source system identifier.
     #[must_use]
     pub fn source_system(&self) -> &str {
         &self.producer_config.source_system
@@ -131,14 +127,6 @@ where
     }
 
     /// Creates a new `HighLevelClient` with the specified configurations.
-    ///
-    /// # Arguments
-    ///
-    /// * `mode` - The operational mode for the client.
-    /// * `producer_builder` - Builder for the producer configuration.
-    /// * `consumer_builders` - Bundled consumer and middleware configuration
-    ///   builders.
-    /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Errors
     ///
@@ -208,12 +196,6 @@ where
 
     /// Sends a message to the specified topic.
     ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to send the message to.
-    /// * `key` - The key associated with the message.
-    /// * `payload` - The payload of the message.
-    ///
     /// # Errors
     ///
     /// Returns a `HighLevelClientError` if the send operation fails.
@@ -259,10 +241,6 @@ where
     }
 
     /// Subscribes the consumer with the provided handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `handler` - The handler to process consumed messages.
     ///
     /// # Errors
     ///
@@ -416,15 +394,6 @@ where
 }
 
 /// Checks if all required topics exist for the given consumer state.
-///
-/// # Arguments
-///
-/// * `producer` - The producer used to fetch metadata.
-/// * `consumer_state` - The current state of the consumer.
-///
-/// # Errors
-///
-/// Returns a `HighLevelClientError` if any required topics are missing.
 fn check_topic_existence<S, C: Codec, D: Codec>(
     producer: &ProsodyProducer<C>,
     consumer_state: &ConsumerState<S, D>,
@@ -446,15 +415,6 @@ where
 
 /// Identifies which topics from the given list are missing in the Kafka
 /// cluster.
-///
-/// # Arguments
-///
-/// * `producer` - The producer used to fetch metadata.
-/// * `topics` - A list of topics to check for existence.
-///
-/// # Errors
-///
-/// Returns a `ProducerError` if metadata fetching fails.
 fn missing_topics<C: Codec>(
     producer: &ProsodyProducer<C>,
     mut topics: Vec<Topic>,

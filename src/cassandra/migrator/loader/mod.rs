@@ -43,22 +43,9 @@ struct MigrationAssets;
 ///
 /// Iterates through all embedded `.cql` files, extracts their content,
 /// calculates checksums, and creates Migration structs. Sorts migrations
-/// by timestamp to ensure correct application order.
-///
-/// # Arguments
-///
-/// * `keyspace` - The keyspace name for template substitution
-///
-/// # Returns
-///
-/// A vector of [`Migration`] objects sorted by timestamp.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Migration files cannot be loaded from embedded assets
-/// - File content contains invalid UTF-8
-/// - Timestamp extraction from filename fails
+/// by timestamp to ensure correct application order. Fails if a file can't
+/// be loaded from the embedded assets, contains invalid UTF-8, or has a
+/// filename whose timestamp can't be extracted.
 pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, super::MigrationError> {
     let mut migrations = Vec::new();
 
@@ -112,14 +99,6 @@ pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, super:
 /// Splits the migration content into separate CQL statements by looking
 /// for semicolon terminators. Filters out empty lines and SQL comments
 /// (lines starting with `--`).
-///
-/// # Arguments
-///
-/// * `content` - The complete migration file content
-///
-/// # Returns
-///
-/// A vector of individual CQL statement strings ready for execution.
 pub fn parse_cql_statements(content: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current_statement = String::new();
@@ -154,14 +133,6 @@ pub fn parse_cql_statements(content: &str) -> Vec<String> {
 ///
 /// Generates a hexadecimal SHA-256 hash of the migration file content
 /// for integrity verification and change detection.
-///
-/// # Arguments
-///
-/// * `content` - The migration file content to hash
-///
-/// # Returns
-///
-/// A hexadecimal string representation of the SHA-256 hash.
 fn calculate_checksum(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -171,21 +142,9 @@ fn calculate_checksum(content: &str) -> String {
 /// Extracts the timestamp prefix from a migration filename.
 ///
 /// Migration files must follow the naming convention `YYYYMMDD_description.cql`
-/// where the first 8 characters form a timestamp for ordering.
-///
-/// # Arguments
-///
-/// * `filename` - The migration filename to extract from
-///
-/// # Returns
-///
-/// The 8-character timestamp string (e.g., "20240101").
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Filename is shorter than 8 characters
-/// - First 8 characters are not all digits
+/// where the first 8 characters form a timestamp for ordering. Returns an
+/// error if the filename is shorter than 8 characters or those characters
+/// aren't all ASCII digits.
 fn extract_timestamp(filename: &str) -> Result<String, super::MigrationError> {
     if filename.len() < 8 {
         return Err(super::MigrationError::InvalidFilenameFormat(

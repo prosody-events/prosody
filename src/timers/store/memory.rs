@@ -112,10 +112,6 @@ struct Inner {
 
 impl InMemoryTriggerStore {
     /// Create a new, empty in-memory trigger store scoped to the given segment.
-    ///
-    /// # Returns
-    ///
-    /// A ready-to-use `InMemoryTriggerStore`.
     #[must_use]
     pub fn new(segment: Segment) -> Self {
         Self {
@@ -268,16 +264,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     // -- Slab trigger operations (time index) --
 
     /// Stream all triggers of a specific type within a given slab.
-    ///
-    /// # Arguments
-    ///
-    /// * `slab` - The slab specification to query.
-    /// * `timer_type` - The timer type to query (Application or
-    ///   `DeferredMessage`).
-    ///
-    /// # Returns
-    ///
-    /// A stream of `Trigger` for the specified type. Never yields an error.
     fn get_slab_triggers(
         &self,
         slab: &Slab,
@@ -303,14 +289,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Stream ALL triggers within a slab across all timer types.
-    ///
-    /// # Arguments
-    ///
-    /// * `slab` - The slab specification to query.
-    ///
-    /// # Returns
-    ///
-    /// A stream of all `Trigger`s in the slab, regardless of timer type.
     fn get_slab_triggers_all_types(
         &self,
         slab: Slab,
@@ -333,15 +311,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Insert a trigger into a slab's time index.
-    ///
-    /// # Arguments
-    ///
-    /// * `slab` - Slab to receive the trigger.
-    /// * `trigger` - The `Trigger` to add.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
         let partition_key = (self.segment.id, slab.size(), slab.id());
         let clustering_key = (trigger.timer_type, trigger.key.clone(), trigger.time);
@@ -358,17 +327,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Delete a specific trigger from a slab's time index.
-    ///
-    /// # Arguments
-    ///
-    /// * `slab` - Slab to modify.
-    /// * `timer_type` - The timer type (Application or `DeferredMessage`).
-    /// * `key` - Trigger's key.
-    /// * `time` - Trigger's scheduled time.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn delete_slab_trigger(
         &self,
         slab: &Slab,
@@ -395,14 +353,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     ///
     /// This clears both Application and `DeferredMessage` timers. Used for
     /// `slab_size` migration and cleanup operations.
-    ///
-    /// # Arguments
-    ///
-    /// * `slab` - Slab to clear.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error> {
         // Clear the entire partition (all timer types)
         let partition_key = (self.segment.id, slab.size(), slab.id());
@@ -413,10 +363,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     // -- Key trigger operations (entity index) --
 
     /// Stream all scheduled times for a given key and timer type.
-    ///
-    /// # Returns
-    ///
-    /// A stream of `CompactDateTime`. Never yields an error.
     fn get_key_times(
         &self,
         timer_type: TimerType,
@@ -427,10 +373,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Stream all triggers for a given key and timer type.
-    ///
-    /// # Returns
-    ///
-    /// A stream of `Trigger`. Never yields an error.
     fn get_key_triggers(
         &self,
         timer_type: TimerType,
@@ -453,10 +395,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Stream ALL triggers for a given key across all timer types.
-    ///
-    /// # Returns
-    ///
-    /// A stream of all `Trigger`s for the key, regardless of timer type.
     fn get_key_triggers_all_types(
         &self,
         key: &Key,
@@ -479,10 +417,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     ///
     /// Duplicate logical timers replace mutable metadata by construction
     /// because the map key is `(timer_type, time)`.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn upsert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let partition_key = (segment_id, trigger.key.clone());
@@ -500,10 +434,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Delete a specific trigger from the key-based index.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn delete_key_trigger(
         &self,
         timer_type: TimerType,
@@ -527,10 +457,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Remove all triggers for a key and timer type from the key index.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn clear_key_triggers(
         &self,
         timer_type: TimerType,
@@ -558,10 +484,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// index.
     ///
     /// For in-memory store, this simply clears and inserts.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn clear_and_schedule_key(
         &self,
         trigger: Trigger,
@@ -596,10 +518,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Remove all triggers for a key across ALL timer types from the key index.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn clear_key_triggers_all_types(&self, key: &Key) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let partition_key = (segment_id, key.clone());
@@ -659,10 +577,6 @@ impl TriggerOperations for InMemoryTriggerStore {
     // -- V1 migration methods --
 
     /// Update segment metadata including version and slab size.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
     async fn update_segment_version(
         &self,
         new_version: SegmentVersion,

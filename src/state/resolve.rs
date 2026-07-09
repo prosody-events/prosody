@@ -105,11 +105,6 @@ where
 /// base is its `prev` — returned without an oracle consult or a durable write
 /// (the own-event-base-is-prev invariant); any other provisional cell is
 /// resolved through the oracle (eager write-back) via [`resolve_cell`].
-///
-/// # Errors
-///
-/// Returns [`ResolveCellError`] when the oracle or the resolution write-back
-/// fails.
 pub(crate) async fn resolve_read<S, O>(
     store: &S,
     oracle: &O,
@@ -137,11 +132,8 @@ where
 ///
 /// Returns the now-committed value: `data` when the oracle says the owning
 /// event committed (the cell is promoted in place), or `prev` when it did not
-/// (the committed base is written back as resolved).
-///
-/// # Errors
-///
-/// Returns [`ResolveCellError::Oracle`] if the oracle read fails, or
+/// (the committed base is written back as resolved). Fails with
+/// [`ResolveCellError::Oracle`] if the oracle read fails, or
 /// [`ResolveCellError::Store`] if the promote / write-back fails.
 pub(crate) async fn resolve_cell<S, O>(
     store: &S,
@@ -181,13 +173,9 @@ where
 /// the recovery sweep to act on.
 ///
 /// A per-cell `Permanent` failure is logged and skipped, leaving the cell for
-/// first-touch or a later sweep and yielding `false`; anything else propagates
-/// so the trigger aborts and the sweep refires.
-///
-/// # Errors
-///
-/// Returns [`ResolveCellError`] on a transient/terminal backend or oracle
-/// failure, or a `provisional_cells` stream failure.
+/// first-touch or a later sweep and yielding `false`; anything else — a
+/// transient/terminal backend or oracle failure, or a `provisional_cells`
+/// stream failure — propagates so the trigger aborts and the sweep refires.
 pub(crate) async fn sweep_provisional<S, O>(
     store: &S,
     oracle: &O,

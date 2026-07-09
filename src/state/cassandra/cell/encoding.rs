@@ -48,10 +48,6 @@ impl TryFrom<i16> for Encoding {
 ///
 /// The cell bytes are opaque to this layer — whatever codec produced them
 /// (JSON, the Kafka-ref `MsgPack`) lives above the store.
-///
-/// # Errors
-///
-/// Returns [`EncodingError`] when zstd compression fails.
 pub(in crate::state::cassandra) fn encode_payload(
     payload: &Bytes,
     encoding: Encoding,
@@ -62,10 +58,6 @@ pub(in crate::state::cassandra) fn encode_payload(
 }
 
 /// Decodes payload-cell bytes encoded with `encoding`.
-///
-/// # Errors
-///
-/// Returns [`EncodingError`] when zstd decompression fails.
 pub(in crate::state::cassandra) fn decode_payload(
     bytes: &[u8],
     encoding: Encoding,

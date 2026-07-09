@@ -106,27 +106,16 @@ where
     /// 2. An in-memory scheduler and its command processing task.
     /// 3. A background scheduler actor for preloading upcoming timers.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - Stable configuration: store and telemetry context.
-    /// * `heartbeats` - Registry for monitoring timer scheduler liveness.
-    /// * `shutdown_rx` - Watch channel signaling partition shutdown; the
-    ///   scheduler actor exits at `>= ShutdownPhase::Draining`.
-    /// * `semaphores` - Per-type semaphores bounding in-flight timer events
-    ///   across all partitions; the timer stream blocks when all permits for
-    ///   the trigger's type are held and terminates if the semaphore is closed.
-    ///
-    /// # Returns
-    ///
-    /// On success, returns a tuple:
-    /// - A [`Stream`] of [`PendingTimer<T>`] delivering timer events.
-    /// - The [`TimerManager<T>`] instance for scheduling and management.
+    /// `shutdown_rx` signals partition shutdown; the scheduler actor exits at
+    /// `>= ShutdownPhase::Draining`. `semaphores` bounds in-flight timer
+    /// events per type (see module docs). Returns a [`Stream`] of
+    /// [`PendingTimer<T>`] alongside the [`TimerManager<T>`] used to
+    /// schedule and manage timers.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The segment metadata cannot be created or retrieved.
-    /// - The scheduler fails to initialize.
+    /// Returns [`TimerManagerError`] if the segment metadata cannot be
+    /// created or retrieved, or if the scheduler fails to initialize.
     pub async fn new(
         config: TimerManagerConfig<T>,
         heartbeats: HeartbeatRegistry,
@@ -553,10 +542,6 @@ where
     /// Returns `None` if the timer is absent from both in-memory state and the
     /// store (oracle interpretation: "committed"). Returns `Some(0)` for legacy
     /// rows without a stored tag.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TimerManagerError::Store`] if the store read fails.
     pub(crate) async fn current_tag(
         &self,
         key: &Key,

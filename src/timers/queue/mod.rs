@@ -47,10 +47,6 @@ impl TriggerQueue {
     /// If the same [`Trigger`] (same key, time, and type) is already
     /// scheduled, refreshes its tracing span to the new trigger's span so
     /// that `onTimer` fires under the most recent caller's trace context.
-    ///
-    /// # Arguments
-    ///
-    /// * `trigger` - The timer event to schedule.
     pub async fn insert(&mut self, trigger: Trigger) {
         if self.enqueue(trigger.clone()) {
             self.active.insert(trigger).await;
@@ -61,12 +57,8 @@ impl TriggerQueue {
     ///
     /// Asynchronously polls the internal delay queue for the next item whose
     /// delay has elapsed. Once retrieved, the trigger is removed from the
-    /// `queue_keys` map.
-    ///
-    /// # Returns
-    ///
-    /// * `Some(Trigger)` when a scheduled trigger expires.
-    /// * `None` if the underlying queue has been closed.
+    /// `queue_keys` map. Returns `None` if the underlying queue has been
+    /// closed.
     pub async fn next(&mut self) -> Option<Trigger> {
         // Poll for the next expired item.
         let expired = poll_fn(|cx| self.queue.poll_expired(cx)).await?;
@@ -85,10 +77,6 @@ impl TriggerQueue {
     ///
     /// This is idempotent: calling remove on an already-removed trigger has no
     /// effect.
-    ///
-    /// # Arguments
-    ///
-    /// * `trigger` - The trigger to remove.
     pub async fn remove(&mut self, trigger: &Trigger) {
         // Remove from delay queue if present (may have already been delivered).
         if let Some(queue_key) = self.queue_keys.remove(trigger) {
@@ -110,10 +98,6 @@ impl TriggerQueue {
     /// `FiringRescheduled` and only needs the timer re-added to the queue.
     /// If the same [`Trigger`] is already in the queue, refreshes its
     /// tracing span to the new trigger's span.
-    ///
-    /// # Arguments
-    ///
-    /// * `trigger` - The timer event to add to the queue.
     pub(crate) fn insert_queue_only(&mut self, trigger: Trigger) {
         self.enqueue(trigger);
     }
@@ -144,10 +128,6 @@ impl TriggerQueue {
     /// Used for canceling a reschedule: the caller transitions the state
     /// from `FiringRescheduled` back to `Firing` and only needs the timer
     /// removed from the queue.
-    ///
-    /// # Arguments
-    ///
-    /// * `trigger` - The trigger to remove from the queue.
     pub(crate) fn remove_queue_only(&mut self, trigger: &Trigger) {
         // Look up and remove the trigger's delay queue key.
         let Some(queue_key) = self.queue_keys.remove(trigger) else {

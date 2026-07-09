@@ -132,11 +132,9 @@ impl KeyedStateConfiguration {
     /// 10). The intrinsic per-collection checks (name, Cassandra TTL ceiling,
     /// identity conflict) stay in [`CollectionDefRegistry::register_identity`].
     ///
-    /// # Errors
-    ///
-    /// Returns [`RegisterStateError`] on an empty descriptor name, a TTL over
-    /// Cassandra's `USING TTL` ceiling, a TTL at or below `recovery_delay`,
-    /// or an identity conflict.
+    /// Fails with [`RegisterStateError`] on an empty descriptor name, a TTL
+    /// over Cassandra's `USING TTL` ceiling, a TTL at or below
+    /// `recovery_delay`, or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::new(self.default_ttl);
         for (state_type, name, identity, def) in &self.registrations {

@@ -357,12 +357,6 @@ where
     /// - `enable.auto.commit=false` (manual offset management)
     /// - `enable.auto.offset.store=false` (manual seek/assign)
     ///
-    /// # Arguments
-    ///
-    /// * `config` - Loader configuration (bootstrap servers, group ID, permits,
-    ///   thresholds, etc.)
-    /// * `heartbeats` - Registry for monitoring background polling loop
-    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -438,20 +432,9 @@ where
     /// original Kafka message headers, ensuring span lifecycles are independent
     /// of cache eviction.
     ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic containing the message
-    /// * `partition` - The partition containing the message
-    /// * `offset` - The exact offset of the message
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The semaphore is closed (loader shut down)
-    /// - The request channel is closed (loader shut down)
-    /// - The response channel is closed (loader shut down)
-    /// - The message cannot be found or decoded
-    /// - A Kafka error occurs during loading
+    /// Fails with [`KafkaLoaderError::LoaderShutdown`] if the semaphore or
+    /// either channel has closed, or with a decode/Kafka error if the message
+    /// can't be found or decoded.
     #[instrument(level = "debug", skip(self), fields(cached = Empty), err)]
     async fn load_message_impl(
         &self,
@@ -510,16 +493,6 @@ where
     /// Sends a load request to the background poll loop, which handles Kafka
     /// polling and message decoding. The decoded message is cached using
     /// `quick_cache`'s S3-FIFO eviction policy for efficient repeated access.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic containing the message
-    /// * `partition` - The partition containing the message
-    /// * `offset` - The exact offset of the message
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if Kafka loading fails or the loader is shut down.
     #[instrument(skip(self), level = "debug", err)]
     async fn load_from_kafka(
         &self,
@@ -842,12 +815,6 @@ fn cleanup_if_empty<P>(
 /// For the first request to an offset, stores the permit for decoding.
 /// For subsequent requests to the same offset, adds the sender but drops the
 /// permit (only one permit needed per offset for decoding).
-///
-/// # Arguments
-///
-/// * `request` - The load request to process
-/// * `active` - Active requests map
-/// * `consumer` - Kafka consumer for assignment
 fn handle_request<P>(request: Request<P>, active: &mut ActiveRequests<P>, consumer: &BaseConsumer) {
     use std::collections::btree_map::Entry;
 
@@ -924,20 +891,9 @@ fn handle_request<P>(request: Request<P>, active: &mut ActiveRequests<P>, consum
 /// `pending_seek` is set here for each partition whose seek succeeds and is
 /// cleared in [`process_poll_result`] when a message is received.
 ///
-/// # Arguments
-///
-/// * `active` - Map of active requests by topic-partition (mutated to set
-///   `pending_seek` flags)
-/// * `consumer` - The Kafka consumer to seek
-/// * `discard_threshold` - Number of messages to read before seeking
-/// * `seek_timeout` - Timeout for seek operations
-///
-/// # Errors
-///
-/// Returns a `KafkaError` if seeking fails. The caller must NOT poll after
-/// a seek failure — the consumer's position is unknown and polling would
-/// risk misclassifying pending offsets as deleted. The caller should retry
-/// the seek on the next iteration.
+/// On a seek failure, the caller must NOT poll — the consumer's position is
+/// unknown and polling would risk misclassifying pending offsets as deleted.
+/// The caller should retry the seek on the next iteration.
 fn seek_to_first_active_offset<P>(
     active: &mut ActiveRequests<P>,
     consumer: &BaseConsumer,
@@ -1061,18 +1017,6 @@ fn seek_to_first_active_offset<P>(
 /// been deleted, rdkafka auto-positions at the Log Start Offset (LSO). Lazy
 /// validation in [`process_poll_result`] detects this case by comparing
 /// requested vs received offsets.
-///
-/// # Arguments
-///
-/// * `active` - Active requests map (checked to avoid duplicate assignments)
-/// * `consumer` - Kafka consumer to assign partition
-/// * `topic` - Topic to assign
-/// * `partition` - Partition number to assign
-/// * `offset` - Offset to start reading from
-///
-/// # Errors
-///
-/// Returns a [`KafkaError`] if the assignment operation fails.
 fn assign_if_needed<P>(
     active: &ActiveRequests<P>,
     consumer: &BaseConsumer,
@@ -1116,16 +1060,6 @@ fn assign_if_needed<P>(
 /// Removes the partition assignment since all requested offsets have been
 /// fulfilled. This keeps resource usage minimal by only holding assignments
 /// for partitions with active requests.
-///
-/// # Arguments
-///
-/// * `consumer` - The Kafka consumer to unassign from
-/// * `topic` - The topic of the partition to unassign
-/// * `partition` - The partition number to unassign
-///
-/// # Errors
-///
-/// Returns a `KafkaError` if the unassign operation fails
 fn unassign_partition(
     consumer: &BaseConsumer,
     topic: Topic,
@@ -1148,16 +1082,6 @@ fn unassign_partition(
 /// Creates a span named "load" with message metadata attributes and connects
 /// it to the upstream trace via the configured [`SpanRelation`]. Span
 /// lifecycles are independent of cache eviction.
-///
-/// # Arguments
-///
-/// * `decoded` - The decoded message containing parent context and metadata
-/// * `cached` - Whether this message was loaded from cache (true) or Kafka
-///   (false)
-///
-/// # Returns
-///
-/// A tracing span linked to the parent context with message metadata recorded.
 fn create_load_span<P>(decoded: &DecodedMessage<P>, cached: bool, relation: SpanRelation) -> Span {
     related_span!(
         relation,

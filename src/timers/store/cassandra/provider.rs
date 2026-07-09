@@ -28,12 +28,6 @@ use std::sync::Arc;
 /// Returns an implementation of `TriggerStore` backed by Apache Cassandra.
 /// This is the recommended way to create a Cassandra store.
 ///
-/// # Arguments
-///
-/// * `config` - Cassandra connection and TTL configuration
-/// * `segment` - Segment this store is scoped to
-/// * `timer_spans` - Span relation for timer execution spans
-///
 /// # Errors
 ///
 /// Returns [`CassandraTriggerStoreError`] if:
@@ -73,12 +67,6 @@ pub struct CassandraTriggerStoreProvider {
 
 impl CassandraTriggerStoreProvider {
     /// Creates a new provider from an existing store setup.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Shared Cassandra session
-    /// * `queries` - Shared prepared statements
-    /// * `timer_spans` - Span relation for timer execution spans
     #[must_use]
     pub fn new(store: CassandraStore, queries: Arc<Queries>, timer_spans: SpanRelation) -> Self {
         Self {

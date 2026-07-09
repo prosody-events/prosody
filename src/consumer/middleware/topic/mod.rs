@@ -107,10 +107,6 @@ pub struct FailureTopicConfiguration {
 
 impl FailureTopicConfiguration {
     /// Creates a new [`FailureTopicConfigurationBuilder`].
-    ///
-    /// # Returns
-    ///
-    /// A [`FailureTopicConfigurationBuilder`] instance.
     #[must_use]
     pub fn builder() -> FailureTopicConfigurationBuilder {
         FailureTopicConfigurationBuilder::default()
@@ -128,25 +124,10 @@ pub struct FailureTopicMiddleware<Enc: Codec = crate::JsonCodec> {
 impl<Enc: Codec> FailureTopicMiddleware<Enc> {
     /// Creates a new [`FailureTopicMiddleware`] with the given configuration.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - A [`FailureTopicConfiguration`] specifying the failure
-    ///   topic.
-    /// * `group_id` - The consumer group ID.
-    /// * `producer` - The [`ProsodyProducer`] used to send failure events.
-    ///
-    /// # Returns
-    ///
-    /// A [`Result<Self, ValidationErrors>`] where:
-    /// - `Ok` contains the new [`FailureTopicMiddleware`] when the
-    ///   configuration is valid.
-    /// - `Err` contains [`ValidationErrors`] if the configuration is invalid.
-    ///
     /// # Errors
     ///
-    /// Returns [`ValidationErrors`] if:
-    /// - `failure_topic` is empty.
-    /// - Any other validation error occurs.
+    /// Returns [`ValidationErrors`] if `failure_topic` is empty or otherwise
+    /// fails validation.
     pub fn new(
         config: FailureTopicConfiguration,
         group_id: String,
@@ -264,19 +245,9 @@ where
     /// If processing fails with a non-Terminal error, sends the message to
     /// the failure topic.
     ///
-    /// # Arguments
-    ///
-    /// * `context` - The context of the message being processed.
-    /// * `message` - The message to be processed.
-    ///
-    /// # Returns
-    ///
-    /// `Ok` wraps a [`FailureTopicOutput`] (inner success, or a rescued
-    /// non-Terminal error the DLQ accepted).
-    ///
-    /// # Errors
-    ///
-    /// [`FailureTopicError::Handler`] for a Terminal inner error;
+    /// Returns `Ok` wrapping a [`FailureTopicOutput`] (inner success, or a
+    /// rescued non-Terminal error the DLQ accepted); fails with
+    /// [`FailureTopicError::Handler`] for a Terminal inner error or
     /// [`FailureTopicError::DlqSendFailed`] when the failure-topic send
     /// fails — see the variant docs for what each preserves.
     async fn on_message<C>(

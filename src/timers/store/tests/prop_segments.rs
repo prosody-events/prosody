@@ -155,11 +155,8 @@ impl SegmentModel {
     }
 }
 
-/// Verifies that two segments have identical fields.
-///
-/// # Errors
-///
-/// Returns an error if any field (id, name, `slab_size`, version) differs.
+/// Verifies that two segments have identical id, name, `slab_size`, and
+/// version fields.
 fn verify_segment_fields(expected: &Segment, actual: &Segment) -> color_eyre::Result<()> {
     if expected.id != actual.id {
         return Err(color_eyre::eyre::eyre!(

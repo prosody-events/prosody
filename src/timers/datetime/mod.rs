@@ -74,12 +74,8 @@ impl CompactDateTime {
     ///
     /// This is a more efficient version of
     /// [`duration_since`](Self::duration_since) that returns a
-    /// [`CompactDuration`] instead of a [`std::time::Duration`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactDateTimeError::PastDateTime`] if `other` is later
-    /// than `self`.
+    /// [`CompactDuration`] instead of a [`std::time::Duration`]; same
+    /// failure mode.
     pub(crate) fn compact_duration_since(
         self,
         other: Self,
@@ -108,8 +104,7 @@ impl CompactDateTime {
     ///
     /// # Errors
     ///
-    /// - [`CompactDateTimeError::OutOfRange`] if current time is out of range.
-    /// - [`CompactDateTimeError::PastDateTime`] if `self` is in the past.
+    /// Same failure modes as [`duration_from_now`](Self::duration_from_now).
     pub fn compact_duration_from_now(self) -> Result<CompactDuration, CompactDateTimeError> {
         self.compact_duration_since(Self::now()?)
     }
@@ -155,11 +150,8 @@ impl TryFrom<DateTime<Utc>> for CompactDateTime {
     /// Converts a [`DateTime<Utc>`] to a [`CompactDateTime`].
     ///
     /// Rounds sub-second precision to the nearest second (≥500ms rounds up).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactDateTimeError::OutOfRange`] if the datetime is before
-    /// 1970-01-01 or after 2106-02-07.
+    /// Fails with [`CompactDateTimeError::OutOfRange`] if the datetime is
+    /// before 1970-01-01 or after 2106-02-07.
     fn try_from(value: DateTime<Utc>) -> Result<Self, Self::Error> {
         let seconds = value.timestamp();
         let nanos = value.timestamp_subsec_nanos();
@@ -173,10 +165,7 @@ impl TryFrom<SystemTime> for CompactDateTime {
     /// Converts a [`SystemTime`] to a [`CompactDateTime`].
     ///
     /// Rounds sub-second precision to the nearest second (≥500ms rounds up).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactDateTimeError::OutOfRange`] if the time is before
+    /// Fails with [`CompactDateTimeError::OutOfRange`] if the time is before
     /// 1970-01-01 or after 2106-02-07.
     fn try_from(value: SystemTime) -> Result<Self, Self::Error> {
         let duration = value

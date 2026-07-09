@@ -95,10 +95,6 @@ where
 /// 7. Dispatches messages to their respective partition managers
 ///
 /// The loop continues until the shutdown flag is set to true.
-///
-/// # Arguments
-///
-/// * `config` - The configuration for the polling process
 pub fn poll<Ctx, C>(config: PollConfig<Ctx, C>)
 where
     Ctx: ConsumerContext,
@@ -204,12 +200,6 @@ where
 /// When a partition manager is temporarily at capacity, this function retries
 /// the dispatch operation after waiting for the poll interval. If the partition
 /// is not found (which happens during rebalancing), the message is discarded.
-///
-/// # Arguments
-///
-/// * `message` - The message to dispatch
-/// * `poll_interval` - Duration to wait between retry attempts
-/// * `managers` - Reference to the collection of partition managers
 fn dispatch_with_retry<P: Send + Sync + 'static>(
     message: ConsumerMessage<P>,
     poll_interval: Duration,
@@ -238,13 +228,6 @@ fn dispatch_with_retry<P: Send + Sync + 'static>(
 /// watermark version changes, which indicates that new offsets have been
 /// committed by the partition managers. These stored offsets will be committed
 /// to Kafka on the next auto-commit interval.
-///
-/// # Arguments
-///
-/// * `consumer` - The Kafka consumer to update offsets in
-/// * `watermark_version` - Counter tracking changes to committed offsets
-/// * `managers` - Collection of partition managers that track committed offsets
-/// * `last_version` - The last processed watermark version
 fn store_watermarks<Ctx, PL>(
     consumer: &BaseConsumer<Ctx>,
     watermark_version: &WatermarkVersion,
@@ -312,21 +295,6 @@ fn store_watermarks<Ctx, PL>(
 /// This function manages backpressure by pausing partitions that are at
 /// capacity and resuming partitions that have available capacity. This prevents
 /// the consumer from losing its partitions due to inactivity.
-///
-/// # Arguments
-///
-/// * `is_paused` - Flag tracking whether any partitions are currently paused
-/// * `consumer` - Kafka consumer to apply pause/resume operations
-/// * `managers` - Collection of partition managers to check capacity
-///
-/// # Returns
-///
-/// * `Ok(())` if pause/resume operations succeeded
-/// * `Err(KafkaError)` if any Kafka operation failed
-///
-/// # Errors
-///
-/// Returns any error from the underlying Kafka pause/resume operations.
 fn pause_busy_partitions<Ctx, PL>(
     is_paused: &mut bool,
     maybe_permit: Option<&OwnedSemaphorePermit>,
@@ -378,24 +346,10 @@ where
 
 /// Dispatches a message to its assigned partition manager.
 ///
-/// Looks up the appropriate partition manager for a message and attempts
-/// to send the message to it. If the partition isn't found or the manager
-/// is at capacity, appropriate errors are returned.
-///
-/// # Arguments
-///
-/// * `message` - The message to dispatch
-/// * `managers` - Collection of partition managers
-///
-/// # Returns
-///
-/// * `Ok(())` if the message was successfully dispatched
-/// * `Err(DispatchError)` describing the reason for failure
-///
-/// # Errors
-///
-/// - `DispatchError::PartitionNotFound` - The target partition is not assigned
-/// - `DispatchError::Busy` - The partition's message queue is full
+/// Looks up the appropriate partition manager for a message and attempts to
+/// send the message to it: `DispatchError::PartitionNotFound` if the target
+/// partition is not assigned, or `DispatchError::Busy` if the partition's
+/// message queue is full.
 fn dispatch_message<P: Send + Sync + 'static>(
     message: ConsumerMessage<P>,
     managers: &Managers<P>,

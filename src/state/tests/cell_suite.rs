@@ -390,10 +390,6 @@ where
 /// projection equals the model after every event regardless of the resolution
 /// path. A crash rebuilds the store over the same warm backing the closure
 /// captures.
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
 pub(crate) async fn run_crash_equivalence_trace<S, F>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -564,10 +560,6 @@ impl Arbitrary for OverwriteTrace {
 /// next read, must equal the model. Both oracle arms run: a committing
 /// predecessor promotes to its `data`, a non-committing one rolls back to its
 /// `prev`.
-///
-/// # Errors
-///
-/// Propagates backend / oracle errors raised during the run.
 pub(crate) async fn run_overwrite_trace<S, F>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -724,10 +716,6 @@ impl CellModel {
 /// and writes interleave so their interaction is exercised, not just each in
 /// isolation (dirty-wins, clear-hides, bounds, direction, limit —
 /// unified-view soundness and oracle-correctness properties).
-///
-/// # Errors
-///
-/// Propagates backend errors raised during the run.
 pub(crate) async fn run_overlay_trace<S>(lower: S, trace: OverlayTrace) -> Result<bool>
 where
     S: CellStore,
@@ -989,10 +977,6 @@ where
 /// ASC/DESC` + `coordinate` range the overlay merge delegates to and the
 /// limit/end the overlay strips before delegating. Every seed is committed
 /// (`write_resolved`), so the oracle is committed-only.
-///
-/// # Errors
-///
-/// Propagates backend errors raised during the run.
 pub(crate) async fn run_bottom_scan_trace<S>(store: S, trace: ScanTrace) -> Result<bool>
 where
     S: CellStore,

@@ -32,18 +32,9 @@ pub enum ErrorCategory {
 /// Defines methods for classifying errors.
 pub trait ClassifyError {
     /// Classifies the error into a specific `ErrorCategory`.
-    ///
-    /// # Returns
-    ///
-    /// An `ErrorCategory` indicating the nature of the error.
     fn classify_error(&self) -> ErrorCategory;
 
-    /// Determines if the error is recoverable.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the error is classified as `ErrorCategory::Transient`, `false`
-    /// otherwise.
+    /// Returns `true` if the error is classified as `ErrorCategory::Transient`.
     fn is_recoverable(&self) -> bool {
         matches!(self.classify_error(), ErrorCategory::Transient)
     }

@@ -34,14 +34,6 @@ pub enum Mode {
 
 impl Display for Mode {
     /// Formats the `Mode` as a string.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` - A mutable reference to the `Formatter`.
-    ///
-    /// # Returns
-    ///
-    /// A `fmt::Result` indicating whether the operation was successful.
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Mode::Pipeline => f.write_str(PIPELINE_MODE),
@@ -54,21 +46,8 @@ impl Display for Mode {
 impl FromStr for Mode {
     type Err = ModeError;
 
-    /// Parses a string slice into a `Mode`.
-    ///
-    /// # Arguments
-    ///
-    /// * `s` - The string slice to parse.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the parsed `Mode` or a `ModeError` if parsing
-    /// fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `ModeError::UnknownMode` if the input string is not a valid
-    /// mode.
+    /// Parses a string slice into a `Mode`, returning
+    /// [`ModeError::UnknownMode`] if it doesn't match a known mode string.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             PIPELINE_MODE => Ok(Mode::Pipeline),

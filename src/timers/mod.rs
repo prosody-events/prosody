@@ -234,13 +234,6 @@ impl Trigger {
     ///
     /// Generates a fresh random `tag` via `rand::rng().random::<i32>()` so
     /// every newly constructed trigger has a unique identity.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` – Entity key identifying what this timer belongs to
-    /// * `time` – When this timer should execute
-    /// * `timer_type` – Timer type classification
-    /// * `span` – Tracing span for distributed observability context
     #[must_use]
     pub fn new(key: Key, time: CompactDateTime, timer_type: TimerType, span: Span) -> Self {
         Self::with_tag(key, time, timer_type, rand::rng().random::<i32>(), span)

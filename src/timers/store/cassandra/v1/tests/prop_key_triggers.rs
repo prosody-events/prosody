@@ -193,10 +193,6 @@ impl V1KeyTriggerModel {
 
 /// Applies v1 key trigger operations to both store and model with inline
 /// verification.
-///
-/// # Errors
-///
-/// Returns an error if operations fail or query results don't match model.
 async fn apply_v1_key_trigger_operations(
     v1_ops: &V1Operations,
     model: &mut V1KeyTriggerModel,

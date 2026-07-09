@@ -97,12 +97,6 @@ impl CassandraTriggerStore {
     /// (e.g., trigger store and defer store), avoiding the creation of multiple
     /// sessions which is not allowed.
     ///
-    /// # Arguments
-    ///
-    /// * `store` - Existing `CassandraStore` to share
-    /// * `keyspace` - Cassandra keyspace name for query preparation
-    /// * `segment` - Segment this store is scoped to
-    ///
     /// # Errors
     ///
     /// Returns error if query preparation fails.

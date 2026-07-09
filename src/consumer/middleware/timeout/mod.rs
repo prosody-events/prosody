@@ -167,12 +167,9 @@ impl TimeoutConfiguration {
 impl TimeoutMiddleware {
     /// Creates a new timeout middleware with the given configuration.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration for the timeout duration
-    /// * `stall_threshold` - The stall threshold duration from consumer
-    ///   configuration, used to calculate the default timeout (80% of this
-    ///   value)
+    /// `stall_threshold` is the consumer's stall threshold duration; when
+    /// `config` doesn't set an explicit timeout, it defaults to 80% of this
+    /// value.
     ///
     /// # Errors
     ///

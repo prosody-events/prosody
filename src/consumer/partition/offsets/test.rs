@@ -39,21 +39,12 @@ fn create_paused_time_runtime() -> Result<Runtime, io::Error> {
 struct Actions(Vec<Action>);
 
 /// Verifies that `OffsetTracker` correctly tracks and commits watermarks.
-///
-/// # Arguments
-/// * `actions` - An `Actions` instance containing the test actions.
 #[quickcheck]
 fn tracks_commit_watermark(actions: Actions) -> TestResult {
     TEST_RUNTIME.block_on(tracks_commit_watermark_impl(actions))
 }
 
 /// Implements the test for verifying watermark tracking and committing.
-///
-/// # Arguments
-/// * `actions` - An `Actions` instance containing the test actions.
-///
-/// # Returns
-/// A `TestResult` indicating whether the test passed or failed.
 async fn tracks_commit_watermark_impl(Actions(actions): Actions) -> TestResult {
     let version = Arc::default();
     let tracker = OffsetTracker::new(
@@ -112,9 +103,6 @@ async fn tracks_commit_watermark_impl(Actions(actions): Actions) -> TestResult {
 
 impl Arbitrary for Actions {
     /// Generates an arbitrary `Actions` instance for `QuickCheck` tests.
-    ///
-    /// # Arguments
-    /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         let mut offset: Offset = 0;
         let mut takes = HashSet::default();
@@ -282,9 +270,6 @@ fn get_stalled(
 
 impl Arbitrary for Action {
     /// Generates an arbitrary `Action` for `QuickCheck` tests.
-    ///
-    /// # Arguments
-    /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         Self {
             offset: u16::arbitrary(g).into(),
@@ -295,9 +280,6 @@ impl Arbitrary for Action {
 
 impl Arbitrary for Operation {
     /// Generates an arbitrary `Operation` for `QuickCheck` tests.
-    ///
-    /// # Arguments
-    /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         if bool::arbitrary(g) {
             Operation::Take(Instant::now())

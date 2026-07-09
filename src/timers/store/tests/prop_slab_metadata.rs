@@ -133,15 +133,8 @@ impl SlabMetadataModel {
     }
 }
 
-/// Verifies a single slab range query against the model.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Range query fails
-/// - Returned IDs don't match model
-/// - Any ID is outside the requested range
-/// - Ordering is incorrect
+/// Verifies a single slab range query against the model: the returned IDs
+/// match the model, fall within `range`, and are strictly ascending.
 async fn verify_slab_range<T>(
     operations: &T,
     model: &SlabMetadataModel,

@@ -221,17 +221,6 @@ pub struct PartitionManager<P> {
 
 impl<P: Send + 'static> PartitionManager<P> {
     /// Creates a new partition manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The partition configuration
-    /// * `handler` - The message handler that will process messages
-    /// * `topic` - The Kafka topic this partition belongs to
-    /// * `partition` - The partition number
-    ///
-    /// # Returns
-    ///
-    /// A new `PartitionManager<P>` instance
     pub fn new<T, S, SP>(
         config: PartitionConfiguration<S, SP, P>,
         handler: T,
@@ -288,11 +277,6 @@ impl<P: Send + 'static> PartitionManager<P> {
     ///
     /// This method indicates whether the internal message queue has capacity
     /// for more messages, which is used to implement backpressure.
-    ///
-    /// # Returns
-    ///
-    /// `true` if there is space in the message queue, `false` if the queue is
-    /// at capacity
     pub fn has_capacity(&self) -> bool {
         self.message_tx.capacity() > 0
     }
@@ -300,17 +284,8 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// Attempts to enqueue a message for processing.
     ///
     /// This non-blocking method tries to send a message to the internal
-    /// processing queue without waiting. If the queue is full or closed,
-    /// the original message is returned.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message to enqueue
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the message was enqueued, or `Err(ConsumerMessage)`
-    /// containing the original message if the queue is full or closed
+    /// processing queue without waiting. If the queue is full or closed, the
+    /// original message is returned to the caller in the `Err` variant.
     pub fn try_send(&self, message: ConsumerMessage<P>) -> Result<(), ConsumerMessage<P>> {
         self.message_tx
             .try_send(message)
@@ -323,12 +298,8 @@ impl<P: Send + 'static> PartitionManager<P> {
     ///
     /// The watermark represents the highest contiguous offset that has been
     /// successfully processed and committed. This is used for offset management
-    /// and reporting consumer progress.
-    ///
-    /// # Returns
-    ///
-    /// The highest contiguous committed offset if any messages have been
-    /// committed, or `None` if no messages have been committed
+    /// and reporting consumer progress. Returns `None` if no messages have
+    /// been committed yet.
     pub fn watermark(&self) -> Option<Offset> {
         self.offsets.watermark()
     }
@@ -345,11 +316,6 @@ impl<P: Send + 'static> PartitionManager<P> {
     ///
     /// This method is used by health monitoring systems to detect processing
     /// issues.
-    ///
-    /// # Returns
-    ///
-    /// `true` if messages are not being processed within the configured stall
-    /// threshold, `false` otherwise
     pub fn is_stalled(&self) -> bool {
         self.offsets.is_stalled() || self.heartbeats.any_stalled()
     }
@@ -362,12 +328,9 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// 3. Waits for in-flight messages to complete processing
     /// 4. Performs final offset commits
     ///
-    /// Used during consumer rebalancing or application shutdown.
-    ///
-    /// # Returns
-    ///
-    /// The final committed offset watermark if shutdown completes successfully,
-    /// or `None` if an error occurs during shutdown
+    /// Used during consumer rebalancing or application shutdown. Returns the
+    /// final committed offset watermark, or `None` if an error occurs during
+    /// shutdown.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
         // Close the message channel to stop accepting new messages
@@ -803,18 +766,8 @@ async fn process_event<T, S, M, P>(
 /// - Prevents consumer group loops by filtering messages from the same group
 /// - Filters messages based on their event type (if filtering is configured)
 ///
-/// # Arguments
-///
-/// * `offsets` - Offset tracker for managing message offsets
-/// * `message_rx` - Receiver channel for incoming messages
-/// * `group_id` - Consumer group identifier
-/// * `highest_offset_seen` - Tracks the highest offset processed
-/// * `allowed_events` - Optional filter for permitted event types
-///
-/// # Returns
-///
-/// A stream of [`UncommittedEvent`] items (each wrapping an
-/// [`UncommittedMessage`] or a timer) ready for processing
+/// Yields [`UncommittedEvent`] items (each wrapping an [`UncommittedMessage`]
+/// or a timer) ready for processing.
 fn build_message_stream<T, P>(
     offsets: &OffsetTracker,
     mut message_rx: Receiver<ConsumerMessage<P>>,
@@ -857,16 +810,6 @@ where
 ///
 /// This prevents processing duplicate messages that might be delivered by
 /// Kafka, especially after consumer rebalances.
-///
-/// # Arguments
-///
-/// * `highest_offset_seen` - Reference to the highest offset already processed
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `true` if the message should be processed, `false` if it should be filtered
-/// out
 fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerMessage<P>) -> Ready<bool> {
     let partition = message.partition();
     let offset = message.offset();
@@ -891,16 +834,7 @@ fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerMessage<P>)
 }
 
 /// Reserves an offset for a message and converts it to an uncommitted message.
-///
-/// # Arguments
-///
-/// * `offsets` - The offset tracker to reserve offsets from
-/// * `received` - The consumer message to process
-///
-/// # Returns
-///
-/// `Some(UncommittedMessage)` if the offset was successfully reserved,
-/// `None` if the reservation failed
+/// Returns `None` if the reservation failed.
 async fn reserve_offset<P: Send + 'static>(
     offsets: &OffsetTracker,
     received: ConsumerMessage<P>,
@@ -926,16 +860,7 @@ async fn reserve_offset<P: Send + 'static>(
 }
 
 /// Filters out messages produced by the same consumer group to prevent loops.
-///
-/// # Arguments
-///
-/// * `group_id` - The consumer group ID
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `Some(message)` if the message should be processed,
-/// `None` if it should be filtered out
+/// Returns `None` if the message should be filtered out.
 async fn filter_loops<P: Send + Sync + 'static>(
     group_id: &str,
     message: UncommittedMessage<P>,
@@ -966,17 +891,7 @@ async fn filter_loops<P: Send + Sync + 'static>(
 /// Filters messages based on their event type if filtering is enabled.
 ///
 /// Only messages with event types matching the allowed patterns will be
-/// processed.
-///
-/// # Arguments
-///
-/// * `allowed_events` - Optional automaton defining allowed event type patterns
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `Some(message)` if the message should be processed,
-/// `None` if it should be filtered out
+/// processed. Returns `None` if the message should be filtered out.
 async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,

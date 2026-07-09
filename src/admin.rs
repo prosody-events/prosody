@@ -47,10 +47,6 @@ impl AdminConfiguration {
 
     /// Creates a basic admin configuration with bootstrap servers.
     ///
-    /// # Arguments
-    ///
-    /// * `bootstrap_servers` - A list of Kafka bootstrap servers.
-    ///
     /// # Errors
     ///
     /// Returns a `ValidationErrors` if the bootstrap servers list is invalid.
@@ -138,10 +134,6 @@ impl TopicConfiguration {
 
     /// Creates a basic topic configuration with just a name.
     ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the topic to create.
-    ///
     /// # Errors
     ///
     /// Returns a `ValidationErrors` if the topic name is invalid.
@@ -173,10 +165,6 @@ pub struct ProsodyAdminClient {
 impl ProsodyAdminClient {
     /// Creates a new `ProsodyAdminClient` with the specified configuration.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - The admin configuration containing bootstrap servers.
-    ///
     /// # Errors
     ///
     /// Returns a `ProsodyAdminClientError` if the client creation fails.
@@ -204,10 +192,6 @@ impl ProsodyAdminClient {
     /// with the same configuration. The first call initializes the client with
     /// the provided configuration; subsequent calls return the same instance.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - The admin configuration containing bootstrap servers.
-    ///
     /// # Errors
     ///
     /// Returns a `ProsodyAdminClientError` if the client creation fails.
@@ -227,11 +211,6 @@ impl ProsodyAdminClient {
     }
 
     /// Creates a new Kafka topic with the specified configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The topic configuration containing name, partitions,
-    ///   replication, etc.
     ///
     /// # Errors
     ///
@@ -317,10 +296,6 @@ impl ProsodyAdminClient {
 
     /// Deletes a Kafka topic.
     ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the topic to delete.
-    ///
     /// # Errors
     ///
     /// Returns a `ProsodyAdminClientError` if the topic deletion fails.
@@ -330,11 +305,6 @@ impl ProsodyAdminClient {
     }
 
     /// Deletes records from Kafka topics up to the specified offsets.
-    ///
-    /// # Arguments
-    ///
-    /// * `records` - An iterator of `(Topic, Partition, Offset)` tuples
-    ///   specifying which records to delete.
     ///
     /// # Errors
     ///
