@@ -6,8 +6,8 @@ use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
 use crate::util::from_env_with_fallback;
 use derive_builder::Builder;
+use std::env;
 use std::path::{Path, PathBuf};
-use std::{env, process};
 use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
@@ -156,15 +156,15 @@ impl KeyedStateConfiguration {
 }
 
 /// Per-client fallback fjall workspace, used when [`FJALL_CACHE_DIR_ENV`] is
-/// unset. Wiped on restart, so it needs no persistence. The UUID suffix keeps
-/// two default-config clients in one process on independent databases —
-/// fjall locks the directory exclusively per live client.
+/// unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped on restart, so it needs
+/// no persistence. The UUID leaf gives every client its own database — fjall
+/// locks the directory exclusively per live client, so two default-config
+/// clients in one process never contend.
 fn default_cache_dir() -> PathBuf {
-    env::temp_dir().join(format!(
-        "prosody-keyed-state-{}-{}",
-        process::id(),
-        Uuid::new_v4().simple()
-    ))
+    env::temp_dir()
+        .join("prosody")
+        .join("keyed-state")
+        .join(Uuid::new_v4().simple().to_string())
 }
 
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
