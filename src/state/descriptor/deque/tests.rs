@@ -9,8 +9,9 @@ use super::*;
 use crate::error::ErrorCategory;
 use quickcheck::{QuickCheck, TestResult};
 
-/// Inv 7: the `Meta`/`Entries` discriminants round-trip through `i8` and every
-/// other value is rejected as a `Permanent` error (never coerced to a variant).
+/// The `Meta`/`Entries` discriminants round-trip through `i8`, and every
+/// other value is rejected as a `Permanent` error (never coerced to a
+/// variant).
 #[test]
 fn prop_deque_section_round_trip() {
     fn prop(value: i8) -> TestResult {

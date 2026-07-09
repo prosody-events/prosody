@@ -60,8 +60,8 @@ impl TimerEventRef {
 ///
 /// Returned by the commit oracle when it resolves a provisional cell's
 /// [`EventRef`] against the upstream commit source (deduplication store for
-/// messages, timer-row tag for timers per
-/// `docs/keyed-state/design-summary.md` §"Recovery"). Distinct from
+/// messages, timer-row tag for timers — see
+/// [`CommitOracle`](crate::state::oracle::CommitOracle)). Distinct from
 /// [`StoreOutcome`], which is the durable store's "did this call mutate
 /// state" signal: the oracle decides, the store acts on the decision.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]

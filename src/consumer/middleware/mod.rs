@@ -52,8 +52,11 @@
 //!
 //! # Usage
 //!
-//! Compose middleware using [`HandlerMiddleware::layer`] and finalize with
-//! [`HandlerMiddleware::into_provider`]:
+//! Compose middleware with [`HandlerMiddleware::layer`] — each call adds a new
+//! **outermost** layer — and finalize with
+//! [`HandlerMiddleware::into_provider`], which terminates the chain with the
+//! handler as the **innermost** component. Retry belongs outermost, since it
+//! re-drives the whole stack:
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
@@ -75,19 +78,19 @@
 //! #     async fn shutdown(self) {}
 //! # }
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
-//! # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-//! # let middle_middleware = CancellationMiddleware;
-//! # let outer_middleware = CancellationMiddleware;
-//! # let my_handler = MyHandler;
+//! # let handler = MyHandler;
 //!
-//! // Basic composition pattern
-//! let provider = inner_middleware
-//!     .layer(middle_middleware)
-//!     .layer(outer_middleware)
-//!     .into_provider(my_handler);
+//! // Stack (outer → inner): retry → cancellation → handler.
+//! let provider = CancellationMiddleware
+//!     .layer(RetryMiddleware::new(retry_config).unwrap())
+//!     .into_provider(handler);
 //! ```
 //!
-//! ## Real Example: Production Pipeline
+//! ## Retrying around a rescue layer
+//!
+//! [`topic::FailureTopicMiddleware`] rescues a failed message to a dead-letter
+//! topic. Wrapping it in its own outer [`retry::RetryMiddleware`] retries the
+//! DLQ write itself, while the inner retry re-drives the handler:
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
@@ -120,7 +123,6 @@
 //! # let telemetry = Telemetry::default();
 //! # let my_business_handler = MyHandler;
 //!
-//! // Low-latency consumer with full error handling
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
 //!     .layer(CancellationMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap())
@@ -276,30 +278,9 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     ///
     /// A provider that implements `FallibleHandlerProvider`.
     ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use prosody::consumer::middleware::*;
-    /// # use prosody::consumer::middleware::retry::*;
-    /// # use prosody::consumer::DemandType;
-    /// # use prosody::consumer::event_context::EventContext;
-    /// # use prosody::consumer::message::ConsumerMessage;
-    /// # use prosody::timers::Trigger;
-    /// # use std::convert::Infallible;
-    /// # #[derive(Clone)]
-    /// # struct MyHandler;
-    /// # impl FallibleHandler for MyHandler {
-    /// #     type Payload = serde_json::Value;
-    /// #     type Error = Infallible;
-    /// #     type Output = ();
-    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn shutdown(self) {}
-    /// # }
-    /// # let config = RetryConfiguration::builder().build().unwrap();
-    /// # let my_handler = MyHandler;
-    /// let provider = RetryMiddleware::new(config).unwrap().into_provider(my_handler);
-    /// ```
+    /// See the [module-level usage example](crate::consumer::middleware) for a
+    /// full composition; a single middleware terminates the chain the same way,
+    /// e.g. `RetryMiddleware::new(config)?.into_provider(handler)`.
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
     where
         Self: Sized,
@@ -342,39 +323,9 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
-    /// # use prosody::consumer::middleware::*;
-    /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
-    /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
-    /// # use prosody::consumer::DemandType;
-    /// # use prosody::consumer::event_context::EventContext;
-    /// # use prosody::consumer::message::ConsumerMessage;
-    /// # use prosody::timers::Trigger;
-    /// # use std::convert::Infallible;
-    /// # #[derive(Clone)]
-    /// # struct MyHandler;
-    /// # impl FallibleHandler for MyHandler {
-    /// #     type Payload = serde_json::Value;
-    /// #     type Error = Infallible;
-    /// #     type Output = ();
-    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn shutdown(self) {}
-    /// # }
-    /// # let retry_config = RetryConfiguration::builder().build().unwrap();
-    /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-    /// # let middle_middleware = CancellationMiddleware;
-    /// # let outer_middleware = CancellationMiddleware;
-    /// # let my_handler = MyHandler;
-    /// // Builds from inner to outer: inner -> middle -> outer
-    /// let provider = inner_middleware
-    ///     .layer(middle_middleware)
-    ///     .layer(outer_middleware)
-    ///     .into_provider(my_handler);
-    ///
-    /// // Request:  outer → middle → inner → handler
-    /// // Response: handler → inner → middle → outer
-    /// ```
+    /// See the [module-level usage example](crate::consumer::middleware), which
+    /// composes `CancellationMiddleware.layer(RetryMiddleware…)` so retry ends
+    /// up outermost.
     fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self, P>
     where
         Self: Sized,
@@ -772,10 +723,10 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// ```
 ///
 /// Because the marker flush is textually *after* the stage in one function,
-/// the finding-1 bug class — marker written before the staged cell is durable
-/// — is **unwritable**, not merely avoided. Promotion runs strictly *after*
-/// the commit (invariant 3): promoting a timer write before its trigger commit
-/// would resurrect it on a crash-refire. The timer marker (trigger tag) is
+/// the marker-before-durable-state bug class is **unwritable**, not merely
+/// avoided. The crash-window argument for the full step order — including
+/// why promotion runs strictly after the commit — lives on
+/// `settle_committed` in `settle.rs`. The timer marker (trigger tag) is
 /// written outside the stack by the marker commit; the message marker here
 /// restores message/timer symmetry.
 ///
@@ -785,7 +736,7 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// `settle` / `abandon` functions, so the sequence still has a single
 /// owner. No other middleware should implement `EventHandler` directly.
 ///
-/// **Stack contract:** `settle` keys the seal to the *final* `Ok` the
+/// **Stack contract:** `settle` keys the stage to the *final* `Ok` the
 /// stack returns, not the inner handler's `Ok`. In the shipped stacks no
 /// reachable path maps an inner `Ok` to an outer `Err`; the defer
 /// middlewares *can* (a rescue failure after inner success), which is safe

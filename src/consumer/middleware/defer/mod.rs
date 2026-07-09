@@ -93,12 +93,12 @@ pub fn calculate_backoff(config: &DeferConfiguration, retry_count: u32) -> Compa
 ///
 /// When a transient inner error is absorbed into an `Ok(Deferred…)`
 /// output, the durability marker for this dispatch commits — but the
-/// failed attempt's dirty state ops must not seal under it, and its
+/// failed attempt's dirty state ops must not stage under it, and its
 /// registered dedup marker must not flush. The `settle` boundary runs the
 /// durability sequence on the stack's *final* `Ok`, so this reset is what
 /// keeps the swallow safe: it discards the failed attempt's dirty ops, the
 /// per-event transaction map, **and the registered marker**, leaving
-/// `settle` an empty session — nothing seals, no marker flushes, and the
+/// `settle` an empty session — nothing stages, no marker flushes, and the
 /// deferred reload is therefore not deduplicated and re-runs the handler
 /// from clean state.
 pub(crate) fn reset_state_session<C>(context: &C)

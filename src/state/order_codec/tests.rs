@@ -1,9 +1,9 @@
 //! Order-preserving key codec invariants.
 //!
-//! Covers the codec half of invariant 3 (clustering byte-order == logical key
-//! order): a per-codec monotonicity differential over random key pairs plus
-//! round-trip, and the frozen-bytes golden for the Deque sign-flip index — a
-//! durable wire-format-freeze contract.
+//! Covers the codec half of the order-preserving invariant (clustering
+//! byte-order == logical key order): a per-codec monotonicity differential
+//! over random key pairs plus round-trip, and the frozen-bytes golden for the
+//! Deque sign-flip index — a durable wire-format-freeze contract.
 
 use super::{
     I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
@@ -12,9 +12,9 @@ use super::{
 use crate::error::{ClassifyError, ErrorCategory};
 use quickcheck::{QuickCheck, TestResult};
 
-/// Asserts the two halves of invariant 3 for one codec over a key pair:
-/// monotonicity (`a.cmp(b) == encode(a).cmp(encode(b))`) and round-trip
-/// (`decode(encode(k)) == k`).
+/// Asserts both halves of the order-preserving invariant for one codec over a
+/// key pair: monotonicity (`a.cmp(b) == encode(a).cmp(encode(b))`) and
+/// round-trip (`decode(encode(k)) == k`).
 fn check_codec<C>(a: C::Key, b: C::Key) -> bool
 where
     C: OrderedKeyCodec,

@@ -395,7 +395,7 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
     Ok(())
 }
 
-/// Invariant 7 (rollback-only-before-flush): inline `abandon` rolls a staged
+/// Rollback-only-before-flush: inline `abandon` rolls a staged
 /// set back to its committed base ONLY before a marker flush is attempted.
 /// After an attempt the flush's durability is ambiguous, so the staged cells
 /// must stay provisional for the armed sweep to resolve through the oracle —

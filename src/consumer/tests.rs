@@ -8,11 +8,11 @@ use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::time::Duration;
 
-/// The deduplication-TTL floor is `max(48 × recovery_delay, 1h)`
-/// (invariant 10). Pins both arms of the `max` and the `≥` boundary over
-/// arbitrary recovery delays: a TTL one second below the required floor is
-/// always rejected with a `required` that matches the floor, and a TTL
-/// exactly at the floor is always allowed.
+/// The deduplication-TTL floor is `max(48 × recovery_delay, 1h)` (see
+/// [`validate_recovery_ttl_margin`]). Pins both arms of the `max` and the `≥`
+/// boundary over arbitrary recovery delays: a TTL one second below the
+/// required floor is always rejected with a `required` that matches the
+/// floor, and a TTL exactly at the floor is always allowed.
 #[quickcheck]
 fn prop_dedup_ttl_must_clear_the_recovery_margin(delay_secs: u32, below: bool) -> TestResult {
     let delay = CompactDuration::new(delay_secs);

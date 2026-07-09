@@ -748,13 +748,10 @@ async fn process_event<T, S, M, P>(
                 // here, owned by the state manager, and user handlers
                 // structurally never see the trigger. State is always
                 // wired, so the sweep is always intercepted (it is inert
-                // when no collections are registered). `recover` never aborts
-                // the fired trigger except on shutdown (retry forever; abort
-                // only on shutdown): it commits the trigger on progress —
-                // resolved, a permanent per-cell skip, or after rescheduling a
-                // fresh backstop for a transient failure — and returns `Abort`
-                // only when shutdown interrupts the reschedule, so the trigger
-                // refires and re-sweeps on the next partition acquisition.
+                // when no collections are registered). See
+                // `PartitionStateManager::recover` for the
+                // never-abort-except-shutdown posture behind the
+                // `SweepResolution` mapping below.
                 if firing.timer_type() == TimerType::StateRecovery {
                     let _guard = firing.process_scope();
                     let (trigger, commit_guard) = firing.into_inner();

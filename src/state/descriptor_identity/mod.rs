@@ -15,8 +15,8 @@
 //! validates every registered descriptor against it:
 //!
 //! 1. [`read_identity`](DescriptorIdentityStore::read_identity) — a present row
-//!    is validated against the asserted identity (mismatch ⇒ `Permanent`); the
-//!    row is never overwritten.
+//!    is validated against the asserted identity (mismatch ⇒
+//!    [`DescriptorIdentityError::Mismatch`]).
 //! 2. If absent,
 //!    [`register_identity`](DescriptorIdentityStore::register_identity)
 //!    attempts first-use registration via an LWT. A concurrent registrant may
@@ -144,9 +144,9 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
 ///
 /// # Errors
 ///
-/// Returns [`DescriptorIdentityError::Mismatch`] (Permanent; the row is **not**
-/// overwritten) when a durable row disagrees with the registered identity, or
-/// [`DescriptorIdentityError::Store`] when the store fails.
+/// Returns [`DescriptorIdentityError::Mismatch`] when a durable row disagrees
+/// with the registered identity, or [`DescriptorIdentityError::Store`] when
+/// the store fails.
 pub(crate) async fn acquire_descriptor_identities<St>(
     store: &St,
     registry: &CollectionDefRegistry,

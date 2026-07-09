@@ -1,7 +1,7 @@
 //! Per-process Fjall client + per-Kafka-partition workspace.
 //!
-//! `FjallClient` and `FjallWorkspace` are the local workspace described by
-//! `docs/keyed-state/design-summary.md`. One
+//! `FjallClient` and `FjallWorkspace` are the process-local write-through
+//! cache workspace backing keyed-state cells. One
 //! `FjallClient` owns a shared `fjall::Database` rooted at the configured
 //! `cache_dir`; per Kafka partition assignment the client mints a
 //! `FjallWorkspace` carrying one named Fjall keyspace (`cache`) tagged with
@@ -26,8 +26,10 @@
 //! impl read fields by reference.
 //!
 //! On process startup, `FjallClient::open` walks every existing
-//! `value_*` keyspace and deletes them — design §"Local Workspace"
-//! §"Process restart": "Delete old workspaces; Cassandra recovers truth."
+//! `value_*` keyspace and deletes them: the cache carries no durability
+//! guarantee — Cassandra provisional cells plus the commit oracle are the
+//! recovery source — so a stale keyspace from a prior process instance is
+//! reaped rather than reused.
 
 use super::error::FjallCellCacheError;
 use crate::error::{ClassifyError, ErrorCategory};

@@ -34,90 +34,25 @@
 //!   continues, skipping any remaining sleep delay. This ensures that
 //!   cancellation doesn't cause message loss when retries could still succeed.
 //!
-//! # Apply-Hook Contract: Per-Invocation, No Exceptions
+//! # Apply-Hook Contract
 //!
-//! The [`FallibleHandler`] trait requires, **per invocation**, that for every
-//! call to `inner.on_message` / `inner.on_timer` which runs and returns, the
-//! framework fires exactly one of `inner.after_commit` (final — no
-//! re-dispatch into the inner is coming) or `inner.after_abort` (non-final —
-//! the same logical event will be re-dispatched into the inner).
+//! [`FallibleHandler`] owns the per-invocation apply-hook contract; each
+//! retry attempt is one invocation of the inner. `RetryHandler::run` owns
+//! the per-attempt responsibility split: it fires `inner.after_abort`
+//! between attempts and leaves the final attempt's hook to the outer layer.
 //!
-//! Retry middleware re-invokes its inner once per attempt; each attempt is
-//! itself an invocation that must be paired with exactly one apply hook on
-//! the inner. Splitting responsibility between this middleware and the
-//! framework above:
-//!
-//! - For every **non-final** attempt — i.e. an attempt whose error was
-//!   `Transient` and which will be followed by another attempt within this
-//!   retry session — this middleware fires `inner.after_abort(Err(error))` on
-//!   the inner *between attempts*, before invoking the inner again. The next
-//!   iteration's `on_message` / `on_timer` is a fresh dispatch from the inner's
-//!   POV.
-//! - For the **final** attempt — the one whose outcome the retry session
-//!   resolves with (success, `Permanent`, `Terminal`, or `Transient` after
-//!   `max_retries`) — this middleware does not fire any apply hook on the
-//!   inner. Instead, the outer layer fires it:
-//!     * When acting as inner [`FallibleHandler`], the outer middleware (or the
-//!       blanket impl) inspects the final `Result<O, E>` and fires the apply
-//!       hook on `RetryHandler`, which we forward verbatim to our own inner
-//!       handler.
-//!     * When acting as the outermost [`EventHandler`] (the durability
-//!       boundary), we pair the offset/timer commit/abort with exactly one
-//!       apply hook on the inner.
-//!
-//! In other words: an inner that is invoked N times in a retry session sees
-//! N apply-hook firings on itself — the first N-1 are `after_abort(Err(...))`
-//! fired by this middleware between attempts, and the last is the framework's
-//! final hook for the whole session.
-//!
-//! Composition note: layers above retry (failure-topic, defer, DLQ
-//! middlewares) still see retry as a single dispatch — they observe one
-//! final `Result` from retry and one corresponding apply-hook call. The
-//! intermediate per-attempt apply hooks fire only on retry's own inner
-//! handler, never on layers above retry.
+//! Layers above retry (failure-topic, defer, DLQ middlewares) still see
+//! retry as a single dispatch — one final `Result` and one corresponding
+//! apply-hook call. The intermediate per-attempt hooks fire only on retry's
+//! own inner handler, never on layers above retry.
 //!
 //! # Usage
 //!
-//! Often used multiple times in a pipeline for different failure points:
-//!
-//! ```rust,no_run
-//! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::retry::*;
-//! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
-//! # use prosody::consumer::middleware::topic::*;
-//! # use prosody::consumer::DemandType;
-//! # use prosody::consumer::event_context::EventContext;
-//! # use prosody::consumer::message::ConsumerMessage;
-//! # use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-//! # use prosody::telemetry::Telemetry;
-//! # use prosody::timers::Trigger;
-//! # use std::convert::Infallible;
-//! # #[derive(Clone)]
-//! # struct MyHandler;
-//! # impl FallibleHandler for MyHandler {
-//! #     type Payload = serde_json::Value;
-//! #     type Error = Infallible;
-//! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn shutdown(self) {}
-//! # }
-//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
-//! # let retry_config = RetryConfiguration::builder().build().unwrap();
-//! # let topic_config = FailureTopicConfiguration::builder().build().unwrap();
-//! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer: ProsodyProducer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
-//! # let telemetry = Telemetry::default();
-//! # let handler = MyHandler;
-//!
-//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationMiddleware)
-//!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap()) // Retry handler failures
-//!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap())
-//!     .layer(RetryMiddleware::new(retry_config).unwrap()) // Retry DLQ writes
-//!     .into_provider(handler);
-//! ```
+//! Retry belongs **outermost** in the stack, and is often used more than once:
+//! an inner retry re-drives the handler, and an outer retry around a
+//! [`FailureTopicMiddleware`](crate::consumer::middleware::topic::FailureTopicMiddleware)
+//! re-drives the dead-letter write itself. See the
+//! [module docs](crate::consumer::middleware) for that worked example.
 //!
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
@@ -284,33 +219,16 @@ async fn wait_with_cancellation<C: EventContext>(
 }
 
 /// How [`RetryHandler::run`] resolved the **final attempt** of a retry
-/// session. Intermediate (non-final) attempts are not represented here — the
-/// loop has already paired each of them with `inner.after_abort(Err(error))`
-/// before invoking the inner again. This enum describes only what the outer
-/// layer should do with the marker and the apply hook for the *last* attempt.
+/// session (non-final attempts are not represented here; `run` owns the
+/// per-attempt apply-hook split).
 ///
-/// - [`Resolution::Commit`] — the final attempt completed and is **final from
-///   the inner's POV**: success (`Ok`), `Permanent`, or `Transient` after
-///   `max_retries` was exhausted. No further dispatch into the inner is coming
-///   for this logical event from retry's standpoint; the outer should commit
-///   the marker and fire `after_commit` on the inner with this `Result<O, E>`.
-///
-/// - [`Resolution::Abort`] — the final attempt was cut short and a **retry of
-///   this dispatch is coming via redelivery** (shutdown signalled mid-loop, or
-///   a `Terminal` error). The durability marker must NOT advance, and the inner
-///   should see `after_abort(Err(error))` so it knows the same logical event
-///   will be re-delivered.
-///
-/// The mapping is performed at the call site:
-///
-/// - In the [`FallibleHandler`] impl, both variants collapse to `Result<O, E>`
-///   and the outer middleware (or blanket impl) decides which apply hook to
-///   fire. `Commit` flattens to its inner `Result`; `Abort` becomes `Err` (the
-///   outer treats this as abort because the underlying error is `Terminal` or
-///   shutdown-driven).
-/// - In the [`EventHandler`] impl (the durability boundary), `Commit` triggers
-///   `commit() + after_commit(result)` and `Abort` triggers `abort() +
-///   after_abort(Err(error))`.
+/// - [`Resolution::Commit`] — the final attempt is final from the inner's POV:
+///   success, `Permanent`, or `Transient` after `max_retries`. The outer
+///   commits the marker and fires `after_commit` on the inner with this
+///   `Result<O, E>`.
+/// - [`Resolution::Abort`] — the final attempt was cut short (shutdown
+///   mid-loop, or a `Terminal` error) and this dispatch will be redelivered.
+///   The marker must NOT advance, and the inner sees `after_abort(Err(error))`.
 enum Resolution<O, E> {
     Commit(Result<O, E>),
     Abort(E),
@@ -681,11 +599,8 @@ where
         }
     }
 
-    /// Forward verbatim. The outer middleware fires exactly one apply hook
-    /// per retry-session dispatch on `RetryHandler`, which we pass through
-    /// to the inner. This pairs with the final attempt's invocation of the
-    /// inner. Apply hooks for any intermediate (non-final) attempts have
-    /// already fired on the inner from inside `run`'s loop.
+    /// Forwarded verbatim; per-attempt hooks already fired inside
+    /// `RetryHandler::run` (see its apply-hook split).
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext<Payload = T::Payload>,
@@ -693,11 +608,8 @@ where
         self.handler.after_commit(context, result).await;
     }
 
-    /// Forward verbatim. The outer middleware fires exactly one apply hook
-    /// per retry-session dispatch on `RetryHandler`, which we pass through
-    /// to the inner. This pairs with the final attempt's invocation of the
-    /// inner. Apply hooks for any intermediate (non-final) attempts have
-    /// already fired on the inner from inside `run`'s loop.
+    /// Forwarded verbatim; per-attempt hooks already fired inside
+    /// `RetryHandler::run` (see its apply-hook split).
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext<Payload = T::Payload>,
@@ -718,12 +630,11 @@ where
 // As the outermost durability layer, transient errors retry forever (no
 // fallback exists below). This impl owns the commit-vs-abort *decision* — a
 // shutdown abort must redeliver, not commit, which only the `Resolution` from
-// `run` distinguishes — but it delegates the durability *sequence* (seal →
-// marker flush → commit → resolve) to the shared `settle` / `abandon`
+// `run` distinguishes — but it delegates the durability *sequence* (stage →
+// arm → marker flush → commit → promote) to the shared `settle` / `abandon`
 // functions, the single owner of that sequence (see the `FallibleEventHandler`
-// docs). Intermediate (non-final) attempts have already been resolved on the
-// inner by `run`'s loop, which fires `inner.after_abort(Err(error))` between
-// attempts to satisfy the per-invocation apply-hook invariant on the inner.
+// docs). Per-attempt apply hooks are `run`'s responsibility — see its
+// apply-hook split.
 
 impl<T> EventHandler for RetryHandler<T>
 where

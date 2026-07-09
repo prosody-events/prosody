@@ -56,7 +56,7 @@ prosody = "0.1"
 
 ### High-Level Client Example
 
-```rust
+```rust,no_run
 use prosody::prelude::*;
 use serde_json::json;
 use std::convert::Infallible;
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.subscribe(MyHandler).await?;
 
-    client.send("my-topic".into(), "message-key", &json!({"value": "Hello, Kafka!"})).await?;
+    client.send("my-topic".into(), "message-key", json!({"value": "Hello, Kafka!"})).await?;
 
     // Run your application logic here
 
@@ -184,17 +184,17 @@ with a transient error, routing them through defer.
 
 All messages must be processed. Retries indefinitely. Uses defer and monopolization detection.
 
-```
-Kafka → Retry → Deduplication → Defer → Monopolization → Shutdown → Scheduler → Timeout → Telemetry → Handler
+```text
+Kafka → Retry → Defer → Monopolization → Deduplication → Cancellation → Scheduler → Timeout → Telemetry → Handler
 ```
 
 | Layer          | Purpose                                                  |
 |----------------|----------------------------------------------------------|
 | Retry          | Retries transient errors indefinitely                    |
-| Deduplication  | Filters duplicate messages via local cache + Cassandra   |
 | Defer          | Stores failing messages for timer-based retry            |
 | Monopolization | Rejects keys exceeding execution time threshold          |
-| Shutdown       | Drains in-flight work on partition revocation            |
+| Deduplication  | Filters duplicate messages via local cache + Cassandra   |
+| Cancellation   | Skips work once shutdown or cancellation is signaled     |
 | Scheduler      | Enforces concurrency limits and VT-based priority        |
 | Timeout        | Cancels handlers exceeding deadline                      |
 | Telemetry      | Emits handler lifecycle events                           |
@@ -426,4 +426,4 @@ For a detailed breakdown of the consumer architecture, message flow, and compone
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.

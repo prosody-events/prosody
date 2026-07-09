@@ -53,71 +53,19 @@
 //! (max-retries on `Transient`, immediate pass-through on `Permanent`) handles
 //! whatever classification the inner produced.
 //!
-//! The inner's [`FallibleHandler::after_commit`] /
-//! [`FallibleHandler::after_abort`] hook still has to fire — and the choice
-//! of hook is driven by whether the inner will see this same logical message
-//! again:
-//!
-//! - **Inner Ok**: forward `after_commit(Ok(inner_output))` /
-//!   `after_abort(Ok(inner_output))` per the outer's marker outcome.
-//! - **Inner Terminal Err**: forward the typed error through whichever apply
-//!   hook the outer resolves (normally `after_abort` since Terminal aborts).
-//! - **Inner non-Terminal Err, DLQ ack**: the marker commits, the inner will
-//!   not be re-dispatched. The inner's typed error is preserved in the
-//!   `Output::Routed(inner_err)` variant and forwarded as
-//!   `after_commit(Err(inner_err))`.
-//! - **Inner non-Terminal Err, DLQ send fails**: the produced error is surfaced
-//!   as [`FailureTopicError::DlqSendFailed`], which carries both the producer
-//!   error (used by the outer retry layer for classification) and the original
-//!   inner error. When the outer retry re-drives the stack, this dispatch is
-//!   *not* final from the inner's POV, so the inner sees
-//!   `after_abort(Err(inner_err))`.
-//! - **Timer Err (any category)**: propagated as [`FailureTopicError::Handler`]
-//!   with the inner's classification untouched; the apply hook forwards
-//!   `Err(inner_err)` to the inner.
+//! The inner's apply hook still has to fire, chosen by whether the inner
+//! will see this same logical event again; the inner's typed error is
+//! preserved ([`FailureTopicOutput::Routed`] /
+//! [`FailureTopicError::DlqSendFailed`]) so the hook can forward it.
+//! [`FallibleHandler`] owns the general per-invocation invariant; the
+//! per-arm routing matrices live on this middleware's `after_commit` /
+//! `after_abort` impls on [`FailureTopicHandler`].
 //!
 //! # Usage
 //!
-//! Typically positioned between retry layers for sophisticated error handling:
-//!
-//! ```rust,no_run
-//! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::retry::*;
-//! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
-//! # use prosody::consumer::middleware::topic::*;
-//! # use prosody::consumer::DemandType;
-//! # use prosody::consumer::event_context::EventContext;
-//! # use prosody::consumer::message::ConsumerMessage;
-//! # use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-//! # use prosody::telemetry::Telemetry;
-//! # use prosody::timers::Trigger;
-//! # use std::convert::Infallible;
-//! # #[derive(Clone)]
-//! # struct MyHandler;
-//! # impl FallibleHandler for MyHandler {
-//! #     type Payload = serde_json::Value;
-//! #     type Error = Infallible;
-//! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn shutdown(self) {}
-//! # }
-//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
-//! # let retry_config = RetryConfiguration::builder().build().unwrap();
-//! # let topic_config = FailureTopicConfiguration::builder().build().unwrap();
-//! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer: ProsodyProducer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
-//! # let telemetry = Telemetry::default();
-//! # let handler = MyHandler;
-//!
-//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationMiddleware)
-//!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap()) // Retry handler failures
-//!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap()) // Route to DLQ
-//!     .layer(RetryMiddleware::new(retry_config).unwrap()) // Retry DLQ writes
-//!     .into_provider(handler);
-//! ```
+//! Typically positioned between two retry layers: an inner retry re-drives the
+//! handler, and an outer retry re-drives the dead-letter write. See the
+//! [module docs](crate::consumer::middleware) for that worked example.
 //!
 //! [`ErrorCategory::Permanent`]: crate::consumer::middleware::ErrorCategory::Permanent
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
@@ -303,18 +251,12 @@ where
 {
     type Error = FailureTopicError<T::Error, Enc::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
-    /// type is produced (unlike middlewares that may short-circuit), so the
-    /// variants encode whether the inner succeeded or whether its
-    /// non-Terminal error was rescued by routing to the failure topic.
-    ///
-    /// - [`FailureTopicOutput::Inner`] — the inner returned `Ok(_)`; carries
-    ///   the inner's [`FallibleHandler::Output`] for downstream 2PC.
-    /// - [`FailureTopicOutput::Routed`] — the inner returned a non-Terminal
-    ///   `Err(_)` and the DLQ producer accepted the routed message. The inner's
-    ///   typed error is **preserved** here so the apply hook can forward it to
-    ///   the inner as `Err(_)` per the [`FallibleHandler`] work-centric
-    ///   invariant. We must not collapse this to `()` — see the trait-level
-    ///   docs.
+    /// type is produced (unlike middlewares that may short-circuit):
+    /// [`FailureTopicOutput::Inner`] carries the inner's success,
+    /// [`FailureTopicOutput::Routed`] preserves the rescued inner error so
+    /// the apply hook can forward it — see `after_commit` / `after_abort`
+    /// below. We must not collapse this to `()` — see the
+    /// [`FallibleHandler`] trait-level docs.
     type Output = FailureTopicOutput<T::Output, T::Error>;
     type Payload = T::Payload;
 
@@ -329,22 +271,14 @@ where
     ///
     /// # Returns
     ///
-    /// A `Result` whose variants are:
-    /// - `Ok(FailureTopicOutput::Inner(output))` — inner ran and succeeded.
-    /// - `Ok(FailureTopicOutput::Routed(inner_err))` — inner ran and returned a
-    ///   non-Terminal error; DLQ producer accepted the routed message. The
-    ///   inner error is preserved for the apply hook.
-    /// - `Err(FailureTopicError::Handler(inner_err))` — inner returned a
-    ///   Terminal error.
-    /// - `Err(FailureTopicError::DlqSendFailed { inner, producer })` — inner
-    ///   returned a non-Terminal error, but routing to the failure topic
-    ///   failed. Both the inner error and the producer error are preserved so
-    ///   the outer retry layer can classify on `producer` and the inner's apply
-    ///   hook can fire as `after_abort(Err(inner))` on re-dispatch.
+    /// `Ok` wraps a [`FailureTopicOutput`] (inner success, or a rescued
+    /// non-Terminal error the DLQ accepted).
     ///
     /// # Errors
     ///
-    /// See `Returns` above for the error variants.
+    /// [`FailureTopicError::Handler`] for a Terminal inner error;
+    /// [`FailureTopicError::DlqSendFailed`] when the failure-topic send
+    /// fails — see the variant docs for what each preserves.
     async fn on_message<C>(
         &self,
         context: C,
@@ -421,7 +355,7 @@ where
             Ok(()) => {
                 // The inner attempt failed but the dispatch resolves `Ok`:
                 // reset the session so the failed attempt's dirty ops never
-                // seal and its registered marker never flushes (the same
+                // stage and its registered marker never flushes (the same
                 // attempt-boundary reset both defer swallow points perform).
                 reset_state_session(&context);
                 Ok(FailureTopicOutput::Routed(error))

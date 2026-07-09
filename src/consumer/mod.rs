@@ -882,9 +882,10 @@ impl PipelineMiddlewareStack {
     }
 }
 
-/// Multiplier on `recovery_delay` for the minimum deduplication TTL
-/// (invariant 10): the dedup marker is the commit oracle, so it must outlive
-/// the recovery window by a wide margin to survive rebalances and retries.
+/// Multiplier on `recovery_delay` for the minimum deduplication TTL: the
+/// dedup marker is the commit oracle, so it must outlive the recovery window
+/// by a wide margin to survive rebalances and retries. See
+/// [`validate_recovery_ttl_margin`].
 const RECOVERY_TTL_DELAY_MULTIPLIER: u64 = 48;
 
 /// Absolute floor for the deduplication TTL when state is registered, in
@@ -892,7 +893,7 @@ const RECOVERY_TTL_DELAY_MULTIPLIER: u64 = 48;
 const MIN_RECOVERY_EVIDENCE_TTL_SECONDS: u64 = 3_600;
 
 /// Validates that the deduplication TTL clears the keyed-state recovery
-/// window (invariant 10, resolution-before-evidence-expiry): `dedup.ttl ≥
+/// window (resolution-before-evidence-expiry): `dedup.ttl ≥
 /// max(48 × recovery_delay, 1h)`. The dedup marker is the commit oracle a
 /// provisional cell is resolved against, so if the marker expires first the
 /// cell can no longer be resolved correctly and a committed write is lost.
@@ -942,9 +943,9 @@ async fn build_shared_state(
     let dedup_config = common_config.dedup.clone();
     // The commit oracle is the dedup marker; a provisional cell must resolve
     // while its marker still lives, so the dedup TTL must clear the recovery
-    // window with margin (invariant 10). Only gate this when state is actually
-    // registered — an inert state layer arms no backstop, so a short dedup TTL
-    // on a stateless consumer is harmless.
+    // window with margin (see `validate_recovery_ttl_margin`). Only gate
+    // this when state is actually registered — an inert state layer arms no
+    // backstop, so a short dedup TTL on a stateless consumer is harmless.
     if keyed_state_config.has_registrations() {
         validate_recovery_ttl_margin(dedup_config.ttl, keyed_state_config.recovery_delay)
             .map_err(KeyedStateInitError::from)?;
@@ -1264,7 +1265,7 @@ where
     /// through the `Uncommitted` types.
     ///
     /// Because the durability boundary never runs here, keyed-state
-    /// collections can be neither sealed nor recovered: registering any is
+    /// collections can be neither staged nor recovered: registering any is
     /// rejected with [`KeyedStateInitError::StateUnsupported`]. Use a
     /// high-level constructor ([`Self::pipeline_consumer`],
     /// [`Self::low_latency_consumer`]) for keyed state and the full middleware
@@ -1290,7 +1291,7 @@ where
         keyed_state_config.validate()?;
 
         // The `settle` durability boundary never runs on this path, so a
-        // registered collection could never be sealed or recovered. Reject it
+        // registered collection could never be staged or recovered. Reject it
         // rather than silently accept a non-functional registration.
         if keyed_state_config.has_registrations() {
             return Err(KeyedStateInitError::StateUnsupported.into());
@@ -1304,7 +1305,7 @@ where
         // Build the empty keyed-state backend the partition machinery requires.
         // Deduplication is structurally mandatory in the store layer, but with
         // no dedup/state middleware on this path the dedup store stays inert and
-        // its oracle is never consulted — an empty registry seals nothing — so a
+        // its oracle is never consulted — an empty registry stages nothing — so a
         // minimal cache capacity is sufficient.
         let stores = StorePair::new(
             trigger_store_config,
@@ -1347,10 +1348,10 @@ where
             } => {
                 // Stateless consumer: the `settle` boundary never runs and the
                 // registry is provably empty (rejected above otherwise), so no
-                // session can ever seal. Back keyed state with the inert memory
+                // session can ever stage. Back keyed state with the inert memory
                 // provider rather than `cassandra_state_provider`, which would
                 // otherwise spawn a loader `BaseConsumer` + poll thread and
-                // create the fjall cache dir for a backend that seals nothing.
+                // create the fjall cache dir for a backend that stages nothing.
                 // The real Cassandra `trigger_provider` still drives the timer
                 // system, and its per-partition store handle is what the (never
                 // consulted) commit oracle receives at acquisition.
@@ -1897,7 +1898,7 @@ pub enum KeyedStateInitError {
 
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`] constructor, which runs no state middleware to
-    /// seal or recover them. Build a high-level consumer (e.g.
+    /// stage or recover them. Build a high-level consumer (e.g.
     /// [`ProsodyConsumer::pipeline_consumer`]) to use keyed state.
     #[error(
         "keyed-state collections require a high-level consumer; the low-level `new` constructor \
@@ -1906,10 +1907,10 @@ pub enum KeyedStateInitError {
     StateUnsupported,
 }
 
-/// The deduplication TTL is below the keyed-state recovery margin
-/// (invariant 10): a provisional cell could outlive its commit-oracle marker
-/// and be lost under crash recovery. Returned at consumer build when state
-/// collections are registered. Raise `PROSODY_IDEMPOTENCE_TTL` or lower
+/// The deduplication TTL is below the keyed-state recovery margin: a
+/// provisional cell could outlive its commit-oracle marker and be lost under
+/// crash recovery. Returned at consumer build when state collections are
+/// registered. Raise `PROSODY_IDEMPOTENCE_TTL` or lower
 /// `recovery_delay` so `dedup.ttl ≥ max(48 × recovery_delay, 1h)` holds.
 ///
 /// All fields are in seconds.

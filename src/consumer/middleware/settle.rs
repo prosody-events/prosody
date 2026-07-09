@@ -27,7 +27,7 @@ use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycl
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
-/// Delay between retries of a durability step (seal / arm / marker flush)
+/// Delay between retries of a durability step (stage / arm / marker flush)
 /// that failed transiently. Mirrors the timer commit retry cadence
 /// ([`crate::timers::uncommitted`]) and the state-manager init loop.
 const DURABILITY_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -39,7 +39,7 @@ enum StepOutcome<R> {
 
     /// The step failed permanently. Only a genuine data rejection is skipped
     /// (the `finalize` stage): the sequence continues defensively, and it
-    /// never flushes a marker over an uncertain seal. Steps whose permanent
+    /// never flushes a marker over an uncertain stage. Steps whose permanent
     /// failure is *not* a data rejection — the backstop arm and the
     /// success-path marker flush, both pure framework bookkeeping — retry
     /// past `Skip` in their own loops instead.
@@ -72,11 +72,11 @@ pub(super) enum ArmOutcome {
     ShuttingDown,
 }
 
-/// The durability sequence: the single owner of seal → arm → marker-flush →
-/// commit → resolve, run once per event after the stack returns its final
+/// The durability sequence: the single owner of stage → arm → marker-flush →
+/// commit → promote, run once per event after the stack returns its final
 /// `result`. Both the blanket [`EventHandler`] impl and
 /// [`RetryHandler`](super::retry::RetryHandler) route their final outcome
-/// here, so the wrong ordering (marker before seal) is structurally
+/// here, so the wrong ordering (marker before stage) is structurally
 /// unwritable.
 ///
 /// Fires exactly one apply hook (`after_commit` / `after_abort`) carrying
@@ -99,9 +99,9 @@ pub(crate) async fn settle<T, C, G>(
     // (mirrors the timeout middleware uncancelling after the inner returns).
     context.uncancel();
 
-    // Reach the event's sealed lifecycle. Every live context carries one —
+    // Reach the event's lifecycle handle. Every live context carries one —
     // `LifecycleAccess` binds unconditionally — so `None` means only an
-    // invalidated context, which cannot seal anyway.
+    // invalidated context, which cannot stage anyway.
     let lifecycle = context.lifecycle().ok();
 
     match result.as_ref().err().map(ClassifyError::classify_error) {
@@ -117,14 +117,14 @@ pub(crate) async fn settle<T, C, G>(
             )
             .await;
         }
-        // Final error (Transient/Permanent): nothing sealed (finalize runs
+        // Final error (Transient/Permanent): nothing staged (finalize runs
         // only on Ok). On a Permanent error the dedup middleware registered
         // the marker; flush it so the failed-but-final message deduplicates.
         // The flush is gated to Permanent: in the shipped stacks a Transient
         // final has no registered marker anyway, but a custom stack whose
         // middleware swallows a post-success failure into a Transient error
         // (without resetting the session) must not have that attempt's
-        // marker certify never-sealed state. Then commit and fire the hook.
+        // marker certify never-staged state. Then commit and fire the hook.
         Some(category) => {
             if category == ErrorCategory::Permanent
                 && let Some(lifecycle) = &lifecycle
@@ -139,8 +139,8 @@ pub(crate) async fn settle<T, C, G>(
     }
 }
 
-/// The success arm of [`settle`]: seal, arm the backstop, flush the marker
-/// strictly after the seal, commit, then resolve the sealed set.
+/// The success arm of [`settle`]: stage, arm the backstop, flush the marker
+/// strictly after the stage, commit, then promote the staged set.
 ///
 /// # Crash windows
 ///
@@ -266,8 +266,8 @@ async fn settle_committed<T, C, G>(
                 // A marker-flush attempt was made before shutdown: its
                 // durability is ambiguous, so the staged cells must NOT roll
                 // back. They stay provisional and the armed sweep resolves
-                // them through the oracle (invariant 7). Rolling back here
-                // could erase a committed write that redelivery then
+                // them through the oracle (see `RollbackSafety`). Rolling back
+                // here could erase a committed write that redelivery then
                 // dedup-filters.
                 abandon(
                     handler,
@@ -286,9 +286,9 @@ async fn settle_committed<T, C, G>(
     guard.commit().await;
 
     // 5. Promote the staged cells (null `event`/`prev`, O(1) per cell). This
-    // is invariant-3 correct only here, strictly after the commit: promoting a
-    // timer write before its trigger commit would resurrect it on a
-    // crash-refire. The backstop stays armed regardless: a `Resolved` key's
+    // is correct only here, strictly after the commit: promoting a timer
+    // write before its trigger commit would resurrect it on a crash-refire.
+    // The backstop stays armed regardless: a `Resolved` key's
     // sweep finds nothing provisional and clears itself when the key goes
     // quiet, while an `Incomplete` promote leaves real work for that same
     // sweep to retry. No point-clear means no cross-event race.
@@ -302,9 +302,9 @@ async fn settle_committed<T, C, G>(
 
 /// Whether inline abandon may roll a staged set back to its committed base.
 ///
-/// The marker flush is the boundary (invariant 7): before any flush attempt a
-/// rollback is sound; after one it is not, because the flush's durability is
-/// ambiguous on a write-timeout.
+/// The marker flush is the boundary: before any flush attempt a rollback is
+/// sound; after one it is not, because the flush's durability is ambiguous
+/// on a write-timeout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RollbackSafety {
     /// No marker flush has been attempted; rolling the staged set back to its
@@ -320,8 +320,8 @@ pub(crate) enum RollbackSafety {
 /// reloadable), conditionally roll back any staged set, and fire
 /// `after_abort`. Reached on a terminal error or a shutdown mid-sequence.
 ///
-/// `safety` gates the rollback (invariant 7, rollback-only-before-flush):
-/// inline rollback to the committed base is sound only
+/// `safety` gates the rollback (rollback-only-before-flush, see
+/// [`RollbackSafety`]): inline rollback to the committed base is sound only
 /// [`RollbackSafety::BeforeMarkerFlush`]. Once a marker flush has been
 /// *attempted* ([`RollbackSafety::AfterMarkerFlush`]) a write-timeout is
 /// ambiguous — the marker may be durable — so rolling back could erase a

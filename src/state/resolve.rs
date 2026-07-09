@@ -10,8 +10,8 @@
 //!
 //! `sweep_provisional` is the recovery loop built once over the public trait:
 //! it streams a collection's provisional cells and resolves each, returning
-//! whether every cell ended resolved — the no-strand signal the recovery sweep
-//! gates its `unschedule_all` on.
+//! whether every cell ended resolved. The backstop that triggered the sweep
+//! is never unscheduled directly (finding F2); it clears only by firing.
 
 use super::CommitDecision;
 use super::SHARD_FANOUT_CONCURRENCY;
@@ -177,8 +177,8 @@ where
 }
 
 /// Resolves every provisional cell of a collection through the oracle (the
-/// quiescence sweep loop). Returns `true` iff every cell ended resolved — the
-/// caller unschedules the backstop only then (the no-strand invariant).
+/// quiescence sweep loop). Returns `true` iff every cell ended resolved, for
+/// the recovery sweep to act on.
 ///
 /// A per-cell `Permanent` failure is logged and skipped, leaving the cell for
 /// first-touch or a later sweep and yielding `false`; anything else propagates

@@ -336,8 +336,9 @@ pub trait CollectionSpec {
 /// ([`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`]) are aliases over
 /// this type.
 ///
-/// A plain `Copy` value (the name is interned) so descriptors are cheap to
-/// build wherever they are needed.
+/// A plain `Copy` value (the name is interned — see [`Descriptor::new`] for
+/// the retention rationale) so descriptors are cheap to build wherever they
+/// are needed.
 #[derive(Educe)]
 #[educe(Clone(bound = ""), Copy, Debug(bound = ""))]
 pub struct Descriptor<K> {

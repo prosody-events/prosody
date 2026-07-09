@@ -40,40 +40,9 @@
 //!
 //! # Usage
 //!
-//! Position early in middleware stack to prevent unnecessary processing when
-//! already cancelled:
-//!
-//! ```rust,no_run
-//! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::retry::*;
-//! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation::*;
-//! # use prosody::consumer::DemandType;
-//! # use prosody::consumer::event_context::EventContext;
-//! # use prosody::consumer::message::ConsumerMessage;
-//! # use prosody::telemetry::Telemetry;
-//! # use prosody::timers::Trigger;
-//! # use std::convert::Infallible;
-//! # #[derive(Clone)]
-//! # struct MyHandler;
-//! # impl FallibleHandler for MyHandler {
-//! #     type Payload = serde_json::Value;
-//! #     type Error = Infallible;
-//! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn shutdown(self) {}
-//! # }
-//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
-//! # let retry_config = RetryConfiguration::builder().build().unwrap();
-//! # let telemetry = Telemetry::default();
-//! # let handler = MyHandler;
-//!
-//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationMiddleware)
-//!     .layer(RetryMiddleware::new(retry_config).unwrap())
-//!     .into_provider(handler);
-//! ```
+//! Position early in the stack, close to the handler, so cancellation is
+//! observed before unnecessary work begins. See the
+//! [module docs](crate::consumer::middleware) for a worked composition example.
 //!
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient

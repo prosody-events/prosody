@@ -113,7 +113,7 @@ pub enum TimerType {
     /// Internal: timer scheduled by defer middleware to retry a failed timer.
     DeferredTimer = 2,
     /// Internal: keyed-state recovery sweep scheduled by the keyed-state
-    /// middleware after seal. Routes back into the middleware on fire and is
+    /// middleware after stage. Routes back into the middleware on fire and is
     /// never dispatched to user handlers.
     StateRecovery = 3,
 }

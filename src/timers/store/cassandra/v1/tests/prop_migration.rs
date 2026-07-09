@@ -326,7 +326,7 @@ async fn setup_v3_state(
     Ok(())
 }
 
-/// Verifies invariant 1: Segment metadata is correct after migration.
+/// Verifies that segment metadata is correct after migration.
 ///
 /// Expected: version=V2, `slab_size=target_slab_size`, name preserved (for V2
 /// only).
@@ -411,7 +411,7 @@ async fn collect_key_index_triggers(
     Ok(triggers)
 }
 
-/// Verifies invariant 2: All triggers are preserved with correct `timer_type`.
+/// Verifies that all triggers are preserved with correct `timer_type`.
 ///
 /// Builds actual trigger set from store and compares to model.
 ///
@@ -436,7 +436,7 @@ async fn verify_data_preservation(
     Ok(())
 }
 
-/// Verifies invariant 3: Triggers are in correct slabs based on target slab
+/// Verifies that triggers are in correct slabs based on target slab
 /// size.
 ///
 /// # Errors
@@ -486,7 +486,7 @@ async fn verify_correct_indexing(
     Ok(())
 }
 
-/// Verifies invariant 4: Slab index matches key index exactly.
+/// Verifies that the slab index matches the key index exactly.
 ///
 /// Both indices must contain the same triggers (dual-index consistency).
 ///
@@ -568,7 +568,7 @@ async fn verify_no_extra_slabs(
     Ok(())
 }
 
-/// Verifies invariant 5: Old V1 data and obsolete slabs are cleaned up.
+/// Verifies that old V1 data and obsolete slabs are cleaned up.
 ///
 /// # Errors
 ///
@@ -643,7 +643,7 @@ async fn verify_cleanup(
     Ok(())
 }
 
-/// Verifies invariant 6: After migration to V3, all keys with triggers have
+/// Verifies that after migration to V3, all keys with triggers have
 /// correct state entries and correct clustering row counts.
 ///
 /// For each `(key, timer_type)` pair:

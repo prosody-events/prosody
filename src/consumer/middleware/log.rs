@@ -35,38 +35,10 @@
 //!
 //! # Usage
 //!
-//! Position as outer middleware for complete error visibility:
-//!
-//! ```rust,no_run
-//! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::log::*;
-//! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
-//! # use prosody::consumer::DemandType;
-//! # use prosody::consumer::event_context::EventContext;
-//! # use prosody::consumer::message::ConsumerMessage;
-//! # use prosody::telemetry::Telemetry;
-//! # use prosody::timers::Trigger;
-//! # use std::convert::Infallible;
-//! # #[derive(Clone)]
-//! # struct MyHandler;
-//! # impl FallibleHandler for MyHandler {
-//! #     type Payload = serde_json::Value;
-//! #     type Error = Infallible;
-//! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn shutdown(self) {}
-//! # }
-//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
-//! # let telemetry = Telemetry::default();
-//! # let handler = MyHandler;
-//!
-//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationMiddleware)
-//!     .layer(LogMiddleware) // Logs all errors from inner layers
-//!     .into_provider(handler);
-//! ```
+//! Position as the **outermost** layer for complete error visibility; composing
+//! it under another middleware silently disables its logging (see above). See
+//! the [module docs](crate::consumer::middleware) for a worked composition
+//! example.
 //!
 //! [`ErrorCategory`]: crate::consumer::middleware::ErrorCategory
 

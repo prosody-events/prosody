@@ -451,12 +451,11 @@ mod scope_containment {
         Ok(registry)
     }
 
-    /// Inv 6 (behavioral): sibling descriptors of every kind bound against one
-    /// session address disjoint cells — a write to one never leaks into
-    /// another's read, even though Value/Map/Deque reuse the same section
-    /// discriminants (`0`/`1`) and coordinate spaces. `CellView` pins
-    /// `(state_type, name)`, so the handles cannot collide sharing a session
-    /// and a key.
+    /// Sibling descriptors of every kind bound against one session address
+    /// disjoint cells — a write to one never leaks into another's read, even
+    /// though Value/Map/Deque reuse the same section discriminants (`0`/`1`)
+    /// and coordinate spaces. `CellView` pins `(state_type, name)`, so the
+    /// handles cannot collide sharing a session and a key.
     #[test]
     fn prop_sibling_descriptors_do_not_leak() {
         async fn check(a: Value, b: Value) -> Result<bool> {

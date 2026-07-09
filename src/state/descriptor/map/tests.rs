@@ -9,7 +9,7 @@
 use super::*;
 use quickcheck::{QuickCheck, TestResult};
 
-/// Inv 7: the `Meta`/`Entries` discriminants round-trip through `i8` and every
+/// The `Meta`/`Entries` discriminants round-trip through `i8`, and every
 /// other value is rejected (never coerced to a variant).
 #[test]
 fn prop_map_section_round_trip() {

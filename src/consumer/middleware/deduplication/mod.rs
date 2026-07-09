@@ -14,7 +14,7 @@
 //! short-circuits before the inner runs; otherwise, on a handler `Ok` or a
 //! permanent error, it registers the message's dedup id in the event's
 //! keyed-state session. The actual marker write happens later, at the
-//! `settle` durability boundary, strictly after the WAL seal — so the
+//! `settle` durability boundary, strictly after the stage — so the
 //! commit marker can never precede the durable state it certifies.
 //! Deduplication is mandatory; there is no disabled variant.
 //!
@@ -330,8 +330,8 @@ where
         // Register the marker on success or permanent error — both are final
         // from the consumer's POV, so the message must dedup on redelivery.
         // The marker is written (flushed) later by the `settle` boundary,
-        // strictly after the WAL seal; registering it here, not writing it,
-        // is what makes "marker before seal" unwritable. A defer-swallow or a
+        // strictly after the stage; registering it here, not writing it,
+        // is what makes "marker before durable state" unwritable. A defer-swallow or a
         // retry attempt-boundary resets the session, discarding the marker, so
         // a deferred reload is correctly not deduped.
         let register = match &result {
@@ -370,7 +370,7 @@ where
         // correct. `Store(_)` is classified Transient (see `ClassifyError`
         // below), so the outer retry layer redrives the whole stack and the
         // inner sees a fresh invocation. (The marker is no longer written
-        // here; the `settle` boundary flushes it after the seal.) Apply hooks
+        // here; the `settle` boundary flushes it after the stage.) Apply hooks
         // are best-effort by design — see `FallibleHandler::after_commit`.
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,

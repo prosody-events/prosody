@@ -12,12 +12,12 @@
 //! [`DeduplicationStore`]: row present ⇔ committed.
 //! [`CommitOracle::record_message`] writes that row via
 //! [`DeduplicationStore::insert`] — the boundary's marker-flush step,
-//! strictly after the WAL seal, so a present row always certifies a durable
-//! seal.
+//! strictly after the stage, so a present row always certifies a durable
+//! stage.
 //!
 //! # Timer side
 //!
-//! `is_timer_committed(key, type, time, wal_tag)` compares the WAL-recorded
+//! `is_timer_committed(key, type, time, wal_tag)` compares the caller-supplied
 //! tag against the current tag in storage — see its doc comment for the
 //! three-state decision.
 //!
@@ -47,10 +47,13 @@ use uuid::Uuid;
 /// commit oracle.
 ///
 /// The implementation is [`StoreTagSource`]: a bare [`TriggerStore`] read
-/// over a clone of the partition's own writing store. No scheduler-aware
+/// over the handle [`StateBackendFactory::for_partition`] passes down (the
+/// one-identity-one-value invariant lives there). No scheduler-aware
 /// source is needed — the oracle is only ever consulted for events that
 /// have fully completed, and per-key serialization guarantees their
 /// durability markers landed before recovery runs.
+///
+/// [`StateBackendFactory::for_partition`]: crate::state::StateBackendFactory::for_partition
 pub trait TimerTagSource: Clone + Send + Sync + 'static {
     /// Error type for tag reads.
     type Error: ClassifyError + Error + Send + Sync + 'static;

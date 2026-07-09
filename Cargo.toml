@@ -24,7 +24,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 axum-extra = { version = "0.12", features = ["routing"] }
 base16ct = "1.0"
-bytes = { version = "1", features = ["serde"] }
+bytes = "1"
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
@@ -37,7 +37,7 @@ fixedstr = { version = "0.5", features = ["flex-str"] }
 fjall = "3.1"
 futures = "0.3"
 humantime = "2.3"
-internment = { version = "0.8", features = ["serde"] }
+internment = "0.8"
 intervallum = "1.4"
 nohash-hasher = "0.2"
 opentelemetry = { version = "0.31", features = ["metrics"] }

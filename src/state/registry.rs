@@ -72,9 +72,8 @@ pub enum CommitMode {
 /// descriptor at `CollectionDefRegistry::register` time, so a definition
 /// cannot assert an identity its descriptor does not have.
 ///
-/// Core Invariant #6: "A collection has one `CommitMode` while a handler
-/// is running" — pinned here at registration time, not at event scope
-/// creation time.
+/// A collection has one `CommitMode` while a handler is running — pinned
+/// here at registration time, not at event scope creation time.
 #[derive(Clone, Copy, Debug)]
 pub struct CollectionDef {
     /// Per-collection TTL override.
@@ -115,11 +114,8 @@ pub(crate) struct RegisteredCollection {
 ///
 /// Keyed by `(state_type, name)`: a collection's name is unique only *within*
 /// its [`StateType`] namespace, so the same name under two state types is two
-/// distinct entries and never an identity conflict. The recovery sweep
-/// enumerates the registered collections for a kind
-/// (`collections_for_kind`), the authoritative declared set — there is
-/// no durable-name union, so a collection whose descriptor was removed is
-/// simply dormant until it returns.
+/// distinct entries and never an identity conflict. See [`Self::collections`]
+/// for what the recovery sweep enumerates.
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionDefRegistry {
     defs: HashMap<StateType, HashMap<StateName, RegisteredCollection>>,

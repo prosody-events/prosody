@@ -73,7 +73,8 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     ///
     /// Useful for advanced scenarios that need the `Trigger` and the
     /// commit/abort capability as two independent values (e.g. moving the
-    /// `Trigger` into a WAL record while retaining the guard).
+    /// `Trigger` into a staged provisional-cell record while retaining the
+    /// guard).
     ///
     /// # Returns
     ///
@@ -222,10 +223,11 @@ where
             return None;
         };
 
-        // Re-stamp the trigger with the canonical tag so WAL writers can embed
-        // the observed-at-dispatch value. `tag` is excluded from `Hash/Eq/Ord`
-        // (see `Trigger` doc), so the in-place write preserves the
-        // `(key, time, timer_type)` identity used by any downstream map keys.
+        // Re-stamp the trigger with the canonical tag so provisional-cell
+        // writers can embed the observed-at-dispatch value. `tag` is excluded
+        // from `Hash/Eq/Ord` (see `Trigger` doc), so the in-place write
+        // preserves the `(key, time, timer_type)` identity used by any
+        // downstream map keys.
         self.trigger.tag = canonical_tag;
 
         Some(FiringTimer {
