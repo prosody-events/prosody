@@ -1,7 +1,7 @@
 //! Pooled, thread-local serialize buffer.
 //!
 //! Hot serialize paths (the Kafka producer's record encoding, the keyed-state
-//! `StateHandle::set` cell encoding) borrow a reusable `Vec<u8>` instead of
+//! `CellView::set` cell encoding) borrow a reusable `Vec<u8>` instead of
 //! allocating a fresh one per call. [`SerializeBufGuard::acquire`] takes the
 //! per-thread buffer; on drop the guard clears it and returns it, keeping the
 //! larger of the two capacities so steady-state encoding stops allocating.

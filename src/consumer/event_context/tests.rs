@@ -194,7 +194,10 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
     loader.store_message(topic, partition, offset, key.clone(), payload.clone());
 
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&message_state("last_seen"), CollectionDef::new(None))?;
+    registry.register(
+        &message_state::<MemoryLoader<Value>>("last_seen"),
+        CollectionDef::new(None),
+    )?;
     let session = test_session(loader, registry);
     let ctx = MockEventContext::<Value>::new().with_session(session);
 

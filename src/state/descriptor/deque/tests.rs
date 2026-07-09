@@ -1,17 +1,16 @@
-//! Deque section-freeze and frozen-byte goldens.
+//! Deque section-freeze and window validation.
 //!
 //! The behavioral invariants (the dense window, crash atomicity, residue
 //! skipping) are proven by the memory-backed `run_deque_trace` property in
-//! [`crate::state::tests`]. These pin the durable wire contracts: the section
-//! discriminants and the `META_BOUNDS` byte layout, so a change fails loudly.
+//! [`crate::state::tests`]; the frozen `head ‖ tail` frame bytes are pinned by
+//! the pair codec's own goldens (`crate::codec`). These pin the durable section
+//! discriminants and the collection-owned `head ≤ tail` window check.
 
 use super::*;
-use crate::error::ErrorCategory;
 use quickcheck::{QuickCheck, TestResult};
 
 /// The `Meta`/`Entries` discriminants round-trip through `i8`, and every
-/// other value is rejected as a `Permanent` error (never coerced to a
-/// variant).
+/// other value is rejected (never coerced to a variant).
 #[test]
 fn prop_deque_section_round_trip() {
     fn prop(value: i8) -> TestResult {
@@ -21,65 +20,44 @@ fn prop_deque_section_round_trip() {
             ),
             _ => TestResult::from_bool(matches!(
                 DequeNs::try_from(value),
-                Err(error @ MetaDecodeError::UnexpectedSection(v))
-                    if v == value && error.classify_error() == ErrorCategory::Permanent
+                Err(UnknownDequeSection(v)) if v == value
             )),
         }
     }
     QuickCheck::new().quickcheck(prop as fn(i8) -> TestResult);
 }
 
-/// The frozen discriminants and the `META_BOUNDS` cell address.
+/// The frozen section discriminants — a durable wire contract (the sections
+/// lower to `0`/`1`).
 #[test]
 fn deque_layout_is_frozen() {
     assert_eq!(DequeNs::Meta as i8, 0);
     assert_eq!(DequeNs::Entries as i8, 1);
-    assert_eq!(i8::from(META_BOUNDS.section), 0);
-    assert!(META_BOUNDS.coordinate.as_bytes().is_empty());
+    assert_eq!(i8::from(META_SECTION), 0);
+    assert_eq!(i8::from(ENTRY_SECTION), 1);
 }
 
-/// Frozen-bytes golden for the `head ‖ tail` bounds payload (16 bytes,
-/// big-endian) — a durable wire-format contract. Covers a positive pair and a
-/// sign-crossing `head` (`push_front` drives the index negative).
+/// [`Window::new`] lifts an ordered `(head, tail)` pair (its length is the
+/// span) and rejects a reversed pair as a `Permanent`
+/// [`MetaDecodeError::Disordered`] rather than a silent misread — the
+/// collection owning the *meaning* the pair codec cannot.
 #[test]
-fn deque_meta_bounds_bytes_are_frozen() {
-    assert_eq!(
-        encode_bounds(1, 258),
-        [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 2]
-    );
-    assert_eq!(
-        encode_bounds(-1, 2),
-        [
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 2
-        ]
-    );
-}
-
-/// The bounds payload round-trips, and a wrong width or a disordered pair is a
-/// `Permanent` error rather than a silent misread.
-#[test]
-fn prop_deque_bounds_round_trip_and_reject() {
+fn prop_deque_window_orders_head_and_tail() {
     fn prop(head: i32, delta: u16) -> TestResult {
-        // `tail = head + delta` keeps the pair ordered; the `i32`/`u16` widths
-        // keep `head + delta` from overflowing `i64`.
+        // The `i32`/`u16` widths keep `head + delta` from overflowing `i64`.
         let head = i64::from(head);
         let tail = head + i64::from(delta);
-        let encoded = encode_bounds(head, tail);
-        let round_trips = decode_bounds(&encoded) == Ok((head, tail));
-        let bad_length = matches!(
-            decode_bounds(&encoded[..15]),
-            Err(MetaDecodeError::BadLength {
-                expected: 16,
-                actual: 15
-            })
-        );
-        // A disordered pair (only when `delta > 0`, so `tail < head` is genuine).
+
+        let ordered =
+            matches!(Window::new(head, tail), Ok(window) if window.len() == Ok(usize::from(delta)));
+        // A genuinely reversed pair (only when `delta > 0`) is rejected.
         let disordered = delta == 0
             || matches!(
-                decode_bounds(&encode_bounds(tail, head)),
-                Err(MetaDecodeError::Disordered { .. })
+                Window::new(tail, head),
+                Err(error @ MetaDecodeError::Disordered { head: h, tail: t })
+                    if h == tail && t == head && error.classify_error() == ErrorCategory::Permanent
             );
-        TestResult::from_bool(round_trips && bad_length && disordered)
+        TestResult::from_bool(ordered && disordered)
     }
     QuickCheck::new().quickcheck(prop as fn(i32, u16) -> TestResult);
 }

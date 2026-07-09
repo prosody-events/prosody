@@ -6,8 +6,8 @@
 //! Deque sign-flip index — a durable wire-format-freeze contract.
 
 use super::{
-    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
-    order_preserving_i64_decode,
+    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, UnitKey, Utf8KeyCodec,
+    order_preserving_i64, order_preserving_i64_decode,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use quickcheck::{QuickCheck, TestResult};
@@ -112,10 +112,10 @@ fn deque_index_anchors_are_frozen() {
 }
 
 /// Frozen-bytes goldens for the other Map key codecs — durable wire contracts
-/// for the entry coordinate (and the bytes a Map `META_MIN`/`META_MAX` stores).
-/// `Utf8KeyCodec` is the raw UTF-8 bytes; `U64KeyCodec` is plain big-endian
-/// (unsigned, so no sign flip — `0` is all-zero, unlike the signed `i64`
-/// codec).
+/// for the entry coordinate (and the bytes a Map
+/// `MapBound::Min`/`MapBound::Max` stores). `Utf8KeyCodec` is the raw UTF-8
+/// bytes; `U64KeyCodec` is plain big-endian (unsigned, so no sign flip — `0` is
+/// all-zero, unlike the signed `i64` codec).
 #[test]
 fn map_key_coordinate_bytes_are_frozen() {
     assert_eq!(Utf8KeyCodec::encode(&"cart".to_owned()).as_bytes(), b"cart");
@@ -141,4 +141,49 @@ fn deque_index_round_trips() {
         TestResult::from_bool(order_preserving_i64_decode(order_preserving_i64(value)) == value)
     }
     QuickCheck::new().quickcheck(prop as fn(i64) -> TestResult);
+}
+
+/// `UnitKey` addresses exactly one cell: it encodes the empty coordinate and
+/// decodes *only* the empty coordinate — non-empty bytes in a unit-addressed
+/// section are a corrupt address, rejected as [`KeyCodecError::BadLength`]
+/// rather than silently read as `()`.
+#[test]
+fn unit_key_round_trips_only_the_empty_coordinate() {
+    assert_eq!(UnitKey::encode(&()).as_bytes(), b"");
+    assert!(UnitKey::decode(&[]).is_ok());
+    assert!(matches!(
+        UnitKey::decode(&[0]),
+        Err(KeyCodecError::BadLength {
+            expected: 0,
+            actual: 1
+        })
+    ));
+}
+
+/// Byte-identity law: every key codec is its own payload codec — `serialize`
+/// writes exactly `encode`'s bytes and `deserialize` agrees with `decode` —
+/// which is what lets a key ride as a cell payload (a map bound cell) with no
+/// adapter. Held by construction today (the `Codec` impls delegate); this
+/// property guards against a future impl drifting the two byte forms apart.
+#[test]
+fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
+    fn agrees<KC>(key: KC::Key) -> bool
+    where
+        KC: OrderedKeyCodec,
+        KC::Key: Clone + PartialEq,
+    {
+        let mut codec = KC::default();
+        let mut buf = Vec::new();
+        if codec.serialize(key.clone(), &mut buf).is_err() {
+            return false;
+        }
+        buf == KC::encode(&key).as_bytes() && codec.deserialize(&mut buf.clone()) == Ok(key)
+    }
+    fn prop(s: String, i: i64, u: u64) -> bool {
+        agrees::<Utf8KeyCodec>(s)
+            && agrees::<I64KeyCodec>(i)
+            && agrees::<U64KeyCodec>(u)
+            && agrees::<UnitKey>(())
+    }
+    QuickCheck::new().quickcheck(prop as fn(String, i64, u64) -> bool);
 }

@@ -6,12 +6,21 @@
 //! last message seen, and an `Application` timer reads both back — the
 //! value cell from durable state, the Kafka-message cell by re-fetching
 //! the original message body from Kafka through the consumer's loader.
+//!
+//! The handler stays generic over `C: EventContext` (no concrete context type
+//! named anywhere), which the typed `MessageDescriptor<L>` handle cannot do —
+//! its resolver names a concrete loader `L`, so it needs `C::State` pinned to
+//! that exact `L`, unknowable from `C: EventContext` alone. The erased
+//! Kafka-message ops (`record_message`/`get_message`) resolve through
+//! whatever loader `C::State` carries, bounded only by the `MessageLoader`
+//! trait, so this test exercises that loader-agnostic path for the
+//! Kafka-message cell instead.
 
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::codec::JsonCodecError;
-use prosody::consumer::event_context::{EventContext, StateAccessError};
+use prosody::consumer::event_context::{BoxEventContextError, EventContext, StateAccessError};
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
@@ -22,12 +31,12 @@ use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
     CommonConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
-    MessageDescriptor, MessageStateError, PipelineMiddlewareConfiguration, ProsodyConsumer,
-    message_state,
+    MessageDescriptor, PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
+use prosody::loader::KafkaLoader;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::state::descriptor::{Registered, ValueDescriptor, ValueStateError, value_state};
+use prosody::state::descriptor::{CellStateError, Registered, ValueDescriptor, value_state};
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use prosody::timers::duration::CompactDuration;
@@ -55,9 +64,14 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-fn last_seen() -> MessageDescriptor {
+fn last_seen() -> MessageDescriptor<KafkaLoader<JsonCodec>> {
     message_state("last_seen")
 }
+
+/// The `last_seen` collection's registered name — the handler reaches it
+/// through the erased, loader-agnostic `record_message`/`get_message` ops
+/// rather than a typed [`Registered`] token (see the module doc).
+const LAST_SEEN: &str = "last_seen";
 
 /// What the handler saw, streamed to the test for content assertions.
 #[derive(Debug)]
@@ -83,8 +97,6 @@ struct CartHandler {
     /// The registration handle for the `cart` value collection — the handler
     /// can bind only collections it was handed a token for.
     cart: Registered<ValueDescriptor>,
-    /// The registration handle for the `last_seen` Kafka-message collection.
-    last_seen: Registered<MessageDescriptor>,
 }
 
 impl CartHandler {
@@ -115,7 +127,10 @@ impl CartHandler {
         let updated = Value::Array(items);
         cart.set(updated.clone()).await?;
 
-        ctx.state(self.last_seen)?.set(&message).await?;
+        ctx.clone()
+            .boxed()
+            .record_message(LAST_SEEN, &message)
+            .await?;
 
         // The final message completes the cart; schedule the timer that
         // reads the accumulated state back. Per-key serialization
@@ -143,8 +158,9 @@ impl CartHandler {
         // Re-fetches the original message body from Kafka through the
         // consumer's loader, decoded by the consumer's own codec.
         let last_seen = ctx
-            .state(self.last_seen)?
-            .get()
+            .clone()
+            .boxed()
+            .get_message(LAST_SEEN)
             .await?
             .map(|message| (message.offset(), message.payload().clone()));
 
@@ -208,11 +224,11 @@ enum CartHandlerError {
 
     /// A value-cell access or codec failure.
     #[error(transparent)]
-    Value(#[from] ValueStateError<JsonCodecError>),
+    Value(#[from] CellStateError<JsonCodecError>),
 
-    /// A Kafka-message-cell access or ref-codec failure.
+    /// A Kafka-message-cell access failure through the erased seam.
     #[error(transparent)]
-    Kafka(#[from] MessageStateError),
+    Kafka(#[from] BoxEventContextError),
 
     /// The cart cell held something other than an array.
     #[error("unexpected cart cell: {0}")]
@@ -288,15 +304,16 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
 
     let (observations_tx, mut observations_rx) = channel(10);
 
-    // Register the collections; the returned tokens are the only way the
-    // handler can bind them.
+    // Register the collections. `cart`'s token is the only way the handler
+    // can bind it; `last_seen` is reached through the erased seam by name
+    // (see the module doc), so its token is only needed to register the
+    // collection's identity, not held by the handler.
     let mut keyed_state = KeyedStateConfiguration::default();
     let cart = keyed_state.register(cart());
-    let last_seen = keyed_state.register(last_seen());
+    let _last_seen = keyed_state.register(last_seen());
     let handler = CartHandler {
         observations_tx,
         cart,
-        last_seen,
     };
 
     let telemetry = Telemetry::new();

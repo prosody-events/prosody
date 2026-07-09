@@ -817,7 +817,9 @@ where
         name: &str,
         message: &ConsumerMessage<Self::Payload>,
     ) -> Result<(), BoxEventContextError> {
-        self.state(Registered::new(message_state(name)))
+        self.state(Registered::new(message_state::<
+            <C::State as CellSession>::Loader,
+        >(name)))
             .map_err(|e| Box::new(e) as BoxEventContextError)?
             .set(message)
             .await
@@ -828,7 +830,9 @@ where
         &self,
         name: &str,
     ) -> Result<Option<ConsumerMessage<Self::Payload>>, BoxEventContextError> {
-        self.state(Registered::new(message_state(name)))
+        self.state(Registered::new(message_state::<
+            <C::State as CellSession>::Loader,
+        >(name)))
             .map_err(|e| Box::new(e) as BoxEventContextError)?
             .get()
             .await

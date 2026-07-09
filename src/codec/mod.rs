@@ -3,6 +3,7 @@
 use std::error::Error;
 
 mod binary;
+mod fixed;
 mod json;
 mod serialize_buf;
 
@@ -10,6 +11,7 @@ pub use binary::{
     BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryMetadata, BinaryPayload, JsonBinaryCodec,
     JsonExtractError, JsonExtractor,
 };
+pub use fixed::{FixedCodec, I64Codec, I64CodecError, PairCodecError};
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
 
 // Crate-internal: not part of the public codec API surface.
@@ -55,19 +57,22 @@ pub trait Codec: Default + Send + Sync + 'static {
     /// Returns an error if `payload` cannot be encoded.
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error>;
 
-    /// Runs `f` with a thread-local cached instance of this codec.
+    /// Runs `f` with an instance of this codec.
     ///
-    /// The first call on each thread constructs the codec via `Default`;
-    /// subsequent calls reuse the same instance, allowing internal buffers
-    /// (such as `simd_json::Buffers`) to be reused across calls.
+    /// The default constructs a fresh codec via `Default` per call — all a
+    /// user codec needs is `CODEC_ID`, `Payload`, `Error`, and the two
+    /// serialize/deserialize methods. Override it to reuse internal buffers
+    /// (such as `simd_json::Buffers`) across calls by backing it with a
+    /// `thread_local!` of the concrete codec type so dispatch stays static;
+    /// [`JsonCodec`] does exactly that.
     ///
-    /// Implementors should back this with a `thread_local!` of the concrete
-    /// codec type so dispatch stays static.
-    ///
-    /// Reentrant calls on the same thread are not supported; implementations
-    /// backed by `RefCell::with_borrow_mut` will panic if `f` recurses into
+    /// Reentrant calls on the same thread are not supported for a
+    /// `thread_local!`-backed override: an implementation using
+    /// `RefCell::with_borrow_mut` panics if `f` recurses into
     /// `with_cached_local` for the same codec.
-    fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R;
+    fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        f(&mut Self::default())
+    }
 }
 
 /// Maps a consumer payload type to the [`Codec`] for its keyed-state cells,

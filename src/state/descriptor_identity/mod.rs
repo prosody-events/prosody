@@ -62,7 +62,7 @@ pub struct DurableDescriptorIdentity {
     pub kind: i8,
 
     /// Resolver token
-    /// ([`ResolverId::RESOLVER_ID`](crate::state::descriptor::ResolverId::RESOLVER_ID));
+    /// ([`CellResolver::RESOLVER_ID`](crate::state::descriptor::CellResolver::RESOLVER_ID));
     /// `None` for the passthrough resolver.
     pub resolver_id: Option<String>,
 

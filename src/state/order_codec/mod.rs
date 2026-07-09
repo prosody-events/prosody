@@ -7,6 +7,7 @@
 //! *tested* contract (the per-codec monotonicity property), not a compiler
 //! proof: a non-monotone codec silently misorders scans.
 
+use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Coordinate;
 use std::str::{Utf8Error, from_utf8};
@@ -14,17 +15,34 @@ use thiserror::Error;
 
 /// Maps a logical key to an order-preserving [`Coordinate`] and back.
 ///
-/// The invariant every impl must satisfy (enforced by the per-codec
-/// monotonicity property test, not the type system):
-/// `a.cmp(b) == encode(a).as_bytes().cmp(encode(b).as_bytes())` and
-/// `decode(encode(k).as_bytes()) == Ok(k)`.
-pub trait OrderedKeyCodec {
+/// Every key codec is also a [`Codec`] over the same type — the supertrait
+/// equalities pin `Payload = Key` — under the **byte-identity law**:
+/// `serialize` writes exactly `encode`'s bytes and `deserialize` is `decode`.
+/// A key can therefore ride as a cell *payload* (a map bound cell stores the
+/// extreme entry's key) with no adapter, and [`Codec::CODEC_ID`] is the one
+/// durable token a key encoding freezes into a collection's identity.
+///
+/// The invariants every impl must satisfy (enforced by the per-codec
+/// monotonicity and byte-identity property tests, not the type system):
+/// - **Order preservation:** `a.cmp(b) ==
+///   encode(a).as_bytes().cmp(encode(b).as_bytes())`.
+/// - **Key round-trip:** `decode(encode(k).as_bytes()) == Ok(k)`.
+/// - **Byte round-trip:** for any `b` a codec itself produced,
+///   `encode(&decode(b)?).as_bytes() == b`. This is what makes a typed scan
+///   durable-compatible: decoding a stored coordinate and re-encoding it (as a
+///   map bound cell does) reproduces the exact stored bytes.
+/// - **Byte identity:** `serialize(k)` appends exactly `encode(k).as_bytes()`.
+///   Held by construction when `serialize`/`deserialize` delegate to
+///   `encode`/`decode`, as every impl here does.
+pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     /// The logical key type, ordered to match its encoded byte order.
-    type Key: Ord;
-
-    /// Stable token frozen into a collection's durable identity, so a changed
-    /// key encoding surfaces as an identity conflict.
-    const KEY_CODEC_ID: &'static str;
+    ///
+    /// `Send + Sync + 'static`, not merely `Ord`: a typed scan yields the
+    /// decoded key in a `Send` stream (so it must be `Send`), and a map bound
+    /// cell stores the key as a [`Codec`] payload (so it must be
+    /// `Sync + 'static`). Every real key (`String`, `i64`, `u64`, `()`)
+    /// already satisfies it.
+    type Key: Ord + Send + Sync + 'static;
 
     /// Encodes a key to its order-preserving bytes.
     fn encode(key: &Self::Key) -> Coordinate;
@@ -36,6 +54,61 @@ pub trait OrderedKeyCodec {
     /// Returns [`KeyCodecError`] when the bytes are not a valid encoding (wrong
     /// length, invalid UTF-8).
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError>;
+}
+
+/// The unit address: the single cell of a one-cell collection, at the empty
+/// coordinate.
+///
+/// Its logical key is `()`, so a single-cell kind (Value, and any meta cell a
+/// keyed kind pins to a fixed address) is addressed the same way a keyed kind
+/// is — through the typed cell view — without a key of its own. The empty
+/// coordinate is byte-identical to a Value cell's historical fixed address, so
+/// adopting it changes no durable bytes. Its [`CODEC_ID`](Codec::CODEC_ID)
+/// rides a collection's identity only where a kind's own key-codec token names
+/// it — Value reports no key codec because its one cell is unit-addressed,
+/// Deque because the kind itself pins its index encoding.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnitKey;
+
+impl OrderedKeyCodec for UnitKey {
+    type Key = ();
+
+    fn encode((): &Self::Key) -> Coordinate {
+        Coordinate::empty()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
+        if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(KeyCodecError::BadLength {
+                expected: 0,
+                actual: bytes.len(),
+            })
+        }
+    }
+}
+
+/// The payload half of `UnitKey` — delegates to `encode`/`decode`, so the
+/// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+impl Codec for UnitKey {
+    type Error = KeyCodecError;
+    type Payload = ();
+
+    const CODEC_ID: &'static str = "unit.v1";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(buf)
+    }
+
+    fn serialize(
+        &mut self,
+        payload: Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        Ok(())
+    }
 }
 
 /// Order-preserving big-endian encoding of a signed `i64`.
@@ -56,13 +129,11 @@ pub fn order_preserving_i64_decode(bytes: [u8; 8]) -> i64 {
 
 /// `String` keys encoded as their raw UTF-8 bytes (UTF-8 byte order == `str`
 /// `Ord`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Utf8KeyCodec;
 
 impl OrderedKeyCodec for Utf8KeyCodec {
     type Key = String;
-
-    const KEY_CODEC_ID: &'static str = "utf8.v1";
 
     fn encode(key: &Self::Key) -> Coordinate {
         Coordinate::from_bytes(key.clone().into_bytes())
@@ -73,14 +144,34 @@ impl OrderedKeyCodec for Utf8KeyCodec {
     }
 }
 
+/// The payload half of `Utf8KeyCodec` — delegates to `encode`/`decode`, so the
+/// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+impl Codec for Utf8KeyCodec {
+    type Error = KeyCodecError;
+    type Payload = String;
+
+    const CODEC_ID: &'static str = "utf8.v1";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(buf)
+    }
+
+    fn serialize(
+        &mut self,
+        payload: Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        Ok(())
+    }
+}
+
 /// `i64` keys encoded via the sign-flipped big-endian [`order_preserving_i64`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct I64KeyCodec;
 
 impl OrderedKeyCodec for I64KeyCodec {
     type Key = i64;
-
-    const KEY_CODEC_ID: &'static str = "i64.v1";
 
     fn encode(key: &Self::Key) -> Coordinate {
         Coordinate::from_bytes(order_preserving_i64(*key).to_vec())
@@ -91,14 +182,34 @@ impl OrderedKeyCodec for I64KeyCodec {
     }
 }
 
+/// The payload half of `I64KeyCodec` — delegates to `encode`/`decode`, so the
+/// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+impl Codec for I64KeyCodec {
+    type Error = KeyCodecError;
+    type Payload = i64;
+
+    const CODEC_ID: &'static str = "i64.v1";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(buf)
+    }
+
+    fn serialize(
+        &mut self,
+        payload: Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        Ok(())
+    }
+}
+
 /// `u64` keys encoded as big-endian bytes (unsigned order == memcmp order).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct U64KeyCodec;
 
 impl OrderedKeyCodec for U64KeyCodec {
     type Key = u64;
-
-    const KEY_CODEC_ID: &'static str = "u64.v1";
 
     fn encode(key: &Self::Key) -> Coordinate {
         Coordinate::from_bytes(key.to_be_bytes().to_vec())
@@ -106,6 +217,28 @@ impl OrderedKeyCodec for U64KeyCodec {
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
         Ok(u64::from_be_bytes(fixed_width_8(bytes)?))
+    }
+}
+
+/// The payload half of `U64KeyCodec` — delegates to `encode`/`decode`, so the
+/// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+impl Codec for U64KeyCodec {
+    type Error = KeyCodecError;
+    type Payload = u64;
+
+    const CODEC_ID: &'static str = "u64.v1";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(buf)
+    }
+
+    fn serialize(
+        &mut self,
+        payload: Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        Ok(())
     }
 }
 
@@ -128,6 +261,13 @@ pub enum KeyCodecError {
         expected: usize,
         /// The width the slice actually had.
         actual: usize,
+    },
+
+    /// A correctly-sized key held a value outside the codec's domain.
+    #[error("bad key discriminant: {actual}")]
+    BadDiscriminant {
+        /// The unrecognized discriminant byte.
+        actual: u8,
     },
 
     /// A UTF-8 key was not valid UTF-8.

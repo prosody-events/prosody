@@ -1,16 +1,17 @@
-//! `CellView` pins its partition coordinates: the wrapped session and the
-//! `(state_type, name)` are private fields, and `session()` is crate-private
-//! (`pub(in crate::state)`). So a downstream holder of a `CellView` cannot read
-//! out its session to re-point a handle at another partition — the
-//! CollectionScopeContainment invariant. The expected `.stderr` is pinned
+//! `CellScope` pins collection-partition containment: it is `pub` only
+//! because it names a parameter of the public `CollectionSpec::handle`, but
+//! its constructor is `pub(in crate::state::descriptor)` and its fields are
+//! private, so downstream code can hold one only where the framework hands
+//! it in and can never mint one. The expected `.stderr` is pinned
 //! (regenerate with `TRYBUILD=overwrite`).
 
-use prosody::state::descriptor::CellView;
-use prosody::state::session::CellSession;
+use prosody::state::descriptor::CellScope;
+use prosody::state::{StateName, StateType};
 
-fn repoint<S: CellSession>(view: &CellView<S>) -> &S {
-    // `CellView::session` is `pub(in crate::state)` — unreachable downstream.
-    view.session()
+fn mint(state_type: StateType, name: StateName) -> CellScope<()> {
+    // `CellScope::new` is `pub(in crate::state::descriptor)` — unreachable
+    // downstream.
+    CellScope::new((), state_type, name)
 }
 
 fn main() {}

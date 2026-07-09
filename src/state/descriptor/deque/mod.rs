@@ -1,9 +1,9 @@
 //! Index-addressed double-ended queue collection.
 //!
 //! A Deque is a dense window of cells over a monotonic `i64` index space. The
-//! [`DequeHandle`] composes the uniform [`CellView`] cell interface — there is
-//! no Deque-specific store, session, or backend. Build a descriptor with
-//! [`deque_state`], register it with the consumer, and bind the
+//! [`DequeHandle`] composes the uniform `CellView` typed cell interface —
+//! there is no Deque-specific store, session, or backend. Build a descriptor
+//! with [`deque_state`], register it with the consumer, and bind the
 //! [`Registered`](super::Registered) handle through
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state).
 //!
@@ -11,11 +11,13 @@
 //!
 //! Two sections separate bookkeeping from data (`DequeNs`):
 //!
-//! * `Meta` holds one `META_BOUNDS` cell: `head ‖ tail` as two big-endian
-//!   `i64`s. `head == tail` (and the absent cell, read as `(0, 0)`) is empty.
+//! * `Meta` holds one unit-addressed cell: `head ‖ tail` as two big-endian
+//!   `i64`s, encoded by the [`(I64Codec, I64Codec)`](crate::codec::FixedCodec)
+//!   pair codec with no framing. `head == tail` (and the absent cell, read as
+//!   the empty window `[0, 0)`) is empty.
 //! * `Entries` holds one cell per live element, addressed by the sign-flipped
-//!   big-endian index ([`order_preserving_i64`]) so the clustering byte order
-//!   is the signed index order.
+//!   big-endian index ([`I64KeyCodec`]) so the clustering byte order is the
+//!   signed index order, and typed by the element cell type `T`.
 //!
 //! # Invariant: dense, monotonic window
 //!
@@ -33,15 +35,17 @@
 //! bounds cell can never outlive — or be outlived by — the entries it anchors.
 
 use super::{
-    CellView, CollectionSpec, Descriptor, StructuralIdentity, decode_cell, encode_cell, ensure_live,
+    CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
+    Descriptor, FromSession, Keyed, ResolvedOf, WriteOf,
 };
-use crate::codec::{Codec, JsonCodec};
+use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::StateAccessError;
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use crate::state::order_codec::order_preserving_i64;
+#[cfg(test)]
+use crate::state::cell_key::{CellKey, Coordinate};
+use crate::state::cell_key::{Direction, Section};
+use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::session::CellSession;
-use crate::state::{CollectionKindId, StateName, StateType, StoreOutcome};
+use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
@@ -50,8 +54,12 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use thiserror::Error;
 
-/// Width of the [`META_BOUNDS`] payload: `head: i64 ‖ tail: i64`, big-endian.
-const META_LEN: usize = 16;
+/// The deque's head/tail meta codec: two big-endian `i64`s composed with no
+/// framing, byte-identical to the frozen 16-byte `head ‖ tail` frame.
+type MetaCodec = (I64Codec, I64Codec);
+
+/// The [`MetaCodec`] decode error — a corrupt (wrong-width) bounds frame.
+type MetaCodecError = PairCodecError<I64CodecError, I64CodecError>;
 
 /// The `Meta` section, holding the single bounds cell.
 const META_SECTION: Section = Section::new(DequeNs::Meta as i8);
@@ -59,15 +67,9 @@ const META_SECTION: Section = Section::new(DequeNs::Meta as i8);
 /// The `Entries` section, holding one cell per live element.
 const ENTRY_SECTION: Section = Section::new(DequeNs::Entries as i8);
 
-/// The single bounds cell (`Meta` section, empty coordinate).
-const META_BOUNDS: CellKey = CellKey {
-    section: META_SECTION,
-    coordinate: Coordinate::empty(),
-};
-
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so
-/// the [`TryFrom`] guard rejects any other value as [`MetaDecodeError`]
+/// the [`TryFrom`] guard rejects any other value as [`UnknownDequeSection`]
 /// (`Permanent`).
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,77 +88,61 @@ impl From<DequeNs> for i8 {
 }
 
 impl TryFrom<i8> for DequeNs {
-    type Error = MetaDecodeError;
+    type Error = UnknownDequeSection;
 
     fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Meta),
             1 => Ok(Self::Entries),
-            _ => Err(MetaDecodeError::UnexpectedSection(value)),
+            _ => Err(UnknownDequeSection(value)),
         }
     }
 }
 
-/// Descriptor for a codec-backed deque collection (JSON by default — annotate
-/// the binding `DequeDescriptor<MyCodec>` to pick another codec). The element
-/// codec types the cell; there is no resolver or key codec (the index encoding
-/// is fixed by the kind). Declare via [`deque_state`].
-pub type DequeDescriptor<C = JsonCodec> = Descriptor<DequeKind<C>>;
+/// Descriptor for a codec-backed deque collection. Generic over an element
+/// [`CellType`] `T` — a plain [`Codec`](crate::codec::Codec) (JSON by default)
+/// or a codec paired with a resolver via [`WithResolver`](super::WithResolver).
+/// There is no key codec: the index encoding is fixed by the kind. Declare via
+/// [`deque_state`].
+pub type DequeDescriptor<T = JsonCodec> = Descriptor<DequeKind<T>>;
 
 /// The Deque [`CollectionSpec`]: a dense index window plus the head/tail bounds
-/// cell; the index encoding is fixed by the kind, so there is no key codec.
-pub struct DequeKind<C>(PhantomData<fn() -> C>);
+/// cell. `KEY_CODEC_ID` is `None` — the kind pins the index encoding
+/// ([`I64KeyCodec`]), so it is never a registration choice.
+pub struct DequeKind<T>(PhantomData<fn() -> T>);
 
-impl<C> CollectionSpec for DequeKind<C>
-where
-    C: Codec,
-{
-    type Handle<S: CellSession> = DequeHandle<S, C>;
+impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {
+    type Cell = Keyed<I64KeyCodec, T>;
+    type Handle<S: CellSession> = DequeHandle<S, T>;
 
-    fn structural_identity() -> StructuralIdentity {
-        StructuralIdentity {
-            kind: CollectionKindId::Deque,
-            codec_id: C::CODEC_ID,
-            resolver_id: None,
-            // The index codec is fixed by the kind, not a registration choice.
-            key_codec_id: None,
+    const KIND: CollectionKindId = CollectionKindId::Deque;
+
+    fn handle<S: CellSession>(scope: CellScope<S>) -> DequeHandle<S, T> {
+        DequeHandle {
+            entries: scope.typed(ENTRY_SECTION),
+            meta: scope.typed(META_SECTION),
         }
-    }
-
-    fn handle<S: CellSession>(
-        session: S,
-        state_type: StateType,
-        name: StateName,
-    ) -> DequeHandle<S, C> {
-        DequeHandle::new(session, state_type, name)
     }
 }
 
-/// Typed, owned handle over a codec-backed deque — a thin composition over a
-/// [`CellView`]. Every operation guards on session termination.
+/// Typed, owned handle over a codec-backed deque — a thin composition over two
+/// typed `CellView`s: `entries` (the per-index data cells, addressed by the
+/// `i64` index and typed by the element cell type `T`) and `meta` (the single
+/// head/tail bounds cell, lifted to a validated `Window` over the
+/// `MetaCodec` pair). Every operation guards on session termination through
+/// the views. Cheap `Clone`.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
-pub struct DequeHandle<S, C> {
-    view: CellView<S>,
-    _marker: PhantomData<fn() -> C>,
+pub struct DequeHandle<S, T> {
+    entries: CellView<S, Keyed<I64KeyCodec, T>>,
+    meta: CellView<S, MetaCodec>,
 }
 
-impl<S, C> DequeHandle<S, C> {
-    /// Wraps a verified session and the binding descriptor's `(state_type,
-    /// name)`. Codec-agnostic so [`StateDescriptor::bind`] mints it without a
-    /// [`Codec`] bound.
-    fn new(session: S, state_type: StateType, name: StateName) -> Self {
-        Self {
-            view: CellView::new(session, state_type, name),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<S, C> DequeHandle<S, C>
+impl<S, T> DequeHandle<S, T>
 where
     S: CellSession,
-    C: Codec,
+    T: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
     /// The number of live elements (`tail − head`, O(1) from the bounds cell).
     ///
@@ -165,10 +151,8 @@ where
     /// Returns a `Permanent` [`DequeStateError`] when the bounds cell is
     /// corrupt or the count exceeds `usize`, or an access error from the
     /// session.
-    pub async fn len(&self) -> Result<usize, DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        Ok(window_len(head, tail)?)
+    pub async fn len(&self) -> Result<usize, DequeStateError<CellCodecError<T>>> {
+        Ok(self.bounds().await?.len()?)
     }
 
     /// Whether the deque holds no live elements (`head == tail`).
@@ -177,91 +161,80 @@ where
     ///
     /// Returns a `Permanent` [`DequeStateError`] when the bounds cell is
     /// corrupt, or an access error from the session.
-    pub async fn is_empty(&self) -> Result<bool, DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        Ok(head == tail)
+    pub async fn is_empty(&self) -> Result<bool, DequeStateError<CellCodecError<T>>> {
+        let window = self.bounds().await?;
+        Ok(window.head == window.tail)
     }
 
-    /// Reads the element at front-relative position `index` (`VecDeque::get`
-    /// semantics): position `0` is the front, a single cell read at `head +
-    /// index`, `None` when `index >= len`.
+    /// Reads and resolves the element at front-relative position `index`
+    /// (`VecDeque::get` semantics): position `0` is the front, a single cell
+    /// read at `head + index`, `None` when `index >= len`.
     ///
     /// # Errors
     ///
     /// Returns a codec error (`Permanent`) when the cell does not decode, a
     /// `Permanent` meta error when the bounds cell is corrupt, or an access
     /// error from the session.
-    pub async fn get(&self, index: usize) -> Result<Option<C::Payload>, DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        if index >= window_len(head, tail)? {
+    pub async fn get(
+        &self,
+        index: usize,
+    ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let window = self.bounds().await?;
+        if index >= window.len()? {
             return Ok(None);
         }
         let offset = i64::try_from(index).map_err(|_| MetaDecodeError::IndexOverflow)?;
-        let absolute = head
+        let absolute = window
+            .head
             .checked_add(offset)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        self.read_entry(absolute).await
+        Ok(self.entries.get(&absolute).await?)
     }
 
     /// Streams the live elements in index order — front to back for
-    /// [`Direction::Forward`], back to front for [`Direction::Backward`]. See
-    /// the module's dense-window invariant: the scan anchors at the window's
-    /// leading edge and stops after `len` cells, so a popped tombstone is
-    /// never yielded.
+    /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
+    /// element is resolved as it is yielded. See the module's dense-window
+    /// invariant: the scan anchors at the window's leading edge and stops after
+    /// `len` cells, so a popped tombstone is never yielded.
     pub fn stream(
         &self,
         dir: Direction,
-    ) -> impl Stream<Item = Result<C::Payload, DequeStateError<C::Error>>> + '_ {
+    ) -> impl Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + '_ {
         try_stream! {
-            ensure_live(self.view.session())?;
-            let (head, tail) = self.bounds().await?;
-            let len = window_len(head, tail)?;
+            let window = self.bounds().await?;
+            let len = window.len()?;
             if len == 0 {
                 return;
             }
             // The leading-edge index: `head` forward, the last live index
             // `tail − 1` backward (`len > 0` proves it does not underflow).
             let anchor = match dir {
-                Direction::Forward => head,
-                Direction::Backward => tail.checked_sub(1).ok_or(MetaDecodeError::IndexOverflow)?,
+                Direction::Forward => window.head,
+                Direction::Backward => window
+                    .tail
+                    .checked_sub(1)
+                    .ok_or(MetaDecodeError::IndexOverflow)?,
             };
-            let start = index_coordinate(anchor);
-            let scan = Scan {
-                section: ENTRY_SECTION,
-                start: Bound::Included(&start),
-                dir,
-                end: Bound::Unbounded,
-                limit: Some(len),
-            };
-            let inner = self.view.scan(scan);
+            let inner = self
+                .entries
+                .scan(Bound::Included(&anchor), dir, Bound::Unbounded, Some(len));
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
-                let (_, bytes) = item.map_err(DequeStateError::Access)?;
-                yield decode_cell::<C>(bytes).map_err(DequeStateError::Codec)?;
+                // The scan yields the decoded index; the dense window makes it
+                // redundant, so only the resolved element is exposed.
+                let (_, value) = item?;
+                yield value;
             }
         }
     }
 
-    /// Reads and decodes the entry cell at absolute index `index` (`None` when
-    /// the cell is absent).
-    async fn read_entry(
-        &self,
-        index: i64,
-    ) -> Result<Option<C::Payload>, DequeStateError<C::Error>> {
-        self.view
-            .get(&entry_cell(index))
-            .await?
-            .map(|bytes| decode_cell::<C>(bytes).map_err(DequeStateError::Codec))
-            .transpose()
-    }
-
-    /// Reads the bounds cell (`(0, 0)` when absent — a fresh/empty deque).
-    async fn bounds(&self) -> Result<(i64, i64), DequeStateError<C::Error>> {
-        match self.view.get(&META_BOUNDS).await? {
-            Some(bytes) => Ok(decode_bounds(&bytes)?),
-            None => Ok((0, 0)),
+    /// Reads the bounds cell, lifting it to a validated [`Window`] (`[0, 0)`
+    /// when absent — a fresh/empty deque). [`Window::new`] validates
+    /// `head ≤ tail`.
+    async fn bounds(&self) -> Result<Window, DequeStateError<CellCodecError<T>>> {
+        match self.meta.get(&()).await.map_err(meta_err)? {
+            Some((head, tail)) => Ok(Window::new(head, tail)?),
+            None => Ok(Window { head: 0, tail: 0 }),
         }
     }
 
@@ -271,12 +244,17 @@ where
     ///
     /// Returns a codec error (`Permanent`) when `value` does not encode, a
     /// `Permanent` meta error on index-space exhaustion, or an access error.
-    pub async fn push_back(&self, value: C::Payload) -> Result<(), DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        let next_tail = tail.checked_add(1).ok_or(MetaDecodeError::IndexOverflow)?;
-        self.write_entry(tail, value).await?;
-        self.write_bounds(head, next_tail).await?;
+    pub async fn push_back(
+        &self,
+        value: WriteOf<'_, T>,
+    ) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        let window = self.bounds().await?;
+        let next_tail = window
+            .tail
+            .checked_add(1)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        self.entries.set(&window.tail, value).await?;
+        self.write_bounds(window.head, next_tail).await?;
         Ok(())
     }
 
@@ -285,51 +263,67 @@ where
     /// # Errors
     ///
     /// See [`Self::push_back`].
-    pub async fn push_front(&self, value: C::Payload) -> Result<(), DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        let prev_head = head.checked_sub(1).ok_or(MetaDecodeError::IndexOverflow)?;
-        self.write_entry(prev_head, value).await?;
-        self.write_bounds(prev_head, tail).await?;
+    pub async fn push_front(
+        &self,
+        value: WriteOf<'_, T>,
+    ) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        let window = self.bounds().await?;
+        let prev_head = window
+            .head
+            .checked_sub(1)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        self.entries.set(&prev_head, value).await?;
+        self.write_bounds(prev_head, window.tail).await?;
         Ok(())
     }
 
     /// Removes and returns the front element, advancing `head` past it (`None`
-    /// when empty). The residue clear and the head move co-stamp.
+    /// when empty). The element resolves *before* the clear and head move, so a
+    /// resolve failure leaves the deque unmutated; the residue clear and the
+    /// head move then co-stamp.
     ///
     /// # Errors
     ///
     /// Returns a codec error (`Permanent`) when the entry does not decode, a
     /// `Permanent` meta error on corruption, or an access error.
-    pub async fn pop_front(&self) -> Result<Option<C::Payload>, DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        if head >= tail {
+    pub async fn pop_front(
+        &self,
+    ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let window = self.bounds().await?;
+        if window.head >= window.tail {
             return Ok(None);
         }
-        let value = self.read_entry(head).await?;
-        self.view.clear(&entry_cell(head)).await?;
-        let next_head = head.checked_add(1).ok_or(MetaDecodeError::IndexOverflow)?;
-        self.write_bounds(next_head, tail).await?;
+        let value = self.entries.get(&window.head).await?;
+        self.entries.clear(&window.head).await?;
+        let next_head = window
+            .head
+            .checked_add(1)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        self.write_bounds(next_head, window.tail).await?;
         Ok(value)
     }
 
     /// Removes and returns the back element, retracting `tail` past it (`None`
-    /// when empty). Symmetric with [`Self::pop_front`].
+    /// when empty). Symmetric with [`Self::pop_front`]: the element resolves
+    /// before the mutation.
     ///
     /// # Errors
     ///
     /// See [`Self::pop_front`].
-    pub async fn pop_back(&self) -> Result<Option<C::Payload>, DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        let (head, tail) = self.bounds().await?;
-        if head >= tail {
+    pub async fn pop_back(
+        &self,
+    ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let window = self.bounds().await?;
+        if window.head >= window.tail {
             return Ok(None);
         }
-        let last = tail.checked_sub(1).ok_or(MetaDecodeError::IndexOverflow)?;
-        let value = self.read_entry(last).await?;
-        self.view.clear(&entry_cell(last)).await?;
-        self.write_bounds(head, last).await?;
+        let last = window
+            .tail
+            .checked_sub(1)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        let value = self.entries.get(&last).await?;
+        self.entries.clear(&last).await?;
+        self.write_bounds(window.head, last).await?;
         Ok(value)
     }
 
@@ -340,110 +334,97 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub async fn flush(&self) -> Result<StoreOutcome, DequeStateError<C::Error>> {
-        ensure_live(self.view.session())?;
-        Ok(self.view.flush().await?)
-    }
-
-    /// Encodes and buffers an entry cell at absolute index `index`.
-    async fn write_entry(
-        &self,
-        index: i64,
-        value: C::Payload,
-    ) -> Result<(), DequeStateError<C::Error>> {
-        let buf = encode_cell::<C>(value).map_err(DequeStateError::Codec)?;
-        self.view.set(&entry_cell(index), &buf).await?;
-        Ok(())
+    pub async fn flush(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
+        Ok(self.entries.flush().await?)
     }
 
     /// Buffers the bounds cell. Co-stamped with the entry mutation a single op
     /// also buffers, so the window heals as a unit.
-    async fn write_bounds(&self, head: i64, tail: i64) -> Result<(), StateAccessError> {
-        self.view
-            .set(&META_BOUNDS, &encode_bounds(head, tail))
-            .await
+    async fn write_bounds(
+        &self,
+        head: i64,
+        tail: i64,
+    ) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        self.meta.set(&(), (head, tail)).await.map_err(meta_err)
     }
 }
 
-/// Declares a codec-backed deque collection named `name` (JSON by default —
-/// annotate the binding `DequeDescriptor<MyCodec>` to pick another codec).
-/// See [`Descriptor::new`](super::Descriptor::new) for the `name` contract.
+/// Declares a codec-backed deque collection named `name` over element cell type
+/// `T` (JSON values by default). See
+/// [`Descriptor::new`](super::Descriptor::new) for the `name` contract.
 #[must_use]
-pub fn deque_state<C>(name: &str) -> DequeDescriptor<C>
+pub fn deque_state<T>(name: &str) -> DequeDescriptor<T>
 where
-    C: Codec,
+    T: CellType<Key = UnitKey>,
 {
     DequeDescriptor::new(name)
 }
 
-/// The entry cell at absolute index `index`.
-fn entry_cell(index: i64) -> CellKey {
-    CellKey {
-        section: ENTRY_SECTION,
-        coordinate: index_coordinate(index),
+/// Re-homes a bounds-cell access or codec error under the deque's entry-codec
+/// error parameter. The `meta` view is the [`MetaCodec`] pair, so its codec
+/// half is a corrupt (wrong-width) bounds frame routed to
+/// [`DequeStateError::MetaFrame`]; its access half joins the entries' [`Cell`]
+/// arm. The key half cannot arise (the meta cell is unit-addressed) but is
+/// forwarded for exhaustiveness.
+///
+/// [`Cell`]: DequeStateError::Cell
+fn meta_err<E>(err: CellStateError<MetaCodecError>) -> DequeStateError<E>
+where
+    E: Error + Send + Sync + 'static,
+{
+    match err {
+        CellStateError::Access(e) => CellStateError::Access(e).into(),
+        CellStateError::Codec(frame) => DequeStateError::MetaFrame(frame),
+        CellStateError::Key(e) => CellStateError::Key(e).into(),
     }
 }
 
-/// The order-preserving coordinate for absolute index `index`.
-fn index_coordinate(index: i64) -> Coordinate {
-    Coordinate::from_bytes(order_preserving_i64(index).to_vec())
+/// The deque's validated live window `[head, tail)`: a half-open index range
+/// with `head ≤ tail`.
+///
+/// The [`MetaCodec`] validates the wire *form* (exactly 16 bytes); this type
+/// validates the *meaning* (`head ≤ tail`), so a disordered window is
+/// unrepresentable past the meta boundary. It is deliberately not named
+/// `Bounds`: [`std::ops::Bound`] is in scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Window {
+    head: i64,
+    tail: i64,
 }
 
-/// The live-window length `tail − head` as a `usize`. Fails with
-/// [`MetaDecodeError::Disordered`] when `tail < head` and
-/// [`MetaDecodeError::IndexOverflow`] when the count exceeds `usize`.
-fn window_len(head: i64, tail: i64) -> Result<usize, MetaDecodeError> {
-    let span = tail
-        .checked_sub(head)
-        .filter(|&span| span >= 0)
-        .ok_or(MetaDecodeError::Disordered { head, tail })?;
-    usize::try_from(span).map_err(|_| MetaDecodeError::IndexOverflow)
-}
-
-/// Encodes the bounds cell payload `head ‖ tail` (16 bytes, big-endian).
-fn encode_bounds(head: i64, tail: i64) -> [u8; META_LEN] {
-    let mut out = [0u8; META_LEN];
-    out[..8].copy_from_slice(&head.to_be_bytes());
-    out[8..].copy_from_slice(&tail.to_be_bytes());
-    out
-}
-
-/// Decodes the bounds cell payload, validating `head ≤ tail`. Fails with
-/// [`MetaDecodeError::BadLength`] for a wrong-width payload and
-/// [`MetaDecodeError::Disordered`] when `tail < head`.
-fn decode_bounds(bytes: &[u8]) -> Result<(i64, i64), MetaDecodeError> {
-    if bytes.len() != META_LEN {
-        return Err(MetaDecodeError::BadLength {
-            expected: META_LEN,
-            actual: bytes.len(),
-        });
+impl Window {
+    /// Lifts a decoded `(head, tail)` pair into a validated window, failing
+    /// [`MetaDecodeError::Disordered`] when `tail < head`.
+    fn new(head: i64, tail: i64) -> Result<Self, MetaDecodeError> {
+        if tail < head {
+            return Err(MetaDecodeError::Disordered { head, tail });
+        }
+        Ok(Self { head, tail })
     }
-    let mut head = [0u8; 8];
-    let mut tail = [0u8; 8];
-    head.copy_from_slice(&bytes[..8]);
-    tail.copy_from_slice(&bytes[8..]);
-    let head = i64::from_be_bytes(head);
-    let tail = i64::from_be_bytes(tail);
-    if tail < head {
-        return Err(MetaDecodeError::Disordered { head, tail });
+
+    /// The live-window length `tail − head` as a `usize`. `head ≤ tail` holds
+    /// by construction, so the span is non-negative; a span past
+    /// `i64`/`usize` is [`MetaDecodeError::IndexOverflow`].
+    fn len(self) -> Result<usize, MetaDecodeError> {
+        let span = self
+            .tail
+            .checked_sub(self.head)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        usize::try_from(span).map_err(|_| MetaDecodeError::IndexOverflow)
     }
-    Ok((head, tail))
 }
 
-/// Error decoding or deriving the deque's `Meta` bookkeeping. Always
-/// `Permanent`: a corrupt bounds cell, a disordered or overflowing window, or a
-/// scanned cell in an unexpected section will not start being valid on retry.
+/// Error converting an `i8` that matches no [`DequeNs`] variant.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown deque section discriminant: {0}")]
+struct UnknownDequeSection(i8);
+
+/// Error deriving the deque's `Meta` bookkeeping. Always `Permanent`: a
+/// disordered or overflowing window will not start being valid on retry. A
+/// corrupt bounds *frame* (wrong width) is the `MetaCodec`'s own error,
+/// surfaced as [`DequeStateError::MetaFrame`].
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MetaDecodeError {
-    /// The bounds cell was not the fixed `head ‖ tail` width.
-    #[error("bad deque bounds length: expected {expected}, got {actual}")]
-    BadLength {
-        /// The width the bounds cell requires.
-        expected: usize,
-        /// The width the cell actually had.
-        actual: usize,
-    },
-
     /// The decoded bounds violated `head ≤ tail`.
     #[error("disordered deque bounds: head {head} > tail {tail}")]
     Disordered {
@@ -456,10 +437,6 @@ pub enum MetaDecodeError {
     /// An index move or length exceeded the representable range.
     #[error("deque index space exhausted")]
     IndexOverflow,
-
-    /// A scanned cell carried a section that is not the entry section.
-    #[error("unexpected deque section discriminant: {0}")]
-    UnexpectedSection(i8),
 }
 
 impl ClassifyError for MetaDecodeError {
@@ -474,17 +451,18 @@ pub enum DequeStateError<E>
 where
     E: Error + Send + Sync + 'static,
 {
-    /// The context refused or failed the state access.
+    /// A typed entry-cell op failed: an access error or an element-codec
+    /// failure.
     #[error(transparent)]
-    Access(#[from] StateAccessError),
+    Cell(#[from] CellStateError<E>),
 
-    /// The codec failed to encode or decode an element.
-    #[error("deque codec failed")]
-    Codec(#[source] E),
-
-    /// The deque's bookkeeping was corrupt or its index space exhausted.
+    /// The deque's bookkeeping was disordered or its index space exhausted.
     #[error(transparent)]
     Meta(#[from] MetaDecodeError),
+
+    /// The stored head/tail bounds frame was corrupt (wrong width).
+    #[error(transparent)]
+    MetaFrame(#[from] MetaCodecError),
 }
 
 impl<E> ClassifyError for DequeStateError<E>
@@ -493,11 +471,22 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Access(e) => e.classify_error(),
-            // A cell that does not round-trip, or corrupt bookkeeping, will not
-            // begin to on retry.
-            Self::Codec(_) | Self::Meta(_) => ErrorCategory::Permanent,
+            Self::Cell(e) => e.classify_error(),
+            Self::Meta(e) => e.classify_error(),
+            // A corrupt bounds frame will not decode on retry.
+            Self::MetaFrame(_) => ErrorCategory::Permanent,
         }
+    }
+}
+
+/// Test-only: the single bounds cell at its frozen address (`Meta` section,
+/// empty coordinate), so a test can read the stored meta frame directly and
+/// pin the deque's binding to the [`MetaCodec`] frame.
+#[cfg(test)]
+pub(crate) fn meta_cell() -> CellKey {
+    CellKey {
+        section: META_SECTION,
+        coordinate: Coordinate::empty(),
     }
 }
 

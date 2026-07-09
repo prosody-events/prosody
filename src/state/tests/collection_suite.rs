@@ -42,7 +42,7 @@ use crate::state::{
     StateType,
 };
 use crate::timers::duration::CompactDuration;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
@@ -450,7 +450,7 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
             MapOp::Set(k, b) => {
                 let v = Value::from(b);
-                handle.set(&k, v.clone()).await?;
+                handle.set(k, v.clone()).await?;
                 scratch.insert(k, v);
                 Ok(OpOutcome::Continue)
             }
@@ -482,13 +482,13 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
     .await
 }
 
-/// `MetaBoundsCoverLive` (Map): the stored `META_MIN`/`META_MAX` bound a
-/// loose **superset** of the live key range — every live key's coordinate lies
-/// within `[min, max]`. Read directly from the raw bound cells, so this proves
-/// the bound *values* are a correct superset, not just that `stream` happens to
-/// yield the right keys. A stale bound may point at a since-removed key, so
-/// containment is asserted over *live* keys only (the loose-superset
-/// invariant).
+/// `MetaBoundsCoverLive` (Map): the stored `MapBound::Min`/`MapBound::Max`
+/// bound a loose **superset** of the live key range — every live key's
+/// coordinate lies within `[min, max]`. Read directly from the raw bound cells,
+/// so this proves the bound *values* are a correct superset, not just that
+/// `stream` happens to yield the right keys. A stale bound may point at a
+/// since-removed key, so containment is asserted over *live* keys only (the
+/// loose-superset invariant).
 async fn assert_map_bounds(
     cells: &MemoryCells,
     oracle: &ScriptedOracle,
@@ -609,10 +609,110 @@ where
     Ok(out)
 }
 
+/// Corrupt-coordinate classification: a stored entry whose coordinate does not
+/// decode as the collection's key codec (here 3 bytes where `I64KeyCodec`
+/// requires 8) surfaces from `stream` as [`CellStateError::Key`] classified
+/// `Permanent` — one skippable row, never Terminal — the only error arm no
+/// well-formed trace can reach.
+#[test]
+fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
+    use crate::error::{ClassifyError, ErrorCategory};
+    use crate::state::cell_key::Coordinate;
+    use crate::state::descriptor::CellStateError;
+    use crate::state::descriptor::map::{MapStateError, entry_cell_for};
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let fx = seed_map_entries_without_bounds()?;
+    let corrupt = entry_cell_for(&Coordinate::from_bytes(vec![1, 2, 3]));
+    block_on(fx.store.write_resolved(
+        &fx.collection_ref,
+        &[(
+            corrupt,
+            Some(Bytes::from(serde_json::to_vec(&Value::from(0_u8))?)),
+        )],
+    ))?;
+
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &fx.cells,
+        &fx.oracle,
+        &fx.registry,
+        &fx.state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let error = block_on(async {
+        let stream = handle.stream(Direction::Forward);
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            if let Err(error) = item {
+                return Ok(error);
+            }
+        }
+        bail!("a corrupt coordinate must end the stream with an error")
+    })?;
+    assert!(matches!(error, MapStateError::Cell(CellStateError::Key(_))));
+    assert_eq!(error.classify_error(), ErrorCategory::Permanent);
+    Ok(())
+}
+
+/// Durable meta-frame golden (Deque): after real pushes flush, the raw bounds
+/// cell sits at its frozen address — `Meta` section, *empty* coordinate — and
+/// stores exactly `head ‖ tail` as two plain big-endian `i64`s. The pair
+/// codec's own goldens pin that frame in isolation; this pins the deque's
+/// *binding* to it: the codec choice, the head-first tuple order, and the unit
+/// address (a swapped tuple, a different meta codec, or a moved address all go
+/// red here while every self-consistent trace stays green).
+#[test]
+fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
+    use crate::state::descriptor::deque::meta_cell;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key)?;
+    let armed: ArmedKeys = Arc::default();
+    let event = read_event(0);
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+    // `push_back` then `push_front`: the window becomes `head = -1, tail = 1`,
+    // so the frame crosses the sign boundary the plain-BE encoding must keep.
+    block_on(async {
+        handle.push_back(Value::from(7_u8)).await?;
+        handle.push_front(Value::from(9_u8)).await?;
+        handle.flush().await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("dq")?,
+    );
+    let Some(bytes) = block_on(store.get(&id, &meta_cell(), event))?.into_inner() else {
+        bail!("bounds cell missing at the frozen address");
+    };
+    assert_eq!(
+        &bytes[..],
+        [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 1
+        ],
+        "meta frame must be head ‖ tail as plain big-endian i64s"
+    );
+    Ok(())
+}
+
 /// A Map registered as "mp" over a fresh warm store, seeded with three
-/// committed entries and deliberately **no** `META_MIN`/`META_MAX` bounds — the
-/// shared fixture for the two missing-bound fallback tests, each of which then
-/// adds back exactly the one bound it isolates (or none).
+/// committed entries and deliberately **no** `MapBound::Min`/`MapBound::Max`
+/// bounds — the shared fixture for the two missing-bound fallback tests, each
+/// of which then adds back exactly the one bound it isolates (or none).
 struct MissingBoundFixture {
     oracle: ScriptedOracle,
     cells: MemoryCells,
@@ -659,9 +759,9 @@ fn seed_map_entries_without_bounds() -> Result<MissingBoundFixture> {
 }
 
 /// Missing-bound fallback: with live entries committed but **no**
-/// `META_MIN` (exactly the post-TTL-expiry state, seeded directly), `stream`
-/// falls back to a full forward scan from the empty anchor and still yields
-/// every live entry in key order.
+/// `MapBound::Min` (exactly the post-TTL-expiry state, seeded directly),
+/// `stream` falls back to a full forward scan from the empty anchor and still
+/// yields every live entry in key order.
 #[test]
 fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
     use futures::executor::block_on;
@@ -684,9 +784,9 @@ fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
     Ok(())
 }
 
-/// Backward missing-bound fallback: with live entries and `META_MIN`
-/// committed but **no** `META_MAX` (the post-TTL-expiry state of just the high
-/// bound, seeded directly), `stream(Direction::Backward)` falls back to an
+/// Backward missing-bound fallback: with live entries and `MapBound::Min`
+/// committed but **no** `MapBound::Max` (the post-TTL-expiry state of just the
+/// high bound, seeded directly), `stream(Direction::Backward)` falls back to an
 /// `Unbounded` high anchor and still yields every live entry descending. The
 /// symmetric counterpart of [`map_missing_min_bound_falls_back_to_full_scan`],
 /// isolating the backward path while the forward bound stands.
@@ -697,7 +797,7 @@ fn map_missing_max_bound_falls_back_to_full_scan() -> Result<()> {
     use futures::executor::block_on;
 
     let fx = seed_map_entries_without_bounds()?;
-    // Seed only META_MIN, leaving META_MAX expired/absent.
+    // Seed only MapBound::Min, leaving MapBound::Max expired/absent.
     let (min_cell, _) = bound_cells();
     let min_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&-1).as_bytes());
     block_on(

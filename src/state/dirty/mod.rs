@@ -31,6 +31,7 @@ use bytes::Bytes;
 use scc::Guard;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::ops::RangeInclusive;
 
 /// Inline capacity of one collection's snapshotted cell set; small
 /// Maps/Deques and every Value stay inline.
@@ -151,15 +152,9 @@ impl DirtyStore {
         collection: &CollectionId,
         section: super::cell_key::Section,
     ) -> CellSnapshot {
-        let scope = SectionScope {
-            key: collection.state_key().key.clone(),
-            state_type: collection.state_type(),
-            name: collection.name().clone(),
-            section,
-        };
         let guard = Guard::new();
         self.entries
-            .range(scope.clone()..=scope, &guard)
+            .range(SectionScope::range(collection, section), &guard)
             .map(|(k, v)| (k.cell.clone(), v.clone()))
             .collect()
     }
@@ -170,10 +165,9 @@ impl DirtyStore {
     /// [`Self::section_snapshot`].
     #[must_use]
     pub fn collection_snapshot(&self, collection: &CollectionId) -> ResolvedCells {
-        let scope = collection_scope(collection);
         let guard = Guard::new();
         self.entries
-            .range(scope.clone()..=scope, &guard)
+            .range(CollectionScope::range(collection), &guard)
             .map(|(k, v)| (k.cell.clone(), v.clone().into_data()))
             .collect()
     }
@@ -183,8 +177,8 @@ impl DirtyStore {
     /// [`Self::clear_event`]: no handler op is in flight while the handler
     /// itself awaits the flush.
     pub fn remove_collection(&self, collection: &CollectionId) {
-        let scope = collection_scope(collection);
-        self.entries.remove_range_sync(scope.clone()..=scope);
+        self.entries
+            .remove_range_sync(CollectionScope::range(collection));
     }
 
     /// Groups this event's (one `key`) dirty cells by collection — the
@@ -193,10 +187,9 @@ impl DirtyStore {
     /// from its own state key.
     #[must_use]
     pub fn touched(&self, key: &Key) -> TouchedCollections {
-        let scope = KeyScope(key.clone());
         let guard = Guard::new();
         let mut grouped = TouchedCollections::new();
-        for (dirty_key, value) in self.entries.range(scope.clone()..=scope, &guard) {
+        for (dirty_key, value) in self.entries.range(KeyScope::range(key.clone()), &guard) {
             let collection = (dirty_key.state_type, dirty_key.name.clone());
             let entry = (dirty_key.cell.clone(), value.clone());
             match grouped.iter_mut().find(|(c, _)| *c == collection) {
@@ -211,8 +204,7 @@ impl DirtyStore {
     /// / reset move. Race-free: single-writer-per-key makes this key's
     /// sub-range exclusively owned during its event.
     pub fn clear_event(&self, key: &Key) {
-        let scope = KeyScope(key.clone());
-        self.entries.remove_range_sync(scope.clone()..=scope);
+        self.entries.remove_range_sync(KeyScope::range(key.clone()));
     }
 }
 
@@ -228,45 +220,99 @@ fn dirty_key(collection: &CollectionId, cell: &CellKey) -> DirtyKey {
     }
 }
 
-/// Query matching every [`DirtyKey`] sharing one Kafka `key` — the whole-event
-/// sub-range, for [`DirtyStore::touched`] and [`DirtyStore::clear_event`].
+/// Which edge of a prefix sub-range a scope bound marks.
+///
+/// Each scope query below matches a *span* of [`DirtyKey`]s by comparing on a
+/// prefix of the key and ignoring the rest (`SectionScope` ignores the
+/// coordinate, `KeyScope` ignores everything past the Kafka `key`). A single
+/// value compared this way is `Equal` to the whole span, and `scc`'s range
+/// start-seek positions by descending the tree against the bound: a bound that
+/// is `Equal` to many keys can land the seek in the *middle* of the span and
+/// silently skip every cell before it. So a range bound is never such a fat
+/// value — it is a strict separator whose comparison tie-breaks past the span:
+/// `Low` sinks just below the span's first key, `High` rises just above its
+/// last, neither ever `Equal` to a stored key, keeping the seek at the span's
+/// true edge so the whole sub-range is visited. Consequently every scope's
+/// [`scc::Equivalent`] impl is always false — the contract-consistent
+/// definition (`equivalent ⇔ compare == Equal`); widening it to prefix
+/// equality would desynchronize it from `compare`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Low,
+    High,
+}
+
+impl Edge {
+    /// The ordering to return once the prefix compares `Equal`: a `Low` bound
+    /// sinks below the span, a `High` bound rises above it.
+    fn beyond(self) -> Ordering {
+        match self {
+            Self::Low => Ordering::Less,
+            Self::High => Ordering::Greater,
+        }
+    }
+}
+
+/// Bounding query for every [`DirtyKey`] sharing one Kafka `key` — the
+/// whole-event sub-range, for [`DirtyStore::touched`] and
+/// [`DirtyStore::clear_event`]. Compares on the Kafka `key` alone; see [`Edge`]
+/// for why each bound is a strict separator.
 #[derive(Clone, PartialEq, Eq)]
-struct KeyScope(Key);
+struct KeyScope {
+    key: Key,
+    edge: Edge,
+}
+
+impl KeyScope {
+    /// The inclusive separator pair spanning one Kafka `key`'s cells.
+    fn range(key: Key) -> RangeInclusive<Self> {
+        Self {
+            key: key.clone(),
+            edge: Edge::Low,
+        }..=Self {
+            key,
+            edge: Edge::High,
+        }
+    }
+}
 
 impl scc::Equivalent<DirtyKey> for KeyScope {
     fn equivalent(&self, key: &DirtyKey) -> bool {
-        self.0 == key.key
+        scc::Comparable::compare(self, key) == Ordering::Equal
     }
 }
 
 impl scc::Comparable<DirtyKey> for KeyScope {
     fn compare(&self, key: &DirtyKey) -> Ordering {
-        self.0.cmp(&key.key)
+        self.key.cmp(&key.key).then(self.edge.beyond())
     }
 }
 
-/// Builds the query matching every [`DirtyKey`] in `collection`.
-fn collection_scope(collection: &CollectionId) -> CollectionScope {
-    CollectionScope {
-        key: collection.state_key().key.clone(),
-        state_type: collection.state_type(),
-        name: collection.name().clone(),
-    }
-}
-
-/// Query matching every [`DirtyKey`] in one collection — the mid-handler
+/// Bounding query for every [`DirtyKey`] in one collection — the mid-handler
 /// flush sub-range, for [`DirtyStore::collection_snapshot`] and
 /// [`DirtyStore::remove_collection`]. Compares on `(key, state_type, name)`,
-/// ignoring the cell, so the inclusive range spans the collection's cells
-/// across every section in coordinate order.
+/// ignoring the cell, so the range spans the collection's cells across every
+/// section in coordinate order; see [`Edge`] for the strict-separator bounds.
 #[derive(Clone, PartialEq, Eq)]
 struct CollectionScope {
     key: Key,
     state_type: StateType,
     name: StateName,
+    edge: Edge,
 }
 
 impl CollectionScope {
+    /// The inclusive separator pair spanning `collection`'s cells.
+    fn range(collection: &CollectionId) -> RangeInclusive<Self> {
+        let at = |edge| Self {
+            key: collection.state_key().key.clone(),
+            state_type: collection.state_type(),
+            name: collection.name().clone(),
+            edge,
+        };
+        at(Edge::Low)..=at(Edge::High)
+    }
+
     fn cmp_key(&self, key: &DirtyKey) -> Ordering {
         self.key
             .cmp(&key.key)
@@ -277,29 +323,43 @@ impl CollectionScope {
 
 impl scc::Equivalent<DirtyKey> for CollectionScope {
     fn equivalent(&self, key: &DirtyKey) -> bool {
-        self.cmp_key(key) == Ordering::Equal
+        scc::Comparable::compare(self, key) == Ordering::Equal
     }
 }
 
 impl scc::Comparable<DirtyKey> for CollectionScope {
     fn compare(&self, key: &DirtyKey) -> Ordering {
-        self.cmp_key(key)
+        self.cmp_key(key).then(self.edge.beyond())
     }
 }
 
-/// Query matching every [`DirtyKey`] in one collection-section — the scan leg
-/// sub-range, for [`DirtyStore::section_snapshot`]. Compares on
-/// `(key, state_type, name, section)`, ignoring the coordinate, so the
-/// inclusive range spans exactly that section's cells in coordinate order.
+/// Bounding query for every [`DirtyKey`] in one collection-section — the scan
+/// leg sub-range, for [`DirtyStore::section_snapshot`]. Compares on
+/// `(key, state_type, name, section)`, ignoring the coordinate, so the range
+/// spans exactly that section's cells in coordinate order; see [`Edge`] for the
+/// strict-separator bounds.
 #[derive(Clone, PartialEq, Eq)]
 struct SectionScope {
     key: Key,
     state_type: StateType,
     name: StateName,
     section: super::cell_key::Section,
+    edge: Edge,
 }
 
 impl SectionScope {
+    /// The inclusive separator pair spanning `collection`'s cells in `section`.
+    fn range(collection: &CollectionId, section: super::cell_key::Section) -> RangeInclusive<Self> {
+        let at = |edge| Self {
+            key: collection.state_key().key.clone(),
+            state_type: collection.state_type(),
+            name: collection.name().clone(),
+            section,
+            edge,
+        };
+        at(Edge::Low)..=at(Edge::High)
+    }
+
     fn cmp_key(&self, key: &DirtyKey) -> Ordering {
         self.key
             .cmp(&key.key)
@@ -311,12 +371,12 @@ impl SectionScope {
 
 impl scc::Equivalent<DirtyKey> for SectionScope {
     fn equivalent(&self, key: &DirtyKey) -> bool {
-        self.cmp_key(key) == Ordering::Equal
+        scc::Comparable::compare(self, key) == Ordering::Equal
     }
 }
 
 impl scc::Comparable<DirtyKey> for SectionScope {
     fn compare(&self, key: &DirtyKey) -> Ordering {
-        self.cmp_key(key)
+        self.cmp_key(key).then(self.edge.beyond())
     }
 }

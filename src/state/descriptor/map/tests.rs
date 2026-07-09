@@ -27,19 +27,20 @@ fn prop_map_section_round_trip() {
     QuickCheck::new().quickcheck(prop as fn(i8) -> TestResult);
 }
 
-/// The frozen discriminants and the two distinct `Meta` cell addresses (a
-/// durable contract — both live in the `Meta` section at fixed coordinates).
+/// The frozen discriminants and the two distinct `Meta` bound coordinates (a
+/// durable contract — the sections lower to `0`/`1` and the bounds encode to
+/// `[0]`/`[1]`).
 #[test]
 fn map_layout_is_frozen() {
     assert_eq!(MapNs::Meta as i8, 0);
     assert_eq!(MapNs::Entries as i8, 1);
+    assert_eq!(i8::from(META_SECTION), 0);
+    assert_eq!(i8::from(ENTRY_SECTION), 1);
 
-    let min = meta_min_cell();
-    let max = meta_max_cell();
-    assert_eq!(i8::from(min.section), 0);
-    assert_eq!(i8::from(max.section), 0);
-    assert_eq!(min.coordinate.as_bytes(), &[0]);
-    assert_eq!(max.coordinate.as_bytes(), &[1]);
+    let min = MapBoundKey::encode(&MapBound::Min);
+    let max = MapBoundKey::encode(&MapBound::Max);
+    assert_eq!(min.as_bytes(), &[0]);
+    assert_eq!(max.as_bytes(), &[1]);
     // The two bounds must address distinct cells.
-    assert_ne!(min.coordinate, max.coordinate);
+    assert_ne!(min, max);
 }

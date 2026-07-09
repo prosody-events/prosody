@@ -1,10 +1,14 @@
-error[E0624]: method `session` is private
-  --> tests/compile_fail/cellview_scope_is_pinned.rs:13:10
+error[E0624]: associated function `new` is private
+  --> tests/compile_fail/cellview_scope_is_pinned.rs:14:16
    |
-13 |     view.session()
-   |          ^^^^^^^ private method
+14 |       CellScope::new((), state_type, name)
+   |                  ^^^ private associated function
    |
   ::: src/state/descriptor/mod.rs
    |
-   |     pub(in crate::state) fn session(&self) -> &S {
-   |     -------------------------------------------- private method defined here
+   | /     pub(in crate::state::descriptor) fn new(
+   | |         session: S,
+   | |         state_type: StateType,
+   | |         name: StateName,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here

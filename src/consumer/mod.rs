@@ -118,8 +118,8 @@ pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::{ManagerRegistry, PartitionProviders, new_context};
 pub use crate::consumer::kafka_state::{
-    MessageDescriptor, MessageRef, MessageRefCodec, MessageRefCodecError, MessageResolver,
-    MessageStateError, message_state,
+    MessageCell, MessageDescriptor, MessageRef, MessageRefCodec, MessageRefCodecError,
+    MessageResolver, MessageStateError, message_deque_state, message_map_state, message_state,
 };
 pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
@@ -161,6 +161,9 @@ pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
 use crate::state::cassandra::{CassandraCellResources, CassandraDescriptorIdentityStore};
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
+// `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
+// here: it would shadow the message-routing `Keyed` trait below.
+pub use crate::state::descriptor::{CellResolver, CellType, FromSession, WithResolver};
 use crate::state::fjall::{FjallClient, FjallClientError};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};

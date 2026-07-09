@@ -84,8 +84,8 @@ pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,
 };
 pub use order_codec::{
-    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, Utf8KeyCodec, order_preserving_i64,
-    order_preserving_i64_decode,
+    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, UnitKey, Utf8KeyCodec,
+    order_preserving_i64, order_preserving_i64_decode,
 };
 pub use registry::CommitMode;
 
@@ -96,11 +96,13 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
 /// Maximum concurrent in-flight requests within a *single* collection
 /// (one Cassandra partition → one Scylla shard): the batch-chunk submission
-/// of one durable write, the recovery sweep's per-cell resolution, and a
-/// stage's committed-base reads. Same shard, so this bounds round-trip /
-/// oracle-consult *overlap* (latency), not throughput; kept modest because it
-/// nests inside the per-collection `STATE_FANOUT_CONCURRENCY` fan-out, so the
-/// product is the per-shard in-flight depth.
+/// of one durable write, the recovery sweep's per-cell resolution, a
+/// stage's committed-base reads, and the ordered resolution window of a typed
+/// cell scan (each scanned cell is decoded and its resolver/loader fan-out run
+/// up to this many items ahead of the consumer). Same shard, so this bounds
+/// round-trip / oracle-consult *overlap* (latency), not throughput; kept modest
+/// because it nests inside the per-collection `STATE_FANOUT_CONCURRENCY`
+/// fan-out, so the product is the per-shard in-flight depth.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
 /// The per-partition backend bundle: the one uniform durable cell store, the

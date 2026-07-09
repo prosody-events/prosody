@@ -2,8 +2,8 @@
 //!
 //! A Map stores one cell per entry, keyed by an order-preserving encoding of
 //! the logical key, plus loose min/max bounds that anchor an ordered scan. The
-//! [`MapHandle`] composes the uniform [`CellView`] cell interface — there is no
-//! Map-specific store, session, or backend. Build a descriptor with
+//! [`MapHandle`] composes the uniform `CellView` typed cell interface — there
+//! is no Map-specific store, session, or backend. Build a descriptor with
 //! [`map_state`], register it with the consumer, and bind the
 //! [`Registered`](super::Registered) handle through
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state).
@@ -12,38 +12,44 @@
 //!
 //! Two sections separate bookkeeping from data (`MapNs`):
 //!
-//! * `Meta` holds two cells, `META_MIN` and `META_MAX`, each storing the entry
-//!   coordinate bytes of an extreme key. They are stored separately (not one
-//!   cell) so each ratchets independently. An empty Map has no `Meta` cells.
+//! * `Meta` holds two cells, addressed by `MapBound::Min`/`MapBound::Max`, each
+//!   storing an extreme entry's *key* through `KC` itself (a key codec is its
+//!   own payload codec — the byte-identity law on `OrderedKeyCodec`). A bound
+//!   cell's payload bytes are `KC::encode(key)` — the very bytes the entry cell
+//!   is addressed by — so a bound reads back as a logical `KC::Key`. The two
+//!   bounds are stored separately (not one cell) so each ratchets
+//!   independently. An empty Map has no `Meta` cells.
 //! * `Entries` holds one cell per key, addressed by the key codec's
-//!   order-preserving coordinate ([`OrderedKeyCodec::encode`]).
+//!   order-preserving coordinate and typed by the entries cell type
+//!   [`Keyed`]`<KC, V>`.
 //!
 //! # Invariant: min/max are a loose outward superset
 //!
-//! `set` ratchets `META_MIN`/`META_MAX` **outward only** and never reads the
-//! entry being written, so a blind last-writer-wins entry write is preserved
-//! and the bounds may point at a key that was since removed — a *superset* of
-//! the live key range, never a subset. `stream` anchors its scan at the bound
-//! on its leading edge — `META_MIN` for a forward (ascending) scan, `META_MAX`
-//! for a backward (descending) one — each falling back to the section edge
-//! (`Unbounded`) when its bound is missing or expired, and relies on the store
-//! hiding cleared cells, so it yields exactly the live entries in key order
-//! regardless of stale bounds: a residue beyond the live range is never
-//! reached, a live key can never sit outside its bound, and the missing-bound
-//! fallback scans from the edge. The bounds are therefore self-healing — never
-//! an exact count, by design (a count would force a read-before-write on every
-//! mutation).
+//! `set` ratchets the min/max bounds **outward only** and never reads the entry
+//! being written, so a blind last-writer-wins entry write is preserved and the
+//! bounds may name a key that was since removed — a *superset* of the live key
+//! range, never a subset. `stream` anchors its scan at the bound on its leading
+//! edge — the min bound for a forward (ascending) scan, the max for a backward
+//! (descending) one — each falling back to the section edge (`Unbounded`) when
+//! its bound is missing or expired, and relies on the store hiding cleared
+//! cells, so it yields exactly the live entries in key order regardless of
+//! stale bounds: a residue beyond the live range is never reached, a live key
+//! can never sit outside its bound, and the missing-bound fallback scans from
+//! the edge. The bounds are therefore self-healing — never an exact count, by
+//! design (a count would force a read-before-write on every mutation).
 
 use super::{
-    CellView, CollectionSpec, Descriptor, StructuralIdentity, decode_cell, encode_cell, ensure_live,
+    CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
+    Descriptor, FromSession, Keyed, ResolvedOf, WriteOf,
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::StateAccessError;
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec};
+#[cfg(test)]
+use crate::state::cell_key::CellKey;
+use crate::state::cell_key::{Coordinate, Direction, Section};
+use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::session::CellSession;
-use crate::state::{CollectionKindId, StateName, StateType, StoreOutcome};
+use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
@@ -89,136 +95,166 @@ impl TryFrom<i8> for MapNs {
     }
 }
 
-/// One streamed map entry: a decoded key and value, or the error that decoding
-/// it raised. Factored out of [`MapHandle::stream`]'s return type.
-pub type MapEntry<KC, VC> = Result<
-    (<KC as OrderedKeyCodec>::Key, <VC as Codec>::Payload),
-    MapStateError<<VC as Codec>::Error>,
->;
+/// The two bound cells' logical address within the `Meta` section: the loose
+/// lower and upper bounds of the live key range. Its encoding (`Min`→`[0]`,
+/// `Max`→`[1]`) is a frozen durable contract, pinned by `map_layout_is_frozen`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MapBound {
+    /// The loose lower bound of the live key range.
+    Min = 0,
+
+    /// The loose upper bound of the live key range.
+    Max = 1,
+}
+
+/// Address codec for the two [`MapBound`] cells. Module-fixed by the Map kind
+/// (the section byte already pins the meta cells), so its
+/// [`CODEC_ID`](Codec::CODEC_ID) never rides a collection's durable identity.
+/// The meta cells are only ever read at their two fixed addresses, so `decode`
+/// is a defensive round-trip, never a scan step.
+#[derive(Clone, Copy, Debug, Default)]
+struct MapBoundKey;
+
+impl OrderedKeyCodec for MapBoundKey {
+    type Key = MapBound;
+
+    fn encode(key: &MapBound) -> Coordinate {
+        Coordinate::from_bytes(vec![*key as u8])
+    }
+
+    fn decode(bytes: &[u8]) -> Result<MapBound, KeyCodecError> {
+        match bytes {
+            [0] => Ok(MapBound::Min),
+            [1] => Ok(MapBound::Max),
+            &[actual] => Err(KeyCodecError::BadDiscriminant { actual }),
+            _ => Err(KeyCodecError::BadLength {
+                expected: 1,
+                actual: bytes.len(),
+            }),
+        }
+    }
+}
+
+/// The payload half of `MapBoundKey` — delegates to `encode`/`decode`, so the
+/// byte-identity law on [`OrderedKeyCodec`] holds by construction. Only the
+/// *entries* key codec rides a bound cell's payload; this impl exists to
+/// satisfy the supertrait, not to store bounds by.
+impl Codec for MapBoundKey {
+    type Error = KeyCodecError;
+    type Payload = MapBound;
+
+    const CODEC_ID: &'static str = "map-bound.v1";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<MapBound, KeyCodecError> {
+        Self::decode(buf)
+    }
+
+    fn serialize(&mut self, payload: MapBound, buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        Ok(())
+    }
+}
+
+/// One item [`MapHandle::stream`] yields: a decoded key paired with its
+/// resolved value, or the error that ended the stream.
+type MapStreamItem<KC, V> =
+    Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
 
 /// Descriptor for a codec-backed ordered map collection. Generic over an
-/// [`OrderedKeyCodec`] (the key encoding, frozen into the identity) and a value
-/// [`Codec`] (JSON by default). There is no resolver. Declare via
-/// [`map_state`].
-pub type MapDescriptor<KC, VC = JsonCodec> = Descriptor<MapKind<KC, VC>>;
+/// [`OrderedKeyCodec`] `KC` (the key encoding, frozen into the identity) and a
+/// value [`CellType`] `V` — a plain [`Codec`] (JSON by default) or a codec
+/// paired with a resolver via [`WithResolver`](super::WithResolver). Declare
+/// via [`map_state`].
+pub type MapDescriptor<KC, V = JsonCodec> = Descriptor<MapKind<KC, V>>;
 
 /// The Map [`CollectionSpec`]: one cell per key plus the min/max bound cells;
 /// the key codec is frozen into the identity.
-pub struct MapKind<KC, VC>(PhantomData<fn() -> (KC, VC)>);
+pub struct MapKind<KC, V>(PhantomData<fn() -> (KC, V)>);
 
-impl<KC, VC> CollectionSpec for MapKind<KC, VC>
+impl<KC, V> CollectionSpec for MapKind<KC, V>
 where
     KC: OrderedKeyCodec,
-    VC: Codec,
+    V: CellType<Key = UnitKey>,
 {
-    type Handle<S: CellSession> = MapHandle<S, KC, VC>;
+    type Cell = Keyed<KC, V>;
+    type Handle<S: CellSession> = MapHandle<S, KC, V>;
 
-    fn structural_identity() -> StructuralIdentity {
-        StructuralIdentity {
-            kind: CollectionKindId::Map,
-            codec_id: VC::CODEC_ID,
-            resolver_id: None,
-            key_codec_id: Some(KC::KEY_CODEC_ID),
+    const KEY_CODEC_ID: Option<&'static str> = Some(KC::CODEC_ID);
+    const KIND: CollectionKindId = CollectionKindId::Map;
+
+    fn handle<S: CellSession>(scope: CellScope<S>) -> MapHandle<S, KC, V> {
+        MapHandle {
+            entries: scope.typed(ENTRY_SECTION),
+            meta: scope.typed(META_SECTION),
         }
-    }
-
-    fn handle<S: CellSession>(
-        session: S,
-        state_type: StateType,
-        name: StateName,
-    ) -> MapHandle<S, KC, VC> {
-        MapHandle::new(session, state_type, name)
     }
 }
 
 /// Typed, owned handle over a codec-backed ordered map — a thin composition
-/// over a [`CellView`]. Every operation guards on session termination.
+/// over two typed `CellView`s: `entries` (the per-key data cells, typed
+/// [`Keyed`]`<KC, V>`) and `meta` (the min/max bound cells, each storing an
+/// extreme entry's key). Every operation guards on session termination through
+/// the views. Cheap `Clone`.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
-pub struct MapHandle<S, KC, VC> {
-    view: CellView<S>,
-    _marker: PhantomData<fn() -> (KC, VC)>,
+pub struct MapHandle<S, KC, V> {
+    entries: CellView<S, Keyed<KC, V>>,
+    meta: CellView<S, Keyed<MapBoundKey, KC>>,
 }
 
-impl<S, KC, VC> MapHandle<S, KC, VC> {
-    /// Wraps a verified session and the binding descriptor's `(state_type,
-    /// name)`. Codec-agnostic so [`StateDescriptor::bind`] mints it without the
-    /// codec bounds.
-    fn new(session: S, state_type: StateType, name: StateName) -> Self {
-        Self {
-            view: CellView::new(session, state_type, name),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<S, KC, VC> MapHandle<S, KC, VC>
+impl<S, KC, V> MapHandle<S, KC, V>
 where
     S: CellSession,
-    KC: OrderedKeyCodec,
-    VC: Codec,
+    KC: OrderedKeyCodec + 'static,
+    V: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, V>: FromSession<'s, S>,
 {
-    /// Reads the value for `key` (`None` when absent).
+    /// Reads and resolves the value for `key` (`None` when absent).
     ///
     /// # Errors
     ///
-    /// Returns a codec error (`Permanent`) when the cell does not decode, or an
-    /// access error from the session.
+    /// Returns a codec error (`Permanent`) when the cell does not decode, a
+    /// resolution error, or an access error from the session.
     pub async fn get(
         &self,
         key: &KC::Key,
-    ) -> Result<Option<VC::Payload>, MapStateError<VC::Error>> {
-        ensure_live(self.view.session())?;
-        let coordinate = KC::encode(key);
-        self.view
-            .get(&entry_cell(&coordinate))
-            .await?
-            .map(|bytes| decode_cell::<VC>(bytes).map_err(MapStateError::Codec))
-            .transpose()
+    ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>> {
+        Ok(self.entries.get(key).await?)
     }
 
     /// Streams the live entries in key order — ascending for
-    /// [`Direction::Forward`], descending for [`Direction::Backward`]. See the
-    /// module's loose-superset invariant: a stale bound never drops a live
-    /// entry, it only ever costs an extra scanned-but-cleared cell.
-    pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapEntry<KC, VC>> + '_ {
+    /// [`Direction::Forward`], descending for [`Direction::Backward`]. Each
+    /// entry's value is resolved as it is yielded, and the entries view decodes
+    /// each yielded key, so the anchor bound is a logical key rather than a
+    /// coordinate. See the module's loose-superset invariant: a stale bound
+    /// never drops a live entry, it only ever costs an extra
+    /// scanned-but-cleared cell.
+    pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         try_stream! {
-            ensure_live(self.view.session())?;
-            // Anchor at the bound on the scan's leading edge — `META_MIN` for
-            // `Forward`, `META_MAX` for `Backward` — falling back to the
-            // section edge (`Unbounded`) when that bound is missing or expired.
-            let bound_cell = match dir {
-                Direction::Forward => meta_min_cell(),
-                Direction::Backward => meta_max_cell(),
+            // Anchor at the bound on the scan's leading edge — the min bound for
+            // `Forward`, the max for `Backward` — falling back to the section
+            // edge (`Unbounded`) when that bound is missing or expired.
+            let anchor = match dir {
+                Direction::Forward => self.read_bound(MapBound::Min).await?,
+                Direction::Backward => self.read_bound(MapBound::Max).await?,
             };
-            let anchor = self.read_bound(&bound_cell).await?;
-            let scan = Scan {
-                section: ENTRY_SECTION,
-                start: anchor.as_ref().map_or(Bound::Unbounded, Bound::Included),
-                dir,
-                end: Bound::Unbounded,
-                limit: None,
-            };
-            let inner = self.view.scan(scan);
+            let start = anchor.as_ref().map_or(Bound::Unbounded, Bound::Included);
+            let inner = self.entries.scan(start, dir, Bound::Unbounded, None);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
-                let (key, bytes) = item.map_err(MapStateError::Access)?;
-                let logical = KC::decode(key.coordinate.as_bytes()).map_err(MapStateError::Key)?;
-                let value = decode_cell::<VC>(bytes).map_err(MapStateError::Codec)?;
-                yield (logical, value);
+                yield item?;
             }
         }
     }
 
-    /// Reads a bound cell's stored entry coordinate (`None` when absent). A
-    /// bound stores the entry coordinate bytes verbatim, with no extra framing
-    /// — `assert_map_bounds` in the collection suite pins that over the
-    /// real write path at quickcheck scale.
+    /// Reads a bound cell's stored extreme key (`None` when absent). The bound
+    /// stores the key through `KC` itself (byte-identity law), so it reads
+    /// back as a logical `KC::Key`.
     async fn read_bound(
         &self,
-        cell: &CellKey,
-    ) -> Result<Option<Coordinate>, MapStateError<VC::Error>> {
-        Ok(self.view.get(cell).await?.map(Coordinate::from_bytes))
+        bound: MapBound,
+    ) -> Result<Option<KC::Key>, MapStateError<CellCodecError<V>>> {
+        self.meta.get(&bound).await.map_err(meta_err)
     }
 
     /// Inserts or overwrites `key`'s value (a blind last-writer-wins write —
@@ -231,14 +267,14 @@ where
     /// access error from the session.
     pub async fn set(
         &self,
-        key: &KC::Key,
-        value: VC::Payload,
-    ) -> Result<(), MapStateError<VC::Error>> {
-        ensure_live(self.view.session())?;
-        let coordinate = KC::encode(key);
-        let buf = encode_cell::<VC>(value).map_err(MapStateError::Codec)?;
-        self.view.set(&entry_cell(&coordinate), &buf).await?;
-        self.ratchet_bounds(&coordinate).await?;
+        key: KC::Key,
+        value: WriteOf<'_, V>,
+    ) -> Result<(), MapStateError<CellCodecError<V>>>
+    where
+        KC::Key: Clone,
+    {
+        self.entries.set(&key, value).await?;
+        self.ratchet_bounds(key).await?;
         Ok(())
     }
 
@@ -248,11 +284,8 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<VC::Error>> {
-        ensure_live(self.view.session())?;
-        let coordinate = KC::encode(key);
-        self.view.clear(&entry_cell(&coordinate)).await?;
-        Ok(())
+    pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
+        Ok(self.entries.clear(key).await?)
     }
 
     /// Drains this map's buffered ops — entries and bound ratchets together,
@@ -262,79 +295,67 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub async fn flush(&self) -> Result<StoreOutcome, MapStateError<VC::Error>> {
-        ensure_live(self.view.session())?;
-        Ok(self.view.flush().await?)
+    pub async fn flush(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
+        Ok(self.entries.flush().await?)
     }
 
-    /// Ratchets `META_MIN`/`META_MAX` outward to `coordinate`. Reads both bound
-    /// cells concurrently (they are independent), then extends each that
-    /// `coordinate` exceeds — the conditional sets stay sequential (cheap
-    /// in-memory buffering, nothing to overlap).
-    async fn ratchet_bounds(
-        &self,
-        coordinate: &Coordinate,
-    ) -> Result<(), MapStateError<VC::Error>> {
-        let (min_cell, max_cell) = (meta_min_cell(), meta_max_cell());
-        let (min, max) = tokio::try_join!(self.read_bound(&min_cell), self.read_bound(&max_cell))?;
-        if min.is_none_or(|min| coordinate.as_bytes() < min.as_bytes()) {
-            self.view.set(&min_cell, coordinate.as_bytes()).await?;
-        }
-        if max.is_none_or(|max| coordinate.as_bytes() > max.as_bytes()) {
-            self.view.set(&max_cell, coordinate.as_bytes()).await?;
+    /// Ratchets the min/max bounds outward to `key`. Reads both bound cells
+    /// concurrently (they are independent), then extends each that `key`
+    /// exceeds by [`Ord`] — the conditional sets stay sequential (cheap
+    /// in-memory buffering, nothing to overlap). `key` *moves* into the single
+    /// extending bound write, mirroring `HashMap::insert` taking its key by
+    /// value; it is cloned only when both bounds extend (the first insert seeds
+    /// Min and Max together).
+    async fn ratchet_bounds(&self, key: KC::Key) -> Result<(), MapStateError<CellCodecError<V>>>
+    where
+        KC::Key: Clone,
+    {
+        let (min, max) = tokio::try_join!(
+            self.read_bound(MapBound::Min),
+            self.read_bound(MapBound::Max)
+        )?;
+        let extend_min = min.is_none_or(|min| key < min);
+        let extend_max = max.is_none_or(|max| key > max);
+        match (extend_min, extend_max) {
+            (true, true) => {
+                // Both bounds extend: clone once for Min, move into Max.
+                self.meta
+                    .set(&MapBound::Min, key.clone())
+                    .await
+                    .map_err(meta_err)?;
+                self.meta.set(&MapBound::Max, key).await.map_err(meta_err)?;
+            }
+            (true, false) => self.meta.set(&MapBound::Min, key).await.map_err(meta_err)?,
+            (false, true) => self.meta.set(&MapBound::Max, key).await.map_err(meta_err)?,
+            (false, false) => {}
         }
         Ok(())
     }
 }
 
 /// Declares a codec-backed ordered map collection named `name` over key codec
-/// `KC` and value codec `VC` (JSON values by default). See
+/// `KC` and value cell type `V` (JSON values by default). See
 /// [`Descriptor::new`](super::Descriptor::new) for the `name` contract.
 #[must_use]
-pub fn map_state<KC, VC>(name: &str) -> MapDescriptor<KC, VC>
+pub fn map_state<KC, V>(name: &str) -> MapDescriptor<KC, V>
 where
     KC: OrderedKeyCodec,
-    VC: Codec,
+    V: CellType<Key = UnitKey>,
 {
     MapDescriptor::new(name)
 }
 
-/// The entry cell at key coordinate `coordinate`.
-fn entry_cell(coordinate: &Coordinate) -> CellKey {
-    CellKey {
-        section: ENTRY_SECTION,
-        coordinate: coordinate.clone(),
-    }
-}
-
-/// Test-only: the entry cell for a key coordinate, so a test can seed raw
-/// entries directly (entries with a missing `META_MIN`) and prove the
-/// missing-bound fallback against the real store.
-#[cfg(test)]
-pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
-    entry_cell(coordinate)
-}
-
-/// Test-only: the `(META_MIN, META_MAX)` bound cells, so a test can read the
-/// stored bounds directly and assert the loose-superset containment invariant.
-#[cfg(test)]
-pub(crate) fn bound_cells() -> (CellKey, CellKey) {
-    (meta_min_cell(), meta_max_cell())
-}
-
-/// The `META_MIN` bound cell.
-fn meta_min_cell() -> CellKey {
-    CellKey {
-        section: META_SECTION,
-        coordinate: Coordinate::from_bytes(vec![0u8]),
-    }
-}
-
-/// The `META_MAX` bound cell.
-fn meta_max_cell() -> CellKey {
-    CellKey {
-        section: META_SECTION,
-        coordinate: Coordinate::from_bytes(vec![1u8]),
+/// Re-homes a meta-cell access error under the map's value-codec error
+/// parameter. The `meta` view's payload codec is the entries key codec `KC`,
+/// so a meta codec failure means a stored bound's key bytes no longer decode —
+/// a key-decode failure, folded under [`CellStateError::Key`].
+fn meta_err<E>(err: CellStateError<KeyCodecError>) -> MapStateError<E>
+where
+    E: Error + Send + Sync + 'static,
+{
+    match err {
+        CellStateError::Access(e) => CellStateError::Access(e).into(),
+        CellStateError::Codec(e) | CellStateError::Key(e) => CellStateError::Key(e).into(),
     }
 }
 
@@ -344,27 +365,19 @@ fn meta_max_cell() -> CellKey {
 struct UnknownMapSection(i8);
 
 /// Error returned by [`MapHandle`] operations.
+///
+/// A single typed-cell arm: both the per-key entry cells and the bound cells go
+/// through the `CellView` interface, so every failure — access, value-codec,
+/// or a stored key that no longer decodes — is already a [`CellStateError`].
 #[derive(Debug, Error)]
 pub enum MapStateError<E>
 where
     E: Error + Send + Sync + 'static,
 {
-    /// The context refused or failed the state access.
+    /// A typed cell op failed: an access error, a value-codec failure, or a
+    /// stored key that did not decode.
     #[error(transparent)]
-    Access(#[from] StateAccessError),
-
-    /// The value codec failed to encode or decode a cell.
-    #[error("map value codec failed")]
-    Codec(#[source] E),
-
-    /// A stored key coordinate did not decode back to a logical key.
-    #[error(transparent)]
-    Key(#[from] KeyCodecError),
-
-    /// A scanned cell carried a section that is not the entry section — a
-    /// defensive guard; `Permanent`.
-    #[error("unexpected map section discriminant: {0}")]
-    Section(i8),
+    Cell(#[from] CellStateError<E>),
 }
 
 impl<E> ClassifyError for MapStateError<E>
@@ -373,13 +386,31 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Access(e) => e.classify_error(),
-            Self::Key(e) => e.classify_error(),
-            // A cell that does not round-trip, or a cell in an unexpected
-            // section, will not begin to behave on retry.
-            Self::Codec(_) | Self::Section(_) => ErrorCategory::Permanent,
+            Self::Cell(e) => e.classify_error(),
         }
     }
+}
+
+/// Test-only: the entry cell at key coordinate `coordinate`, so a test can
+/// seed raw entries directly (entries with a missing bound) and prove the
+/// missing-bound fallback against the real store.
+#[cfg(test)]
+pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
+    CellKey {
+        section: ENTRY_SECTION,
+        coordinate: coordinate.clone(),
+    }
+}
+
+/// Test-only: the `(Min, Max)` bound cells, so a test can read the stored
+/// bounds directly and assert the loose-superset containment invariant.
+#[cfg(test)]
+pub(crate) fn bound_cells() -> (CellKey, CellKey) {
+    let cell = |bound: MapBound| CellKey {
+        section: META_SECTION,
+        coordinate: MapBoundKey::encode(&bound),
+    };
+    (cell(MapBound::Min), cell(MapBound::Max))
 }
 
 #[cfg(test)]
