@@ -47,7 +47,7 @@ pub(crate) mod test_db;
 mod tests;
 
 pub use error::FjallCellCacheError;
-pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
+pub use workspace::{FjallClient, FjallClientError, FjallWorkspace};
 
 use self::codec::Read;
 use crate::state::CollectionId;
@@ -194,11 +194,11 @@ pub struct FjallCellCache {
 /// The [`Database`] is held in both arms because batch writes are issued
 /// through [`Database::batch`], not the keyspace handle. The `index` keyspace
 /// (warm provisional coordinates + scan coverage) rides alongside `cache` in
-/// both arms purely for lifecycle co-location — it shares the workspace's epoch
-/// (cold at a fresh assignment, dropped at revocation). Index and cell-cache
-/// writes are **not** issued as one cross-keyspace batch; the warm index is a
-/// rebuildable hint (a fresh epoch re-seeds from the durable `kind=Index`), so
-/// they need no atomicity with the committed-value write.
+/// both arms purely for lifecycle co-location — it shares the workspace's
+/// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
+/// cell-cache writes are **not** issued as one cross-keyspace batch; the warm
+/// index is a rebuildable hint (a fresh assignment re-seeds from the durable
+/// `kind=Index`), so they need no atomicity with the committed-value write.
 enum Inner {
     Bare {
         database: Database,
@@ -626,10 +626,11 @@ impl FjallCellCache {
     // --- Warm index: provisional coordinates + cold-seed latch ---------------
     //
     // The warm provisional index the recovery sweep short-circuits on. It lives
-    // in the per-partition `index` keyspace, cold at a fresh epoch and dropped
-    // at revocation. It is the disk-spilling relocation of the former in-RAM
-    // `ProvisionalIndex`; the durable Cassandra `kind=Index` markers remain the
-    // authoritative cold-recovery source (a fresh epoch re-seeds from them).
+    // in the per-partition `index` keyspace, cold at a fresh assignment and
+    // dropped at revocation. It is the disk-spilling relocation of the former
+    // in-RAM `ProvisionalIndex`; the durable Cassandra `kind=Index` markers
+    // remain the authoritative cold-recovery source (a fresh assignment
+    // re-seeds from them).
 
     /// Whether `collection`'s one-time cold seed has run (the seeded latch).
     pub(crate) async fn index_seeded(

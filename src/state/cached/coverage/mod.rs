@@ -38,12 +38,13 @@
 //!   mutators after the lower write established the committed value). A covered
 //!   interval cannot be minted from provisional data.
 //! - **`CovVolatile`.** Coverage is spilled to the per-partition fjall `index`
-//!   keyspace, which is **epoch-scoped**: a fresh assignment (after crash or
-//!   rebalance) mints an **empty** keyspace and the old one is dropped at
-//!   revocation, so "stale coverage survives a crash" is unrepresentable — a
-//!   cold epoch trusts nothing uncovered. Coverage is authoritative only
-//!   *within* one assignment (exclusive partition ownership), never persisted
-//!   across epochs.
+//!   keyspace, which is **assignment-scoped**: every assignment's keyspaces are
+//!   born cold under a freshly minted name
+//!   ([`FjallClient::workspace`](crate::state::fjall::FjallClient::workspace)
+//!   owns that invariant) and dropped at revocation, so "stale coverage
+//!   survives a crash" is unrepresentable — a fresh assignment trusts nothing
+//!   uncovered. Coverage is authoritative only *within* one assignment
+//!   (exclusive partition ownership), never persisted across assignments.
 //! - **`GetNeverReadsOwnStaged`.** Cover-on-get reads the lower store on an
 //!   uncovered (or expired-covered) `get` and publishes the result. It is sound
 //!   because `get` is never called on a cell the current event already staged
@@ -85,8 +86,8 @@ use tokio::sync::Mutex;
 const LOCK_SHARDS: usize = 16;
 
 /// Sections whose materialized [`IntervalSet`] is memoized in RAM. Bounds the
-/// memo regardless of how many sections an epoch touches; an evicted section
-/// simply reloads from fjall on its next access.
+/// memo regardless of how many sections an assignment touches; an evicted
+/// section simply reloads from fjall on its next access.
 const MEMO_SECTIONS: usize = 1024;
 
 /// Per-partition scan coverage, keyed by `(CollectionId, Section)`, spilled to
@@ -106,10 +107,10 @@ const MEMO_SECTIONS: usize = 1024;
 ///
 /// The one-per-partition [`FjallCellCache`] handle is a cheap `Arc` clone of
 /// the one the [`Cached`](super::Cached) cache operates, so coverage shares the
-/// workspace's epoch lifecycle: cold (empty) at a fresh assignment
+/// workspace's lifecycle: cold (empty) at a fresh assignment
 /// (`CovVolatile`), dropped at revocation. Like the mutation locks, the memo
 /// is sound only because this `Coverage` (through its `Arc`-shared clones) is
-/// the workspace's **single owner** for the epoch — a second live instance
+/// the workspace's **single owner** for the assignment — a second live instance
 /// over the same keyspace would neither serialize with nor observe this one's
 /// mutations.
 ///
@@ -118,8 +119,8 @@ const MEMO_SECTIONS: usize = 1024;
 /// Every mutation is a whole-section load→mutate→store cycle; two interleaved
 /// cycles on one section would lose the first store, and a **lost punch
 /// resurrects stale coverage** — a wrong covered answer for the rest of the
-/// epoch. Per-key event serialization does **not** exclude this: session ops
-/// are `&self`, so one handler can hold two of them concurrently polled (a
+/// assignment. Per-key event serialization does **not** exclude this: session
+/// ops are `&self`, so one handler can hold two of them concurrently polled (a
 /// `join!`-ed flush and scan, a scan stream held across a get). Each mutation
 /// therefore serializes on a hash-sharded per-`(collection, section)` async
 /// lock, which also owns every **memo write**: a mutation refreshes the memo
@@ -142,7 +143,7 @@ pub struct Coverage {
 /// The shared coverage-mutation lock pool (see [`Coverage`]'s mutation-
 /// atomicity note): a fixed shard array indexed by the hash of
 /// `(collection, section)`, so it is bounded regardless of how many sections
-/// an epoch touches.
+/// an assignment touches.
 #[derive(Debug)]
 struct MutationLocks {
     hasher: RandomState,

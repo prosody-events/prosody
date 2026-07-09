@@ -21,7 +21,7 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
 };
 use crate::state::commit::{CommitManager, StoreTagSource};
-use crate::state::fjall::{AssignmentEpoch, FjallCellCache, FjallCellCacheError, FjallClient};
+use crate::state::fjall::{FjallCellCache, FjallCellCacheError, FjallClient};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{PartitionBackend, StateBackendFactory};
@@ -109,8 +109,7 @@ where
         partition: Partition,
         triggers: S,
     ) -> Result<Self::Backend, Self::Error> {
-        let epoch = AssignmentEpoch::mint();
-        let workspace = self.client.workspace(topic, partition, epoch)?;
+        let workspace = self.client.workspace(topic, partition)?;
         // The cache owns the workspace, holding it (and so its on-disk
         // partition) alive until the partition's state manager is dropped at
         // revocation.

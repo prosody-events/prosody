@@ -354,12 +354,12 @@ fn coverage_op_budget() -> Result<()> {
 }
 
 /// Warm survival within an assignment: a `Cached` rebuilt over the **same**
-/// fjall workspace (not a fresh epoch) is warm — its disk-backed provisional
-/// index and coverage both survive. The rebuilt cache's recovery sweep answers
-/// from the local fjall index with **zero** cold `provisional_cells` sweeps
-/// (only bounded warm point reads), and a covered `get` serves with zero lower
-/// reads. This is the in-assignment-warm proxy the crash case (a fresh epoch)
-/// is the cold complement of.
+/// fjall workspace (not a fresh assignment) is warm — its disk-backed
+/// provisional index and coverage both survive. The rebuilt cache's recovery
+/// sweep answers from the local fjall index with **zero** cold
+/// `provisional_cells` sweeps (only bounded warm point reads), and a covered
+/// `get` serves with zero lower reads. This is the in-assignment-warm proxy the
+/// crash case (a fresh assignment) is the cold complement of.
 #[test]
 fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -676,7 +676,7 @@ fn prop_memory_cached_crash_equivalence() {
         // oracle, so a crash drops coverage but not durable state.
         // `test_db::cold_cache` reuses the `crash` keyspace pair on the shared
         // database and CLEARS it (a cheap journal marker, no fsync) — modeling a
-        // fresh epoch without a keyspace creation per make. Distinct v4 segments
+        // fresh assignment without a keyspace creation per make. Distinct v4 segments
         // per iteration keep the shared keyspace's crashes disjoint.
         let make = || {
             let lower = MemoryCellStore::new(
@@ -788,13 +788,14 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
     })
 }
 
-/// `CovVolatile`: a cold restart (a fresh assignment epoch) trusts nothing
+/// `CovVolatile`: a cold restart (a fresh assignment) trusts nothing
 /// uncovered, so the next read falls through to the lower store. Coverage now
 /// spills to the per-partition fjall `index` keyspace, so a cold restart is a
-/// **fresh epoch** — a brand-new cache + index keyspace pair (the `"restart"`
-/// name), which is empty. Reusing the *same* workspace would be legitimately
-/// warm by design (the on-disk coverage survives within one assignment); the
-/// crash/rebalance case that must trust nothing is exactly the fresh epoch.
+/// **fresh assignment** — a brand-new cache + index keyspace pair (the
+/// `"restart"` name), which is empty. Reusing the *same* workspace would be
+/// legitimately warm by design (the on-disk coverage survives within one
+/// assignment); the crash/rebalance case that must trust nothing is exactly the
+/// fresh assignment.
 #[test]
 fn cov_volatile_cold_restart_falls_through() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -822,8 +823,8 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))])
             .await?;
 
-        // Cold restart = a fresh epoch: a new cache + index keyspace pair, so
-        // coverage is empty. The stale value from the old epoch's cache keyspace
+        // Cold restart = a fresh assignment: a new cache + index keyspace pair, so
+        // coverage is empty. The stale value from the old assignment's cache keyspace
         // is gone with it; the uncovered `get` falls through and self-heals to
         // `99`.
         let restarted = Cached::new(test_db::cache("restart")?, lower.clone());
@@ -942,7 +943,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
 /// coordinate — and a transiently-failing punch must **retry and land**, never
 /// be swallowed. Swallowed, the pre-promote `prev` stays covered and a covered
 /// `get` serves it verbatim (no read-side mismatch detection) for the rest of
-/// the epoch. Injects one coverage-rewrite failure via the `cover_store`
+/// the assignment. Injects one coverage-rewrite failure via the `cover_store`
 /// fault seam and asserts the promoted value is served after the promote.
 #[test]
 fn promote_punch_failure_never_freezes_stale_prev() -> Result<()> {

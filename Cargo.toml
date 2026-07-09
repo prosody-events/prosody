@@ -76,7 +76,7 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "parking_lot",
 ] }
-uuid = { version = "1.23", features = ["v5", "v8"] }
+uuid = { version = "1.23", features = ["v4", "v5", "v8"] }
 validator = { version = "0.20", features = ["derive"] }
 whoami = "2.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

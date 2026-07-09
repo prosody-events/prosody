@@ -8,6 +8,7 @@ use crate::util::from_env_with_fallback;
 use derive_builder::Builder;
 use std::path::{Path, PathBuf};
 use std::{env, process};
+use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 /// Environment variable for the local fjall workspace directory.
@@ -42,9 +43,10 @@ pub struct KeyedStateConfiguration {
     ///
     /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
     /// **must** set it — the cache is wiped on process restart, so the mount
-    /// needs no persistence. Defaults to a per-process temporary directory
-    /// so unconfigured consumers (and consumers that never register state)
-    /// work out of the box.
+    /// needs no persistence. Each live client needs its own directory (fjall
+    /// locks it exclusively). Defaults to a per-client temporary directory so
+    /// unconfigured consumers (and consumers that never register state) work
+    /// out of the box, even several in one process.
     ///
     /// Environment variable: `PROSODY_FJALL_CACHE_DIR`
     #[builder(default = "from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())?")]
@@ -153,10 +155,16 @@ impl KeyedStateConfiguration {
     }
 }
 
-/// Per-process fallback fjall workspace, used when [`FJALL_CACHE_DIR_ENV`] is
-/// unset. Wiped on restart, so it needs no persistence.
+/// Per-client fallback fjall workspace, used when [`FJALL_CACHE_DIR_ENV`] is
+/// unset. Wiped on restart, so it needs no persistence. The UUID suffix keeps
+/// two default-config clients in one process on independent databases —
+/// fjall locks the directory exclusively per live client.
 fn default_cache_dir() -> PathBuf {
-    env::temp_dir().join(format!("prosody-keyed-state-{}", process::id()))
+    env::temp_dir().join(format!(
+        "prosody-keyed-state-{}-{}",
+        process::id(),
+        Uuid::new_v4().simple()
+    ))
 }
 
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {

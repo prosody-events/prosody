@@ -121,7 +121,7 @@ const GAP_COVER_STRIDE: usize = 64;
 ///
 /// `Coverage` spills to the same per-partition fjall `index` keyspace, so it
 /// accumulates on disk (RAM bounded by fjall's block cache) and shares the
-/// workspace's epoch lifecycle — cold at a fresh assignment, dropped at
+/// workspace's lifecycle — cold at a fresh assignment, dropped at
 /// revocation (`CovVolatile`). It is a cheap `Arc`-backed handle, cloned with
 /// the stack per event.
 #[derive(Clone)]
@@ -173,7 +173,7 @@ impl<L> Cached<L> {
     /// cell. A covered hit is served verbatim with **no read-side mismatch
     /// detection**, so this punch is correctness, not a hint: swallowing a
     /// failure would freeze the pre-change value behind coverage for the rest
-    /// of the epoch. Retrying matches the durability posture elsewhere —
+    /// of the assignment. Retrying matches the durability posture elsewhere —
     /// a broken fjall self-heals when it recovers, and a genuinely stuck one
     /// visibly stalls rather than silently serving wrong answers.
     ///
@@ -602,7 +602,7 @@ where
         // The disk-backed warm provisional index gates the recovery sweep. Warm
         // (seeded): the local fjall snapshot answers with ZERO Cassandra queries
         // (the zero-query-on-quiescence goal); an empty snapshot yields nothing.
-        // Cold (a fresh epoch after crash/rebalance mints an empty `index`
+        // Cold (a fresh assignment after crash/rebalance mints an empty `index`
         // keyspace): the lower store's unconditional bounded `kind=Index` seed
         // runs (cost ∝ #provisional, never #cells), each coordinate is recorded
         // into fjall as it streams, and the collection is marked seeded.
@@ -656,7 +656,7 @@ where
                     }
                 }
             } else {
-                // Cold path taken (fresh epoch, or a warm read failed above).
+                // Cold path taken (fresh assignment, or a warm read failed above).
                 let inner = self.lower.provisional_cells(collection);
                 pin_mut!(inner);
                 let mut all_recorded = true;

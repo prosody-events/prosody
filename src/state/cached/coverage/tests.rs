@@ -369,7 +369,7 @@ fn prop_coverage_memo_matches_durable_spill() {
 /// whole-section load→mutate→store cycles: unserialized, the cover's store —
 /// computed from a load that still contained the punched coordinate — can land
 /// after the punch's store and resurrect its coverage, and a resurrected
-/// coordinate is served verbatim for the rest of the epoch. Per-key event
+/// coordinate is served verbatim for the rest of the assignment. Per-key event
 /// serialization does not exclude the race: one handler can hold two `&self`
 /// session ops concurrently polled (`join!`). Each round re-covers, races the
 /// two mutations on the multi-threaded runtime, and asserts the punch stuck.

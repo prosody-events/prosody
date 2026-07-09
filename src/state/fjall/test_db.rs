@@ -72,7 +72,7 @@ pub fn cache_with_clock(name: &str, clock: Clock) -> Result<FjallCellCache> {
 }
 
 /// A **cold** [`FjallCellCache`]: get-or-create the `name` keyspace pair, then
-/// [`clear`](Keyspace::clear) both — modeling a fresh assignment epoch (a cold
+/// [`clear`](Keyspace::clear) both — modeling a fresh assignment (a cold
 /// cache over the same warm durable backing) without a keyspace-creation
 /// `fsync`. Cache lookups key on `(segment, key, cell)`, never the keyspace
 /// name, so a cleared reused keyspace is byte-for-byte a brand-new one. The
