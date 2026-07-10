@@ -19,7 +19,7 @@
 
 use super::super::cached::Cached;
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::fjall::Clock;
 use super::super::fjall::test_db;
 use super::super::memory::{MemoryCellStore, MemoryCells};
@@ -40,7 +40,6 @@ use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -214,21 +213,23 @@ fn prop_memory_cached_overlay_view() {
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
-/// Collects a forward scan over `[start, end]` (inclusive), mapping each cell
-/// to its single coordinate byte.
-async fn scan_forward<S>(store: &S, id: &CollectionId, start: u8, end: Bound<u8>) -> Result<Vec<u8>>
+/// Collects a forward scan over `start` to `end`, mapping each cell to its
+/// single coordinate byte. A whole-section scan passes a `ScanEdge::Included`
+/// of a dominating sentinel (`255`) rather than an unbounded edge.
+async fn scan_forward<S>(
+    store: &S,
+    id: &CollectionId,
+    start: u8,
+    end: ScanEdge<u8>,
+) -> Result<Vec<u8>>
 where
     S: CellStore,
 {
     let start_c = Coordinate::from_bytes(vec![start]);
-    let end_c = match end {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(b) => Bound::Included(Coordinate::from_bytes(vec![b])),
-        Bound::Excluded(b) => Bound::Excluded(Coordinate::from_bytes(vec![b])),
-    };
+    let end_c = end.map(|b| Coordinate::from_bytes(vec![b]));
     let scan = Scan {
         section: SECTION,
-        start: Bound::Included(&start_c),
+        start: ScanEdge::Included(&start_c),
         dir: Direction::Forward,
         end: end_c.as_ref(),
         limit: None,
@@ -272,10 +273,10 @@ fn coverage_op_budget() -> Result<()> {
 
         // Warm the whole section with one unbounded scan (covering the gaps),
         // then verify a covered re-scan issues ZERO lower scans.
-        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm, vec![0, 2, 4, 6, 8]);
         counting.reset();
-        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let covered = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(covered, vec![0, 2, 4, 6, 8]);
         assert_eq!(
             counting.lower_scans(),
@@ -308,7 +309,7 @@ fn coverage_op_budget() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(4), Some(bytes(40)))])
             .await?;
         counting.reset();
-        let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let after = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(after, vec![0, 2, 4, 6, 8]);
         assert_eq!(
             counting.lower_scans(),
@@ -334,7 +335,7 @@ fn coverage_op_budget() -> Result<()> {
         // scan issues one gap query, then a covered re-scan issues zero.
         let other = collection("budget-cold")?;
         counting.reset();
-        let uncovered = scan_forward(&cached, &other, 0, Bound::Included(20)).await?;
+        let uncovered = scan_forward(&cached, &other, 0, ScanEdge::Included(20)).await?;
         assert!(uncovered.is_empty());
         assert_eq!(
             counting.lower_scans(),
@@ -342,7 +343,7 @@ fn coverage_op_budget() -> Result<()> {
             "a never-covered range falls through once"
         );
         counting.reset();
-        let _ = scan_forward(&cached, &other, 0, Bound::Included(20)).await?;
+        let _ = scan_forward(&cached, &other, 0, ScanEdge::Included(20)).await?;
         assert_eq!(
             counting.lower_scans(),
             0,
@@ -619,12 +620,12 @@ fn coverage_scan_isolation() -> Result<()> {
         // fall-through and the warm covered serve are checked.
         for _ in 0..2u32 {
             assert_eq!(
-                scan_forward(&cached, &a, 0, Bound::Unbounded).await?,
+                scan_forward(&cached, &a, 0, ScanEdge::Included(255)).await?,
                 vec![10, 20, 30],
                 "scan of A's section must not bleed into B or the decoy section"
             );
             assert_eq!(
-                scan_forward(&cached, &b, 0, Bound::Unbounded).await?,
+                scan_forward(&cached, &b, 0, ScanEdge::Included(255)).await?,
                 vec![40, 50]
             );
         }
@@ -652,9 +653,9 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
         }
         // Warm coverage, then a fully covered re-scan from fjall must yield all
         // N cells.
-        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm.len(), usize::from(N));
-        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let covered = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(covered.len(), usize::from(N));
         assert!(covered.iter().copied().eq(0..N));
         Ok(())
@@ -1352,10 +1353,10 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
                 .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
                 .await?;
         }
-        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm, vec![3, 5, 7]);
         lower.reset();
-        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let covered = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(covered, vec![3, 5, 7]);
         assert_eq!(lower.lower_scans(), 0, "a live covered scan reads nothing");
 
@@ -1364,7 +1365,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         // coordinate as absent (Cov1).
         now.store(NOW_EXPIRED, Ordering::Relaxed);
         lower.reset();
-        let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let after = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(
             after,
             vec![3, 5, 7],

@@ -60,7 +60,7 @@
 use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellSession;
@@ -76,7 +76,6 @@ use internment::Intern;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
-use std::ops::Bound;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
 
@@ -857,20 +856,20 @@ where
     /// at the first error.
     pub(crate) fn scan<'a>(
         &'a self,
-        start: Bound<&'a KeyOf<T>>,
+        start: ScanEdge<&'a KeyOf<T>>,
         dir: Direction,
-        end: Bound<&'a KeyOf<T>>,
+        end: ScanEdge<&'a KeyOf<T>>,
         limit: Option<usize>,
     ) -> impl Stream<Item = ScanItem<T>> + Send + 'a {
         try_stream! {
             ensure_live(self.scope.session())?;
             let session = self.scope.session();
-            // Encode the direction-relative bounds once, here — the owned
+            // Encode the direction-relative edges once, here — the owned
             // coordinates outlive the scan the generator drives to completion
             // below. (`Scan::start`/`end` follow `dir`; `Scan` itself derives
             // the byte-order low/high.)
-            let start = encode_bound::<T::Key>(start);
-            let end = encode_bound::<T::Key>(end);
+            let start = encode_edge::<T::Key>(start);
+            let end = encode_edge::<T::Key>(end);
             let scan = Scan {
                 section: self.section,
                 start: start.as_ref(),
@@ -1010,15 +1009,11 @@ pub(in crate::state::descriptor) fn encode_cell<C: Codec>(
     Ok(buf)
 }
 
-/// Lowers a typed scan bound to its order-preserving coordinate bound. Called
+/// Lowers a typed scan edge to its order-preserving coordinate edge. Called
 /// once per scan, on the stream's first poll; the owned coordinate — not the
 /// borrowed key — is what the running scan holds.
-fn encode_bound<K: OrderedKeyCodec>(bound: Bound<&K::Key>) -> Bound<Coordinate> {
-    match bound {
-        Bound::Included(key) => Bound::Included(K::encode(key)),
-        Bound::Excluded(key) => Bound::Excluded(K::encode(key)),
-        Bound::Unbounded => Bound::Unbounded,
-    }
+fn encode_edge<K: OrderedKeyCodec>(edge: ScanEdge<&K::Key>) -> ScanEdge<Coordinate> {
+    edge.map(K::encode)
 }
 
 /// Guards every cell operation: a session whose partition is shutting

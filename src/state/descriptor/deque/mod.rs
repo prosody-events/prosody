@@ -51,7 +51,7 @@ use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
-use crate::state::cell_key::{Direction, Section};
+use crate::state::cell_key::{Direction, ScanEdge, Section};
 use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -60,7 +60,6 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
-use std::ops::Bound;
 use thiserror::Error;
 
 /// The deque's head/tail meta codec: two big-endian `i64`s composed with no
@@ -204,8 +203,9 @@ where
     /// Streams the live elements in index order — front to back for
     /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
     /// element is resolved as it is yielded. See the module's dense-window
-    /// invariant: the scan anchors at the window's leading edge and stops after
-    /// `len` cells, so a popped tombstone is never yielded.
+    /// invariant: the scan is bounded to the window `[head, tail − 1]`, so a
+    /// popped tombstone (below `head` or at/above `tail`) is never yielded;
+    /// `limit = len` is a belt-and-braces backstop over the fully-known window.
     pub fn stream(
         &self,
         dir: Direction,
@@ -216,18 +216,19 @@ where
             if len == 0 {
                 return;
             }
-            // The leading-edge index: `head` forward, the last live index
-            // `tail − 1` backward (`len > 0` proves it does not underflow).
-            let anchor = match dir {
-                Direction::Forward => window.head,
-                Direction::Backward => window
-                    .tail
-                    .checked_sub(1)
-                    .ok_or(MetaDecodeError::IndexOverflow)?,
+            // Anchor both edges on the window: front `head` to back `tail − 1`
+            // (`len > 0` proves `tail − 1` does not underflow), mirrored
+            // backward.
+            let head = window.head;
+            let last = window
+                .tail
+                .checked_sub(1)
+                .ok_or(MetaDecodeError::IndexOverflow)?;
+            let (start, end) = match dir {
+                Direction::Forward => (ScanEdge::Included(&head), ScanEdge::Included(&last)),
+                Direction::Backward => (ScanEdge::Included(&last), ScanEdge::Included(&head)),
             };
-            let inner = self
-                .entries
-                .scan(Bound::Included(&anchor), dir, Bound::Unbounded, Some(len));
+            let inner = self.entries.scan(start, dir, end, Some(len));
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 // The scan yields the decoded index; the dense window makes it
@@ -395,7 +396,7 @@ where
 /// The [`MetaCodec`] validates the wire *form* (exactly 16 bytes); this type
 /// validates the *meaning* (`head ≤ tail`), so a disordered window is
 /// unrepresentable past the meta boundary. It is deliberately not named
-/// `Bounds`: [`std::ops::Bound`] is in scope.
+/// `Bounds`, to avoid confusion with [`std::ops::Bound`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Window {
     head: i64,

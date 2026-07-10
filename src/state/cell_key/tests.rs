@@ -6,9 +6,8 @@
 //! per-collection discriminant freeze and unknown-rejection lives with the
 //! collection section enums, not in the cell core.
 
-use super::{CellKey, Coordinate, Direction, Scan, Section};
+use super::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use quickcheck::QuickCheck;
-use std::ops::Bound;
 
 /// [`CellKey`] orders by `(section, coordinate)`: the section discriminant
 /// dominates, then the unsigned-lexicographic coordinate bytes break ties.
@@ -48,20 +47,21 @@ fn coordinate_empty_is_least() {
 }
 
 /// Construction smoke for [`Scan`]: the required `section` field and the
-/// direction-relative `start`/`end` bounds line up and read back.
+/// direction-relative `start`/`end` edges line up and read back.
 #[test]
 fn scan_construction_carries_section_and_start() {
     let start = Coordinate::empty();
+    let end = Coordinate::from_bytes(vec![9u8]);
     let scan = Scan {
         section: Section::new(1),
-        start: Bound::Included(&start),
+        start: ScanEdge::Included(&start),
         dir: Direction::Forward,
-        end: Bound::Unbounded,
+        end: ScanEdge::Excluded(&end),
         limit: Some(10),
     };
     assert_eq!(scan.section, Section::new(1));
     assert_eq!(scan.dir, Direction::Forward);
-    assert_eq!(scan.start, Bound::Included(&start));
-    assert_eq!(scan.end, Bound::Unbounded);
+    assert_eq!(scan.start, ScanEdge::Included(&start));
+    assert_eq!(scan.end, ScanEdge::Excluded(&end));
     assert_eq!(scan.limit, Some(10));
 }

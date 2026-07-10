@@ -107,43 +107,121 @@ pub enum Direction {
     Backward,
 }
 
-/// A single-section cell scan request over a half-open / closed coordinate
-/// range.
+/// One concrete edge of a [`Scan`]: an inclusive or exclusive endpoint at a
+/// known coordinate. There is deliberately **no unbounded variant** — every
+/// cell scan is pinned to a concrete start *and* end, so a scan can never walk
+/// past a collection's known-live extent into a tombstone field. Making the
+/// unbounded case unrepresentable is the type-level enforcement of that rule
+/// (the twin of the timer system's watermark bound).
 ///
-/// `section` is required, so a cross-section scan cannot be constructed. The
-/// `start`/`end` [`Bound`]s are **direction-relative**: forward walks from
-/// `start` (the low side) toward `end` (the high side); backward walks from
-/// `start` (the high side) toward `end` (the low side). `Unbounded` on either
-/// side runs to the section edge in that direction.
-///
-/// The exclusive bounds exist for the coverage cache's gap fall-through: the
+/// The exclusive edge exists for the coverage cache's gap fall-through: the
 /// open `(p, q)` interval between two separately-covered sub-ranges (whose
 /// endpoints `p`/`q` are already covered) is exactly an `Excluded`/`Excluded`
 /// scan, and a punched singleton `{X}` is `Included(X)`/`Included(X)`.
+///
+/// Generic over the borrowed inner so the same type serves a [`Scan`]'s
+/// `ScanEdge<&Coordinate>` and the typed cell view's `ScanEdge<&Key>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanEdge<T> {
+    /// The endpoint coordinate is part of the range.
+    Included(T),
+
+    /// The endpoint coordinate is excluded from the range.
+    Excluded(T),
+}
+
+impl<T> ScanEdge<T> {
+    /// The endpoint coordinate, regardless of inclusivity.
+    #[must_use]
+    pub fn coordinate(&self) -> &T {
+        match self {
+            Self::Included(t) | Self::Excluded(t) => t,
+        }
+    }
+
+    /// Borrows the inner value, preserving inclusivity.
+    #[must_use]
+    pub fn as_ref(&self) -> ScanEdge<&T> {
+        match self {
+            Self::Included(t) => ScanEdge::Included(t),
+            Self::Excluded(t) => ScanEdge::Excluded(t),
+        }
+    }
+
+    /// Maps the inner value, preserving inclusivity.
+    #[must_use]
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> ScanEdge<U> {
+        match self {
+            Self::Included(t) => ScanEdge::Included(f(t)),
+            Self::Excluded(t) => ScanEdge::Excluded(f(t)),
+        }
+    }
+
+    /// Recovers a [`ScanEdge`] from a [`Bound`], or `None` for the unbounded
+    /// case a `ScanEdge` cannot represent. The one lossy direction; every
+    /// bounded bound round-trips.
+    #[must_use]
+    pub fn from_bound(bound: Bound<T>) -> Option<Self> {
+        match bound {
+            Bound::Included(t) => Some(Self::Included(t)),
+            Bound::Excluded(t) => Some(Self::Excluded(t)),
+            Bound::Unbounded => None,
+        }
+    }
+}
+
+impl<T: Clone> ScanEdge<&T> {
+    /// Clones the borrowed inner, parallelling [`Bound::cloned`].
+    #[must_use]
+    pub fn cloned(self) -> ScanEdge<T> {
+        match self {
+            Self::Included(t) => ScanEdge::Included(t.clone()),
+            Self::Excluded(t) => ScanEdge::Excluded(t.clone()),
+        }
+    }
+}
+
+impl<T> From<ScanEdge<T>> for Bound<T> {
+    fn from(edge: ScanEdge<T>) -> Self {
+        match edge {
+            ScanEdge::Included(t) => Bound::Included(t),
+            ScanEdge::Excluded(t) => Bound::Excluded(t),
+        }
+    }
+}
+
+/// A single-section cell scan request over a bounded coordinate range.
+///
+/// `section` is required, so a cross-section scan cannot be constructed. The
+/// `start`/`end` [`ScanEdge`]s are **direction-relative**: forward walks from
+/// `start` (the low side) toward `end` (the high side); backward walks from
+/// `start` (the high side) toward `end` (the low side). Both edges are
+/// concrete — a `ScanEdge` has no unbounded variant — so a scan is always
+/// pinned to a known coordinate range.
 #[derive(Clone, Copy)]
 pub struct Scan<'a> {
     /// The section whose cells the scan walks.
     pub section: Section,
 
-    /// The bound the scan starts walking from (low side forward, high side
+    /// The edge the scan starts walking from (low side forward, high side
     /// backward).
-    pub start: Bound<&'a Coordinate>,
+    pub start: ScanEdge<&'a Coordinate>,
 
     /// The direction the scan walks from `start`.
     pub dir: Direction,
 
-    /// The bound the scan stops at (high side forward, low side backward).
-    pub end: Bound<&'a Coordinate>,
+    /// The edge the scan stops at (high side forward, low side backward).
+    pub end: ScanEdge<&'a Coordinate>,
 
     /// The optional maximum number of cells to yield.
     pub limit: Option<usize>,
 }
 
 impl Scan<'_> {
-    /// The scan's direction-relative bounds resolved to absolute `(low, high)`:
+    /// The scan's direction-relative edges resolved to absolute `(low, high)`:
     /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]
-    pub fn low_high(&self) -> (Bound<&Coordinate>, Bound<&Coordinate>) {
+    pub fn low_high(&self) -> (ScanEdge<&Coordinate>, ScanEdge<&Coordinate>) {
         match self.dir {
             Direction::Forward => (self.start, self.end),
             Direction::Backward => (self.end, self.start),
@@ -167,21 +245,19 @@ impl Scan<'_> {
     }
 }
 
-/// Whether `coordinate` is at or above the low `bound`.
-fn above_low(coordinate: &Coordinate, bound: Bound<&Coordinate>) -> bool {
-    match bound {
-        Bound::Unbounded => true,
-        Bound::Included(lo) => coordinate >= lo,
-        Bound::Excluded(lo) => coordinate > lo,
+/// Whether `coordinate` is at or above the low `edge`.
+fn above_low(coordinate: &Coordinate, edge: ScanEdge<&Coordinate>) -> bool {
+    match edge {
+        ScanEdge::Included(lo) => coordinate >= lo,
+        ScanEdge::Excluded(lo) => coordinate > lo,
     }
 }
 
-/// Whether `coordinate` is at or below the high `bound`.
-fn below_high(coordinate: &Coordinate, bound: Bound<&Coordinate>) -> bool {
-    match bound {
-        Bound::Unbounded => true,
-        Bound::Included(hi) => coordinate <= hi,
-        Bound::Excluded(hi) => coordinate < hi,
+/// Whether `coordinate` is at or below the high `edge`.
+fn below_high(coordinate: &Coordinate, edge: ScanEdge<&Coordinate>) -> bool {
+    match edge {
+        ScanEdge::Included(hi) => coordinate <= hi,
+        ScanEdge::Excluded(hi) => coordinate < hi,
     }
 }
 

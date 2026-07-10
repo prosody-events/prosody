@@ -52,7 +52,7 @@ pub use workspace::{FjallClient, FjallClientError, FjallWorkspace};
 use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
@@ -997,25 +997,21 @@ fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
     }
 }
 
-/// The fjall byte key bound opening a covered scan's low side. `Unbounded`
-/// starts at the section prefix itself (the least key in the section); a
-/// bounded coordinate appends to the prefix, preserving exclusivity.
-fn byte_low_bound(section_prefix: &[u8], lo: Bound<&Coordinate>) -> Bound<Vec<u8>> {
+/// The fjall byte key bound opening a covered scan's low side. The edge's
+/// coordinate appends to the section prefix, preserving exclusivity.
+fn byte_low_bound(section_prefix: &[u8], lo: ScanEdge<&Coordinate>) -> Bound<Vec<u8>> {
     match lo {
-        Bound::Unbounded => Bound::Included(section_prefix.to_vec()),
-        Bound::Included(c) => Bound::Included(byte_key(section_prefix, c)),
-        Bound::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
+        ScanEdge::Included(c) => Bound::Included(byte_key(section_prefix, c)),
+        ScanEdge::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
     }
 }
 
-/// The fjall byte key bound closing a covered scan's high side. `Unbounded`
-/// stops at the section's upper boundary (the successor prefix), so the scan
-/// never crosses into the next section or another collection.
-fn byte_high_bound(section_prefix: &[u8], hi: Bound<&Coordinate>) -> Bound<Vec<u8>> {
+/// The fjall byte key bound closing a covered scan's high side. The edge's
+/// coordinate appends to the section prefix, preserving exclusivity.
+fn byte_high_bound(section_prefix: &[u8], hi: ScanEdge<&Coordinate>) -> Bound<Vec<u8>> {
     match hi {
-        Bound::Unbounded => section_upper_bound(section_prefix),
-        Bound::Included(c) => Bound::Included(byte_key(section_prefix, c)),
-        Bound::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
+        ScanEdge::Included(c) => Bound::Included(byte_key(section_prefix, c)),
+        ScanEdge::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
     }
 }
 
@@ -1026,20 +1022,4 @@ fn byte_key(section_prefix: &[u8], coordinate: &Coordinate) -> Vec<u8> {
     key.extend_from_slice(section_prefix);
     key.extend_from_slice(coordinate);
     key
-}
-
-/// The smallest byte key strictly greater than every key carrying
-/// `section_prefix` — the lexicographic successor (increment the rightmost
-/// non-`0xFF` byte, drop the tail). An all-`0xFF` prefix has no successor, so
-/// the scan runs unbounded-high (the per-item prefix check then stops it).
-fn section_upper_bound(section_prefix: &[u8]) -> Bound<Vec<u8>> {
-    let mut bound = section_prefix.to_vec();
-    while let Some(last) = bound.last_mut() {
-        if *last < u8::MAX {
-            *last += 1;
-            return Bound::Excluded(bound);
-        }
-        bound.pop();
-    }
-    Bound::Unbounded
 }

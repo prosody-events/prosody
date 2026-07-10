@@ -28,15 +28,16 @@
 //! `set` ratchets the min/max bounds **outward only** and never reads the entry
 //! being written, so a blind last-writer-wins entry write is preserved and the
 //! bounds may name a key that was since removed — a *superset* of the live key
-//! range, never a subset. `stream` anchors its scan at the bound on its leading
-//! edge — the min bound for a forward (ascending) scan, the max for a backward
-//! (descending) one — each falling back to the section edge (`Unbounded`) when
-//! its bound is missing or expired, and relies on the store hiding cleared
-//! cells, so it yields exactly the live entries in key order regardless of
-//! stale bounds: a residue beyond the live range is never reached, a live key
-//! can never sit outside its bound, and the missing-bound fallback scans from
-//! the edge. The bounds are therefore self-healing — never an exact count, by
-//! design (a count would force a read-before-write on every mutation).
+//! range, never a subset. `stream` anchors **both** edges of its scan on the
+//! bounds — `[min, max]` ascending, mirrored descending — reading them
+//! concurrently, and relies on the store hiding cleared cells, so it yields
+//! exactly the live entries in key order regardless of stale bounds: a residue
+//! beyond the live range is never reached, and a live key can never sit outside
+//! its bounds, so bounding the scan to `[min, max]` drops no entry. When either
+//! bound is absent the map holds no live entries (see the TTL-refresh
+//! invariant), so no scan is issued at all. The bounds are therefore
+//! self-healing — never an exact count, by design (a count would force a
+//! read-before-write on every mutation).
 //!
 //! # Invariant: on a TTL'd map the bounds outlive every entry
 //!
@@ -57,7 +58,7 @@ use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
-use crate::state::cell_key::{Coordinate, Direction, Section};
+use crate::state::cell_key::{Coordinate, Direction, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -66,7 +67,6 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
-use std::ops::Bound;
 use thiserror::Error;
 
 /// The `Meta` section, holding the two bound cells.
@@ -235,21 +235,28 @@ where
     /// Streams the live entries in key order — ascending for
     /// [`Direction::Forward`], descending for [`Direction::Backward`]. Each
     /// entry's value is resolved as it is yielded, and the entries view decodes
-    /// each yielded key, so the anchor bound is a logical key rather than a
-    /// coordinate. See the module's loose-superset invariant: a stale bound
-    /// never drops a live entry, it only ever costs an extra
-    /// scanned-but-cleared cell.
+    /// each yielded key, so the anchors are logical keys rather than
+    /// coordinates. See the module's loose-superset invariant: the scan is
+    /// bounded to `[min, max]`, so a stale bound never drops a live entry, it
+    /// only ever costs an extra scanned-but-cleared cell. When either bound is
+    /// absent the map holds no live entries, so no scan is issued.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         try_stream! {
-            // Anchor at the bound on the scan's leading edge — the min bound for
-            // `Forward`, the max for `Backward` — falling back to the section
-            // edge (`Unbounded`) when that bound is missing or expired.
-            let anchor = match dir {
-                Direction::Forward => self.read_bound(MapBound::Min).await?,
-                Direction::Backward => self.read_bound(MapBound::Max).await?,
+            // Anchor both edges on the bounds, read concurrently. Both present
+            // or both absent are the only states (extend-only writes + the
+            // TTL-refresh invariant); both absent ⇒ empty map ⇒ no scan.
+            let (min, max) = tokio::try_join!(
+                self.read_bound(MapBound::Min),
+                self.read_bound(MapBound::Max)
+            )?;
+            let (Some(min), Some(max)) = (min, max) else {
+                return;
             };
-            let start = anchor.as_ref().map_or(Bound::Unbounded, Bound::Included);
-            let inner = self.entries.scan(start, dir, Bound::Unbounded, None);
+            let (start, end) = match dir {
+                Direction::Forward => (ScanEdge::Included(&min), ScanEdge::Included(&max)),
+                Direction::Backward => (ScanEdge::Included(&max), ScanEdge::Included(&min)),
+            };
+            let inner = self.entries.scan(start, dir, end, None);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item?;
@@ -421,8 +428,8 @@ where
 }
 
 /// Test-only: the entry cell at key coordinate `coordinate`, so a test can
-/// seed raw entries directly (entries with a missing bound) and prove the
-/// missing-bound fallback against the real store.
+/// seed raw entry cells directly — including a coordinate that does not decode
+/// as the collection's key codec — to exercise the real store's scan path.
 #[cfg(test)]
 pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
     CellKey {

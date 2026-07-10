@@ -17,7 +17,7 @@ use super::{
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::fjall::test_db;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
@@ -37,7 +37,6 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
-use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -266,11 +265,15 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
                 .is_some(),
             "the committed cell reads back present",
         );
+        // A concrete edge pair dominating every 4-byte `cell_i` coordinate
+        // (all begin `0x00`) — a whole-section scan with `ScanEdge`.
+        let low = Coordinate::empty();
+        let high = Coordinate::from_bytes(vec![0xFF, 0xFF, 0xFF, 0xFF]);
         let scan = Scan {
             section: Section::new(0),
-            start: Bound::Unbounded,
+            start: ScanEdge::Included(&low),
             dir: Direction::Forward,
-            end: Bound::Unbounded,
+            end: ScanEdge::Included(&high),
             limit: None,
         };
         let stream = store.scan_cells(c.id(), scan, event(1));
@@ -1005,11 +1008,15 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
             let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
             (committed.into_inner(), co_expiry)
         } else {
+            // A concrete edge pair covering the single value cell (empty
+            // coordinate) — a whole-section scan with `ScanEdge`.
+            let low = Coordinate::empty();
+            let high = Coordinate::from_bytes(vec![0xFF, 0xFF, 0xFF, 0xFF]);
             let scan = Scan {
                 section: Section::new(0),
-                start: Bound::Unbounded,
+                start: ScanEdge::Included(&low),
                 dir: Direction::Forward,
-                end: Bound::Unbounded,
+                end: ScanEdge::Included(&high),
                 limit: None,
             };
             let stream = store.scan_for_cache(c.id(), scan, event(2));

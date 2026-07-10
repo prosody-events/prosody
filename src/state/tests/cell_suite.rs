@@ -33,7 +33,7 @@
 //!   is the resolved committed base, the same path `finalize` uses.
 
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::dirty::DirtyStore;
 use super::super::identity::{CollectionId, CollectionRef};
 use super::super::oracle::CommitOracle;
@@ -51,7 +51,6 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
-use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
@@ -837,7 +836,7 @@ struct ScanReq {
     forward: bool,
     start_excl: bool,
     end_excl: bool,
-    end: Option<u8>,
+    end: u8,
     limit: Option<u8>,
     partial: Option<u8>,
 }
@@ -853,7 +852,7 @@ impl Arbitrary for ScanReq {
             // and the open `(p, q)` intervals coverage stitching produces.
             start_excl: bool::arbitrary(g),
             end_excl: bool::arbitrary(g),
-            end: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
+            end: u8::arbitrary(g) % (CELLS + 1),
             // Includes 0 and values > the cell count.
             limit: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 4)),
             partial: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
@@ -908,28 +907,27 @@ fn in_scan_range(req: ScanReq, c: u8) -> bool {
         (false, false) => c <= req.start,
         (false, true) => c < req.start,
     };
-    let within_end = req.end.is_none_or(|end| match (req.forward, req.end_excl) {
-        (true, false) => c <= end,
-        (true, true) => c < end,
-        (false, false) => c >= end,
-        (false, true) => c > end,
-    });
+    let within_end = match (req.forward, req.end_excl) {
+        (true, false) => c <= req.end,
+        (true, true) => c < req.end,
+        (false, false) => c >= req.end,
+        (false, true) => c > req.end,
+    };
     on_start_side && within_end
 }
 
 /// Builds the [`Scan`] request from a [`ScanReq`] and owned anchor coordinates.
-/// `req.start_excl`/`req.end_excl` choose the bound exclusivity; an absent
-/// `end` is `Unbounded`.
-fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: Option<&'a Coordinate>) -> Scan<'a> {
+/// `req.start_excl`/`req.end_excl` choose the edge exclusivity.
+fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: &'a Coordinate) -> Scan<'a> {
     let start = if req.start_excl {
-        Bound::Excluded(start)
+        ScanEdge::Excluded(start)
     } else {
-        Bound::Included(start)
+        ScanEdge::Included(start)
     };
-    let end = match end {
-        Some(end) if req.end_excl => Bound::Excluded(end),
-        Some(end) => Bound::Included(end),
-        None => Bound::Unbounded,
+    let end = if req.end_excl {
+        ScanEdge::Excluded(end)
+    } else {
+        ScanEdge::Included(end)
     };
     Scan {
         section: SECTION,
@@ -958,8 +956,8 @@ where
     S: CellStore,
 {
     let start = Coordinate::from_bytes(vec![req.start]);
-    let end = req.end.map(|e| Coordinate::from_bytes(vec![e]));
-    let stream = overlay.scan_cells(id, scan_of(*req, &start, end.as_ref()), own);
+    let end = Coordinate::from_bytes(vec![req.end]);
+    let stream = overlay.scan_cells(id, scan_of(*req, &start, &end), own);
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while take.is_none_or(|k| out.len() < k)
@@ -1012,8 +1010,8 @@ where
             ScanStep::Scan(req) => {
                 let expected = scan_oracle(&model, req);
                 let start = Coordinate::from_bytes(vec![req.start]);
-                let end = req.end.map(|e| Coordinate::from_bytes(vec![e]));
-                let stream = store.scan_cells(&id, scan_of(req, &start, end.as_ref()), own);
+                let end = Coordinate::from_bytes(vec![req.end]);
+                let stream = store.scan_cells(&id, scan_of(req, &start, &end), own);
                 futures::pin_mut!(stream);
                 let mut got = Vec::new();
                 while let Some(item) = stream.next().await {

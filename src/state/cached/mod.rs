@@ -86,7 +86,7 @@ mod coverage;
 use self::coverage::{Coverage, Interval, Piece};
 use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, CoverDecision, FjallCellCache, ScanHit};
 use super::identity::{CollectionId, CollectionRef};
@@ -370,9 +370,12 @@ where
         limit: Option<usize>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         try_stream! {
-            let covered = self
-                .fjall
-                .scan_present(collection, scan_for_piece(section, piece, dir, limit));
+            // A piece of a bounded request is always bounded, so `scan_for_piece`
+            // is `Some`; a `None` would mean an unbounded piece, served as empty.
+            let Some(scan) = scan_for_piece(section, piece, dir, limit) else {
+                return;
+            };
+            let covered = self.fjall.scan_present(collection, scan);
             pin_mut!(covered);
             let mut last: Option<Coordinate> = None;
             // Set when the covered serve must hand the remainder to the lower
@@ -434,7 +437,12 @@ where
             // read as exhaustion below and over-cover the unscanned tail. The
             // stream is lazy, so a limited caller dropping it early stops the
             // lower paging anyway.
-            let scan = scan_for_piece(section, piece, dir, None);
+            // A piece of a bounded request is always bounded (see
+            // `scan_for_piece`); a `None` would mean an unbounded piece, served
+            // as empty.
+            let Some(scan) = scan_for_piece(section, piece, dir, None) else {
+                return;
+            };
             let inner = self.lower.scan_for_cache(collection, scan, own);
             pin_mut!(inner);
             let mut contiguous = true;
@@ -542,7 +550,10 @@ where
         // direction-relative bounds map onto it (start = low forward / high
         // backward).
         let (lo, hi) = scan.low_high();
-        let request = Interval::new(lo.cloned(), hi.cloned());
+        // Every scan edge is concrete; the total `ScanEdge → Bound` conversion
+        // builds the coverage request the `IntervalSet` speaks (which keeps its
+        // own `Bound` endpoints — unaffected by the bounded-scan retype).
+        let request = Interval::new(lo.cloned().into(), hi.cloned().into());
         try_stream! {
             // An empty request (e.g. `(a, a)`) yields nothing.
             let Some(request) = request else {
@@ -923,23 +934,30 @@ fn group_by_section<'c>(cells: impl Iterator<Item = &'c CellKey>) -> SectionGrou
 /// `low → high`, backward `high → low`. `limit` is an optional per-piece cap
 /// on the covered serve; the stitched scan still applies the merged-output
 /// limit across pieces, and the gap serve must pass `None` (see `serve_gap`).
+///
+/// Returns `None` only when a piece endpoint is unbounded — which cannot
+/// happen here: `scan_cells` clamps every emitted piece to the bounded request
+/// (`query` intersects each interval with the concrete request bounds), so a
+/// bounded request yields only bounded pieces. The `Option` keeps that
+/// unreachability total (no `unwrap`/`panic`); callers short-circuit a `None`
+/// piece to an empty sub-stream.
 fn scan_for_piece(
     section: Section,
     piece: &Interval,
     dir: Direction,
     limit: Option<usize>,
-) -> Scan<'_> {
+) -> Option<Scan<'_>> {
     let (start, end) = match dir {
         Direction::Forward => (piece.low(), piece.high()),
         Direction::Backward => (piece.high(), piece.low()),
     };
-    Scan {
+    Some(Scan {
         section,
-        start,
+        start: ScanEdge::from_bound(start)?,
         dir,
-        end,
+        end: ScanEdge::from_bound(end)?,
         limit,
-    }
+    })
 }
 
 /// The covered piece's sub-range still unserved after a fjall error/expiry at

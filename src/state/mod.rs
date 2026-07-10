@@ -12,7 +12,7 @@
 //! * [`identity`] — collection identity ([`CollectionId`], [`CollectionRef`],
 //!   [`StateKey`], [`CollectionKindId`], …).
 //! * [`cell_key`] — intra-collection cell addressing ([`CellKey`], [`Section`],
-//!   [`Coordinate`], [`Scan`]).
+//!   [`Coordinate`], [`Scan`], [`ScanEdge`]).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
@@ -78,7 +78,7 @@ pub mod store;
 pub(crate) mod tests;
 
 pub use access::StateAccessError;
-pub use cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+pub use cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,

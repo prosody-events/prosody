@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `Unbounded` found for enum `ScanEdge<T>` in the current scope
+  --> tests/compile_fail/scan_edge_has_no_unbounded.rs:16:24
+   |
+16 |         end: ScanEdge::Unbounded,
+   |                        ^^^^^^^^^ variant, associated function, or constant not found in `ScanEdge<_>`

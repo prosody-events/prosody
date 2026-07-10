@@ -11,7 +11,7 @@
 
 use super::coverage::Interval;
 use super::{Cached, Direction, GAP_COVER_STRIDE, remainder_after};
-use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Scan, ScanEdge, Section};
 use crate::state::event_ref::EventRef;
 use crate::state::fjall::test_db;
 use crate::state::identity::{CollectionId, CollectionRef, StateKey, StateName, StateType};
@@ -97,21 +97,17 @@ fn error_at_the_far_endpoint_leaves_no_remainder() -> Result<()> {
 async fn scan_take<L>(
     cached: &Cached<L>,
     id: &CollectionId,
-    end: Bound<u8>,
+    end: ScanEdge<u8>,
     take: usize,
 ) -> Result<Vec<u8>>
 where
     L: CellStore,
 {
     let start = c(0);
-    let end = match end {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(b) => Bound::Included(c(b)),
-        Bound::Excluded(b) => Bound::Excluded(c(b)),
-    };
+    let end = end.map(c);
     let scan = Scan {
         section: Section::new(0),
-        start: Bound::Included(&start),
+        start: ScanEdge::Included(&start),
         dir: Direction::Forward,
         end: end.as_ref(),
         limit: None,
@@ -170,13 +166,13 @@ fn gap_frontier_persists_mid_stream_and_never_over_covers() -> Result<()> {
         let cached = Cached::new(test_db::cache("frontier")?, counting.clone());
 
         // Drain part of the gap fill, then drop the stream mid-piece.
-        let partial = scan_take(&cached, &id, Bound::Unbounded, consumed).await?;
+        let partial = scan_take(&cached, &id, ScanEdge::Included(255), consumed).await?;
         assert_eq!(partial.len(), consumed);
 
         // The persisted frontier `[0, boundary]` serves covered: zero lower
         // scans.
         counting.reset();
-        let prefix = scan_take(&cached, &id, Bound::Included(boundary), usize::MAX).await?;
+        let prefix = scan_take(&cached, &id, ScanEdge::Included(boundary), usize::MAX).await?;
         assert_eq!(prefix.len(), GAP_COVER_STRIDE);
         assert_eq!(
             counting.lower_scans(),
@@ -188,7 +184,7 @@ fn gap_frontier_persists_mid_stream_and_never_over_covers() -> Result<()> {
         // unpersisted tail reads as a gap and falls through, so nothing past
         // the frontier is served as covered-absent.
         counting.reset();
-        let all = scan_take(&cached, &id, Bound::Unbounded, usize::MAX).await?;
+        let all = scan_take(&cached, &id, ScanEdge::Included(255), usize::MAX).await?;
         assert_eq!(all.len(), TOTAL, "no cell past the frontier may be lost");
         assert!(
             counting.lower_scans() > 0,

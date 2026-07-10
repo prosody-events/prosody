@@ -430,7 +430,7 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
 #[test]
 fn prop_gap_cover_stride_frontier() {
     use super::super::{Cached, GAP_COVER_STRIDE};
-    use crate::state::cell_key::{CellKey, Direction, Scan};
+    use crate::state::cell_key::{CellKey, Direction, Scan, ScanEdge};
     use crate::state::event_ref::EventRef;
     use crate::state::fjall::test_db;
     use crate::state::identity::CollectionRef;
@@ -450,18 +450,14 @@ fn prop_gap_cover_stride_frontier() {
     async fn drain<L: CellStore>(
         cached: &Cached<L>,
         id: &CollectionId,
-        end: Bound<u8>,
+        end: ScanEdge<u8>,
         take: usize,
     ) -> Result<usize> {
         let start = Coordinate::from_bytes(vec![0]);
-        let end = match end {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(b) => Bound::Included(Coordinate::from_bytes(vec![b])),
-            Bound::Excluded(b) => Bound::Excluded(Coordinate::from_bytes(vec![b])),
-        };
+        let end = end.map(|b| Coordinate::from_bytes(vec![b]));
         let scan = Scan {
             section: Section::new(0),
-            start: Bound::Included(&start),
+            start: ScanEdge::Included(&start),
             dir: Direction::Forward,
             end: end.as_ref(),
             limit: None,
@@ -511,7 +507,7 @@ fn prop_gap_cover_stride_frontier() {
             let cached = Cached::new(test_db::cache("stride-frontier")?, counting.clone());
 
             // Drop the gap scan after `consumed` cells.
-            if drain(&cached, &id, Bound::Unbounded, consumed).await? != consumed {
+            if drain(&cached, &id, ScanEdge::Included(255), consumed).await? != consumed {
                 return Ok(false);
             }
 
@@ -519,7 +515,7 @@ fn prop_gap_cover_stride_frontier() {
             if covered > 0 {
                 counting.reset();
                 let end = u8::try_from(covered - 1)?;
-                let prefix = drain(&cached, &id, Bound::Included(end), usize::MAX).await?;
+                let prefix = drain(&cached, &id, ScanEdge::Included(end), usize::MAX).await?;
                 if prefix != covered || counting.lower_scans() != 0 {
                     return Ok(false);
                 }
@@ -528,7 +524,7 @@ fn prop_gap_cover_stride_frontier() {
             // Never over-covered: the full re-scan still yields EVERY cell, and
             // the unpersisted tail (if any) falls through to the lower store.
             counting.reset();
-            let all = drain(&cached, &id, Bound::Unbounded, usize::MAX).await?;
+            let all = drain(&cached, &id, ScanEdge::Included(255), usize::MAX).await?;
             if all != total {
                 return Ok(false);
             }

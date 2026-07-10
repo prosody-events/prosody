@@ -13,7 +13,7 @@ use super::test_db;
 use super::{CacheRead, Clock, FjallCellCache, FjallClient, FjallClientError, ScanHit};
 use crate::Topic;
 use crate::state::cell::Committed;
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::tests::support::fresh_collection;
 use crate::test_util::TEST_RUNTIME;
@@ -215,11 +215,12 @@ impl Arbitrary for ScanFixture {
             mem::swap(&mut a, &mut b);
         }
         let equal = a == b;
-        let pick = |g: &mut Gen, c: Vec<u8>| match u8::arbitrary(g) % 3 {
-            0 => Bound::Unbounded,
-            1 => Bound::Included(c),
-            _ if equal => Bound::Included(c),
-            _ => Bound::Excluded(c),
+        // Every scan edge is concrete now (`ScanEdge` has no unbounded variant),
+        // so bounds are always Included/Excluded; equal endpoints stay
+        // doubly-Included to keep the range a valid (possibly empty) span.
+        let pick = |g: &mut Gen, c: Vec<u8>| match u8::arbitrary(g) % 2 {
+            0 if !equal => Bound::Excluded(c),
+            _ => Bound::Included(c),
         };
         Self {
             lo: pick(g, a),
@@ -311,6 +312,10 @@ fn prop_scan_present_hops_match_model() {
         } else {
             (lo.as_ref(), hi.as_ref())
         };
+        // `pick` only ever produces bounded edges, so this conversion never
+        // yields `None`; it is total (no `unwrap`) for the unreachable case.
+        let start = ScanEdge::from_bound(start).ok_or_else(|| eyre!("scan start unbounded"))?;
+        let end = ScanEdge::from_bound(end).ok_or_else(|| eyre!("scan end unbounded"))?;
         let scan = Scan {
             section,
             start,

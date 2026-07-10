@@ -675,7 +675,13 @@ mod typed_cell_view {
         }
 
         let view = scope.typed::<GatedCell>(CELL_SECTION);
-        let stream = view.scan(Bound::Unbounded, Direction::Forward, Bound::Unbounded, None);
+        let (lo, hi) = (i64::MIN, i64::MAX);
+        let stream = view.scan(
+            ScanEdge::Included(&lo),
+            Direction::Forward,
+            ScanEdge::Included(&hi),
+            None,
+        );
         let collector = async {
             futures::pin_mut!(stream);
             let mut keys = Vec::new();
@@ -794,7 +800,13 @@ mod typed_cell_view {
 
         let scope = CellScope::new(session, StateType::Application, name);
         let view = scope.typed::<Keyed<I64KeyCodec, JsonCodec>>(CELL_SECTION);
-        let stream = view.scan(Bound::Unbounded, Direction::Forward, Bound::Unbounded, None);
+        let (lo, hi) = (i64::MIN, i64::MAX);
+        let stream = view.scan(
+            ScanEdge::Included(&lo),
+            Direction::Forward,
+            ScanEdge::Included(&hi),
+            None,
+        );
         futures::pin_mut!(stream);
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
@@ -881,7 +893,13 @@ mod typed_cell_view {
         );
         let view =
             scope.typed::<Keyed<Utf8KeyCodec, MessageCell<MemoryLoader<Value>>>>(CELL_SECTION);
-        assert_send(view.scan(Bound::Unbounded, Direction::Forward, Bound::Unbounded, None));
+        let key = String::new();
+        assert_send(view.scan(
+            ScanEdge::Included(&key),
+            Direction::Forward,
+            ScanEdge::Included(&key),
+            None,
+        ));
         Ok(())
     }
 
