@@ -38,7 +38,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
-use tracing::{Span, warn};
+use tracing::{Level, Span, warn};
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
@@ -248,16 +248,33 @@ where
     /// that context was captured in-process at scheduling time or restored
     /// from persistent storage — so memory- and Cassandra-backed timers
     /// produce identical dispatch-span topology.
+    ///
+    /// The span's level follows the fired timer's type
+    /// ([`TimerType::is_application`]); two macro invocations because a
+    /// tracing callsite's level is static.
     pub fn set_dispatch_span(&self, relation: SpanRelation) {
         let context = self.trigger.context();
-        let span = related_span!(
-            relation,
-            context,
-            "trigger",
-            key = %self.trigger.key,
-            timer.fire_time = %self.trigger.time.to_rfc3339(),
-            timer.type = ?self.trigger.timer_type,
-        );
+        let span = if self.trigger.timer_type.is_application() {
+            related_span!(
+                level: Level::INFO,
+                relation,
+                context,
+                "trigger",
+                key = %self.trigger.key,
+                timer.fire_time = %self.trigger.time.to_rfc3339(),
+                timer.type = ?self.trigger.timer_type,
+            )
+        } else {
+            related_span!(
+                level: Level::DEBUG,
+                relation,
+                context,
+                "trigger",
+                key = %self.trigger.key,
+                timer.fire_time = %self.trigger.time.to_rfc3339(),
+                timer.type = ?self.trigger.timer_type,
+            )
+        };
         self.trigger.set_span(span);
     }
 }

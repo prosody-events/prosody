@@ -22,7 +22,7 @@ use crate::state::session::CellSession;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, TimerRequest, TimerType};
+use crate::timers::{TimerManager, TimerRequest, TimerType, timer_span};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -35,7 +35,7 @@ use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
-use tracing::{Span, field::Empty, field::display, instrument};
+use tracing::{Instrument, Span, error, field::Empty, field::display};
 
 /// Marker trait for errors that can be returned from event context operations.
 ///
@@ -377,6 +377,32 @@ where
             result = operation(inner) => result,
         }
     }
+
+    /// Runs a cancellable operation inside `span`, recording the guard's key
+    /// on it once the closure runs and any failure as an error event in its
+    /// scope — the hand-built equivalent of `#[instrument(err)]`, needed
+    /// because timer-op span levels follow the runtime [`TimerType`]
+    /// (`timer_span!`).
+    async fn run_spanned<F, R>(
+        &self,
+        span: Span,
+        operation: F,
+    ) -> Result<R, TimerManagerError<T::Error>>
+    where
+        F: AsyncFnOnce(Arc<Inner<T, S>>) -> Result<R, TimerManagerError<T::Error>>,
+    {
+        let result = self
+            .run_cancellable(async |inner| {
+                Span::current().record("key", display(&inner.key));
+                operation(inner).await
+            })
+            .instrument(span.clone())
+            .await;
+        if let Err(error) = &result {
+            span.in_scope(|| error!(error = %error));
+        }
+        result
+    }
 }
 
 impl<T, S> EventContext for PartitionEventContext<T, S>
@@ -447,78 +473,76 @@ where
     /// relates back to (as `OTel` parent or link, per the configured
     /// `timer_spans`): the request captures it as the trigger's scheduling
     /// context, and its `key`/`timer.fire_time`/`timer.type` attributes make
-    /// the relationship self-describing. `key` lives behind
-    /// `run_cancellable`, so it is recorded once the closure runs.
-    #[instrument(
-        name = "schedule",
-        skip_all,
-        fields(key = Empty, timer.fire_time = %time.to_rfc3339(), timer.type = ?timer_type),
-        err
-    )]
+    /// the relationship self-describing. Span level follows the timer type
+    /// ([`TimerType::is_application`]); `key` lives behind `run_spanned`, so
+    /// it is recorded once the closure runs.
     async fn schedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), Self::Error> {
-        self.run_cancellable(async |inner| {
-            let span = Span::current();
-            span.record("key", display(&inner.key));
-            let request = TimerRequest::new(inner.key.clone(), time, timer_type, span);
+        let span = timer_span!(
+            timer_type,
+            "schedule",
+            key = Empty,
+            timer.fire_time = %time.to_rfc3339(),
+            timer.type = ?timer_type,
+        );
+        self.run_spanned(span, async |inner| {
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
             inner.timers.schedule(request).await
         })
         .await
     }
 
-    #[instrument(
-        name = "clear_and_schedule",
-        skip_all,
-        fields(key = Empty, timer.fire_time = %time.to_rfc3339(), timer.type = ?timer_type),
-        err
-    )]
     async fn clear_and_schedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.run_cancellable(async |inner| {
-            let span = Span::current();
-            span.record("key", display(&inner.key));
-            let request = TimerRequest::new(inner.key.clone(), time, timer_type, span);
+        let span = timer_span!(
+            timer_type,
+            "clear_and_schedule",
+            key = Empty,
+            timer.fire_time = %time.to_rfc3339(),
+            timer.type = ?timer_type,
+        );
+        self.run_spanned(span, async |inner| {
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
             inner.timers.clear_and_schedule(request).await
         })
         .await
     }
 
-    #[instrument(
-        name = "unschedule",
-        skip_all,
-        fields(key = Empty, timer.fire_time = %time.to_rfc3339(), timer.type = ?timer_type),
-        err
-    )]
     async fn unschedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.run_cancellable(async |inner| {
-            Span::current().record("key", display(&inner.key));
+        let span = timer_span!(
+            timer_type,
+            "unschedule",
+            key = Empty,
+            timer.fire_time = %time.to_rfc3339(),
+            timer.type = ?timer_type,
+        );
+        self.run_spanned(span, async |inner| {
             inner.timers.unschedule(&inner.key, time, timer_type).await
         })
         .await
     }
 
-    #[instrument(
-        name = "clear_scheduled",
-        skip_all,
-        fields(key = Empty, timer.type = ?timer_type),
-        err
-    )]
     async fn clear_scheduled(
         &self,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.run_cancellable(async |inner| {
-            Span::current().record("key", display(&inner.key));
+        let span = timer_span!(
+            timer_type,
+            "clear_scheduled",
+            key = Empty,
+            timer.type = ?timer_type,
+        );
+        self.run_spanned(span, async |inner| {
             inner.timers.unschedule_all(&inner.key, timer_type).await
         })
         .await

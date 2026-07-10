@@ -46,6 +46,13 @@ impl FromStr for SpanRelation {
 /// site is a consumer-side continuation of a propagated context, and the kind
 /// must not vary with the configured relation.
 ///
+/// The span defaults to INFO — related spans are application-facing message
+/// and timer continuations. The `level:` form exists for the trigger dispatch
+/// span, whose level follows the fired timer's type (see
+/// [`TimerType::is_application`](crate::timers::TimerType::is_application));
+/// the level must be a constant expression, since a tracing callsite's level
+/// is static.
+///
 /// Span name and fields are macro-expanded at the call site, preserving source
 /// location.
 ///
@@ -61,11 +68,14 @@ impl FromStr for SpanRelation {
 /// ```
 #[macro_export]
 macro_rules! related_span {
-    ($relation:expr, $context:expr, $name:literal $(, $($fields:tt)*)?) => {{
+    ($relation:expr, $context:expr, $name:literal $(, $($fields:tt)*)?) => {
+        $crate::related_span!(level: ::tracing::Level::INFO, $relation, $context, $name $(, $($fields)*)?)
+    };
+    (level: $level:expr, $relation:expr, $context:expr, $name:literal $(, $($fields:tt)*)?) => {{
         let __context: ::opentelemetry::Context = $context;
         match $relation {
             $crate::otel::SpanRelation::Child => {
-                let __span = ::tracing::info_span!($name, otel.kind = "consumer" $(, $($fields)*)?);
+                let __span = ::tracing::span!($level, $name, otel.kind = "consumer" $(, $($fields)*)?);
                 if let ::core::result::Result::Err(__e) =
                     ::tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(
                         &__span,
@@ -78,7 +88,7 @@ macro_rules! related_span {
             }
             $crate::otel::SpanRelation::FollowsFrom => {
                 let __span =
-                    ::tracing::info_span!(parent: None, $name, otel.kind = "consumer" $(, $($fields)*)?);
+                    ::tracing::span!(parent: None, $level, $name, otel.kind = "consumer" $(, $($fields)*)?);
                 let __span_ctx =
                     ::opentelemetry::trace::TraceContextExt::span(&__context)
                         .span_context()

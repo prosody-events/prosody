@@ -26,7 +26,7 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 
 | Area | Home |
 | --- | --- |
-| Crate-wide (`integration_test_count`, `test_cassandra_config`) | `src/tests/test_util.rs` |
+| Crate-wide (`integration_test_count`, `test_cassandra_config`; span capture: `captured_spans{,_filtered}`, `assert_span_relation`, `sampled_remote_context`) | `src/tests/test_util.rs` |
 | Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support.rs` |
 | Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |
 | Timers (segment/trigger factories, in-memory `TimerManager` harness) | `src/timers/test_support.rs` |

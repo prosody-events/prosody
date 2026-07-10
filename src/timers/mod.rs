@@ -79,6 +79,8 @@ mod slab;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
 pub mod uncommitted;
 
 /// Classifies a timer by its origin, used to route and account for execution
@@ -119,6 +121,40 @@ pub enum TimerType {
     /// never dispatched to user handlers.
     StateRecovery = 3,
 }
+
+impl TimerType {
+    /// `true` only for [`TimerType::Application`] — timers scheduled by user
+    /// code, as opposed to the framework-internal types.
+    ///
+    /// This is the span-level axis: spans for application timers export at
+    /// INFO, spans for internal timer types at DEBUG, so a trace filtered at
+    /// INFO contains only spans the user's own code caused (see the
+    /// crate-internal `timer_span!` macro). The match is exhaustive so a new
+    /// variant must pick a side.
+    #[must_use]
+    pub fn is_application(self) -> bool {
+        match self {
+            Self::Application => true,
+            Self::DeferredMessage | Self::DeferredTimer | Self::StateRecovery => false,
+        }
+    }
+}
+
+/// Creates a timer-operation span at the level owed to its [`TimerType`]:
+/// `info_span!` for application timers, `debug_span!` for framework-internal
+/// ones (the [`TimerType::is_application`] invariant). A macro because a
+/// tracing callsite's level is static — selecting it at runtime requires
+/// branching between two invocations.
+macro_rules! timer_span {
+    ($timer_type:expr, $name:literal $(, $($fields:tt)*)?) => {
+        if $crate::timers::TimerType::is_application($timer_type) {
+            ::tracing::info_span!($name $(, $($fields)*)?)
+        } else {
+            ::tracing::debug_span!($name $(, $($fields)*)?)
+        }
+    };
+}
+pub(crate) use timer_span;
 
 impl From<TimerType> for i8 {
     fn from(timer_type: TimerType) -> Self {

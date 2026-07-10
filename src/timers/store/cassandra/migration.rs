@@ -132,7 +132,7 @@ pub(crate) fn needs_key_state_migration(segment: &Segment) -> bool {
 ///
 /// **Note**: This function is Cassandra-specific since V1 schema only exists
 /// for Cassandra storage.
-#[instrument(level = "info", skip(store, segment), fields(segment_id = %segment.id), err)]
+#[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
 pub(crate) async fn migrate_segment_version(
     store: &CassandraTriggerStore,
     mut segment: Segment,
@@ -292,7 +292,7 @@ async fn cleanup_v1_data(
 /// The version is bumped to V3 only after all backfills complete (commit
 /// point). If migration crashes before the version bump, the next access
 /// will re-run it — all writes are idempotent.
-#[instrument(level = "info", skip(store, segment), fields(segment_id = %segment.id), err)]
+#[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
 pub(crate) async fn migrate_key_states(
     store: &CassandraTriggerStore,
     mut segment: Segment,
@@ -524,7 +524,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
 /// **Note**: This function is Cassandra-specific. If the segment is not v2
 /// or v3, migration is skipped and the segment is returned unchanged rather
 /// than erroring — see the version check below.
-#[instrument(level = "info", skip(store, segment), fields(segment_id = %segment.id), err)]
+#[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
 pub(crate) async fn migrate_slab_size(
     store: &CassandraTriggerStore,
     mut segment: Segment,

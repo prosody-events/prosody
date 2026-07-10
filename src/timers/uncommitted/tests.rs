@@ -1,7 +1,9 @@
 use super::*;
 use crate::consumer::Uncommitted;
 use crate::related_span;
-use crate::test_util::{assert_span_relation, captured_spans, sampled_remote_context};
+use crate::test_util::{
+    assert_span_relation, captured_spans, captured_spans_filtered, sampled_remote_context,
+};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManager;
@@ -22,6 +24,7 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -45,7 +48,7 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-        *metadata.level() <= tracing::Level::WARN
+        *metadata.level() <= Level::WARN
     }
 
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
@@ -226,6 +229,42 @@ fn new_trigger_under_span(key: &str) -> Result<Trigger> {
     built.ok_or_else(|| eyre!("scheduling trigger was not built"))
 }
 
+/// Schedules `trigger` and fires it once the paused clock passes its time.
+async fn schedule_and_fire(
+    manager: &TimerManager<TestStore>,
+    stream: &mut (impl Stream<Item = PendingTimer<TestStore>> + Unpin),
+    trigger: Trigger,
+) -> Result<FiringTimer<TestStore>> {
+    manager.schedule_trigger(trigger).await?;
+    advance(Duration::from_secs(2)).await;
+    task::yield_now().await;
+    stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected a pending timer"))?
+        .fire()
+        .await
+        .ok_or_else(|| eyre!("expected fire() to return Some"))
+}
+
+/// [`schedule_and_fire`] for a `Trigger::restored` of `timer_type` carrying
+/// the fixed sampled remote scheduling context.
+async fn fire_restored(
+    manager: &TimerManager<TestStore>,
+    stream: &mut (impl Stream<Item = PendingTimer<TestStore>> + Unpin),
+    timer_type: TimerType,
+    key: &str,
+) -> Result<FiringTimer<TestStore>> {
+    let trigger = Trigger::restored(
+        Key::from(key),
+        sched_time()?,
+        timer_type,
+        0,
+        sampled_remote_context(),
+    );
+    schedule_and_fire(manager, stream, trigger).await
+}
+
 /// Schedules `trigger`, fires it, then asserts that
 /// [`FiringTimer::set_dispatch_span`] connects the `"trigger"` dispatch span to
 /// the trigger's scheduling context per `relation`, by span-id equality.
@@ -235,16 +274,7 @@ async fn assert_dispatch_targets(
     relation: SpanRelation,
     trigger: Trigger,
 ) -> Result<()> {
-    manager.schedule_trigger(trigger).await?;
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-    let firing = stream
-        .next()
-        .await
-        .ok_or_else(|| eyre!("expected a pending timer"))?
-        .fire()
-        .await
-        .ok_or_else(|| eyre!("expected fire() to return Some"))?;
+    let firing = schedule_and_fire(manager, stream, trigger).await?;
 
     let scheduling = firing.trigger().context().span().span_context().clone();
     assert!(
@@ -285,6 +315,66 @@ async fn dispatch_span_targets_scheduling_context() -> Result<()> {
         let new_trigger = new_trigger_under_span(&format!("new-{relation:?}"))?;
         assert_dispatch_targets(&manager, &mut stream, relation, new_trigger).await?;
     }
+
+    Ok(())
+}
+
+/// The dispatch span's level follows the fired timer's type
+/// ([`TimerType::is_application`]): an INFO-filtered subscriber exports the
+/// `"trigger"` span for an application timer but not for a
+/// framework-internal one, which still exports — relation intact — at DEBUG.
+#[tokio::test]
+async fn dispatch_span_level_follows_timer_type() -> Result<()> {
+    time::pause();
+    let (stream, manager, _shutdown) = setup_timer_manager().await?;
+    pin_mut!(stream);
+
+    let application =
+        fire_restored(&manager, &mut stream, TimerType::Application, "level-app").await?;
+    let scheduling = application
+        .trigger()
+        .context()
+        .span()
+        .span_context()
+        .clone();
+    let spans = captured_spans_filtered(LevelFilter::INFO, || {
+        application.set_dispatch_span(SpanRelation::Child);
+        application.trigger().set_span(Span::none());
+    });
+    assert_span_relation(&spans, "trigger", SpanRelation::Child, &scheduling)?;
+    application.commit().await;
+
+    let internal = fire_restored(
+        &manager,
+        &mut stream,
+        TimerType::StateRecovery,
+        "level-info",
+    )
+    .await?;
+    let spans = captured_spans_filtered(LevelFilter::INFO, || {
+        internal.set_dispatch_span(SpanRelation::Child);
+        internal.trigger().set_span(Span::none());
+    });
+    assert!(
+        spans.iter().all(|span| span.name != "trigger"),
+        "internal-timer dispatch span must not export at INFO"
+    );
+    internal.commit().await;
+
+    let internal = fire_restored(
+        &manager,
+        &mut stream,
+        TimerType::StateRecovery,
+        "level-debug",
+    )
+    .await?;
+    let scheduling = internal.trigger().context().span().span_context().clone();
+    let spans = captured_spans_filtered(LevelFilter::DEBUG, || {
+        internal.set_dispatch_span(SpanRelation::Child);
+        internal.trigger().set_span(Span::none());
+    });
+    assert_span_relation(&spans, "trigger", SpanRelation::Child, &scheduling)?;
+    internal.commit().await;
 
     Ok(())
 }

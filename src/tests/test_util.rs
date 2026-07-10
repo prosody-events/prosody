@@ -17,6 +17,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tracing::subscriber::with_default;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 /// The shared, pre-migrated keyspace every Cassandra-backed test runs against.
@@ -97,12 +99,23 @@ impl SpanExporter for TestExporter {
 /// on span end, so no tokio runtime is required. Dropping the provider flushes
 /// any span still buffered before the captured vector is read back.
 pub(crate) fn captured_spans(f: impl FnOnce()) -> Vec<SpanData> {
+    captured_spans_filtered(LevelFilter::TRACE, f)
+}
+
+/// [`captured_spans`] with a maximum-level filter on the exporting layer, for
+/// asserting which spans a level-filtered subscriber exports at all — the
+/// span-level invariant: application-facing spans at INFO, framework-internal
+/// spans at DEBUG.
+pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) -> Vec<SpanData> {
     let exporter = TestExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(max_level),
+    );
 
     with_default(subscriber, f);
     drop(provider);

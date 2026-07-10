@@ -170,8 +170,9 @@ where
         if is_deferred(&self.store, &self.key).await? {
             // Hand-built (not `#[instrument]` on this method): only the
             // deferred append branch may mint the schedule span — the
-            // delegating branch gets one from the inner context's
-            // instrumented `schedule`.
+            // delegating branch gets one from the inner context's `schedule`.
+            // Statically an Application timer, so INFO is its level under
+            // the `TimerType::is_application` span-level invariant.
             let span = info_span!(
                 "schedule",
                 key = %self.key,

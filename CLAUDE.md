@@ -476,14 +476,22 @@ explicit `fields` control the attributes; `err` records failures on the span),
 and `#[instrument(level = "debug", skip(self), err)]` for internal plumbing.
 Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of
-one span), a relation against a carried context (`related_span!`), and a value
+one span), a relation against a carried context (`related_span!`), a value
 known only mid-body (declare the field `Empty`, then
-`Span::current().record(...)`). Record unsigned integers as `i64` — the OTel
-layer exports signed ints as typed Int attributes but stringifies `u64`/`usize`
-through their Debug form. Timer instants on span attributes are recorded as
-`timer.fire_time = %time.to_rfc3339()` (paired with `timer.type`); this RFC
-3339 convention governs **span attributes only** — log events keep the plain
-`Display` form (`fire_time = %fire_time`).
+`Span::current().record(...)`), and a level known only at runtime (a tracing
+callsite's level is static — branch between two invocations). Record unsigned
+integers as `i64` — the OTel layer exports signed ints as typed Int attributes
+but stringifies `u64`/`usize` through their Debug form. Timer instants on span
+attributes are recorded as `timer.fire_time = %time.to_rfc3339()` (paired with
+`timer.type`); this RFC 3339 convention governs **span attributes only** — log
+events keep the plain `Display` form (`fire_time = %fire_time`).
+
+**Span level is audience.** Application-facing spans — message lifecycle,
+keyed-state collection ops, application-timer ops — export at info;
+framework-internal spans use `level = "debug"`, so a trace filtered at info
+contains only spans the user's own code caused. Spans whose subject is a
+runtime `TimerType` decide via `TimerType::is_application`: the crate-internal
+`timer_span!` macro and `related_span!`'s `level:` form own the branch.
 
 **Import tracing macros from `tracing` directly — never `use tracing::log::…`.**
 `tracing::log` re-exports the bare `log` crate and no `log`→`tracing` bridge is
