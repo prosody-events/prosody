@@ -553,9 +553,9 @@ impl FjallCellCache {
     /// runtime.
     ///
     /// The fjall keyspace is shared across **all** collections, so the scan is
-    /// bounded to the `(collection, section)` byte prefix on both ends — an
-    /// unbounded high bound stops at the section's upper boundary, never
-    /// bleeding into the next section or another collection. A per-row prefix
+    /// bounded to the `(collection, section)` byte prefix on both ends — both
+    /// scan edges append their coordinates to that prefix, so the range never
+    /// bleeds into the next section or another collection. A per-row prefix
     /// check guards the same invariant defensively (see `scan_hop`).
     pub(crate) fn scan_present<'a>(
         &'a self,
@@ -876,12 +876,12 @@ impl FjallCellCache {
 /// (the last raw key examined) when the hop stopped on a bound and more rows
 /// may remain, `None` when the range was exhausted.
 ///
-/// The fjall keyspace is shared across all collections, so a row outside the
-/// section prefix is never yielded: walking forward it marks the section's
-/// upper boundary (reachable only through the missing-successor unbounded high
-/// bound) and ends the scan; walking backward it *precedes* the section (the
-/// low byte bound pins the other side), so it is skipped but still counted
-/// against the budget, keeping every hop's work bounded.
+/// The fjall keyspace is shared across all collections, but both range edges
+/// carry the section prefix, so a row outside it is unreachable through the
+/// range — the per-row prefix check is a defensive guard. Should one ever
+/// appear, walking forward it marks the section's upper boundary and ends the
+/// scan; walking backward it *precedes* the section, so it is skipped but
+/// still counted against the budget, keeping every hop's work bounded.
 fn scan_hop(
     rows: impl Iterator<Item = Guard>,
     section_prefix: &[u8],

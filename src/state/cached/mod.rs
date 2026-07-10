@@ -476,8 +476,8 @@ where
                 yield (cell, bytes);
             }
             // Exhausted with no hole: the empty tail is genuinely absent, so
-            // cover the whole gap (crucial for unbounded-end `iter()`), which
-            // subsumes any pending frontier.
+            // cover the whole gap (a covered re-scan then pays no lower read
+            // for that tail), which subsumes any pending frontier.
             if contiguous {
                 degrade_cover_mut(
                     "cover",

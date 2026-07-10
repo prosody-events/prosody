@@ -271,7 +271,7 @@ fn coverage_op_budget() -> Result<()> {
                 .await?;
         }
 
-        // Warm the whole section with one unbounded scan (covering the gaps),
+        // Warm the whole section with one full-range scan (covering the gaps),
         // then verify a covered re-scan issues ZERO lower scans.
         let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm, vec![0, 2, 4, 6, 8]);
@@ -582,7 +582,7 @@ where
 
 /// A covered scan never bleeds into another collection or section sharing the
 /// fjall partition: with two collections and a decoy section seeded in one
-/// cache, an unbounded scan of each section yields only its own cells.
+/// cache, a full-range scan of each section yields only its own cells.
 #[test]
 fn coverage_scan_isolation() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -615,7 +615,7 @@ fn coverage_scan_isolation() -> Result<()> {
             .write_resolved(&a_ref, &[(decoy.clone(), Some(bytes(5)))])
             .await?;
 
-        // An unbounded scan of A's entry section must yield only A's entries —
+        // A full-range scan of A's entry section must yield only A's entries —
         // not B's, and not the decoy section. Run twice so both the cold gap
         // fall-through and the warm covered serve are checked.
         for _ in 0..2u32 {
