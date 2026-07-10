@@ -27,7 +27,10 @@ use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::map::bound_cells;
-use crate::state::descriptor::{DequeHandle, MapHandle, StateDescriptor, deque_state, map_state};
+use crate::state::descriptor::{
+    DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
+};
+use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
@@ -206,6 +209,39 @@ pub(crate) type DequeTrace = Trace<DequeOp>;
 /// A map trace.
 pub(crate) type MapTrace = Trace<MapOp>;
 
+/// The bounded window width the deque-holes property ranges over.
+const MAX_DEQUE_WINDOW: usize = 8;
+
+/// The head-index pool for the deque-holes property — small and spanning the
+/// sign boundary so windows crossing zero are exercised.
+const HEAD_POOL: [i64; 7] = [-3, -2, -1, 0, 1, 2, 3];
+
+/// A directly-seeded sparse deque window: a `head` index and a run of per-index
+/// cells — `Some(v)` present, `None` a hole (a TTL-expired entry not yet
+/// swept). `tail = head + cells.len()`. Seeded straight into the store (never
+/// produced by the handle, which keeps the window dense) to pin the TTL'd-hole
+/// read contract: `len` an upper bound, `get`/`stream` skip holes without
+/// error.
+#[derive(Clone, Debug)]
+pub(crate) struct DequeHoles {
+    head: i64,
+    cells: Vec<Option<u8>>,
+}
+
+impl Arbitrary for DequeHoles {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            head: g.choose(&HEAD_POOL).copied().unwrap_or(0),
+            cells: capped_vec(g, MAX_DEQUE_WINDOW),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let head = self.head;
+        Box::new(self.cells.shrink().map(move |cells| Self { head, cells }))
+    }
+}
+
 /// Builds a fresh session for one event over the shared warm backing. Dropped
 /// senders are fine — `watch::Receiver::borrow` keeps returning the last value,
 /// so the session reads as non-terminated.
@@ -217,11 +253,34 @@ fn make_session(
     armed: &ArmedKeys,
     event: EventRef,
 ) -> SuiteSession {
+    make_session_with_dirty(
+        cells,
+        oracle,
+        registry,
+        state_key,
+        armed,
+        event,
+        Arc::default(),
+    )
+}
+
+/// [`make_session`] over a caller-owned dirty workspace, so a test can snapshot
+/// the per-event buffered cells (the Map TTL bound-refresh property inspects
+/// the staged-set composition through it).
+fn make_session_with_dirty(
+    cells: &MemoryCells,
+    oracle: &ScriptedOracle,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    armed: &ArmedKeys,
+    event: EventRef,
+    dirty: Arc<DirtyStore>,
+) -> SuiteSession {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     KeyedStateSession::new(SessionParts::<SuiteBackend, _> {
         cell: MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone()),
-        dirty: Arc::default(),
+        dirty,
         oracle: oracle.clone(),
         loader: MemoryLoader::new(),
         registry: registry.clone(),
@@ -480,6 +539,155 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
         },
     )
     .await
+}
+
+/// Map TTL bound-refresh (staged-set composition): on a collection **with a
+/// TTL**, every `set` buffers *both* bound cells — even a re-set of a key
+/// already within the committed bounds — so their TTL is refreshed and the
+/// bounds outlive every entry. Runs multiple committed events over a fresh
+/// per-event dirty workspace so a later set lands within *committed* bounds:
+/// the case a single-event snapshot cannot reach, because the first set always
+/// seeds both bounds into the dirty overlay, masking an extend-only regression.
+pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(
+        &descriptor,
+        CollectionDef::new(Some(CompactDuration::new(3_600))),
+    )?;
+    let registry = Arc::new(registry);
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("mp")?,
+    );
+    let armed: ArmedKeys = Arc::default();
+    let (min_cell, max_cell) = bound_cells();
+
+    for (index, ev) in trace.events.into_iter().enumerate() {
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(index as u128),
+        };
+        let dirty = Arc::new(DirtyStore::new());
+        let session = make_session_with_dirty(
+            &cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            dirty.clone(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        for op in &ev.ops {
+            match *op {
+                MapOp::Set(k, b) => {
+                    handle.set(k, Value::from(b)).await?;
+                    // Snapshot immediately, before any later Flush drains dirty.
+                    let snapshot = dirty.collection_snapshot(&id);
+                    let has_min = snapshot.iter().any(|(c, _)| *c == min_cell);
+                    let has_max = snapshot.iter().any(|(c, _)| *c == max_cell);
+                    if !(has_min && has_max) {
+                        return Ok(false);
+                    }
+                }
+                MapOp::Remove(k) => handle.remove(&k).await?,
+                MapOp::Get(k) => {
+                    handle.get(&k).await?;
+                }
+                MapOp::Flush => {
+                    handle.flush().await?;
+                }
+            }
+        }
+        session
+            .finalize()
+            .await
+            .map_err(|e| eyre!("finalize: {e}"))?;
+        oracle
+            .record_message(event_dedup(event))
+            .await
+            .map_err(|e| eyre!("marker: {e}"))?;
+        session.commit_apply().await;
+    }
+    Ok(true)
+}
+
+/// Deque TTL-hole read contract: over a directly-seeded sparse window, `len`
+/// is the full span `tail − head` (an upper bound on the live count), `get`
+/// returns `None` at a hole and past the span, and both stream directions yield
+/// exactly the present values in index order (ascending forward, reversed
+/// backward) without error. Seeded directly — never via wall-clock TTL — the
+/// only way to reach a holed window the handle itself never produces.
+pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
+    use bytes::Bytes;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, collection_ref) = registry_and_ref(&descriptor, "dq", &state_key)?;
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+
+    let head = shape.head;
+    let tail = head + shape.cells.len() as i64;
+    store
+        .write_resolved(
+            &collection_ref,
+            &[(
+                deque::meta_cell(),
+                Some(Bytes::from(deque::seed_frame(head, tail))),
+            )],
+        )
+        .await?;
+    for (i, cell) in shape.cells.iter().enumerate() {
+        if let Some(value) = cell {
+            let coordinate = I64KeyCodec::encode(&(head + i as i64));
+            let bytes = Bytes::from(serde_json::to_vec(&Value::from(*value))?);
+            store
+                .write_resolved(
+                    &collection_ref,
+                    &[(deque::entry_cell_for(&coordinate), Some(bytes))],
+                )
+                .await?;
+        }
+    }
+
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+    let len = shape.cells.len();
+    if handle.len().await? != len {
+        return Ok(false);
+    }
+    for p in 0..len + 2 {
+        let expected = shape.cells.get(p).copied().flatten().map(Value::from);
+        if handle.get(p).await? != expected {
+            return Ok(false);
+        }
+    }
+    let present: Vec<Value> = shape
+        .cells
+        .iter()
+        .copied()
+        .filter_map(|c| c.map(Value::from))
+        .collect();
+    if collect_deque(&handle, Direction::Forward).await? != present {
+        return Ok(false);
+    }
+    let reversed: Vec<Value> = present.iter().rev().cloned().collect();
+    Ok(collect_deque(&handle, Direction::Backward).await? == reversed)
 }
 
 /// `MetaBoundsCoverLive` (Map): the stored `MapBound::Min`/`MapBound::Max`

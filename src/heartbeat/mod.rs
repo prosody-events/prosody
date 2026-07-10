@@ -67,7 +67,7 @@ impl HeartbeatRegistry {
     #[must_use]
     pub fn register(&self, name: &str) -> Heartbeat {
         let mut registry = self.heartbeats.lock();
-        let heartbeat = Heartbeat::new(format!("{} {name}", &self.base_name), self.stall_threshold);
+        let heartbeat = Heartbeat::new(format!("{} {name}", self.base_name), self.stall_threshold);
         registry.push(heartbeat.clone());
         heartbeat
     }

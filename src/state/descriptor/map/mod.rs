@@ -37,6 +37,17 @@
 //! can never sit outside its bound, and the missing-bound fallback scans from
 //! the edge. The bounds are therefore self-healing — never an exact count, by
 //! design (a count would force a read-before-write on every mutation).
+//!
+//! # Invariant: on a TTL'd map the bounds outlive every entry
+//!
+//! A bound cell carries the collection's TTL, but an entry `set` within the
+//! existing bounds would refresh only the entry's TTL — so, left alone, the
+//! bounds could expire while live entries remain. To prevent that skew, on a
+//! collection with a TTL every `set` rewrites *both* bound cells (with the
+//! ratcheted extremes), refreshing their TTL. So a bound cell always lives at
+//! least as long as the newest entry, and **absent bounds ⇔ no live entries**.
+//! A non-TTL'd map keeps the extend-only write — nothing expires, so the
+//! invariant holds vacuously.
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
@@ -299,12 +310,16 @@ where
     }
 
     /// Ratchets the min/max bounds outward to `key`. Reads both bound cells
-    /// concurrently (they are independent), then extends each that `key`
-    /// exceeds by [`Ord`] — the conditional sets stay sequential (cheap
-    /// in-memory buffering, nothing to overlap). `key` *moves* into the single
-    /// extending bound write, mirroring `HashMap::insert` taking its key by
-    /// value; it is cloned only when both bounds extend (the first insert seeds
-    /// Min and Max together).
+    /// concurrently (they are independent), then writes the ratcheted extremes.
+    ///
+    /// On a **TTL'd** collection both bound cells are rewritten every `set`,
+    /// even when neither extreme moves: that unconditional rewrite refreshes
+    /// the bounds' TTL so they outlive every entry (the module's
+    /// TTL-refresh invariant). On a **non-TTL'd** collection only a bound
+    /// that `key` extends by [`Ord`] is written — nothing expires, so a
+    /// rewrite would be pure churn. Either way the conditional sets stay
+    /// sequential (cheap in-memory buffering, nothing to overlap): `key` is
+    /// cloned into the lower write and moved into the upper.
     async fn ratchet_bounds(&self, key: KC::Key) -> Result<(), MapStateError<CellCodecError<V>>>
     where
         KC::Key: Clone,
@@ -313,6 +328,21 @@ where
             self.read_bound(MapBound::Min),
             self.read_bound(MapBound::Max)
         )?;
+        if self.meta.has_ttl() {
+            // Compute both ratcheted extremes before the moves: `new_min` may
+            // clone `key`, `new_max` consumes it.
+            let new_min = min.filter(|min| *min <= key).unwrap_or_else(|| key.clone());
+            let new_max = max.filter(|max| *max >= key).unwrap_or(key);
+            self.meta
+                .set(&MapBound::Min, new_min)
+                .await
+                .map_err(meta_err)?;
+            self.meta
+                .set(&MapBound::Max, new_max)
+                .await
+                .map_err(meta_err)?;
+            return Ok(());
+        }
         let extend_min = min.is_none_or(|min| key < min);
         let extend_max = max.is_none_or(|max| key > max);
         match (extend_min, extend_max) {

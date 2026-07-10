@@ -8,7 +8,10 @@ use self::cell_suite::{
     OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
     run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
-use self::collection_suite::{DequeTrace, MapTrace, run_deque_trace, run_map_trace};
+use self::collection_suite::{
+    DequeHoles, DequeTrace, MapTrace, run_deque_holes, run_deque_trace, run_map_trace,
+    run_map_ttl_bounds_trace,
+};
 use self::support::fresh_collection;
 use super::CollectionRef;
 use super::memory::{MemoryCellStore, MemoryCells};
@@ -137,4 +140,27 @@ fn prop_map_collection_lifecycle() {
         executor::block_on(run_map_trace(trace))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Map TTL bound-refresh: on a TTL'd map every `set` — including a re-set of a
+/// key already within the committed bounds — buffers both `MapBound` cells, so
+/// the bounds' TTL is refreshed and they outlive every entry (absent bounds ⇔
+/// no live entries). Staged-set composition, so no clock is needed.
+#[test]
+fn prop_map_ttl_bounds_refresh() {
+    fn property(trace: MapTrace) -> Result<bool> {
+        executor::block_on(run_map_ttl_bounds_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Deque TTL holes: over a directly-seeded sparse window, `len` is the full
+/// span (an upper bound on live elements) and `get`/`stream` skip expired
+/// indices without error — the TTL'd-deque hole read contract.
+#[test]
+fn prop_deque_ttl_holes() {
+    fn property(shape: DequeHoles) -> Result<bool> {
+        executor::block_on(run_deque_holes(shape))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeHoles) -> Result<bool>);
 }

@@ -657,6 +657,12 @@ impl<S: CellSession> CellScope<S> {
         &self.session
     }
 
+    /// Whether this collection carries a TTL — a cheap, allocation-free
+    /// registry lookup the Map bound refresh consults per `set`.
+    pub(in crate::state::descriptor) fn has_ttl(&self) -> bool {
+        self.session.collection_has_ttl(self.state_type, &self.name)
+    }
+
     /// Reads one cell's visible committed bytes.
     pub(in crate::state::descriptor) async fn raw_get(
         &self,
@@ -740,6 +746,12 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
             section: self.section,
             coordinate: <T::Key as OrderedKeyCodec>::encode(key),
         }
+    }
+
+    /// Whether this view's collection carries a TTL (see
+    /// [`CellScope::has_ttl`]).
+    pub(crate) fn has_ttl(&self) -> bool {
+        self.scope.has_ttl()
     }
 }
 

@@ -19,20 +19,29 @@
 //!   big-endian index ([`I64KeyCodec`]) so the clustering byte order is the
 //!   signed index order, and typed by the element cell type `T`.
 //!
-//! # Invariant: dense, monotonic window
+//! # Invariant: monotonic window; dense without a TTL
 //!
-//! `[head, tail)` is a dense, fully-live, contiguous window: every index in the
-//! range maps to a present entry cell, `head ≤ tail`, and indices are monotonic
-//! and never reused — a pop advances `head`/`tail` past the freed index, never
-//! back into it. So `len` is `tail − head` (O(1) from the meta), `get(i)` is
-//! the single cell at `head + i`, and a scan anchored at `head` with `limit =
-//! tail − head` visits exactly the live window, never a popped tombstone (which
-//! sits below `head` or at/above `tail`). Co-stamping makes the window heal as
-//! a unit: a handler's entry mutation and the bounds move it buffers in one op
-//! stage in one batch with one write TS/TTL (see
+//! `[head, tail)` is a contiguous window with `head ≤ tail`, and indices are
+//! monotonic and never reused — a pop advances `head`/`tail` past the freed
+//! index, never back into it. So `len` is `tail − head` (O(1) from the meta),
+//! `get(i)` reads the single cell at `head + i`, and a scan anchored at `head`
+//! with `limit = tail − head` visits the window, never a popped tombstone
+//! (which sits below `head` or at/above `tail`). Co-stamping makes the window
+//! move heal as a unit: a handler's entry mutation and the bounds move it
+//! buffers in one op stage in one batch with one write TS/TTL (see
 //! [`KeyedStateSession::finalize`](crate::state::session)) — and a mid-handler
-//! [`DequeHandle::flush`] drains them in one batch the same way — so the
-//! bounds cell can never outlive — or be outlived by — the entries it anchors.
+//! [`DequeHandle::flush`] drains them in one batch the same way.
+//!
+//! **Without a TTL the window is also dense**: every index in `[head, tail)`
+//! maps to a present entry cell, so `len` is exact and a scan yields exactly
+//! `len` elements. **With a TTL** an entry's expiry is anchored at its push, so
+//! entries can expire *inside* the window while it stays put — the window
+//! develops holes. The bounds cell is rewritten by every op, so it outlives the
+//! entries and `head`/`tail` are unaffected. Under holes `len` is an **upper
+//! bound** on the live count, and `get`/`stream` **skip** an expired index — an
+//! absent cell resolves as skipped (`get` → `None`, `stream` omits it), never
+//! an error. This is acceptable time-window semantics: a TTL'd deque is a
+//! sliding window of not-yet-expired elements.
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
@@ -489,6 +498,27 @@ pub(crate) fn meta_cell() -> CellKey {
         section: META_SECTION,
         coordinate: Coordinate::empty(),
     }
+}
+
+/// Test-only: the entry cell at index `coordinate` (already encoded through
+/// [`I64KeyCodec`]), so a test can seed a sparse window directly — entries with
+/// holes a live deque never produces — and prove the TTL'd-hole tolerance
+/// against the real store.
+#[cfg(test)]
+pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
+    CellKey {
+        section: ENTRY_SECTION,
+        coordinate: coordinate.clone(),
+    }
+}
+
+/// Test-only: the frozen `head ‖ tail` meta frame as raw bytes — two plain
+/// big-endian `i64`s, the [`MetaCodec`] layout pinned by
+/// `deque_meta_cell_bytes_are_frozen` — so a test can seed the bounds cell
+/// directly.
+#[cfg(test)]
+pub(crate) fn seed_frame(head: i64, tail: i64) -> Vec<u8> {
+    [head.to_be_bytes(), tail.to_be_bytes()].concat()
 }
 
 #[cfg(test)]

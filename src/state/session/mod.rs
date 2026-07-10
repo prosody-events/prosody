@@ -113,6 +113,13 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// cancelled. Descriptor handles guard every operation on this.
     fn is_terminated(&self) -> bool;
 
+    /// Whether the collection named `(state_type, name)` carries a TTL — the
+    /// query the Map bound refresh consults to keep its bound cells' TTL
+    /// renewed on every `set`, so the bounds provably outlive every entry.
+    /// No default impl: a silent `false` would disable the refresh for a
+    /// real session.
+    fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool;
+
     /// Validates that the keyed-state collection named `(state_type, name)` is
     /// registered with the asserted structural identity, returning the
     /// canonical [`StateName`].
@@ -547,6 +554,10 @@ where
 
     fn is_terminated(&self) -> bool {
         self.inner.termination.is_terminated()
+    }
+
+    fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool {
+        self.inner.registry.ttl_for(state_type, name).is_some()
     }
 
     fn verify_state_registration(

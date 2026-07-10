@@ -114,6 +114,10 @@ where
         true
     }
 
+    fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
+        false
+    }
+
     fn verify_state_registration(
         &self,
         _name: &'static str,
