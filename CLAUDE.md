@@ -504,6 +504,25 @@ See the write-through cache in `CassandraTimerDeferStore`
 (`src/consumer/middleware/defer/timer/store/cassandra/mod.rs`) for the
 reference implementation.
 
+## Workflows
+
+When launching multi-agent workflows:
+
+- **Select model and effort per task by complexity — don't let every agent
+  inherit the session model.** Reserve the top tier for the hardest
+  creative/correctness-critical work; use mid tiers for review lenses and
+  judgment-guided-but-narrow tasks; use the smallest tier and low effort for
+  mechanical work (grep enumeration, running gate commands). But never
+  downgrade a stage whose output gates a commit or ship decision.
+- **Disable the advisor in every agent prompt.** The advisor tool stalls and
+  kills workflow agents; each prompt must explicitly forbid consulting it.
+- **Keep structured-output schemata trivially simple.** One of the most common
+  workflow failure modes is an agent unable to satisfy its output schema:
+  complex schemas, long strings, angle-bracket content, and tight constraints
+  make the StructuredOutput call fail and the agent die. Use flat objects with
+  a few short bounded fields (status, one-line summary, report path) and put
+  all detail in report files the agent writes to the scratchpad.
+
 ## Research
 
 - Automatically use context7 for code generation and library documentation.
