@@ -318,7 +318,13 @@ impl<C: Codec> ProsodyProducer<C> {
         C::with_cached_local(|codec| codec.serialize(payload, &mut serialized))
             .map_err(ProducerError::Serialization)?;
 
-        Span::current().record("payload_size", serialized.len());
+        // Recorded as i64: the OTel layer exports signed ints as typed Int
+        // attributes but stringifies unsigned values through their Debug form.
+        // A payload beyond i64 cannot exist; leave the field unrecorded rather
+        // than invent a value.
+        if let Ok(payload_size) = i64::try_from(serialized.len()) {
+            Span::current().record("payload_size", payload_size);
+        }
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
