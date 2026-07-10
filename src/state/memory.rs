@@ -5,10 +5,11 @@ use super::cell_key::{CellKey, Direction, Scan};
 use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
+use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
-use super::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
-use super::store::CellStore;
+use super::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_marker, resolve_read};
+use super::store::{CellStore, route_abort, route_commit};
 use super::{CollectionId, CollectionRef, EventRef, StateType};
 use ahash::RandomState;
 use async_stream::try_stream;
@@ -25,16 +26,25 @@ type IdentityKey = (String, i8, String);
 /// The in-memory cell map: cells keyed by `(CollectionId, CellKey)`.
 type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
 
+/// The in-memory event-marker map: one standing [`EventMarker`] per collection.
+type MarkerMap = scc::HashMap<CollectionId, EventMarker, RandomState>;
+
 /// A process-wide shareable in-memory cell map.
 ///
 /// The oracle-independent half of [`MemoryCellStore`]: the cells themselves,
-/// keyed by `(CollectionId, CellKey)`. One instance is shared across partition
+/// keyed by `(CollectionId, CellKey)`, plus the standing **event markers**
+/// (mirroring the Cassandra marker rows). Both are the *durable* half — the
+/// marker map is this backend's whole marker slice, and it must survive the
+/// `make_store()` crash exactly as Cassandra marker rows would, so it lives
+/// here and not on the per-assignment [`MemoryCellStore`]. There is no seed or
+/// memo because RAM *is* the memo. One instance is shared across partition
 /// assignments (`Clone` shares the `Arc`), so committed state survives a
 /// rebalance within the process — each partition wraps it in a fresh
 /// [`MemoryCellStore`] carrying that partition's oracle.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCells {
     inner: Arc<CellMap>,
+    markers: Arc<MarkerMap>,
 }
 
 impl MemoryCells {
@@ -58,6 +68,15 @@ impl MemoryCells {
             true
         });
         out
+    }
+
+    /// The collection's standing event marker read straight from the durable
+    /// backing — the marker-shape probe, never routed through the resolving
+    /// store.
+    #[cfg(test)]
+    pub(crate) fn standing_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
+        self.markers
+            .read_sync(collection, |_, marker| marker.clone())
     }
 }
 
@@ -242,7 +261,39 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
+        // Nothing staged ⇒ no marker and no boundary check (nothing to strand) —
+        // the empty-batch no-op the overwrite generator exercises.
+        if let Some((_, first)) = staged.first() {
+            let event = first.event();
+            // Stage boundary: resolve any standing FOREIGN marker (a different
+            // event) before overwriting it, establishing marker uniqueness per
+            // collection. A resolution failure fails the stage.
+            if let Some(marker) = self
+                .cells
+                .markers
+                .read_async(collection.id(), |_, marker| marker.clone())
+                .await
+                && marker.event() != event
+            {
+                resolve_marker(self, self.resolver.oracle(), collection, &marker)
+                    .await
+                    .map_err(flatten_resolve)?;
+            }
+            // Marker-first: order-irrelevant in memory (no mid-call crash), but
+            // mirrors the documented stage ordering. All staged entries carry
+            // the same event, so the first is representative. `clears` beyond
+            // freezing the payload is not applied (no producer yet).
+            self.cells
+                .markers
+                .upsert_async(
+                    collection.id().clone(),
+                    EventMarker::frozen(event, staged, clears),
+                )
+                .await;
+        }
         for (cell, write) in writes {
             self.map()
                 .upsert_async(
@@ -264,6 +315,10 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        // Not yet applied: no producer emits a non-empty clear (the section-clear
+        // surface arrives with the fast path). `write_resolved` never touches the
+        // event marker.
+        _clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         for (cell, data) in cells {
             match data {
@@ -311,6 +366,40 @@ where
             // (idempotent — clearing an absent coordinate is a no-op).
             self.warm.clear(collection.id(), cell).await;
         }
+        Ok(())
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        Ok(self
+            .cells
+            .markers
+            .read_async(collection, |_, marker| marker.clone())
+            .await)
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        _clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        route_commit(self, collection, writes).await?;
+        // Settle owns the marker delete; removing an absent marker is a no-op
+        // (idempotent settle).
+        self.cells.markers.remove_async(collection.id()).await;
+        Ok(())
+    }
+
+    async fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        route_abort(self, collection, writes).await?;
+        self.cells.markers.remove_async(collection.id()).await;
         Ok(())
     }
 }

@@ -70,10 +70,11 @@ use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge};
 use crate::state::event_ref::EventRef;
+use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
-use crate::state::store::CellStore;
+use crate::state::store::{CellStore, route_abort, route_commit};
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
@@ -590,6 +591,11 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        // Not yet consumed — this store still records per-coordinate `kind=Index`
+        // markers; the event-marker row that reads `clears`/`staged` replaces
+        // them in the Cassandra marker step.
+        _clears: &'a [SectionClear],
+        _staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         let pk = Pk::of(collection.id());
         // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
@@ -655,6 +661,9 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        // Not yet applied — the section-erase gap deletes arrive with the
+        // Cassandra marker step; this store keeps its per-coordinate index rows.
+        _clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         let pk = Pk::of(collection.id());
         // Encode each cell's committed `data` up front (owns the `Bytes`); no
@@ -761,6 +770,34 @@ where
         self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        _collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        // Truthful, not a stub: this store writes no event-marker rows yet, so
+        // no collection ever has one — the per-coordinate `kind=Index` range is
+        // still the recovery source. The Cassandra marker step makes this a real
+        // `kind=Marker` point read.
+        Ok(None)
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        _clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        route_commit(self, collection, writes).await
+    }
+
+    async fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        route_abort(self, collection, writes).await
     }
 }
 

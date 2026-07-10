@@ -90,6 +90,7 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, CoverDecision, FjallCellCache, ScanHit};
 use super::identity::{CollectionId, CollectionRef};
+use super::marker::{EventMarker, SectionClear};
 use super::store::CellStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
@@ -706,12 +707,20 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         // Anchor the co-expiry on a clock read taken BEFORE the lower write
         // (see the module's TTL co-expiry doc and `expiry_at`). Establish
-        // first (Cov3): a failed lower write leaves coverage untouched.
+        // first (Cov3): a failed lower write leaves coverage untouched. The
+        // marker lifecycle lives entirely in the lower store; the cache never
+        // caches markers.
         let stamped_at = self.fjall.clock().now_ms();
-        if let Err(error) = self.lower.write_provisional(collection, writes).await {
+        if let Err(error) = self
+            .lower
+            .write_provisional(collection, writes, clears, staged)
+            .await
+        {
             // A partial durable stage may have landed `kind=Index` markers the
             // warm set now misses; drop the seeded latch so the next sweep
             // re-seeds from the durable index and restores completeness (the
@@ -744,11 +753,12 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // Pre-write anchor (Cov1/FLOOR), establish-first (Cov3) — see
         // `write_provisional`.
         let stamped_at = self.fjall.clock().now_ms();
-        self.lower.write_resolved(collection, cells).await?;
+        self.lower.write_resolved(collection, cells, clears).await?;
         // Rollback/committed-write resolved the cells; drop their warm
         // provisional coordinates in one batch (a no-op for a never-staged
         // direct write). A failed clear is a harmless over-report the sweep's
@@ -804,12 +814,17 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // Settle in the lower store (the authoritative settle) — the lower store
         // owns the promote-vs-delete routing (present data promotes, a staged
-        // clear deletes the row, per the row-absence invariant). See the module
-        // doc's Incomplete trap for why the result below is returned verbatim.
-        let result = self.lower.commit_provisional(collection, writes).await;
+        // clear deletes the row, per the row-absence invariant) and the marker
+        // delete. See the module doc's Incomplete trap for why the result below
+        // is returned verbatim.
+        let result = self
+            .lower
+            .commit_provisional(collection, writes, clears)
+            .await;
         if result.is_ok() {
             // The provisional `data` is now the committed value; re-publish it.
             // `mark_resolved` does NOT re-stamp the durable TTL, so the
@@ -860,9 +875,12 @@ where
             .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
             .collect();
         // Pre-write anchor (Cov1/FLOOR): the rollback re-writes `prev` with a
-        // fresh `USING TTL`, so it co-expires from this instant.
+        // fresh `USING TTL`, so it co-expires from this instant. Forward to the
+        // lower `abort_provisional` (not a bare `write_resolved`) so the lower
+        // store's marker delete runs — the cache owns only the fjall re-publish
+        // of the rolled-back `prev`, layered over the lower settle.
         let stamped_at = self.fjall.clock().now_ms();
-        let result = self.lower.write_resolved(collection, &cells).await;
+        let result = self.lower.abort_provisional(collection, writes).await;
         if result.is_ok() {
             // The rollback resolved the cells; drop their warm provisional
             // coordinates in one batch, then publish the rolled-back `prev`.
@@ -880,6 +898,15 @@ where
             .await;
         }
         result
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        // The cache never caches markers — the marker lifecycle lives in the
+        // lower store — so forward straight through.
+        self.lower.standing_marker(collection).await
     }
 }
 

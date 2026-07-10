@@ -161,7 +161,7 @@ fn gap_frontier_persists_mid_stream_and_never_over_covers() -> Result<()> {
         for i in 0..TOTAL {
             seed.push((cell_at(u8::try_from(i)?), Some(bytes(1))));
         }
-        counting.write_resolved(&cref, &seed).await?;
+        counting.write_resolved(&cref, &seed, &[]).await?;
 
         let cached = Cached::new(test_db::cache("frontier")?, counting.clone());
 

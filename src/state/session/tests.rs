@@ -563,3 +563,50 @@ fn prop_value_lifecycle_equivalence() {
     }
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
+
+/// [`StagedRecord::append`] merges a re-staged cell to a single entry with the
+/// last write's data (the own-event-base-is-prev invariant lets the `prev`
+/// stay), while never dropping a disjoint cell — the append-only staged-record
+/// invariant the mid-handler flush seam relies on.
+#[test]
+fn staged_record_append_merges_last_write_and_keeps_disjoint() -> Result<()> {
+    use super::StagedRecord;
+    use crate::state::CollectionRef;
+    use crate::state::cell::{Committed, ProvisionalWrite};
+    use crate::state::tests::cell_suite::{bytes, cell_at};
+    use crate::state::tests::support::fresh_collection;
+
+    let cref = CollectionRef::new(fresh_collection("staged")?, None);
+    let event = probe(1);
+    let write = |value: u8| ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), event);
+
+    let mut record = StagedRecord::default();
+    record.append(
+        cref.clone(),
+        vec![(cell_at(0), write(10)), (cell_at(1), write(11))],
+    );
+    // Second stage of the same collection: re-stage cell 1 (new data), add cell 2.
+    record.append(cref, vec![(cell_at(1), write(99)), (cell_at(2), write(12))]);
+
+    let set = record.into_staged_set();
+    assert_eq!(set.len(), 1, "one collection");
+    let (_, cells) = &set[0];
+    assert_eq!(cells.len(), 3, "cell 1 merged to one entry, not duplicated");
+    assert_eq!(
+        cells
+            .iter()
+            .find(|(cell, _)| *cell == cell_at(1))
+            .map(|(_, w)| w.data().cloned()),
+        Some(Some(bytes(99))),
+        "re-stage overwrites data (last write wins)"
+    );
+    assert!(
+        cells.iter().any(|(cell, _)| *cell == cell_at(0)),
+        "disjoint cell 0 kept"
+    );
+    assert!(
+        cells.iter().any(|(cell, _)| *cell == cell_at(2)),
+        "new cell 2 added"
+    );
+    Ok(())
+}

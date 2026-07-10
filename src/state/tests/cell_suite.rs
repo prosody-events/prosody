@@ -36,6 +36,7 @@ use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::dirty::DirtyStore;
 use super::super::identity::{CollectionId, CollectionRef};
+use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::MemoryCells;
 use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
@@ -182,10 +183,28 @@ impl CommitOracle for ScriptedOracle {
 /// primitives — so hooking them would only add live round-trips.
 pub(crate) trait ShapeProbe {
     async fn cell_rows(&self, id: &CollectionId) -> Result<BTreeSet<u8>>;
+
+    /// The collection's standing **event marker** as physically observed, or
+    /// [`MarkerObservation::Untracked`] on a backend that cannot yet answer
+    /// (the Cassandra interim, which writes no marker rows). An `Untracked`
+    /// answer makes the runner skip the marker check explicitly, never
+    /// vacuously pass a wrong `None`.
+    async fn standing_marker(&self, id: &CollectionId) -> Result<MarkerObservation>;
+}
+
+/// What a [`ShapeProbe`] physically sees for a collection's event marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MarkerObservation {
+    /// The backend cannot answer (the Cassandra interim) — skip the check.
+    Untracked,
+
+    /// The observed marker's owning event, or `None` when no marker stands.
+    Marker(Option<EventRef>),
 }
 
 /// [`ShapeProbe`] over the memory backend: the store map itself, every entry
-/// regardless of variant (so a lingering `Resolved(None)` residue is visible).
+/// regardless of variant (so a lingering `Resolved(None)` residue is visible),
+/// and the durable marker map (so a leaked or missing marker is visible).
 pub(crate) struct MemoryShapeProbe(pub(crate) MemoryCells);
 
 impl ShapeProbe for MemoryShapeProbe {
@@ -196,6 +215,12 @@ impl ShapeProbe for MemoryShapeProbe {
             .into_iter()
             .map(|cell| coord_of(&cell))
             .collect())
+    }
+
+    async fn standing_marker(&self, id: &CollectionId) -> Result<MarkerObservation> {
+        Ok(MarkerObservation::Marker(
+            self.0.standing_marker_of(id).map(|marker| marker.event()),
+        ))
     }
 }
 
@@ -439,6 +464,12 @@ where
     let (ids, refs) = pooled_collections()?;
     let mut store = make_store()?;
     let mut model: Vec<BTreeMap<u8, Option<Bytes>>> = vec![BTreeMap::new(); POOL as usize];
+    // The standing event marker per collection, as the owning event's dedup
+    // payload (`None` ⇒ no marker stands). Set on stage; cleared by a clean
+    // settle or a crash→sweep; **kept** by a crash→first-touch (first-touch is
+    // marker-free — the over-report the model pins); replaced by the next stage
+    // (boundary overwrite).
+    let mut marker_model: Vec<Option<u128>> = vec![None; POOL as usize];
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let dedup_id = Uuid::from_u128(index as u128);
@@ -480,8 +511,11 @@ where
                 cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
             }
             store
-                .write_provisional(&refs[*coll as usize], &cell_writes)
+                .write_provisional(&refs[*coll as usize], &cell_writes, &[], &cell_writes)
                 .await?;
+            // The stage writes (overwriting any lingering foreign marker) this
+            // event's marker for the collection.
+            marker_model[*coll as usize] = Some(index as u128);
             staged_writes.push((*coll, cell_writes));
         }
 
@@ -505,9 +539,16 @@ where
                         return Ok(false);
                     }
                 }
+                // The sweep's marker leg deletes every collection's standing
+                // marker (including any lingering from an earlier first-touch).
+                for marker in &mut marker_model {
+                    *marker = None;
+                }
             } else {
                 // First-touch under a fresh event so own-event never
                 // short-circuits; the read resolves each staged provisional cell.
+                // First-touch is marker-free, so each staged collection's marker
+                // (set above) lingers — the over-report the model keeps.
                 let recovery_event = EventRef::Message {
                     dedup_id: Uuid::from_u128(u128::MAX - index as u128),
                 };
@@ -520,19 +561,23 @@ where
                 }
             }
         } else if matches!(ev.outcome, Outcome::CleanCommitted) {
-            // Promote through the lifecycle settle path (publishes `data`).
+            // Promote through the lifecycle settle path (publishes `data`); the
+            // settle deletes the collection's marker.
             for (coll, cell_writes) in &staged_writes {
                 store
-                    .commit_provisional(&refs[*coll as usize], cell_writes)
+                    .commit_provisional(&refs[*coll as usize], cell_writes, &[])
                     .await?;
+                marker_model[*coll as usize] = None;
             }
         } else {
             // The only remaining non-crash outcome: clean inline rollback
-            // through the settle path (publishes `prev`).
+            // through the settle path (publishes `prev`); the settle deletes the
+            // marker.
             for (coll, cell_writes) in &staged_writes {
                 store
                     .abort_provisional(&refs[*coll as usize], cell_writes)
                     .await?;
+                marker_model[*coll as usize] = None;
             }
         }
 
@@ -551,6 +596,21 @@ where
                 .collect();
             if probe.cell_rows(id).await? != present {
                 return Ok(false);
+            }
+        }
+
+        // Marker-shape oracle: the standing event marker must match the model
+        // exactly — absent when settled or swept, the owning event when the
+        // stage lingers (first-touch recovery). `Untracked` (Cassandra interim)
+        // skips the check rather than passing a wrong `None`.
+        for (slot, id) in ids.iter().enumerate() {
+            if let MarkerObservation::Marker(observed) = probe.standing_marker(id).await? {
+                let expected = marker_model[slot].map(|dedup_id| EventRef::Message {
+                    dedup_id: Uuid::from_u128(dedup_id),
+                });
+                if observed != expected {
+                    return Ok(false);
+                }
             }
         }
     }
@@ -643,7 +703,9 @@ where
             }
             cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
         }
-        store.write_provisional(&refs[slot], &cell_writes).await?;
+        store
+            .write_provisional(&refs[slot], &cell_writes, &[], &cell_writes)
+            .await?;
         if op.commit {
             oracle.record_message(dedup_id).await?;
             for &(coord, mutation) in &cells {
@@ -799,14 +861,14 @@ where
                 // pure dirty-over-committed.
                 overlay
                     .lower()
-                    .write_resolved(&collection_ref, &[(cell_at(c), Some(bytes(b)))])
+                    .write_resolved(&collection_ref, &[(cell_at(c), Some(bytes(b)))], &[])
                     .await?;
                 model.committed.insert(c, Some(bytes(b)));
             }
             OverlayOp::CommitClear(c) => {
                 overlay
                     .lower()
-                    .write_resolved(&collection_ref, &[(cell_at(c), None)])
+                    .write_resolved(&collection_ref, &[(cell_at(c), None)], &[])
                     .await?;
                 model.committed.insert(c, None);
             }
@@ -1054,13 +1116,13 @@ where
             // committed set/clear so the bottom store alone holds the data.
             ScanStep::Seed(SeedOp::CommitSet(c, b) | SeedOp::DirtySet(c, b)) => {
                 store
-                    .write_resolved(&collection_ref, &[(cell_at(c), Some(bytes(b)))])
+                    .write_resolved(&collection_ref, &[(cell_at(c), Some(bytes(b)))], &[])
                     .await?;
                 model.committed.insert(c, Some(bytes(b)));
             }
             ScanStep::Seed(SeedOp::CommitClear(c) | SeedOp::DirtyClear(c)) => {
                 store
-                    .write_resolved(&collection_ref, &[(cell_at(c), None)])
+                    .write_resolved(&collection_ref, &[(cell_at(c), None)], &[])
                     .await?;
                 model.committed.insert(c, None);
             }
@@ -1116,6 +1178,9 @@ struct OpCounts {
     write_provisional: AtomicUsize,
     write_resolved: AtomicUsize,
     mark_resolved: AtomicUsize,
+    commit_provisional: AtomicUsize,
+    abort_provisional: AtomicUsize,
+    standing_marker: AtomicUsize,
     get: AtomicUsize,
     scan_cells: AtomicUsize,
     provisional_cells: AtomicUsize,
@@ -1130,11 +1195,23 @@ impl<S> CountingCellStore<S> {
         }
     }
 
-    /// Total durable mutations (excludes reads).
+    /// Total durable mutations (excludes reads). Folds the two settle verbs in:
+    /// a forwarded `commit_provisional` / `abort_provisional` routes through
+    /// the *inner* store's `mark_resolved` / `write_resolved`, invisible to
+    /// this wrapper's per-primitive counters, so the settle itself is
+    /// counted here.
     pub(crate) fn durable_writes(&self) -> usize {
         self.counts.write_provisional.load(Ordering::Relaxed)
             + self.counts.write_resolved.load(Ordering::Relaxed)
             + self.counts.mark_resolved.load(Ordering::Relaxed)
+            + self.counts.commit_provisional.load(Ordering::Relaxed)
+            + self.counts.abort_provisional.load(Ordering::Relaxed)
+    }
+
+    /// Standing-marker point reads — the quiescence counter: one per sweep
+    /// marker leg. A read, so excluded from [`Self::durable_writes`].
+    pub(crate) fn marker_reads(&self) -> usize {
+        self.counts.standing_marker.load(Ordering::Relaxed)
     }
 
     /// Point reads issued to the lower store — zero on a covered-negative
@@ -1167,6 +1244,9 @@ impl<S> CountingCellStore<S> {
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
+        self.counts.commit_provisional.store(0, Ordering::Relaxed);
+        self.counts.abort_provisional.store(0, Ordering::Relaxed);
+        self.counts.standing_marker.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cells.store(0, Ordering::Relaxed);
@@ -1228,21 +1308,26 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         // One increment per collection-grain batch call (not one per cell).
         self.counts
             .write_provisional
             .fetch_add(1, Ordering::Relaxed);
-        self.inner.write_provisional(collection, writes).await
+        self.inner
+            .write_provisional(collection, writes, clears, staged)
+            .await
     }
 
     async fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         self.counts.write_resolved.fetch_add(1, Ordering::Relaxed);
-        self.inner.write_resolved(collection, cells).await
+        self.inner.write_resolved(collection, cells, clears).await
     }
 
     async fn mark_resolved<'a>(
@@ -1252,6 +1337,42 @@ where
     ) -> Result<(), Self::Error> {
         self.counts.mark_resolved.fetch_add(1, Ordering::Relaxed);
         self.inner.mark_resolved(collection, cells).await
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        self.counts.standing_marker.fetch_add(1, Ordering::Relaxed);
+        self.inner.standing_marker(collection).await
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        // Count the settle itself: the inner store routes to `mark_resolved` /
+        // `write_resolved` on *itself*, so those never reach this wrapper's
+        // per-primitive counters.
+        self.counts
+            .commit_provisional
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .commit_provisional(collection, writes, clears)
+            .await
+    }
+
+    async fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        self.counts
+            .abort_provisional
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.abort_provisional(collection, writes).await
     }
 }
 
@@ -1431,12 +1552,14 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         if let Some(category) = self.injected_stage(collection) {
             return Err(FailCellError::Poison(category));
         }
         self.inner
-            .write_provisional(collection, writes)
+            .write_provisional(collection, writes, clears, staged)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -1445,9 +1568,10 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         self.inner
-            .write_resolved(collection, cells)
+            .write_resolved(collection, cells, clears)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -1462,6 +1586,52 @@ where
         }
         self.inner
             .mark_resolved(collection, cells)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        self.inner
+            .standing_marker(collection)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        // A settle arriving via the sweep's marker leg routes through the inner
+        // store's `mark_resolved` on the *inner* store, bypassing the poison on
+        // this wrapper's `mark_resolved`. Re-check the poison here against the
+        // promoted (present-data) cells so a per-cell promote poison still fires
+        // on the batch settle.
+        let keeps: Vec<CellKey> = writes
+            .iter()
+            .filter(|(_, write)| write.data().is_some())
+            .map(|(cell, _)| cell.clone())
+            .collect();
+        if let Some(category) = self.injected(collection, &keeps) {
+            return Err(FailCellError::Poison(category));
+        }
+        self.inner
+            .commit_provisional(collection, writes, clears)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    async fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .abort_provisional(collection, writes)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -1525,10 +1695,14 @@ mod sweep {
     }
 
     /// Drives one random outcome assignment through `sweep_provisional` and
-    /// checks its contract. Stages one committed provisional cell per outcome
-    /// in a single collection (so all resolutions share one sweep), poisons
-    /// the chosen cells, then asserts the sweep's return matches the
-    /// assignment.
+    /// checks its contract. Stages **all** the outcomes' cells under **one**
+    /// committed event in a single `write_provisional` (the stage-boundary rule
+    /// makes multiple events' provisional cells coexisting on one collection
+    /// unreachable — a later stage would boundary-resolve its predecessor), so
+    /// the sweep resolves them as one marker leg followed by the per-cell
+    /// mop-up. Poisons the chosen cells, then asserts the sweep's return
+    /// matches the assignment. Converted from the prior one-event-per-cell
+    /// shape: same failure-arm invariant, now a reachable staging shape.
     async fn run_sweep_failure(SweepOutcomes(outcomes): SweepOutcomes) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let registry = Arc::new(CollectionDefRegistry::default());
@@ -1542,20 +1716,19 @@ mod sweep {
             None,
         );
 
-        // One committed provisional cell per outcome, at distinct coordinates.
+        // All cells staged under one committed event, at distinct coordinates.
+        let dedup_id = Uuid::from_u128(0);
+        let event = EventRef::Message { dedup_id };
+        let mut writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(outcomes.len());
         for c in 0..outcomes.len() as u8 {
-            let dedup_id = Uuid::from_u128(u128::from(c));
-            let event = EventRef::Message { dedup_id };
             let cell = cell_at(c);
             let prev = inner.get(collection.id(), &cell, event).await?;
-            inner
-                .write_provisional(
-                    &collection,
-                    &[(cell, ProvisionalWrite::new(Some(bytes(c)), prev, event))],
-                )
-                .await?;
-            oracle.record_message(dedup_id).await?;
+            writes.push((cell, ProvisionalWrite::new(Some(bytes(c)), prev, event)));
         }
+        inner
+            .write_provisional(&collection, &writes, &[], &writes)
+            .await?;
+        oracle.record_message(dedup_id).await?;
 
         let poison: BTreeMap<u8, ErrorCategory> = outcomes
             .iter()
@@ -1617,19 +1790,16 @@ mod sweep {
             let dedup_id = Uuid::from_u128(i as u128);
             let event = EventRef::Message { dedup_id };
             let prev = store.get(id, &cell, event).await?;
-            store
-                .write_provisional(
-                    r,
-                    &[(
-                        cell.clone(),
-                        ProvisionalWrite::new(Some(bytes(7)), prev, event),
-                    )],
-                )
-                .await?;
+            let writes = [(
+                cell.clone(),
+                ProvisionalWrite::new(Some(bytes(7)), prev, event),
+            )];
+            store.write_provisional(r, &writes, &[], &writes).await?;
             oracle.record_message(dedup_id).await?;
         }
 
-        // First sweep resolves every cell.
+        // First sweep resolves every cell — via the marker leg's one settle per
+        // collection, so `durable_writes` counts the folded `commit_provisional`.
         for r in &refs {
             assert!(sweep_provisional(&store, &oracle, r).await?);
         }
@@ -1637,17 +1807,25 @@ mod sweep {
             store.durable_writes() > 0,
             "first sweep must resolve provisional cells"
         );
+        // Non-vacuous: the sweep read each collection's standing marker once.
+        assert_eq!(
+            store.marker_reads(),
+            refs.len(),
+            "first sweep reads each collection's standing marker exactly once"
+        );
 
-        // Second sweep is a no-op: no provisional cell remains to resolve, and
-        // once seeded the recovery entry short-circuits on the empty set.
+        // Second sweep is a no-op: no provisional cell remains to resolve and no
+        // marker stands (the first sweep's settle deleted it), so the marker leg
+        // and the per-cell leg both issue zero durable writes.
         store.reset();
         for r in &refs {
             assert!(sweep_provisional(&store, &oracle, r).await?);
         }
         assert_eq!(store.durable_writes(), 0);
-        // The sweep still *entered* `provisional_cells` once per collection —
-        // the counter that makes the durable-write assertion non-vacuous.
+        // The sweep still *entered* both legs once per collection — the counters
+        // that make the durable-write assertion non-vacuous.
         assert_eq!(store.recovery_sweeps(), refs.len());
+        assert_eq!(store.marker_reads(), refs.len());
         Ok(())
     }
 
@@ -1746,14 +1924,12 @@ mod sweep {
             let cell = cell_at(op.coord());
             let prev = warm.get(collection.id(), &cell, event).await?;
             let prev_value = prev.get().cloned();
-            warm.write_provisional(
-                &collection,
-                &[(
-                    cell.clone(),
-                    ProvisionalWrite::new(Some(bytes(i as u8)), prev, event),
-                )],
-            )
-            .await?;
+            let writes = [(
+                cell.clone(),
+                ProvisionalWrite::new(Some(bytes(i as u8)), prev, event),
+            )];
+            warm.write_provisional(&collection, &writes, &[], &writes)
+                .await?;
             match op {
                 SetOp::StageOnly(_) => {}
                 SetOp::Promote(_) => {
@@ -1761,7 +1937,7 @@ mod sweep {
                         .await?;
                 }
                 SetOp::Rollback(_) => {
-                    warm.write_resolved(&collection, &[(cell.clone(), prev_value)])
+                    warm.write_resolved(&collection, &[(cell.clone(), prev_value)], &[])
                         .await?;
                 }
             }

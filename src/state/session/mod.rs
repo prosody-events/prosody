@@ -90,6 +90,64 @@ mod tests;
 /// to.
 type StagedSet = Vec<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>;
 
+/// The per-event staged record: the provisional writes `finalize` staged,
+/// grouped by collection, that the lifecycle promotes or rolls back and that
+/// each collection's event marker lists.
+///
+/// # Invariant: the staged record is append-only
+///
+/// A coordinate durably staged by the event is **never dropped** from the
+/// record until settle or reset. A later stage of the same collection merges
+/// per cell ([`Self::append`]) — a re-staged cell replaces its entry (same
+/// committed `prev` by the own-event-base-is-prev invariant) — but never
+/// removes a previously staged cell. Dropping one would strand its durable
+/// provisional row: unlisted by the marker, it is invisible to the recovery
+/// sweep, and rollback would no longer be exact. `finalize` is the only stager
+/// this phase, so the merge path exists for the mid-handler flush the session
+/// will grow later; the record's invariant is what that seam relies on.
+#[derive(Default)]
+struct StagedRecord {
+    collections: StagedSet,
+}
+
+impl StagedRecord {
+    /// Merges one collection's staged writes into the record: a re-staged cell
+    /// replaces its prior entry, a new cell is appended, and a
+    /// not-yet-recorded collection is added. Never removes a staged cell.
+    fn append(&mut self, collection: CollectionRef, writes: Vec<(CellKey, ProvisionalWrite)>) {
+        match self
+            .collections
+            .iter_mut()
+            .find(|(existing, _)| *existing == collection)
+        {
+            Some((_, recorded)) => {
+                for (cell, write) in writes {
+                    match recorded.iter_mut().find(|(c, _)| *c == cell) {
+                        Some(slot) => slot.1 = write,
+                        None => recorded.push((cell, write)),
+                    }
+                }
+            }
+            None => self.collections.push((collection, writes)),
+        }
+    }
+
+    /// Whether nothing was staged.
+    fn is_empty(&self) -> bool {
+        self.collections.is_empty()
+    }
+
+    /// The recorded collections, for the recovery-delay fold.
+    fn collections(&self) -> &StagedSet {
+        &self.collections
+    }
+
+    /// Consumes the record into its grouped staged set, for resolution.
+    fn into_staged_set(self) -> StagedSet {
+        self.collections
+    }
+}
+
 /// The per-event session collections read, buffer, and mutate through.
 ///
 /// `get`/`scan` describe the session's **visible committed bytes** for a cell —
@@ -411,7 +469,7 @@ where
     termination: TerminationWatch,
     /// The recorded staged set the lifecycle promotes or rolls back. `None`
     /// until `finalize` stages a `ReadCommitted` collection.
-    staged: SyncMutex<Option<StagedSet>>,
+    staged: SyncMutex<Option<StagedRecord>>,
     /// The registered message commit marker, flushed strictly after the stage
     /// and cleared by `reset`.
     marker: SyncMutex<Option<Uuid>>,
@@ -509,15 +567,19 @@ where
     where
         L: Send + Sync + 'static,
     {
-        let Some(set) = self.inner.staged.lock().take() else {
+        let Some(record) = self.inner.staged.lock().take() else {
             return ApplyOutcome::NothingStaged;
         };
         let lower = self.inner.overlay.lower();
-        let all_resolved = stream::iter(set)
+        let all_resolved = stream::iter(record.into_staged_set())
             .map(|(collection_ref, writes)| {
                 cooperative(async move {
                     let result = if committed {
-                        lower.commit_provisional(&collection_ref, &writes).await
+                        // No section clears this phase (no producer); the
+                        // marker delete is owned by the settle verb.
+                        lower
+                            .commit_provisional(&collection_ref, &writes, &[])
+                            .await
                     } else {
                         lower.abort_provisional(&collection_ref, &writes).await
                     };
@@ -653,7 +715,7 @@ where
         self.inner
             .overlay
             .lower()
-            .write_resolved(&collection_ref, &resolved)
+            .write_resolved(&collection_ref, &resolved, &[])
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         // Drain only after the write landed: a store failure leaves the
@@ -690,10 +752,17 @@ where
             .try_filter_map(|opt| async move { Ok(opt) })
             .try_collect()
             .await?;
-        if staged.is_empty() {
+        // Fold the staged collections into the append-only record. `touched`
+        // yields each collection once, so this is one append per collection; the
+        // merge path exists for the record's invariant, not for this call.
+        let mut record = StagedRecord::default();
+        for (collection_ref, writes) in staged {
+            record.append(collection_ref, writes);
+        }
+        if record.is_empty() {
             Ok(FinalizeOutcome::Clean)
         } else {
-            *self.inner.staged.lock() = Some(staged);
+            *self.inner.staged.lock() = Some(record);
             Ok(FinalizeOutcome::Staged)
         }
     }
@@ -746,8 +815,9 @@ where
         // never appear here. The fold is sync (`recovery_within_for` is sync),
         // so no await runs under the `staged` lock.
         let floor = self.inner.recovery_delay;
-        self.inner.staged.lock().as_ref().map_or(floor, |staged| {
-            staged
+        self.inner.staged.lock().as_ref().map_or(floor, |record| {
+            record
+                .collections()
                 .iter()
                 .filter_map(|(collection, _)| {
                     let id = collection.id();
@@ -816,8 +886,11 @@ where
                 .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
                 .try_collect()
                 .await?;
+            // `finalize` is the only stager this phase, so the staged union so
+            // far IS this single stage's writes; clears are empty (no
+            // section-clear producer exists yet).
             lower
-                .write_provisional(&collection_ref, &writes)
+                .write_provisional(&collection_ref, &writes, &[], &writes)
                 .await
                 .map_err(|e| StateAccessError::store(&e))?;
             Ok(Some((collection_ref, writes)))
@@ -828,7 +901,7 @@ where
                 .map(|(cell, value)| (cell, value.into_data()))
                 .collect();
             lower
-                .write_resolved(&collection_ref, &resolved)
+                .write_resolved(&collection_ref, &resolved, &[])
                 .await
                 .map_err(|e| StateAccessError::store(&e))?;
             Ok(None)

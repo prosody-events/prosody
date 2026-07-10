@@ -641,6 +641,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
                 deque::meta_cell(),
                 Some(Bytes::from(deque::seed_frame(head, tail))),
             )],
+            &[],
         )
         .await?;
     for (i, cell) in shape.cells.iter().enumerate() {
@@ -651,6 +652,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
                 .write_resolved(
                     &collection_ref,
                     &[(deque::entry_cell_for(&coordinate), Some(bytes))],
+                    &[],
                 )
                 .await?;
         }
@@ -855,6 +857,7 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
                 Some(Bytes::from(serde_json::to_vec(&Value::from(0_u8))?)),
             ),
         ],
+        &[],
     ))?;
 
     let armed: ArmedKeys = Arc::default();

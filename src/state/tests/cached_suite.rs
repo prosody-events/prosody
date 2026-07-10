@@ -22,6 +22,7 @@ use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::fjall::Clock;
 use super::super::fjall::test_db;
+use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
@@ -176,16 +177,20 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.write_provisional(collection, writes)
+        self.inner
+            .write_provisional(collection, writes, clears, staged)
     }
 
     fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.write_resolved(collection, cells)
+        self.inner.write_resolved(collection, cells, clears)
     }
 
     fn mark_resolved<'a>(
@@ -194,6 +199,30 @@ where
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         self.inner.mark_resolved(collection, cells)
+    }
+
+    fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
+        self.inner.standing_marker(collection)
+    }
+
+    fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.commit_provisional(collection, writes, clears)
+    }
+
+    fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.abort_provisional(collection, writes)
     }
 }
 
@@ -267,7 +296,7 @@ fn coverage_op_budget() -> Result<()> {
         // write-through publishes+covers its point.
         for c in [0u8, 2, 4, 6, 8] {
             cached
-                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
 
@@ -306,7 +335,7 @@ fn coverage_op_budget() -> Result<()> {
         // re-scan serves entirely from the cache — ZERO lower reads after the
         // write (no read-after-write to the durable store).
         cached
-            .write_resolved(&cref, &[(cell_at(4), Some(bytes(40)))])
+            .write_resolved(&cref, &[(cell_at(4), Some(bytes(40)))], &[])
             .await?;
         counting.reset();
         let after = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
@@ -378,12 +407,17 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
         // First cache instance: cover a value and leave a provisional cell.
         let cached = Cached::new(test_db::cache("warm")?, counting.clone());
         cached
-            .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))])
+            .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))], &[])
             .await?;
         let prev = cached.get(&id, &cell_at(3), event).await?;
         let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
         cached
-            .write_provisional(&cref, &[(cell_at(3), write)])
+            .write_provisional(
+                &cref,
+                &[(cell_at(3), write.clone())],
+                &[],
+                &[(cell_at(3), write)],
+            )
             .await?;
 
         // Prime the warm provisional index: the first sweep is a cold seed (one
@@ -469,6 +503,11 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
                 &cref,
                 &[(
                     cell_at(3),
+                    ProvisionalWrite::new(Some(bytes(5)), prev.clone(), event),
+                )],
+                &[],
+                &[(
+                    cell_at(3),
                     ProvisionalWrite::new(Some(bytes(5)), prev, event),
                 )],
             )
@@ -526,6 +565,11 @@ fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
         cached
             .write_provisional(
                 &cref,
+                &[(
+                    cell_at(3),
+                    ProvisionalWrite::new(Some(bytes(5)), prev.clone(), event),
+                )],
+                &[],
                 &[(
                     cell_at(3),
                     ProvisionalWrite::new(Some(bytes(5)), prev, event),
@@ -603,16 +647,16 @@ fn coverage_scan_isolation() -> Result<()> {
         };
         for c in [10u8, 20, 30] {
             cached
-                .write_resolved(&a_ref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&a_ref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         for c in [40u8, 50] {
             cached
-                .write_resolved(&b_ref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&b_ref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         cached
-            .write_resolved(&a_ref, &[(decoy.clone(), Some(bytes(5)))])
+            .write_resolved(&a_ref, &[(decoy.clone(), Some(bytes(5)))], &[])
             .await?;
 
         // A full-range scan of A's entry section must yield only A's entries —
@@ -648,7 +692,7 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
 
         for c in 0..N {
             cached
-                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         // Warm coverage, then a fully covered re-scan from fjall must yield all
@@ -740,7 +784,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
 
         // Write through coordinate 7; it is now covered and served from fjall.
         cached
-            .write_resolved(&cref, &[(cell_at(7), Some(bytes(7)))])
+            .write_resolved(&cref, &[(cell_at(7), Some(bytes(7)))], &[])
             .await?;
         lower.reset();
         assert_eq!(
@@ -756,7 +800,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         // still holds the stale (now-expired) `7` while the lower store holds
         // `70`. The expired covered get must fall through and yield `70`.
         lower
-            .write_resolved(&cref, &[(cell_at(7), Some(bytes(70)))])
+            .write_resolved(&cref, &[(cell_at(7), Some(bytes(70)))], &[])
             .await?;
         lower.reset();
         assert_eq!(
@@ -820,7 +864,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
 
         let cached = Cached::new(test_db::cache("volatile")?, lower.clone());
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         assert_eq!(
             cached.get(&id, &cell_at(1), probe(1)).await?.get(),
@@ -829,7 +873,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
 
         // Change the durable value out-of-band, leaving the stale fjall `1`.
         lower
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))], &[])
             .await?;
 
         // Cold restart = a fresh assignment: a new cache + index keyspace pair, so
@@ -864,7 +908,7 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
 
         // First write publishes cleanly and covers `1`.
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         assert_eq!(
             cached.get(&id, &cell_at(1), probe(1)).await?.get(),
@@ -876,7 +920,7 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
         // is punched out of coverage.
         fail.store(true, Ordering::Relaxed);
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))], &[])
             .await?;
 
         // Heal the cache fault; the next get is now uncovered, so it falls
@@ -913,7 +957,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
         let update = [(cell_at(1), Some(bytes(11))), (cell_at(2), Some(bytes(22)))];
 
         // One multi-cell write-through publishes cleanly and covers both cells.
-        cached.write_resolved(&cref, &seed).await?;
+        cached.write_resolved(&cref, &seed, &[]).await?;
         for (c, v) in [(1u8, 1u8), (2, 2)] {
             assert_eq!(
                 cached
@@ -928,7 +972,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
         // (durable truth is `11`/`22`), but the atomic batch lands nothing → all
         // coordinates in the batch are punched out of coverage.
         fail.store(true, Ordering::Relaxed);
-        cached.write_resolved(&cref, &update).await?;
+        cached.write_resolved(&cref, &update, &[]).await?;
 
         // Heal the fault; both gets are now uncovered, so each falls through to
         // its fresh durable value — never serving the stale batch.
@@ -973,12 +1017,17 @@ fn promote_punch_failure_never_freezes_stale_prev() -> Result<()> {
         // Committed base `1`, covered by write-through; stage `5` over it (the
         // stage publishes `prev` = 1, so the coordinate stays covered with 1).
         cached
-            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
             .await?;
         let prev = cached.get(&id, &cell_at(0), event).await?;
         let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
         cached
-            .write_provisional(&cref, &[(cell_at(0), write)])
+            .write_provisional(
+                &cref,
+                &[(cell_at(0), write.clone())],
+                &[],
+                &[(cell_at(0), write)],
+            )
             .await?;
 
         // The raw promote with the punch's next coverage rewrite failing: the
@@ -1024,12 +1073,12 @@ fn write_path_punch_retries_until_it_lands() -> Result<()> {
         // Cover `1` cleanly, then write `2` with the publish AND the first
         // punch rewrite failing.
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         fail_puts.store(true, Ordering::Relaxed);
         fail_covers.store(1, Ordering::Relaxed);
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))], &[])
             .await?;
         fail_puts.store(false, Ordering::Relaxed);
 
@@ -1074,7 +1123,12 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         let prev = cached.get(&id, &cell_at(0), event).await?;
         let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
         cached
-            .write_provisional(&cref, &[(cell_at(0), write.clone())])
+            .write_provisional(
+                &cref,
+                &[(cell_at(0), write.clone())],
+                &[],
+                &[(cell_at(0), write.clone())],
+            )
             .await?;
         // `probe(1)` is a message event with dedup id `1`; record it committed
         // so the promote arm resolves to `data`.
@@ -1084,7 +1138,7 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         // lower promote succeeded), never folded into an error.
         fail.store(true, Ordering::Relaxed);
         let result = cached
-            .commit_provisional(&cref, &[(cell_at(0), write)])
+            .commit_provisional(&cref, &[(cell_at(0), write)], &[])
             .await;
         assert!(
             result.is_ok(),
@@ -1244,7 +1298,7 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                 match *op {
                     TtlMut::Set(key, value) => {
                         cached
-                            .write_resolved(&cref, &[(cell_at(key), Some(bytes(value)))])
+                            .write_resolved(&cref, &[(cell_at(key), Some(bytes(value)))], &[])
                             .await?;
                         committed.insert(key, Committed::new(Some(bytes(value))));
                         death.insert(key, death_at(clock));
@@ -1256,7 +1310,12 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             event,
                         );
                         cached
-                            .write_provisional(&cref, &[(cell_at(key), write)])
+                            .write_provisional(
+                                &cref,
+                                &[(cell_at(key), write.clone())],
+                                &[],
+                                &[(cell_at(key), write)],
+                            )
                             .await?;
                         staged.insert(key, value);
                         death.insert(key, death_at(clock));
@@ -1271,7 +1330,7 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             event,
                         );
                         cached
-                            .commit_provisional(&cref, &[(cell_at(key), write)])
+                            .commit_provisional(&cref, &[(cell_at(key), write)], &[])
                             .await?;
                         committed.insert(key, Committed::new(Some(bytes(value))));
                         // `mark_resolved` keeps the stage TTL → death
@@ -1358,7 +1417,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         // warm the whole section with one scan so the gaps cover too.
         for c in [3u8, 5, 7] {
             cached
-                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;

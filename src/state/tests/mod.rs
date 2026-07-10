@@ -8,18 +8,24 @@ use self::cell_suite::{
     MemoryShapeProbe, OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace,
     run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
+use self::cell_suite::{bytes, cell_at};
 use self::collection_suite::{
     DequeHoles, DequeTrace, MapTrace, run_deque_holes, run_deque_trace, run_map_trace,
     run_map_ttl_bounds_trace,
 };
 use self::support::fresh_collection;
-use super::CollectionRef;
+use super::cell::ProvisionalWrite;
 use super::memory::{MemoryCellStore, MemoryCells};
+use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
+use super::store::CellStore;
+use super::{CollectionRef, EventRef};
 use color_eyre::eyre::Result;
+use futures::StreamExt;
 use futures::executor;
 use quickcheck::QuickCheck;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// `CollectionRef` equality and hashing key on the inner `CollectionId` only —
 /// the TTL is a per-write hint, not part of identity. Two refs to the same
@@ -171,4 +177,102 @@ fn prop_deque_ttl_holes() {
         executor::block_on(run_deque_holes(shape))
     }
     QuickCheck::new().quickcheck(property as fn(DequeHoles) -> Result<bool>);
+}
+
+/// Staging over a standing **foreign** marker with live cells: event A stages
+/// coordinates {0, 1}, the process crashes with no recovery (a fresh store over
+/// the same warm cells), then event B stages coordinate {1} on the same
+/// collection. B's stage boundary must resolve A's standing marker first, so
+/// A's untouched coordinate 0 settles to A's verdict, B's marker replaces A's,
+/// and only B's cell stays provisional. This is the one production-reachable
+/// shape the crash trace generator does not yet emit (its generator recovers
+/// each crash before the next event); the generated crash/reassignment alphabet
+/// subsumes it in the Cassandra marker phase.
+async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let id = fresh_collection("boundary")?;
+    let collection = CollectionRef::new(id.clone(), None);
+    let store = memory_store(cells.clone(), oracle.clone());
+
+    // Stage event A at coordinates {0, 1} over an empty base.
+    let a_dedup = Uuid::from_u128(1);
+    let a = EventRef::Message { dedup_id: a_dedup };
+    let prev0 = store.get(&id, &cell_at(0), a).await?;
+    let prev1 = store.get(&id, &cell_at(1), a).await?;
+    let writes_a = [
+        (cell_at(0), ProvisionalWrite::new(Some(bytes(10)), prev0, a)),
+        (cell_at(1), ProvisionalWrite::new(Some(bytes(11)), prev1, a)),
+    ];
+    store
+        .write_provisional(&collection, &writes_a, &[], &writes_a)
+        .await?;
+    if a_committed {
+        oracle.record_message(a_dedup).await?;
+    }
+
+    // Crash with no recovery: a fresh store over the same warm cells (A's
+    // provisional cells and marker survive in `MemoryCells`).
+    let store = memory_store(cells.clone(), oracle.clone());
+
+    // Stage event B at coordinate {1}; the boundary resolves A's marker.
+    let b = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let prev_b = store.get(&id, &cell_at(1), b).await?;
+    let writes_b = [(
+        cell_at(1),
+        ProvisionalWrite::new(Some(bytes(21)), prev_b, b),
+    )];
+    store
+        .write_provisional(&collection, &writes_b, &[], &writes_b)
+        .await?;
+
+    // Exactly B's one staged cell remains provisional — checked BEFORE any
+    // resolving read, so a skipped boundary resolve (A's coordinate 0 left
+    // provisional) surfaces here rather than being masked by a later `get`.
+    let mut provisional = 0usize;
+    let stream = store.provisional_cells(&id);
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        item?;
+        provisional += 1;
+    }
+    assert_eq!(
+        provisional, 1,
+        "the boundary resolved A's cells; only B's staged cell is provisional"
+    );
+
+    // B's marker replaces A's.
+    assert_eq!(
+        cells.standing_marker_of(&id).map(|marker| marker.event()),
+        Some(b),
+        "B's marker stands after the boundary overwrite"
+    );
+
+    // A's untouched coordinate 0 is resolved per A's verdict: A's data on
+    // commit, exact absence (A's `None` base) on abort.
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    let cell0 = store.get(&id, &cell_at(0), probe).await?.into_inner();
+    assert_eq!(
+        cell0,
+        a_committed.then(|| bytes(10)),
+        "A's coordinate 0 resolves per A's verdict at B's stage boundary"
+    );
+    Ok(())
+}
+
+/// Boundary resolve when A committed: A's coordinate 0 promotes to A's data.
+#[test]
+fn boundary_resolves_committed_foreign_marker() -> Result<()> {
+    executor::block_on(boundary_resolve_pin(true))
+}
+
+/// Boundary resolve when A aborted: A's coordinate 0 rolls back to its absent
+/// base.
+#[test]
+fn boundary_resolves_aborted_foreign_marker() -> Result<()> {
+    executor::block_on(boundary_resolve_pin(false))
 }

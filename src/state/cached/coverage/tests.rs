@@ -502,7 +502,7 @@ fn prop_gap_cover_stride_frontier() {
                 };
                 seed.push((cell, Some(bytes(1))));
             }
-            counting.write_resolved(&cref, &seed).await?;
+            counting.write_resolved(&cref, &seed, &[]).await?;
 
             let cached = Cached::new(test_db::cache("stride-frontier")?, counting.clone());
 

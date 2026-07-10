@@ -344,10 +344,14 @@ async fn state_type_namespaces_cells() -> Result<()> {
     );
 
     store
-        .write_resolved(&app, &[(cell.clone(), Some(Bytes::from_static(b"app")))])
+        .write_resolved(
+            &app,
+            &[(cell.clone(), Some(Bytes::from_static(b"app")))],
+            &[],
+        )
         .await?;
     store
-        .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))])
+        .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))], &[])
         .await?;
 
     // A resolved cell never consults the oracle, so the probe event is inert.

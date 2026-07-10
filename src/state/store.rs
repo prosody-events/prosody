@@ -50,6 +50,7 @@ use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Scan};
 use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
+use super::marker::{EventMarker, SectionClear};
 use crate::error::ClassifyError;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -179,7 +180,40 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a;
 
     /// Stages each `(cell, write)`'s provisional cell (`data | prev | event`)
-    /// in one same-partition batch, binding `collection`'s TTL.
+    /// in one same-partition batch, binding `collection`'s TTL, and
+    /// creates/overwrites the collection's **event marker** — the durable
+    /// recovery handle naming the staging event and the coordinates it staged.
+    ///
+    /// # The event-marker lifecycle (stated once, here)
+    ///
+    /// Exactly one verb family owns the marker: this verb (create/overwrite),
+    /// and [`commit_provisional`](Self::commit_provisional) /
+    /// [`abort_provisional`](Self::abort_provisional) / the recovery sweep
+    /// (delete). [`write_resolved`](Self::write_resolved) and
+    /// [`mark_resolved`](Self::mark_resolved) never touch it — there is nothing
+    /// provisional to recover — so a fresh-commit no-op marker write is
+    /// unrepresentable.
+    ///
+    /// `staged` is the session's **whole** per-collection staged record
+    /// (`writes ⊆ staged`); the marker lists it, so a stage that splits over
+    /// the byte budget overwrites the marker with the running union rather than
+    /// dropping a previously staged coordinate (which would strand its durable
+    /// row from recovery). The staged record is append-only and owned by the
+    /// session for exactly this reason. An attempt N+1 stage replaces attempt
+    /// N's marker with N+1's record — handlers are assumed deterministic across
+    /// retries. An **empty** `staged` writes no marker and skips the boundary
+    /// check below (nothing staged ⇒ nothing to strand).
+    ///
+    /// Before staging, the backend resolves any **foreign** standing marker (a
+    /// different event) — the stage-boundary rule that keeps marker uniqueness
+    /// per collection an invariant; a resolution failure fails the stage (the
+    /// retry middleware handles it).
+    ///
+    /// `clears` names each cleared section with its frozen survivor list,
+    /// frozen into the marker payload here so re-apply during recovery
+    /// stays a pure function of durable staged data. No producer emits a
+    /// non-empty `clears` until the session's section-clear surface exists,
+    /// so backends freeze the payload but do not yet apply the erase.
     ///
     /// # Errors
     ///
@@ -188,6 +222,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     /// Writes each `(cell, data)` as a resolved cell in one same-partition
@@ -195,7 +231,13 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
     /// `None` **deletes the row** (the row-absence invariant). Covers the
     /// `ReadUncommitted` direct clear, the mid-handler flush of a clear, and
-    /// rollback-to-absent.
+    /// rollback-to-absent. Never touches the event marker (see
+    /// [`write_provisional`](Self::write_provisional)).
+    ///
+    /// `clears` names sections to erase before applying `cells` — the
+    /// direct-apply twin of a staged clear. No producer emits a non-empty
+    /// `clears` yet, so backends document (not silently hide) that the
+    /// parameter is not yet applied.
     ///
     /// # Errors
     ///
@@ -204,7 +246,22 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    /// Point-reads the collection's standing **event marker**, or `None` when
+    /// none stands (≈ always). Feeds the recovery sweep's marker leg and the
+    /// stage-boundary rule. Required with no default: a defaulted `Ok(None)` on
+    /// a marker-bearing backend would be a silent recovery hole, so every impl
+    /// answers truthfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on a store failure.
+    fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a;
 
     /// Promotes each `cell`'s provisional cell to resolved: nulls `event` and
     /// `prev`, keeping `data`. O(1) bytes per cell. Idempotent — promoting a
@@ -225,21 +282,20 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Settles a staged set as **committed**: each cell's provisional `data`
-    /// becomes the committed value. The default routes on data presence — a
-    /// present-data cell promotes in place ([`Self::mark_resolved`]); an
-    /// absent-data cell (a staged clear) **deletes** the row via
-    /// [`Self::write_resolved`]`(cell, None)`, upholding the row-absence
-    /// invariant. The [`Cached`](super::cached::Cached) cache overrides it to
-    /// also publish the committed projection into fjall, returning the
-    /// **lower** result verbatim so a cache-publish failure never gates
-    /// promotion.
+    /// Settles a staged set as **committed** AND deletes the collection's event
+    /// marker: each cell's provisional `data` becomes the committed value.
     ///
-    /// Both arms are idempotent and row-disjoint (an event stages each cell at
-    /// most once, so no cell appears in both), so the two sequential awaits are
-    /// order-free; the sweep retries either on failure. A settle with no clears
-    /// issues exactly one `mark_resolved` batch set — the second round-trip
-    /// arrives only when the event actually staged a clear.
+    /// Required with no default (the routing lives in a shared free function,
+    /// `route_commit`, which every impl calls): with markers, a defaulted
+    /// override behind a trait default is a landmine — a wrapper store that
+    /// forgot to forward the verb would fall into a default routing through the
+    /// *wrapper's* verbs and bypass the inner store's marker delete, a leaked
+    /// marker with no compile error. Making both settle verbs required makes
+    /// that bug class uncompilable.
+    ///
+    /// `clears` frozen at stage time flow through inertly until a producer
+    /// exists (see [`write_provisional`](Self::write_provisional)). Idempotent;
+    /// the sweep retries it.
     ///
     /// # Errors
     ///
@@ -248,32 +304,15 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        async move {
-            let mut keeps: Vec<CellKey> = Vec::with_capacity(writes.len());
-            let mut clears: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(writes.len());
-            for (cell, write) in writes {
-                if write.data().is_some() {
-                    keeps.push(cell.clone());
-                } else {
-                    clears.push((cell.clone(), None));
-                }
-            }
-            if !keeps.is_empty() {
-                self.mark_resolved(collection, &keeps).await?;
-            }
-            if !clears.is_empty() {
-                self.write_resolved(collection, &clears).await?;
-            }
-            Ok(())
-        }
-    }
+        clears: &'a [SectionClear],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Settles a staged set as **aborted**: each cell's committed base `prev`
-    /// is written back as the resolved value. The default is
-    /// [`Self::write_resolved`] over the `prev`s; the
-    /// [`Cached`](super::cached::Cached) cache overrides it to also publish the
-    /// `prev` projection into fjall, returning the **lower** result verbatim.
+    /// Settles a staged set as **aborted** AND deletes the collection's event
+    /// marker: each cell's committed base `prev` is written back as the
+    /// resolved value. Required with no default, for the reason on
+    /// [`commit_provisional`](Self::commit_provisional). The base was never
+    /// touched by the stage, so the rollback is exact and needs no per-section
+    /// discard. Idempotent; the sweep retries it.
     ///
     /// # Errors
     ///
@@ -282,13 +321,70 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        async move {
-            let cells: Vec<(CellKey, Option<Bytes>)> = writes
-                .iter()
-                .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
-                .collect();
-            self.write_resolved(collection, &cells).await
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+}
+
+/// Routes a committed settle to the primitive verbs: present-data cells promote
+/// in place ([`CellStore::mark_resolved`]); absent-data cells (staged clears)
+/// **delete** the row via [`CellStore::write_resolved`]`(cell, None)`,
+/// upholding the row-absence invariant. Both arms are idempotent and
+/// row-disjoint (an event stages each cell at most once), so the two sequential
+/// awaits are order-free; the sweep retries either on failure. A settle with no
+/// clears issues exactly one `mark_resolved` batch set.
+///
+/// The one routing definition every backend's [`CellStore::commit_provisional`]
+/// calls after its own marker delete. Free (not a trait default) so a wrapper
+/// that forwards the verb cannot silently inherit it and bypass the inner
+/// store's marker delete.
+///
+/// # Errors
+///
+/// Returns the store's error on a promote / delete failure.
+pub(crate) async fn route_commit<S>(
+    store: &S,
+    collection: &CollectionRef,
+    writes: &[(CellKey, ProvisionalWrite)],
+) -> Result<(), S::Error>
+where
+    S: CellStore,
+{
+    let mut keeps: Vec<CellKey> = Vec::with_capacity(writes.len());
+    let mut clears: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(writes.len());
+    for (cell, write) in writes {
+        if write.data().is_some() {
+            keeps.push(cell.clone());
+        } else {
+            clears.push((cell.clone(), None));
         }
     }
+    if !keeps.is_empty() {
+        store.mark_resolved(collection, &keeps).await?;
+    }
+    if !clears.is_empty() {
+        store.write_resolved(collection, &clears, &[]).await?;
+    }
+    Ok(())
+}
+
+/// Routes an aborted settle to [`CellStore::write_resolved`] over the staged
+/// `prev`s (`prev = None` restores exact absence). The one rollback definition
+/// every backend's [`CellStore::abort_provisional`] calls after its own marker
+/// delete — free, for the reason on [`route_commit`].
+///
+/// # Errors
+///
+/// Returns the store's error on a write failure.
+pub(crate) async fn route_abort<S>(
+    store: &S,
+    collection: &CollectionRef,
+    writes: &[(CellKey, ProvisionalWrite)],
+) -> Result<(), S::Error>
+where
+    S: CellStore,
+{
+    let cells: Vec<(CellKey, Option<Bytes>)> = writes
+        .iter()
+        .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
+        .collect();
+    store.write_resolved(collection, &cells, &[]).await
 }

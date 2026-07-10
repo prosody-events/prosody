@@ -23,7 +23,7 @@ use crate::state::fjall::test_db;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{
-    OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, ShapeProbe, Trace,
+    MarkerObservation, OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, ShapeProbe, Trace,
     run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
     value_cell,
 };
@@ -85,6 +85,13 @@ impl ShapeProbe for CassandraShapeProbe {
             }
         }
         Ok(out)
+    }
+
+    async fn standing_marker(&self, _id: &CollectionId) -> Result<MarkerObservation> {
+        // The interim store writes no event-marker rows (`standing_marker` is
+        // truthfully `None`), so there is nothing to observe here yet — the
+        // Cassandra marker step upgrades this to a real `kind=Marker` read.
+        Ok(MarkerObservation::Untracked)
     }
 }
 
@@ -165,6 +172,8 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
                 cell.clone(),
                 ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
             )],
+            &[],
+            &[],
         )
         .await?;
     let staged = provisional_cells(&store, c.id()).await?;
@@ -184,7 +193,9 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     );
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
 
-    store.write_resolved(&c, &[(cell.clone(), None)]).await?;
+    store
+        .write_resolved(&c, &[(cell.clone(), None)], &[])
+        .await?;
     assert_eq!(
         store.get(c.id(), &cell, event(2)).await?,
         Committed::new(None)
@@ -235,6 +246,8 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
                     event(1),
                 ),
             )],
+            &[],
+            &[],
         )
         .await?;
     store.mark_resolved(&c, slice::from_ref(&cell)).await?;
@@ -298,7 +311,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         let resolved: Vec<(CellKey, Option<Bytes>)> = (0..committed)
             .map(|i| (cell_i(i), Some(Bytes::from(i.to_be_bytes().to_vec()))))
             .collect();
-        store.write_resolved(&c, &resolved).await?;
+        store.write_resolved(&c, &resolved, &[]).await?;
 
         // Read-skip: a committed get + full-section scan over the clean cells
         // consult only the `kind=Cell` range — no recovery read of either kind.
@@ -354,7 +367,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
                 )
             })
             .collect();
-        store.write_provisional(&c, &staged).await?;
+        store.write_provisional(&c, &staged, &[], &staged).await?;
 
         // A cold sweep: one bounded seed read + one point read per provisional
         // coordinate, independent of `committed` (the same `counts` handle).
@@ -394,11 +407,11 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
 
     // Committed base present, then stage a clear over it and settle committed.
     store
-        .write_resolved(&c, &[(cell.clone(), Some(old.clone()))])
+        .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
         .await?;
     let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
     store
-        .write_provisional(&c, &[(cell.clone(), write.clone())])
+        .write_provisional(&c, &[(cell.clone(), write.clone())], &[], &[])
         .await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged
@@ -410,7 +423,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
 
     oracle.record_message(Uuid::from_u128(2)).await?;
     store
-        .commit_provisional(&c, &[(cell.clone(), write)])
+        .commit_provisional(&c, &[(cell.clone(), write)], &[])
         .await?;
 
     assert_eq!(
@@ -513,7 +526,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     // the raw bytes — a regression to raw storage fails both assertions.
     let payload = Bytes::from(vec![0xAB_u8; 4096]);
     store
-        .write_resolved(&c, &[(cell, Some(payload.clone()))])
+        .write_resolved(&c, &[(cell, Some(payload.clone()))], &[])
         .await?;
 
     let cql = format!(
@@ -645,7 +658,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         let cell = value_cell();
         let data = Bytes::from(payload);
         store
-            .write_resolved(&c, &[(cell.clone(), Some(data))])
+            .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
         let Some(bytes) = store.get(c.id(), &cell, event(1)).await?.into_inner() else {
             return Err(eyre!("expected a present committed value"));
@@ -707,7 +720,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
                 (cell, Some(Bytes::from(p.clone())))
             })
             .collect();
-        store.write_resolved(&c, &cells).await?;
+        store.write_resolved(&c, &cells, &[]).await?;
 
         // `WRITETIME`/`TTL` are read functions (no schema change); both are
         // non-null because every cell wrote a present `data`.
@@ -910,11 +923,13 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
                 cell_b.clone(),
                 ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
             )],
+            &[],
+            &[],
         )
         .await?;
     // Pre-seed D resolved so the batch's `cell_delete` has a row to remove.
     store
-        .write_resolved(&c, &[(cell_d.clone(), Some(data_d.clone()))])
+        .write_resolved(&c, &[(cell_d.clone(), Some(data_d.clone()))], &[])
         .await?;
 
     // Owned blobs the bound rows borrow into; must outlive the awaited batch.
@@ -1146,7 +1161,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         );
         let cell = value_cell();
         store
-            .write_resolved(&c, &[(cell.clone(), Some(old.clone()))])
+            .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
             .await?;
         // `event(1)` is never recorded in the oracle, so resolution rolls the
         // staged clear back to `prev`.
@@ -1157,6 +1172,8 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
                     cell.clone(),
                     ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
                 )],
+                &[],
+                &[],
             )
             .await?;
 
