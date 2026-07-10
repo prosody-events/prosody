@@ -277,7 +277,7 @@ impl<C: Codec> ProsodyProducer<C> {
     /// - The Kafka send operation fails
     #[instrument(
         skip(self, topic, headers, payload),
-        fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), payload_size, partition, offset, timestamp),
+        fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, payload_size, partition, offset, timestamp),
         err
     )]
     pub async fn send<'a, H>(

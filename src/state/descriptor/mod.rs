@@ -79,6 +79,7 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
+use tracing::instrument;
 
 pub mod deque;
 pub mod map;
@@ -733,6 +734,11 @@ impl<S: Clone, T> Clone for CellView<S, T> {
 }
 
 impl<S: CellSession, T: CellType> CellView<S, T> {
+    /// The collection's name, for the handles' operation spans.
+    pub(in crate::state::descriptor) fn name(&self) -> &StateName {
+        &self.scope.name
+    }
+
     /// The full cell address for `key` in this view's section — the sole place
     /// a typed key is lowered to its order-preserving coordinate.
     fn cell(&self, key: &KeyOf<T>) -> CellKey {
@@ -931,6 +937,7 @@ where
     /// Returns an access error from the session, a codec error (Permanent)
     /// when the cell bytes do not decode, or a resolution error from the
     /// resolver.
+    #[instrument(name = "value.get", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn get(&self) -> Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>> {
         self.view.get(&()).await
     }
@@ -941,6 +948,7 @@ where
     ///
     /// Returns a codec error (Permanent) when the cell fails to encode, or
     /// an access error from the session.
+    #[instrument(name = "value.set", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn set(
         &self,
         value: WriteOf<'_, T>,
@@ -953,6 +961,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
+    #[instrument(name = "value.clear", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn clear(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
         self.view.clear(&()).await
     }
@@ -964,6 +973,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
+    #[instrument(name = "value.flush", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn flush(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
         self.view.flush().await
     }

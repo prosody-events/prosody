@@ -6,7 +6,7 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -53,6 +53,14 @@ impl CompactDateTime {
     #[must_use]
     pub fn epoch_seconds(self) -> u32 {
         self.epoch_seconds
+    }
+
+    /// Formats the datetime as an RFC 3339 UTC timestamp
+    /// (`2026-07-10T19:00:00Z`) — the `OTel`-conventional encoding for
+    /// timestamp attributes, used by the timer spans' `timer.fire_time`.
+    #[must_use]
+    pub fn to_rfc3339(self) -> String {
+        DateTime::<Utc>::from(self).to_rfc3339_opts(SecondsFormat::Secs, true)
     }
 
     /// Calculates duration from `other` to `self`.
@@ -186,7 +194,8 @@ impl From<CompactDateTime> for SystemTime {
 }
 
 impl Display for CompactDateTime {
-    /// Formats the datetime using RFC 3339 (ISO 8601) in UTC.
+    /// Formats the datetime in `chrono`'s human-readable UTC form. For the
+    /// machine-standard RFC 3339 encoding, use [`CompactDateTime::to_rfc3339`].
     ///
     /// # Examples
     ///

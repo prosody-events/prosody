@@ -53,6 +53,7 @@ use std::error::Error;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use thiserror::Error;
+use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
 /// The deque's head/tail meta codec: two big-endian `i64`s composed with no
 /// framing, byte-identical to the frozen 16-byte `head ‖ tail` frame.
@@ -152,6 +153,7 @@ where
     /// Returns a `Permanent` [`DequeStateError`] when the bounds cell is
     /// corrupt or the count exceeds `usize`, or an access error from the
     /// session.
+    #[instrument(name = "deque.len", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn len(&self) -> Result<usize, DequeStateError<CellCodecError<T>>> {
         Ok(self.bounds().await?.len()?)
     }
@@ -162,6 +164,7 @@ where
     ///
     /// Returns a `Permanent` [`DequeStateError`] when the bounds cell is
     /// corrupt, or an access error from the session.
+    #[instrument(name = "deque.is_empty", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, DequeStateError<CellCodecError<T>>> {
         let window = self.bounds().await?;
         Ok(window.head == window.tail)
@@ -176,10 +179,22 @@ where
     /// Returns a codec error (`Permanent`) when the cell does not decode, a
     /// `Permanent` meta error when the bounds cell is corrupt, or an access
     /// error from the session.
+    #[instrument(
+        name = "deque.get",
+        skip_all,
+        fields(collection = self.entries.name().as_str(), deque.index = Empty),
+        err
+    )]
     pub async fn get(
         &self,
         index: usize,
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        // Recorded as i64: the OTel layer exports signed ints as typed Int
+        // attributes but stringifies unsigned values; a beyond-i64 index is
+        // out of window anyway and stays unrecorded.
+        if let Ok(index) = i64::try_from(index) {
+            Span::current().record("deque.index", index);
+        }
         let window = self.bounds().await?;
         if index >= window.len()? {
             return Ok(None);
@@ -201,8 +216,19 @@ where
         &self,
         dir: Direction,
     ) -> impl Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + '_ {
+        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
+        // so each inner await is instrumented with a clone instead; the
+        // span's recorded time is the stream's own work. Unlike the sibling
+        // ops' `err`, failures are yielded per item rather than recorded on
+        // the span — a failing scan ends with an OK-status span, and the
+        // yielded `Err` surfaces to the caller inside this span's scope.
+        let span = info_span!(
+            "deque.stream",
+            collection = self.entries.name().as_str(),
+            direction = ?dir,
+        );
         try_stream! {
-            let window = self.bounds().await?;
+            let window = self.bounds().instrument(span.clone()).await?;
             let len = window.len()?;
             if len == 0 {
                 return;
@@ -220,7 +246,7 @@ where
                 .entries
                 .scan(Bound::Included(&anchor), dir, Bound::Unbounded, Some(len));
             futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
+            while let Some(item) = inner.next().instrument(span.clone()).await {
                 // The scan yields the decoded index; the dense window makes it
                 // redundant, so only the resolved element is exposed.
                 let (_, value) = item?;
@@ -245,6 +271,7 @@ where
     ///
     /// Returns a codec error (`Permanent`) when `value` does not encode, a
     /// `Permanent` meta error on index-space exhaustion, or an access error.
+    #[instrument(name = "deque.push_back", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn push_back(
         &self,
         value: WriteOf<'_, T>,
@@ -264,6 +291,7 @@ where
     /// # Errors
     ///
     /// See [`Self::push_back`].
+    #[instrument(name = "deque.push_front", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn push_front(
         &self,
         value: WriteOf<'_, T>,
@@ -287,6 +315,7 @@ where
     ///
     /// Returns a codec error (`Permanent`) when the entry does not decode, a
     /// `Permanent` meta error on corruption, or an access error.
+    #[instrument(name = "deque.pop_front", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn pop_front(
         &self,
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
@@ -311,6 +340,7 @@ where
     /// # Errors
     ///
     /// See [`Self::pop_front`].
+    #[instrument(name = "deque.pop_back", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn pop_back(
         &self,
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
@@ -335,6 +365,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
+    #[instrument(name = "deque.flush", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn flush(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
         Ok(self.entries.flush().await?)
     }

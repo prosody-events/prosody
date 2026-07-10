@@ -29,6 +29,7 @@ use std::fmt::{self, Debug};
 use std::future::{Future, pending, ready};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::span::Id;
 
 mod context;
 mod integration;
@@ -196,14 +197,17 @@ impl EventContext for MockContext {
 // OutcomeHandler - Mock handler for tests
 // ============================================================================
 
+/// `(ambient span id, event span id)` recorded inside one handler call.
+type AmbientPair = (Option<Id>, Option<Id>);
+
 /// Handler that returns predetermined outcomes.
 #[derive(Clone)]
 struct OutcomeHandler {
     outcome: OutcomeSlot,
     timer_calls: Arc<Mutex<Vec<Key>>>,
-    /// `(ambient span id, trigger span id)` observed inside each `on_timer`
-    /// call — pins that dispatch entered the trigger's span.
-    ambient_pairs: Arc<Mutex<Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)>>>,
+    /// Pairs observed inside each `on_timer` call — pins that dispatch
+    /// entered the trigger's span.
+    ambient_pairs: Arc<Mutex<Vec<AmbientPair>>>,
 }
 
 impl OutcomeHandler {
@@ -227,7 +231,7 @@ impl OutcomeHandler {
 
     /// Returns the `(ambient, trigger-span)` id pairs recorded per call.
     #[must_use]
-    fn ambient_pairs(&self) -> Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)> {
+    fn ambient_pairs(&self) -> Vec<AmbientPair> {
         self.ambient_pairs.lock().clone()
     }
 

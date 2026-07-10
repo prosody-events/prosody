@@ -31,6 +31,7 @@ use crate::{Key, Partition, Topic};
 use color_eyre::eyre::{bail, eyre};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::subscriber::with_default;
 
 /// Defers offset 1 on key 0 with a 60-second transient backoff.
 async fn defer_single_message(harness: &mut TestHarness) -> color_eyre::Result<()> {
@@ -569,7 +570,7 @@ fn retried_message_handler_runs_inside_the_load_span() -> color_eyre::Result<()>
     // ambient span (`Span::current()`). A registry is installed so spans get
     // real ids — the `is_some` guard fails, rather than passing vacuously,
     // if spans are disabled.
-    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+    with_default(tracing_subscriber::registry(), || {
         TEST_RUNTIME.block_on(async {
             let mut harness = TestHarness::new(1)?;
 

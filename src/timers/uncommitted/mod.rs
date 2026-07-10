@@ -242,10 +242,12 @@ where
     /// `trigger.span()` returns the dispatch span when the handler reads it.
     ///
     /// This is the single point where the configured timer span relation is
-    /// applied, and it binds the dispatch span directly to the scheduling
-    /// context — whether that context was captured in-process at scheduling
-    /// time or restored from persistent storage — so memory- and
-    /// Cassandra-backed timers produce identical dispatch-span topology.
+    /// applied for store-fired timers (deferred-retry reloads mint their own
+    /// `timer_defer.load` dispatch span under the same relation), and it
+    /// binds the dispatch span directly to the scheduling context — whether
+    /// that context was captured in-process at scheduling time or restored
+    /// from persistent storage — so memory- and Cassandra-backed timers
+    /// produce identical dispatch-span topology.
     pub fn set_dispatch_span(&self, relation: SpanRelation) {
         let context = self.trigger.context();
         let span = related_span!(
@@ -253,8 +255,8 @@ where
             context,
             "trigger",
             key = %self.trigger.key,
-            time = %self.trigger.time,
-            timer_type = ?self.trigger.timer_type,
+            timer.fire_time = %self.trigger.time.to_rfc3339(),
+            timer.type = ?self.trigger.timer_type,
         );
         self.trigger.set_span(span);
     }

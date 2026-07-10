@@ -140,7 +140,8 @@ impl CassandraTimerDeferStore {
             context.clone(),
             "timer_defer.load",
             key = %key,
-            time = %time,
+            timer.fire_time = %time.to_rfc3339(),
+            timer.type = ?TimerType::Application,
             cached = cached
         );
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, span.clone());

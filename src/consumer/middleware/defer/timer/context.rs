@@ -17,9 +17,7 @@
 
 use crate::Key;
 use crate::consumer::Keyed;
-use crate::consumer::event_context::{
-    EventContext, StateAccessError, TerminationSignals, timer_op_span,
-};
+use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -29,7 +27,7 @@ use crate::timers::datetime::CompactDateTime;
 use futures::TryFutureExt;
 use std::future::Future;
 use thiserror::Error;
-use tracing::Instrument;
+use tracing::{Instrument, error, info_span};
 
 /// Context wrapper that unifies active and deferred timer operations.
 ///
@@ -170,16 +168,29 @@ where
         }
 
         if is_deferred(&self.store, &self.key).await? {
-            // Append to defer store, under the same schedule span the
-            // non-deferred path gets from the partition context.
-            let span = timer_op_span("schedule", &self.key, time, TimerType::Application);
+            // Hand-built (not `#[instrument]` on this method): only the
+            // deferred append branch may mint the schedule span — the
+            // delegating branch gets one from the inner context's
+            // instrumented `schedule`.
+            let span = info_span!(
+                "schedule",
+                key = %self.key,
+                timer.fire_time = %time.to_rfc3339(),
+                timer.type = ?TimerType::Application,
+            );
             let trigger =
                 Trigger::new(self.key.clone(), time, TimerType::Application, span.clone());
             self.store
                 .append_deferred_timer(&trigger)
-                .instrument(span)
+                .instrument(span.clone())
                 .await
-                .map_err(TimerDeferContextError::Store)
+                .map_err(|error| {
+                    // Parity with the instrumented branch's `err`: mark the
+                    // span before the error propagates, so a failed append is
+                    // visible on the trace.
+                    span.in_scope(|| error!(error = %error, "deferred timer append failed"));
+                    TimerDeferContextError::Store(error)
+                })
         } else {
             // Delegate to inner context
             self.inner

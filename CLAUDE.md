@@ -468,6 +468,23 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 
 ## Tracing / OpenTelemetry
 
+**Instrument with `#[instrument]`, never a hand-built `info_span!` +
+`.instrument(...)`.** The repo pattern: `#[instrument(name = "map.set",
+skip_all, fields(collection = ..., map.key = ?key), err)]` for user-facing
+operations (span name = the operation, low-cardinality; `skip_all` plus
+explicit `fields` control the attributes; `err` records failures on the span),
+and `#[instrument(level = "debug", skip(self), err)]` for internal plumbing.
+Hand-built spans are reserved for the cases the attribute cannot express: a
+function returning `impl Stream` (instrument each inner await with a clone of
+one span), a relation against a carried context (`related_span!`), and a value
+known only mid-body (declare the field `Empty`, then
+`Span::current().record(...)`). Record unsigned integers as `i64` — the OTel
+layer exports signed ints as typed Int attributes but stringifies `u64`/`usize`
+through their Debug form. Timer instants on span attributes are recorded as
+`timer.fire_time = %time.to_rfc3339()` (paired with `timer.type`); this RFC
+3339 convention governs **span attributes only** — log events keep the plain
+`Display` form (`fire_time = %fire_time`).
+
 **Import tracing macros from `tracing` directly — never `use tracing::log::…`.**
 `tracing::log` re-exports the bare `log` crate and no `log`→`tracing` bridge is
 installed, so events logged through it silently vanish (a producer

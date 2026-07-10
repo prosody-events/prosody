@@ -54,9 +54,11 @@ use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use thiserror::Error;
+use tracing::{Instrument, info_span, instrument};
 
 /// The `Meta` section, holding the two bound cells.
 const META_SECTION: Section = Section::new(MapNs::Meta as i8);
@@ -201,10 +203,14 @@ pub struct MapHandle<S, KC, V> {
     meta: CellView<S, Keyed<MapBoundKey, KC>>,
 }
 
+// `KC::Key: Debug` exists only so the operation spans can record the map key
+// as an attribute; every real key (`String`, `i64`, `u64`) already satisfies
+// it, and no other map machinery needs it.
 impl<S, KC, V> MapHandle<S, KC, V>
 where
     S: CellSession,
     KC: OrderedKeyCodec + 'static,
+    KC::Key: Debug,
     V: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, V>: FromSession<'s, S>,
 {
@@ -214,6 +220,12 @@ where
     ///
     /// Returns a codec error (`Permanent`) when the cell does not decode, a
     /// resolution error, or an access error from the session.
+    #[instrument(
+        name = "map.get",
+        skip_all,
+        fields(collection = self.entries.name().as_str(), map.key = ?key),
+        err
+    )]
     pub async fn get(
         &self,
         key: &KC::Key,
@@ -229,18 +241,29 @@ where
     /// never drops a live entry, it only ever costs an extra
     /// scanned-but-cleared cell.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
+        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
+        // so each inner await is instrumented with a clone instead; the
+        // span's recorded time is the stream's own work. Unlike the sibling
+        // ops' `err`, failures are yielded per item rather than recorded on
+        // the span — a failing scan ends with an OK-status span, and the
+        // yielded `Err` surfaces to the caller inside this span's scope.
+        let span = info_span!(
+            "map.stream",
+            collection = self.entries.name().as_str(),
+            direction = ?dir,
+        );
         try_stream! {
             // Anchor at the bound on the scan's leading edge — the min bound for
             // `Forward`, the max for `Backward` — falling back to the section
             // edge (`Unbounded`) when that bound is missing or expired.
             let anchor = match dir {
-                Direction::Forward => self.read_bound(MapBound::Min).await?,
-                Direction::Backward => self.read_bound(MapBound::Max).await?,
+                Direction::Forward => self.read_bound(MapBound::Min).instrument(span.clone()).await?,
+                Direction::Backward => self.read_bound(MapBound::Max).instrument(span.clone()).await?,
             };
             let start = anchor.as_ref().map_or(Bound::Unbounded, Bound::Included);
             let inner = self.entries.scan(start, dir, Bound::Unbounded, None);
             futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
+            while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
             }
         }
@@ -264,6 +287,12 @@ where
     ///
     /// Returns a codec error (`Permanent`) when `value` does not encode, or an
     /// access error from the session.
+    #[instrument(
+        name = "map.set",
+        skip_all,
+        fields(collection = self.entries.name().as_str(), map.key = ?key),
+        err
+    )]
     pub async fn set(
         &self,
         key: KC::Key,
@@ -283,6 +312,12 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
+    #[instrument(
+        name = "map.remove",
+        skip_all,
+        fields(collection = self.entries.name().as_str(), map.key = ?key),
+        err
+    )]
     pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
         Ok(self.entries.clear(key).await?)
     }
@@ -294,6 +329,12 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
+    #[instrument(
+        name = "map.flush",
+        skip_all,
+        fields(collection = self.entries.name().as_str()),
+        err
+    )]
     pub async fn flush(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
         Ok(self.entries.flush().await?)
     }

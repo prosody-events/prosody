@@ -41,7 +41,7 @@ impl StoredTimer {
     /// built here from the stored scheduling context per `linking` IS the
     /// dispatch span, and the trigger carries it live for the handler.
     fn to_trigger(&self, linking: SpanRelation) -> Trigger {
-        let span = related_span!(linking, self.context.clone(), "timer_defer.load", key = %self.key, time = %self.time, cached = false);
+        let span = related_span!(linking, self.context.clone(), "timer_defer.load", key = %self.key, timer.fire_time = %self.time.to_rfc3339(), timer.type = ?TimerType::Application, cached = false);
         let trigger = Trigger::new(
             self.key.clone(),
             self.time,

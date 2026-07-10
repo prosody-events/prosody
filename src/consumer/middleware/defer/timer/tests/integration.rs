@@ -11,6 +11,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::KafkaLoaderError;
 use crate::tracing::init_test_logging;
 use scylla::errors::ExecutionError;
+use tracing::subscriber::with_default;
 
 /// Returns the retry count for `key`, failing the test if it isn't deferred.
 async fn expect_deferred(harness: &TestHarness, key: &str) -> color_eyre::Result<u32> {
@@ -760,7 +761,7 @@ fn retry_handler_runs_inside_the_reload_span() -> color_eyre::Result<()> {
     // (`Span::current()`). A registry (not the global ERROR-filtered test
     // subscriber) is installed so spans get real ids — the `is_some` guard
     // below fails, rather than passing vacuously, if spans are disabled.
-    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+    with_default(tracing_subscriber::registry(), || {
         TEST_RUNTIME.block_on(async {
             let harness = TestHarness::new()?;
 

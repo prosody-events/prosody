@@ -18,6 +18,7 @@ use crate::{Key, Offset};
 use parking_lot::Mutex;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
+use tracing::span::Id;
 
 pub use crate::consumer::middleware::tests::test_support::{HandlerOutcome, OutcomeError};
 
@@ -33,6 +34,9 @@ pub struct ProcessedMessage {
 // ============================================================================
 // OutcomeHandler - Mock handler returning trace-specified outcomes
 // ============================================================================
+
+/// `(ambient span id, event span id)` recorded inside one handler call.
+type AmbientPair = (Option<Id>, Option<Id>);
 
 /// Handler that returns predetermined outcomes from the trace.
 ///
@@ -50,9 +54,9 @@ pub struct OutcomeHandler {
     /// Used to simulate shutdown occurring mid-handler-execution, exercising
     /// post-call cancellation promotion paths.
     shutdown_trigger: Arc<Mutex<Option<MockEventContext>>>,
-    /// `(ambient span id, message span id)` observed inside each
-    /// `on_message` call — pins that dispatch entered the message's span.
-    ambient_pairs: Arc<Mutex<Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)>>>,
+    /// Pairs observed inside each `on_message` call — pins that dispatch
+    /// entered the message's span.
+    ambient_pairs: Arc<Mutex<Vec<AmbientPair>>>,
 }
 
 impl OutcomeHandler {
@@ -107,7 +111,7 @@ impl OutcomeHandler {
 
     /// Returns the `(ambient, message-span)` id pairs recorded per call.
     #[must_use]
-    pub fn ambient_pairs(&self) -> Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)> {
+    pub fn ambient_pairs(&self) -> Vec<AmbientPair> {
         self.ambient_pairs.lock().clone()
     }
 
@@ -131,7 +135,7 @@ impl Debug for OutcomeHandler {
             .field("outcome", &self.outcome)
             .field("processed_count", &self.processed.len())
             .field("shutdown_trigger", &self.shutdown_trigger.lock().is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

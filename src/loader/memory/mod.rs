@@ -150,7 +150,9 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
         drop(messages);
 
         // Reload span related to the storer's context, the memory twin of
-        // the Kafka loader's create_load_span.
+        // the Kafka loader's create_load_span. `cached` is hardcoded `false`
+        // (this loader has no cache) so the two twins export identical
+        // attribute sets.
         let span = related_span!(
             self.message_spans,
             context,
@@ -159,6 +161,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             offset = offset,
             topic = %topic,
             key = %message_value.key,
+            cached = false,
         );
         Ok(ConsumerMessage::from_decoded(message_value, span, permit))
     }

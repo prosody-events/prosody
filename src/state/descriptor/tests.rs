@@ -13,6 +13,7 @@ use crate::consumer::kafka_state::{MessageCell, message_state};
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -20,10 +21,12 @@ use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
-use crate::test_util::ArbJson;
+use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, bail, eyre};
+use futures::TryStreamExt;
 use futures::executor;
+use opentelemetry_sdk::trace::SpanData;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -424,6 +427,106 @@ fn prop_descriptors_from_equal_strings_are_interchangeable() {
         )
     }
     QuickCheck::new().quickcheck(prop as fn(String) -> TestResult);
+}
+
+/// The named attribute's exported value, stringified.
+fn span_attr(span: &SpanData, key: &str) -> Option<String> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.to_string())
+}
+
+/// A representative operation of every kind and shape (value read/write,
+/// keyed map ops, deque mutators, both stream twins) exports a span named
+/// for the operation, carrying the `collection` attribute (plus `map.key` /
+/// `direction` where applicable), and parented on the ambient span — so a
+/// handler's state access is visible and self-describing under its event
+/// span without any explicit parenting.
+#[test]
+fn collection_ops_export_operation_spans() -> Result<()> {
+    let outcome: RefCell<Result<()>> = RefCell::new(Ok(()));
+    let spans = captured_spans(|| {
+        let handler = tracing::info_span!("handler");
+        let _guard = handler.enter();
+        // `TEST_RUNTIME`, not `futures::executor`: the simple span processor
+        // block_ons its export on span end, which may not nest inside a
+        // `LocalPool`. The root future runs on this thread, so the entered
+        // `handler` span stays ambient.
+        *outcome.borrow_mut() = TEST_RUNTIME.block_on(async {
+            let value = bind_registered(cart(), MemoryLoader::new())?;
+            value.set(json!({"qty": 1_i32})).await?;
+            value.get().await?;
+
+            let map = bind_registered(
+                map_state::<Utf8KeyCodec, JsonCodec>("counts"),
+                MemoryLoader::new(),
+            )?;
+            map.set("k1".to_owned(), json!(1_i32)).await?;
+            map.get(&"k1".to_owned()).await?;
+            let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
+            map.remove(&"k1".to_owned()).await?;
+
+            let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
+            deque.push_back(json!(7_i32)).await?;
+            let _elements: Vec<_> = deque.stream(Direction::Forward).try_collect().await?;
+            deque.pop_front().await?;
+            Ok(())
+        });
+    });
+    outcome.into_inner()?;
+
+    let handler_id = spans
+        .iter()
+        .find(|s| s.name == "handler")
+        .ok_or_else(|| eyre!("handler span not exported"))?
+        .span_context
+        .span_id();
+
+    for (name, collection) in [
+        ("value.set", "cart"),
+        ("value.get", "cart"),
+        ("map.set", "counts"),
+        ("map.get", "counts"),
+        ("map.stream", "counts"),
+        ("map.remove", "counts"),
+        ("deque.push_back", "dq"),
+        ("deque.stream", "dq"),
+        ("deque.pop_front", "dq"),
+    ] {
+        let span = spans
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| eyre!("missing span {name}"))?;
+        assert_eq!(
+            span_attr(span, "collection").as_deref(),
+            Some(collection),
+            "{name} must carry its collection name"
+        );
+        assert_eq!(
+            span.parent_span_id, handler_id,
+            "{name} must nest under the ambient span"
+        );
+        if name.starts_with("map.") && name != "map.stream" {
+            assert_eq!(
+                span_attr(span, "map.key").as_deref(),
+                Some("\"k1\""),
+                "{name} must carry the map key"
+            );
+        }
+    }
+    for name in ["map.stream", "deque.stream"] {
+        let stream = spans
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| eyre!("missing span {name}"))?;
+        assert_eq!(
+            span_attr(stream, "direction").as_deref(),
+            Some("Forward"),
+            "{name} must carry the scan direction"
+        );
+    }
+    Ok(())
 }
 
 /// Behavioral arm of the `CollectionScopeContainment` invariant. The
