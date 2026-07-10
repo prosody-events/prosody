@@ -510,7 +510,7 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         if name.starts_with("map.") && name != "map.stream" {
             assert_eq!(
                 span_attr(span, "map.key").as_deref(),
-                Some("\"k1\""),
+                Some("k1"),
                 "{name} must carry the map key"
             );
         }

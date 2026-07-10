@@ -383,6 +383,11 @@ where
     /// scope — the hand-built equivalent of `#[instrument(err)]`, needed
     /// because timer-op span levels follow the runtime [`TimerType`]
     /// (`timer_span!`).
+    ///
+    /// The key is recorded through the owned `span` handle, never
+    /// `Span::current()`: a level-disabled span (an internal timer op under
+    /// an info filter) never becomes current, so recording through "current"
+    /// would deface the ambient event span with a duplicate `key`.
     async fn run_spanned<F, R>(
         &self,
         span: Span,
@@ -393,7 +398,7 @@ where
     {
         let result = self
             .run_cancellable(async |inner| {
-                Span::current().record("key", display(&inner.key));
+                span.record("key", display(&inner.key));
                 operation(inner).await
             })
             .instrument(span.clone())
@@ -488,8 +493,12 @@ where
             timer.fire_time = %time.to_rfc3339(),
             timer.type = ?timer_type,
         );
+        // The request carries the owned span (the trigger's scheduling
+        // context), not `Span::current()` — see `run_spanned` for why a
+        // level-disabled span must not fall back to the ambient one.
+        let request_span = span.clone();
         self.run_spanned(span, async |inner| {
-            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, request_span);
             inner.timers.schedule(request).await
         })
         .await
@@ -507,8 +516,12 @@ where
             timer.fire_time = %time.to_rfc3339(),
             timer.type = ?timer_type,
         );
+        // The request carries the owned span (the trigger's scheduling
+        // context), not `Span::current()` — see `run_spanned` for why a
+        // level-disabled span must not fall back to the ambient one.
+        let request_span = span.clone();
         self.run_spanned(span, async |inner| {
-            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, request_span);
             inner.timers.clear_and_schedule(request).await
         })
         .await

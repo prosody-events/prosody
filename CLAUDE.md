@@ -492,6 +492,12 @@ framework-internal spans use `level = "debug"`, so a trace filtered at info
 contains only spans the user's own code caused. Spans whose subject is a
 runtime `TimerType` decide via `TimerType::is_application`: the crate-internal
 `timer_span!` macro and `related_span!`'s `level:` form own the branch.
+Mid-body records on such spans must go through the **owned span handle**,
+never `Span::current()`: a level-disabled span never becomes current, so
+"current" silently falls back to the ambient event span and defaces it with a
+duplicate attribute (`run_spanned` in `event_context` is the exemplar).
+Record attribute values with `%` (Display) whenever the type allows — Debug
+quotes strings, which breaks joining the same key across spans.
 
 **Import tracing macros from `tracing` directly — never `use tracing::log::…`.**
 `tracing::log` re-exports the bare `log` crate and no `log`→`tracing` bridge is

@@ -54,7 +54,7 @@ use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
-use std::fmt::Debug;
+use std::fmt::Display;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use thiserror::Error;
@@ -203,14 +203,15 @@ pub struct MapHandle<S, KC, V> {
     meta: CellView<S, Keyed<MapBoundKey, KC>>,
 }
 
-// `KC::Key: Debug` exists only so the operation spans can record the map key
-// as an attribute; every real key (`String`, `i64`, `u64`) already satisfies
-// it, and no other map machinery needs it.
+// `KC::Key: Display` exists only so the operation spans can record the map
+// key as a joinable attribute (Debug would quote strings); every real key
+// (`String`, `i64`, `u64`) already satisfies it, and no other map machinery
+// needs it.
 impl<S, KC, V> MapHandle<S, KC, V>
 where
     S: CellSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Debug,
+    KC::Key: Display,
     V: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, V>: FromSession<'s, S>,
 {
@@ -223,7 +224,7 @@ where
     #[instrument(
         name = "map.get",
         skip_all,
-        fields(collection = self.entries.name().as_str(), map.key = ?key),
+        fields(collection = self.entries.name().as_str(), map.key = %key),
         err
     )]
     pub async fn get(
@@ -290,7 +291,7 @@ where
     #[instrument(
         name = "map.set",
         skip_all,
-        fields(collection = self.entries.name().as_str(), map.key = ?key),
+        fields(collection = self.entries.name().as_str(), map.key = %key),
         err
     )]
     pub async fn set(
@@ -315,7 +316,7 @@ where
     #[instrument(
         name = "map.remove",
         skip_all,
-        fields(collection = self.entries.name().as_str(), map.key = ?key),
+        fields(collection = self.entries.name().as_str(), map.key = %key),
         err
     )]
     pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
