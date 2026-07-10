@@ -1,10 +1,10 @@
 //! Pure unit tests for the cell-row shape table.
 //!
 //! [`try_decode_cell`] is a pure function over the [`RawCellRow`] tuple, so
-//! every shape — including the promote-of-clear residue and the corruption
-//! arms — is checked here without a cluster. This is the cheap guard against
-//! the shape-table regressions a live-Cassandra run would otherwise be the
-//! first to catch.
+//! every shape — including the legacy promote-of-clear residue and the
+//! corruption arms — is checked here without a cluster. This is the cheap guard
+//! against the shape-table regressions a live-Cassandra run would otherwise be
+//! the first to catch.
 
 use super::super::encoding::{Encoding, EncodingError, decode_payload, encode_payload};
 use super::{CellCorruptReason, RawCellRow, blob_ttl, try_decode_cell};
@@ -57,9 +57,10 @@ fn resolved_present() -> Result<()> {
     Ok(())
 }
 
-/// The promote-of-clear residue: `data`/`prev_data` both NULL but
-/// `encoding`/`version` still populated → `Resolved(None)`,
-/// NOT corruption.
+/// The legacy promote-of-clear residue: `data`/`prev_data` both NULL but
+/// `encoding`/`version` still populated → `Resolved(None)`, NOT corruption.
+/// No current statement produces this shape (a committed-absent cell deletes
+/// its row); the decoder tolerates it for rows written by earlier builds.
 #[test]
 fn resolved_clear_residue_is_not_corrupt() -> Result<()> {
     let row: RawCellRow = (None, None, Some(enc()), Some(ver()), None);

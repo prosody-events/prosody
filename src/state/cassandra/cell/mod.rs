@@ -30,19 +30,22 @@
 //!   clear-over-present stages `data = null` with a non-null `prev_data`, which
 //!   still needs an encoding).
 //! * [`write_resolved`](CellStore::write_resolved) — writes a committed value
-//!   with `prev_data`/`event` nulled (the `ReadUncommitted` direct write, the
-//!   mid-handler flush, and rollback resolution).
+//!   with `prev_data`/`event` nulled, **or deletes the row** when the value is
+//!   absent (the `ReadUncommitted` direct write/clear, the mid-handler flush,
+//!   and rollback resolution).
 //! * [`mark_resolved`](CellStore::mark_resolved) — *promote*: nulls `prev_data`
-//!   and `event` only, keeping `data` and its TTL. O(1) bytes.
+//!   and `event` only, keeping `data` and its TTL. O(1) bytes; reserved for
+//!   present data.
 //!
-//! # Promote-of-clear residue
+//! # Committed absence is row absence
 //!
-//! Promoting a staged *clear* (`data = null`, `prev_data = Some`) nulls
-//! `prev_data`/`event` but leaves the row's `encoding`/`version` populated with
-//! `data` still null. That shape — encoding/version present, both blobs null —
-//! is a legitimate `Resolved(Committed(None))`, **not** corruption. The decoder
-//! validates encoding/version per-blob, never as a row-level "encoding implies
-//! a blob" rule, precisely so this residue decodes cleanly.
+//! Every path that resolves a cell to absent **deletes** the `kind=Cell` row
+//! (`cell_delete`) rather than nulling its columns — the row-absence invariant
+//! owned by [`CellStore`]. An absent-data promote therefore routes through
+//! `write_resolved(cell, None)`; [`mark_resolved`](CellStore::mark_resolved)
+//! never resolves a cell to absent. No statement in this build produces the
+//! legacy null-null-with-encoding residue shape; the decoder's tolerance of it
+//! (for rows written by earlier builds) is documented at the decoder.
 //!
 //! # Concurrency
 //!
@@ -667,32 +670,43 @@ where
         } else {
             &self.queries.write_resolved_no_ttl
         };
-        // Each unit pairs the resolved-value write with an `index_delete`. On the
-        // rollback path (resolving a provisional cell to its `prev`) this clears
-        // the cell's provisional-coordinate marker. On a fresh committed write (a
+        // Each unit pairs a cell mutation with an `index_delete`. A present value
+        // writes the resolved-value shape; an absent value **deletes** the
+        // `kind=Cell` row (the row-absence invariant — no null-blob residue).
+        // The paired `index_delete` clears the cell's provisional-coordinate
+        // marker on the rollback path; on a fresh committed write (a
         // ReadUncommitted direct write / mid-handler flush that was never staged)
         // no marker exists, so the delete is a harmless no-op tombstone in the
         // `kind=Index` slice. Pairing unconditionally keeps a cell's rows one
-        // atomic unit; differentiating rollback from fresh-commit to skip the
-        // no-op is future work — `write_resolved` carries no provisional signal.
+        // atomic unit until the per-coordinate index markers are replaced.
         let units: Vec<BatchUnit<CellBatchRow>> = blobs
             .iter()
             .zip(cells)
             .map(|(blob, (cell, _))| {
                 let addr = CellAddr::new(pk, cell);
+                let cell_row = match blob.data {
+                    Some(_) => CellBatchRow {
+                        statement: cell_stmt,
+                        row: RowShape::Resolved(ResolvedRow {
+                            ttl,
+                            data: blob.data.as_deref(),
+                            encoding: blob.encoding,
+                            version: blob.version,
+                            addr,
+                        }),
+                    },
+                    None => CellBatchRow {
+                        statement: &self.queries.cell_delete,
+                        row: RowShape::Key(KeyRow {
+                            kind: CellKind::Cell,
+                            addr,
+                        }),
+                    },
+                };
                 BatchUnit::new(
                     blob_weight(blob) + PER_STATEMENT_OVERHEAD,
                     smallvec![
-                        CellBatchRow {
-                            statement: cell_stmt,
-                            row: RowShape::Resolved(ResolvedRow {
-                                ttl,
-                                data: blob.data.as_deref(),
-                                encoding: blob.encoding,
-                                version: blob.version,
-                                addr,
-                            }),
-                        },
+                        cell_row,
                         CellBatchRow {
                             statement: &self.queries.index_delete,
                             row: RowShape::Key(KeyRow {
@@ -1246,6 +1260,19 @@ cassandra_queries! {
         mark_resolved: (
             "UPDATE $keyspace.{} \
              SET prev_data = null, event = null \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Row-level delete of one `kind=Cell` row: the committed-absent shape
+        /// (see the `CellStore` row-absence invariant). One row tombstone that
+        /// also covers any future columns — strictly better than nulling every
+        /// column. No TTL clause (deletes carry none). Its CQL text matches
+        /// `index_delete`; the two are kept separate because they die separately
+        /// and bind a different constant `kind`.
+        cell_delete: (
+            "DELETE FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL

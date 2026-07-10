@@ -71,6 +71,15 @@ use std::future::Future;
 ///   rollback resolution, where the committed value is the staged `prev`).
 /// * [`Self::mark_resolved`] — *promote*: nulls `event` and `prev`, keeping
 ///   `data`. O(1) regardless of value size; the commit arm of resolution.
+///
+/// # Committed absence is row absence
+///
+/// **Invariant:** a committed-absent cell is stored as *no row*. Every path
+/// that resolves a cell to absent deletes the row rather than leaving a
+/// null-blob residue. This is why [`Self::write_resolved`] partitions on data
+/// presence (a `None` value deletes) and why [`Self::commit_provisional`]
+/// routes an absent-data promote to `write_resolved(cell, None)` instead of the
+/// value-preserving [`Self::mark_resolved`] verb.
 pub trait CellStore: Clone + Send + Sync + 'static {
     /// Error type for cell-store operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -181,9 +190,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Writes each `(cell, data)` as a resolved cell (`data` committed;
-    /// `event`/`prev` null) in one same-partition batch, binding `collection`'s
-    /// TTL.
+    /// Writes each `(cell, data)` as a resolved cell in one same-partition
+    /// batch, binding `collection`'s TTL, partitioning internally on data
+    /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
+    /// `None` **deletes the row** (the row-absence invariant). Covers the
+    /// `ReadUncommitted` direct clear, the mid-handler flush of a clear, and
+    /// rollback-to-absent.
     ///
     /// # Errors
     ///
@@ -198,6 +210,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// `prev`, keeping `data`. O(1) bytes per cell. Idempotent — promoting a
     /// resolved cell is a harmless no-op write.
     ///
+    /// **Precondition:** callers route an absent-data promote to
+    /// [`write_resolved`](Self::write_resolved)`(cell, None)` (the row-absence
+    /// invariant), so this verb only ever promotes present data. Promoting a
+    /// staged clear through it anyway is harmless legacy residue — the row
+    /// decodes `Committed(None)`, never corruption — not an error.
+    ///
     /// # Errors
     ///
     /// Returns [`Self::Error`] on a store failure.
@@ -208,11 +226,20 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     /// Settles a staged set as **committed**: each cell's provisional `data`
-    /// becomes the committed value. The default is the O(1) promote
-    /// ([`Self::mark_resolved`] over the keys); the
-    /// [`Cached`](super::cached::Cached) cache overrides it to also publish the
-    /// committed `data` projection into fjall, returning the **lower** result
-    /// verbatim so a cache-publish failure never gates promotion.
+    /// becomes the committed value. The default routes on data presence — a
+    /// present-data cell promotes in place ([`Self::mark_resolved`]); an
+    /// absent-data cell (a staged clear) **deletes** the row via
+    /// [`Self::write_resolved`]`(cell, None)`, upholding the row-absence
+    /// invariant. The [`Cached`](super::cached::Cached) cache overrides it to
+    /// also publish the committed projection into fjall, returning the
+    /// **lower** result verbatim so a cache-publish failure never gates
+    /// promotion.
+    ///
+    /// Both arms are idempotent and row-disjoint (an event stages each cell at
+    /// most once, so no cell appears in both), so the two sequential awaits are
+    /// order-free; the sweep retries either on failure. A settle with no clears
+    /// issues exactly one `mark_resolved` batch set — the second round-trip
+    /// arrives only when the event actually staged a clear.
     ///
     /// # Errors
     ///
@@ -223,8 +250,22 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         async move {
-            let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
-            self.mark_resolved(collection, &keys).await
+            let mut keeps: Vec<CellKey> = Vec::with_capacity(writes.len());
+            let mut clears: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(writes.len());
+            for (cell, write) in writes {
+                if write.data().is_some() {
+                    keeps.push(cell.clone());
+                } else {
+                    clears.push((cell.clone(), None));
+                }
+            }
+            if !keeps.is_empty() {
+                self.mark_resolved(collection, &keeps).await?;
+            }
+            if !clears.is_empty() {
+                self.write_resolved(collection, &clears).await?;
+            }
+            Ok(())
         }
     }
 

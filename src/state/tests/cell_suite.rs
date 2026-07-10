@@ -36,6 +36,7 @@ use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::dirty::DirtyStore;
 use super::super::identity::{CollectionId, CollectionRef};
+use super::super::memory::MemoryCells;
 use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
 use super::super::resolve::sweep_provisional;
@@ -47,7 +48,7 @@ use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
@@ -160,6 +161,41 @@ impl CommitOracle for ScriptedOracle {
         } else {
             CommitDecision::NotCommitted
         })
+    }
+}
+
+/// The physical-row-shape oracle for the row-absence invariant.
+///
+/// Enumerates the physically stored `kind=Cell` rows of a collection's shared
+/// test section, as their first coordinate byte (the suites use single-byte
+/// coordinates, matching [`cell_at`]). At any settled checkpoint the stored-row
+/// set must equal the model's *present* set — a residue row (an absent value
+/// left with live columns/entry) shows up as an extra member, a lost row as a
+/// missing one, so exact equality catches both. Probe errors are environment
+/// errors (propagated with `?`), never property failures.
+///
+/// Only [`run_crash_equivalence_trace`] and [`run_bottom_scan_trace`] take a
+/// probe: they drive every physical settle primitive (clean promote, clean
+/// abort, crash→sweep, crash→first-touch, and the direct `write_resolved(None)`
+/// clear). `run_overlay_trace`/`run_overwrite_trace` add no new physical path —
+/// their committed mutations and first-touch resolutions go through those same
+/// primitives — so hooking them would only add live round-trips.
+pub(crate) trait ShapeProbe {
+    async fn cell_rows(&self, id: &CollectionId) -> Result<BTreeSet<u8>>;
+}
+
+/// [`ShapeProbe`] over the memory backend: the store map itself, every entry
+/// regardless of variant (so a lingering `Resolved(None)` residue is visible).
+pub(crate) struct MemoryShapeProbe(pub(crate) MemoryCells);
+
+impl ShapeProbe for MemoryShapeProbe {
+    async fn cell_rows(&self, id: &CollectionId) -> Result<BTreeSet<u8>> {
+        Ok(self
+            .0
+            .stored_coordinates(id)
+            .into_iter()
+            .map(|cell| coord_of(&cell))
+            .collect())
     }
 }
 
@@ -389,14 +425,16 @@ where
 /// projection equals the model after every event regardless of the resolution
 /// path. A crash rebuilds the store over the same warm backing the closure
 /// captures.
-pub(crate) async fn run_crash_equivalence_trace<S, F>(
+pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
     oracle: ScriptedOracle,
     trace: Trace,
+    probe: &P,
 ) -> Result<bool>
 where
     S: CellStore,
     F: Fn() -> Result<S>,
+    P: ShapeProbe,
 {
     let (ids, refs) = pooled_collections()?;
     let mut store = make_store()?;
@@ -500,6 +538,20 @@ where
 
         if !assert_converged(&store, &ids, &model).await? {
             return Ok(false);
+        }
+
+        // Physical-shape oracle: the stored `kind=Cell` rows must equal the
+        // model's present set exactly — a committed-absent cell is row absence
+        // (no residue row), a committed value is one row. Rides every settle path
+        // the trace generates.
+        for (id, expected) in ids.iter().zip(&model) {
+            let present: BTreeSet<u8> = expected
+                .iter()
+                .filter_map(|(&coord, value)| value.is_some().then_some(coord))
+                .collect();
+            if probe.cell_rows(id).await? != present {
+                return Ok(false);
+            }
         }
     }
 
@@ -975,9 +1027,14 @@ where
 /// ASC/DESC` + `coordinate` range the overlay merge delegates to and the
 /// limit/end the overlay strips before delegating. Every seed is committed
 /// (`write_resolved`), so the oracle is committed-only.
-pub(crate) async fn run_bottom_scan_trace<S>(store: S, trace: ScanTrace) -> Result<bool>
+pub(crate) async fn run_bottom_scan_trace<S, P>(
+    store: S,
+    trace: ScanTrace,
+    probe: &P,
+) -> Result<bool>
 where
     S: CellStore,
+    P: ShapeProbe,
 {
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let id = CollectionId::new(
@@ -1021,6 +1078,21 @@ where
                 if got != expected {
                     return Ok(false);
                 }
+            }
+        }
+
+        // After each seed (the direct `write_resolved` path, `None` ⇒ row
+        // delete): the stored `kind=Cell` rows equal the committed-present set,
+        // pinning the ReadUncommitted-clear row-absence path with no oracle in
+        // the loop.
+        if matches!(step, ScanStep::Seed(_)) {
+            let present: BTreeSet<u8> = model
+                .committed
+                .iter()
+                .filter_map(|(&coord, value)| value.is_some().then_some(coord))
+                .collect();
+            if probe.cell_rows(&id).await? != present {
+                return Ok(false);
             }
         }
     }

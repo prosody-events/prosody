@@ -5,8 +5,8 @@ pub(crate) mod identity_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    MemoryShapeProbe, OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
 use self::collection_suite::{
     DequeHoles, DequeTrace, MapTrace, run_deque_holes, run_deque_trace, run_map_trace,
@@ -65,7 +65,13 @@ fn prop_memory_cell_crash_equivalence() {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let make = || Ok(memory_store(cells.clone(), oracle.clone()));
-        executor::block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
+        let probe = MemoryShapeProbe(cells.clone());
+        executor::block_on(run_crash_equivalence_trace(
+            make,
+            oracle.clone(),
+            trace,
+            &probe,
+        ))
     }
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
@@ -108,8 +114,10 @@ fn prop_memory_overlay_view() {
 fn prop_memory_bottom_scan() {
     fn property(trace: ScanTrace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
-        let store = memory_store(MemoryCells::new(), oracle);
-        executor::block_on(run_bottom_scan_trace(store, trace))
+        let cells = MemoryCells::new();
+        let store = memory_store(cells.clone(), oracle);
+        let probe = MemoryShapeProbe(cells);
+        executor::block_on(run_bottom_scan_trace(store, trace, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }

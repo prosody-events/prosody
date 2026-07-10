@@ -43,6 +43,22 @@ impl MemoryCells {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Every stored cell key for `collection`, **regardless of variant** — the
+    /// physical-shape probe for the row-absence invariant, so a lingering
+    /// `Resolved(None)` entry (which must be a removal, not a tombstone) is
+    /// visible as an extra member.
+    #[cfg(test)]
+    pub(crate) fn stored_coordinates(&self, collection: &CollectionId) -> Vec<CellKey> {
+        let mut out = Vec::new();
+        self.inner.iter_sync(|(id, cell), _stored| {
+            if id == collection {
+                out.push(cell.clone());
+            }
+            true
+        });
+        out
+    }
 }
 
 /// In-memory, uniform [`CellStore`] — the in-memory (and mock-mode) backend.
@@ -250,12 +266,25 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
     ) -> Result<(), Self::Error> {
         for (cell, data) in cells {
-            self.map()
-                .upsert_async(
-                    (collection.id().clone(), cell.clone()),
-                    StoredCell::Resolved(data.clone()),
-                )
-                .await;
+            match data {
+                // Present value: upsert the resolved cell.
+                Some(_) => {
+                    self.map()
+                        .upsert_async(
+                            (collection.id().clone(), cell.clone()),
+                            StoredCell::Resolved(data.clone()),
+                        )
+                        .await;
+                }
+                // Absent value: remove the entry (the row-absence invariant —
+                // a missing entry already reads `Resolved(Committed(None))` via
+                // `read_raw`'s default). Removing an absent key is a no-op.
+                None => {
+                    self.map()
+                        .remove_async(&(collection.id().clone(), cell.clone()))
+                        .await;
+                }
+            }
             // Rollback/committed-write resolves the cell; drop its provisional
             // coordinate (a no-op for a never-staged direct write).
             self.warm.clear(collection.id(), cell).await;

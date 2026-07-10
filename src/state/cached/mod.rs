@@ -805,11 +805,11 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        // Promote in the lower store (the authoritative settle); see the
-        // module doc's Incomplete trap for why the result below is returned
-        // verbatim.
-        let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
-        let result = self.lower.mark_resolved(collection, &keys).await;
+        // Settle in the lower store (the authoritative settle) — the lower store
+        // owns the promote-vs-delete routing (present data promotes, a staged
+        // clear deletes the row, per the row-absence invariant). See the module
+        // doc's Incomplete trap for why the result below is returned verbatim.
+        let result = self.lower.commit_provisional(collection, writes).await;
         if result.is_ok() {
             // The provisional `data` is now the committed value; re-publish it.
             // `mark_resolved` does NOT re-stamp the durable TTL, so the

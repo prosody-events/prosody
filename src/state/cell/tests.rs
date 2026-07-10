@@ -12,8 +12,8 @@ fn event() -> EventRef {
 /// The pure committed-value projection (the external reader's view): a
 /// resolved cell projects its committed value, a provisional cell projects
 /// its `prev` (the committed base, stale by exactly the in-flight event) —
-/// never its in-flight `data`. A cleared/rolled-back/promote-of-clear
-/// residue all project absence (the `ClearIsAbsence` corollary).
+/// never its in-flight `data`. A cleared/rolled-back/absent-base cell all
+/// project absence (the `ClearIsAbsence` corollary).
 #[test]
 fn project_committed_is_prev_for_provisional_and_data_for_resolved() {
     let data = Bytes::from_static(b"data");
@@ -47,7 +47,8 @@ fn project_committed_is_prev_for_provisional_and_data_for_resolved() {
         Some(&prev),
     );
 
-    // A promote-of-clear residue (both blobs null) projects absence.
+    // A provisional clear over an absent base (both blobs null) projects
+    // absence.
     assert_eq!(
         Cell::Provisional(ProvisionalCell::new(None, None, event())).project_committed(),
         None,

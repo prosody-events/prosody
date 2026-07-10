@@ -18,11 +18,17 @@
 //! `encoding` and `version` are **shared** by `data` and
 //! `prev_data`: a single build encodes both with the same codec. The pairing
 //! is therefore validated *per blob* (a present blob needs an encoding), never
-//! as a row-level "encoding implies a blob" rule. That distinction is
-//! load-bearing: promoting a staged clear leaves the row with
-//! `data`/`prev_data` both NULL but `encoding`/`version`
-//! still populated (promote is O(1) and does not touch them), which is a
-//! legitimate `Resolved(None)`, not corruption.
+//! as a row-level "encoding implies a blob" rule. Per-blob validation is
+//! load-bearing for the live shapes — a clear-over-present *stage* carries a
+//! NULL `data` with a present `prev_data`, so the row still needs an encoding.
+//!
+//! It also keeps the decoder tolerant of a **legacy** shape: both blobs NULL
+//! with `encoding`/`version` still populated, which decodes cleanly as
+//! `Resolved(None)`. This build never produces it — a committed-absent cell
+//! deletes its row (the [`CellStore`](crate::state::store::CellStore)
+//! row-absence invariant) — but rows written by earlier builds that promoted a
+//! staged clear in place may still carry it, and the decoder keeps reading them
+//! as absence, never corruption.
 //!
 //! The `event` column deserializes structurally into a [`RawEventRef`] and is
 //! validated into an [`EventRef`](crate::state::EventRef) here via

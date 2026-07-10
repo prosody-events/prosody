@@ -28,8 +28,8 @@ use super::super::registry::CollectionDefRegistry;
 use super::super::store::CellStore;
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    CountingCellStore, OverlayTrace, SECTION, ScriptedOracle, Trace, bytes, cell_at,
-    run_crash_equivalence_trace, run_overlay_trace,
+    CountingCellStore, MemoryShapeProbe, OverlayTrace, SECTION, ScriptedOracle, Trace, bytes,
+    cell_at, run_crash_equivalence_trace, run_overlay_trace,
 };
 use super::support::{fresh_collection as collection, probe};
 use crate::test_util::TEST_RUNTIME;
@@ -687,7 +687,15 @@ fn prop_memory_cached_crash_equivalence() {
             );
             Ok(Cached::new(test_db::cold_cache("crash")?, lower))
         };
-        TEST_RUNTIME.block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
+        // The durable physical shape lives in the shared memory cells (fjall is
+        // only the cold-on-crash cache), so the row-absence probe reads them.
+        let probe = MemoryShapeProbe(cells.clone());
+        TEST_RUNTIME.block_on(run_crash_equivalence_trace(
+            make,
+            oracle.clone(),
+            trace,
+            &probe,
+        ))
     }
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }

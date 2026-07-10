@@ -1,12 +1,15 @@
 //! The single cell-resolution decision, shared by every recovery path.
 //!
 //! `resolve_cell` is the one place a provisional cell becomes committed:
-//! consult the commit oracle for the cell's owning event, then either *promote*
-//! it ([`CellStore::mark_resolved`], the commit arm) or write the committed
-//! base back as resolved ([`CellStore::write_resolved`], the rollback arm).
-//! Eager promotion after commit, the quiescence sweep, and first-touch all
-//! funnel through here, so "a provisional cell is resolved only via the oracle"
-//! (the oracle-always invariant) holds by construction.
+//! consult the commit oracle for the cell's owning event, then resolve it one
+//! of three ways — *promote* present data in place
+//! ([`CellStore::mark_resolved`], the commit arm for a `Set`), **delete** the
+//! row for a committed clear ([`CellStore::write_resolved`]`(None)`, the
+//! row-absence invariant), or write the committed base back as resolved
+//! ([`CellStore::write_resolved`], the rollback arm). Eager promotion after
+//! commit, the quiescence sweep, and first-touch all funnel through here, so "a
+//! provisional cell is resolved only via the oracle" (the oracle-always
+//! invariant) holds by construction.
 //!
 //! `sweep_provisional` is the recovery loop built once over the public trait:
 //! it streams a collection's provisional cells and resolves each, returning
@@ -152,10 +155,20 @@ where
         .map_err(ResolveCellError::Oracle)?;
     match decision {
         CommitDecision::Committed => {
-            store
-                .mark_resolved(collection, slice::from_ref(cell))
-                .await
-                .map_err(ResolveCellError::Store)?;
+            // Promote-of-a-clear must delete the row, not null it: an absent-data
+            // commit routes to `write_resolved(None)` (the row-absence
+            // invariant), present data promotes in place.
+            if provisional.data().is_some() {
+                store
+                    .mark_resolved(collection, slice::from_ref(cell))
+                    .await
+                    .map_err(ResolveCellError::Store)?;
+            } else {
+                store
+                    .write_resolved(collection, &[(cell.clone(), None)])
+                    .await
+                    .map_err(ResolveCellError::Store)?;
+            }
             Ok(Committed::new(provisional.into_data()))
         }
         CommitDecision::NotCommitted => {

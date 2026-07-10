@@ -3,7 +3,8 @@
 //! These run against the local Cassandra node and the shared `prosody_test`
 //! keyspace (migrated on driver connect). They exercise the part the pure
 //! decoder test cannot: `prepare`/`bind`/round-trip of every cell statement,
-//! including the promote-of-clear residue read back live. The backend-generic
+//! including a committed clear deleting its row and the legacy null-null
+//! residue read back live. The backend-generic
 //! property suites ([`crate::state::tests::cell_suite`]) run here over the
 //! production assembly `Cached<CassandraStore>` and `Overlay<Cached<…>>`, so
 //! memory and Cassandra prove identical invariants. Each test mints a fresh
@@ -22,8 +23,9 @@ use crate::state::fjall::test_db;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{
-    OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace, value_cell,
+    OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, ShapeProbe, Trace,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    value_cell,
 };
 use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
@@ -37,10 +39,54 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
+use std::collections::BTreeSet;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
+
+/// [`ShapeProbe`] over the live cluster: the physically stored `kind=Cell` rows
+/// of the trace's own partition, read by raw CQL. A residue row (an absent
+/// value left with live `encoding`/`version` columns) is returned; a
+/// `cell_delete`d row is not — so exact-set equality against the model's
+/// present set catches residue and lost rows alike. Queries only the passed
+/// collection's partition key — the isolation rule.
+struct CassandraShapeProbe {
+    session: CassandraSession,
+}
+
+impl ShapeProbe for CassandraShapeProbe {
+    async fn cell_rows(&self, id: &CollectionId) -> Result<BTreeSet<u8>> {
+        use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+        let cql = format!(
+            "SELECT coordinate FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? \
+             AND key = ? AND state_type = ? AND name = ? AND kind = 0"
+        );
+        let result = self
+            .session
+            .session()
+            .query_unpaged(
+                cql,
+                (
+                    id.state_key().segment_id,
+                    id.state_key().key.as_ref(),
+                    i8::from(id.state_type()),
+                    id.name().as_str(),
+                ),
+            )
+            .await?
+            .into_rows_result()?;
+        let mut out = BTreeSet::new();
+        for row in result.rows::<(Vec<u8>,)>()? {
+            let (coordinate,) = row?;
+            if let Some(&byte) = coordinate.first() {
+                out.insert(byte);
+            }
+        }
+        Ok(out)
+    }
+}
 
 /// The production committed bottom assembly: fjall write-through over the
 /// resolving Cassandra cell store.
@@ -328,26 +374,31 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
     Ok(())
 }
 
-/// Stage a clear over a present base, observe it provisional (`data` null,
-/// `prev` present), promote, and read back absent — the promote-of-clear
-/// residue decoded live (encoding/version linger, both blobs null).
+/// Committing a staged clear over a present base **deletes the row** (the
+/// row-absence invariant): the cell reads back absent, and no residue row
+/// lingers — a stale `encoding`/`version` would still be selected. Settles
+/// through the routed `commit_provisional` path (the promote arm that owns
+/// clear→delete).
 #[tokio::test]
-async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
+async fn committed_clear_deletes_the_row() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::state::oracle::CommitOracle;
+
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
-    let c = collection("cart")?;
+    let oracle = ScriptedOracle::default();
+    let store = fx.bottom_store(oracle.clone());
+    let c = collection("clear-deletes")?;
     let cell = value_cell();
     let old = Bytes::from_static(b"old");
 
+    // Committed base present, then stage a clear over it and settle committed.
     store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2)),
-            )],
-        )
+        .write_resolved(&c, &[(cell.clone(), Some(old.clone()))])
+        .await?;
+    let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
+    store
+        .write_provisional(&c, &[(cell.clone(), write.clone())])
         .await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged
@@ -357,10 +408,89 @@ async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
     assert_eq!(prov.data(), None);
     assert_eq!(prov.prev(), Some(&old));
 
-    store.mark_resolved(&c, slice::from_ref(&cell)).await?;
+    oracle.record_message(Uuid::from_u128(2)).await?;
+    store
+        .commit_provisional(&c, &[(cell.clone(), write)])
+        .await?;
+
     assert_eq!(
         store.get(c.id(), &cell, event(3)).await?,
         Committed::new(None)
+    );
+
+    // The residue row would still be selected by its live `encoding`/`version`;
+    // its absence proves the commit deleted the row rather than nulling columns.
+    let cql = format!(
+        "SELECT encoding, version FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id \
+         = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0 AND section = ? AND \
+         coordinate = ?"
+    );
+    let id = c.id();
+    let residue = fx
+        .cassandra
+        .session()
+        .query_unpaged(
+            cql,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                i8::from(cell.section),
+                cell.coordinate.as_bytes(),
+            ),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<i16>, Option<i32>)>()?;
+    assert!(
+        residue.is_none(),
+        "committed clear must delete the row, leaving no residue: {residue:?}"
+    );
+    Ok(())
+}
+
+/// Legacy decode tolerance: the null-null-with-encoding residue shape is no
+/// longer produced by any statement (a committed-absent cell deletes its row),
+/// but rows written by earlier builds may still carry it. Seeded directly via
+/// raw CQL, it must still read `Committed(None)`, never corruption — the
+/// decoder's tolerance kept honest now that no code path produces the shape.
+#[tokio::test]
+async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("legacy-residue")?;
+    let cell = value_cell();
+    let id = c.id();
+
+    // Both blobs and `event` absent, `encoding` = 4 (RawZstdV1), `version` = 1
+    // (INITIAL_VERSION) — the legacy promote-of-clear residue shape.
+    let insert = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate, encoding, version) VALUES (?, ?, ?, ?, 0, ?, ?, 4, 1)"
+    );
+    fx.cassandra
+        .session()
+        .query_unpaged(
+            insert,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                i8::from(cell.section),
+                cell.coordinate.as_bytes(),
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        store.get(id, &cell, event(1)).await?,
+        Committed::new(None),
+        "the decoder must read the legacy residue as committed-absence"
     );
     Ok(())
 }
@@ -635,28 +765,28 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
         .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
 }
 
-/// Builds the mixed-statement batch for the binding-order test: three units
-/// whose single flatten interleaves every row shape and all five cell
+/// Builds the mixed-statement batch for the binding-order test: four units
+/// whose single flatten interleaves every row shape and all six cell
 /// statements — stage+index for A, promote+index-delete for B,
-/// resolved-write+index-delete for C. The blobs, cells, and `id` outlive the
-/// returned borrows (the caller holds them).
+/// resolved-write+index-delete for C, and a `cell_delete` row-delete for D. The
+/// blobs, cells, and `id` outlive the returned borrows (the caller holds them).
 fn mixed_binding_batch<'a>(
     q: &'a CellQueries,
     id: &'a CollectionId,
     blob_a: &'a CellBlobs,
     blob_c: &'a CellBlobs,
-    cell_a: &'a CellKey,
-    cell_b: &'a CellKey,
-    cell_c: &'a CellKey,
+    cells: [&'a CellKey; 4],
 ) -> Vec<BatchUnit<CellBatchRow<'a>>> {
     use super::Pk;
     use smallvec::smallvec;
 
+    let [cell_a, cell_b, cell_c, cell_d] = cells;
     let pk = Pk::of(id);
-    let (addr_a, addr_b, addr_c) = (
+    let (addr_a, addr_b, addr_c, addr_d) = (
         CellAddr::new(pk, cell_a),
         CellAddr::new(pk, cell_b),
         CellAddr::new(pk, cell_c),
+        CellAddr::new(pk, cell_d),
     );
     vec![
         BatchUnit::new(
@@ -724,6 +854,16 @@ fn mixed_binding_batch<'a>(
                 },
             ],
         ),
+        BatchUnit::new(
+            1_024,
+            smallvec![CellBatchRow {
+                statement: &q.cell_delete,
+                row: RowShape::Key(KeyRow {
+                    kind: CellKind::Cell,
+                    addr: addr_d,
+                }),
+            }],
+        ),
     ]
 }
 
@@ -732,12 +872,13 @@ fn mixed_binding_batch<'a>(
 /// count/order mismatch scylla falls back to an **empty** context with no
 /// error — a misordered `unzip` flatten would bind a row against the wrong
 /// statement's columns silently. Build ONE batch whose single flatten
-/// interleaves every [`RowShape`] across **five distinct prepared
+/// interleaves every [`RowShape`] across **six distinct prepared
 /// statements** — stage a cell, upsert its index marker, promote a
-/// pre-provisioned cell, delete markers, and write a fresh resolved value —
-/// with **distinct payloads** so any cross-binding corrupts an observable
-/// value. Read every cell back: each landing correctly proves its statement
-/// bound its own columns.
+/// pre-provisioned cell, delete markers, write a fresh resolved value, and
+/// row-delete a pre-seeded cell (`cell_delete`, distinct from `index_delete`
+/// only by its constant `kind`) — with **distinct payloads** so any
+/// cross-binding corrupts an observable value. Read every cell back: each
+/// landing correctly proves its statement bound its own columns.
 #[tokio::test]
 async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Result<()> {
     use crate::state::cell_key::Coordinate;
@@ -752,11 +893,12 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         section: Section::new(0),
         coordinate: Coordinate::from_bytes(vec![b]),
     };
-    let (cell_a, cell_b, cell_c) = (cell(1), cell(2), cell(3));
-    let (data_a, data_b, data_c) = (
+    let (cell_a, cell_b, cell_c, cell_d) = (cell(1), cell(2), cell(3), cell(4));
+    let (data_a, data_b, data_c, data_d) = (
         Bytes::from_static(b"aaa"),
         Bytes::from_static(b"bbb"),
         Bytes::from_static(b"ccc"),
+        Bytes::from_static(b"ddd"),
     );
 
     // Pre-provision B (a provisional cell + its index marker) so the mixed batch
@@ -770,19 +912,21 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
             )],
         )
         .await?;
+    // Pre-seed D resolved so the batch's `cell_delete` has a row to remove.
+    store
+        .write_resolved(&c, &[(cell_d.clone(), Some(data_d.clone()))])
+        .await?;
 
     // Owned blobs the bound rows borrow into; must outlive the awaited batch.
     let blob_a = encode_cell_blobs(Some(&data_a), None)?;
     let blob_c = encode_cell_blobs(Some(&data_c), None)?;
-    // One batch, one flatten, five distinct statements interleaved.
+    // One batch, one flatten, six distinct statements interleaved.
     let units = mixed_binding_batch(
         &fx.queries,
         &id,
         &blob_a,
         &blob_c,
-        &cell_a,
-        &cell_b,
-        &cell_c,
+        [&cell_a, &cell_b, &cell_c, &cell_d],
     );
     fx.cassandra
         .execute_unlogged_batches(&units, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
@@ -811,6 +955,12 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     assert_eq!(
         store.get(&id, &cell_c, event(3)).await?,
         Committed::new(Some(data_c))
+    );
+    // D's row was deleted (the `cell_delete` bound its own `kind=Cell` key
+    // columns, not `index_delete`'s `kind=Index`), so it reads absent.
+    assert_eq!(
+        store.get(&id, &cell_d, event(3)).await?,
+        Committed::new(None)
     );
     Ok(())
 }
@@ -848,7 +998,10 @@ fn prop_cassandra_cell_crash_equivalence() {
                 fx.bottom_store(oracle.clone()),
             ))
         };
-        run_crash_equivalence_trace(make, oracle.clone(), trace).await
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_crash_equivalence_trace(make, oracle.clone(), trace, &probe).await
     }
 
     init_test_logging();
@@ -924,7 +1077,10 @@ fn prop_cassandra_overlay_view() {
 fn prop_cassandra_bottom_scan() {
     async fn run(trace: ScanTrace) -> Result<bool> {
         let fx = fixture().await?;
-        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace).await
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace, &probe).await
     }
 
     init_test_logging();
