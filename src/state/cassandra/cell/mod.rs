@@ -11,18 +11,31 @@
 //! ([`Cached`](crate::state::cached::Cached),
 //! [`Overlay`](crate::state::overlay::Overlay)) are oracle-free.
 //!
-//! # Cell rows and the provisional index
+//! # Cell rows and the event marker
 //!
 //! The partition's leading clustering [`CellKind`] splits it into two disjoint
 //! ranges. A `kind=Cell` row is one cell over the columns `data | prev_data |
-//! encoding | version | event`, addressed by `(section, coordinate)`. Beside
-//! every staged cell, a bare `kind=Index` marker row records its coordinate;
-//! recovery ([`provisional_cells`](CellStore::provisional_cells)) reads only
-//! that front-of-partition marker range and point-reads each marked cell, so
-//! its cost is proportional to the number of provisional cells, never the
-//! partition size. A cell's `kind=Cell` mutation and its `kind=Index` marker
-//! are written as one atomic same-partition batch unit, so the two never tear
-//! apart. The three mutators write exactly one cell-column shape each:
+//! encoding | version | event`, addressed by `(section, coordinate)`. One
+//! `kind=Marker` row per collection, at the **fixed address**
+//! `(section = 0, coordinate = empty)`, is the durable recovery handle: its
+//! `event` column names the staging event and its `data` column carries the
+//! frozen marker payload — the event's full staged coordinate list
+//! ([`crate::state::marker`]). Recovery
+//! ([`provisional_cells`](CellStore::provisional_cells)) point-reads the
+//! marker, then point-reads each listed cell, so its cost is proportional to
+//! the number of provisional cells, never the partition size — and because
+//! every marker write and delete lands at the one fixed position, marker churn
+//! compacts to a single entry instead of accumulating a tombstone field.
+//!
+//! Marker lifecycle ownership is stated once, on
+//! [`write_provisional`](CellStore::write_provisional). A stage that fits the
+//! batch budget carries the marker row **in** the atomic batch; an over-budget
+//! stage writes the marker first, alone, so a torn stage is always
+//! marker-without-cells (over-report-safe), never cells-without-marker (a
+//! strand). The per-assignment RAM memo ([`MarkerMemo`]) bounds durable marker
+//! reads to at most one per collection per assignment.
+//!
+//! The three cell mutators write exactly one cell-column shape each:
 //!
 //! * [`write_provisional`](CellStore::write_provisional) — *stage*: `data`,
 //!   `prev_data`, `event`, and the shared `encoding`/`version` in one `UPDATE`.
@@ -70,13 +83,16 @@ use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge};
 use crate::state::event_ref::EventRef;
-use crate::state::marker::{EventMarker, SectionClear};
+use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
-use crate::state::store::{CellStore, route_abort, route_commit};
+use crate::state::resolve::{
+    ResolveCellError, Resolver, flatten_resolve, resolve_marker, resolve_read,
+};
+use crate::state::store::CellStore;
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
+use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
@@ -111,11 +127,10 @@ const VALUE_ENCODING: Encoding = Encoding::RawZstdV1;
 /// for a deployment with a tighter commitlog.
 const MAX_BATCH_BYTES: u64 = 5 * 1_024 * 1_024;
 
-/// Soft ceiling on the number of **cells** (batch units) in one batch. Each
-/// unit contributes up to two statements (a `kind=Cell` mutation and a
-/// `kind=Index` marker), so the emitted statement count stays under `2 ×` this
-/// — still far under the protocol u16 max the driver enforces client-side, so
-/// the byte budget dominates for any non-trivial value.
+/// Soft ceiling on the number of batch units in one batch. Each unit is one
+/// row (a stage batch adds at most one extra marker row total), far under the
+/// protocol u16 max the driver enforces client-side, so the byte budget
+/// dominates for any non-trivial value.
 const MAX_BATCH_STATEMENTS: usize = 4_096;
 
 /// Per-statement size the row weight adds on top of its blob bytes, covering
@@ -135,29 +150,29 @@ const INITIAL_VERSION: i32 = 1;
 /// into two disjoint front-to-back ranges.
 ///
 /// [`Cell`](Self::Cell) rows carry the full cell columns;
-/// [`Index`](Self::Index) rows are bare provisional-coordinate markers
-/// co-clustered ahead of them, so recovery reads only the (bounded) `Index`
-/// range instead of scanning every cell. It is **always bound as a constant
-/// clustering predicate**, never decoded back into a value — hence
-/// serialize-only ([`SerializeValue`] in [`super::serialize`]), with no
-/// `TryFrom`/`DeserializeValue`.
+/// [`Marker`](Self::Marker) is the collection's **one** event-marker row at the
+/// fixed address `(section = 0, coordinate = empty)`, so recovery is a single
+/// point read at a compaction-merged position — never a range over a tombstone
+/// field. It is **always bound as a constant clustering predicate**, never
+/// decoded back into a value — hence serialize-only ([`SerializeValue`] in
+/// [`super::serialize`]), with no `TryFrom`/`DeserializeValue`.
 ///
 /// # Reserved-`kind` safety
 ///
 /// `kind` is **cell-store-internal**: it splits the physical partition into the
-/// data slice and the recovery-marker slice, and no collection may address the
+/// data slice and the event-marker slice, and no collection may address the
 /// marker slice. This is enforced structurally, not by a runtime check:
 ///
-/// * `CellKind` and its `Index` variant are private to the Cassandra state
+/// * `CellKind` and its `Marker` variant are private to the Cassandra state
 ///   backend — never re-exported, never reachable from a collection.
 /// * A collection addresses a cell only through a [`CellKey`], which carries
 ///   **only** `(section, coordinate)` — it has no `kind` field, so the marker
 ///   slice is unnameable from the collection layer.
 /// * This store binds `kind` itself, as the compile-time constant
-///   `CellKind::Cell` on every data read/write and `CellKind::Index` only on
-///   the marker mutators.
+///   `CellKind::Cell` on every data read/write and `CellKind::Marker` only on
+///   the marker statements.
 ///
-/// So "a collection reads or writes the index slice" is uncompilable, and no
+/// So "a collection reads or writes the marker slice" is uncompilable, and no
 /// assertion or property test is needed to defend it.
 ///
 /// [`CellKey`]: crate::state::cell_key::CellKey
@@ -169,9 +184,11 @@ pub(super) enum CellKind {
     /// column shape.
     Cell = 0,
 
-    /// A bare provisional-coordinate marker row (only the clustering key is
-    /// populated).
-    Index = 1,
+    /// The collection's fixed-address event-marker row: `event` names the
+    /// staging event, `data` carries the frozen marker payload
+    /// ([`crate::state::marker`]). Wire value `1` unchanged from the
+    /// per-coordinate design this row replaced.
+    Marker = 1,
 }
 
 impl From<CellKind> for i8 {
@@ -204,20 +221,40 @@ impl CassandraCellResources {
     }
 }
 
-/// Test-only recovery-read counters, incremented inside
-/// [`provisional_cells`](CellStore::provisional_cells) — the **unconditional
-/// cold seed**. The seeded-latch short-circuit lives one layer up on
-/// [`Cached`](crate::state::cached::Cached), which calls this only on a cold
-/// sweep, so a warm-clean sweep never enters here and both counters stay at
-/// zero — the non-vacuous "zero queries on quiescence" signal.
+/// Test-only recovery-read counters. `marker_point_reads` increments only in
+/// [`standing_marker`](CellStore::standing_marker)'s durable-read arm — a
+/// [`MarkerMemo`] hit must not count — which is what makes the "at most one
+/// durable marker read per collection per assignment" pin non-vacuous.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryReadCounts {
-    /// `kind=Index` range queries issued — one per cold seed, zero when warm.
-    pub(crate) index_range_reads: AtomicUsize,
+    /// Durable event-marker point reads — memo misses only.
+    pub(crate) marker_point_reads: AtomicUsize,
     /// `kind=Cell` point reads issued during recovery — bounded by
     /// #provisional.
     pub(crate) cell_point_reads: AtomicUsize,
+}
+
+/// Per-assignment RAM event-marker state — the shared memo all three marker
+/// consumers ride (the cold recovery seed, the stage-boundary check, and
+/// read-help): `checked` records the collections whose durable marker has been
+/// consulted this assignment, `standing` the markers known to stand.
+///
+/// **Memo invariant:** the RAM state may **over-report** a marker (list one
+/// that never durably landed — resolving a phantom marker is a harmless no-op
+/// settle) but must never **under-report** (`checked` true while `standing`
+/// misses a durable marker would strand that marker's cells from the sweep
+/// until the next assignment). Therefore `standing` is updated **before** the
+/// durable stage attempt, and `checked` is set only by the durable read path,
+/// the stage path, and the settle path. Per-key serialization means no two ops
+/// race on one collection's entry; scc handles cross-collection concurrency.
+///
+/// Minted fresh per [`CassandraStore`] (fresh store per partition acquisition
+/// ⇒ cold memo per assignment); clones share the `Arc`.
+#[derive(Debug, Default)]
+struct MarkerMemo {
+    checked: scc::HashSet<CollectionId, RandomState>,
+    standing: scc::HashMap<CollectionId, EventMarker, RandomState>,
 }
 
 /// Cassandra-backed uniform cell store.
@@ -226,6 +263,7 @@ pub struct CassandraStore<O> {
     session: CassandraSession,
     queries: Arc<CellQueries>,
     resolver: Resolver<O>,
+    memo: Arc<MarkerMemo>,
     #[cfg(test)]
     counters: Arc<RecoveryReadCounts>,
 }
@@ -245,6 +283,7 @@ impl<O> CassandraStore<O> {
             session,
             queries,
             resolver: Resolver::new(oracle, registry),
+            memo: Arc::default(),
             #[cfg(test)]
             counters: Arc::default(),
         }
@@ -299,10 +338,12 @@ impl<O> CassandraStore<O> {
     }
 
     /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
-    /// mutation — the shared tail of the three cell mutators. Each
-    /// [`BatchUnit`] is one cell's indivisible row pair (its `kind=Cell`
-    /// mutation and its `kind=Index` marker), packed into the fewest
-    /// batches under the byte and statement budgets.
+    /// mutation — the shared tail of the cell mutators. Each [`BatchUnit`] is
+    /// one row (a cell mutation, or the marker row), packed into the fewest
+    /// batches under the byte and statement budgets; every batch is
+    /// row-disjoint by construction (the marker address is disjoint from every
+    /// cell row by `kind`), so no same-batch timestamp tie can pit a delete
+    /// against a write of one row.
     async fn run_batches(
         &self,
         units: &[BatchUnit<CellBatchRow<'_>>],
@@ -316,6 +357,59 @@ impl<O> CassandraStore<O> {
             )
             .await?;
         Ok(())
+    }
+
+    /// Builds the resolved-write batch units for `cells` — the shared unit
+    /// construction of `write_resolved` and `abort_provisional`. A present
+    /// value binds the resolved-value shape; an absent value **deletes** the
+    /// `kind=Cell` row (the row-absence invariant — no null-blob residue).
+    fn resolved_units<'u>(
+        &'u self,
+        pk: Pk<'u>,
+        ttl: Option<i32>,
+        blobs: &'u [CellBlobs],
+        cells: &'u [(CellKey, Option<Bytes>)],
+    ) -> Vec<BatchUnit<CellBatchRow<'u>>> {
+        let cell_stmt = if ttl.is_some() {
+            &self.queries.write_resolved
+        } else {
+            &self.queries.write_resolved_no_ttl
+        };
+        blobs
+            .iter()
+            .zip(cells)
+            .map(|(blob, (cell, _))| {
+                let addr = CellAddr::new(pk, cell);
+                let row = match blob.data {
+                    Some(_) => CellBatchRow {
+                        statement: cell_stmt,
+                        row: RowShape::Resolved(ResolvedRow {
+                            ttl,
+                            data: blob.data.as_deref(),
+                            encoding: blob.encoding,
+                            version: blob.version,
+                            addr,
+                        }),
+                    },
+                    None => CellBatchRow {
+                        statement: &self.queries.cell_delete,
+                        row: RowShape::Key(KeyRow {
+                            kind: CellKind::Cell,
+                            addr,
+                        }),
+                    },
+                };
+                BatchUnit::new(blob_weight(blob), smallvec![row])
+            })
+            .collect()
+    }
+
+    /// Mirrors a successful settle into the [`MarkerMemo`]: the marker is now
+    /// durably deleted, so the collection is known marker-absent for the rest
+    /// of the assignment.
+    async fn settle_memo(&self, collection: &CollectionId) {
+        self.memo.standing.remove_async(collection).await;
+        let _ = self.memo.checked.insert_async(collection.clone()).await;
     }
 }
 
@@ -488,52 +582,27 @@ where
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         try_stream! {
-            // The unconditional **cold seed**: one bounded front-of-partition
-            // `kind=Index` range read yields the provisional coordinate list
-            // (cost ∝ #provisional, never #cells) — the durable recovery source.
-            // The warm short-circuit that skips this on a quiescent sweep lives
-            // one layer up on `Cached` (which owns the fjall warm index), so this
-            // is reached only on a cold sweep. There is no whole-partition scan.
-            let coords = {
-                let pk = Pk::of(collection);
-                #[cfg(test)]
-                self.counters.index_range_reads.fetch_add(1, Ordering::Relaxed);
-                let index = self
-                    .cql()
-                    .execute_iter(
-                        self.queries.index_scan.clone(),
-                        (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Index),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)
-                    .map_err(into_store_err::<O::Error>)?
-                    .rows_stream::<decode::IndexRow>()
-                    .map_err(CassandraStoreError::from)
-                    .map_err(into_store_err::<O::Error>)?;
-                pin_mut!(index);
-                // N (= #provisional) is bounded-small, so the drain stays
-                // sequential behind the `cooperative` checkpoint that yields a
-                // large recovery drain to the runtime every ~128 items.
-                let mut coords: Vec<CellKey> = Vec::new();
-                while let Some(row) = cooperative(index.try_next())
-                    .await
-                    .map_err(CassandraStoreError::from)
-                    .map_err(into_store_err::<O::Error>)?
-                {
-                    coords.push(decode::index_cell_key(row));
-                }
-                coords
+            // The **cold seed** is the standing event marker (memoized — the
+            // one durable marker point read per collection per assignment
+            // happens in `standing_marker`, wherever it fires first): its
+            // frozen payload lists the staged coordinates, so recovery cost is
+            // ∝ #provisional, never #cells, with no range read anywhere. The
+            // warm short-circuit that skips this on a quiescent sweep lives
+            // one layer up on `Cached` (which owns the fjall warm index).
+            let Some(marker) = self.standing_marker(collection).await? else {
+                return;
             };
+            // Bounded by one event's staged set, sized once.
+            let coords: Vec<CellKey> = marker.staged().to_vec();
 
-            // Point-read each coordinate's `kind=Cell` row to rebuild its
-            // `ProvisionalCell`, pipelined on the partition's shard fan-out —
-            // the reads are independent and both consumers are order-free (the
-            // sweep resolves `buffer_unordered`; the warm index records a set),
-            // so a store-outage backlog no longer stretches the sweep by one
-            // serial round-trip per cell. A coordinate whose row is absent (a
-            // compaction-window straggler — cell and marker share one TTL) or
-            // decodes `Cell::Resolved` (concurrently resolved, or a leftover set
-            // entry) is silently dropped — both over-report-safe.
+            // Point-read each listed coordinate's `kind=Cell` row to rebuild
+            // its `ProvisionalCell`, pipelined on the partition's shard
+            // fan-out — the reads are independent and both consumers are
+            // order-free (the sweep resolves `buffer_unordered`; the warm
+            // index records a set). A listed coordinate whose row is absent
+            // (cell and marker share one TTL) or decodes `Cell::Resolved`
+            // (first-touch or concurrently resolved) is silently dropped —
+            // the marker's over-report is safe.
             let reads = stream::iter(coords)
                 .map(|key| {
                     // `cooperative` adds a per-cell coop-budget checkpoint;
@@ -591,13 +660,55 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        // Not yet consumed — this store still records per-coordinate `kind=Index`
-        // markers; the event-marker row that reads `clears`/`staged` replaces
-        // them in the Cassandra marker step.
-        _clears: &'a [SectionClear],
-        _staged: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+        staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         let pk = Pk::of(collection.id());
+        // Boundary + marker only when something is staged (`writes ⊆ staged`,
+        // so an empty `staged` is the empty-batch no-op — nothing to strand).
+        // `clears` freezes into the marker payload via `EventMarker::frozen`
+        // but is not yet applied (no producer emits a non-empty clear).
+        let marker_blob: Option<(Bytes, EventRef)> = match staged.first() {
+            None => None,
+            Some((_, first)) => {
+                let event = first.event();
+                // Stage boundary: resolve any standing FOREIGN marker (a
+                // different event) before overwriting it, establishing marker
+                // uniqueness per collection. A same-event marker (mid-handler
+                // flush / retry attempt) is overwritten, never resolved. A
+                // resolution failure fails the stage (retry middleware).
+                if let Some(marker) = self.standing_marker(collection.id()).await?
+                    && marker.event() != event
+                {
+                    resolve_marker(self, self.resolver.oracle(), collection, &marker)
+                        .await
+                        .map_err(flatten_resolve)?;
+                }
+                let marker = EventMarker::frozen(event, staged, clears);
+                // Memo BEFORE the durable attempt (the over-report-safe
+                // direction — see the `MarkerMemo` invariant).
+                self.memo
+                    .standing
+                    .upsert_async(collection.id().clone(), marker.clone())
+                    .await;
+                let _ = self
+                    .memo
+                    .checked
+                    .insert_async(collection.id().clone())
+                    .await;
+                // The frozen payload rides the store-wide blob convention: the
+                // same zstd `encode_payload` and `encoding`/`version` stamps
+                // as every cell blob, decoded through `decode_blob`.
+                let payload = encode_marker_payload(&marker)
+                    .map_err(CassandraCellStoreError::from)
+                    .map_err(ResolveCellError::Store)?;
+                let blob = encode_payload(&payload, VALUE_ENCODING)
+                    .map_err(CassandraCellStoreError::from)
+                    .map_err(ResolveCellError::Store)?;
+                Some((blob, event))
+            }
+        };
+
         // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
         // bound rows borrow into it and into each input cell's coordinate slice,
         // so the whole batch is one `blobs` allocation with no per-cell copy.
@@ -610,51 +721,76 @@ where
 
         // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
         // hence which statement each row carries — is made once for the whole
-        // batch, never per cell.
+        // batch, never per cell. The marker row shares the TTL (co-expiry with
+        // the newest staged cell).
         let ttl = collection.ttl().map(ttl_to_i32);
-        let (cell_stmt, index_stmt) = if ttl.is_some() {
-            (&self.queries.write_provisional, &self.queries.index_insert)
+        let (cell_stmt, marker_stmt) = if ttl.is_some() {
+            (&self.queries.write_provisional, &self.queries.marker_write)
         } else {
             (
                 &self.queries.write_provisional_no_ttl,
-                &self.queries.index_insert_no_ttl,
+                &self.queries.marker_write_no_ttl,
             )
         };
-        // One unit per cell holds the cell mutation and its index marker as an
-        // indivisible pair, so `chunk_boundaries` never tears a cell's two rows
-        // into separate batches. Weight = blob bytes + one overhead for the cell
-        // row + one for the bare index row.
-        let units: Vec<BatchUnit<CellBatchRow>> = blobs
-            .iter()
-            .zip(writes)
-            .map(|(blob, (cell, write))| {
-                let addr = CellAddr::new(pk, cell);
-                BatchUnit::new(
-                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
-                    smallvec![
-                        CellBatchRow {
-                            statement: cell_stmt,
-                            row: RowShape::Stage(StageRow {
-                                ttl,
-                                data: blob.data.as_deref(),
-                                prev_data: blob.prev_data.as_deref(),
-                                encoding: blob.encoding,
-                                version: blob.version,
-                                event: write.event(),
-                                addr,
-                            }),
-                        },
-                        CellBatchRow {
-                            statement: index_stmt,
-                            row: RowShape::IndexUpsert(IndexUpsertRow { ttl, addr }),
-                        },
-                    ],
-                )
-            })
-            .collect();
-        self.run_batches(&units)
-            .await
-            .map_err(ResolveCellError::Store)
+        // The marker unit leads; each cell unit is one row.
+        let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
+        if let Some((blob, event)) = &marker_blob {
+            units.push(BatchUnit::new(
+                blob.len() as u64 + PER_STATEMENT_OVERHEAD,
+                smallvec![CellBatchRow {
+                    statement: marker_stmt,
+                    row: RowShape::MarkerWrite(MarkerWriteRow {
+                        ttl,
+                        payload: blob,
+                        event: *event,
+                        addr: CellAddr::marker(pk),
+                    }),
+                }],
+            ));
+        }
+        units.extend(blobs.iter().zip(writes).map(|(blob, (cell, write))| {
+            let addr = CellAddr::new(pk, cell);
+            BatchUnit::new(
+                blob_weight(blob),
+                smallvec![CellBatchRow {
+                    statement: cell_stmt,
+                    row: RowShape::Stage(StageRow {
+                        ttl,
+                        data: blob.data.as_deref(),
+                        prev_data: blob.prev_data.as_deref(),
+                        encoding: blob.encoding,
+                        version: blob.version,
+                        event: write.event(),
+                        addr,
+                    }),
+                }],
+            )
+        }));
+
+        // Marker-first ordering. Within one batch the marker rides atomically;
+        // an over-budget stage MUST await the marker batch to completion
+        // before issuing the cell batches, because `execute_unlogged_batches`
+        // runs its chunks `buffer_unordered` (chunk order is NOT guaranteed).
+        // Marker-without-cells is the over-report-safe crash shape;
+        // cells-without-marker would strand them from recovery.
+        if marker_blob.is_none()
+            || fits_one_batch(
+                units.iter().map(BatchUnit::weight),
+                MAX_BATCH_BYTES,
+                MAX_BATCH_STATEMENTS,
+            )
+        {
+            self.run_batches(&units)
+                .await
+                .map_err(ResolveCellError::Store)
+        } else {
+            self.run_batches(&units[..1])
+                .await
+                .map_err(ResolveCellError::Store)?;
+            self.run_batches(&units[1..])
+                .await
+                .map_err(ResolveCellError::Store)
+        }
     }
 
     async fn write_resolved<'a>(
@@ -662,9 +798,12 @@ where
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
         // Not yet applied — the section-erase gap deletes arrive with the
-        // Cassandra marker step; this store keeps its per-coordinate index rows.
+        // durable clear fast path.
         _clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        // A marker-free single-row primitive (the marker lifecycle belongs to
+        // the staged verbs — see `CellStore::write_provisional`), so a fresh
+        // committed write never touches the marker slice.
         let pk = Pk::of(collection.id());
         // Encode each cell's committed `data` up front (owns the `Bytes`); no
         // `prev`, so the blobs carry only `data` + its encoding/version.
@@ -672,61 +811,8 @@ where
         for (_, data) in cells {
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
         }
-
         let ttl = collection.ttl().map(ttl_to_i32);
-        let cell_stmt = if ttl.is_some() {
-            &self.queries.write_resolved
-        } else {
-            &self.queries.write_resolved_no_ttl
-        };
-        // Each unit pairs a cell mutation with an `index_delete`. A present value
-        // writes the resolved-value shape; an absent value **deletes** the
-        // `kind=Cell` row (the row-absence invariant — no null-blob residue).
-        // The paired `index_delete` clears the cell's provisional-coordinate
-        // marker on the rollback path; on a fresh committed write (a
-        // ReadUncommitted direct write / mid-handler flush that was never staged)
-        // no marker exists, so the delete is a harmless no-op tombstone in the
-        // `kind=Index` slice. Pairing unconditionally keeps a cell's rows one
-        // atomic unit until the per-coordinate index markers are replaced.
-        let units: Vec<BatchUnit<CellBatchRow>> = blobs
-            .iter()
-            .zip(cells)
-            .map(|(blob, (cell, _))| {
-                let addr = CellAddr::new(pk, cell);
-                let cell_row = match blob.data {
-                    Some(_) => CellBatchRow {
-                        statement: cell_stmt,
-                        row: RowShape::Resolved(ResolvedRow {
-                            ttl,
-                            data: blob.data.as_deref(),
-                            encoding: blob.encoding,
-                            version: blob.version,
-                            addr,
-                        }),
-                    },
-                    None => CellBatchRow {
-                        statement: &self.queries.cell_delete,
-                        row: RowShape::Key(KeyRow {
-                            kind: CellKind::Cell,
-                            addr,
-                        }),
-                    },
-                };
-                BatchUnit::new(
-                    blob_weight(blob) + PER_STATEMENT_OVERHEAD,
-                    smallvec![
-                        cell_row,
-                        CellBatchRow {
-                            statement: &self.queries.index_delete,
-                            row: RowShape::Key(KeyRow {
-                                kind: CellKind::Index,
-                                addr,
-                            }),
-                        },
-                    ],
-                )
-            })
-            .collect();
+        let units = self.resolved_units(pk, ttl, &blobs, cells);
         self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)
@@ -738,32 +824,22 @@ where
         cells: &'a [CellKey],
     ) -> Result<(), Self::Error> {
         let pk = Pk::of(collection.id());
-        // Promotes carry no blob — only key columns — so every unit weighs a
-        // fixed overhead per member row (the cell promote + its index-marker
-        // delete) and the byte budget never bites; the count budget alone splits
-        // an enormous promote set.
+        // A marker-free single-row primitive. Promotes carry no blob — only
+        // key columns — so every unit weighs the fixed overhead and the count
+        // budget alone splits an enormous promote set.
         let units: Vec<BatchUnit<CellBatchRow>> = cells
             .iter()
             .map(|cell| {
                 let addr = CellAddr::new(pk, cell);
                 BatchUnit::new(
-                    2 * PER_STATEMENT_OVERHEAD,
-                    smallvec![
-                        CellBatchRow {
-                            statement: &self.queries.mark_resolved,
-                            row: RowShape::Key(KeyRow {
-                                kind: CellKind::Cell,
-                                addr,
-                            }),
-                        },
-                        CellBatchRow {
-                            statement: &self.queries.index_delete,
-                            row: RowShape::Key(KeyRow {
-                                kind: CellKind::Index,
-                                addr,
-                            }),
-                        },
-                    ],
+                    PER_STATEMENT_OVERHEAD,
+                    smallvec![CellBatchRow {
+                        statement: &self.queries.mark_resolved,
+                        row: RowShape::Key(KeyRow {
+                            kind: CellKind::Cell,
+                            addr,
+                        }),
+                    }],
                 )
             })
             .collect();
@@ -774,13 +850,60 @@ where
 
     async fn standing_marker<'a>(
         &'a self,
-        _collection: &'a CollectionId,
+        collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
-        // Truthful, not a stub: this store writes no event-marker rows yet, so
-        // no collection ever has one — the per-coordinate `kind=Index` range is
-        // still the recovery source. The Cassandra marker step makes this a real
-        // `kind=Marker` point read.
-        Ok(None)
+        // Memo hit: the durable marker was consulted this assignment, so the
+        // RAM state is at least durable truth — zero durable reads.
+        if self.memo.checked.contains_async(collection).await {
+            return Ok(self
+                .memo
+                .standing
+                .read_async(collection, |_, marker| marker.clone())
+                .await);
+        }
+        // Memo miss: the one durable point read at the fixed marker address,
+        // seeding the memo for the rest of the assignment.
+        #[cfg(test)]
+        self.counters
+            .marker_point_reads
+            .fetch_add(1, Ordering::Relaxed);
+        let pk = Pk::of(collection);
+        let addr = CellAddr::marker(pk);
+        let row = self
+            .cql()
+            .execute_unpaged(
+                &self.queries.marker_read,
+                (
+                    pk.segment_id,
+                    pk.key,
+                    pk.state_type,
+                    pk.name,
+                    CellKind::Marker,
+                    addr.section,
+                    addr.coordinate,
+                ),
+            )
+            .await
+            .map_err(CassandraStoreError::from)
+            .map_err(into_store_err::<O::Error>)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)
+            .map_err(into_store_err::<O::Error>)?
+            .maybe_first_row::<decode::MarkerRow>()
+            .map_err(CassandraStoreError::from)
+            .map_err(into_store_err::<O::Error>)?;
+        let marker = row
+            .map(decode::try_decode_marker)
+            .transpose()
+            .map_err(ResolveCellError::Store)?;
+        if let Some(marker) = &marker {
+            self.memo
+                .standing
+                .upsert_async(collection.clone(), marker.clone())
+                .await;
+        }
+        let _ = self.memo.checked.insert_async(collection.clone()).await;
+        Ok(marker)
     }
 
     async fn commit_provisional<'a>(
@@ -789,7 +912,38 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         _clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        route_commit(self, collection, writes).await
+        // The routing `route_commit` defines — present data promotes in place,
+        // a staged clear deletes its row (the row-absence invariant) — packed
+        // natively with the marker delete into ONE `run_batches` call, so the
+        // settle stays one batched round-trip set. Every row disjoint (an
+        // event stages each cell at most once; the marker address is
+        // kind-disjoint), individually idempotent, order-free.
+        let pk = Pk::of(collection.id());
+        let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
+        units.extend(writes.iter().map(|(cell, write)| {
+            let addr = CellAddr::new(pk, cell);
+            let statement = if write.data().is_some() {
+                &self.queries.mark_resolved
+            } else {
+                &self.queries.cell_delete
+            };
+            BatchUnit::new(
+                PER_STATEMENT_OVERHEAD,
+                smallvec![CellBatchRow {
+                    statement,
+                    row: RowShape::Key(KeyRow {
+                        kind: CellKind::Cell,
+                        addr,
+                    }),
+                }],
+            )
+        }));
+        units.push(marker_delete_unit(pk, &self.queries));
+        self.run_batches(&units)
+            .await
+            .map_err(ResolveCellError::Store)?;
+        self.settle_memo(collection.id()).await;
+        Ok(())
     }
 
     async fn abort_provisional<'a>(
@@ -797,7 +951,27 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        route_abort(self, collection, writes).await
+        // Rollback: write each staged cell's committed base `prev` back as
+        // resolved (`prev = None` restores exact row absence — the routing
+        // `route_abort` defines) plus the marker delete, in one `run_batches`
+        // packing.
+        let pk = Pk::of(collection.id());
+        let cells: Vec<(CellKey, Option<Bytes>)> = writes
+            .iter()
+            .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
+            .collect();
+        let mut blobs = Vec::with_capacity(cells.len());
+        for (_, data) in &cells {
+            blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
+        }
+        let ttl = collection.ttl().map(ttl_to_i32);
+        let mut units = self.resolved_units(pk, ttl, &blobs, &cells);
+        units.push(marker_delete_unit(pk, &self.queries));
+        self.run_batches(&units)
+            .await
+            .map_err(ResolveCellError::Store)?;
+        self.settle_memo(collection.id()).await;
+        Ok(())
     }
 }
 
@@ -836,7 +1010,7 @@ struct CellBlobs {
 /// The key + clustering columns addressing one cell in its partition: the four
 /// partition-key columns and the cell's `section`/`coordinate`. `kind` is
 /// **not** carried — each [`RowShape`] binds its own `kind` (`Cell` vs
-/// `Index`), so one address serves both a cell row and its index-marker row.
+/// `Marker`), so one address type serves both a cell row and the marker row.
 #[derive(Clone, Copy)]
 struct CellAddr<'a> {
     pk: Pk<'a>,
@@ -850,6 +1024,17 @@ impl<'a> CellAddr<'a> {
             pk,
             section: i8::from(cell.section),
             coordinate: cell.coordinate.as_bytes(),
+        }
+    }
+
+    /// The collection's **fixed marker address**: `(section = 0,
+    /// coordinate = empty)`. Every marker statement binds this one position
+    /// (with `kind = Marker`), so marker churn compacts to a single entry.
+    fn marker(pk: Pk<'a>) -> Self {
+        Self {
+            pk,
+            section: 0,
+            coordinate: &[],
         }
     }
 }
@@ -867,9 +1052,9 @@ struct CellBatchRow<'a> {
 }
 
 /// The column shape a [`CellBatchRow`] binds — one variant per distinct bind
-/// tuple. A cell promote and an index-marker delete share the key-only
-/// [`Key`](Self::Key) shape: they differ only in statement and constant
-/// `kind`, both carried as data.
+/// tuple. A cell promote, a cell delete, and a marker delete share the
+/// key-only [`Key`](Self::Key) shape: they differ only in statement and
+/// constant `kind`, both carried as data.
 enum RowShape<'a> {
     /// Stage a provisional cell (`kind=Cell`): the full `data | prev_data |
     /// event` shape plus shared `encoding`/`version`.
@@ -877,12 +1062,13 @@ enum RowShape<'a> {
     /// Write a resolved value (`kind=Cell`): committed `data` +
     /// encoding/version, nulling `prev_data`/`event`.
     Resolved(ResolvedRow<'a>),
-    /// Upsert a bare provisional-coordinate marker (`kind=Index`) at the
-    /// cell's TTL, so the marker expires with it.
-    IndexUpsert(IndexUpsertRow<'a>),
+    /// Upsert the collection's event-marker row (`kind=Marker`) at the fixed
+    /// address, at the collection TTL so it co-expires with the staged cells.
+    MarkerWrite(MarkerWriteRow<'a>),
     /// Key columns only, binding the carried [`CellKind`]: a cell promote
     /// (`kind=Cell`, nulling `prev_data`/`event` while keeping `data` and its
-    /// TTL) or an index-marker delete (`kind=Index`).
+    /// TTL), a `cell_delete` (`kind=Cell`), or a `marker_delete`
+    /// (`kind=Marker`).
     Key(KeyRow<'a>),
 }
 
@@ -909,15 +1095,20 @@ struct ResolvedRow<'a> {
     addr: CellAddr<'a>,
 }
 
-/// The `index_insert[_no_ttl]` bind shape: key columns then, with TTL, the
-/// trailing `USING TTL ?` value.
-struct IndexUpsertRow<'a> {
+/// The `marker_write[_no_ttl]` bind shape: the encoded marker payload with its
+/// encoding/version, the staging event, and the fixed marker address. `ttl`
+/// selects the with-/no-TTL statement and the bound column count, exactly like
+/// [`StageRow`].
+struct MarkerWriteRow<'a> {
     ttl: Option<i32>,
+    payload: &'a [u8],
+    event: EventRef,
     addr: CellAddr<'a>,
 }
 
-/// The key-only bind shape shared by `mark_resolved` and `index_delete`: the
-/// four PK columns, the constant `kind`, and the cell's `section`/`coordinate`.
+/// The key-only bind shape shared by `mark_resolved`, `cell_delete`, and
+/// `marker_delete`: the four PK columns, the constant `kind`, and the row's
+/// `section`/`coordinate`.
 struct KeyRow<'a> {
     kind: CellKind,
     addr: CellAddr<'a>,
@@ -938,7 +1129,7 @@ impl SerializeRow for CellBatchRow<'_> {
         match &self.row {
             RowShape::Stage(row) => row.serialize(ctx, writer),
             RowShape::Resolved(row) => row.serialize(ctx, writer),
-            RowShape::IndexUpsert(row) => row.serialize(ctx, writer),
+            RowShape::MarkerWrite(row) => row.serialize(ctx, writer),
             RowShape::Key(row) => row.serialize(ctx, writer),
         }
     }
@@ -1040,32 +1231,46 @@ impl SerializeRow for ResolvedRow<'_> {
     }
 }
 
-impl SerializeRow for IndexUpsertRow<'_> {
+impl SerializeRow for MarkerWriteRow<'_> {
     fn serialize(
         &self,
         ctx: &RowSerializationContext<'_>,
         writer: &mut RowWriter<'_>,
     ) -> Result<(), SerializationError> {
         let a = &self.addr;
-        // `INSERT … (…, kind, section, coordinate) VALUES (…) USING TTL ?` binds
-        // the TTL **after** the value list.
+        // The `ttl` arms differ only by the leading `USING TTL ?` column the
+        // no-TTL statement omits (as `StageRow`). The payload always carries
+        // this build's encoding/version stamps.
         match self.ttl {
             Some(ttl) => (
+                ttl,
+                self.payload,
+                VALUE_ENCODING,
+                INITIAL_VERSION,
+                self.event,
                 a.pk.segment_id,
                 a.pk.key,
                 a.pk.state_type,
                 a.pk.name,
-                CellKind::Index,
+                CellKind::Marker,
                 a.section,
                 a.coordinate,
-                ttl,
             )
                 .serialize(ctx, writer),
-            None => KeyRow {
-                kind: CellKind::Index,
-                addr: self.addr,
-            }
-            .serialize(ctx, writer),
+            None => (
+                self.payload,
+                VALUE_ENCODING,
+                INITIAL_VERSION,
+                self.event,
+                a.pk.segment_id,
+                a.pk.key,
+                a.pk.state_type,
+                a.pk.name,
+                CellKind::Marker,
+                a.section,
+                a.coordinate,
+            )
+                .serialize(ctx, writer),
         }
     }
 
@@ -1096,6 +1301,35 @@ impl SerializeRow for KeyRow<'_> {
     fn is_empty(&self) -> bool {
         false
     }
+}
+
+/// The one-row batch unit deleting a collection's event-marker row at its
+/// fixed address — appended by both settle verbs.
+fn marker_delete_unit<'u>(pk: Pk<'u>, queries: &'u CellQueries) -> BatchUnit<CellBatchRow<'u>> {
+    BatchUnit::new(
+        PER_STATEMENT_OVERHEAD,
+        smallvec![CellBatchRow {
+            statement: &queries.marker_delete,
+            row: RowShape::Key(KeyRow {
+                kind: CellKind::Marker,
+                addr: CellAddr::marker(pk),
+            }),
+        }],
+    )
+}
+
+/// Whether `weights` pack into a **single** batch under the byte and count
+/// budgets — the pure marker-first ordering decision: `chunk_boundaries`
+/// provably yields one chunk iff the weight sum fits `max_bytes` and the count
+/// fits `max_count`, so a stage passing this check may carry its marker in the
+/// atomic batch; otherwise the marker must be awaited alone first.
+fn fits_one_batch(weights: impl Iterator<Item = u64>, max_bytes: u64, max_count: usize) -> bool {
+    let (mut total, mut count) = (0_u64, 0_usize);
+    for weight in weights {
+        total = total.saturating_add(weight);
+        count += 1;
+    }
+    total <= max_bytes && count <= max_count
 }
 
 /// Maps a raw Cassandra error into the resolving store error, generic only over
@@ -1170,8 +1404,8 @@ cassandra_queries! {
     /// Container for the prepared CQL statements used by [`CassandraStore`].
     ///
     /// Every statement binds the leading clustering `kind` as a constant
-    /// (`CellKind::Cell` for the cell statements, `CellKind::Index` for the
-    /// three index statements) — a clustering-prefix column cannot be skipped.
+    /// (`CellKind::Cell` for the cell statements, `CellKind::Marker` for the
+    /// marker statements) — a clustering-prefix column cannot be skipped.
     /// Each cell mutation is one `UPDATE`/`INSERT`/`DELETE` of one row; a
     /// multi-cell collection write binds these once per cell into one
     /// same-partition `UNLOGGED BATCH` (via `execute_unlogged_batches`), so all
@@ -1184,8 +1418,8 @@ cassandra_queries! {
     /// (`>`/`<`, for coverage gap fall-through). Every scan binds a concrete
     /// start coordinate ([`ScanEdge`] has no unbounded variant). The end bound
     /// is enforced in code (`past_end`), so it needs no statement variant. The
-    /// `index_*` statements maintain and read the `kind=Index`
-    /// marker range that bounds recovery. None use `ALLOW FILTERING`.
+    /// `marker_*` statements maintain and point-read the one fixed-address
+    /// event-marker row that bounds recovery. None use `ALLOW FILTERING`.
     pub struct CellQueries {
         /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
@@ -1306,8 +1540,8 @@ cassandra_queries! {
         /// (see the `CellStore` row-absence invariant). One row tombstone that
         /// also covers any future columns — strictly better than nulling every
         /// column. No TTL clause (deletes carry none). Its CQL text matches
-        /// `index_delete`; the two are kept separate because they die separately
-        /// and bind a different constant `kind`.
+        /// `marker_delete`; the two are kept separate because they die
+        /// separately and bind a different constant `kind`.
         cell_delete: (
             "DELETE FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
@@ -1315,41 +1549,46 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Inserts a bare `kind=Index` provisional-coordinate marker with TTL,
-        /// anchored to the staged cell's TTL so the marker expires with it.
-        index_insert: (
-            "INSERT INTO $keyspace.{} \
-             (segment_id, key, state_type, name, kind, section, coordinate) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Inserts a bare `kind=Index` marker without TTL.
-        index_insert_no_ttl: (
-            "INSERT INTO $keyspace.{} \
-             (segment_id, key, state_type, name, kind, section, coordinate) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Deletes a `kind=Index` marker (on cell resolution — promote or
-        /// rollback). A delete of an absent marker is a harmless no-op.
-        index_delete: (
-            "DELETE FROM $keyspace.{} \
+        /// Upserts the collection's event-marker row with TTL (co-expiry with
+        /// the staged cells): the frozen payload in `data`/`encoding`/`version`
+        /// and the staging event in `event`. Deliberately does NOT touch
+        /// `prev_data` — a marker row never carries one, and binding an
+        /// explicit null would write a needless column tombstone at the fixed
+        /// address on every stage.
+        marker_write: (
+            "UPDATE $keyspace.{} USING TTL ? \
+             SET data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Reads the whole `kind=Index` marker range for recovery — the
-        /// provisional coordinate list, bounded by #provisional and disjoint
-        /// from the `kind=Cell` slice. Recovery point-reads each coordinate's
-        /// cell via `read_cell`.
-        index_scan: (
-            "SELECT section, coordinate \
+        /// Upserts the event-marker row without TTL.
+        marker_write_no_ttl: (
+            "UPDATE $keyspace.{} \
+             SET data = ?, encoding = ?, version = ?, event = ? \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Point-reads the event-marker row at its fixed address — the cold
+        /// recovery seed (cost: one point read at a compaction-merged
+        /// position, never a range over a tombstone field).
+        marker_read: (
+            "SELECT data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ?",
+             AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Row-level delete of the event-marker row (on settle — the whole
+        /// stage resolved). Deleting an absent marker is a harmless no-op.
+        marker_delete: (
+            "DELETE FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
     }

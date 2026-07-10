@@ -8,8 +8,8 @@
 //! rows. [`EventMarker`] is what
 //! [`standing_marker`](super::store::CellStore::standing_marker) returns and
 //! the memory backend stores; this module also owns its frozen
-//! wire `encode_marker_payload`/`decode_marker_payload` codec (the payload the
-//! Cassandra marker row will carry — un-gated from test-only in that phase).
+//! wire `encode_marker_payload`/`decode_marker_payload` codec — the payload
+//! the Cassandra marker row carries in its `data` column.
 //!
 //! # Invariants
 //!
@@ -34,15 +34,11 @@
 use super::cell::ProvisionalWrite;
 use super::cell_key::{CellKey, Coordinate, Section};
 use super::event_ref::EventRef;
-#[cfg(test)]
 use crate::error::{ClassifyError, ErrorCategory};
-#[cfg(test)]
 use bytes::Bytes;
-#[cfg(test)]
 use thiserror::Error;
 
 /// Width of the `u32` big-endian count/length prefixes in the frozen payload.
-#[cfg(test)]
 const LEN_PREFIX: usize = 4;
 
 /// One cleared section paired with its **frozen survivor list**: the
@@ -130,7 +126,6 @@ impl EventMarker {
     }
 
     /// Reconstructs a marker from decoded parts (the payload decoder).
-    #[cfg(test)]
     #[must_use]
     fn from_parts(event: EventRef, staged: Vec<CellKey>, clears: Vec<SectionClear>) -> Self {
         Self {
@@ -173,12 +168,16 @@ impl EventMarker {
 ///                  survivor_count × [coord_len: u32 BE][coord bytes]
 /// ```
 ///
-/// Frozen and pinned now; the Cassandra marker row is its production caller (it
-/// rides the row's `data`/`encoding`/`version` columns) — until then only the
-/// frozen-bytes and round-trip tests exercise it.
-#[cfg(test)]
-#[must_use]
-pub(in crate::state) fn encode_marker_payload(marker: &EventMarker) -> Bytes {
+/// Frozen and pinned; the Cassandra marker row is its production caller (the
+/// payload rides the row's `data`/`encoding`/`version` columns).
+///
+/// # Errors
+///
+/// Returns [`MarkerPayloadError::TooLarge`] if a count or coordinate length
+/// exceeds the `u32` the wire format carries — never a silent truncation.
+pub(in crate::state) fn encode_marker_payload(
+    marker: &EventMarker,
+) -> Result<Bytes, MarkerPayloadError> {
     let mut len = LEN_PREFIX;
     for cell in &marker.staged {
         len += 1 + LEN_PREFIX + cell.coordinate.as_bytes().len();
@@ -192,19 +191,20 @@ pub(in crate::state) fn encode_marker_payload(marker: &EventMarker) -> Bytes {
     }
 
     let mut buf = Vec::with_capacity(len);
-    buf.extend_from_slice(&(marker.staged.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&len_u32(marker.staged.len())?.to_be_bytes());
     for cell in &marker.staged {
-        push_coordinate(&mut buf, cell.section, &cell.coordinate);
+        buf.push(i8::from(cell.section).cast_unsigned());
+        push_len_prefixed(&mut buf, &cell.coordinate)?;
     }
-    buf.extend_from_slice(&(marker.clears.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&len_u32(marker.clears.len())?.to_be_bytes());
     for clear in &marker.clears {
         buf.push(i8::from(clear.section).cast_unsigned());
-        buf.extend_from_slice(&(clear.survivors.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&len_u32(clear.survivors.len())?.to_be_bytes());
         for coordinate in &clear.survivors {
-            push_len_prefixed(&mut buf, coordinate);
+            push_len_prefixed(&mut buf, coordinate)?;
         }
     }
-    Bytes::from(buf)
+    Ok(Bytes::from(buf))
 }
 
 /// Decodes a marker payload produced by [`encode_marker_payload`], binding it
@@ -214,15 +214,18 @@ pub(in crate::state) fn encode_marker_payload(marker: &EventMarker) -> Bytes {
 ///
 /// Returns [`MarkerPayloadError`] on a truncated buffer or trailing garbage —
 /// both classify [`Permanent`](ErrorCategory::Permanent), a data rejection.
-#[cfg(test)]
 pub(in crate::state) fn decode_marker_payload(
     event: EventRef,
     bytes: &[u8],
 ) -> Result<EventMarker, MarkerPayloadError> {
     let mut cursor = Cursor::new(bytes);
 
+    // Every `with_capacity` below is capped at the cursor's remaining byte
+    // count: the count came from an untrusted durable blob, so a lying value
+    // must not demand an unbounded allocation — it still fails `Truncated`
+    // once the bytes run out.
     let staged_count = cursor.take_u32()?;
-    let mut staged = Vec::with_capacity(staged_count as usize);
+    let mut staged = Vec::with_capacity((staged_count as usize).min(cursor.remaining()));
     for _ in 0..staged_count {
         let section = Section::new(cursor.take_section()?);
         let coordinate = cursor.take_coordinate()?;
@@ -233,11 +236,11 @@ pub(in crate::state) fn decode_marker_payload(
     }
 
     let clears_count = cursor.take_u32()?;
-    let mut clears = Vec::with_capacity(clears_count as usize);
+    let mut clears = Vec::with_capacity((clears_count as usize).min(cursor.remaining()));
     for _ in 0..clears_count {
         let section = Section::new(cursor.take_section()?);
         let survivor_count = cursor.take_u32()?;
-        let mut survivors = Vec::with_capacity(survivor_count as usize);
+        let mut survivors = Vec::with_capacity((survivor_count as usize).min(cursor.remaining()));
         for _ in 0..survivor_count {
             survivors.push(cursor.take_coordinate()?);
         }
@@ -250,29 +253,26 @@ pub(in crate::state) fn decode_marker_payload(
     Ok(EventMarker::from_parts(event, staged, clears))
 }
 
-/// Appends `[section][coord_len: u32 BE][coord bytes]` to `buf`.
-#[cfg(test)]
-fn push_coordinate(buf: &mut Vec<u8>, section: Section, coordinate: &Coordinate) {
-    buf.push(i8::from(section).cast_unsigned());
-    push_len_prefixed(buf, coordinate);
+/// A `usize` length as the `u32` wire prefix, or
+/// [`MarkerPayloadError::TooLarge`].
+fn len_u32(len: usize) -> Result<u32, MarkerPayloadError> {
+    u32::try_from(len).map_err(|_| MarkerPayloadError::TooLarge)
 }
 
 /// Appends `[coord_len: u32 BE][coord bytes]` to `buf`.
-#[cfg(test)]
-fn push_len_prefixed(buf: &mut Vec<u8>, coordinate: &Coordinate) {
+fn push_len_prefixed(buf: &mut Vec<u8>, coordinate: &Coordinate) -> Result<(), MarkerPayloadError> {
     let coordinate = coordinate.as_bytes();
-    buf.extend_from_slice(&(coordinate.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&len_u32(coordinate.len())?.to_be_bytes());
     buf.extend_from_slice(coordinate);
+    Ok(())
 }
 
 /// A forward-only reader over a marker payload buffer, failing loudly on any
 /// short read rather than truncating.
-#[cfg(test)]
 struct Cursor<'a> {
     bytes: &'a [u8],
 }
 
-#[cfg(test)]
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
@@ -280,6 +280,11 @@ impl<'a> Cursor<'a> {
 
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+
+    /// Bytes not yet consumed — the allocation cap for count-sized buffers.
+    fn remaining(&self) -> usize {
+        self.bytes.len()
     }
 
     /// Splits off the next `n` bytes, or fails on a short buffer.
@@ -310,8 +315,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Failure decoding a frozen event-marker payload.
-#[cfg(test)]
+/// Failure encoding or decoding a frozen event-marker payload.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MarkerPayloadError {
     /// The buffer ended before a length-prefixed field was fully read.
@@ -321,9 +325,13 @@ pub enum MarkerPayloadError {
     /// Bytes remained after the last declared field was read.
     #[error("event-marker payload has trailing garbage")]
     TrailingGarbage,
+
+    /// A count or coordinate length exceeded the `u32` the wire format
+    /// carries (encode-side; a stage this size is unreachable in practice).
+    #[error("event-marker payload field exceeds the u32 wire limit")]
+    TooLarge,
 }
 
-#[cfg(test)]
 impl ClassifyError for MarkerPayloadError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Permanent

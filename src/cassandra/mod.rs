@@ -343,8 +343,9 @@ impl<R> BatchUnit<R> {
 
     /// The packing weight. A function item (not a closure), so
     /// `units.iter().map(BatchUnit::weight)` stays higher-ranked over `R`'s
-    /// borrow.
-    fn weight(&self) -> u64 {
+    /// borrow. Crate-visible so callers can make the single-batch packing
+    /// decision (`fits_one_batch` in the cell store) over the same weights.
+    pub(crate) fn weight(&self) -> u64 {
         self.weight
     }
 }

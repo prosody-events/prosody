@@ -3,9 +3,12 @@
 -- Purpose: Provision the durable storage for the uniform keyed-state CELL STORE
 --          plus the group-global descriptor identity table. One Cassandra
 --          partition (segment_id, key, state_type, name) is ONE collection; each
---          `kind = 0` clustering row (section, coordinate) is ONE cell, and a
---          co-clustered `kind = 1` bare row indexes each provisional
---          coordinate for bounded recovery. A cell is one
+--          `kind = 0` clustering row (section, coordinate) is ONE cell, and one
+--          fixed-address `kind = 1` (Marker) row per collection — at
+--          (section = 0, coordinate = empty) — is the EVENT MARKER: `event`
+--          names the staging event and `data`/`encoding`/`version` carry its
+--          frozen staged-coordinate payload, so recovery is one marker point
+--          read plus per-coordinate cell point reads. A cell is one
 --          provisional cell: `data` is the committed value once `event` is null,
 --          or the in-flight event's outcome while `event` is set, with
 --          `prev_data` carrying the committed value the event superseded. The
@@ -23,16 +26,18 @@ CREATE TYPE {{KEYSPACE}}.event_ref (
 -- One partition = one collection (one transactional cell store). Clustering
 -- columns address a cell within it: `kind` splits the partition into two
 -- disjoint front-to-back ranges — `kind = 0` (Cell) rows carry the full cell
--- columns, `kind = 1` (Index) rows are bare provisional-coordinate markers.
--- `section` groups a collection's cells into disjoint sub-structures
--- (bookkeeping vs data), `coordinate` orders cells within a section by unsigned
--- lexicographic byte order (= the order-preserving codec's contract). All three
--- are opaque to the cell store — the collection layer owns section/coordinate
--- meaning; `kind` is bound as a constant clustering predicate, never a value.
--- `kind` leads so the Index rows form one contiguous front-of-partition range
--- disjoint from the Cell rows: recovery reads only that range (cost ∝
--- #provisional, never #cells), then point-reads each coordinate's Cell row. A
--- single-section forward scan is a contiguous clustering range:
+-- columns, and the single `kind = 1` (Marker) row at (section = 0,
+-- coordinate = empty) is the collection's event marker (staging event +
+-- frozen staged-coordinate payload). `section` groups a collection's cells
+-- into disjoint sub-structures (bookkeeping vs data), `coordinate` orders
+-- cells within a section by unsigned lexicographic byte order (= the
+-- order-preserving codec's contract). All three are opaque to the cell store
+-- — the collection layer owns section/coordinate meaning; `kind` is bound as
+-- a constant clustering predicate, never a value. The marker lives at one
+-- fixed clustering position, so its write/delete churn compacts to a single
+-- entry and recovery is a point read (cost ∝ #provisional cells it lists,
+-- never #cells). A single-section forward scan is a contiguous clustering
+-- range:
 --   WHERE <pk>=… AND kind = 0 AND section = ? AND coordinate >= ? (no ALLOW
 -- FILTERING).
 CREATE TABLE {{KEYSPACE}}.{{TABLE_KEYED_STATE_CELL}} (

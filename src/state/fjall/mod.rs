@@ -198,7 +198,7 @@ pub struct FjallCellCache {
 /// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
 /// cell-cache writes are **not** issued as one cross-keyspace batch; the warm
 /// index is a rebuildable hint (a fresh assignment re-seeds from the durable
-/// `kind=Index`), so they need no atomicity with the committed-value write.
+/// event marker), so they need no atomicity with the committed-value write.
 enum Inner {
     Bare {
         database: Database,
@@ -628,9 +628,9 @@ impl FjallCellCache {
     // The warm provisional index the recovery sweep short-circuits on. It lives
     // in the per-partition `index` keyspace, cold at a fresh assignment and
     // dropped at revocation. It is the disk-spilling relocation of the former
-    // in-RAM `ProvisionalIndex`; the durable Cassandra `kind=Index` markers
-    // remain the authoritative cold-recovery source (a fresh assignment
-    // re-seeds from them).
+    // in-RAM `ProvisionalIndex`; the durable Cassandra event marker remains
+    // the authoritative cold-recovery source (a fresh assignment re-seeds
+    // from it).
 
     /// Whether `collection`'s one-time cold seed has run (the seeded latch).
     pub(crate) async fn index_seeded(

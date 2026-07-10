@@ -84,7 +84,10 @@ impl Arbitrary for ArbMarker {
 fn prop_marker_payload_round_trips() {
     fn prop(marker: ArbMarker) -> TestResult {
         let ArbMarker(marker) = marker;
-        let bytes = encode_marker_payload(&marker);
+        let bytes = match encode_marker_payload(&marker) {
+            Ok(bytes) => bytes,
+            Err(e) => return TestResult::error(format!("encode failed: {e}")),
+        };
         match decode_marker_payload(event(), &bytes) {
             Ok(decoded) => TestResult::from_bool(decoded == marker),
             Err(e) => TestResult::error(format!("decode failed: {e}")),
@@ -97,7 +100,7 @@ fn prop_marker_payload_round_trips() {
 /// two sections (one at the empty coordinate) and one clear with one survivor.
 /// A round-trip property cannot prove wire freezing, so pin the bytes.
 #[test]
-fn frozen_marker_payload_bytes() {
+fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
     let staged = vec![
         (
             CellKey {
@@ -138,10 +141,11 @@ fn frozen_marker_payload_bytes() {
         0x00, 0x00, 0x00, 0x01, 0x10, // survivor coord_len 1, [0x10]
     ];
     assert_eq!(
-        encode_marker_payload(&marker).as_ref(),
+        encode_marker_payload(&marker)?.as_ref(),
         expected.as_slice(),
         "frozen marker payload layout"
     );
+    Ok(())
 }
 
 /// A buffer that ends inside a declared field decodes to `Truncated`, never a
@@ -156,14 +160,28 @@ fn truncated_payload_is_rejected() {
     );
 }
 
+/// A count-inflated buffer — a `u32::MAX` staged count over four bytes of
+/// payload — fails `Truncated` (the error is the observable; the decoder's
+/// capacity cap keeps the lying count from demanding an unbounded allocation
+/// on the way there).
+#[test]
+fn inflated_count_is_rejected() {
+    let inflated = [0xFF, 0xFF, 0xFF, 0xFF];
+    assert_eq!(
+        decode_marker_payload(event(), &inflated),
+        Err(MarkerPayloadError::Truncated)
+    );
+}
+
 /// Bytes past the last declared field decode to `TrailingGarbage`.
 #[test]
-fn trailing_garbage_is_rejected() {
+fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
     let marker = EventMarker::frozen(event(), &[], &[]);
-    let mut bytes = encode_marker_payload(&marker).to_vec();
+    let mut bytes = encode_marker_payload(&marker)?.to_vec();
     bytes.push(0xFF);
     assert_eq!(
         decode_marker_payload(event(), &bytes),
         Err(MarkerPayloadError::TrailingGarbage)
     );
+    Ok(())
 }

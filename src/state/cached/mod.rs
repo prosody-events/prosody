@@ -615,15 +615,16 @@ where
         // (seeded): the local fjall snapshot answers with ZERO Cassandra queries
         // (the zero-query-on-quiescence goal); an empty snapshot yields nothing.
         // Cold (a fresh assignment after crash/rebalance mints an empty `index`
-        // keyspace): the lower store's unconditional bounded `kind=Index` seed
-        // runs (cost ∝ #provisional, never #cells), each coordinate is recorded
-        // into fjall as it streams, and the collection is marked seeded.
+        // keyspace): the lower store's bounded seed runs — the event-marker
+        // point read and its listed-coordinate point reads (cost ∝
+        // #provisional, never #cells) — each coordinate is recorded into fjall
+        // as it streams, and the collection is marked seeded.
         //
         // The sweep touches only provisional (= gap) coordinates, never covered
         // ones, so it needs no coverage interaction (the Cov2 corollary). A warm
         // read/write failure degrades toward the cold path (re-seed from durable
         // truth), never toward trusting a possibly-incomplete warm set — the
-        // fjall index is a hint over the authoritative `kind=Index` markers.
+        // fjall index is a hint over the authoritative durable event marker.
         try_stream! {
             // Resolve the warm coordinate list, or fall through to the cold seed.
             // A warm read failure — `is_seeded` OR `snapshot` — must degrade to
@@ -682,7 +683,7 @@ where
                 }
                 // Latch `seeded` only if the whole coords set landed on disk. If
                 // any record failed, leave it unseeded so the next sweep re-seeds
-                // cold from the durable `kind=Index` markers rather than
+                // cold from the durable event marker rather than
                 // short-circuiting on an incomplete snapshot and stranding a
                 // provisional cell — symmetric with `write_provisional`.
                 if all_recorded {
@@ -710,6 +711,26 @@ where
         clears: &'a [SectionClear],
         staged: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
+        // Boundary punch: the lower store's stage boundary resolves any
+        // standing FOREIGN event marker *beneath* this cache — a settle no
+        // wrapper verb observes, so no publish or punch would ever follow it.
+        // With a warm workspace still covering those cells' stage-time `prev`,
+        // a committed foreign marker resolved down there would promote durably
+        // while fjall keeps serving the stale covered `prev` — an unbounded
+        // stale window, because the boundary (unlike the sweep) never routes
+        // through this type's settle verbs. So punch the marker's staged
+        // coordinates BEFORE forwarding down (mirroring `mark_resolved`'s
+        // punch-first rationale): uncovering early only costs a fall-through
+        // (the lower read is oracle-resolving), and the uncommitted arm needs
+        // no special casing — the punch is still harmless. RAM-warm via the
+        // lower store's marker memo, so the fast path adds no durable read.
+        if let Some((_, first)) = staged.first()
+            && let Some(marker) = self.lower.standing_marker(collection.id()).await?
+            && marker.event() != first.event()
+        {
+            self.punch_cells_must_succeed(collection.id(), marker.staged().iter())
+                .await;
+        }
         // Anchor the co-expiry on a clock read taken BEFORE the lower write
         // (see the module's TTL co-expiry doc and `expiry_at`). Establish
         // first (Cov3): a failed lower write leaves coverage untouched. The
@@ -721,16 +742,16 @@ where
             .write_provisional(collection, writes, clears, staged)
             .await
         {
-            // A partial durable stage may have landed `kind=Index` markers the
-            // warm set now misses; drop the seeded latch so the next sweep
-            // re-seeds from the durable index and restores completeness (the
+            // A partial durable stage may have landed cells the warm set now
+            // misses; drop the seeded latch so the next sweep re-seeds from
+            // the durable event marker and restores completeness (the
             // warm-index invariant), closing the strand hole.
             degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
             return Err(error);
         }
         // Record the staged coordinates into the warm index after the durable
         // ack, as one atomic batch. A warm write failure drops the seeded
-        // latch so the next sweep re-seeds from the durable `kind=Index` —
+        // latch so the next sweep re-seeds from the durable event marker —
         // never leaving the latch true with an unaccounted coordinate.
         if let Err(error) = self
             .fjall

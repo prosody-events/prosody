@@ -155,9 +155,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Streams the whole partition's provisional cells (all sections) for the
     /// recovery sweep, filtering resolved rows in code.
     ///
-    /// This is the **cold** recovery source (the bounded durable `kind=Index`
-    /// range read + point reads on the Cassandra store). The warm short-circuit
-    /// that skips it on a quiescent sweep lives on
+    /// This is the **cold** recovery source: on the Cassandra store, the
+    /// event-marker point read (memoized per assignment) followed by one point
+    /// read per listed coordinate — cost ∝ #provisional, never partition size.
+    /// The warm short-circuit that skips it on a quiescent sweep lives on
     /// [`Cached`](super::cached::Cached).
     fn provisional_cells<'a>(
         &'a self,
@@ -285,13 +286,14 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Settles a staged set as **committed** AND deletes the collection's event
     /// marker: each cell's provisional `data` becomes the committed value.
     ///
-    /// Required with no default (the routing lives in a shared free function,
-    /// `route_commit`, which every impl calls): with markers, a defaulted
-    /// override behind a trait default is a landmine — a wrapper store that
-    /// forgot to forward the verb would fall into a default routing through the
-    /// *wrapper's* verbs and bypass the inner store's marker delete, a leaked
-    /// marker with no compile error. Making both settle verbs required makes
-    /// that bug class uncompilable.
+    /// Required with no default (`route_commit` is the reference routing the
+    /// memory backend calls; the Cassandra backend implements the identical
+    /// routing natively as one same-partition batch packing): with markers, a
+    /// defaulted override behind a trait default is a landmine — a wrapper
+    /// store that forgot to forward the verb would fall into a default routing
+    /// through the *wrapper's* verbs and bypass the inner store's marker
+    /// delete, a leaked marker with no compile error. Making both settle verbs
+    /// required makes that bug class uncompilable.
     ///
     /// `clears` frozen at stage time flow through inertly until a producer
     /// exists (see [`write_provisional`](Self::write_provisional)). Idempotent;
@@ -332,12 +334,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 /// awaits are order-free; the sweep retries either on failure. A settle with no
 /// clears issues exactly one `mark_resolved` batch set.
 ///
-/// The one routing definition every backend's [`CellStore::commit_provisional`]
-/// calls before its own marker delete — settle the cells, then drop the
-/// recovery handle, so a crash mid-settle leaves the marker standing to list
-/// the still-provisional cells. Free (not a trait default) so a wrapper that
-/// forwards the verb cannot silently inherit it and bypass the inner store's
-/// marker delete.
+/// The reference routing: the memory backend calls it before its marker
+/// delete; the Cassandra backend implements the identical routing natively as
+/// one same-partition batch packing (settle + marker delete in one round-trip
+/// set — a recorded divergence, not drift). Free (not a trait default) so a
+/// wrapper that forwards the verb cannot silently inherit it and bypass the
+/// inner store's marker delete.
 ///
 /// # Errors
 ///
@@ -369,9 +371,9 @@ where
 }
 
 /// Routes an aborted settle to [`CellStore::write_resolved`] over the staged
-/// `prev`s (`prev = None` restores exact absence). The one rollback definition
-/// every backend's [`CellStore::abort_provisional`] calls before its own marker
-/// delete — free, for the reason on [`route_commit`].
+/// `prev`s (`prev = None` restores exact absence). The reference rollback
+/// routing — called by the memory backend, implemented natively as one batch
+/// packing by Cassandra — free, for the reason on [`route_commit`].
 ///
 /// # Errors
 ///

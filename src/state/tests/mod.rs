@@ -184,10 +184,10 @@ fn prop_deque_ttl_holes() {
 /// the same warm cells), then event B stages coordinate {1} on the same
 /// collection. B's stage boundary must resolve A's standing marker first, so
 /// A's untouched coordinate 0 settles to A's verdict, B's marker replaces A's,
-/// and only B's cell stays provisional. This is the one production-reachable
-/// shape the crash trace generator does not yet emit (its generator recovers
-/// each crash before the next event); the generated crash/reassignment alphabet
-/// subsumes it in the Cassandra marker phase.
+/// and only B's cell stays provisional. The generated crash/reassignment
+/// alphabet (the `Defer` recovery in the crash-equivalence trace) subsumes
+/// this shape; these two pins are kept as the fast, deterministic falsifiers
+/// for the boundary arm.
 async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();

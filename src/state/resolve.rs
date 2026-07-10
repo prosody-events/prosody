@@ -262,8 +262,9 @@ where
 ///
 /// Two legs, both with the retry-forever posture: the **marker leg** first
 /// ([`resolve_marker`] on any standing event marker), then the per-cell
-/// **mop-up** (the cold `provisional_cells` scan) that covers a marker-free
-/// backend and any unlisted strays. A `Permanent` failure in either leg is
+/// **mop-up** (the cold `provisional_cells` scan) that covers any cells the
+/// marker leg left behind (a Permanent-skipped cell, a marker-listed
+/// coordinate resolved concurrently). A `Permanent` failure in either leg is
 /// logged and skipped, leaving the work for first-touch or a later sweep and
 /// yielding `false`; anything else — a transient/terminal backend or oracle
 /// failure, or a `provisional_cells` stream failure — propagates so the trigger
@@ -277,9 +278,9 @@ where
     S: CellStore,
     O: CommitOracle,
 {
-    // Marker leg: resolve the standing marker as a unit before the per-cell
-    // mop-up. On a marker-free backend `standing_marker` is `None`, so this is
-    // a no-op there.
+    // Marker leg: resolve the standing event marker as a unit before the
+    // per-cell mop-up. A quiescent collection answers `None` (RAM-warm on both
+    // backends), so this is a free no-op almost always.
     let marker_ok = match store
         .standing_marker(collection.id())
         .await

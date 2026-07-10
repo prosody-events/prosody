@@ -85,7 +85,7 @@ impl Coordinate {
 ///
 /// It carries **only** `(section, coordinate)` — never the cell store's
 /// internal `kind` discriminant (the reserved-`kind` safety invariant). A
-/// backend that splits its partition into a data slice and a recovery-marker
+/// backend that splits its partition into a data slice and an event-marker
 /// slice binds that discriminant itself as a compile-time constant; because it
 /// is unnameable here, no collection can address the marker slice.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]

@@ -70,6 +70,21 @@ impl MemoryCells {
         out
     }
 
+    /// The stored cell keys currently in the `Provisional` variant — the
+    /// staged-coverage probe's raw view (never routed through the resolving
+    /// store, which would first-touch-resolve what it reads).
+    #[cfg(test)]
+    pub(crate) fn provisional_coordinates(&self, collection: &CollectionId) -> Vec<CellKey> {
+        let mut out = Vec::new();
+        self.inner.iter_sync(|(id, cell), stored| {
+            if id == collection && matches!(stored, StoredCell::Provisional { .. }) {
+                out.push(cell.clone());
+            }
+            true
+        });
+        out
+    }
+
     /// The collection's standing event marker read straight from the durable
     /// backing — the marker-shape probe, never routed through the resolving
     /// store.
@@ -217,7 +232,7 @@ where
             // The coordinates to visit. Warm (seeded): the in-RAM index — an
             // empty snapshot yields nothing and never scans the map. Cold: the
             // one-time full-map seed scan that populates the index and marks the
-            // collection seeded, mirroring the Cassandra `kind=Index` seed read.
+            // collection seeded, mirroring the Cassandra cold marker seed.
             let coords = if self.warm.is_seeded(collection).await {
                 self.warm.snapshot(collection)
             } else {

@@ -32,7 +32,7 @@ use std::ops::Range;
 /// `chunk_boundaries` treats each weight as an atomic, unsplittable element, so
 /// this cover+contiguity clause is exactly the guarantee a unit-based caller —
 /// [`super::CassandraStore::execute_unlogged_batches`], where one weight is a
-/// whole cell (data row plus index marker) — relies on to keep a unit's rows in
+/// caller-defined atomic row group — relies on to keep a unit's rows in
 /// one batch: a contiguous index partition never splits an index.
 #[quickcheck]
 fn chunk_boundaries_are_minimal_and_within_limits(
