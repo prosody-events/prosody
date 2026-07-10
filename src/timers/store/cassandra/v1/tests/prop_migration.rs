@@ -6,7 +6,6 @@
 use super::test_cassandra_config;
 use crate::Key;
 use crate::cassandra::CassandraStore;
-use crate::otel::SpanRelation;
 use crate::test_util::TEST_KEYSPACE;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -22,6 +21,7 @@ use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use strum::VariantArray;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Test input containing a migration scenario.
@@ -211,7 +211,7 @@ async fn setup_v1_state(
         let v1_trigger = TriggerV1 {
             key: trigger_data.key.clone(),
             time: trigger_data.time,
-            span: Span::current(),
+            context: Span::current().context(),
         };
 
         operations
@@ -720,13 +720,9 @@ pub async fn prop_migration_invariants(
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V2,
             };
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                segment,
-                SpanRelation::default(),
-            )
-            .await?;
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             setup_v2_state(&cassandra_store, &input).await?;
         }
         SegmentVersion::V3 => {
@@ -739,13 +735,9 @@ pub async fn prop_migration_invariants(
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V3,
             };
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                segment,
-                SpanRelation::default(),
-            )
-            .await?;
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             let store = TableAdapter::new(cassandra_store);
             setup_v3_state(&store, &input).await?;
         }
@@ -760,13 +752,8 @@ pub async fn prop_migration_invariants(
         slab_size: input.target_slab_size,
         version: SegmentVersion::V3,
     };
-    let cassandra_store = CassandraTriggerStore::with_store(
-        cassandra_base,
-        &config.keyspace,
-        segment,
-        SpanRelation::default(),
-    )
-    .await?;
+    let cassandra_store =
+        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
     let store = TableAdapter::new(cassandra_store);
 
     // Trigger migration by calling get_segment()

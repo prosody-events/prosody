@@ -304,7 +304,7 @@ impl TriggerOperations for InMemoryTriggerStore {
             };
 
             // Stream all triggers from the partition
-            for (_clustering_key, trigger) in triggers_map.iter() {
+            for trigger in triggers_map.values() {
                 yield trigger.clone();
             }
         }
@@ -407,7 +407,7 @@ impl TriggerOperations for InMemoryTriggerStore {
             };
 
             // Stream all triggers from the partition
-            for (_clustering_key, trigger) in triggers_map.iter() {
+            for trigger in triggers_map.values() {
                 yield trigger.clone();
             }
         }

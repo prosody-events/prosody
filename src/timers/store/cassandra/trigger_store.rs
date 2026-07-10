@@ -20,14 +20,22 @@
 //! yielding triggers in `(timer_type, time)` order without issuing a
 //! clustering scan for types that are already inline-or-absent.
 //!
+//! **Restored triggers carry the persisted scheduling context, never a
+//! span.** A fetched trigger is rebuilt via [`Trigger::restored`] from the
+//! stored span map, so its trace is exactly the scheduling-time context —
+//! the origin trace is never touched after scheduling. The configured
+//! `timer_spans` relation is applied exactly once, at fire time, by
+//! [`FiringTimer::set_dispatch_span`] against that context, which is what
+//! makes memory- and Cassandra-backed timers produce identical dispatch-span
+//! topology.
+//!
+//! [`FiringTimer::set_dispatch_span`]: crate::timers::uncommitted::FiringTimer::set_dispatch_span
 //! [`TriggerOperations`]: crate::timers::store::operations::TriggerOperations
 //! [`CassandraTriggerStore`]: crate::timers::store::cassandra::CassandraTriggerStore
 //! [`TimerState`]: crate::timers::store::cassandra::TimerState
 
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::otel::SpanRelation;
-use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -54,7 +62,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, instrument};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 impl TriggerOperations for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
@@ -299,10 +306,9 @@ impl TriggerOperations for CassandraTriggerStore {
                 cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger");
                 let tag = tag_opt.unwrap_or(0_i32);
 
-                yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
+                yield Trigger::restored(key.into(), time, timer_type, tag, context);
             }
         }
     }
@@ -335,11 +341,9 @@ impl TriggerOperations for CassandraTriggerStore {
                     .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
-                let span =
-                    related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger_all_types");
                 let tag = tag_opt.unwrap_or(0_i32);
 
-                yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
+                yield Trigger::restored(key.into(), time, timer_type, tag, context);
             }
         }
     }
@@ -489,9 +493,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 TimerState::Inline(timer) => {
                     // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
-                    let span =
-                        related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                    yield Trigger::with_tag(key_clone.clone(), timer.time, timer_type, timer.tag, span);
+                    yield Trigger::restored(key_clone.clone(), timer.time, timer_type, timer.tag, context);
                 }
                 TimerState::Overflow => {
                     // Overflow: scan clustering rows.
@@ -513,10 +515,8 @@ impl TriggerOperations for CassandraTriggerStore {
                             .map_err(CassandraStoreError::from)?
                     {
                         let context = self.propagator().extract(&span_map);
-                        let span =
-                            related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger");
                         let tag = tag_opt.unwrap_or(0_i32);
-                        yield Trigger::with_tag(key_clone.clone(), time, timer_type, tag, span);
+                        yield Trigger::restored(key_clone.clone(), time, timer_type, tag, context);
                     }
                 }
                 TimerState::Absent => {
@@ -593,19 +593,27 @@ impl TriggerOperations for CassandraTriggerStore {
 
                 let mut variants_iter = TimerType::VARIANTS.iter();
                 let mut inline_next = advance_inline(
-                    &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                    &key_clone,
+                    &state_map,
+                    &mut variants_iter,
+                    self.propagator(),
                 );
 
                 // For each clustering row, flush any inline entries that
                 // sort before it.
                 while let Some(clustering) = advance_clustering(
-                    &key_clone, &mut clustering_stream, self.propagator(),
+                    &key_clone,
+                    &mut clustering_stream,
+                    self.propagator(),
                 ).await? {
                     while let Some(s) = inline_next.take() {
                         if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
                             yield s;
                             inline_next = advance_inline(
-                                &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                                &key_clone,
+                                &state_map,
+                                &mut variants_iter,
+                                self.propagator(),
                             );
                         } else {
                             inline_next = Some(s);
@@ -619,7 +627,10 @@ impl TriggerOperations for CassandraTriggerStore {
                 while let Some(trigger) = inline_next {
                     yield trigger;
                     inline_next = advance_inline(
-                        &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                        &key_clone,
+                        &state_map,
+                        &mut variants_iter,
+                        self.propagator(),
                     );
                 }
             } else {
@@ -628,9 +639,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 for &tt in TimerType::VARIANTS {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
-                        let span =
-                            related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                        yield Trigger::with_tag(key_clone.clone(), timer.time, tt, timer.tag, span);
+                        yield Trigger::restored(key_clone.clone(), timer.time, tt, timer.tag, context);
                     }
                 }
             }
@@ -1207,7 +1216,7 @@ pub(super) fn extract_span_map(
     trigger: &Trigger,
 ) -> HashMap<String, String> {
     let mut span_map = HashMap::with_capacity(2);
-    let context = trigger.span.load().context();
+    let context = trigger.context();
     propagator.inject_context(&context, &mut span_map);
     span_map
 }
@@ -1228,17 +1237,12 @@ fn advance_inline<'a>(
     })?;
 
     let context = propagator.extract(&timer.span);
-    let span = related_span!(
-        SpanRelation::Child,
-        context.clone(),
-        "fetch_key_trigger_all_types_inline"
-    );
-    Some(Trigger::with_tag(
+    Some(Trigger::restored(
         key.clone(),
         timer.time,
         timer_type,
         timer.tag,
-        span,
+        context,
     ))
 }
 
@@ -1271,18 +1275,12 @@ async fn advance_clustering(
         let tag = tag_opt.unwrap_or(0_i32);
 
         let context = propagator.extract(&span_map);
-        let span = related_span!(
-            SpanRelation::Child,
-            context.clone(),
-            "fetch_key_trigger_all_types"
-        );
-
-        return Ok(Some(Trigger::with_tag(
+        return Ok(Some(Trigger::restored(
             key.clone(),
             time,
             timer_type,
             tag,
-            span,
+            context,
         )));
     }
     Ok(None)

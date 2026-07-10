@@ -24,7 +24,9 @@ use educe::Educe;
 use futures::executor::block_on;
 use std::borrow::Cow;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::spawn;
@@ -45,6 +47,7 @@ use tracing::{debug, error, info};
 #[educe(Debug)]
 pub struct ProbeServer {
     /// The bound socket address of the server
+    #[cfg(test)]
     address: SocketAddr,
 
     /// Channel for signaling server shutdown
@@ -127,6 +130,7 @@ impl ProbeServer {
         });
 
         Ok(Self {
+            #[cfg(test)]
             address,
             shutdown_tx,
             handle,
@@ -135,9 +139,7 @@ impl ProbeServer {
 
     #[cfg(test)]
     /// Returns the server's bound address.
-    ///
-    /// This method is only available in test builds and is useful
-    /// for connecting to dynamically assigned ports during tests.
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }

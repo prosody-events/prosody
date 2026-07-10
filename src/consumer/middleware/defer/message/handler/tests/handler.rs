@@ -50,6 +50,9 @@ pub struct OutcomeHandler {
     /// Used to simulate shutdown occurring mid-handler-execution, exercising
     /// post-call cancellation promotion paths.
     shutdown_trigger: Arc<Mutex<Option<MockEventContext>>>,
+    /// `(ambient span id, message span id)` observed inside each
+    /// `on_message` call — pins that dispatch entered the message's span.
+    ambient_pairs: Arc<Mutex<Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)>>>,
 }
 
 impl OutcomeHandler {
@@ -60,6 +63,7 @@ impl OutcomeHandler {
             outcome: OutcomeSlot::default(),
             processed: Arc::new(scc::Queue::default()),
             shutdown_trigger: Arc::new(Mutex::new(None)),
+            ambient_pairs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -99,6 +103,12 @@ impl OutcomeHandler {
     /// Records a processed message.
     fn record_processed(&self, key: Key, offset: Offset) {
         self.processed.push(ProcessedMessage { key, offset });
+    }
+
+    /// Returns the `(ambient, message-span)` id pairs recorded per call.
+    #[must_use]
+    pub fn ambient_pairs(&self) -> Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)> {
+        self.ambient_pairs.lock().clone()
     }
 
     /// Takes the next outcome, returning Success if none was set.
@@ -152,6 +162,9 @@ impl FallibleHandler for OutcomeHandler {
 
         // Record this message as processed (for order verification)
         self.record_processed(key, offset);
+        self.ambient_pairs
+            .lock()
+            .push((tracing::Span::current().id(), message.span().id()));
 
         self.maybe_trigger_shutdown();
         outcome.into_result()

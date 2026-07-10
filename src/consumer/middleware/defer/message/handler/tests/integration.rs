@@ -561,3 +561,40 @@ fn transient_retry_not_redeferred_on_shutdown() -> color_eyre::Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn retried_message_handler_runs_inside_the_load_span() -> color_eyre::Result<()> {
+    // The message-defer retry dispatch instruments the inner call with the
+    // reloaded message's span, so a retried handler observes it as the
+    // ambient span (`Span::current()`). A registry is installed so spans get
+    // real ids — the `is_some` guard fails, rather than passing vacuously,
+    // if spans are disabled.
+    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        TEST_RUNTIME.block_on(async {
+            let mut harness = TestHarness::new(1)?;
+
+            defer_single_message(&mut harness).await?;
+
+            let timer = TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: TimerOutcome::Success,
+            };
+            harness.execute_timer(&timer).await?;
+
+            // The second dispatch is the retry: its ambient span must be the
+            // reloaded message's own span, by id.
+            let pairs = harness.inner_handler.ambient_pairs();
+            let (ambient, load) = pairs
+                .get(1)
+                .ok_or_else(|| eyre!("retry dispatch was not recorded"))?;
+            assert!(ambient.is_some(), "spans must be enabled for this pin");
+            assert_eq!(
+                ambient, load,
+                "retried handler must run inside the reloaded message's span"
+            );
+
+            Ok(())
+        })
+    })
+}

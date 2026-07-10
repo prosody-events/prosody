@@ -45,8 +45,8 @@ impl TriggerQueue {
     /// Inserts a [`Trigger`] into the queue for delayed firing.
     ///
     /// If the same [`Trigger`] (same key, time, and type) is already
-    /// scheduled, refreshes its tracing span to the new trigger's span so
-    /// that `onTimer` fires under the most recent caller's trace context.
+    /// scheduled, the queued trigger adopts the new trigger's trace so that
+    /// `onTimer` fires under the most recent caller's trace context.
     pub async fn insert(&mut self, trigger: Trigger) {
         if self.enqueue(trigger.clone()) {
             self.active.insert(trigger).await;
@@ -96,21 +96,21 @@ impl TriggerQueue {
     ///
     /// Used for rescheduling: the caller has already set the state to
     /// `FiringRescheduled` and only needs the timer re-added to the queue.
-    /// If the same [`Trigger`] is already in the queue, refreshes its
-    /// tracing span to the new trigger's span.
+    /// If the same [`Trigger`] is already in the queue, the queued trigger
+    /// adopts the new trigger's trace.
     pub(crate) fn insert_queue_only(&mut self, trigger: Trigger) {
         self.enqueue(trigger);
     }
 
     /// Adds a trigger to the delay queue, returning `true` if newly inserted.
     ///
-    /// If the trigger already exists (same key, time, and type), refreshes
-    /// the span so `onTimer` fires under the most recent caller's trace
-    /// context and returns `false`.
+    /// If the trigger already exists (same key, time, and type), the queued
+    /// trigger adopts the new trigger's trace so `onTimer` fires under the
+    /// most recent caller's trace context, and returns `false`.
     fn enqueue(&mut self, trigger: Trigger) -> bool {
         let vacant = match self.queue_keys.entry(trigger.clone()) {
             Entry::Occupied(occupied) => {
-                occupied.key().set_span(trigger.span());
+                occupied.key().adopt_trace_from(&trigger);
                 return false;
             }
             Entry::Vacant(vacant) => vacant,

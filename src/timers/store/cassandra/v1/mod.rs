@@ -11,8 +11,6 @@
 use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::otel::SpanRelation;
-use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
@@ -26,7 +24,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 use tracing::instrument;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(test)]
 pub mod tests;
@@ -112,12 +109,11 @@ impl V1Operations {
         slab_id: SlabId,
         trigger: TriggerV1,
     ) -> Result<(), CassandraTriggerStoreError> {
-        // Extract span context from tracing::Span
+        // Serialize the trigger's scheduling context for storage.
         let mut span_map: HashMap<String, String> = HashMap::new();
-        let context = trigger.span.context();
         self.store
             .propagator()
-            .inject_context(&context, &mut span_map);
+            .inject_context(&trigger.context, &mut span_map);
 
         self.store
             .session()
@@ -205,12 +201,11 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context, "fetch_slab_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),
                     time,
-                    span,
+                    context,
                 };
             }
         }
@@ -294,12 +289,11 @@ impl V1Operations {
         segment_id: &SegmentId,
         trigger: TriggerV1,
     ) -> Result<(), CassandraTriggerStoreError> {
-        // Extract span context for v1 trigger
+        // Serialize the trigger's scheduling context for storage.
         let mut span_map: HashMap<String, String> = HashMap::new();
-        let context = trigger.span.context();
         self.store
             .propagator()
-            .inject_context(&context, &mut span_map);
+            .inject_context(&trigger.context, &mut span_map);
 
         self.store
             .session()
@@ -345,12 +339,11 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context, "fetch_key_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),
                     time,
-                    span,
+                    context,
                 };
             }
         }

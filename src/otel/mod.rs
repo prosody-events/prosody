@@ -42,6 +42,10 @@ impl FromStr for SpanRelation {
 ///   (`parent: None`); `context`'s span is added as an `OTel` link
 ///   (follows-from relationship).
 ///
+/// Both arms mark the span `otel.kind = "consumer"` — every `related_span!`
+/// site is a consumer-side continuation of a propagated context, and the kind
+/// must not vary with the configured relation.
+///
 /// Span name and fields are macro-expanded at the call site, preserving source
 /// location.
 ///
@@ -53,7 +57,7 @@ impl FromStr for SpanRelation {
 /// let timer_spans = SpanRelation::Child;
 /// let context = Context::current();
 /// let key = "abc";
-/// let span = related_span!(timer_spans, context, "fetch_trigger", key = %key);
+/// let span = related_span!(timer_spans, context, "timer_defer.load", key = %key);
 /// ```
 #[macro_export]
 macro_rules! related_span {
@@ -61,7 +65,7 @@ macro_rules! related_span {
         let __context: ::opentelemetry::Context = $context;
         match $relation {
             $crate::otel::SpanRelation::Child => {
-                let __span = ::tracing::info_span!($name $(, $($fields)*)?);
+                let __span = ::tracing::info_span!($name, otel.kind = "consumer" $(, $($fields)*)?);
                 if let ::core::result::Result::Err(__e) =
                     ::tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(
                         &__span,
@@ -99,3 +103,6 @@ macro_rules! related_span {
 #[derive(Debug, Error)]
 #[error("unknown span relation value '{0}'; expected 'child' or 'follows_from'")]
 pub struct ParseSpanRelationError(String);
+
+#[cfg(test)]
+mod tests;

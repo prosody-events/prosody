@@ -21,12 +21,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, warn};
+use tracing::{Span, debug, error, warn};
 
 use crate::Codec;
 use crate::EventType;
 use crate::Topic;
-use crate::consumer::decode::decode_message;
+use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{Managers, WatermarkVersion};
@@ -36,6 +36,9 @@ use crate::propagator::new_propagator;
 use crate::related_span;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+#[cfg(test)]
+mod tests;
 
 /// Configuration for the Kafka message polling process.
 ///
@@ -174,15 +177,7 @@ where
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {
             // Create receive span connected to parent trace context
-            let receive_span = related_span!(
-                message_spans,
-                decoded.parent_context.clone(),
-                "receive",
-                partition = decoded.value.partition,
-                offset = decoded.value.offset,
-                topic = %decoded.value.topic,
-                key = %decoded.value.key,
-            );
+            let receive_span = create_receive_span(&decoded, message_spans);
 
             let consumer_message =
                 ConsumerMessage::from_decoded(decoded.value, receive_span, permit);
@@ -193,6 +188,24 @@ where
     }
 
     debug!("polling stopped");
+}
+
+/// Creates a tracing span for a received message connected to its upstream
+/// context.
+///
+/// Creates a span named "receive" with message metadata attributes and
+/// connects it to the upstream trace via the configured [`SpanRelation`].
+fn create_receive_span<P>(decoded: &DecodedMessage<P>, relation: SpanRelation) -> Span {
+    related_span!(
+        relation,
+        decoded.parent_context.clone(),
+        "receive",
+        messaging.system = "kafka",
+        partition = decoded.value.partition,
+        offset = decoded.value.offset,
+        topic = %decoded.value.topic,
+        key = %decoded.value.key,
+    )
 }
 
 /// Attempts to dispatch a message to its partition manager with retries.

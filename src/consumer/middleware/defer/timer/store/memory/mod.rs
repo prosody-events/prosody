@@ -16,7 +16,6 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Timer entry with span context for reconstruction.
 #[derive(Clone, Debug)]
@@ -28,18 +27,29 @@ struct StoredTimer {
 
 impl StoredTimer {
     fn from_trigger(trigger: &Trigger) -> Self {
-        let span = trigger.span();
         Self {
             key: trigger.key.clone(),
             time: trigger.time,
-            context: span.context(),
+            context: trigger.context(),
         }
     }
 
-    /// Reconstructs trigger with fresh span linked to stored context.
+    /// Reconstructs the retry trigger, carrying the live reload span.
+    ///
+    /// Reload time is dispatch time for a deferred retry: this path never
+    /// passes through `set_dispatch_span`, so the `timer_defer.load` span
+    /// built here from the stored scheduling context per `linking` IS the
+    /// dispatch span, and the trigger carries it live for the handler.
     fn to_trigger(&self, linking: SpanRelation) -> Trigger {
         let span = related_span!(linking, self.context.clone(), "timer_defer.load", key = %self.key, time = %self.time, cached = false);
-        Trigger::new(self.key.clone(), self.time, TimerType::Application, span)
+        let trigger = Trigger::new(
+            self.key.clone(),
+            self.time,
+            TimerType::Application,
+            span.clone(),
+        );
+        trigger.set_span(span);
+        trigger
     }
 }
 
@@ -254,3 +264,6 @@ impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

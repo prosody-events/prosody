@@ -47,7 +47,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
@@ -631,9 +631,13 @@ where
             self.source.clone(),
         );
 
+        // Instrument with the reload span so the retried handler runs inside
+        // it ambiently, mirroring the partition dispatch arms.
+        let load_span = message.span();
         match self
             .handler
             .on_message(context.clone(), message, DemandType::Failure)
+            .instrument(load_span)
             .await
         {
             Ok(output) => {

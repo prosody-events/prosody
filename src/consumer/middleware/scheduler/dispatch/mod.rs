@@ -11,9 +11,7 @@ use crate::consumer::DemandType;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
-use ahash::RandomState;
 use quanta::Instant;
-use quick_cache::UnitWeighter;
 use quick_cache::unsync::Cache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,8 +58,8 @@ struct Selector {
     tasks: Vec<Task>,
     success_time: DecayingDuration120,
     failure_time: DecayingDuration120,
-    invocation_times: Cache<TopicPartitionKey, Instant, UnitWeighter, RandomState>,
-    key_times: Cache<TopicPartitionKey, DecayingDuration120, UnitWeighter, RandomState>,
+    invocation_times: Cache<TopicPartitionKey, Instant>,
+    key_times: Cache<TopicPartitionKey, DecayingDuration120>,
     failure_weight: f64,
     normal_weight: f64,
     max_wait: f64,

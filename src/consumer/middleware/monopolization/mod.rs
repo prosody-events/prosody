@@ -39,14 +39,12 @@
 //!   for 90%)
 //! - `window_duration`: Rolling window duration (default: 5 minutes)
 
-use ahash::RandomState;
 use derive_builder::Builder;
 use humantime::format_duration;
 use interval::IntervalSet;
 use interval::interval_set::ToIntervalSet;
 use interval::prelude::{Bounded, Intersection, Union};
 use quanta::Instant;
-use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +65,10 @@ use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use crate::timers::Trigger;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Key, Partition, Topic, TopicPartitionKey};
+
+/// Rolling per-key execution intervals, shared by the middleware, its
+/// provider, and every handler it wraps.
+type KeyIntervals = Arc<Cache<TopicPartitionKey, IntervalSet<u64>>>;
 
 /// Configuration for monopolization detection.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -121,7 +123,7 @@ pub struct MonopolizationMiddleware {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
-    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: KeyIntervals,
 }
 
 /// Provider that creates monopolization handlers for each partition.
@@ -131,7 +133,7 @@ pub struct MonopolizationProvider<T> {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
-    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: KeyIntervals,
 }
 
 /// Handler wrapper that checks for monopolization before delegating to inner
@@ -142,7 +144,7 @@ pub struct MonopolizationHandler<T> {
     topic: Topic,
     partition: Partition,
     reference_instant: Instant,
-    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: KeyIntervals,
     monopolization_threshold: f64,
     window_duration: Duration,
 }
@@ -404,7 +406,7 @@ where
 
 async fn run_event_loop(
     reference_instant: Instant,
-    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: KeyIntervals,
     window_duration: Duration,
     mut telemetry_rx: broadcast::Receiver<TelemetryEvent>,
 ) {

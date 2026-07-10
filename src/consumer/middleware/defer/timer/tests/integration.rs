@@ -537,9 +537,12 @@ fn span_restored_on_retry() -> color_eyre::Result<()> {
     // This tests the round-trip:
     // 1. Application timer fires with a span (from Span::current())
     // 2. Timer defers, span context stored via propagator.inject_context()
-    // 3. DeferredTimer fires, span restored via propagator.extract()
-    // 4. Fresh span created and linked to stored context via set_parent()
-    // 5. Inner handler receives trigger with the linked span
+    // 3. DeferredTimer fires, span context restored via propagator.extract()
+    // 4. A reload span is built from the restored context per the configured
+    //    relation and installed as the trigger's live dispatch span (reload time is
+    //    dispatch time on the defer path)
+    // 5. Inner handler receives the retry trigger carrying that span, whose context
+    //    chains back to the original trace
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -747,5 +750,50 @@ fn disabled_config_propagates_errors_no_deferral() -> color_eyre::Result<()> {
         );
 
         Ok(())
+    })
+}
+
+#[test]
+fn retry_handler_runs_inside_the_reload_span() -> color_eyre::Result<()> {
+    // The defer-retry dispatch instruments the inner call with the reload
+    // trigger's span, so a retried handler observes it as the ambient span
+    // (`Span::current()`). A registry (not the global ERROR-filtered test
+    // subscriber) is installed so spans get real ids — the `is_some` guard
+    // below fails, rather than passing vacuously, if spans are disabled.
+    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        TEST_RUNTIME.block_on(async {
+            let harness = TestHarness::new()?;
+
+            harness.inner_handler.set_outcome(HandlerOutcome::Transient);
+            harness.decider.set_next(true);
+            let trigger = TestHarness::create_trigger("ambient-key", 1000);
+            let result = harness
+                .handler
+                .on_timer(harness.context().clone(), trigger, DemandType::Normal)
+                .await;
+            assert!(result.is_ok(), "Defer should absorb transient error");
+
+            harness.inner_handler.set_outcome(HandlerOutcome::Success);
+            let retry = TestHarness::create_deferred_timer_trigger("ambient-key", 1001);
+            let result = harness
+                .handler
+                .on_timer(harness.context().clone(), retry, DemandType::Normal)
+                .await;
+            assert!(result.is_ok(), "Retry should succeed");
+
+            // The second dispatch is the retry: its ambient span must be the
+            // reload trigger's own span, by id.
+            let pairs = harness.inner_handler.ambient_pairs();
+            let (ambient, reload) = pairs
+                .get(1)
+                .ok_or_else(|| color_eyre::eyre::eyre!("retry dispatch was not recorded"))?;
+            assert!(ambient.is_some(), "spans must be enabled for this pin");
+            assert_eq!(
+                ambient, reload,
+                "retried handler must run inside the reload trigger's span"
+            );
+
+            Ok(())
+        })
     })
 }

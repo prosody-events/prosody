@@ -4,6 +4,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use color_eyre::eyre::{Result, bail};
+use opentelemetry::Context;
 use tokio::time::{Duration, advance, pause};
 
 #[tokio::test]
@@ -147,7 +148,11 @@ async fn test_multiple_triggers() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_insert_duplicate_refreshes_span() -> Result<()> {
+async fn test_insert_duplicate_adopts_trace() -> Result<()> {
+    /// Marker planted in a [`Context`] to identify which trigger's trace won.
+    #[derive(Debug, PartialEq)]
+    struct TraceMarker(&'static str);
+
     pause();
 
     let mut triggers = TriggerQueue::new();
@@ -155,16 +160,16 @@ async fn test_insert_duplicate_refreshes_span() -> Result<()> {
     let key = Key::from("dedup-key");
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
 
-    let span_a = tracing::info_span!("span_a");
-    let span_b = tracing::info_span!("span_b");
+    let context_a = Context::new().with_value(TraceMarker("a"));
+    let context_b = Context::new().with_value(TraceMarker("b"));
 
-    let trigger_a = Trigger::new(key.clone(), time, TimerType::Application, span_a);
-    let trigger_b = Trigger::new(key.clone(), time, TimerType::Application, span_b.clone());
+    let trigger_a = Trigger::restored(key.clone(), time, TimerType::Application, 0, context_a);
+    let trigger_b = Trigger::restored(key.clone(), time, TimerType::Application, 0, context_b);
 
-    // Insert first trigger with span_a
+    // Insert first trigger carrying context_a
     triggers.insert(trigger_a).await;
 
-    // Insert duplicate with span_b — should refresh span
+    // Insert duplicate carrying context_b — the queued trigger should adopt it
     triggers.insert(trigger_b).await;
 
     // Expire and pop the trigger
@@ -173,8 +178,11 @@ async fn test_insert_duplicate_refreshes_span() -> Result<()> {
         bail!("No expired trigger found");
     };
 
-    // The expired trigger should carry span_b's identity
-    assert_eq!(expired.span().id(), span_b.id());
+    // The expired trigger should carry context_b's marker
+    assert_eq!(
+        expired.context().get::<TraceMarker>(),
+        Some(&TraceMarker("b"))
+    );
 
     Ok(())
 }

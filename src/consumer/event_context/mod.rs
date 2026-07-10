@@ -35,7 +35,7 @@ use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
-use tracing::Span;
+use tracing::{Instrument, Span, info_span};
 
 /// Marker trait for errors that can be returned from event context operations.
 ///
@@ -449,8 +449,12 @@ where
         timer_type: TimerType,
     ) -> Result<(), Self::Error> {
         self.run_cancellable(async |inner| {
-            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
-            inner.timers.schedule(request).await
+            // The schedule span is the trigger's link/parent target at fire
+            // time (see `timer_op_span`): it names the operation and carries
+            // the fire time, so the relationship is self-describing.
+            let span = timer_op_span("schedule", &inner.key, time, timer_type);
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, span.clone());
+            inner.timers.schedule(request).instrument(span).await
         })
         .await
     }
@@ -461,8 +465,13 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
-            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
-            inner.timers.clear_and_schedule(request).await
+            let span = timer_op_span("clear_and_schedule", &inner.key, time, timer_type);
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, span.clone());
+            inner
+                .timers
+                .clear_and_schedule(request)
+                .instrument(span)
+                .await
         })
         .await
     }
@@ -473,7 +482,12 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
-            inner.timers.unschedule(&inner.key, time, timer_type).await
+            let span = timer_op_span("unschedule", &inner.key, time, timer_type);
+            inner
+                .timers
+                .unschedule(&inner.key, time, timer_type)
+                .instrument(span)
+                .await
         })
         .await
     }
@@ -483,7 +497,12 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
-            inner.timers.unschedule_all(&inner.key, timer_type).await
+            let span = info_span!("clear_scheduled", key = %inner.key, timer_type = ?timer_type);
+            inner
+                .timers
+                .unschedule_all(&inner.key, timer_type)
+                .instrument(span)
+                .await
         })
         .await
     }
@@ -584,6 +603,28 @@ where
         }
         .right_future()
     }
+}
+
+/// Creates the span for a user-facing timer operation.
+///
+/// This span is what a fired timer's `"trigger"` dispatch span relates back
+/// to (as `OTel` parent or link, per the configured `timer_spans`): the
+/// schedule-side constructors capture it as the trigger's scheduling context.
+/// Naming the operation and carrying `key`/`time`/`timer_type` makes that
+/// relationship self-describing in the trace.
+pub(crate) fn timer_op_span(
+    name: &'static str,
+    key: &Key,
+    time: CompactDateTime,
+    timer_type: TimerType,
+) -> Span {
+    info_span!(
+        "timer_op",
+        otel.name = name,
+        key = %key,
+        time = %time,
+        timer_type = ?timer_type,
+    )
 }
 
 /// Object-safe boxed event context

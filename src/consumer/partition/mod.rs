@@ -50,7 +50,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::{Instant, sleep, sleep_until};
-use tracing::{debug, debug_span, error, info_span, instrument};
+use tracing::{Instrument, debug, debug_span, error, info_span, instrument};
 
 mod keyed;
 mod metrics;
@@ -698,8 +698,13 @@ async fn process_event<T, S, M, P>(
             );
             let cloned_context = context.clone();
             let _guard = message.process_scope();
+            // Instrument with the receive span so handler-created spans (and
+            // `Span::current()` captures like `EventContext::schedule`) nest
+            // under it ambiently.
+            let receive_span = message.span();
             handler
                 .on_message(context, message, DemandType::Normal)
+                .instrument(receive_span)
                 .await;
             cloned_context.invalidate();
         }
@@ -751,7 +756,13 @@ async fn process_event<T, S, M, P>(
                 );
                 let cloned_context = context.clone();
                 let _guard = firing.process_scope();
-                handler.on_timer(context, firing, DemandType::Normal).await;
+                // Instrument with the dispatch span so handler-created spans
+                // nest under it ambiently (mirrors the message arm).
+                let dispatch_span = firing.trigger().span();
+                handler
+                    .on_timer(context, firing, DemandType::Normal)
+                    .instrument(dispatch_span)
+                    .await;
                 cloned_context.invalidate();
             }
         }
@@ -909,7 +920,8 @@ async fn filter_event_type<P: Send + Sync + 'static + EventType>(
         info_span!(
             parent: message.span(),
             "message.filtered",
-            reason = "event-type"
+            reason = "event-type",
+            event_type
         )
         .in_scope(|| {
             debug!("skipping message because {event_type} is not an allowed event type");

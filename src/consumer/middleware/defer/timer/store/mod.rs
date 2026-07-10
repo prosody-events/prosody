@@ -17,7 +17,6 @@ use crate::timers::datetime::CompactDateTime;
 use opentelemetry::Context;
 use std::error::Error;
 use std::future::Future;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use cassandra::{CassandraTimerDeferStore, CassandraTimerDeferStoreProvider};
 pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
@@ -91,7 +90,7 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
 
             if let Some((trigger, _)) = self.get_next_deferred_timer(key).await? {
                 self.set_retry_count(key, 0).await?;
-                let context = trigger.span().context();
+                let context = trigger.context();
                 Ok(TimerRetryCompletionResult::MoreTimers {
                     next_time: trigger.time,
                     context,

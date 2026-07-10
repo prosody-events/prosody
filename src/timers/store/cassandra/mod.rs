@@ -21,7 +21,6 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::otel::SpanRelation;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::queries::Queries;
@@ -70,7 +69,6 @@ pub struct CassandraTriggerStore {
     pub(super) store: CassandraStore,
     pub(super) queries: Arc<Queries>,
     pub(super) segment: Segment,
-    pub(super) timer_spans: SpanRelation,
     /// Per-partition cache of `(Key, TimerType) → TimerState`.
     ///
     /// Tracks the current state of each key/type pair:
@@ -104,7 +102,6 @@ impl CassandraTriggerStore {
         store: CassandraStore,
         keyspace: &str,
         segment: Segment,
-        timer_spans: SpanRelation,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
@@ -113,7 +110,6 @@ impl CassandraTriggerStore {
             queries,
             segment,
             state_cache: state::new_state_cache(),
-            timer_spans,
         })
     }
 
@@ -125,14 +121,12 @@ impl CassandraTriggerStore {
         store: CassandraStore,
         queries: Arc<Queries>,
         segment: Segment,
-        timer_spans: SpanRelation,
     ) -> Self {
         Self {
             store,
             queries,
             segment,
             state_cache: state::new_state_cache(),
-            timer_spans,
         }
     }
 

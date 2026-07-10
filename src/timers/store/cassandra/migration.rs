@@ -70,6 +70,7 @@ use super::{CassandraTriggerStore, CassandraTriggerStoreError};
 use ahash::HashSet;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
+use rand::RngExt;
 use tokio::task::coop::cooperative;
 use tokio::try_join;
 use tracing::{debug, info, instrument, warn};
@@ -170,12 +171,15 @@ pub(crate) async fn migrate_segment_version(
                     let store = store.clone();
 
                     async move {
-                        // Convert v1 trigger to v2 with Application timer type
-                        let v2_trigger = Trigger::new(
+                        // Convert v1 trigger to v2 with Application timer
+                        // type; mint a fresh random tag (v1 rows have none)
+                        // and carry the restored scheduling context.
+                        let v2_trigger = Trigger::restored(
                             v1_trigger.key.clone(),
                             v1_trigger.time,
                             TimerType::Application,
-                            v1_trigger.span,
+                            rand::rng().random::<i32>(),
+                            v1_trigger.context,
                         );
 
                         // Recalculate slab based on trigger time and segment slab_size.

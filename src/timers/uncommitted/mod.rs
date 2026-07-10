@@ -27,6 +27,7 @@ use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
+use crate::timers::TriggerTrace;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
@@ -38,14 +39,15 @@ use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 use tracing::{Span, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
 
-/// Shared no-op span used to release processing resources without allocating
-/// a fresh `Arc` on every [`TriggerProcessGuard`] drop.
-static NONE_SPAN: LazyLock<Arc<Span>> = LazyLock::new(|| Arc::new(Span::none()));
+/// Shared released trace (a dispatched no-op span) used to release processing
+/// resources without allocating a fresh `Arc` on every
+/// [`TriggerProcessGuard`] drop.
+static RELEASED_TRACE: LazyLock<Arc<TriggerTrace>> =
+    LazyLock::new(|| Arc::new(TriggerTrace::Dispatched(Span::none())));
 
 /// A trait for uncommitted timer operations.
 ///
@@ -89,7 +91,7 @@ pub struct PendingTimer<T>
 where
     T: TriggerStore,
 {
-    /// The underlying timer data: key, execution time, and tracing span.
+    /// The underlying timer data: key, execution time, and trace.
     trigger: Trigger,
 
     /// Transaction state and coordination with [`TimerManager`].
@@ -107,7 +109,7 @@ pub struct FiringTimer<T>
 where
     T: TriggerStore,
 {
-    /// The underlying timer data: key, execution time, and tracing span.
+    /// The underlying timer data: key, execution time, and trace.
     trigger: Trigger,
 
     /// Transaction state and coordination with [`TimerManager`].
@@ -158,7 +160,7 @@ where
 ///
 /// Ensures deterministic cleanup when timer processing completes, rather than
 /// waiting for unpredictable garbage collection timing.
-pub struct TriggerProcessGuard(Arc<ArcSwap<Span>>);
+pub struct TriggerProcessGuard(Arc<ArcSwap<TriggerTrace>>);
 
 impl<T> PendingTimer<T>
 where
@@ -233,13 +235,19 @@ where
         &self.trigger
     }
 
-    /// Replaces the trigger's tracing span with a `"trigger"` dispatch span.
+    /// Replaces the trigger's trace with a `"trigger"` dispatch span.
     ///
-    /// Creates the dispatch span from the trigger's current span context,
+    /// Creates the dispatch span from the trigger's scheduling context,
     /// connecting it per `relation`. Called at fire time so that
     /// `trigger.span()` returns the dispatch span when the handler reads it.
+    ///
+    /// This is the single point where the configured timer span relation is
+    /// applied, and it binds the dispatch span directly to the scheduling
+    /// context — whether that context was captured in-process at scheduling
+    /// time or restored from persistent storage — so memory- and
+    /// Cassandra-backed timers produce identical dispatch-span topology.
     pub fn set_dispatch_span(&self, relation: SpanRelation) {
-        let context = self.trigger.span().context();
+        let context = self.trigger.context();
         let span = related_span!(
             relation,
             context,
@@ -408,7 +416,7 @@ where
     ///
     /// Returns `Span::none()` if processing resources have been released.
     fn span(&self) -> Span {
-        self.trigger.span.load().as_ref().clone()
+        self.trigger.span()
     }
 
     /// Decompose into the raw [`Trigger`] and the commit guard.
@@ -433,7 +441,7 @@ where
 
 impl Drop for TriggerProcessGuard {
     fn drop(&mut self) {
-        self.0.store(Arc::clone(&NONE_SPAN));
+        self.0.store(Arc::clone(&RELEASED_TRACE));
     }
 }
 
@@ -444,7 +452,7 @@ where
     type Guard = TriggerProcessGuard;
 
     fn process_scope(&self) -> Self::Guard {
-        TriggerProcessGuard(self.trigger.span.clone())
+        TriggerProcessGuard(self.trigger.trace.clone())
     }
 }
 

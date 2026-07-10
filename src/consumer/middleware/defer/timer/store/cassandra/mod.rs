@@ -38,7 +38,6 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use tracing::{debug, instrument};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub(crate) mod queries;
 
@@ -104,7 +103,7 @@ impl CassandraTimerDeferStore {
 
     /// Serializes a trigger's span context to W3C trace format for storage.
     fn inject_span_context(&self, trigger: &Trigger) -> HashMap<String, String> {
-        self.span_map_from_context(&trigger.span().context())
+        self.span_map_from_context(&trigger.context())
     }
 
     /// Deserializes span context from a span map and creates a linked span.
@@ -119,27 +118,34 @@ impl CassandraTimerDeferStore {
         span_map
     }
 
-    /// Creates a linked span from a stored context.
+    /// Reconstructs the retry trigger from a stored context, carrying the
+    /// live reload span.
     ///
     /// The cache stores [`Context`], never [`tracing::Span`] — spans must
-    /// finish to flush, so a fresh span is created on every read. `cached` is
-    /// `true` when served from the in-memory write-through cache, `false` on
-    /// a DB read.
-    fn create_span_from_context(
+    /// finish to flush, so a fresh span is created on every read. Reload time
+    /// is dispatch time for a deferred retry: this path never passes through
+    /// `set_dispatch_span`, so the `timer_defer.load` span built here per the
+    /// configured relation IS the dispatch span, and the trigger carries it
+    /// live for the handler. `cached` is `true` when served from the
+    /// in-memory write-through cache, `false` on a DB read.
+    fn reconstruct_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         context: &Context,
         cached: bool,
-    ) -> tracing::Span {
-        related_span!(
+    ) -> Trigger {
+        let span = related_span!(
             self.timer_spans,
             context.clone(),
             "timer_defer.load",
             key = %key,
             time = %time,
             cached = cached
-        )
+        );
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, span.clone());
+        trigger.set_span(span);
+        trigger
     }
 
     /// Reads `(next_timer, retry_count)` static columns from the DB.
@@ -383,8 +389,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         // attributed as cached
         if let Some(cached) = self.cache.get(key.as_ref()) {
             return Ok(cached.map(|entry| {
-                let span = self.create_span_from_context(key, entry.time, &entry.context, true);
-                let trigger = Trigger::new(key.clone(), entry.time, TimerType::Application, span);
+                let trigger = self.reconstruct_trigger(key, entry.time, &entry.context, true);
                 (trigger, entry.retry_count)
             }));
         }
@@ -396,8 +401,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         self.cache.insert(Arc::clone(key), entry_opt.clone());
 
         Ok(entry_opt.map(|entry| {
-            let span = self.create_span_from_context(key, entry.time, &entry.context, false);
-            let trigger = Trigger::new(key.clone(), entry.time, TimerType::Application, span);
+            let trigger = self.reconstruct_trigger(key, entry.time, &entry.context, false);
             (trigger, entry.retry_count)
         }))
     }

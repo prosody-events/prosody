@@ -17,7 +17,9 @@
 
 use crate::Key;
 use crate::consumer::Keyed;
-use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
+use crate::consumer::event_context::{
+    EventContext, StateAccessError, TerminationSignals, timer_op_span,
+};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -27,6 +29,7 @@ use crate::timers::datetime::CompactDateTime;
 use futures::TryFutureExt;
 use std::future::Future;
 use thiserror::Error;
+use tracing::Instrument;
 
 /// Context wrapper that unifies active and deferred timer operations.
 ///
@@ -167,15 +170,14 @@ where
         }
 
         if is_deferred(&self.store, &self.key).await? {
-            // Append to defer store
-            let trigger = Trigger::new(
-                self.key.clone(),
-                time,
-                TimerType::Application,
-                tracing::Span::current(),
-            );
+            // Append to defer store, under the same schedule span the
+            // non-deferred path gets from the partition context.
+            let span = timer_op_span("schedule", &self.key, time, TimerType::Application);
+            let trigger =
+                Trigger::new(self.key.clone(), time, TimerType::Application, span.clone());
             self.store
                 .append_deferred_timer(&trigger)
+                .instrument(span)
                 .await
                 .map_err(TimerDeferContextError::Store)
         } else {

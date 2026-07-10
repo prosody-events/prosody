@@ -9,18 +9,25 @@
 use super::MessageLoader;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::otel::SpanRelation;
+use crate::related_span;
 use crate::{Key, Offset, Partition, Topic};
 use ahash::HashMap;
 use chrono::Utc;
+use opentelemetry::Context;
 use parking_lot::RwLock;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-/// Type alias for the message storage map.
-type MessageStorage<P> = HashMap<(Topic, Partition, Offset), Arc<ConsumerMessageValue<P>>>;
+/// Type alias for the message storage map: each stored message keeps the
+/// storer's trace context so reloads can relate their `load` span to it,
+/// mirroring the Kafka loader's persisted-context reconstruction.
+type MessageStorage<P> =
+    HashMap<(Topic, Partition, Offset), (Arc<ConsumerMessageValue<P>>, Context)>;
 
 /// In-memory message loader for testing.
 ///
@@ -43,16 +50,27 @@ type MessageStorage<P> = HashMap<(Topic, Partition, Offset), Arc<ConsumerMessage
 pub struct MemoryLoader<P> {
     messages: Arc<RwLock<MessageStorage<P>>>,
     semaphore: Arc<Semaphore>,
+    message_spans: SpanRelation,
 }
 
 impl<P: Send + Sync + 'static> MemoryLoader<P> {
-    /// Creates a new in-memory loader with empty storage.
+    /// Creates a new in-memory loader with empty storage and the default
+    /// `message_spans` relation; see [`Self::with_message_spans`].
     #[must_use]
     pub fn new() -> Self {
+        Self::with_message_spans(SpanRelation::default())
+    }
+
+    /// Creates a new in-memory loader that relates reload `load` spans to the
+    /// storing caller's context per `message_spans`, mirroring the Kafka
+    /// loader's configured relation.
+    #[must_use]
+    pub fn with_message_spans(message_spans: SpanRelation) -> Self {
         Self {
             messages: Arc::new(RwLock::new(HashMap::default())),
             // Large semaphore since we don't care about backpressure in tests
             semaphore: Arc::new(Semaphore::new(1000)),
+            message_spans,
         }
     }
 
@@ -77,9 +95,10 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             timestamp: Utc::now(),
             payload,
         });
+        let context = Span::current().context();
         self.messages
             .write()
-            .insert((topic, partition, offset), message_value);
+            .insert((topic, partition, offset), (message_value, context));
     }
 
     /// Removes a message from storage.
@@ -124,19 +143,24 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
 
         // Look up the message
         let messages = self.messages.read();
-        let message_value = messages
+        let (message_value, context) = messages
             .get(&(topic, partition, offset))
             .ok_or(MemoryLoaderError::NotFound(topic, partition, offset))?
             .clone();
         drop(messages);
 
-        // Create a ConsumerMessage with the loaded message value
-        // Note: Uses current span since we don't have original span context
-        Ok(ConsumerMessage::from_decoded(
-            message_value,
-            Span::current(),
-            permit,
-        ))
+        // Reload span related to the storer's context, the memory twin of
+        // the Kafka loader's create_load_span.
+        let span = related_span!(
+            self.message_spans,
+            context,
+            "load",
+            partition = partition,
+            offset = offset,
+            topic = %topic,
+            key = %message_value.key,
+        );
+        Ok(ConsumerMessage::from_decoded(message_value, span, permit))
     }
 }
 

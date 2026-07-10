@@ -1087,6 +1087,7 @@ fn create_load_span<P>(decoded: &DecodedMessage<P>, cached: bool, relation: Span
         relation,
         decoded.parent_context.clone(),
         "load",
+        messaging.system = "kafka",
         partition = decoded.value.partition,
         offset = decoded.value.offset,
         topic = %decoded.value.topic,

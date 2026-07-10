@@ -41,7 +41,7 @@ use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::{TimerType, Trigger};
 use crate::{Partition, Topic};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// Output of [`TimerDeferHandler`] dispatches; drives apply-hook routing.
 ///
@@ -340,9 +340,12 @@ where
             self.source.clone(),
         );
 
+        // Instrument with the reload span so the retried handler runs inside
+        // it ambiently, mirroring the partition dispatch arms.
         let output = match self
             .handler
             .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
+            .instrument(stored_trigger.span())
             .await
         {
             Ok(output) => output,

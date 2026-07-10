@@ -27,12 +27,12 @@ use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use educe::Educe;
 use futures::Stream;
+use opentelemetry::Context;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
-use tracing::Span;
 use uuid::Uuid;
 
 /// Cassandra-based persistent storage implementation.
@@ -132,9 +132,9 @@ pub struct TriggerV1 {
     /// When this timer should execute.
     pub time: CompactDateTime,
 
-    /// Tracing span for distributed observability context.
+    /// Scheduling-time trace context for distributed observability.
     #[educe(PartialEq(ignore), Hash(ignore))]
-    pub span: Span,
+    pub context: Context,
 }
 
 impl PartialOrd for TriggerV1 {
@@ -145,7 +145,7 @@ impl PartialOrd for TriggerV1 {
 
 impl Ord for TriggerV1 {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Compare by (key, time) tuple, ignoring span
+        // Compare by (key, time) tuple, ignoring the trace context
         (&self.key, &self.time).cmp(&(&other.key, &other.time))
     }
 }
@@ -334,7 +334,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Streams scheduled times for a key and timer type.
     ///
     /// Returns only timestamps without full trigger metadata.
-    /// More efficient than `get_key_triggers` when span data not needed.
+    /// More efficient than `get_key_triggers` when trace context not needed.
     fn get_key_times(
         &self,
         timer_type: TimerType,
@@ -343,7 +343,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
 
     /// Streams full trigger objects for a key and timer type.
     ///
-    /// Includes all metadata (key, time, `timer_type`, span).
+    /// Includes all metadata (key, time, `timer_type`, trace context).
     fn get_key_triggers(
         &self,
         timer_type: TimerType,

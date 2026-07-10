@@ -201,6 +201,9 @@ impl EventContext for MockContext {
 struct OutcomeHandler {
     outcome: OutcomeSlot,
     timer_calls: Arc<Mutex<Vec<Key>>>,
+    /// `(ambient span id, trigger span id)` observed inside each `on_timer`
+    /// call — pins that dispatch entered the trigger's span.
+    ambient_pairs: Arc<Mutex<Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)>>>,
 }
 
 impl OutcomeHandler {
@@ -209,6 +212,7 @@ impl OutcomeHandler {
         Self {
             outcome: OutcomeSlot::default(),
             timer_calls: Arc::new(Mutex::new(Vec::new())),
+            ambient_pairs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -219,6 +223,12 @@ impl OutcomeHandler {
     #[must_use]
     fn timer_calls(&self) -> Vec<Key> {
         self.timer_calls.lock().clone()
+    }
+
+    /// Returns the `(ambient, trigger-span)` id pairs recorded per call.
+    #[must_use]
+    fn ambient_pairs(&self) -> Vec<(Option<tracing::span::Id>, Option<tracing::span::Id>)> {
+        self.ambient_pairs.lock().clone()
     }
 
     fn take_outcome(&self) -> HandlerOutcome {
@@ -267,6 +277,9 @@ impl FallibleHandler for OutcomeHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         self.timer_calls.lock().push(trigger.key.clone());
+        self.ambient_pairs
+            .lock()
+            .push((tracing::Span::current().id(), trigger.span().id()));
         self.take_outcome().into_result()
     }
 

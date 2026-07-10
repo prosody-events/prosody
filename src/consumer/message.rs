@@ -216,8 +216,8 @@ struct ProcessingState {
     #[educe(Debug(ignore))]
     span: Span,
 
-    /// Permit used to bound buffering
-    permit: OwnedSemaphorePermit,
+    /// Permit used to bound buffering.
+    _permit: OwnedSemaphorePermit,
 }
 
 /// The full data and metadata for a consumer message.
@@ -270,7 +270,11 @@ impl<P> ConsumerMessage<P> {
     #[must_use]
     pub fn new(value: ConsumerMessageValue<P>, span: Span, permit: OwnedSemaphorePermit) -> Self {
         let value = Arc::new(value);
-        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState {
+            span,
+            _permit: permit,
+        })
+        .into();
 
         Self {
             value,
@@ -288,7 +292,11 @@ impl<P> ConsumerMessage<P> {
         span: Span,
         permit: OwnedSemaphorePermit,
     ) -> Self {
-        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState {
+            span,
+            _permit: permit,
+        })
+        .into();
 
         Self {
             value,

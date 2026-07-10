@@ -13,8 +13,7 @@ use super::{CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
-use crate::otel::SpanRelation;
-use crate::test_util::{integration_test_count, test_cassandra_config};
+use crate::test_util::{integration_test_count, sampled_remote_context, test_cassandra_config};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -55,13 +54,9 @@ async fn setup_test_store_with_version(
     let segment_id = segment.id;
     let config = test_cassandra_config();
     let cassandra_store = CassandraStore::new(&config).await?;
-    let store = CassandraTriggerStore::with_store(
-        cassandra_store,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
+    let store =
+        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
+            .await?;
     store.insert_segment().await?;
     Ok((store, segment_id))
 }
@@ -75,14 +70,13 @@ trigger_store_tests!(
         let config = test_cassandra_config();
         let store = CassandraStore::new(&config).await?;
         let segment = test_segment("", slab_size);
-        CassandraTriggerStore::with_store(store, &config.keyspace, segment, SpanRelation::default())
-            .await
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
         let config = test_cassandra_config();
         let segment = test_segment("", slab_size);
-        cassandra_store(&config, segment, SpanRelation::default()).await
+        cassandra_store(&config, segment).await
     },
     integration_test_count(25)
 );
@@ -1048,6 +1042,54 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
 }
 
 #[tokio::test]
+async fn scheduled_context_survives_persist_fetch_round_trip() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    use opentelemetry::trace::TraceContextExt as _;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("context_round_trip").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("ctx-round-trip-{}", Uuid::new_v4()).into();
+    let time = CompactDateTime::from(1_700_000u32);
+    let timer_type = TimerType::Application;
+
+    // Persist a trigger carrying a known scheduling context, then read it back.
+    let scheduled = sampled_remote_context();
+    let expected = scheduled.span().span_context().clone();
+    store
+        .add_trigger(Trigger::restored(
+            key.clone(),
+            time,
+            timer_type,
+            7,
+            scheduled,
+        ))
+        .await?;
+
+    let fetched: Vec<Trigger> = store
+        .operations()
+        .get_key_triggers_all_types(&key)
+        .try_collect()
+        .await?;
+    assert_eq!(fetched.len(), 1, "exactly one trigger should be persisted");
+    let restored = fetched[0].context().span().span_context().clone();
+    assert_eq!(
+        restored.trace_id(),
+        expected.trace_id(),
+        "the scheduled trace id must survive persist -> fetch -> Trigger::restored"
+    );
+    assert_eq!(
+        restored.span_id(),
+        expected.span_id(),
+        "the scheduled span id must survive the round trip"
+    );
+
+    store.remove_trigger(&key, time, timer_type).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
     use crate::timers::store::TriggerStore;
     use crate::timers::store::adapter::TableAdapter;
@@ -1120,13 +1162,7 @@ fn test_prop_timer_state_invariant() {
                 let config = test_cassandra_config();
                 let store = CassandraStore::new(&config).await?;
                 let segment = test_segment("", slab_size);
-                CassandraTriggerStore::with_store(
-                    store,
-                    &config.keyspace,
-                    segment,
-                    SpanRelation::default(),
-                )
-                .await
+                CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
             }
             .instrument(span.clone()),
         ) {
@@ -1167,25 +1203,15 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
 
     // Build store A with the chosen segment.
     let base_a = CassandraStore::new(&config).await?;
-    let ops_a = CassandraTriggerStore::with_store(
-        base_a,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
+    let ops_a =
+        CassandraTriggerStore::with_store(base_a, &config.keyspace, segment.clone()).await?;
     ops_a.insert_segment().await?;
 
     // Build store B with the same segment but a fresh (cold) cache, sharing
     // the same prepared queries.
     let base_b = CassandraStore::new(&config).await?;
-    let ops_b = CassandraTriggerStore::with_store(
-        base_b,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
+    let ops_b =
+        CassandraTriggerStore::with_store(base_b, &config.keyspace, segment.clone()).await?;
 
     let key: Key = format!("provider-test-{}", Uuid::new_v4()).into();
     let tt = TimerType::Application;
@@ -1247,9 +1273,7 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
 
     let config = test_cassandra_config();
     let base = CassandraStore::new(&config).await?;
-    let provider =
-        CassandraTriggerStoreProvider::with_store(base, &config.keyspace, SpanRelation::default())
-            .await?;
+    let provider = CassandraTriggerStoreProvider::with_store(base, &config.keyspace).await?;
     let segment = test_segment("oracle_writer_handle", 60_u32);
     let writer = provider.create_store(segment);
     let oracle = CommitManager::new(
