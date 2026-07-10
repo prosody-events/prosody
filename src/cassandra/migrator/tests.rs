@@ -9,16 +9,31 @@ use super::CassandraMigrator;
 use crate::cassandra::{CassandraStoreError, TABLE_LOCKS};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
+use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::iter::Iterator;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 /// Creates a Cassandra session for testing.
+///
+/// The request timeout is sized for DDL, not OLTP: keyspace/table create and
+/// drop wait on schema agreement, which exceeds the driver's default 30s
+/// while the full suite's Cassandra-heavy property tests saturate the node.
 async fn create_test_session() -> Result<Session> {
-    let session = Box::pin(SessionBuilder::new().known_node("localhost:9042").build()).await?;
+    let profile = ExecutionProfile::builder()
+        .request_timeout(Some(Duration::from_mins(2)))
+        .build();
+    let session = Box::pin(
+        SessionBuilder::new()
+            .known_node("localhost:9042")
+            .default_execution_profile_handle(profile.into_handle())
+            .build(),
+    )
+    .await?;
 
     Ok(session)
 }
