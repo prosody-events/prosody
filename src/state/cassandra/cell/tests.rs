@@ -165,17 +165,11 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     let cell = value_cell();
     let data = Bytes::from_static(b"v1");
 
-    store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
-            )],
-            &[],
-            &[],
-        )
-        .await?;
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
+    )];
+    store.write_provisional(&c, &writes, &[], &writes).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (key, prov) = staged
         .into_iter()
@@ -235,21 +229,15 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 
     // A clean event: stage then promote, leaving nothing provisional and no
     // live `kind=Index` marker.
-    store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(
-                    Some(Bytes::from_static(b"v")),
-                    Committed::new(None),
-                    event(1),
-                ),
-            )],
-            &[],
-            &[],
-        )
-        .await?;
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"v")),
+            Committed::new(None),
+            event(1),
+        ),
+    )];
+    store.write_provisional(&c, &writes, &[], &writes).await?;
     store.mark_resolved(&c, slice::from_ref(&cell)).await?;
 
     // Cold sweep: `Cached` finds the collection unseeded, so it drives the
@@ -410,9 +398,8 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
         .await?;
     let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
-    store
-        .write_provisional(&c, &[(cell.clone(), write.clone())], &[], &[])
-        .await?;
+    let writes = [(cell.clone(), write.clone())];
+    store.write_provisional(&c, &writes, &[], &writes).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged
         .into_iter()
@@ -916,16 +903,12 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
 
     // Pre-provision B (a provisional cell + its index marker) so the mixed batch
     // can promote it.
+    let writes_b = [(
+        cell_b.clone(),
+        ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
+    )];
     store
-        .write_provisional(
-            &c,
-            &[(
-                cell_b.clone(),
-                ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
-            )],
-            &[],
-            &[],
-        )
+        .write_provisional(&c, &writes_b, &[], &writes_b)
         .await?;
     // Pre-seed D resolved so the batch's `cell_delete` has a row to remove.
     store
@@ -1165,17 +1148,11 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
             .await?;
         // `event(1)` is never recorded in the oracle, so resolution rolls the
         // staged clear back to `prev`.
-        store
-            .write_provisional(
-                &c,
-                &[(
-                    cell.clone(),
-                    ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
-                )],
-                &[],
-                &[],
-            )
-            .await?;
+        let writes = [(
+            cell.clone(),
+            ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
+        )];
+        store.write_provisional(&c, &writes, &[], &writes).await?;
 
         let (value, co_expiry) = if path == "get_for_cache" {
             let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;

@@ -333,9 +333,11 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 /// clears issues exactly one `mark_resolved` batch set.
 ///
 /// The one routing definition every backend's [`CellStore::commit_provisional`]
-/// calls after its own marker delete. Free (not a trait default) so a wrapper
-/// that forwards the verb cannot silently inherit it and bypass the inner
-/// store's marker delete.
+/// calls before its own marker delete — settle the cells, then drop the
+/// recovery handle, so a crash mid-settle leaves the marker standing to list
+/// the still-provisional cells. Free (not a trait default) so a wrapper that
+/// forwards the verb cannot silently inherit it and bypass the inner store's
+/// marker delete.
 ///
 /// # Errors
 ///
@@ -368,7 +370,7 @@ where
 
 /// Routes an aborted settle to [`CellStore::write_resolved`] over the staged
 /// `prev`s (`prev = None` restores exact absence). The one rollback definition
-/// every backend's [`CellStore::abort_provisional`] calls after its own marker
+/// every backend's [`CellStore::abort_provisional`] calls before its own marker
 /// delete — free, for the reason on [`route_commit`].
 ///
 /// # Errors

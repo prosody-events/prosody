@@ -255,9 +255,9 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
     };
-    let cell0 = store.get(&id, &cell_at(0), probe).await?.into_inner();
+    let resolved0 = store.get(&id, &cell_at(0), probe).await?.into_inner();
     assert_eq!(
-        cell0,
+        resolved0,
         a_committed.then(|| bytes(10)),
         "A's coordinate 0 resolves per A's verdict at B's stage boundary"
     );

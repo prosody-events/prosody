@@ -304,12 +304,16 @@ impl Arbitrary for Outcome {
 /// and the recovery path to use when the outcome is a crash. The flat list is
 /// grouped by collection ([`collapse_writes`]) so each touched collection
 /// stages **all** its cells in one `write_provisional` call (the multi-cell
-/// batch).
+/// batch) — unless `split` is set, which stages a ≥2-cell collection in two
+/// sequential same-event `write_provisional` calls (prefix, then the union),
+/// exercising the same-event marker overwrite at the stage boundary (the second
+/// stage's standing marker is the event's OWN and must not be resolved).
 #[derive(Clone, Debug)]
 struct TraceEvent {
     writes: Vec<(u8, u8, Mutation)>,
     outcome: Outcome,
     recover_by_sweep: bool,
+    split: bool,
 }
 
 impl Arbitrary for TraceEvent {
@@ -322,6 +326,7 @@ impl Arbitrary for TraceEvent {
             writes,
             outcome: Outcome::arbitrary(g),
             recover_by_sweep: bool::arbitrary(g),
+            split: bool::arbitrary(g),
         }
     }
 }
@@ -446,10 +451,68 @@ where
     Ok(count)
 }
 
+/// The per-collection staged writes an event produces: for each touched
+/// collection, its pool index and the `(cell, write)` set staged atomically.
+type StagedWrites = Vec<(u8, Vec<(CellKey, ProvisionalWrite)>)>;
+
+/// Stages every collection in `staged` under `event`, checking each cell's
+/// committed base against the model first (returning `None` on a mismatch — a
+/// property violation the caller surfaces) and returning the per-collection
+/// staged writes for the settle. When `split` is set, a ≥2-cell collection
+/// is staged in two sequential same-event `write_provisional` calls — the
+/// prefix, then the whole set as the union. The second call's standing marker
+/// is the event's OWN; the stage boundary must overwrite it, never resolve it.
+/// This is the only path that exercises the same-event marker overwrite, so
+/// treating an own marker as foreign strands the prefix and fails convergence.
+async fn stage_event<S>(
+    store: &S,
+    ids: &[CollectionId],
+    refs: &[CollectionRef],
+    staged: &[(u8, Vec<(u8, Mutation)>)],
+    model: &[BTreeMap<u8, Option<Bytes>>],
+    event: EventRef,
+    split: bool,
+) -> Result<Option<StagedWrites>>
+where
+    S: CellStore,
+{
+    let mut staged_writes = Vec::with_capacity(staged.len());
+    for (coll, cells) in staged {
+        let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
+        for &(coord, mutation) in cells {
+            let key = cell_at(coord);
+            let prev = store.get(&ids[*coll as usize], &key, event).await?;
+            if prev.get().cloned() != model[*coll as usize].get(&coord).cloned().flatten() {
+                return Ok(None);
+            }
+            cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
+        }
+        let collection = &refs[*coll as usize];
+        if split && cell_writes.len() >= 2 {
+            let mid = cell_writes.len() / 2;
+            store
+                .write_provisional(collection, &cell_writes[..mid], &[], &cell_writes[..mid])
+                .await?;
+            store
+                .write_provisional(collection, &cell_writes[mid..], &[], &cell_writes)
+                .await?;
+        } else {
+            store
+                .write_provisional(collection, &cell_writes, &[], &cell_writes)
+                .await?;
+        }
+        staged_writes.push((*coll, cell_writes));
+    }
+    Ok(Some(staged_writes))
+}
+
 /// Drives `trace` through stores built by `make_store`, asserting the committed
 /// projection equals the model after every event regardless of the resolution
 /// path. A crash rebuilds the store over the same warm backing the closure
-/// captures.
+/// captures. Alongside the committed projection it tracks a
+/// standing-event-marker model and compares it against the row-shape probe
+/// after every event, and its [`stage_event`] split dimension exercises the
+/// same-event marker overwrite.
 pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -491,32 +554,21 @@ where
         }
         let staged = staged.as_slice();
 
-        // Stage each collection's whole cell set in ONE `write_provisional` call
-        // over its committed base (prev-is-committed at stage time: no
-        // provisional cell lingers between events). Keep the staged
-        // `(cell, ProvisionalWrite)` set per collection so the clean arms settle
-        // through `commit_provisional` / `abort_provisional` in one call too
-        // (carrying the projection the write-through cache publishes).
-        let mut staged_writes: Vec<(u8, Vec<(CellKey, ProvisionalWrite)>)> =
-            Vec::with_capacity(staged.len());
-        for (coll, cells) in staged {
-            let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
-            for &(coord, mutation) in cells {
-                let key = cell_at(coord);
-                let prev = store.get(&ids[*coll as usize], &key, event).await?;
-                let prev_value = prev.get().cloned();
-                if prev_value != model[*coll as usize].get(&coord).cloned().flatten() {
-                    return Ok(false);
-                }
-                cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
-            }
-            store
-                .write_provisional(&refs[*coll as usize], &cell_writes, &[], &cell_writes)
-                .await?;
-            // The stage writes (overwriting any lingering foreign marker) this
-            // event's marker for the collection.
+        // Stage each collection's cell set over its committed base
+        // (prev-is-committed at stage time: no provisional cell lingers between
+        // events). Keep the staged `(cell, ProvisionalWrite)` set per collection
+        // so the clean arms settle through `commit_provisional` /
+        // `abort_provisional` in one call too (carrying the projection the
+        // write-through cache publishes).
+        let Some(staged_writes) =
+            stage_event(&store, &ids, &refs, staged, &model, event, ev.split).await?
+        else {
+            return Ok(false);
+        };
+        // Each stage writes (overwriting any lingering foreign marker) this
+        // event's marker for the collection.
+        for (coll, _) in &staged_writes {
             marker_model[*coll as usize] = Some(index as u128);
-            staged_writes.push((*coll, cell_writes));
         }
 
         // Marker strictly after staging; advance the model for committed cells.
@@ -541,9 +593,7 @@ where
                 }
                 // The sweep's marker leg deletes every collection's standing
                 // marker (including any lingering from an earlier first-touch).
-                for marker in &mut marker_model {
-                    *marker = None;
-                }
+                marker_model.fill(None);
             } else {
                 // First-touch under a fresh event so own-event never
                 // short-circuits; the read resolves each staged provisional cell.
@@ -665,10 +715,12 @@ impl Arbitrary for OverwriteTrace {
 
 /// Drives events that NEVER promote or roll back explicitly: each event reads
 /// its committed base through a **cold** store (`make_store`), so a
-/// predecessor's still-provisional cell is resolved through the oracle on read
-/// — the implicit-overwrite / first-touch path. The staged `prev` must equal
-/// the model committed base, and at the end every cell, resolved only by the
-/// next read, must equal the model. Both oracle arms run: a committing
+/// predecessor's still-provisional cell is resolved through the oracle — the
+/// implicit-overwrite / first-touch path. A predecessor is resolved either at
+/// the **next stage of its collection** (the stage-boundary resolve of the
+/// standing foreign marker) or, when its collection is never re-staged, by the
+/// final read. The staged `prev` must equal the model committed base, and at
+/// the end every cell must equal the model. Both oracle arms run: a committing
 /// predecessor promotes to its `data`, a non-committing one rolls back to its
 /// `prev`.
 pub(crate) async fn run_overwrite_trace<S, F>(
@@ -714,7 +766,8 @@ where
         }
     }
 
-    // Every last provisional cell, resolved only by this final read, converges.
+    // Every cell still provisional (a collection never re-staged, so no stage
+    // boundary resolved it), resolved by this final read, converges.
     let store = make_store()?;
     for (i, id) in ids.iter().enumerate() {
         let final_event = EventRef::Message {
@@ -1899,6 +1952,12 @@ mod sweep {
     /// beyond what the point-read filter drops (the incremental set must stay
     /// ⟺ the durable provisional cells). Minting the cold store fresh over the
     /// shared cells is the memory cold-window.
+    ///
+    /// Because each stage's boundary resolves the predecessor's standing
+    /// marker, **only the final op's cell can still be provisional**: a
+    /// trailing `StageOnly` lingers, any trailing settle clears it. So the
+    /// property also asserts both sets against that exact expected set,
+    /// keeping teeth even when the intermediate sets collapse to trivial.
     async fn run_set_agreement(SetOps(ops): SetOps) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
@@ -1916,6 +1975,12 @@ mod sweep {
         // Seed the warm store's latch (empty), so subsequent ops exercise the
         // incrementally-maintained set, not another cold scan.
         let _ = provisional_key_set(&warm, collection.id()).await?;
+
+        // At most the final op's cell survives the stage-boundary resolves.
+        let expected: BTreeSet<CellKey> = match ops.last() {
+            Some(op @ SetOp::StageOnly(_)) => BTreeSet::from([cell_at(op.coord())]),
+            _ => BTreeSet::new(),
+        };
 
         for (i, op) in ops.into_iter().enumerate() {
             let event = EventRef::Message {
@@ -1946,7 +2011,7 @@ mod sweep {
         let warm_set = provisional_key_set(&warm, collection.id()).await?;
         let cold = MemoryCellStore::new(cells, oracle, registry);
         let cold_set = provisional_key_set(&cold, collection.id()).await?;
-        Ok(warm_set == cold_set)
+        Ok(warm_set == expected && cold_set == expected)
     }
 
     /// The seeded in-memory provisional set agrees with the durable provisional

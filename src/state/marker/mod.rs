@@ -8,8 +8,8 @@
 //! rows. [`EventMarker`] is what
 //! [`standing_marker`](super::store::CellStore::standing_marker) returns and
 //! the memory backend stores; this module also owns its frozen
-//! wire [`encode_marker_payload`]/[`decode_marker_payload`] codec (the payload
-//! the Cassandra marker row will carry).
+//! wire `encode_marker_payload`/`decode_marker_payload` codec (the payload the
+//! Cassandra marker row will carry — un-gated from test-only in that phase).
 //!
 //! # Invariants
 //!

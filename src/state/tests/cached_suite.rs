@@ -1309,13 +1309,9 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             prev_of(&committed, key),
                             event,
                         );
+                        let writes = [(cell_at(key), write)];
                         cached
-                            .write_provisional(
-                                &cref,
-                                &[(cell_at(key), write.clone())],
-                                &[],
-                                &[(cell_at(key), write)],
-                            )
+                            .write_provisional(&cref, &writes, &[], &writes)
                             .await?;
                         staged.insert(key, value);
                         death.insert(key, death_at(clock));
