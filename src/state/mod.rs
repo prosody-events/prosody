@@ -64,6 +64,7 @@ pub mod event_ref;
 pub mod fjall;
 pub mod identity;
 pub mod manager;
+pub(crate) mod marker;
 pub mod memory;
 pub mod oracle;
 pub mod order_codec;
