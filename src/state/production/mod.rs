@@ -127,9 +127,6 @@ where
         // cache and its scan coverage both spill to the one per-partition
         // `index` keyspace.
         let CassandraCellResources { session, queries } = &self.cell;
-        // The bottom store's marker-presence latch shares the workspace `index`
-        // keyspace, so it is cold at a fresh assignment and reclaimed at
-        // revocation with the rest of the warm index.
         let cassandra = CassandraStore::new(
             session.clone(),
             queries.clone(),

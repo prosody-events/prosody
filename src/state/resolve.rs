@@ -317,9 +317,9 @@ where
     O: CommitOracle,
 {
     // Marker leg: resolve the standing event marker as a unit before the
-    // per-cell mop-up. A quiescent collection answers `None` (memo-warm on both
-    // backends — no durable marker read), so this is a free no-op almost
-    // always.
+    // per-cell mop-up. A quiescent collection answers `None` (RAM-native on the
+    // memory backend, memo-warm on Cassandra — no durable marker read either
+    // way), so this is a free no-op almost always.
     let marker_ok = match store
         .standing_marker(collection.id())
         .await

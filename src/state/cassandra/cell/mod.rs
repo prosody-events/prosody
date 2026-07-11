@@ -47,8 +47,8 @@
 //! **read-help**: `get`/`scan` (and their cache-fill twins) resolve a standing
 //! foreign clears-bearing marker through the sweep path before serving — the
 //! committed-unapplied read-window contract stated on
-//! [`get`](CellStore::get) — riding the same memo, so the fast path stays a
-//! RAM check.
+//! [`get`](CellStore::get) — riding the same memo, so the fast path pays no
+//! durable marker read.
 //!
 //! The three cell mutators write exactly one cell-column shape each:
 //!
@@ -289,6 +289,9 @@ pub(crate) struct RecoveryReadCounts {
 /// handles cross-collection concurrency. Minted fresh per [`CassandraStore`]
 /// (fresh store per partition acquisition ⇒ cold memo per assignment); clones
 /// share the `Arc`.
+///
+/// One field, still a named type: it anchors the memo and ownership invariants
+/// the module, stage, and settle docs cite.
 #[derive(Debug, Default)]
 struct MarkerMemo {
     standing: scc::HashMap<CollectionId, EventMarker, RandomState>,
@@ -446,9 +449,10 @@ impl<O> CassandraStore<O> {
             .collect()
     }
 
-    /// Mirrors a successful settle into the [`MarkerMemo`]: the marker is now
-    /// durably deleted, so the collection is known marker-absent for the rest
-    /// of the assignment.
+    /// Mirrors a successful settle into the marker memo ([`MarkerMemo`]'s
+    /// standing map plus the presence latch): the marker is now durably
+    /// deleted, so the collection is known marker-absent for the rest of the
+    /// assignment.
     async fn settle_memo(&self, collection: &CollectionId) {
         self.memo.standing.remove_async(collection).await;
         self.presence.set(collection).await;
@@ -532,7 +536,8 @@ where
         try_stream! {
             // Read-help once before the pager opens (`help_read_window`): a
             // standing foreign clears-bearing marker is resolved so the scan
-            // pages post-clear truth. Memo-backed — RAM after the seed read.
+            // pages post-clear truth. Memo-backed — no durable marker read
+            // after the seed read.
             let standing = self.standing_marker(collection).await?;
             help_read_window(self, self.resolver.oracle(), &collection_ref, standing.as_ref(), own)
                 .await
@@ -620,7 +625,8 @@ where
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
         // The committed-unapplied read window (`help_read_window`): consult
-        // the standing marker — memo-backed, so RAM after the one seed read —
+        // the standing marker — memo-backed, so no durable read after the one
+        // seed read —
         // CONCURRENTLY with the cell point read, keeping the ~always
         // marker-free fast path free of serial latency. If the marker was
         // resolved (foreign + clears), the pre-help row may hold a now-erased

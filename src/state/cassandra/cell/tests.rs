@@ -342,7 +342,7 @@ async fn drain_section_scan<S: CellStore>(store: &S, id: &CollectionId) -> Resul
 /// After a clean, fully-settled event, the recovery sweep issues **zero**
 /// Cassandra queries: the stage's boundary check paid the one durable
 /// event-marker point read (a cold memo miss), the settle recorded the marker
-/// known-absent in the RAM memo, so both the cold sweep (marker memo hit,
+/// known-absent in the marker memo, so both the cold sweep (marker memo hit,
 /// nothing listed) and the warm sweep (fjall short-circuit) touch nothing
 /// durable. The zeros are non-vacuous: the same counter provably incremented
 /// at the stage first.
@@ -379,7 +379,7 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
     );
 
     // Cold sweep: `Cached` finds the collection unseeded and drives the
-    // bottom store's seed — whose marker leg answers from the RAM memo
+    // bottom store's seed — whose marker leg answers from the marker memo
     // (settled ⇒ known-absent), so no durable read of either kind.
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
     // Warm sweep: the seeded, empty warm index short-circuits before the
@@ -398,7 +398,7 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 
     // The clear leg adds NO steady-state queries: a second event stages with
     // a section clear and settles through `commit_provisional(…, clears)` —
-    // the Cov-Clr punch is fjall/coverage-only and the boundary rides the RAM
+    // the Cov-Clr punch is fjall/coverage-only and the boundary rides the
     // memo, so the durable marker-read count never moves again and both
     // post-settle sweeps stay at zero durable reads.
     let writes = [(
@@ -559,8 +559,9 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
 }
 
 /// Presence-latch loss degrades to a **re-check, never an under-report**: if
-/// the per-assignment latch is lost mid-assignment (a fjall error, modeled here
-/// as an index-keyspace clear), the next `standing_marker` pays exactly ONE
+/// the per-assignment latch is lost mid-assignment (modeled here as an
+/// index-keyspace clear — the same unchecked answer a fjall read error degrades
+/// to), the next `standing_marker` pays exactly ONE
 /// durable marker point read, still observes the standing durable marker, and
 /// re-seeds the latch — it never rides a stale RAM answer that would strand the
 /// marker. Takes an EXCLUSIVE index keyspace (the clearing-test isolation

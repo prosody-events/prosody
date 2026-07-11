@@ -270,9 +270,10 @@ fn prop_bound_frame_round_trips() {
     QuickCheck::new().quickcheck(prop as fn(ArbBound) -> TestResult);
 }
 
-/// The frozen wire bytes of a coord key, a seeded key, and a cover key/value —
-/// any persisted encoding gets a pinned-bytes test. Also proves a coord key
-/// round-trips back to its `CellKey` and a cover key back to its low bound.
+/// The frozen wire bytes of a coord key, a seeded key, a presence key, and a
+/// cover key/value — any persisted encoding gets a pinned-bytes test. Also
+/// proves a coord key round-trips back to its `CellKey` and a cover key back to
+/// its low bound.
 #[test]
 fn frozen_warm_index_bytes() -> Result<()> {
     let id = fixed_collection("frozen")?;

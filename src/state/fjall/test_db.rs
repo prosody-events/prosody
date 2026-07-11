@@ -79,7 +79,8 @@ pub fn cache_with_clock(name: &str, clock: Clock) -> Result<FjallCellCache> {
 /// store a cold presence domain — an exclusive keyspace name cleared before the
 /// mint, or a handle from the same [`cold_cache`] the assembly rebuilds.
 pub fn presence(name: &str) -> Result<MarkerPresence> {
-    Ok(cache(name)?.presence())
+    let index = shared_database()?.keyspace(&format!("{name}_index"), keyspace_options)?;
+    Ok(MarkerPresence { index })
 }
 
 /// A **cold** [`FjallCellCache`]: get-or-create the `name` keyspace pair, then

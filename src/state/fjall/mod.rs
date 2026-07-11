@@ -193,7 +193,8 @@ pub struct FjallCellCache {
 ///
 /// The [`Database`] is held in both arms because batch writes are issued
 /// through [`Database::batch`], not the keyspace handle. The `index` keyspace
-/// (warm provisional coordinates, scan coverage, and the marker-presence latch)
+/// (warm provisional coordinates, scan coverage, and the cold-seed and
+/// marker-presence latches)
 /// rides alongside `cache` in
 /// both arms purely for lifecycle co-location — it shares the workspace's
 /// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
@@ -219,7 +220,7 @@ impl Inner {
     }
 
     /// The warm-index keyspace handle (provisional coordinates, coverage, and
-    /// the marker-presence latch).
+    /// the cold-seed and marker-presence latches).
     fn index_handle(&self) -> &Keyspace {
         match self {
             Self::Bare { index, .. } => index,
