@@ -278,8 +278,12 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     ///
     /// Sync and infallible by design: it touches only the in-memory dirty
     /// buffer, does no I/O, and cannot fail — deliberately asymmetric with the
-    /// async, fallible [`Self::commit`]. It is valid even on a terminated
-    /// session.
+    /// async, fallible [`Self::commit`]. A terminated session (partition
+    /// shutting down, or the event cancelled) discards nothing and returns
+    /// [`StoreOutcome::NoOp`]: this is the same containment every other cell op
+    /// gets from the descriptor's live-guard, expressed as a `NoOp` because the
+    /// infallible signature cannot surface `Terminated`. It keeps a stale clone
+    /// that outlived its event from draining a later same-key event's buffer.
     ///
     /// Distinct from the settle boundary's rollback of staged provisional cells
     /// (`rollback_aborted`, framework-only, after the handler returns): this is
@@ -767,6 +771,16 @@ where
     }
 
     fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome {
+        // A terminated session must not mutate the shared per-partition dirty
+        // store. Every other cell op refuses a terminated session through the
+        // descriptor's `ensure_live`; rollback, being sync + infallible, cannot
+        // return `Terminated`, so it expresses the same containment as a NoOp —
+        // a terminated session discards nothing. Without this, a stale clone
+        // outliving its event (a handle moved into a spawned task) could drain a
+        // later same-key event's live buffer: a silent lost write.
+        if self.is_terminated() {
+            return StoreOutcome::NoOp;
+        }
         let id = self.id_for(state_type, name);
         let dirty = self.inner.overlay.dirty();
         // Peek-then-drain is race-free per [`DirtyStore::remove_collection`]:

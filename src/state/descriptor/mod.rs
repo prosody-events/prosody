@@ -723,7 +723,10 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Discards this collection's uncommitted buffered ops mid-handler; see
-    /// [`CellSession::rollback`] for the contract.
+    /// [`CellSession::rollback`] for the contract. The terminated-session guard
+    /// lives in the session impl (as a `NoOp`), not here: the infallible
+    /// signature cannot surface [`StateAccessError::Terminated`] the way
+    /// `ensure_live` does for the fallible ops.
     pub(in crate::state::descriptor) fn raw_rollback(&self) -> StoreOutcome {
         self.session.rollback(self.state_type, &self.name)
     }

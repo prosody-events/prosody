@@ -19,8 +19,9 @@
 //! buffer to empty. Two focused examples pin ordering a trace cannot observe:
 //! the single marker flushes **exactly once, strictly after the stage** (the
 //! [`ScriptedOracle`] `record_message` counter); another pins the `commit()`
-//! drain to its own collection. Three deterministic pins nail the `rollback()`
-//! contract.
+//! drain to its own collection. Four deterministic pins nail the `rollback()`
+//! contract, including that a terminated session's rollback is a `NoOp` so a
+//! stale clone cannot drain a later same-key event's buffer.
 
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
@@ -138,6 +139,30 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), self.cancel_rx.clone()),
+        }))
+    }
+
+    /// Mints a session for `event` over a caller-owned cancel watch (sharing
+    /// the fixture's store, oracle, dirty workspace, and key). Production gives
+    /// each event its own per-event cancel signal; the fixture's shared channel
+    /// cannot terminate one event alone, which the stale-clone containment test
+    /// needs.
+    fn session_with_cancel(
+        &self,
+        event: EventRef,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> EventStateScope<Session> {
+        EventStateScope::new(KeyedStateSession::new(SessionParts {
+            cell: self.cell_store(),
+            dirty: self.dirty.clone(),
+            oracle: self.oracle.clone(),
+            loader: (),
+            registry: self.registry.clone(),
+            state_key: self.state_key.clone(),
+            event,
+            recovery_delay: CompactDuration::new(30),
+            armed: self.armed.clone(),
+            termination: TerminationWatch::new(self.shutdown_rx.clone(), cancel_rx),
         }))
     }
 
@@ -510,6 +535,58 @@ async fn rollback_without_a_commit_restores_the_pre_event_value() -> Result<()> 
     // Nothing left to stage, and the buffer is empty for the key.
     assert_eq!(session.finalize().await?, FinalizeOutcome::Clean);
     assert!(fx.dirty.touched(&key).is_empty());
+    Ok(())
+}
+
+/// A stale, terminated session clone must **not** drain a later same-key
+/// event's live buffer. The dirty workspace is shared per partition and keyed
+/// only by `(key, collection)` — no event identity — so a handle a handler
+/// moved into a spawned task addresses exactly the range the next same-key
+/// event buffers into. `rollback()` on a terminated session is therefore a
+/// `NoOp`: the same containment every fallible cell op gets from the
+/// descriptor's live-guard, expressed as a `NoOp` because the infallible
+/// signature cannot surface `Terminated`. Without the guard the stale clone
+/// silently discards the next event's writes.
+#[tokio::test]
+async fn rollback_on_a_terminated_session_is_noop() -> Result<()> {
+    let fx = Fixture::new()?;
+
+    // Event 1 over its own cancel watch; leak a stale clone (the handle a
+    // handler could move into a spawned task).
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let scope1 = fx.session_with_cancel(message(1).0, cancel_rx);
+    let stale = scope1.handle();
+
+    // Event 1 completes: its context is invalidated (cancel latched, exactly
+    // what `EventContext::invalidate` does after every dispatch) and its scope
+    // drops, clearing event 1's dirty range.
+    cancel_tx.send(true)?;
+    assert!(stale.is_terminated());
+    drop(scope1);
+
+    // Event 2 for the same key on a fresh, live cancel watch buffers W.
+    let (_cancel_tx2, cancel_rx2) = watch::channel(false);
+    let scope2 = fx.session_with_cancel(message(2).0, cancel_rx2);
+    let session = scope2.handle();
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"W")
+        .await?;
+
+    // The stale clone's rollback finds a terminated session: NoOp, no drain.
+    assert_eq!(
+        stale.rollback(StateType::Application, &fx.value_name),
+        StoreOutcome::NoOp,
+    );
+
+    // Event 2's buffer is intact: the key is still dirty and event 2 reads its
+    // own W.
+    assert!(!fx.dirty.touched(&fx.state_key.key).is_empty());
+    assert_eq!(
+        session
+            .get(StateType::Application, &fx.value_name, &value_cell())
+            .await?,
+        Some(Bytes::from_static(b"W")),
+    );
     Ok(())
 }
 
