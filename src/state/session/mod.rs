@@ -300,7 +300,7 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
 /// bounds but can neither implement it nor reach the lifecycle: staging,
 /// promoting, and resetting are framework-only moves.
 pub(crate) mod sealed {
-    use super::{CompactDateTime, CompactDuration, Future, StateAccessError, Uuid};
+    use super::{CellStore, CompactDateTime, CompactDuration, Future, StateAccessError, Uuid};
 
     /// Whether `finalize` staged any provisional cells.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,6 +337,15 @@ pub(crate) mod sealed {
 
     /// Framework-only lifecycle over a per-event session.
     pub trait StateLifecycle {
+        /// The uniform durable cell store the session settles against —
+        /// [`KeyedStateSession`](super::KeyedStateSession) projects its
+        /// backend's store (`B::Cell`).
+        // Ruling: zero-consumer today, nominally "don't build surface ahead
+        // of a caller" — owner-confirmed sequencing exception: the settlement
+        // receipt consumes it (`finalize` returning a store-parameterized
+        // receipt), carried early solely to keep that diff reviewable.
+        type Cell: CellStore;
+
         /// Resolves every touched collection by its commit mode:
         /// `ReadCommitted` collections stage a provisional cell (the
         /// staged set is recorded), `ReadUncommitted` collections write
@@ -798,6 +807,8 @@ where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
+    type Cell = B::Cell;
+
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
         let touched = self
             .inner

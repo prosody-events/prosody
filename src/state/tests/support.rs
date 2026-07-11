@@ -7,6 +7,7 @@ use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
+use crate::state::memory::MemoryCellStore;
 use crate::state::oracle::CommitOracle;
 use crate::state::session::CellSession;
 use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
@@ -30,7 +31,7 @@ use uuid::Uuid;
 /// about commit resolution; the commit-tracking double is
 /// [`ScriptedOracle`](super::cell_suite::ScriptedOracle).
 #[derive(Clone)]
-pub(crate) struct FixedOracle(CommitDecision);
+pub struct FixedOracle(CommitDecision);
 
 impl FixedOracle {
     pub(crate) fn committed() -> Self {
@@ -192,6 +193,8 @@ impl<P> StateLifecycle for UnavailableState<P>
 where
     P: Clone + Send + Sync + 'static,
 {
+    type Cell = MemoryCellStore<FixedOracle>;
+
     async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
         Ok(FinalizeOutcome::Clean)
     }
