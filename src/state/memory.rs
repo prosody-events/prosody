@@ -8,7 +8,9 @@ use super::descriptor_identity::{
 use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
-use super::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_marker, resolve_read};
+use super::resolve::{
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, resolve_marker, resolve_read,
+};
 use super::store::{CellStore, route_abort, route_commit};
 use super::{CollectionId, CollectionRef, EventRef, StateType};
 use ahash::RandomState;
@@ -144,6 +146,31 @@ where
     fn map(&self) -> &CellMap {
         &self.cells.inner
     }
+
+    /// Applies one frozen section clear: removes every stored cell of the
+    /// cleared section whose coordinate is not a survivor (positional
+    /// exclusion — the frozen list is sorted, so a binary search decides), and
+    /// clears each removed coordinate from the [`WarmIndex`]. Erasing a
+    /// still-provisional foreign entry is correct (the erasure argument on
+    /// [`CellStore::commit_provisional`]); removal is idempotent.
+    async fn erase_clear(&self, collection: &CollectionId, clear: &SectionClear) {
+        let mut removed: Vec<CellKey> = Vec::new();
+        self.map().iter_sync(|(id, cell), _stored| {
+            if id == collection
+                && cell.section == clear.section()
+                && clear.survivors().binary_search(&cell.coordinate).is_err()
+            {
+                removed.push(cell.clone());
+            }
+            true
+        });
+        for cell in removed {
+            self.map()
+                .remove_async(&(collection.clone(), cell.clone()))
+                .await;
+            self.warm.clear(collection, &cell).await;
+        }
+    }
 }
 
 impl<O> CellStore for MemoryCellStore<O>
@@ -158,8 +185,22 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
-        let raw = self.read_raw(collection, cell);
         let collection_ref = self.resolver.collection_ref(collection);
+        // The committed-unapplied read window: resolve a standing foreign
+        // clears-bearing marker before the raw read (`help_read_window`), so
+        // the read serves post-clear truth. The marker map is RAM — the
+        // ~always marker-free fast path costs one map read.
+        let marker = self.standing_marker(collection).await?;
+        help_read_window(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            marker.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?;
+        let raw = self.read_raw(collection, cell);
         resolve_read(
             self,
             self.resolver.oracle(),
@@ -178,22 +219,29 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        // Snapshot the matching raw cells synchronously (scc holds no borrowing
-        // iterator across an await), then resolve each lazily.
-        let mut raw: Vec<(CellKey, Cell)> = Vec::new();
-        self.map().iter_sync(|(id, cell), stored| {
-            if id == collection && cell.section == scan.section && scan.contains(&cell.coordinate) {
-                raw.push((cell.clone(), stored.to_cell()));
-            }
-            true
-        });
-        raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
-        if scan.dir == Direction::Backward {
-            raw.reverse();
-        }
-        let limit = scan.limit;
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
+            // Read-help before the snapshot (see `get`): a standing foreign
+            // clears-bearing marker is resolved so the snapshot below reads
+            // post-clear truth.
+            let marker = self.standing_marker(collection).await?;
+            help_read_window(self, self.resolver.oracle(), &collection_ref, marker.as_ref(), own)
+                .await
+                .map_err(flatten_resolve)?;
+            // Snapshot the matching raw cells synchronously (scc holds no
+            // borrowing iterator across an await), then resolve each lazily.
+            let mut raw: Vec<(CellKey, Cell)> = Vec::new();
+            self.map().iter_sync(|(id, cell), stored| {
+                if id == collection && cell.section == scan.section && scan.contains(&cell.coordinate) {
+                    raw.push((cell.clone(), stored.to_cell()));
+                }
+                true
+            });
+            raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
+            if scan.dir == Direction::Backward {
+                raw.reverse();
+            }
+            let limit = scan.limit;
             // The limit bounds *yielded* (present) cells, not raw rows: a cleared
             // or rolled-back-to-absent cell in range is skipped without consuming
             // a limit slot (matching the Cassandra scan's `yielded` counter).
@@ -276,37 +324,41 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
-        staged: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
-        // Nothing staged ⇒ no marker and no boundary check (nothing to strand) —
-        // the empty-batch no-op the overwrite generator exercises.
-        if let Some((_, first)) = staged.first() {
-            let event = first.event();
+        // `None` ⇒ the explicit empty-stage no-op: no marker and no boundary
+        // check (nothing to strand). A clears-only stage passes a marker with
+        // empty `staged()` and runs the boundary like any stage.
+        debug_assert!(
+            marker.is_some() || writes.is_empty(),
+            "a markerless stage must write nothing"
+        );
+        if let Some(marker) = marker {
+            debug_assert!(
+                writes
+                    .iter()
+                    .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
+                "every staged write must be listed by the event marker"
+            );
             // Stage boundary: resolve any standing FOREIGN marker (a different
             // event) before overwriting it, establishing marker uniqueness per
             // collection. A resolution failure fails the stage.
-            if let Some(marker) = self
+            if let Some(standing) = self
                 .cells
                 .markers
                 .read_async(collection.id(), |_, marker| marker.clone())
                 .await
-                && marker.event() != event
+                && standing.event() != marker.event()
             {
-                resolve_marker(self, self.resolver.oracle(), collection, &marker)
+                resolve_marker(self, self.resolver.oracle(), collection, &standing)
                     .await
                     .map_err(flatten_resolve)?;
             }
             // Marker-first: order-irrelevant in memory (no mid-call crash), but
-            // mirrors the documented stage ordering. All staged entries carry
-            // the same event, so the first is representative. `clears` beyond
-            // freezing the payload is not applied (no producer yet).
+            // mirrors the documented stage ordering.
             self.cells
                 .markers
-                .upsert_async(
-                    collection.id().clone(),
-                    EventMarker::frozen(event, staged, clears),
-                )
+                .upsert_async(collection.id().clone(), marker.clone())
                 .await;
         }
         for (cell, write) in writes {
@@ -330,11 +382,14 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
-        // Not yet applied: no producer emits a non-empty clear (the section-clear
-        // surface arrives with the fast path). `write_resolved` never touches the
-        // event marker.
-        _clears: &'a [SectionClear],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        // Erase the cleared sections before upserting `cells` (belt-and-braces
+        // — survivors are excluded positionally anyway). `write_resolved`
+        // never touches the marker map.
+        for clear in clears {
+            self.erase_clear(collection.id(), clear).await;
+        }
         for (cell, data) in cells {
             match data {
                 // Present value: upsert the resolved cell.
@@ -399,9 +454,15 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        _clears: &'a [SectionClear],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        // Route, erase, delete — all idempotent, and memory has no mid-call
+        // crash, so the ordering carries no correctness weight (survivors are
+        // excluded from the erase positionally either way).
         route_commit(self, collection, writes).await?;
+        for clear in clears {
+            self.erase_clear(collection.id(), clear).await;
+        }
         // Settle owns the marker delete; removing an absent marker is a no-op
         // (idempotent settle).
         self.cells.markers.remove_async(collection.id()).await;

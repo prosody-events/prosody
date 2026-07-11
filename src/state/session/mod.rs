@@ -58,6 +58,7 @@ use crate::state::descriptor::{
 use crate::state::dirty::{ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::manager::ArmedKeys;
+use crate::state::marker::EventMarker;
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -552,8 +553,9 @@ where
             .map(|(collection_ref, writes)| {
                 cooperative(async move {
                     let result = if committed {
-                        // No section clears this phase (no producer); the
-                        // marker delete is owned by the settle verb.
+                        // No section clears: the session lowers a cleared
+                        // section by per-cell expansion, so its stages freeze
+                        // none. The marker delete is owned by the settle verb.
                         lower
                             .commit_provisional(&collection_ref, &writes, &[])
                             .await
@@ -880,13 +882,15 @@ where
                 return Ok((!cleared.is_empty()).then(|| (collection_ref, Vec::new())));
             }
             // `finalize` builds the staged record exactly once per collection
-            // from the post-checkpoint dirty buffer, so `staged` IS this
-            // stage's writes; only a retry attempt re-running `finalize`
-            // re-stages (an idempotent same-event marker overwrite). `clears`
-            // stay empty: a cleared section's erase rides the per-cell clears
-            // above.
+            // from the post-checkpoint dirty buffer, so the marker lists
+            // exactly this stage's writes; only a retry attempt re-running
+            // `finalize` re-stages (an idempotent same-event marker
+            // overwrite). The marker freezes no clears: the session lowers a
+            // cleared section by per-cell expansion — the erase rides the
+            // per-cell clears above.
+            let marker = EventMarker::frozen(event, &writes, &[]);
             lower
-                .write_provisional(&collection_ref, &writes, &[], &writes)
+                .write_provisional(&collection_ref, &writes, Some(&marker))
                 .await
                 .map_err(|e| StateAccessError::store(&e))?;
             Ok(Some((collection_ref, writes)))

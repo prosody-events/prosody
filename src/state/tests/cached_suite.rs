@@ -177,11 +177,9 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
-        staged: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner
-            .write_provisional(collection, writes, clears, staged)
+        self.inner.write_provisional(collection, writes, marker)
     }
 
     fn write_resolved<'a>(
@@ -410,14 +408,13 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))], &[])
             .await?;
         let prev = cached.get(&id, &cell_at(3), event).await?;
-        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        let writes = [(
+            cell_at(3),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(cell_at(3), write.clone())],
-                &[],
-                &[(cell_at(3), write)],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
         // Prime the warm provisional index: the first sweep is a cold seed (one
@@ -498,19 +495,13 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
         // Leave a provisional cell, then seed the warm index with a cold sweep
         // (records the coordinate into fjall and marks the collection seeded).
         let prev = cached.get(&id, &cell_at(3), event).await?;
+        let writes = [(
+            cell_at(3),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(
-                    cell_at(3),
-                    ProvisionalWrite::new(Some(bytes(5)), prev.clone(), event),
-                )],
-                &[],
-                &[(
-                    cell_at(3),
-                    ProvisionalWrite::new(Some(bytes(5)), prev, event),
-                )],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
         assert_eq!(
             drain_provisional(&cached, &id).await?,
@@ -562,19 +553,13 @@ fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
 
         // Leave a provisional cell.
         let prev = cached.get(&id, &cell_at(3), event).await?;
+        let writes = [(
+            cell_at(3),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(
-                    cell_at(3),
-                    ProvisionalWrite::new(Some(bytes(5)), prev.clone(), event),
-                )],
-                &[],
-                &[(
-                    cell_at(3),
-                    ProvisionalWrite::new(Some(bytes(5)), prev, event),
-                )],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
         // Cold seed with a failing `index_record`: the sweep still finds the
@@ -711,10 +696,14 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
 /// publish-on-settle path), and a "crash" rebuilds the cache cold over the same
 /// warm memory cells (a fresh fjall partition — `CovVolatile`). The committed
 /// projection must converge to the model on every path, with the write-through
-/// publish and the dropped-coverage cold restart both exercised.
+/// publish and the dropped-coverage cold restart both exercised. Runs the
+/// trace **clears-free** ([`Trace::without_clears`]): a committed durable
+/// clear applied beneath `Cached` leaves covered stale values until the
+/// Cov-Clr coverage punch lands, whose phase un-strips this run.
 #[test]
 fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
+        let trace = trace.without_clears();
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         // Each `make` yields a cold cache over the same warm memory cells +
@@ -1020,14 +1009,13 @@ fn promote_punch_failure_never_freezes_stale_prev() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
             .await?;
         let prev = cached.get(&id, &cell_at(0), event).await?;
-        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        let writes = [(
+            cell_at(0),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(cell_at(0), write.clone())],
-                &[],
-                &[(cell_at(0), write)],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
         // The raw promote with the punch's next coverage rewrite failing: the
@@ -1122,13 +1110,10 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         // may fail or not — irrelevant to this test).
         let prev = cached.get(&id, &cell_at(0), event).await?;
         let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        let writes = [(cell_at(0), write.clone())];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(cell_at(0), write.clone())],
-                &[],
-                &[(cell_at(0), write.clone())],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
         // `probe(1)` is a message event with dedup id `1`; record it committed
         // so the promote arm resolves to `data`.
@@ -1310,8 +1295,9 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             event,
                         );
                         let writes = [(cell_at(key), write)];
+                        let marker = EventMarker::frozen(event, &writes, &[]);
                         cached
-                            .write_provisional(&cref, &writes, &[], &writes)
+                            .write_provisional(&cref, &writes, Some(&marker))
                             .await?;
                         staged.insert(key, value);
                         death.insert(key, death_at(clock));

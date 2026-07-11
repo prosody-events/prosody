@@ -204,8 +204,8 @@ where
 /// [`commit_provisional`](CellStore::commit_provisional) (committed) or
 /// [`abort_provisional`](CellStore::abort_provisional) (not committed). Both
 /// verbs delete the marker, including the exhausted case (no live writes),
-/// which is why no separate marker-delete verb exists. `clears` rides through
-/// verbatim (inert until a producer exists, exactly right once it does).
+/// which is why no separate marker-delete verb exists. `clears` ride through
+/// verbatim to the commit arm, which applies the frozen gap erase.
 ///
 /// # Errors
 ///
@@ -255,6 +255,44 @@ where
             .await
             .map_err(ResolveCellError::Store),
     }
+}
+
+/// The committed-unapplied read window: a standing **foreign** event marker
+/// that carries section clears means gap tombstones may not have landed yet,
+/// and a pre-clear resolved row cannot be caught by per-cell oracle resolution
+/// the way a provisional cell is. Resolve the whole marker through the sweep
+/// path ([`resolve_marker`]) before serving the read; markers without clears
+/// are left standing (first-touch stays cell-grained and marker-free).
+///
+/// The one read-help decision, shared by both bottom stores' `get`/`scan`
+/// pairs. Returns whether it resolved, so a caller that read concurrently with
+/// the marker consult re-issues its raw read. The own-event guard is
+/// load-bearing: the staging event's own reads between stage and settle must
+/// NOT resolve its own marker (that would settle the event mid-flight) — the
+/// trigger is strictly *foreign AND clears non-empty*.
+///
+/// # Errors
+///
+/// Returns [`ResolveCellError`] as [`resolve_marker`] would.
+pub(crate) async fn help_read_window<S, O>(
+    store: &S,
+    oracle: &O,
+    collection: &CollectionRef,
+    marker: Option<&EventMarker>,
+    own: EventRef,
+) -> Result<bool, ResolveCellError<S::Error, O::Error>>
+where
+    S: CellStore,
+    O: CommitOracle,
+{
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    if marker.event() == own || marker.clears().is_empty() {
+        return Ok(false);
+    }
+    resolve_marker(store, oracle, collection, marker).await?;
+    Ok(true)
 }
 
 /// Resolves a collection's in-flight stage during recovery. Returns `true` iff

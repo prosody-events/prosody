@@ -35,6 +35,20 @@
 //! strand). The per-assignment RAM memo ([`MarkerMemo`]) bounds durable marker
 //! reads to at most one per collection per assignment.
 //!
+//! The marker also carries the stage's **section clears** (each cleared
+//! section with its frozen survivor list). A committed clear is applied as the
+//! n+1 **gap range deletes** between sorted survivors ([`gaps_unit`]) —
+//! survivors are excluded positionally, never temporally. On the settle path
+//! the gaps and the marker delete ride one indivisible batch unit (a marker
+//! delete landing without its gaps would lose the committed clear forever);
+//! [`write_resolved`](CellStore::write_resolved) applies its direct clears the
+//! same way, marker-free. Until the gaps land, reads are defended by
+//! **read-help**: `get`/`scan` (and their cache-fill twins) resolve a standing
+//! foreign clears-bearing marker through the sweep path before serving — the
+//! committed-unapplied read-window contract stated on
+//! [`get`](CellStore::get) — riding the same memo, so the fast path stays a
+//! RAM check.
+//!
 //! The three cell mutators write exactly one cell-column shape each:
 //!
 //! * [`write_provisional`](CellStore::write_provisional) — *stage*: `data`,
@@ -87,7 +101,7 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, resolve_marker, resolve_read,
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, resolve_marker, resolve_read,
 };
 use crate::state::store::CellStore;
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
@@ -104,7 +118,7 @@ use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;
 use scylla::statement::prepared::PreparedStatement;
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 use std::error::Error;
 use std::sync::Arc;
 #[cfg(test)]
@@ -417,6 +431,49 @@ impl<O> CassandraStore<O>
 where
     O: CommitOracle,
 {
+    /// The stage's marker half, ahead of any row building: the stage-boundary
+    /// resolve, the memo mirror, and the frozen payload's encoding. Returns
+    /// the marker row's blob.
+    ///
+    /// The boundary resolves any standing FOREIGN marker (a different event)
+    /// before overwriting it, establishing marker uniqueness per collection. A
+    /// same-event marker (a retry attempt re-running finalize, or the later
+    /// chunk of a split stage) is overwritten, never resolved. A resolution
+    /// failure fails the stage (retry middleware). The memo is updated BEFORE
+    /// the durable attempt (the over-report-safe direction — see the
+    /// [`MarkerMemo`] invariant).
+    async fn stage_marker(
+        &self,
+        collection: &CollectionRef,
+        marker: &EventMarker,
+    ) -> Result<Bytes, CellStoreError<O::Error>> {
+        if let Some(standing) = self.standing_marker(collection.id()).await?
+            && standing.event() != marker.event()
+        {
+            resolve_marker(self, self.resolver.oracle(), collection, &standing)
+                .await
+                .map_err(flatten_resolve)?;
+        }
+        self.memo
+            .standing
+            .upsert_async(collection.id().clone(), marker.clone())
+            .await;
+        let _ = self
+            .memo
+            .checked
+            .insert_async(collection.id().clone())
+            .await;
+        // The frozen payload rides the store-wide blob convention: the same
+        // zstd `encode_payload` and `encoding`/`version` stamps as every cell
+        // blob, decoded through `decode_blob`.
+        let payload = encode_marker_payload(marker)
+            .map_err(CassandraCellStoreError::from)
+            .map_err(ResolveCellError::Store)?;
+        encode_payload(&payload, VALUE_ENCODING)
+            .map_err(CassandraCellStoreError::from)
+            .map_err(ResolveCellError::Store)
+    }
+
     /// The single resolving section scan, yielding each present cell's
     /// committed bytes **and** its cache-fill co-expiry TTL (the remaining TTL
     /// of whichever blob the row carries — [`decode`]'s `blob_ttl`).
@@ -449,6 +506,13 @@ where
         let end = scan.end.cloned();
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
+            // Read-help once before the pager opens (`help_read_window`): a
+            // standing foreign clears-bearing marker is resolved so the scan
+            // pages post-clear truth. Memo-backed — RAM after the seed read.
+            let standing = self.standing_marker(collection).await?;
+            help_read_window(self, self.resolver.oracle(), &collection_ref, standing.as_ref(), own)
+                .await
+                .map_err(flatten_resolve)?;
             let pk = Pk::of(collection);
             // The start edge always binds its coordinate; the comparator was
             // fixed by the statement selected above.
@@ -530,11 +594,34 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        let (raw, ttl) = match self
-            .point_read::<CellTtlRow>(&self.queries.read_cell_ttl, collection, cell)
-            .await
-            .map_err(ResolveCellError::Store)?
+        let collection_ref = self.resolver.collection_ref(collection);
+        // The committed-unapplied read window (`help_read_window`): consult
+        // the standing marker — memo-backed, so RAM after the one seed read —
+        // CONCURRENTLY with the cell point read, keeping the ~always
+        // marker-free fast path free of serial latency. If the marker was
+        // resolved (foreign + clears), the pre-help row may hold a now-erased
+        // value, so the point read is re-issued.
+        let (row, standing) = futures::join!(
+            self.point_read::<CellTtlRow>(&self.queries.read_cell_ttl, collection, cell),
+            self.standing_marker(collection),
+        );
+        let mut row = row.map_err(ResolveCellError::Store)?;
+        if help_read_window(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            standing?.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?
         {
+            row = self
+                .point_read::<CellTtlRow>(&self.queries.read_cell_ttl, collection, cell)
+                .await
+                .map_err(ResolveCellError::Store)?;
+        }
+        let (raw, ttl) = match row {
             Some(row) => {
                 let (cell, ttl) =
                     decode::try_decode_cell_ttl(row).map_err(ResolveCellError::Store)?;
@@ -542,7 +629,6 @@ where
             }
             None => (Cell::Resolved(Committed::new(None)), None),
         };
-        let collection_ref = self.resolver.collection_ref(collection);
         let committed = resolve_read(
             self,
             self.resolver.oracle(),
@@ -660,54 +746,25 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
-        staged: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
+        // `None` ⇒ the explicit empty-stage no-op: no marker, no boundary
+        // check (nothing to strand). A clears-only stage passes a marker with
+        // empty `staged()` and runs the boundary like any stage.
+        debug_assert!(
+            marker.is_some() || writes.is_empty(),
+            "a markerless stage must write nothing"
+        );
+        debug_assert!(
+            marker.is_none_or(|marker| writes
+                .iter()
+                .all(|(cell, _)| marker.staged().binary_search(cell).is_ok())),
+            "every staged write must be listed by the event marker"
+        );
         let pk = Pk::of(collection.id());
-        // Boundary + marker only when something is staged (`writes ⊆ staged`,
-        // so an empty `staged` is the empty-batch no-op — nothing to strand).
-        // `clears` freezes into the marker payload via `EventMarker::frozen`
-        // but is not yet applied (no producer emits a non-empty clear).
-        let marker_blob: Option<(Bytes, EventRef)> = match staged.first() {
+        let marker_blob: Option<(Bytes, EventRef)> = match marker {
             None => None,
-            Some((_, first)) => {
-                let event = first.event();
-                // Stage boundary: resolve any standing FOREIGN marker (a
-                // different event) before overwriting it, establishing marker
-                // uniqueness per collection. A same-event marker (a retry
-                // attempt re-running finalize) is overwritten, never
-                // resolved. A resolution failure fails the stage (retry
-                // middleware).
-                if let Some(marker) = self.standing_marker(collection.id()).await?
-                    && marker.event() != event
-                {
-                    resolve_marker(self, self.resolver.oracle(), collection, &marker)
-                        .await
-                        .map_err(flatten_resolve)?;
-                }
-                let marker = EventMarker::frozen(event, staged, clears);
-                // Memo BEFORE the durable attempt (the over-report-safe
-                // direction — see the `MarkerMemo` invariant).
-                self.memo
-                    .standing
-                    .upsert_async(collection.id().clone(), marker.clone())
-                    .await;
-                let _ = self
-                    .memo
-                    .checked
-                    .insert_async(collection.id().clone())
-                    .await;
-                // The frozen payload rides the store-wide blob convention: the
-                // same zstd `encode_payload` and `encoding`/`version` stamps
-                // as every cell blob, decoded through `decode_blob`.
-                let payload = encode_marker_payload(&marker)
-                    .map_err(CassandraCellStoreError::from)
-                    .map_err(ResolveCellError::Store)?;
-                let blob = encode_payload(&payload, VALUE_ENCODING)
-                    .map_err(CassandraCellStoreError::from)
-                    .map_err(ResolveCellError::Store)?;
-                Some((blob, event))
-            }
+            Some(marker) => Some((self.stage_marker(collection, marker).await?, marker.event())),
         };
 
         // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
@@ -798,13 +855,14 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
-        // Not yet applied — the section-erase gap deletes arrive with the
-        // durable clear fast path.
-        _clears: &'a [SectionClear],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // A marker-free single-row primitive (the marker lifecycle belongs to
-        // the staged verbs — see `CellStore::write_provisional`), so a fresh
-        // committed write never touches the marker slice.
+        // A marker-free primitive (the marker lifecycle belongs to the staged
+        // verbs — see `CellStore::write_provisional`), so a fresh committed
+        // write never touches the marker slice. A cleared section's gap
+        // deletes lead as one unit (NO marker delete — resolved writes are
+        // marker-free); survivors are the present-data `cells`, excluded from
+        // the gaps positionally, so every batch row stays disjoint.
         let pk = Pk::of(collection.id());
         // Encode each cell's committed `data` up front (owns the `Bytes`); no
         // `prev`, so the blobs carry only `data` + its encoding/version.
@@ -813,7 +871,11 @@ where
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
         }
         let ttl = collection.ttl().map(ttl_to_i32);
-        let units = self.resolved_units(pk, ttl, &blobs, cells);
+        let mut units = Vec::with_capacity(cells.len() + 1);
+        if !clears.is_empty() {
+            units.push(gaps_unit(&self.queries, pk, clears, GapsMarker::MarkerFree));
+        }
+        units.extend(self.resolved_units(pk, ttl, &blobs, cells));
         self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)
@@ -911,14 +973,17 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        _clears: &'a [SectionClear],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // The routing `route_commit` defines — present data promotes in place,
         // a staged clear deletes its row (the row-absence invariant) — packed
-        // natively with the marker delete into ONE `run_batches` call, so the
-        // settle stays one batched round-trip set. Every row disjoint (an
-        // event stages each cell at most once; the marker address is
-        // kind-disjoint), individually idempotent, order-free.
+        // natively with the clear gaps and the marker delete into ONE
+        // `run_batches` call, so the settle stays one batched round-trip set.
+        // Every row disjoint (an event stages each cell at most once; gaps
+        // exclude survivors positionally and each other; the marker address is
+        // kind-disjoint; a `cell_delete` of a staged clear inside a gap range
+        // is a delete/delete tie — harmless), individually idempotent,
+        // order-free.
         let pk = Pk::of(collection.id());
         let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
         units.extend(writes.iter().map(|(cell, write)| {
@@ -939,7 +1004,20 @@ where
                 }],
             )
         }));
-        units.push(marker_delete_unit(pk, &self.queries));
+        // Gaps + marker delete ride ONE indivisible unit: the marker must
+        // never be deleted in a batch that lands without the gap tombstones,
+        // or a committed clear is lost forever. The clears-free settle keeps
+        // the standalone marker-delete unit.
+        if clears.is_empty() {
+            units.push(marker_delete_unit(pk, &self.queries));
+        } else {
+            units.push(gaps_unit(
+                &self.queries,
+                pk,
+                clears,
+                GapsMarker::DeleteMarker,
+            ));
+        }
         self.run_batches(&units)
             .await
             .map_err(ResolveCellError::Store)?;
@@ -1055,7 +1133,8 @@ struct CellBatchRow<'a> {
 /// The column shape a [`CellBatchRow`] binds — one variant per distinct bind
 /// tuple. A cell promote, a cell delete, and a marker delete share the
 /// key-only [`Key`](Self::Key) shape: they differ only in statement and
-/// constant `kind`, both carried as data.
+/// constant `kind`, both carried as data. The two one-coordinate gap deletes
+/// (`gap_below`/`gap_above`) share [`GapEdge`](Self::GapEdge) the same way.
 enum RowShape<'a> {
     /// Stage a provisional cell (`kind=Cell`): the full `data | prev_data |
     /// event` shape plus shared `encoding`/`version`.
@@ -1071,6 +1150,16 @@ enum RowShape<'a> {
     /// TTL), a `cell_delete` (`kind=Cell`), or a `marker_delete`
     /// (`kind=Marker`).
     Key(KeyRow<'a>),
+    /// Whole-section gap delete (`gap_section`): a cleared section with no
+    /// survivors — pk + `kind=Cell` + section, no coordinate predicate.
+    GapSection(GapSectionRow<'a>),
+    /// One-edge gap delete (`gap_below` / `gap_above`): the open range below
+    /// the first or above the last survivor — one bound coordinate, borrowed
+    /// from the frozen survivor list.
+    GapEdge(GapEdgeRow<'a>),
+    /// Open-interval gap delete (`gap_between`): the range between two
+    /// adjacent survivors — two bound coordinates.
+    GapBetween(GapBetweenRow<'a>),
 }
 
 /// The `write_provisional[_no_ttl]` bind shape. `ttl` selects the with-/no-TTL
@@ -1115,6 +1204,29 @@ struct KeyRow<'a> {
     addr: CellAddr<'a>,
 }
 
+/// The `gap_section` bind shape: pk + `kind=Cell` + the cleared section.
+struct GapSectionRow<'a> {
+    pk: Pk<'a>,
+    section: i8,
+}
+
+/// The `gap_below`/`gap_above` bind shape: [`GapSectionRow`]'s columns plus
+/// the one bound survivor coordinate.
+struct GapEdgeRow<'a> {
+    pk: Pk<'a>,
+    section: i8,
+    coordinate: &'a [u8],
+}
+
+/// The `gap_between` bind shape: [`GapSectionRow`]'s columns plus the two
+/// adjacent survivor coordinates bounding the open interval.
+struct GapBetweenRow<'a> {
+    pk: Pk<'a>,
+    section: i8,
+    low: &'a [u8],
+    high: &'a [u8],
+}
+
 impl BatchRow for CellBatchRow<'_> {
     fn statement(&self) -> &PreparedStatement {
         self.statement
@@ -1132,6 +1244,9 @@ impl SerializeRow for CellBatchRow<'_> {
             RowShape::Resolved(row) => row.serialize(ctx, writer),
             RowShape::MarkerWrite(row) => row.serialize(ctx, writer),
             RowShape::Key(row) => row.serialize(ctx, writer),
+            RowShape::GapSection(row) => row.serialize(ctx, writer),
+            RowShape::GapEdge(row) => row.serialize(ctx, writer),
+            RowShape::GapBetween(row) => row.serialize(ctx, writer),
         }
     }
 
@@ -1304,8 +1419,160 @@ impl SerializeRow for KeyRow<'_> {
     }
 }
 
+impl SerializeRow for GapSectionRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        (
+            self.pk.segment_id,
+            self.pk.key,
+            self.pk.state_type,
+            self.pk.name,
+            CellKind::Cell,
+            self.section,
+        )
+            .serialize(ctx, writer)
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SerializeRow for GapEdgeRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        (
+            self.pk.segment_id,
+            self.pk.key,
+            self.pk.state_type,
+            self.pk.name,
+            CellKind::Cell,
+            self.section,
+            self.coordinate,
+        )
+            .serialize(ctx, writer)
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SerializeRow for GapBetweenRow<'_> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        writer: &mut RowWriter<'_>,
+    ) -> Result<(), SerializationError> {
+        (
+            self.pk.segment_id,
+            self.pk.key,
+            self.pk.state_type,
+            self.pk.name,
+            CellKind::Cell,
+            self.section,
+            self.low,
+            self.high,
+        )
+            .serialize(ctx, writer)
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// Whether [`gaps_unit`] appends the marker-delete row to the gap rows.
+#[derive(Clone, Copy)]
+enum GapsMarker {
+    /// The commit-settle path: gaps + marker delete are one indivisible unit,
+    /// so the marker can never die in a batch that lands without its gaps.
+    DeleteMarker,
+    /// The resolved-write path: marker-free by design, gaps only.
+    MarkerFree,
+}
+
+/// One **indivisible** batch unit erasing every cleared section: per section,
+/// the n+1 gap range deletes around its sorted, deduped survivors
+/// (`< k₁`, `(k₁,k₂)`, …, `> kₙ`; `gap_section` alone when no survivor) —
+/// plus, on the commit path, the marker-delete row. Sized once
+/// (`Σ survivors + 1` rows per section); bound coordinates borrow from the
+/// frozen [`SectionClear`]s, no copies. An open interval between adjacent
+/// distinct survivors is never empty-inverted, and a `< k₁` on an empty
+/// coordinate matches nothing — harmless.
+fn gaps_unit<'u>(
+    queries: &'u CellQueries,
+    pk: Pk<'u>,
+    clears: &'u [SectionClear],
+    marker: GapsMarker,
+) -> BatchUnit<CellBatchRow<'u>> {
+    let count = clears
+        .iter()
+        .map(|clear| clear.survivors().len() + 1)
+        .sum::<usize>()
+        + usize::from(matches!(marker, GapsMarker::DeleteMarker));
+    let mut rows: SmallVec<[CellBatchRow<'u>; 2]> = SmallVec::with_capacity(count);
+    let mut weight = count as u64 * PER_STATEMENT_OVERHEAD;
+    for clear in clears {
+        let section = i8::from(clear.section());
+        let survivors = clear.survivors();
+        let (Some(first), Some(last)) = (survivors.first(), survivors.last()) else {
+            rows.push(CellBatchRow {
+                statement: &queries.gap_section,
+                row: RowShape::GapSection(GapSectionRow { pk, section }),
+            });
+            continue;
+        };
+        weight += (first.as_bytes().len() + last.as_bytes().len()) as u64;
+        rows.push(CellBatchRow {
+            statement: &queries.gap_below,
+            row: RowShape::GapEdge(GapEdgeRow {
+                pk,
+                section,
+                coordinate: first.as_bytes(),
+            }),
+        });
+        for pair in survivors.windows(2) {
+            weight += (pair[0].as_bytes().len() + pair[1].as_bytes().len()) as u64;
+            rows.push(CellBatchRow {
+                statement: &queries.gap_between,
+                row: RowShape::GapBetween(GapBetweenRow {
+                    pk,
+                    section,
+                    low: pair[0].as_bytes(),
+                    high: pair[1].as_bytes(),
+                }),
+            });
+        }
+        rows.push(CellBatchRow {
+            statement: &queries.gap_above,
+            row: RowShape::GapEdge(GapEdgeRow {
+                pk,
+                section,
+                coordinate: last.as_bytes(),
+            }),
+        });
+    }
+    if matches!(marker, GapsMarker::DeleteMarker) {
+        rows.push(CellBatchRow {
+            statement: &queries.marker_delete,
+            row: RowShape::Key(KeyRow {
+                kind: CellKind::Marker,
+                addr: CellAddr::marker(pk),
+            }),
+        });
+    }
+    BatchUnit::new(weight, rows)
+}
+
 /// The one-row batch unit deleting a collection's event-marker row at its
-/// fixed address — appended by both settle verbs.
+/// fixed address — appended by the clears-free settle verbs.
 fn marker_delete_unit<'u>(pk: Pk<'u>, queries: &'u CellQueries) -> BatchUnit<CellBatchRow<'u>> {
     BatchUnit::new(
         PER_STATEMENT_OVERHEAD,
@@ -1420,7 +1687,9 @@ cassandra_queries! {
     /// start coordinate ([`ScanEdge`] has no unbounded variant). The end bound
     /// is enforced in code (`past_end`), so it needs no statement variant. The
     /// `marker_*` statements maintain and point-read the one fixed-address
-    /// event-marker row that bounds recovery. None use `ALLOW FILTERING`.
+    /// event-marker row that bounds recovery. The `gap_*` statements are the
+    /// section-clear range deletes (`gaps_unit`) — writes, never reads, so
+    /// no statement can scan a tombstone field. None use `ALLOW FILTERING`.
     pub struct CellQueries {
         /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
@@ -1590,6 +1859,42 @@ cassandra_queries! {
             "DELETE FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Whole-section gap delete: erases a cleared section with no
+        /// survivors as one clustering-range tombstone (`kind` bound
+        /// `CellKind::Cell`; a write, never a read — no TTL clause).
+        gap_section: (
+            "DELETE FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Gap delete below the first survivor (`coordinate < ?`).
+        gap_below: (
+            "DELETE FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate < ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Gap delete between two adjacent survivors
+        /// (`coordinate > ? AND coordinate < ?` — both exclusive, so the
+        /// survivors themselves are never covered).
+        gap_between: (
+            "DELETE FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate > ? AND coordinate < ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Gap delete above the last survivor (`coordinate > ?`).
+        gap_above: (
+            "DELETE FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate > ?",
             TABLE_KEYED_STATE_CELL
         ),
     }

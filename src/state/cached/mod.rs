@@ -708,8 +708,7 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
-        staged: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
         // Boundary punch: the lower store's stage boundary resolves any
         // standing FOREIGN event marker *beneath* this cache — a settle no
@@ -724,11 +723,11 @@ where
         // (the lower read is oracle-resolving), and the uncommitted arm needs
         // no special casing — the punch is still harmless. RAM-warm via the
         // lower store's marker memo, so the fast path adds no durable read.
-        if let Some((_, first)) = staged.first()
-            && let Some(marker) = self.lower.standing_marker(collection.id()).await?
-            && marker.event() != first.event()
+        if let Some(marker) = marker
+            && let Some(standing) = self.lower.standing_marker(collection.id()).await?
+            && standing.event() != marker.event()
         {
-            self.punch_cells_must_succeed(collection.id(), marker.staged().iter())
+            self.punch_cells_must_succeed(collection.id(), standing.staged().iter())
                 .await;
         }
         // Anchor the co-expiry on a clock read taken BEFORE the lower write
@@ -739,7 +738,7 @@ where
         let stamped_at = self.fjall.clock().now_ms();
         if let Err(error) = self
             .lower
-            .write_provisional(collection, writes, clears, staged)
+            .write_provisional(collection, writes, marker)
             .await
         {
             // A partial durable stage may have landed cells the warm set now

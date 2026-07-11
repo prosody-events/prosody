@@ -5,25 +5,24 @@ pub(crate) mod identity_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    MemoryShapeProbe, OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace,
-    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    ApplyTrace, MemoryShapeProbe, OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace,
+    run_apply_idempotence, run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace,
+    run_overwrite_trace,
 };
-use self::cell_suite::{bytes, cell_at};
+use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
     DequeHoles, DequeTrace, MapTrace, run_deque_holes, run_deque_trace, run_map_trace,
     run_map_ttl_bounds_trace,
 };
 use self::support::fresh_collection;
 use super::cell::ProvisionalWrite;
-use super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use super::dirty::DirtyStore;
+use super::marker::{EventMarker, SectionClear};
 use super::memory::{MemoryCellStore, MemoryCells};
 use super::oracle::CommitOracle;
-use super::overlay::Overlay;
 use super::registry::CollectionDefRegistry;
 use super::store::CellStore;
 use super::{CollectionRef, CommitMode, EventRef};
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use futures::executor;
 use quickcheck::QuickCheck;
@@ -116,91 +115,9 @@ fn prop_memory_overlay_view() {
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
-/// A dirty clear marker is scoped to exactly its section: clearing section 1
-/// hides section 1's committed cell from both `get` and `scan_cells` while the
-/// sibling section-0 cell stays visible through both. Pins the section
-/// argument of the overlay's two marker checks — the overlay property drives
-/// a single section, and through the collection handles the clear expansion
-/// masks the marker, so a marker consulted at the wrong section (serving a
-/// cleared section's stale rows, or hiding a live sibling section) is
-/// invisible to both.
-#[test]
-fn overlay_clear_marker_is_section_scoped() -> Result<()> {
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
-        let lower = memory_store(MemoryCells::new(), oracle);
-        let id = fresh_collection("sections")?;
-        let collection = CollectionRef::new(id.clone(), None);
-        let own = EventRef::Message {
-            dedup_id: Uuid::from_u128(1),
-        };
-        let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower);
-
-        // One committed cell in each of two sections, at the same coordinate.
-        let cell_in = |section: i8| CellKey {
-            section: Section::new(section),
-            coordinate: Coordinate::from_bytes(vec![0]),
-        };
-        for section in [0, 1] {
-            let cell = cell_in(section);
-            let value = Some(bytes(section.unsigned_abs()));
-            overlay
-                .lower()
-                .write_resolved(&collection, &[(cell, value)], &[])
-                .await?;
-        }
-
-        overlay.dirty().clear_section(&id, Section::new(1));
-
-        // `get`: the cleared section reads absent, the sibling stays visible.
-        assert_eq!(
-            overlay.get(&id, &cell_in(1), own).await?.into_inner(),
-            None,
-            "the cleared section's committed cell is hidden from get"
-        );
-        assert_eq!(
-            overlay.get(&id, &cell_in(0), own).await?.into_inner(),
-            Some(bytes(0)),
-            "the sibling section's committed cell stays visible to get"
-        );
-
-        // `scan_cells`: the same scoping through the range leg.
-        let low = Coordinate::empty();
-        let high = Coordinate::from_bytes(vec![u8::MAX]);
-        let mut scanned = Vec::new();
-        for section in [0, 1] {
-            let scan = Scan {
-                section: Section::new(section),
-                start: ScanEdge::Included(&low),
-                dir: Direction::Forward,
-                end: ScanEdge::Included(&high),
-                limit: None,
-            };
-            let stream = overlay.scan_cells(&id, scan, own);
-            futures::pin_mut!(stream);
-            let mut cells = Vec::new();
-            while let Some(item) = stream.next().await {
-                let (key, value) = item?;
-                cells.push((key, value));
-            }
-            scanned.push(cells);
-        }
-        assert_eq!(
-            scanned[0],
-            vec![(cell_in(0), bytes(0))],
-            "the sibling section's committed cell stays visible to scan"
-        );
-        assert!(
-            scanned[1].is_empty(),
-            "the cleared section's committed cell is hidden from scan"
-        );
-        Ok(())
-    })
-}
-
 /// Scan correctness directly over `MemoryCellStore::scan_cells` (no overlay):
 /// the backend's own ordering, range bounds, and limit handling match the
-/// committed-only oracle.
+/// committed-only oracle — including post-clear (gap-erased) section states.
 #[test]
 fn prop_memory_bottom_scan() {
     fn property(trace: ScanTrace) -> Result<bool> {
@@ -308,14 +225,21 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
     // Stage event A at coordinates {0, 1} over an empty base.
     let a_dedup = Uuid::from_u128(1);
     let a = EventRef::Message { dedup_id: a_dedup };
-    let prev0 = store.get(&id, &cell_at(0), a).await?;
-    let prev1 = store.get(&id, &cell_at(1), a).await?;
+    let prev0 = store.get(&id, &cell_in(0, 0), a).await?;
+    let prev1 = store.get(&id, &cell_in(0, 1), a).await?;
     let writes_a = [
-        (cell_at(0), ProvisionalWrite::new(Some(bytes(10)), prev0, a)),
-        (cell_at(1), ProvisionalWrite::new(Some(bytes(11)), prev1, a)),
+        (
+            cell_in(0, 0),
+            ProvisionalWrite::new(Some(bytes(10)), prev0, a),
+        ),
+        (
+            cell_in(0, 1),
+            ProvisionalWrite::new(Some(bytes(11)), prev1, a),
+        ),
     ];
+    let marker_a = EventMarker::frozen(a, &writes_a, &[]);
     store
-        .write_provisional(&collection, &writes_a, &[], &writes_a)
+        .write_provisional(&collection, &writes_a, Some(&marker_a))
         .await?;
     if a_committed {
         oracle.record_message(a_dedup).await?;
@@ -329,13 +253,14 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
     let b = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
-    let prev_b = store.get(&id, &cell_at(1), b).await?;
+    let prev_b = store.get(&id, &cell_in(0, 1), b).await?;
     let writes_b = [(
-        cell_at(1),
+        cell_in(0, 1),
         ProvisionalWrite::new(Some(bytes(21)), prev_b, b),
     )];
+    let marker_b = EventMarker::frozen(b, &writes_b, &[]);
     store
-        .write_provisional(&collection, &writes_b, &[], &writes_b)
+        .write_provisional(&collection, &writes_b, Some(&marker_b))
         .await?;
 
     // Exactly B's one staged cell remains provisional — checked BEFORE any
@@ -365,7 +290,7 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
     };
-    let resolved0 = store.get(&id, &cell_at(0), probe).await?.into_inner();
+    let resolved0 = store.get(&id, &cell_in(0, 0), probe).await?.into_inner();
     assert_eq!(
         resolved0,
         a_committed.then(|| bytes(10)),
@@ -385,4 +310,115 @@ fn boundary_resolves_committed_foreign_marker() -> Result<()> {
 #[test]
 fn boundary_resolves_aborted_foreign_marker() -> Result<()> {
     executor::block_on(boundary_resolve_pin(false))
+}
+
+/// The clears-only stage boundary: event A stages cells {0, 1}, the process
+/// crashes with no recovery, then event B stages **clears only** — an empty
+/// write set whose marker carries a cleared section. The boundary must resolve
+/// A's marker exactly as a writing stage would (A's cells settle per A's
+/// verdict, nothing of A stays provisional) while B's clears-bearing marker
+/// stands. The crash-trace generator's clears dimension produces this shape
+/// organically; this pin is its fast deterministic falsifier, matching the
+/// documented role of [`boundary_resolve_pin`].
+async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let id = fresh_collection("clears-only-boundary")?;
+    let collection = CollectionRef::new(id.clone(), None);
+    let store = memory_store(cells.clone(), oracle.clone());
+
+    // Stage event A at section-0 coordinates {0, 1} over an empty base.
+    let a_dedup = Uuid::from_u128(1);
+    let a = EventRef::Message { dedup_id: a_dedup };
+    let prev0 = store.get(&id, &cell_in(0, 0), a).await?;
+    let prev1 = store.get(&id, &cell_in(0, 1), a).await?;
+    let writes_a = [
+        (
+            cell_in(0, 0),
+            ProvisionalWrite::new(Some(bytes(10)), prev0, a),
+        ),
+        (
+            cell_in(0, 1),
+            ProvisionalWrite::new(Some(bytes(11)), prev1, a),
+        ),
+    ];
+    let marker_a = EventMarker::frozen(a, &writes_a, &[]);
+    store
+        .write_provisional(&collection, &writes_a, Some(&marker_a))
+        .await?;
+    if a_committed {
+        oracle.record_message(a_dedup).await?;
+    }
+
+    // Crash with no recovery, then event B stages CLEARS ONLY on section 1:
+    // writes = [], marker with one cleared section (no survivors).
+    let store = memory_store(cells.clone(), oracle.clone());
+    let b = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let clears_b = [SectionClear::frozen(SECTIONS[1], &[])];
+    let marker_b = EventMarker::frozen(b, &[], &clears_b);
+    store
+        .write_provisional(&collection, &[], Some(&marker_b))
+        .await?;
+
+    // Raw probes BEFORE any resolving read — a `get` would read-help-resolve
+    // B's clears-bearing marker and destroy the shape under test.
+    let standing = cells
+        .standing_marker_of(&id)
+        .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
+    assert_eq!(standing.event(), b, "B's marker replaced A's");
+    assert_eq!(
+        standing.clears().len(),
+        1,
+        "B's marker carries its cleared section"
+    );
+    assert!(
+        cells.provisional_coordinates(&id).is_empty(),
+        "the boundary resolved all of A's cells; B staged nothing"
+    );
+
+    // A's cells settled per A's verdict (these reads resolve B's marker via
+    // read-help — after the shape assertions above, and section 0 is
+    // untouched by B's section-1 clear either way).
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    for (c, value) in [(0, bytes(10)), (1, bytes(11))] {
+        let resolved = store.get(&id, &cell_in(0, c), probe).await?.into_inner();
+        assert_eq!(
+            resolved,
+            a_committed.then(|| value.clone()),
+            "A's coordinate {c} resolves per A's verdict at B's clears-only boundary"
+        );
+    }
+    Ok(())
+}
+
+/// Clears-only boundary resolve when A committed.
+#[test]
+fn clears_only_boundary_resolves_committed_foreign_marker() -> Result<()> {
+    executor::block_on(clears_only_boundary_pin(true))
+}
+
+/// Clears-only boundary resolve when A aborted.
+#[test]
+fn clears_only_boundary_resolves_aborted_foreign_marker() -> Result<()> {
+    executor::block_on(clears_only_boundary_pin(false))
+}
+
+/// Apply idempotence over the memory cell store: any generated interleaving of
+/// marker resolution, verdict-matching settle re-applies, and per-cell
+/// first-touches over one staged set with durable section clears converges to
+/// the verdict state — no marker, no provisional residue, exact row shape.
+#[test]
+fn prop_memory_apply_idempotence() {
+    fn property(input: ApplyTrace) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let store = memory_store(cells.clone(), oracle.clone());
+        let probe = MemoryShapeProbe(cells);
+        executor::block_on(run_apply_idempotence(store, oracle, input, &probe))
+    }
+    QuickCheck::new().quickcheck(property as fn(ApplyTrace) -> Result<bool>);
 }

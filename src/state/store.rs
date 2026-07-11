@@ -89,6 +89,17 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// provisional cell through the oracle (or short-circuiting to its `prev`
     /// when `own` owns it). A missing row resolves to `Committed(None)`.
     ///
+    /// # The committed-unapplied read window
+    ///
+    /// Reads return **marker-resolved truth**: a standing **foreign** event
+    /// marker that carries section clears is resolved through the sweep path
+    /// (`help_read_window` in `resolve`) before the read is served, so a
+    /// committed-but-unapplied clear can never serve pre-clear rows. Markers
+    /// without clears are left standing — first-touch resolution stays
+    /// cell-grained and marker-free. [`Self::scan_cells`] and the cache-fill
+    /// twins ([`Self::get_for_cache`] / [`Self::scan_for_cache`]) share the
+    /// same implementation, so the contract holds across all four reads.
+    ///
     /// # Errors
     ///
     /// Returns [`Self::Error`] on a store failure, a corrupt row shape, or an
@@ -103,7 +114,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Complete, ordered, single-section scan (start positional, section
     /// required). Provisional cells in range are oracle-resolved here; cleared
     /// or absent cells are skipped, so the stream yields only present committed
-    /// bytes in `coordinate` byte order.
+    /// bytes in `coordinate` byte order. Returns marker-resolved truth exactly
+    /// as [`Self::get`] does (the committed-unapplied read window, stated
+    /// there).
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -182,8 +195,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 
     /// Stages each `(cell, write)`'s provisional cell (`data | prev | event`)
     /// in one same-partition batch, binding `collection`'s TTL, and
-    /// creates/overwrites the collection's **event marker** — the durable
-    /// recovery handle naming the staging event and the coordinates it staged.
+    /// creates/overwrites the collection's **event marker** from the
+    /// pre-frozen `marker` — the durable recovery handle naming the staging
+    /// event, the coordinates it staged, and the sections it cleared.
     ///
     /// # The event-marker lifecycle (stated once, here)
     ///
@@ -195,27 +209,30 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// provisional to recover — so a fresh-commit no-op marker write is
     /// unrepresentable.
     ///
-    /// `staged` is the event's **whole** per-collection staged set
-    /// (`writes ⊆ staged`); the marker lists it, so a stage that splits over
-    /// the byte budget overwrites the marker with the full set rather than
+    /// `marker` carries the event's **whole** per-collection staged set
+    /// (`writes ⊆ marker.staged()`), so a stage that splits over the byte
+    /// budget passes the same union marker with every chunk rather than
     /// stranding a coordinate (an unlisted durable row is invisible to the
-    /// recovery sweep). The session builds it once per collection at
+    /// recovery sweep). The session freezes it once per collection at
     /// `finalize`; only a retry attempt re-running `finalize` re-stages,
     /// replacing the same-event marker idempotently — handlers are assumed
-    /// deterministic across retries. An **empty** `staged` writes no marker
-    /// and skips the boundary check below (nothing staged ⇒ nothing to
-    /// strand).
+    /// deterministic across retries. `None` is the explicit empty-stage no-op
+    /// (`writes` must be empty): no marker, no boundary check — nothing to
+    /// strand. A **clears-only** stage is representable as `writes = []` with
+    /// a marker whose `staged()` is empty and `clears()` non-empty; it writes
+    /// the marker and runs the boundary check like any stage, because a
+    /// committed-unapplied clear is recoverable state.
     ///
-    /// Before staging, the backend resolves any **foreign** standing marker (a
-    /// different event) — the stage-boundary rule that keeps marker uniqueness
-    /// per collection an invariant; a resolution failure fails the stage (the
-    /// retry middleware handles it).
+    /// Before staging, the backend resolves any standing marker naming a
+    /// **different** event — the stage-boundary rule that keeps marker
+    /// uniqueness per collection an invariant; a resolution failure fails the
+    /// stage (the retry middleware handles it).
     ///
-    /// `clears` names each cleared section with its frozen survivor list,
-    /// frozen into the marker payload here so re-apply during recovery
-    /// stays a pure function of durable staged data. No producer emits a
-    /// non-empty `clears` until the session's section-clear surface exists,
-    /// so backends freeze the payload but do not yet apply the erase.
+    /// The marker's `clears` are frozen here and **applied at settle** (see
+    /// [`commit_provisional`](Self::commit_provisional)), so re-apply during
+    /// recovery stays a pure function of durable staged data. The session
+    /// still lowers handler clears by per-cell expansion and freezes no
+    /// clears; the recovery sweep replaying a marker is the live producer.
     ///
     /// # Errors
     ///
@@ -224,8 +241,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
-        staged: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     /// Writes each `(cell, data)` as a resolved cell in one same-partition
@@ -236,10 +252,13 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// and rollback-to-absent. Never touches the event marker (see
     /// [`write_provisional`](Self::write_provisional)).
     ///
-    /// `clears` names sections to erase before applying `cells` — the
-    /// direct-apply twin of a staged clear. No producer emits a non-empty
-    /// `clears` yet, so backends document (not silently hide) that the
-    /// parameter is not yet applied.
+    /// `clears` names sections to erase before `cells` land — the direct-apply
+    /// twin of a staged clear: every non-survivor row of each cleared section
+    /// is deleted (on Cassandra as gap range tombstones between the sorted
+    /// survivors), with survivors excluded **positionally** via the frozen
+    /// list. The caller derives each clear's survivors from `cells`' own
+    /// present-data coordinates — the single survivor definition — so no
+    /// written row can overlap a gap range (batches stay row-disjoint).
     ///
     /// # Errors
     ///
@@ -296,9 +315,16 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// delete, a leaked marker with no compile error. Making both settle verbs
     /// required makes that bug class uncompilable.
     ///
-    /// `clears` frozen at stage time flow through inertly until a producer
-    /// exists (see [`write_provisional`](Self::write_provisional)). Idempotent;
-    /// the sweep retries it.
+    /// `clears` (frozen at stage time) are **applied here**: each cleared
+    /// section's non-survivor rows are erased — on Cassandra as the n+1 gap
+    /// range deletes between sorted survivors, packed with the marker delete
+    /// into one indivisible batch unit (a marker delete landing without its
+    /// gaps would lose the committed clear forever). Erasing a
+    /// still-provisional **foreign** row is correct: single-writer ordering
+    /// puts the committed clear after every pre-existing row, so a
+    /// non-survivor's post-clear state is absent regardless of its unresolved
+    /// history (the erasure argument). Survivors are protected positionally by
+    /// the frozen list, never temporally. Idempotent; the sweep retries it.
     ///
     /// # Errors
     ///

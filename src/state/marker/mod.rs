@@ -59,9 +59,10 @@ impl SectionClear {
     /// coordinates of that section's staged cells whose data is present,
     /// ascending. The one survivor definition — the session builds these from
     /// its staged record, the stage freezes them into the payload verbatim,
-    /// and the sweep replays them from the payload verbatim. No production
-    /// caller constructs a clear until the section-clear surface lands; until
-    /// then only the marker-payload tests exercise it.
+    /// and the settle/sweep replay them from the payload verbatim. No
+    /// production caller constructs a clear while the session lowers clears by
+    /// per-cell expansion; the marker-payload tests and the backend suite
+    /// runners (crash, scan, and apply-idempotence traces) exercise it.
     #[cfg(test)]
     #[must_use]
     pub(in crate::state) fn frozen(
