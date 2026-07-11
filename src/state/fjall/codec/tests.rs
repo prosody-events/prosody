@@ -1,7 +1,7 @@
 use super::{
     Read, collection_prefix, coord_cell_key, cover_low_bound, decode_bound, decode_cell,
     encode_absent_cell, encode_bound, encode_present_cell, index_coord_key, index_cover_key,
-    index_seeded_key,
+    index_presence_key, index_seeded_key,
 };
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::tests::support::{arb_coordinate, fixed_collection};
@@ -293,7 +293,17 @@ fn frozen_warm_index_bytes() -> Result<()> {
     let seeded = index_seeded_key(&id);
     let mut expected = prefix.to_vec();
     expected.push(0x01);
-    assert_eq!(seeded, expected, "seeded key layout");
+    assert_eq!(seeded.as_slice(), expected.as_slice(), "seeded key layout");
+
+    // presence key: [hash][Presence=0x03].
+    let presence = index_presence_key(&id);
+    let mut expected = prefix.to_vec();
+    expected.push(0x03);
+    assert_eq!(
+        presence.as_slice(),
+        expected.as_slice(),
+        "presence key layout"
+    );
 
     // cover key: [hash][Cover=0x02][section=0x07][lo-frame]; the lo-frame is
     // [Included=0x01][coordinate]. The stored value is the hi-frame.

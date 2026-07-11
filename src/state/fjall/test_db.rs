@@ -23,7 +23,7 @@
 //! reclaimer.
 
 use super::workspace::keyspace_options;
-use super::{Clock, FjallCellCache};
+use super::{Clock, FjallCellCache, MarkerPresence};
 use color_eyre::eyre::{Result, eyre};
 use fjall::{Database, Keyspace};
 use std::sync::LazyLock;
@@ -69,6 +69,17 @@ pub fn cache(name: &str) -> Result<FjallCellCache> {
 pub fn cache_with_clock(name: &str, clock: Clock) -> Result<FjallCellCache> {
     let (database, cache, index) = keyspace_pair(name)?;
     Ok(FjallCellCache::with_clock(database, cache, index, clock))
+}
+
+/// A [`MarkerPresence`] handle over the `name` warm-index keyspace — the bare
+/// bottom store's marker-checked latch. Shares [`cache`]'s isolation contract
+/// (distinct v4 segments keep non-clearing tests disjoint) with one addition:
+/// the latch is **per-assignment** state, so a test that mints a SECOND store
+/// over the same collection (modeling reassignment/crash) must give the new
+/// store a cold presence domain — an exclusive keyspace name cleared before the
+/// mint, or a handle from the same [`cold_cache`] the assembly rebuilds.
+pub fn presence(name: &str) -> Result<MarkerPresence> {
+    Ok(cache(name)?.presence())
 }
 
 /// A **cold** [`FjallCellCache`]: get-or-create the `name` keyspace pair, then

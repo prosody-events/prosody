@@ -63,8 +63,8 @@ const COLLECTION_PREFIX_LEN: usize = 16;
 ///
 /// A serialize-only discriminator (`From<_> for u8`) that leads each key we
 /// write. Reads are always prefix-scoped to one family (a `Coord`/`Cover`
-/// range, or a `Seeded` point key), so the discriminator is never decoded back
-/// — the family is known from the range that produced the key.
+/// range, or a `Seeded`/`Presence` point key), so the discriminator is never
+/// decoded back — the family is known from the range that produced the key.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IndexKind {
@@ -76,6 +76,11 @@ enum IndexKind {
     /// One stored scan-coverage interval: key
     /// `[hash][Cover][section][lo-bound frame]`, value `[hi-bound frame]`.
     Cover = 0x02,
+    /// The marker-presence latch: key `[hash][Presence]`, empty value.
+    /// Presence ⟺ the collection's durable event marker has been consulted this
+    /// assignment — the bounded, disk-backed half of the bottom store's marker
+    /// memo (see [`MarkerPresence`](super::MarkerPresence)).
+    Presence = 0x03,
 }
 
 impl From<IndexKind> for u8 {
@@ -166,11 +171,22 @@ pub(super) fn cell_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
 /// section's `i8` discriminant. Range scans build their byte bounds by
 /// appending coordinate bytes to this prefix.
 #[must_use]
-pub(super) fn section_prefix(id: &CollectionId, section: Section) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(SECTION_PREFIX_LEN);
-    prefix.extend_from_slice(&collection_prefix(id));
-    prefix.push(i8::from(section).cast_unsigned());
+pub(super) fn section_prefix(id: &CollectionId, section: Section) -> [u8; SECTION_PREFIX_LEN] {
+    let mut prefix = [0; SECTION_PREFIX_LEN];
+    prefix[..COLLECTION_PREFIX_LEN].copy_from_slice(&collection_prefix(id));
+    prefix[COLLECTION_PREFIX_LEN] = i8::from(section).cast_unsigned();
     prefix
+}
+
+/// The `[hash][kind]` head every warm-index family starts with — the whole key
+/// of a single-entry family (`Seeded`, `Presence`) and the range prefix of a
+/// multi-entry one (`Coord`). A compile-time-size stack array: fixed-size keys
+/// never heap-allocate.
+fn index_family_head(id: &CollectionId, kind: IndexKind) -> [u8; COLLECTION_PREFIX_LEN + 1] {
+    let mut key = [0; COLLECTION_PREFIX_LEN + 1];
+    key[..COLLECTION_PREFIX_LEN].copy_from_slice(&collection_prefix(id));
+    key[COLLECTION_PREFIX_LEN] = kind.into();
+    key
 }
 
 /// Reconstructs a cell's [`Coordinate`] from a full fjall key by dropping the
@@ -198,11 +214,8 @@ pub(super) fn index_coord_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
 /// The `[hash][Coord]` prefix bounding a collection's provisional-coordinate
 /// range — the ascending scan `snapshot` drains.
 #[must_use]
-pub(super) fn index_coord_prefix(id: &CollectionId) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(COLLECTION_PREFIX_LEN + 1);
-    prefix.extend_from_slice(&collection_prefix(id));
-    prefix.push(IndexKind::Coord.into());
-    prefix
+pub(super) fn index_coord_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
+    index_family_head(id, IndexKind::Coord)
 }
 
 /// Reconstructs a [`CellKey`] from a `Coord` index key produced by
@@ -221,21 +234,29 @@ pub(super) fn coord_cell_key(key: &[u8]) -> CellKey {
 /// The warm-index key for a collection's one-time cold-seed latch:
 /// `[hash][Seeded]`. Presence ⟺ the seed has run.
 #[must_use]
-pub(super) fn index_seeded_key(id: &CollectionId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(COLLECTION_PREFIX_LEN + 1);
-    key.extend_from_slice(&collection_prefix(id));
-    key.push(IndexKind::Seeded.into());
-    key
+pub(super) fn index_seeded_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
+    index_family_head(id, IndexKind::Seeded)
+}
+
+/// The warm-index key for a collection's marker-presence latch:
+/// `[hash][Presence]`. Presence ⟺ the collection's durable event marker has
+/// been consulted this assignment (see
+/// [`MarkerPresence`](super::MarkerPresence)).
+#[must_use]
+pub(super) fn index_presence_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
+    index_family_head(id, IndexKind::Presence)
 }
 
 /// The `[hash][Cover][section]` prefix bounding one `(collection, section)`'s
 /// stored coverage intervals — the range a coverage read-modify-write scans.
 #[must_use]
-pub(super) fn index_cover_prefix(id: &CollectionId, section: Section) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(COLLECTION_PREFIX_LEN + 2);
-    prefix.extend_from_slice(&collection_prefix(id));
-    prefix.push(IndexKind::Cover.into());
-    prefix.push(i8::from(section).cast_unsigned());
+pub(super) fn index_cover_prefix(
+    id: &CollectionId,
+    section: Section,
+) -> [u8; COLLECTION_PREFIX_LEN + 2] {
+    let mut prefix = [0; COLLECTION_PREFIX_LEN + 2];
+    prefix[..=COLLECTION_PREFIX_LEN].copy_from_slice(&index_family_head(id, IndexKind::Cover));
+    prefix[COLLECTION_PREFIX_LEN + 1] = i8::from(section).cast_unsigned();
     prefix
 }
 

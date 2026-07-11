@@ -382,8 +382,8 @@ where
     /// ran at the settle attempt, or the workspace died with the assignment —
     /// but load-bearing under the fault alphabet's skipped-settle window.
     /// Verdict-blind like the boundary punch (rare path; correctness beats
-    /// eviction precision). The consult rides the lower store's RAM marker
-    /// memo, so the fast path adds no durable read.
+    /// eviction precision). The consult rides the lower store's marker memo
+    /// (presence latch + standing map), so the fast path adds no durable read.
     async fn punch_read_window(
         &self,
         collection: &CollectionId,
@@ -779,8 +779,8 @@ where
         // early only costs a fall-through (the lower read is
         // oracle-resolving), and the uncommitted arm needs no special casing —
         // the punch is verdict-blind (rare path; correctness beats eviction
-        // precision). RAM-warm via the lower store's marker memo, so the fast
-        // path adds no durable read.
+        // precision). Warm via the lower store's marker memo (presence latch +
+        // standing map), so the fast path adds no durable read.
         if let Some(marker) = marker
             && let Some(standing) = self.lower.standing_marker(collection.id()).await?
             && standing.event() != marker.event()

@@ -193,7 +193,8 @@ pub struct FjallCellCache {
 ///
 /// The [`Database`] is held in both arms because batch writes are issued
 /// through [`Database::batch`], not the keyspace handle. The `index` keyspace
-/// (warm provisional coordinates + scan coverage) rides alongside `cache` in
+/// (warm provisional coordinates, scan coverage, and the marker-presence latch)
+/// rides alongside `cache` in
 /// both arms purely for lifecycle co-location — it shares the workspace's
 /// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
 /// cell-cache writes are **not** issued as one cross-keyspace batch; the warm
@@ -217,7 +218,8 @@ impl Inner {
         }
     }
 
-    /// The warm-index keyspace handle (provisional coordinates + coverage).
+    /// The warm-index keyspace handle (provisional coordinates, coverage, and
+    /// the marker-presence latch).
     fn index_handle(&self) -> &Keyspace {
         match self {
             Self::Bare { index, .. } => index,
@@ -345,6 +347,17 @@ impl FjallCellCache {
     #[must_use]
     pub(crate) fn clock(&self) -> &Clock {
         &self.clock
+    }
+
+    /// Mints a [`MarkerPresence`] handle over this cache's warm-index keyspace
+    /// — the bottom store's bounded marker-checked latch, sharing the
+    /// workspace's per-assignment lifecycle (cold exactly when the store's RAM
+    /// memo is, dropped at revocation).
+    #[must_use]
+    pub(crate) fn presence(&self) -> MarkerPresence {
+        MarkerPresence {
+            index: self.inner.index_handle().clone(),
+        }
     }
 
     /// Looks up one cell's committed value as a three-state [`CacheRead`]: a
@@ -591,7 +604,7 @@ impl FjallCellCache {
                 let budget = hop_rows.max(1);
                 let need = remaining.map_or(budget, |n| n.min(budget));
                 let hop_handle = handle.clone();
-                let hop_prefix = section_prefix.clone();
+                let hop_prefix = section_prefix;
                 let (hop_lo, hop_hi) = (lo_bound.clone(), hi_bound.clone());
                 let (hits, resume) = spawn_blocking(move || {
                     let rows = hop_handle.range((hop_lo, hop_hi));
@@ -757,7 +770,7 @@ impl FjallCellCache {
         let prefix = codec::index_coord_prefix(collection);
         spawn_blocking(move || {
             let mut out: Vec<CellKey> = Vec::new();
-            for guard in handle.prefix(&prefix) {
+            for guard in handle.prefix(prefix) {
                 let (key, _) = guard.into_inner()?;
                 out.push(codec::coord_cell_key(&key));
             }
@@ -788,7 +801,7 @@ impl FjallCellCache {
         let prefix = codec::index_cover_prefix(collection, section);
         spawn_blocking(move || {
             let mut out: Vec<(Bound<Coordinate>, Bound<Coordinate>)> = Vec::new();
-            for guard in handle.prefix(&prefix) {
+            for guard in handle.prefix(prefix) {
                 let (key, value) = guard.into_inner()?;
                 let lo = codec::cover_low_bound(&key)?;
                 let hi = codec::decode_bound(value.as_ref())?;
@@ -835,7 +848,7 @@ impl FjallCellCache {
             // set. `remove_range`-by-prefix has no batch primitive, so stale keys
             // are removed by first collecting them in the same guard scan.
             let stale: Vec<Slice> = handle
-                .prefix(&prefix)
+                .prefix(prefix)
                 .map(|guard| guard.into_inner().map(|(key, _)| key))
                 .collect::<Result<_, _>>()?;
             for key in &stale {
@@ -868,6 +881,55 @@ impl FjallCellCache {
         })
         .await??;
         Ok(())
+    }
+}
+
+/// A `Clone` handle over the per-partition warm-index keyspace recording
+/// **marker presence**: whether a collection's durable event marker has been
+/// consulted this assignment. The bounded, disk-backed replacement for the
+/// bottom store's former in-RAM checked set — the rows live in the
+/// per-assignment `index` keyspace, so the workspace `Drop` and the startup
+/// orphan sweep reclaim them at revocation.
+///
+/// **Infallible by design.** fjall is never a durability or recovery source,
+/// so a fjall error degrades to a re-check, never an under-report:
+/// [`contains`](Self::contains) reads as **unchecked** (`false`) on any error
+/// and [`set`](Self::set) warns and continues. Each failure costs one redundant
+/// durable marker point read — under a *persistent* fjall failure that is a
+/// continuous per-consult fallback (one durable read per consult until fjall
+/// heals), never a wrong answer. Neither can lose a durable marker: the
+/// standing RAM map is untouched by presence failures (the memo and ownership
+/// invariants live on the bottom store's `MarkerMemo`).
+#[derive(Clone, Educe)]
+#[educe(Debug)]
+pub(crate) struct MarkerPresence {
+    #[educe(Debug(ignore))]
+    index: Keyspace,
+}
+
+impl MarkerPresence {
+    /// Whether `collection`'s durable marker has been consulted this
+    /// assignment. Any fjall error reads as **unchecked** (`false`) — a
+    /// redundant durable re-check, never an under-report.
+    pub(crate) async fn contains(&self, collection: &CollectionId) -> bool {
+        match read_cell(&self.index, codec::index_presence_key(collection)).await {
+            Ok(raw) => raw.is_some(),
+            Err(error) => {
+                warn!(%error, "marker-presence read failed; treating collection as unchecked");
+                false
+            }
+        }
+    }
+
+    /// Records `collection`'s durable marker as consulted. A fjall error is
+    /// swallowed (warn): the collection stays unchecked and the next consult
+    /// pays one redundant durable read.
+    pub(crate) async fn set(&self, collection: &CollectionId) {
+        if let Err(error) =
+            write_index_empty(&self.index, codec::index_presence_key(collection)).await
+        {
+            warn!(%error, "marker-presence write failed; leaving collection unchecked");
+        }
     }
 }
 
@@ -944,8 +1006,12 @@ fn index_keys<'a>(
 }
 
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
-/// blocking hop.
-async fn read_cell(cache: &Keyspace, key: Vec<u8>) -> Result<Option<Slice>, FjallCellCacheError> {
+/// blocking hop. Generic over the key so a variable-length `Vec<u8>` cell key
+/// and a fixed-size `[u8; N]` index key both read without a bridging copy.
+async fn read_cell(
+    cache: &Keyspace,
+    key: impl AsRef<[u8]> + Send + 'static,
+) -> Result<Option<Slice>, FjallCellCacheError> {
     let cache = cache.clone();
     Ok(spawn_blocking(move || cache.get(key)).await??)
 }
@@ -962,10 +1028,14 @@ async fn write_cell(
 }
 
 /// Inserts an empty-valued warm-index key (presence-as-boolean), one blocking
-/// hop.
-async fn write_index_empty(handle: &Keyspace, key: Vec<u8>) -> Result<(), FjallCellCacheError> {
+/// hop. Generic over the key so a fixed-size `[u8; N]` index key inserts
+/// without a bridging copy.
+async fn write_index_empty(
+    handle: &Keyspace,
+    key: impl AsRef<[u8]> + Send + 'static,
+) -> Result<(), FjallCellCacheError> {
     let handle = handle.clone();
-    spawn_blocking(move || handle.insert(key.as_slice(), [].as_slice())).await??;
+    spawn_blocking(move || handle.insert(key.as_ref(), [].as_slice())).await??;
     Ok(())
 }
 

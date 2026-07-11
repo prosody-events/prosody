@@ -21,7 +21,7 @@ use crate::state::cached::Cached;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use crate::state::fjall::test_db;
+use crate::state::fjall::{MarkerPresence, test_db};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
@@ -194,6 +194,7 @@ struct Fixture {
     cassandra: CassandraSession,
     queries: Arc<CellQueries>,
     registry: Arc<CollectionDefRegistry>,
+    presence: MarkerPresence,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -204,17 +205,35 @@ async fn fixture() -> Result<Fixture> {
         cassandra,
         queries,
         registry: Arc::new(CollectionDefRegistry::default()),
+        presence: test_db::presence("cassandra_cell_presence")?,
     })
 }
 
 impl Fixture {
-    /// The bare resolving Cassandra cell store over `oracle`.
+    /// The bare resolving Cassandra cell store over `oracle`, using the
+    /// fixture's shared warm presence keyspace. Safe while a test builds ONE
+    /// store per collection (fresh v4 segments keep tests disjoint); a test
+    /// minting a second store over the same collection models a fresh
+    /// assignment and must pass a cold presence handle via
+    /// [`bottom_store_with`](Self::bottom_store_with).
     fn bottom_store(&self, oracle: ScriptedOracle) -> CassandraStore<ScriptedOracle> {
+        self.bottom_store_with(oracle, self.presence.clone())
+    }
+
+    /// A bare store over an explicit presence handle — for assemblies that
+    /// model reassignment (crash/overwrite rebuilds, fresh cold readers) and
+    /// the presence-degradation test.
+    fn bottom_store_with(
+        &self,
+        oracle: ScriptedOracle,
+        presence: MarkerPresence,
+    ) -> CassandraStore<ScriptedOracle> {
         CassandraStore::new(
             self.cassandra.clone(),
             self.queries.clone(),
             oracle,
             self.registry.clone(),
+            presence,
         )
     }
 }
@@ -536,6 +555,81 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
             "each sweep pays exactly #provisional cell point reads {committed}"
         );
     }
+    Ok(())
+}
+
+/// Presence-latch loss degrades to a **re-check, never an under-report**: if
+/// the per-assignment latch is lost mid-assignment (a fjall error, modeled here
+/// as an index-keyspace clear), the next `standing_marker` pays exactly ONE
+/// durable marker point read, still observes the standing durable marker, and
+/// re-seeds the latch — it never rides a stale RAM answer that would strand the
+/// marker. Takes an EXCLUSIVE index keyspace (the clearing-test isolation
+/// rule).
+#[tokio::test]
+async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    // Exclusive, clearable presence domain: `keyspace_pair` and
+    // `test_db::presence` open the same `<name>_index` keyspace.
+    let (_db, _cache, index) = test_db::keyspace_pair("cassandra_presence_degrade")?;
+    index.clear()?;
+    let store = fx.bottom_store_with(
+        ScriptedOracle::default(),
+        test_db::presence("cassandra_presence_degrade")?,
+    );
+    let counts = store.recovery_reads();
+    let c = collection("presence-degrade")?;
+    let cell = value_cell();
+
+    // Stage a provisional marker: the boundary pays the one cold durable marker
+    // read and seeds standing + presence.
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"v")),
+            Committed::new(None),
+            event(1),
+        ),
+    )];
+    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let after_stage = counts.marker_point_reads.load(Ordering::Relaxed);
+    assert_eq!(
+        after_stage, 1,
+        "the stage boundary pays one cold durable marker read"
+    );
+
+    // A consult while seeded: presence hit, no durable read.
+    store.standing_marker(c.id()).await?;
+    assert_eq!(
+        counts.marker_point_reads.load(Ordering::Relaxed),
+        after_stage,
+        "a seeded presence latch answers from the standing map — no durable read",
+    );
+
+    // Lose the latch mid-assignment.
+    index.clear()?;
+
+    // The next consult pays exactly one durable re-check and still sees the
+    // standing durable marker.
+    let recovered = store.standing_marker(c.id()).await?;
+    assert_eq!(
+        counts.marker_point_reads.load(Ordering::Relaxed),
+        after_stage + 1,
+        "presence loss forces exactly one durable re-check",
+    );
+    assert!(
+        recovered.is_some_and(|m| m.event() == event(1)),
+        "the re-check reads the still-standing durable marker",
+    );
+
+    // And it re-seeded the latch: a further consult rides RAM again.
+    store.standing_marker(c.id()).await?;
+    assert_eq!(
+        counts.marker_point_reads.load(Ordering::Relaxed),
+        after_stage + 1,
+        "the re-check re-seeds the presence latch — no further durable read",
+    );
     Ok(())
 }
 
@@ -1110,7 +1204,18 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // and reads A back provisional with A's payload (the stage row bound its
     // columns). B was promoted out of the provisional set by the key-only
     // promote row.
-    let reader = fx.bottom_store(ScriptedOracle::default());
+    //
+    // Fresh-assignment presence for each fresh reader: the presence latch is
+    // per-assignment state; without a cold domain the reader would presence-hit
+    // (the writer staged into the shared fixture latch) into its empty standing
+    // map and skip the durable marker read this test exists to exercise.
+    // Exclusive keyspace name (clearing-test rule).
+    let (_db, _cache, presence_index) = test_db::keyspace_pair("cassandra_mixed_presence")?;
+    presence_index.clear()?;
+    let reader = fx.bottom_store_with(
+        ScriptedOracle::default(),
+        test_db::presence("cassandra_mixed_presence")?,
+    );
     let staged = provisional_cells(&reader, &id).await?;
     assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
     let (key, prov) = staged
@@ -1144,7 +1249,13 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     fx.cassandra
         .execute_unlogged_batches(&delete, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
-    let reader = fx.bottom_store(ScriptedOracle::default());
+    // Fresh reader = fresh assignment: reset the exclusive presence latch so
+    // this reader's cold memo forces the durable read that now finds no marker.
+    presence_index.clear()?;
+    let reader = fx.bottom_store_with(
+        ScriptedOracle::default(),
+        test_db::presence("cassandra_mixed_presence")?,
+    );
     assert!(
         provisional_cells(&reader, &id).await?.is_empty(),
         "marker_delete removed the marker row, so cold recovery lists nothing"
@@ -1184,11 +1295,19 @@ fn prop_cassandra_cell_crash_equivalence() {
         // `cold_cache` clears the shared `cassandra_crash` keyspace pair (a
         // cheap journal marker, no keyspace-creation fsync) instead of
         // minting a fresh workspace per make; distinct v4 segments per
-        // iteration keep the shared keyspace disjoint.
+        // iteration keep the shared keyspace disjoint. The cleared index
+        // keyspace also resets the bottom store's presence latch — per-
+        // assignment state dies with the assignment, so the presence handle is
+        // minted from that same cold cache.
         let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
+            let cache = test_db::cold_cache("cassandra_crash")?;
+            let presence = cache.presence();
             Ok(Cached::new(
-                test_db::cold_cache("cassandra_crash")?,
-                FailingCellStore::with_handle(fx.bottom_store(oracle.clone()), handle.clone()),
+                cache,
+                FailingCellStore::with_handle(
+                    fx.bottom_store_with(oracle.clone(), presence),
+                    handle.clone(),
+                ),
             ))
         };
         let probe = CassandraShapeProbe {
@@ -1237,11 +1356,15 @@ fn prop_cassandra_cell_implicit_overwrite() {
         // Each op reads its committed base through a fresh COLD store, so
         // `make` clears the shared `cassandra_overwrite` keyspace pair (no
         // keyspace-creation fsync); distinct v4 segments per iteration keep it
-        // disjoint.
+        // disjoint. The cleared index keyspace resets the bottom store's
+        // presence latch too — a fresh cold assignment — so its presence handle
+        // is minted from that same cold cache.
         let make = || -> Result<Bottom> {
+            let cache = test_db::cold_cache("cassandra_overwrite")?;
+            let presence = cache.presence();
             Ok(Cached::new(
-                test_db::cold_cache("cassandra_overwrite")?,
-                fx.bottom_store(oracle.clone()),
+                cache,
+                fx.bottom_store_with(oracle.clone(), presence),
             ))
         };
         run_overwrite_trace(make, oracle.clone(), trace).await

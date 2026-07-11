@@ -171,8 +171,8 @@ impl FjallWorkspace {
         &self.cache
     }
 
-    /// Returns the warm-index keyspace handle (provisional coordinates +
-    /// scan coverage).
+    /// Returns the warm-index keyspace handle (provisional coordinates,
+    /// scan coverage, and the marker-presence latch).
     #[must_use]
     pub fn index_handle(&self) -> &Keyspace {
         &self.index
