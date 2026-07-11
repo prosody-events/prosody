@@ -305,6 +305,25 @@ hang-guard, never the assertion. Patterns in TESTING.md.
 
 **Traits:** Keep generic with associated types; use type erasure only for FFI (JS/Python/Ruby)
 
+**Every public API must stay FFI-exposable.** Prosody's public surface is
+**cross-language**: the sibling clients `prosody-{js,py,rb,cs}` wrap a
+*published* `prosody` through type erasure (napi / pyo3 / magnus / C-ABI). Treat
+every `pub` type or method a client could call — for *any* feature, not just
+keyed state — as a potential binding target. When you add or change public API,
+confirm the shape can be exposed to all four clients before landing it:
+- Return types must be expressible across the boundary — a simple owned value, a
+  `Result` with a structured `thiserror` error, or a plain C-like enum
+  (`StoreOutcome`), never an exotic generic or borrow in return position that
+  can't be materialized at a concrete instantiation.
+- `async` and sync are **both** fine: every client bridges the tokio runtime
+  (napi async, `pyo3-async-runtimes`, tokio rt in cs/rb). A sync-infallible
+  method is the easiest shape; an `async fn -> Result<_, E>` is the established
+  one — mirror an existing exposed sibling.
+- The clients consume a released crate version, so nothing reaches them
+  automatically. The bar is **not foreclosing** exposure: grep `~/code/prosody-*`
+  for the existing binding pattern and check the new shape survives
+  napi/pyo3/magnus/C-ABI.
+
 **Configuration:** Use `#[derive(Builder, Validate)]`, mark builders with `#[must_use]`
 
 ```rust
