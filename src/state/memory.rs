@@ -5,10 +5,13 @@ use super::cell_key::{CellKey, Direction, Scan};
 use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
+use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
-use super::resolve::{ResolveCellError, Resolver, flatten_resolve, resolve_read};
-use super::store::CellStore;
+use super::resolve::{
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, resolve_marker, resolve_read,
+};
+use super::store::{CellStore, route_abort, route_commit};
 use super::{CollectionId, CollectionRef, EventRef, StateType};
 use ahash::RandomState;
 use async_stream::try_stream;
@@ -25,16 +28,25 @@ type IdentityKey = (String, i8, String);
 /// The in-memory cell map: cells keyed by `(CollectionId, CellKey)`.
 type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
 
+/// The in-memory event-marker map: one standing [`EventMarker`] per collection.
+type MarkerMap = scc::HashMap<CollectionId, EventMarker, RandomState>;
+
 /// A process-wide shareable in-memory cell map.
 ///
 /// The oracle-independent half of [`MemoryCellStore`]: the cells themselves,
-/// keyed by `(CollectionId, CellKey)`. One instance is shared across partition
+/// keyed by `(CollectionId, CellKey)`, plus the standing **event markers**
+/// (mirroring the Cassandra marker rows). Both are the *durable* half — the
+/// marker map is this backend's whole marker slice, and it must survive the
+/// `make_store()` crash exactly as Cassandra marker rows would, so it lives
+/// here and not on the per-assignment [`MemoryCellStore`]. There is no seed or
+/// memo because RAM *is* the memo. One instance is shared across partition
 /// assignments (`Clone` shares the `Arc`), so committed state survives a
 /// rebalance within the process — each partition wraps it in a fresh
 /// [`MemoryCellStore`] carrying that partition's oracle.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCells {
     inner: Arc<CellMap>,
+    markers: Arc<MarkerMap>,
 }
 
 impl MemoryCells {
@@ -42,6 +54,46 @@ impl MemoryCells {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every stored cell key for `collection`, **regardless of variant** — the
+    /// physical-shape probe for the row-absence invariant, so a lingering
+    /// `Resolved(None)` entry (which must be a removal, not a tombstone) is
+    /// visible as an extra member.
+    #[cfg(test)]
+    pub(crate) fn stored_coordinates(&self, collection: &CollectionId) -> Vec<CellKey> {
+        let mut out = Vec::new();
+        self.inner.iter_sync(|(id, cell), _stored| {
+            if id == collection {
+                out.push(cell.clone());
+            }
+            true
+        });
+        out
+    }
+
+    /// The stored cell keys currently in the `Provisional` variant — the
+    /// staged-coverage probe's raw view (never routed through the resolving
+    /// store, which would first-touch-resolve what it reads).
+    #[cfg(test)]
+    pub(crate) fn provisional_coordinates(&self, collection: &CollectionId) -> Vec<CellKey> {
+        let mut out = Vec::new();
+        self.inner.iter_sync(|(id, cell), stored| {
+            if id == collection && matches!(stored, StoredCell::Provisional { .. }) {
+                out.push(cell.clone());
+            }
+            true
+        });
+        out
+    }
+
+    /// The collection's standing event marker read straight from the durable
+    /// backing — the marker-shape probe, never routed through the resolving
+    /// store.
+    #[cfg(test)]
+    pub(crate) fn standing_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
+        self.markers
+            .read_sync(collection, |_, marker| marker.clone())
     }
 }
 
@@ -94,6 +146,55 @@ where
     fn map(&self) -> &CellMap {
         &self.cells.inner
     }
+
+    /// The committed-unapplied read window, shared verbatim by `get` and
+    /// `scan_cells`: resolve a standing FOREIGN clears-bearing marker
+    /// (`help_read_window`) before the raw read/snapshot, so both paths serve
+    /// post-clear truth. The marker map is RAM — the ~always marker-free fast
+    /// path costs one map read. Both read paths MUST run identical help;
+    /// funneling them through one helper makes drift structurally impossible.
+    async fn read_help(
+        &self,
+        collection_ref: &CollectionRef,
+        own: EventRef,
+    ) -> Result<(), ResolveCellError<Infallible, O::Error>> {
+        let marker = self.standing_marker(collection_ref.id()).await?;
+        help_read_window(
+            self,
+            self.resolver.oracle(),
+            collection_ref,
+            marker.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?;
+        Ok(())
+    }
+
+    /// Applies one frozen section clear: removes every stored cell of the
+    /// cleared section whose coordinate is not a survivor (positional
+    /// exclusion — the frozen list is sorted, so a binary search decides), and
+    /// clears each removed coordinate from the [`WarmIndex`]. Erasing a
+    /// still-provisional foreign entry is correct (the erasure argument on
+    /// [`CellStore::commit_provisional`]); removal is idempotent.
+    async fn erase_clear(&self, collection: &CollectionId, clear: &SectionClear) {
+        let mut removed: Vec<CellKey> = Vec::new();
+        self.map().iter_sync(|(id, cell), _stored| {
+            if id == collection
+                && cell.section == clear.section()
+                && clear.survivors().binary_search(&cell.coordinate).is_err()
+            {
+                removed.push(cell.clone());
+            }
+            true
+        });
+        for cell in removed {
+            self.map()
+                .remove_async(&(collection.clone(), cell.clone()))
+                .await;
+            self.warm.clear(collection, &cell).await;
+        }
+    }
 }
 
 impl<O> CellStore for MemoryCellStore<O>
@@ -108,8 +209,9 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
-        let raw = self.read_raw(collection, cell);
         let collection_ref = self.resolver.collection_ref(collection);
+        self.read_help(&collection_ref, own).await?;
+        let raw = self.read_raw(collection, cell);
         resolve_read(
             self,
             self.resolver.oracle(),
@@ -128,22 +230,25 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        // Snapshot the matching raw cells synchronously (scc holds no borrowing
-        // iterator across an await), then resolve each lazily.
-        let mut raw: Vec<(CellKey, Cell)> = Vec::new();
-        self.map().iter_sync(|(id, cell), stored| {
-            if id == collection && cell.section == scan.section && scan.contains(&cell.coordinate) {
-                raw.push((cell.clone(), stored.to_cell()));
-            }
-            true
-        });
-        raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
-        if scan.dir == Direction::Backward {
-            raw.reverse();
-        }
-        let limit = scan.limit;
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
+            // Read-help before the snapshot (see `read_help`), so the snapshot
+            // below reads post-clear truth.
+            self.read_help(&collection_ref, own).await?;
+            // Snapshot the matching raw cells synchronously (scc holds no
+            // borrowing iterator across an await), then resolve each lazily.
+            let mut raw: Vec<(CellKey, Cell)> = Vec::new();
+            self.map().iter_sync(|(id, cell), stored| {
+                if id == collection && cell.section == scan.section && scan.contains(&cell.coordinate) {
+                    raw.push((cell.clone(), stored.to_cell()));
+                }
+                true
+            });
+            raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
+            if scan.dir == Direction::Backward {
+                raw.reverse();
+            }
+            let limit = scan.limit;
             // The limit bounds *yielded* (present) cells, not raw rows: a cleared
             // or rolled-back-to-absent cell in range is skipped without consuming
             // a limit slot (matching the Cassandra scan's `yielded` counter).
@@ -182,7 +287,7 @@ where
             // The coordinates to visit. Warm (seeded): the in-RAM index — an
             // empty snapshot yields nothing and never scans the map. Cold: the
             // one-time full-map seed scan that populates the index and marks the
-            // collection seeded, mirroring the Cassandra `kind=Index` seed read.
+            // collection seeded, mirroring the Cassandra cold marker seed.
             let coords = if self.warm.is_seeded(collection).await {
                 self.warm.snapshot(collection)
             } else {
@@ -226,7 +331,43 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
+        // `None` ⇒ the explicit empty-stage no-op: no marker and no boundary
+        // check (nothing to strand). A clears-only stage passes a marker with
+        // empty `staged()` and runs the boundary like any stage.
+        debug_assert!(
+            marker.is_some() || writes.is_empty(),
+            "a markerless stage must write nothing"
+        );
+        if let Some(marker) = marker {
+            debug_assert!(
+                writes
+                    .iter()
+                    .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
+                "every staged write must be listed by the event marker"
+            );
+            // Stage boundary: resolve any standing FOREIGN marker (a different
+            // event) before overwriting it, establishing marker uniqueness per
+            // collection. A resolution failure fails the stage.
+            if let Some(standing) = self
+                .cells
+                .markers
+                .read_async(collection.id(), |_, marker| marker.clone())
+                .await
+                && standing.event() != marker.event()
+            {
+                resolve_marker(self, self.resolver.oracle(), collection, &standing)
+                    .await
+                    .map_err(flatten_resolve)?;
+            }
+            // Marker-first: order-irrelevant in memory (no mid-call crash), but
+            // mirrors the documented stage ordering.
+            self.cells
+                .markers
+                .upsert_async(collection.id().clone(), marker.clone())
+                .await;
+        }
         for (cell, write) in writes {
             self.map()
                 .upsert_async(
@@ -248,14 +389,34 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        // Erase the cleared sections before upserting `cells` (belt-and-braces
+        // — survivors are excluded positionally anyway). `write_resolved`
+        // never touches the marker map.
+        for clear in clears {
+            self.erase_clear(collection.id(), clear).await;
+        }
         for (cell, data) in cells {
-            self.map()
-                .upsert_async(
-                    (collection.id().clone(), cell.clone()),
-                    StoredCell::Resolved(data.clone()),
-                )
-                .await;
+            match data {
+                // Present value: upsert the resolved cell.
+                Some(_) => {
+                    self.map()
+                        .upsert_async(
+                            (collection.id().clone(), cell.clone()),
+                            StoredCell::Resolved(data.clone()),
+                        )
+                        .await;
+                }
+                // Absent value: remove the entry (the row-absence invariant —
+                // a missing entry already reads `Resolved(Committed(None))` via
+                // `read_raw`'s default). Removing an absent key is a no-op.
+                None => {
+                    self.map()
+                        .remove_async(&(collection.id().clone(), cell.clone()))
+                        .await;
+                }
+            }
             // Rollback/committed-write resolves the cell; drop its provisional
             // coordinate (a no-op for a never-staged direct write).
             self.warm.clear(collection.id(), cell).await;
@@ -282,6 +443,46 @@ where
             // (idempotent — clearing an absent coordinate is a no-op).
             self.warm.clear(collection.id(), cell).await;
         }
+        Ok(())
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        Ok(self
+            .cells
+            .markers
+            .read_async(collection, |_, marker| marker.clone())
+            .await)
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        // Route, erase, delete — all idempotent, and memory has no mid-call
+        // crash, so the ordering carries no correctness weight (survivors are
+        // excluded from the erase positionally either way).
+        route_commit(self, collection, writes).await?;
+        for clear in clears {
+            self.erase_clear(collection.id(), clear).await;
+        }
+        // Settle owns the marker delete; removing an absent marker is a no-op
+        // (idempotent settle).
+        self.cells.markers.remove_async(collection.id()).await;
+        Ok(())
+    }
+
+    async fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        route_abort(self, collection, writes).await?;
+        self.cells.markers.remove_async(collection.id()).await;
         Ok(())
     }
 }

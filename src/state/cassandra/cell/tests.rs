@@ -3,27 +3,33 @@
 //! These run against the local Cassandra node and the shared `prosody_test`
 //! keyspace (migrated on driver connect). They exercise the part the pure
 //! decoder test cannot: `prepare`/`bind`/round-trip of every cell statement,
-//! including the promote-of-clear residue read back live. The backend-generic
+//! including a committed clear deleting its row and the legacy null-null
+//! residue read back live. The backend-generic
 //! property suites ([`crate::state::tests::cell_suite`]) run here over the
 //! production assembly `Cached<CassandraStore>` and `Overlay<Cached<…>>`, so
 //! memory and Cassandra prove identical invariants. Each test mints a fresh
 //! `segment_id` (and the property suites mint one per iteration) so rows never
 //! collide across runs.
 
+use super::decode::try_decode_marker;
 use super::{
-    CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, IndexUpsertRow,
-    KeyRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs,
+    CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, KeyRow,
+    MarkerWriteRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs, fits_one_batch,
 };
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
+use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::fjall::test_db;
+use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{
-    OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace, value_cell,
+    ApplyTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle, ProbedMarker,
+    ScanTrace, ScriptedOracle, ShapeProbe, Trace, probed_parts, run_apply_idempotence,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    value_cell,
 };
 use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
@@ -37,15 +43,149 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
-use std::ops::Bound;
+use std::collections::BTreeSet;
+use std::iter;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
+/// [`ShapeProbe`] over the live cluster, read by raw CQL against the trace's
+/// own partition key only (the isolation rule):
+///
+/// * `cell_rows` — the physically stored `kind=Cell` rows as `(section,
+///   coordinate byte)`. A residue row (an absent value left with live
+///   `encoding`/`version` columns) is returned; a `cell_delete`d or gap-erased
+///   row is not — so exact-set equality against the model's present set catches
+///   residue and lost rows alike.
+/// * `standing_marker` — the whole `kind=Marker` slice, asserting the
+///   structural shape (at most ONE row, at the fixed address `(0, empty)` — the
+///   zero-per-coordinate-rows postcondition) before decoding the frozen payload
+///   (staged set AND clear half) through the production decoder.
+/// * `provisional_rows` — `kind=Cell` rows whose `event` is populated (filtered
+///   in code; CQL cannot filter a regular column without ALLOW FILTERING, and
+///   the partition is the trace's own — bounded).
+struct CassandraShapeProbe {
+    session: CassandraSession,
+}
+
+/// The six-column raw shape of one `kind=Marker` slice row the probe reads.
+type MarkerSliceRow = (
+    i8,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+);
+
+/// The four partition-key binds of `id`'s collection.
+fn pk_binds(id: &CollectionId) -> (&Uuid, &str, i8, &str) {
+    (
+        &id.state_key().segment_id,
+        id.state_key().key.as_ref(),
+        i8::from(id.state_type()),
+        id.name().as_str(),
+    )
+}
+
+impl ShapeProbe for CassandraShapeProbe {
+    async fn cell_rows(&self, id: &CollectionId) -> Result<BTreeSet<(i8, u8)>> {
+        use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+        let cql = format!(
+            "SELECT section, coordinate FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE \
+             segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0"
+        );
+        let result = self
+            .session
+            .session()
+            .query_unpaged(cql, pk_binds(id))
+            .await?
+            .into_rows_result()?;
+        let mut out = BTreeSet::new();
+        for row in result.rows::<(i8, Vec<u8>)>()? {
+            let (section, coordinate) = row?;
+            if let Some(&byte) = coordinate.first() {
+                out.insert((section, byte));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn standing_marker(&self, id: &CollectionId) -> Result<Option<ProbedMarker>> {
+        use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+        let cql = format!(
+            "SELECT section, coordinate, data, encoding, version, event FROM \
+             {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? AND key = ? AND \
+             state_type = ? AND name = ? AND kind = 1"
+        );
+        let result = self
+            .session
+            .session()
+            .query_unpaged(cql, pk_binds(id))
+            .await?
+            .into_rows_result()?;
+        let mut rows: Vec<MarkerSliceRow> = Vec::new();
+        for row in result.rows::<MarkerSliceRow>()? {
+            rows.push(row?);
+        }
+        // The structural postcondition: the whole marker slice is at most ONE
+        // row, at the fixed address — zero per-coordinate rows exist.
+        if rows.len() > 1 {
+            return Err(eyre!(
+                "marker slice holds {} rows, expected ≤ 1",
+                rows.len()
+            ));
+        }
+        let Some((section, coordinate, data, encoding, version, raw_event)) = rows.pop() else {
+            return Ok(None);
+        };
+        if section != 0 || !coordinate.is_empty() {
+            return Err(eyre!(
+                "marker row off the fixed address: section {section}, coordinate {coordinate:?}"
+            ));
+        }
+        let marker = try_decode_marker((data, encoding, version, raw_event))?;
+        let (staged, clears) = probed_parts(&marker);
+        Ok(Some((marker.event(), staged, clears)))
+    }
+
+    async fn provisional_rows(&self, id: &CollectionId) -> Result<BTreeSet<(i8, u8)>> {
+        use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+        let cql = format!(
+            "SELECT section, coordinate, event FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0"
+        );
+        let result = self
+            .session
+            .session()
+            .query_unpaged(cql, pk_binds(id))
+            .await?
+            .into_rows_result()?;
+        let mut out = BTreeSet::new();
+        for row in result.rows::<(i8, Vec<u8>, Option<RawEventRef>)>()? {
+            let (section, coordinate, event) = row?;
+            if event.is_some()
+                && let Some(&byte) = coordinate.first()
+            {
+                out.insert((section, byte));
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// The production committed bottom assembly: fjall write-through over the
 /// resolving Cassandra cell store.
 type Bottom = Cached<CassandraStore<ScriptedOracle>>;
+
+/// [`Bottom`] with the crash trace's lower fault seam between the cache and
+/// the resolving store, so generated lower-store faults fire beneath the
+/// cache.
+type FaultyBottom = Cached<FailingCellStore<CassandraStore<ScriptedOracle>>>;
 
 /// The shared driver session and prepared cell statements — the
 /// partition-independent half both the bottom store and the property assemblies
@@ -103,7 +243,9 @@ where
 }
 
 /// Stage a set, observe it provisional, promote, read back resolved — the
-/// hot-path round-trip — then a direct resolved clear reads back absent.
+/// hot-path round-trip — then a direct resolved clear reads back absent. A fast
+/// deterministic smoke of shapes the crash-equivalence property and its
+/// physical oracle (`assert_physical`) cover organically over generated traces.
 #[tokio::test]
 async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     init_test_logging();
@@ -113,15 +255,12 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     let cell = value_cell();
     let data = Bytes::from_static(b"v1");
 
-    store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
-            )],
-        )
-        .await?;
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
+    )];
+    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (key, prov) = staged
         .into_iter()
@@ -139,7 +278,9 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     );
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
 
-    store.write_resolved(&c, &[(cell.clone(), None)]).await?;
+    store
+        .write_resolved(&c, &[(cell.clone(), None)], &[])
+        .await?;
     assert_eq!(
         store.get(c.id(), &cell, event(2)).await?,
         Committed::new(None)
@@ -156,15 +297,36 @@ fn cell_i(i: u32) -> CellKey {
     }
 }
 
-/// After a clean, fully-resolved event, the recovery sweep issues **zero**
-/// Cassandra queries once its collection is seeded: the first (cold) sweep runs
-/// the one bounded `kind=Index` seed read and marks the collection seeded in
-/// the disk-backed warm index; the second (warm) sweep short-circuits on the
-/// local fjall index. The warm gate lives on `Cached` (which owns the fjall
-/// cache), so this runs the production `Cached<CassandraStore>` assembly
-/// and reads the `CassandraStore`'s `RecoveryReadCounts` — which `Cached`
-/// touches only on a cold sweep, so the "zero" is non-vacuous (the cold sweep
-/// provably incremented them first).
+/// Drains a whole-section-0 forward scan (a concrete edge pair dominating
+/// every 4-byte [`cell_i`] coordinate, which all begin `0x00`), returning the
+/// yield count.
+async fn drain_section_scan<S: CellStore>(store: &S, id: &CollectionId) -> Result<u32> {
+    let low = Coordinate::empty();
+    let high = Coordinate::from_bytes(vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    let scan = Scan {
+        section: Section::new(0),
+        start: ScanEdge::Included(&low),
+        dir: Direction::Forward,
+        end: ScanEdge::Included(&high),
+        limit: None,
+    };
+    let stream = store.scan_cells(id, scan, event(1));
+    futures::pin_mut!(stream);
+    let mut scanned = 0_u32;
+    while let Some(item) = stream.next().await {
+        item?;
+        scanned += 1;
+    }
+    Ok(scanned)
+}
+
+/// After a clean, fully-settled event, the recovery sweep issues **zero**
+/// Cassandra queries: the stage's boundary check paid the one durable
+/// event-marker point read (a cold memo miss), the settle recorded the marker
+/// known-absent in the RAM memo, so both the cold sweep (marker memo hit,
+/// nothing listed) and the warm sweep (fjall short-circuit) touch nothing
+/// durable. The zeros are non-vacuous: the same counter provably incremented
+/// at the stage first.
 #[tokio::test]
 async fn warm_quiescence_issues_zero_queries() -> Result<()> {
     init_test_logging();
@@ -177,66 +339,95 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
     let c = collection("warm-quiescence")?;
     let cell = value_cell();
 
-    // A clean event: stage then promote, leaving nothing provisional and no
-    // live `kind=Index` marker.
-    store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(
-                    Some(Bytes::from_static(b"v")),
-                    Committed::new(None),
-                    event(1),
-                ),
-            )],
-        )
-        .await?;
-    store.mark_resolved(&c, slice::from_ref(&cell)).await?;
-
-    // Cold sweep: `Cached` finds the collection unseeded, so it drives the
-    // bottom store's bounded seed read (finds no live marker) and seeds the warm
-    // index.
-    assert!(provisional_cells(&store, c.id()).await?.is_empty());
-    let seed_index = counts.index_range_reads.load(Ordering::Relaxed);
-    let seed_points = counts.cell_point_reads.load(Ordering::Relaxed);
-    assert!(
-        seed_index >= 1,
-        "the cold sweep must issue the kind=Index seed read"
+    // A clean event: stage, then settle through `commit_provisional` (the
+    // production settle that deletes the event marker), leaving nothing
+    // provisional and no standing marker.
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"v")),
+            Committed::new(None),
+            event(1),
+        ),
+    )];
+    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    store.commit_provisional(&c, &writes, &[]).await?;
+    let staged_marker_reads = counts.marker_point_reads.load(Ordering::Relaxed);
+    assert_eq!(
+        staged_marker_reads, 1,
+        "the stage boundary pays the one durable marker read on a cold memo"
     );
 
-    // Warm sweep: the seeded, empty warm index short-circuits with no further
-    // Cassandra query — `Cached` never enters the bottom store's cold seed.
+    // Cold sweep: `Cached` finds the collection unseeded and drives the
+    // bottom store's seed — whose marker leg answers from the RAM memo
+    // (settled ⇒ known-absent), so no durable read of either kind.
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    // Warm sweep: the seeded, empty warm index short-circuits before the
+    // bottom store entirely.
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
     assert_eq!(
-        counts.index_range_reads.load(Ordering::Relaxed),
-        seed_index,
-        "a warm quiescence issues no kind=Index read"
+        counts.marker_point_reads.load(Ordering::Relaxed),
+        staged_marker_reads,
+        "a quiescent sweep issues no durable marker read"
     );
     assert_eq!(
         counts.cell_point_reads.load(Ordering::Relaxed),
-        seed_points,
-        "a warm quiescence issues no point read"
+        0,
+        "a quiescent sweep issues no recovery point read"
+    );
+
+    // The clear leg adds NO steady-state queries: a second event stages with
+    // a section clear and settles through `commit_provisional(…, clears)` —
+    // the Cov-Clr punch is fjall/coverage-only and the boundary rides the RAM
+    // memo, so the durable marker-read count never moves again and both
+    // post-settle sweeps stay at zero durable reads.
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"w")),
+            Committed::new(Some(Bytes::from_static(b"v"))),
+            event(2),
+        ),
+    )];
+    let clears = [SectionClear::frozen(cell.section, &writes)];
+    let marker = EventMarker::frozen(event(2), &writes, &clears);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    store.commit_provisional(&c, &writes, &clears).await?;
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    assert_eq!(
+        counts.marker_point_reads.load(Ordering::Relaxed),
+        staged_marker_reads,
+        "the clear leg's stage boundary and sweeps ride the memo — no new durable marker read"
+    );
+    assert_eq!(
+        counts.cell_point_reads.load(Ordering::Relaxed),
+        0,
+        "the clear leg adds no recovery point read"
     );
     Ok(())
 }
 
-/// Recovery cost is bounded by **#provisional, never #committed**: a cold sweep
-/// over collections with wildly different committed-cell counts issues the same
-/// one `kind=Index` range read plus exactly one point read per provisional
-/// coordinate. The committed cells live in the `kind=Cell` range recovery never
-/// scans, so they cost nothing.
+/// Recovery cost is bounded by **#provisional, never #committed**: a cold
+/// sweep over collections with wildly different committed-cell counts issues
+/// at most ONE durable event-marker point read per collection per assignment
+/// **total** (the shared memo, seeded by whichever consumer fires first —
+/// pinned by staying at 1 across the first read's read-help seed, the second
+/// read, the stage's boundary check, the cold sweep, AND a second sweep) plus
+/// exactly one cell point read per provisional coordinate per sweep. The
+/// committed cells live in the `kind=Cell` range recovery never touches, so
+/// they cost nothing.
 ///
-/// This also pins the **set-gated read-skip**: before any cell is staged,
-/// a committed `get` and full-section `scan` over the clean cells touch only
-/// the `kind=Cell` range — **neither** recovery counter moves — so reads never
-/// consult the provisional index (byte-for-byte today's cost). The zeros are
-/// non-vacuous: the very same counters provably increment on the sweep below.
+/// This also pins who pays the seed: a committed `write_resolved` is
+/// marker-free by design (no counter moves), the FIRST read pays the one
+/// durable marker read (read-help's cold-memo seed), and every later consumer
+/// rides the memo. The fixed values are non-vacuous: the same counters stay
+/// exactly 1 across five more marker consumers below.
 ///
-/// Sizes are kept modest (not large production scale) so the live
-/// test stays fast and its committed-cell `index_delete` tombstones stay under
-/// Cassandra's scan-warn threshold; 16× is ample to distinguish an O(#cells)
-/// regression, which would read 32 vs 512 rather than a fixed 4.
+/// Sizes are kept modest (not large production scale) so the live test stays
+/// fast; 16× is ample to distinguish an O(#cells) regression, which would
+/// read 32 vs 512 rather than a fixed 4.
 #[tokio::test]
 async fn bounded_recovery_is_size_independent() -> Result<()> {
     const PROVISIONAL: u32 = 4;
@@ -249,15 +440,21 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         let store = fx.bottom_store(ScriptedOracle::default());
         let c = collection(&format!("bounded-{committed}"))?;
 
-        // `committed` resolved cells: no live `kind=Index` marker.
+        // `committed` resolved cells: marker-free (no event marker written) —
+        // the counters must not move on the write itself.
+        let counts = store.recovery_reads();
         let resolved: Vec<(CellKey, Option<Bytes>)> = (0..committed)
             .map(|i| (cell_i(i), Some(Bytes::from(i.to_be_bytes().to_vec()))))
             .collect();
-        store.write_resolved(&c, &resolved).await?;
+        store.write_resolved(&c, &resolved, &[]).await?;
+        assert_eq!(
+            counts.marker_point_reads.load(Ordering::Relaxed),
+            0,
+            "a committed write never issues a durable marker read"
+        );
 
-        // Read-skip: a committed get + full-section scan over the clean cells
-        // consult only the `kind=Cell` range — no recovery read of either kind.
-        let counts = store.recovery_reads();
+        // The FIRST read pays the one durable marker read of the whole
+        // assignment: read-help seeds the cold memo alongside the point read.
         assert!(
             store
                 .get(c.id(), &cell_i(0), event(1))
@@ -266,25 +463,19 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
                 .is_some(),
             "the committed cell reads back present",
         );
-        let scan = Scan {
-            section: Section::new(0),
-            start: Bound::Unbounded,
-            dir: Direction::Forward,
-            end: Bound::Unbounded,
-            limit: None,
-        };
-        let stream = store.scan_cells(c.id(), scan, event(1));
-        futures::pin_mut!(stream);
-        let mut scanned = 0_u32;
-        while let Some(item) = stream.next().await {
-            item?;
-            scanned += 1;
-        }
+        assert_eq!(
+            counts.marker_point_reads.load(Ordering::Relaxed),
+            1,
+            "the first read seeds the marker memo with one durable read"
+        );
+        // A whole-section scan (its read-help rides the memo: still one
+        // durable marker read).
+        let scanned = drain_section_scan(&store, c.id()).await?;
         assert_eq!(scanned, committed, "the scan yields every committed cell");
         assert_eq!(
-            counts.index_range_reads.load(Ordering::Relaxed),
-            0,
-            "a committed get/scan never issues a kind=Index read"
+            counts.marker_point_reads.load(Ordering::Relaxed),
+            1,
+            "the scan's read-help rides the memo — still one durable marker read"
         );
         assert_eq!(
             counts.cell_point_reads.load(Ordering::Relaxed),
@@ -292,7 +483,8 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
             "a committed get/scan never issues a recovery point read"
         );
 
-        // A fixed handful of provisional cells: each a live marker.
+        // A fixed handful of provisional cells staged by one event, listed by
+        // its event marker. The stage's boundary check rides the same memo.
         let staged: Vec<(CellKey, ProvisionalWrite)> = (0..PROVISIONAL)
             .map(|i| {
                 (
@@ -300,52 +492,81 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
                     ProvisionalWrite::new(
                         Some(Bytes::from_static(b"p")),
                         Committed::new(None),
-                        event(u128::from(i)),
+                        event(1),
                     ),
                 )
             })
             .collect();
-        store.write_provisional(&c, &staged).await?;
+        let marker = EventMarker::frozen(event(1), &staged, &[]);
+        store.write_provisional(&c, &staged, Some(&marker)).await?;
+        assert_eq!(
+            counts.marker_point_reads.load(Ordering::Relaxed),
+            1,
+            "the stage boundary rides the memo — still one durable marker read"
+        );
 
-        // A cold sweep: one bounded seed read + one point read per provisional
-        // coordinate, independent of `committed` (the same `counts` handle).
+        // A cold sweep: the marker leg answers from the memo (zero durable
+        // marker reads) + one point read per listed coordinate, independent of
+        // `committed` (the same `counts` handle).
         let found = provisional_cells(&store, c.id()).await?;
         assert_eq!(found.len(), PROVISIONAL as usize);
         assert_eq!(
-            counts.index_range_reads.load(Ordering::Relaxed),
+            counts.marker_point_reads.load(Ordering::Relaxed),
             1,
-            "one bounded kind=Index seed read regardless of committed size {committed}"
+            "the cold sweep rides the memo — still one durable marker read {committed}"
         );
         assert_eq!(
             counts.cell_point_reads.load(Ordering::Relaxed),
             PROVISIONAL as usize,
             "recovery point reads bounded by #provisional, not #committed {committed}"
         );
+
+        // A second sweep re-reads the listed cells but STILL pays no durable
+        // marker read — the "at most one per collection per assignment" pin.
+        let again = provisional_cells(&store, c.id()).await?;
+        assert_eq!(again.len(), PROVISIONAL as usize);
+        assert_eq!(
+            counts.marker_point_reads.load(Ordering::Relaxed),
+            1,
+            "a second sweep pays no durable marker read {committed}"
+        );
+        assert_eq!(
+            counts.cell_point_reads.load(Ordering::Relaxed),
+            2 * PROVISIONAL as usize,
+            "each sweep pays exactly #provisional cell point reads {committed}"
+        );
     }
     Ok(())
 }
 
-/// Stage a clear over a present base, observe it provisional (`data` null,
-/// `prev` present), promote, and read back absent — the promote-of-clear
-/// residue decoded live (encoding/version linger, both blobs null).
+/// Committing a staged clear over a present base **deletes the row** (the
+/// row-absence invariant): the cell reads back absent, and no residue row
+/// lingers — a stale `encoding`/`version` would still be selected. Settles
+/// through the routed `commit_provisional` path (the promote arm that owns
+/// clear→delete). A deterministic falsifier of the row-absence shape
+/// `assert_physical` asserts for every model-absent coordinate on the crash
+/// traces; it isolates the committed-clear delete leg at the bottom store.
 #[tokio::test]
-async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
+async fn committed_clear_deletes_the_row() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::state::oracle::CommitOracle;
+
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
-    let c = collection("cart")?;
+    let oracle = ScriptedOracle::default();
+    let store = fx.bottom_store(oracle.clone());
+    let c = collection("clear-deletes")?;
     let cell = value_cell();
     let old = Bytes::from_static(b"old");
 
+    // Committed base present, then stage a clear over it and settle committed.
     store
-        .write_provisional(
-            &c,
-            &[(
-                cell.clone(),
-                ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2)),
-            )],
-        )
+        .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
         .await?;
+    let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
+    let writes = [(cell.clone(), write.clone())];
+    let marker = EventMarker::frozen(event(2), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged
         .into_iter()
@@ -354,10 +575,89 @@ async fn provisional_clear_over_present_promotes_to_absent() -> Result<()> {
     assert_eq!(prov.data(), None);
     assert_eq!(prov.prev(), Some(&old));
 
-    store.mark_resolved(&c, slice::from_ref(&cell)).await?;
+    oracle.record_message(Uuid::from_u128(2)).await?;
+    store
+        .commit_provisional(&c, &[(cell.clone(), write)], &[])
+        .await?;
+
     assert_eq!(
         store.get(c.id(), &cell, event(3)).await?,
         Committed::new(None)
+    );
+
+    // The residue row would still be selected by its live `encoding`/`version`;
+    // its absence proves the commit deleted the row rather than nulling columns.
+    let cql = format!(
+        "SELECT encoding, version FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id \
+         = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0 AND section = ? AND \
+         coordinate = ?"
+    );
+    let id = c.id();
+    let residue = fx
+        .cassandra
+        .session()
+        .query_unpaged(
+            cql,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                i8::from(cell.section),
+                cell.coordinate.as_bytes(),
+            ),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<i16>, Option<i32>)>()?;
+    assert!(
+        residue.is_none(),
+        "committed clear must delete the row, leaving no residue: {residue:?}"
+    );
+    Ok(())
+}
+
+/// Legacy decode tolerance: the null-null-with-encoding residue shape is no
+/// longer produced by any statement (a committed-absent cell deletes its row),
+/// but rows written by earlier builds may still carry it. Seeded directly via
+/// raw CQL, it must still read `Committed(None)`, never corruption — the
+/// decoder's tolerance kept honest now that no code path produces the shape.
+#[tokio::test]
+async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("legacy-residue")?;
+    let cell = value_cell();
+    let id = c.id();
+
+    // Both blobs and `event` absent, `encoding` = 4 (RawZstdV1), `version` = 1
+    // (INITIAL_VERSION) — the legacy null-null residue shape.
+    let insert = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate, encoding, version) VALUES (?, ?, ?, ?, 0, ?, ?, 4, 1)"
+    );
+    fx.cassandra
+        .session()
+        .query_unpaged(
+            insert,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                i8::from(cell.section),
+                cell.coordinate.as_bytes(),
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        store.get(id, &cell, event(1)).await?,
+        Committed::new(None),
+        "the decoder must read the legacy residue as committed-absence"
     );
     Ok(())
 }
@@ -380,7 +680,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     // the raw bytes — a regression to raw storage fails both assertions.
     let payload = Bytes::from(vec![0xAB_u8; 4096]);
     store
-        .write_resolved(&c, &[(cell, Some(payload.clone()))])
+        .write_resolved(&c, &[(cell, Some(payload.clone()))], &[])
         .await?;
 
     let cql = format!(
@@ -446,22 +746,27 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
     let c = collection("corrupt-timer")?;
     let id = c.id();
 
-    // The corrupt `kind=0` (Cell) row: `event` non-NULL alone reaches the
-    // validator — with data/prev/encoding/version all NULL the decoder skips
-    // straight to `try_into_event`, where the Timer arm rejects the unknown
-    // `timer_type: 99` in the `event_ref` UDT literal (whose own `kind: 1` field
-    // means Timer — distinct from the clustering `kind` column).
-    let insert_cell = format!(
-        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
-         kind, section, coordinate, event) VALUES (?, ?, ?, ?, 0, ?, ?, {{kind: 1, msg_dedup_id: \
-         null, timer_type: 99, time: 0, tag: 0}})"
-    );
-    // Its `kind=1` (Index) marker, so the index-based recovery scan discovers
-    // the coordinate and point-reads the corrupt cell (recovery no longer scans
-    // the whole partition).
-    let insert_marker = format!(
-        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
-         kind, section, coordinate) VALUES (?, ?, ?, ?, 1, ?, ?)"
+    // Stage one healthy provisional cell through the real store (so the event
+    // marker lists its coordinate on the real wire path), then corrupt the
+    // cell row's `event` UDT by raw CQL: the Timer arm rejects the unknown
+    // `timer_type: 99` in the literal (whose own `kind: 1` field means Timer —
+    // distinct from the clustering `kind` column). Recovery point-reads the
+    // marker-listed coordinate and must reject the ONE row, not the partition.
+    let cell = value_cell();
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"v")),
+            Committed::new(None),
+            event(1),
+        ),
+    )];
+    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let corrupt_cell = format!(
+        "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} SET event = {{kind: 1, msg_dedup_id: \
+         null, timer_type: 99, time: 0, tag: 0}} WHERE segment_id = ? AND key = ? AND state_type \
+         = ? AND name = ? AND kind = 0 AND section = ? AND coordinate = ?"
     );
     let binds = (
         id.state_key().segment_id,
@@ -473,11 +778,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
     );
     fx.cassandra
         .session()
-        .query_unpaged(insert_cell, binds)
-        .await?;
-    fx.cassandra
-        .session()
-        .query_unpaged(insert_marker, binds)
+        .query_unpaged(corrupt_cell, binds)
         .await?;
 
     let stream = store.provisional_cells(id);
@@ -512,7 +813,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         let cell = value_cell();
         let data = Bytes::from(payload);
         store
-            .write_resolved(&c, &[(cell.clone(), Some(data))])
+            .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
         let Some(bytes) = store.get(c.id(), &cell, event(1)).await?.into_inner() else {
             return Err(eyre!("expected a present committed value"));
@@ -574,7 +875,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
                 (cell, Some(Bytes::from(p.clone())))
             })
             .collect();
-        store.write_resolved(&c, &cells).await?;
+        store.write_resolved(&c, &cells, &[]).await?;
 
         // `WRITETIME`/`TTL` are read functions (no schema change); both are
         // non-null because every cell wrote a present `data`.
@@ -632,94 +933,94 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
         .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
 }
 
-/// Builds the mixed-statement batch for the binding-order test: three units
-/// whose single flatten interleaves every row shape and all five cell
-/// statements — stage+index for A, promote+index-delete for B,
-/// resolved-write+index-delete for C. The blobs, cells, and `id` outlive the
-/// returned borrows (the caller holds them).
+/// Builds the mixed-statement batch for the binding-order test: five one-row
+/// units whose single flatten interleaves every [`RowShape`] across five
+/// distinct prepared statements — stage A, promote B, resolved-write C,
+/// `cell_delete` D, and the `marker_write` of the collection's event marker.
+/// (`marker_delete` cannot join this batch: it targets the same fixed-address
+/// row as the marker write, and within one batch the shared timestamp's
+/// delete-wins tie-break would erase the write it is meant to prove — so the
+/// delete is proven in a follow-up batch.) The blobs, cells, and `id` outlive
+/// the returned borrows (the caller holds them).
 fn mixed_binding_batch<'a>(
     q: &'a CellQueries,
     id: &'a CollectionId,
     blob_a: &'a CellBlobs,
     blob_c: &'a CellBlobs,
-    cell_a: &'a CellKey,
-    cell_b: &'a CellKey,
-    cell_c: &'a CellKey,
+    marker_blob: &'a Bytes,
+    cells: [&'a CellKey; 4],
 ) -> Vec<BatchUnit<CellBatchRow<'a>>> {
     use super::Pk;
     use smallvec::smallvec;
 
+    let [cell_a, cell_b, cell_c, cell_d] = cells;
     let pk = Pk::of(id);
-    let (addr_a, addr_b, addr_c) = (
+    let (addr_a, addr_b, addr_c, addr_d) = (
         CellAddr::new(pk, cell_a),
         CellAddr::new(pk, cell_b),
         CellAddr::new(pk, cell_c),
+        CellAddr::new(pk, cell_d),
     );
     vec![
         BatchUnit::new(
             1_024,
-            smallvec![
-                CellBatchRow {
-                    statement: &q.write_provisional_no_ttl,
-                    row: RowShape::Stage(StageRow {
-                        ttl: None,
-                        data: blob_a.data.as_deref(),
-                        prev_data: None,
-                        encoding: blob_a.encoding,
-                        version: blob_a.version,
-                        event: event(2),
-                        addr: addr_a,
-                    }),
-                },
-                CellBatchRow {
-                    statement: &q.index_insert_no_ttl,
-                    row: RowShape::IndexUpsert(IndexUpsertRow {
-                        ttl: None,
-                        addr: addr_a,
-                    }),
-                },
-            ],
+            smallvec![CellBatchRow {
+                statement: &q.write_provisional_no_ttl,
+                row: RowShape::Stage(StageRow {
+                    ttl: None,
+                    data: blob_a.data.as_deref(),
+                    prev_data: None,
+                    encoding: blob_a.encoding,
+                    version: blob_a.version,
+                    event: event(2),
+                    addr: addr_a,
+                }),
+            }],
         ),
         BatchUnit::new(
             1_024,
-            smallvec![
-                CellBatchRow {
-                    statement: &q.mark_resolved,
-                    row: RowShape::Key(KeyRow {
-                        kind: CellKind::Cell,
-                        addr: addr_b,
-                    }),
-                },
-                CellBatchRow {
-                    statement: &q.index_delete,
-                    row: RowShape::Key(KeyRow {
-                        kind: CellKind::Index,
-                        addr: addr_b,
-                    }),
-                },
-            ],
+            smallvec![CellBatchRow {
+                statement: &q.mark_resolved,
+                row: RowShape::Key(KeyRow {
+                    kind: CellKind::Cell,
+                    addr: addr_b,
+                }),
+            }],
         ),
         BatchUnit::new(
             1_024,
-            smallvec![
-                CellBatchRow {
-                    statement: &q.write_resolved_no_ttl,
-                    row: RowShape::Resolved(ResolvedRow {
-                        ttl: None,
-                        data: blob_c.data.as_deref(),
-                        encoding: blob_c.encoding,
-                        version: blob_c.version,
-                        addr: addr_c,
-                    }),
-                },
-                CellBatchRow {
-                    statement: &q.index_delete,
-                    row: RowShape::Key(KeyRow {
-                        kind: CellKind::Index,
-                        addr: addr_c,
-                    }),
-                },
-            ],
+            smallvec![CellBatchRow {
+                statement: &q.write_resolved_no_ttl,
+                row: RowShape::Resolved(ResolvedRow {
+                    ttl: None,
+                    data: blob_c.data.as_deref(),
+                    encoding: blob_c.encoding,
+                    version: blob_c.version,
+                    addr: addr_c,
+                }),
+            }],
+        ),
+        BatchUnit::new(
+            1_024,
+            smallvec![CellBatchRow {
+                statement: &q.cell_delete,
+                row: RowShape::Key(KeyRow {
+                    kind: CellKind::Cell,
+                    addr: addr_d,
+                }),
+            }],
+        ),
+        BatchUnit::new(
+            1_024,
+            smallvec![CellBatchRow {
+                statement: &q.marker_write_no_ttl,
+                row: RowShape::MarkerWrite(MarkerWriteRow {
+                    ttl: None,
+                    payload: marker_blob,
+                    event: event(2),
+                    addr: CellAddr::marker(pk),
+                }),
+            }],
         ),
     ]
 }
@@ -730,14 +1031,20 @@ fn mixed_binding_batch<'a>(
 /// error — a misordered `unzip` flatten would bind a row against the wrong
 /// statement's columns silently. Build ONE batch whose single flatten
 /// interleaves every [`RowShape`] across **five distinct prepared
-/// statements** — stage a cell, upsert its index marker, promote a
-/// pre-provisioned cell, delete markers, and write a fresh resolved value —
+/// statements** — stage a cell, promote a pre-provisioned cell, write a fresh
+/// resolved value, row-delete a pre-seeded cell, and write the event marker —
 /// with **distinct payloads** so any cross-binding corrupts an observable
-/// value. Read every cell back: each landing correctly proves its statement
-/// bound its own columns.
+/// value. Read everything back through a FRESH store (a cold marker memo, so
+/// the recovery read decodes the batch-written marker): each value landing
+/// correctly proves its statement bound its own columns. A follow-up batch
+/// proves `marker_delete` (same-row timestamp ties bar it from the first
+/// batch — see [`mixed_binding_batch`]).
 #[tokio::test]
 async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Result<()> {
+    use super::encoding::encode_payload;
+    use super::{Pk, VALUE_ENCODING, marker_delete_unit};
     use crate::state::cell_key::Coordinate;
+    use crate::state::marker::encode_marker_payload;
 
     init_test_logging();
     let fx = fixture().await?;
@@ -749,47 +1056,62 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         section: Section::new(0),
         coordinate: Coordinate::from_bytes(vec![b]),
     };
-    let (cell_a, cell_b, cell_c) = (cell(1), cell(2), cell(3));
-    let (data_a, data_b, data_c) = (
+    let (cell_a, cell_b, cell_c, cell_d) = (cell(1), cell(2), cell(3), cell(4));
+    let (data_a, data_b, data_c, data_d) = (
         Bytes::from_static(b"aaa"),
         Bytes::from_static(b"bbb"),
         Bytes::from_static(b"ccc"),
+        Bytes::from_static(b"ddd"),
     );
 
-    // Pre-provision B (a provisional cell + its index marker) so the mixed batch
-    // can promote it.
+    // Pre-provision B so the mixed batch can promote it.
+    let writes_b = [(
+        cell_b.clone(),
+        ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
+    )];
+    let marker_b = EventMarker::frozen(event(1), &writes_b, &[]);
     store
-        .write_provisional(
-            &c,
-            &[(
-                cell_b.clone(),
-                ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
-            )],
-        )
+        .write_provisional(&c, &writes_b, Some(&marker_b))
+        .await?;
+    // Pre-seed D resolved so the batch's `cell_delete` has a row to remove.
+    store
+        .write_resolved(&c, &[(cell_d.clone(), Some(data_d.clone()))], &[])
         .await?;
 
     // Owned blobs the bound rows borrow into; must outlive the awaited batch.
     let blob_a = encode_cell_blobs(Some(&data_a), None)?;
     let blob_c = encode_cell_blobs(Some(&data_c), None)?;
+    // The batch's event marker lists exactly A (the one cell it stages),
+    // encoded through the production payload + blob conventions.
+    let staged_a = [(
+        cell_a.clone(),
+        ProvisionalWrite::new(Some(data_a.clone()), Committed::new(None), event(2)),
+    )];
+    let marker_blob = encode_payload(
+        &encode_marker_payload(&EventMarker::frozen(event(2), &staged_a, &[]))?,
+        VALUE_ENCODING,
+    )?;
     // One batch, one flatten, five distinct statements interleaved.
     let units = mixed_binding_batch(
         &fx.queries,
         &id,
         &blob_a,
         &blob_c,
-        &cell_a,
-        &cell_b,
-        &cell_c,
+        &marker_blob,
+        [&cell_a, &cell_b, &cell_c, &cell_d],
     );
     fx.cassandra
         .execute_unlogged_batches(&units, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
 
-    // A is provisional with its own payload (the stage + index-upsert rows
-    // bound their columns; the index-based recovery scan reads it back), and it
-    // is the ONLY provisional cell (the index-delete cleared B's marker, C
-    // never had one).
-    let staged = provisional_cells(&store, &id).await?;
+    // Read back through a FRESH store: its cold memo forces the durable
+    // marker read, so recovery decodes the batch-written marker (proving the
+    // `marker_write` row bound its own columns), finds it lists exactly A,
+    // and reads A back provisional with A's payload (the stage row bound its
+    // columns). B was promoted out of the provisional set by the key-only
+    // promote row.
+    let reader = fx.bottom_store(ScriptedOracle::default());
+    let staged = provisional_cells(&reader, &id).await?;
     assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
     let (key, prov) = staged
         .into_iter()
@@ -802,12 +1124,30 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns); C written fresh resolved to its own payload (the resolved-write
     // row bound its columns).
     assert_eq!(
-        store.get(&id, &cell_b, event(3)).await?,
+        reader.get(&id, &cell_b, event(3)).await?,
         Committed::new(Some(data_b))
     );
     assert_eq!(
-        store.get(&id, &cell_c, event(3)).await?,
+        reader.get(&id, &cell_c, event(3)).await?,
         Committed::new(Some(data_c))
+    );
+    // D's row was deleted (the `cell_delete` bound its own `kind=Cell` key
+    // columns, not the marker slice's `kind=Marker`), so it reads absent.
+    assert_eq!(
+        reader.get(&id, &cell_d, event(3)).await?,
+        Committed::new(None)
+    );
+
+    // Follow-up batch: `marker_delete` removes the fixed-address marker row —
+    // a second fresh store's cold recovery then finds no marker at all.
+    let delete = [marker_delete_unit(Pk::of(&id), &fx.queries)];
+    fx.cassandra
+        .execute_unlogged_batches(&delete, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
+        .await?;
+    let reader = fx.bottom_store(ScriptedOracle::default());
+    assert!(
+        provisional_cells(&reader, &id).await?.is_empty(),
+        "marker_delete removed the marker row, so cold recovery lists nothing"
     );
     Ok(())
 }
@@ -824,34 +1164,66 @@ fn finish(result: Result<bool>) -> TestResult {
 }
 
 /// The crash-recovery-equivalence property over the production
-/// `Cached<CassandraStore>` assembly (crash-recovery equivalence and
-/// oracle-correctness properties). A "crash" rebuilds the cache cold over the
-/// same durable Cassandra rows and oracle set. The tempdir and fjall client
-/// outlive every store the `make` closure mints (the await completes before
-/// they drop).
+/// `Cached<CassandraStore>` assembly at the full clears-bearing alphabet
+/// (crash-recovery equivalence and oracle-correctness properties). A "crash"
+/// rebuilds the cache cold over the same durable Cassandra rows and oracle
+/// set, so every durable clear leg — gap range deletes, the indivisible
+/// gaps+marker-delete settle unit, the marker payload's clear half, read-help
+/// — runs beneath the production cache with its Cov-Clr punches, and the
+/// lower fault seam (`FaultDepth::Lower` settle failures + directed
+/// post-failure reads, stage faults) fires beneath the cache against live
+/// CQL. The tempdir and fjall client outlive every store the `make` closure
+/// mints (the await completes before they drop).
 #[test]
 fn prop_cassandra_cell_crash_equivalence() {
     async fn run(trace: Trace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
         // Each `make` is a crash: a cold fjall cache over the same durable
-        // Cassandra rows. `cold_cache` clears the shared `cassandra_crash`
-        // keyspace pair (a cheap journal marker, no keyspace-creation fsync)
-        // instead of minting a fresh workspace per make; distinct v4 segments
-        // per iteration keep the shared keyspace disjoint.
-        let make = || -> Result<Bottom> {
+        // Cassandra rows, with the runner's lower fault seam between them.
+        // `cold_cache` clears the shared `cassandra_crash` keyspace pair (a
+        // cheap journal marker, no keyspace-creation fsync) instead of
+        // minting a fresh workspace per make; distinct v4 segments per
+        // iteration keep the shared keyspace disjoint.
+        let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
             Ok(Cached::new(
                 test_db::cold_cache("cassandra_crash")?,
-                fx.bottom_store(oracle.clone()),
+                FailingCellStore::with_handle(fx.bottom_store(oracle.clone()), handle.clone()),
             ))
         };
-        run_crash_equivalence_trace(make, oracle.clone(), trace).await
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_crash_equivalence_trace(make, oracle.clone(), trace, &probe).await
     }
 
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
         .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
+}
+
+/// Apply idempotence over the bare live store: any generated interleaving of
+/// marker resolution, verdict-matching settle re-applies, and per-cell
+/// first-touches over one staged set with durable section clears converges to
+/// the verdict state — no marker, no provisional residue, exact row shape.
+#[test]
+fn prop_cassandra_apply_idempotence() {
+    async fn run(input: ApplyTrace) -> Result<bool> {
+        let fx = fixture().await?;
+        let oracle = ScriptedOracle::default();
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_apply_idempotence(fx.bottom_store(oracle.clone()), oracle, input, &probe).await
+    }
+
+    init_test_logging();
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|input| finish(TEST_RUNTIME.block_on(run(input)))) as fn(ApplyTrace) -> TestResult,
+        );
 }
 
 /// Implicit-overwrite soundness over `Cached<CassandraStore>`: each overwrite
@@ -921,7 +1293,10 @@ fn prop_cassandra_overlay_view() {
 fn prop_cassandra_bottom_scan() {
     async fn run(trace: ScanTrace) -> Result<bool> {
         let fx = fixture().await?;
-        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace).await
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace, &probe).await
     }
 
     init_test_logging();
@@ -987,29 +1362,30 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         );
         let cell = value_cell();
         store
-            .write_resolved(&c, &[(cell.clone(), Some(old.clone()))])
+            .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
             .await?;
         // `event(1)` is never recorded in the oracle, so resolution rolls the
         // staged clear back to `prev`.
-        store
-            .write_provisional(
-                &c,
-                &[(
-                    cell.clone(),
-                    ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
-                )],
-            )
-            .await?;
+        let writes = [(
+            cell.clone(),
+            ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
+        )];
+        let marker = EventMarker::frozen(event(1), &writes, &[]);
+        store.write_provisional(&c, &writes, Some(&marker)).await?;
 
         let (value, co_expiry) = if path == "get_for_cache" {
             let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
             (committed.into_inner(), co_expiry)
         } else {
+            // A concrete edge pair covering the single value cell (empty
+            // coordinate) — a whole-section scan with `ScanEdge`.
+            let low = Coordinate::empty();
+            let high = Coordinate::from_bytes(vec![0xFF, 0xFF, 0xFF, 0xFF]);
             let scan = Scan {
                 section: Section::new(0),
-                start: Bound::Unbounded,
+                start: ScanEdge::Included(&low),
                 dir: Direction::Forward,
-                end: Bound::Unbounded,
+                end: ScanEdge::Included(&high),
                 limit: None,
             };
             let stream = store.scan_for_cache(c.id(), scan, event(2));
@@ -1031,4 +1407,180 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Marker TTL co-expiry pin: staging on a TTL'd collection stamps the
+/// event-marker row with the collection TTL, so the marker dies with the
+/// newest staged cell. Structurally untestable by the trace suites (their
+/// collection pool is TTL-less), so pinned directly with a raw-CQL
+/// `TTL(data)` read at the fixed marker address.
+#[tokio::test]
+async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::timers::duration::CompactDuration;
+
+    const TTL: u32 = 3_600;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = CollectionRef::new(
+        collection("marker-ttl")?.id().clone(),
+        Some(CompactDuration::new(TTL)),
+    );
+    let cell = value_cell();
+    let writes = [(
+        cell,
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"v")),
+            Committed::new(None),
+            event(1),
+        ),
+    )];
+    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+
+    let cql = format!(
+        "SELECT TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? AND \
+         key = ? AND state_type = ? AND name = ? AND kind = 1 AND section = 0 AND coordinate = ?"
+    );
+    let id = c.id();
+    let remaining = fx
+        .cassandra
+        .session()
+        .query_unpaged(
+            cql,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                b"" as &[u8],
+            ),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<i32>,)>()?
+        .and_then(|(ttl,)| ttl)
+        .ok_or_else(|| eyre!("the event-marker row or its TTL is missing"))?;
+    assert!(
+        remaining > 0_i32 && remaining <= TTL as i32,
+        "marker TTL {remaining} must lie in (0, {TTL}]"
+    );
+    assert!(
+        remaining > TTL as i32 - 60_i32,
+        "marker TTL {remaining} must be freshly stamped (60s slack for elapsed wall time)"
+    );
+    Ok(())
+}
+
+/// The `Cached` stage-boundary punch: event A stages two coordinates through
+/// the cached assembly (fjall covers A's stage-time `prev`s as the committed
+/// projections), A's commit marker is recorded but the settle never runs (the
+/// skipped-settle window); event B then stages ONE overlapping coordinate
+/// through the same assembly. The lower store's stage boundary resolves A's
+/// event marker *beneath* the cache, so `Cached::write_provisional` must punch
+/// A's marker-listed coordinates BEFORE forwarding down — without the punch,
+/// A's untouched coordinate keeps serving the stale covered `prev` verbatim
+/// forever. A deterministic falsifier of the punch-ordering the fault/crash
+/// alphabet surfaces as model divergence against the live `Cached` composition;
+/// it isolates the skipped-settle boundary window without a generated schedule.
+#[tokio::test]
+async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
+    use crate::state::oracle::CommitOracle;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let oracle = ScriptedOracle::default();
+    let store = Cached::new(
+        test_db::cache("cassandra_boundary_punch")?,
+        fx.bottom_store(oracle.clone()),
+    );
+    let c = collection("boundary-punch")?;
+    let id = c.id().clone();
+    let (cell0, cell1) = (cell_i(0), cell_i(1));
+    let (base0, base1) = (Bytes::from_static(b"base0"), Bytes::from_static(b"base1"));
+
+    // Committed bases, covered by the write-through publish.
+    store
+        .write_resolved(
+            &c,
+            &[
+                (cell0.clone(), Some(base0.clone())),
+                (cell1.clone(), Some(base1.clone())),
+            ],
+            &[],
+        )
+        .await?;
+
+    // Event A stages over both coordinates; its stage re-publishes the prevs
+    // (the bases) as the covered committed projections. A's commit marker is
+    // recorded — A is committed — but the settle is never attempted.
+    let writes_a = [
+        (
+            cell0.clone(),
+            ProvisionalWrite::new(
+                Some(Bytes::from_static(b"a0")),
+                Committed::new(Some(base0)),
+                event(1),
+            ),
+        ),
+        (
+            cell1.clone(),
+            ProvisionalWrite::new(
+                Some(Bytes::from_static(b"a1")),
+                Committed::new(Some(base1)),
+                event(1),
+            ),
+        ),
+    ];
+    let marker_a = EventMarker::frozen(event(1), &writes_a, &[]);
+    store
+        .write_provisional(&c, &writes_a, Some(&marker_a))
+        .await?;
+    oracle.record_message(Uuid::from_u128(1)).await?;
+
+    // Event B stages the overlapping coordinate 1. Its prev-read may serve
+    // the covered pre-settle value (the accepted bounded window — nothing is
+    // asserted on it); the stage's boundary then resolves A's marker beneath
+    // the cache and the punch drops A's listed coordinates from coverage.
+    let prev_b = store.get(&id, &cell1, event(2)).await?;
+    let writes_b = [(
+        cell1.clone(),
+        ProvisionalWrite::new(Some(Bytes::from_static(b"b1")), prev_b, event(2)),
+    )];
+    let marker_b = EventMarker::frozen(event(2), &writes_b, &[]);
+    store
+        .write_provisional(&c, &writes_b, Some(&marker_b))
+        .await?;
+
+    // A's untouched coordinate 0 must read A's committed data: the punch
+    // uncovered it, so the read falls through to the boundary-promoted row
+    // instead of serving the stale covered prev.
+    assert_eq!(
+        store.get(&id, &cell0, event(3)).await?,
+        Committed::new(Some(Bytes::from_static(b"a0"))),
+        "the stage-boundary punch must drop the stale covered prev"
+    );
+    Ok(())
+}
+
+/// The pure single-batch packing decision `write_provisional` bases its
+/// marker-first ordering on: a unit set fits one batch iff the weight sum is
+/// within the byte budget AND the unit count is within the statement budget.
+/// (The intra-call tear of an over-budget stage cannot be injected through
+/// the trait; the ordering is enforced by the two sequential awaits plus this
+/// decision, and the staged-coverage postcondition guards the durable shape
+/// on every generated trace.)
+#[test]
+fn fits_one_batch_decides_on_both_budgets() {
+    // Strictly under both budgets, and exactly at both boundaries.
+    assert!(fits_one_batch([1, 2].into_iter(), 5, 3));
+    assert!(fits_one_batch([2, 3].into_iter(), 5, 2));
+    // Over the byte budget by one.
+    assert!(!fits_one_batch([3, 3].into_iter(), 5, 8));
+    // Over the count budget by one.
+    assert!(!fits_one_batch([1, 1, 1].into_iter(), 100, 2));
+    // Empty always fits.
+    assert!(fits_one_batch(iter::empty(), 0, 0));
 }

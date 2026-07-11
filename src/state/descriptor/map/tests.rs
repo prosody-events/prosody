@@ -1,10 +1,9 @@
 //! Map section-freeze and frozen-byte goldens.
 //!
-//! The behavioral invariants (key ordering, the loose-superset bounds, the
-//! missing-bound fallback, crash atomicity) are proven by the memory-backed
-//! `run_map_trace` property and the missing-bound directed test in
-//! [`crate::state::tests`]. These pin the durable wire contracts: the section
-//! discriminants and the `Meta` cell addresses.
+//! The behavioral invariants (key ordering, the loose-superset bounds, clear,
+//! crash atomicity) are proven by the memory-backed `run_map_trace` property
+//! in [`crate::state::tests`]. These pin the durable wire contracts: the
+//! section discriminants and the `Meta` cell addresses.
 
 use super::*;
 use quickcheck::{QuickCheck, TestResult};

@@ -1,24 +1,29 @@
 //! The single cell-resolution decision, shared by every recovery path.
 //!
 //! `resolve_cell` is the one place a provisional cell becomes committed:
-//! consult the commit oracle for the cell's owning event, then either *promote*
-//! it ([`CellStore::mark_resolved`], the commit arm) or write the committed
-//! base back as resolved ([`CellStore::write_resolved`], the rollback arm).
-//! Eager promotion after commit, the quiescence sweep, and first-touch all
-//! funnel through here, so "a provisional cell is resolved only via the oracle"
-//! (the oracle-always invariant) holds by construction.
+//! consult the commit oracle for the cell's owning event, then resolve it one
+//! of three ways — *promote* present data in place
+//! ([`CellStore::mark_resolved`], the commit arm for a `Set`), **delete** the
+//! row for a committed clear ([`CellStore::write_resolved`]`(None)`, the
+//! row-absence invariant), or write the committed base back as resolved
+//! ([`CellStore::write_resolved`], the rollback arm). Eager promotion after
+//! commit, the quiescence sweep, and first-touch all funnel through here, so "a
+//! provisional cell is resolved only via the oracle" (the oracle-always
+//! invariant) holds by construction.
 //!
 //! `sweep_provisional` is the recovery loop built once over the public trait:
-//! it streams a collection's provisional cells and resolves each, returning
-//! whether every cell ended resolved. The backstop that triggered the sweep
-//! is never unscheduled directly (finding F2); it clears only by firing.
+//! it resolves the collection's standing event marker as a unit
+//! (`resolve_marker`) then streams any remaining provisional cells, returning
+//! whether the stage ended fully resolved. The backstop that triggered the
+//! sweep is never unscheduled directly (finding F2); it clears only by firing.
 
 use super::CommitDecision;
 use super::SHARD_FANOUT_CONCURRENCY;
-use super::cell::{Cell, Committed, ProvisionalCell};
+use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::CellKey;
 use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
+use super::marker::EventMarker;
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::store::CellStore;
@@ -135,6 +140,12 @@ where
 /// (the committed base is written back as resolved). Fails with
 /// [`ResolveCellError::Oracle`] if the oracle read fails, or
 /// [`ResolveCellError::Store`] if the promote / write-back fails.
+///
+/// First-touch resolution stays **cell-grained and marker-free**: it uses the
+/// primitive verbs and leaves any standing event marker in place. The marker's
+/// resulting over-report is harmless — a later point read sees the cell already
+/// resolved and drops it — and the marker is cleared by the next stage boundary
+/// or the sweep's marker leg ([`resolve_marker`]).
 pub(crate) async fn resolve_cell<S, O>(
     store: &S,
     oracle: &O,
@@ -152,15 +163,29 @@ where
         .map_err(ResolveCellError::Oracle)?;
     match decision {
         CommitDecision::Committed => {
-            store
-                .mark_resolved(collection, slice::from_ref(cell))
-                .await
-                .map_err(ResolveCellError::Store)?;
+            // Promote-of-a-clear must delete the row, not null it: an absent-data
+            // commit routes to `write_resolved(None)` (the row-absence
+            // invariant), present data promotes in place.
+            if provisional.data().is_some() {
+                store
+                    .mark_resolved(collection, slice::from_ref(cell))
+                    .await
+                    .map_err(ResolveCellError::Store)?;
+            } else {
+                store
+                    .write_resolved(collection, &[(cell.clone(), None)], &[])
+                    .await
+                    .map_err(ResolveCellError::Store)?;
+            }
             Ok(Committed::new(provisional.into_data()))
         }
         CommitDecision::NotCommitted => {
             store
-                .write_resolved(collection, &[(cell.clone(), provisional.prev().cloned())])
+                .write_resolved(
+                    collection,
+                    &[(cell.clone(), provisional.prev().cloned())],
+                    &[],
+                )
                 .await
                 .map_err(ResolveCellError::Store)?;
             Ok(Committed::new(provisional.into_prev()))
@@ -168,14 +193,120 @@ where
     }
 }
 
-/// Resolves every provisional cell of a collection through the oracle (the
-/// quiescence sweep loop). Returns `true` iff every cell ended resolved, for
-/// the recovery sweep to act on.
+/// Resolves a collection's standing **event marker** as a unit, the shared leg
+/// of the sweep and (in the memory backend) the stage boundary.
 ///
-/// A per-cell `Permanent` failure is logged and skipped, leaving the cell for
-/// first-touch or a later sweep and yielding `false`; anything else — a
-/// transient/terminal backend or oracle failure, or a `provisional_cells`
-/// stream failure — propagates so the trigger aborts and the sweep refires.
+/// One oracle verdict on the marker's event decides the whole stage: rebuild
+/// the still-live staged writes — for each listed coordinate,
+/// [`CellStore::provisional_cell_at`], keeping only a cell still owned by the
+/// marker's event (an absent / resolved / foreign-event cell is already
+/// settled, an over-report-safe drop) — then
+/// [`commit_provisional`](CellStore::commit_provisional) (committed) or
+/// [`abort_provisional`](CellStore::abort_provisional) (not committed). Both
+/// verbs delete the marker, including the exhausted case (no live writes),
+/// which is why no separate marker-delete verb exists. `clears` ride through
+/// verbatim to the commit arm, which applies the frozen gap erase.
+///
+/// # Errors
+///
+/// Returns [`ResolveCellError::Oracle`] on an oracle failure or
+/// [`ResolveCellError::Store`] on a rebuild / settle failure.
+pub(crate) async fn resolve_marker<S, O>(
+    store: &S,
+    oracle: &O,
+    collection: &CollectionRef,
+    marker: &EventMarker,
+) -> Result<(), ResolveCellError<S::Error, O::Error>>
+where
+    S: CellStore,
+    O: CommitOracle,
+{
+    let decision = oracle
+        .resolve(collection.id().state_key(), marker.event())
+        .await
+        .map_err(ResolveCellError::Oracle)?;
+    let mut writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(marker.staged().len());
+    for cell in marker.staged() {
+        let provisional = store
+            .provisional_cell_at(collection.id(), cell)
+            .await
+            .map_err(ResolveCellError::Store)?;
+        if let Some(provisional) = provisional
+            && provisional.event() == marker.event()
+        {
+            // A resolved decision site: `Committed::new` is legal here.
+            writes.push((
+                cell.clone(),
+                ProvisionalWrite::new(
+                    provisional.data().cloned(),
+                    Committed::new(provisional.prev().cloned()),
+                    provisional.event(),
+                ),
+            ));
+        }
+    }
+    match decision {
+        CommitDecision::Committed => store
+            .commit_provisional(collection, &writes, marker.clears())
+            .await
+            .map_err(ResolveCellError::Store),
+        CommitDecision::NotCommitted => store
+            .abort_provisional(collection, &writes)
+            .await
+            .map_err(ResolveCellError::Store),
+    }
+}
+
+/// The committed-unapplied read window: a standing **foreign** event marker
+/// that carries section clears means gap tombstones may not have landed yet,
+/// and a pre-clear resolved row cannot be caught by per-cell oracle resolution
+/// the way a provisional cell is. Resolve the whole marker through the sweep
+/// path ([`resolve_marker`]) before serving the read; markers without clears
+/// are left standing (first-touch stays cell-grained and marker-free).
+///
+/// The one read-help decision, shared by both bottom stores' `get`/`scan`
+/// pairs. Returns whether it resolved, so a caller that read concurrently with
+/// the marker consult re-issues its raw read. The own-event guard is
+/// load-bearing: the staging event's own reads between stage and settle must
+/// NOT resolve its own marker (that would settle the event mid-flight) — the
+/// trigger is strictly *foreign AND clears non-empty*.
+///
+/// # Errors
+///
+/// Returns [`ResolveCellError`] as [`resolve_marker`] would.
+pub(crate) async fn help_read_window<S, O>(
+    store: &S,
+    oracle: &O,
+    collection: &CollectionRef,
+    marker: Option<&EventMarker>,
+    own: EventRef,
+) -> Result<bool, ResolveCellError<S::Error, O::Error>>
+where
+    S: CellStore,
+    O: CommitOracle,
+{
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    if marker.event() == own || marker.clears().is_empty() {
+        return Ok(false);
+    }
+    resolve_marker(store, oracle, collection, marker).await?;
+    Ok(true)
+}
+
+/// Resolves a collection's in-flight stage during recovery. Returns `true` iff
+/// nothing was left unresolved, for the recovery sweep to act on.
+///
+/// Two legs, both with the retry-forever posture: the **marker leg** first
+/// ([`resolve_marker`] on any standing event marker), then the per-cell
+/// **mop-up** (the cold `provisional_cells` scan) that covers any cells the
+/// marker leg left behind (a Permanent-skipped cell, a marker-listed
+/// coordinate resolved concurrently). A `Permanent` failure in either leg is
+/// logged and skipped, leaving the work for first-touch or a later sweep and
+/// yielding `false`; anything else — a transient/terminal backend or oracle
+/// failure, or a `provisional_cells` stream failure — propagates so the trigger
+/// aborts and the sweep refires.
 pub(crate) async fn sweep_provisional<S, O>(
     store: &S,
     oracle: &O,
@@ -185,12 +316,35 @@ where
     S: CellStore,
     O: CommitOracle,
 {
+    // Marker leg: resolve the standing event marker as a unit before the
+    // per-cell mop-up. A quiescent collection answers `None` (RAM-warm on both
+    // backends), so this is a free no-op almost always.
+    let marker_ok = match store
+        .standing_marker(collection.id())
+        .await
+        .map_err(ResolveCellError::Store)?
+    {
+        Some(marker) => match resolve_marker(store, oracle, collection, &marker).await {
+            Ok(()) => true,
+            Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+                error!(
+                    name = collection.id().name().as_str(),
+                    "skipping permanently-failing event marker; first-touch or the next stage \
+                     boundary must resolve it: {error:#}"
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        },
+        None => true,
+    };
+
     // Resolutions of distinct cells are independent and commutative (each cell
     // is promoted/rolled-back once), so pipeline them on the partition's shard:
     // `try_fold` ANDs the per-cell Permanent-skip flags and short-circuits on a
     // propagating error — the same outcome as the sequential loop, order-free.
     // Cassandra/oracle I/O leaves drive the coop budget, so no `cooperative`.
-    store
+    let cells_ok = store
         .provisional_cells(collection.id())
         .map_err(ResolveCellError::Store)
         .map(|item| async move {
@@ -210,7 +364,8 @@ where
         })
         .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
         .try_fold(true, |all, ok| async move { Ok(all && ok) })
-        .await
+        .await?;
+    Ok(marker_ok && cells_ok)
 }
 
 /// Error raised by cell resolution: the bottom stores' resolving `get`/

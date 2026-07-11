@@ -18,13 +18,22 @@
 //! `Mutex`, no per-event map. The full `(state_type, name)` in the key prevents
 //! same-key / different-collection collisions in the shared tree.
 //!
+//! Section clears ride a **sibling marker tree**: [`DirtyStore::clear_section`]
+//! upserts a *dirty clear marker* keyed `(key, state_type, name, section)` and
+//! discards the section's already-buffered cells, so from that program point
+//! the section reads as deleted and later `set`s repopulate it. The overlay
+//! consults the marker on reads ([`DirtyStore::section_cleared`]);
+//! [`DirtyStore::touched`] reports each collection's cleared sections beside
+//! its cells; [`DirtyStore::clear_event`] / [`DirtyStore::remove_collection`]
+//! sweep both trees.
+//!
 //! The dirty store is volatile and discarded at each settle/attempt boundary —
 //! it is **never** a durability or recovery source. Crash recovery runs off the
 //! Cassandra provisional cells and the commit oracle.
 //!
 //! [`Overlay`]: crate::state::overlay::Overlay
 
-use super::cell_key::CellKey;
+use super::cell_key::{CellKey, Section};
 use super::identity::{CollectionId, StateName, StateType};
 use crate::Key;
 use bytes::Bytes;
@@ -47,15 +56,23 @@ pub type CellSnapshot = SmallVec<[(CellKey, DirtyVal); CELLS_INLINE]>;
 
 /// One collection's dirty cells in committed-write form (`(cell, data)`),
 /// owned and coordinate-ordered — the [`CellStore::write_resolved`] input
-/// shape, inline like [`CellSnapshot`] so a flush of a Value or a small
+/// shape, inline like [`CellSnapshot`] so a checkpoint of a Value or a small
 /// Map/Deque allocates nothing.
 ///
 /// [`CellStore::write_resolved`]: crate::state::store::CellStore::write_resolved
 pub type ResolvedCells = SmallVec<[(CellKey, Option<Bytes>); CELLS_INLINE]>;
 
-/// One event's touched cells grouped by collection: `(state_type, name)` and
-/// its [`CellSnapshot`].
-pub type TouchedCollection = ((StateType, StateName), CellSnapshot);
+/// Inline capacity of one collection's cleared-section list; a collection has
+/// two or three sections.
+const SECTIONS_INLINE: usize = 2;
+
+/// One collection's sections under a standing dirty clear marker, inline for
+/// the handful of sections a collection has.
+pub type ClearedSections = SmallVec<[Section; SECTIONS_INLINE]>;
+
+/// One event's touched cells grouped by collection: `(state_type, name)`, the
+/// sections it cleared (dirty clear markers), and its [`CellSnapshot`].
+pub type TouchedCollection = ((StateType, StateName), ClearedSections, CellSnapshot);
 
 /// One event's touched collections — the `finalize` work-list, inline for the
 /// common handful.
@@ -69,6 +86,18 @@ struct DirtyKey {
     state_type: StateType,
     name: StateName,
     cell: CellKey,
+}
+
+/// One dirty clear marker's address in the marker tree: the event's Kafka
+/// `key`, the collection, and the cleared [`Section`]. A sibling of
+/// [`DirtyKey`], not a widened one — the cell tree's key and its ordering stay
+/// untouched.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MarkerKey {
+    key: Key,
+    state_type: StateType,
+    name: StateName,
+    section: Section,
 }
 
 /// The latest staged outcome for a dirty cell (last-writer-wins).
@@ -93,11 +122,13 @@ impl DirtyVal {
     }
 }
 
-/// In-memory dirty cell store: the latest [`DirtyVal`] per touched cell, keyed
-/// by `DirtyKey`, shared per partition.
+/// In-memory dirty cell store: the latest [`DirtyVal`] per touched cell plus
+/// the standing dirty clear markers, keyed by `DirtyKey`/`MarkerKey`, shared
+/// per partition.
 #[derive(Debug, Default)]
 pub struct DirtyStore {
     entries: scc::TreeIndex<DirtyKey, DirtyVal>,
+    markers: scc::TreeIndex<MarkerKey, ()>,
 }
 
 impl DirtyStore {
@@ -121,6 +152,34 @@ impl DirtyStore {
             .upsert_sync(dirty_key(collection, cell), DirtyVal::Cleared);
     }
 
+    /// Buffers a dirty clear marker for one collection-section and discards
+    /// the section's already-buffered cells: from this program point the
+    /// section reads as deleted, and later `set`s repopulate it —
+    /// last-writer-wins per cell plus the marker, no op algebra. Discarding
+    /// buffered `Cleared` cells too is sound: under the marker they read
+    /// identically (absent), and the durable clear's gap erase subsumes every
+    /// pre-marker outcome — `finalize` skips a `Cleared` cell in a cleared
+    /// section for the same reason. Race-free per key for the same reason as
+    /// [`Self::clear_event`].
+    pub fn clear_section(&self, collection: &CollectionId, section: Section) {
+        self.markers
+            .upsert_sync(marker_key(collection, section), ());
+        self.entries
+            .remove_range_sync(SectionScope::range(collection, section));
+    }
+
+    /// Whether a dirty clear marker stands for the collection-section — the
+    /// [`Overlay`] read hook. Lock-free [`scc::TreeIndex::peek_with`] for the
+    /// reason on [`Self::lookup`].
+    ///
+    /// [`Overlay`]: crate::state::overlay::Overlay
+    #[must_use]
+    pub fn section_cleared(&self, collection: &CollectionId, section: Section) -> bool {
+        self.markers
+            .peek_with(&marker_key(collection, section), |_, ()| ())
+            .is_some()
+    }
+
     /// The cell's buffered outcome, if any — the [`Overlay`] point lookup.
     ///
     /// Uses the lock-free [`scc::TreeIndex::peek_with`], not `read_sync`: a
@@ -128,7 +187,7 @@ impl DirtyStore {
     /// (never interior-mutated), so the lock-free snapshot read is exactly
     /// right — and it avoids `read_sync`'s lock-retry loop, which spins
     /// forever on a key that was just drained by [`Self::remove_collection`]
-    /// in the same (single-threaded) event (the flush → re-read path).
+    /// in the same (single-threaded) event (the checkpoint → re-read path).
     ///
     /// [`Overlay`]: crate::state::overlay::Overlay
     #[must_use]
@@ -147,11 +206,7 @@ impl DirtyStore {
     ///
     /// [`Overlay`]: crate::state::overlay::Overlay
     #[must_use]
-    pub fn section_snapshot(
-        &self,
-        collection: &CollectionId,
-        section: super::cell_key::Section,
-    ) -> CellSnapshot {
+    pub fn section_snapshot(&self, collection: &CollectionId, section: Section) -> CellSnapshot {
         let guard = Guard::new();
         self.entries
             .range(SectionScope::range(collection, section), &guard)
@@ -161,7 +216,8 @@ impl DirtyStore {
 
     /// An owned, coordinate-ordered snapshot of one collection's dirty cells
     /// across every section, already in committed-write form — the mid-handler
-    /// flush's drain read. Same owned-snapshot rationale as
+    /// checkpoint's drain read (cells only; [`Self::cleared_sections`] is its
+    /// clear half). Same owned-snapshot rationale as
     /// [`Self::section_snapshot`].
     #[must_use]
     pub fn collection_snapshot(&self, collection: &CollectionId) -> ResolvedCells {
@@ -172,39 +228,76 @@ impl DirtyStore {
             .collect()
     }
 
-    /// Discards one collection's buffered outcomes (after a mid-handler flush
-    /// wrote them through). Race-free for the same reason as
-    /// [`Self::clear_event`]: no handler op is in flight while the handler
-    /// itself awaits the flush.
+    /// One collection's sections under a standing dirty clear marker — the
+    /// mid-handler checkpoint's clear half, beside
+    /// [`Self::collection_snapshot`].
+    #[must_use]
+    pub fn cleared_sections(&self, collection: &CollectionId) -> ClearedSections {
+        let guard = Guard::new();
+        self.markers
+            .range(MarkerCollectionScope::range(collection), &guard)
+            .map(|(key, ())| key.section)
+            .collect()
+    }
+
+    /// Discards one collection's buffered outcomes and dirty clear markers
+    /// (after a mid-handler checkpoint wrote them through). Race-free for the
+    /// same reason as [`Self::clear_event`]: no handler op is in flight while
+    /// the handler itself awaits the checkpoint.
     pub fn remove_collection(&self, collection: &CollectionId) {
         self.entries
             .remove_range_sync(CollectionScope::range(collection));
+        self.markers
+            .remove_range_sync(MarkerCollectionScope::range(collection));
     }
 
-    /// Groups this event's (one `key`) dirty cells by collection — the
+    /// Groups this event's (one `key`) dirty state by collection — the
     /// `finalize` work-list. Each entry pairs a `(state_type, name)` with its
-    /// touched `(cell, outcome)` set; the caller rebuilds the [`CollectionId`]
-    /// from its own state key.
+    /// cleared sections (dirty clear markers) and its touched
+    /// `(cell, outcome)` set; a marker-only collection appears with an empty
+    /// cell set. The caller rebuilds the [`CollectionId`] from its own state
+    /// key.
     #[must_use]
     pub fn touched(&self, key: &Key) -> TouchedCollections {
         let guard = Guard::new();
         let mut grouped = TouchedCollections::new();
+        for (marker_key, ()) in self
+            .markers
+            .range(MarkerKeyScope::range(key.clone()), &guard)
+        {
+            let collection = (marker_key.state_type, marker_key.name.clone());
+            match grouped.iter_mut().find(|(c, ..)| *c == collection) {
+                Some((_, cleared, _)) => cleared.push(marker_key.section),
+                None => grouped.push((
+                    collection,
+                    ClearedSections::from_iter([marker_key.section]),
+                    CellSnapshot::new(),
+                )),
+            }
+        }
         for (dirty_key, value) in self.entries.range(KeyScope::range(key.clone()), &guard) {
             let collection = (dirty_key.state_type, dirty_key.name.clone());
             let entry = (dirty_key.cell.clone(), value.clone());
-            match grouped.iter_mut().find(|(c, _)| *c == collection) {
-                Some((_, cells)) => cells.push(entry),
-                None => grouped.push((collection, SmallVec::from_iter([entry]))),
+            match grouped.iter_mut().find(|(c, ..)| *c == collection) {
+                Some((_, _, cells)) => cells.push(entry),
+                None => grouped.push((
+                    collection,
+                    ClearedSections::new(),
+                    SmallVec::from_iter([entry]),
+                )),
             }
         }
         grouped
     }
 
-    /// Discards every cell buffered for one event's `key` — the clear-at-settle
-    /// / reset move. Race-free: single-writer-per-key makes this key's
-    /// sub-range exclusively owned during its event.
+    /// Discards every cell and dirty clear marker buffered for one event's
+    /// `key` — the clear-at-settle / reset move. Race-free:
+    /// single-writer-per-key makes this key's sub-range exclusively owned
+    /// during its event.
     pub fn clear_event(&self, key: &Key) {
         self.entries.remove_range_sync(KeyScope::range(key.clone()));
+        self.markers
+            .remove_range_sync(MarkerKeyScope::range(key.clone()));
     }
 }
 
@@ -217,6 +310,16 @@ fn dirty_key(collection: &CollectionId, cell: &CellKey) -> DirtyKey {
         state_type: collection.state_type(),
         name: collection.name().clone(),
         cell: cell.clone(),
+    }
+}
+
+/// Builds the marker-tree key for one cleared section of a collection.
+fn marker_key(collection: &CollectionId, section: Section) -> MarkerKey {
+    MarkerKey {
+        key: collection.state_key().key.clone(),
+        state_type: collection.state_type(),
+        name: collection.name().clone(),
+        section,
     }
 }
 
@@ -289,7 +392,7 @@ impl scc::Comparable<DirtyKey> for KeyScope {
 }
 
 /// Bounding query for every [`DirtyKey`] in one collection — the mid-handler
-/// flush sub-range, for [`DirtyStore::collection_snapshot`] and
+/// checkpoint sub-range, for [`DirtyStore::collection_snapshot`] and
 /// [`DirtyStore::remove_collection`]. Compares on `(key, state_type, name)`,
 /// ignoring the cell, so the range spans the collection's cells across every
 /// section in coordinate order; see [`Edge`] for the strict-separator bounds.
@@ -343,13 +446,13 @@ struct SectionScope {
     key: Key,
     state_type: StateType,
     name: StateName,
-    section: super::cell_key::Section,
+    section: Section,
     edge: Edge,
 }
 
 impl SectionScope {
     /// The inclusive separator pair spanning `collection`'s cells in `section`.
-    fn range(collection: &CollectionId, section: super::cell_key::Section) -> RangeInclusive<Self> {
+    fn range(collection: &CollectionId, section: Section) -> RangeInclusive<Self> {
         let at = |edge| Self {
             key: collection.state_key().key.clone(),
             state_type: collection.state_type(),
@@ -377,6 +480,85 @@ impl scc::Equivalent<DirtyKey> for SectionScope {
 
 impl scc::Comparable<DirtyKey> for SectionScope {
     fn compare(&self, key: &DirtyKey) -> Ordering {
+        self.cmp_key(key).then(self.edge.beyond())
+    }
+}
+
+/// [`KeyScope`]'s marker-tree twin: bounds every [`MarkerKey`] sharing one
+/// Kafka `key`, for [`DirtyStore::touched`] and [`DirtyStore::clear_event`].
+/// Deliberately a plain duplicate of the cell-tree scope, not generic scope
+/// machinery — two flat structs read better than a scope abstraction. See
+/// [`Edge`] for the strict-separator bounds.
+#[derive(Clone, PartialEq, Eq)]
+struct MarkerKeyScope {
+    key: Key,
+    edge: Edge,
+}
+
+impl MarkerKeyScope {
+    /// The inclusive separator pair spanning one Kafka `key`'s markers.
+    fn range(key: Key) -> RangeInclusive<Self> {
+        Self {
+            key: key.clone(),
+            edge: Edge::Low,
+        }..=Self {
+            key,
+            edge: Edge::High,
+        }
+    }
+}
+
+impl scc::Equivalent<MarkerKey> for MarkerKeyScope {
+    fn equivalent(&self, key: &MarkerKey) -> bool {
+        scc::Comparable::compare(self, key) == Ordering::Equal
+    }
+}
+
+impl scc::Comparable<MarkerKey> for MarkerKeyScope {
+    fn compare(&self, key: &MarkerKey) -> Ordering {
+        self.key.cmp(&key.key).then(self.edge.beyond())
+    }
+}
+
+/// [`CollectionScope`]'s marker-tree twin: bounds every [`MarkerKey`] in one
+/// collection, for [`DirtyStore::remove_collection`]. See [`Edge`] for the
+/// strict-separator bounds.
+#[derive(Clone, PartialEq, Eq)]
+struct MarkerCollectionScope {
+    key: Key,
+    state_type: StateType,
+    name: StateName,
+    edge: Edge,
+}
+
+impl MarkerCollectionScope {
+    /// The inclusive separator pair spanning `collection`'s markers.
+    fn range(collection: &CollectionId) -> RangeInclusive<Self> {
+        let at = |edge| Self {
+            key: collection.state_key().key.clone(),
+            state_type: collection.state_type(),
+            name: collection.name().clone(),
+            edge,
+        };
+        at(Edge::Low)..=at(Edge::High)
+    }
+
+    fn cmp_key(&self, key: &MarkerKey) -> Ordering {
+        self.key
+            .cmp(&key.key)
+            .then(self.state_type.cmp(&key.state_type))
+            .then(self.name.cmp(&key.name))
+    }
+}
+
+impl scc::Equivalent<MarkerKey> for MarkerCollectionScope {
+    fn equivalent(&self, key: &MarkerKey) -> bool {
+        scc::Comparable::compare(self, key) == Ordering::Equal
+    }
+}
+
+impl scc::Comparable<MarkerKey> for MarkerCollectionScope {
+    fn compare(&self, key: &MarkerKey) -> Ordering {
         self.cmp_key(key).then(self.edge.beyond())
     }
 }

@@ -52,7 +52,7 @@ pub use workspace::{FjallClient, FjallClientError, FjallWorkspace};
 use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
@@ -198,7 +198,7 @@ pub struct FjallCellCache {
 /// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
 /// cell-cache writes are **not** issued as one cross-keyspace batch; the warm
 /// index is a rebuildable hint (a fresh assignment re-seeds from the durable
-/// `kind=Index`), so they need no atomicity with the committed-value write.
+/// event marker), so they need no atomicity with the committed-value write.
 enum Inner {
     Bare {
         database: Database,
@@ -553,9 +553,9 @@ impl FjallCellCache {
     /// runtime.
     ///
     /// The fjall keyspace is shared across **all** collections, so the scan is
-    /// bounded to the `(collection, section)` byte prefix on both ends — an
-    /// unbounded high bound stops at the section's upper boundary, never
-    /// bleeding into the next section or another collection. A per-row prefix
+    /// bounded to the `(collection, section)` byte prefix on both ends — both
+    /// scan edges append their coordinates to that prefix, so the range never
+    /// bleeds into the next section or another collection. A per-row prefix
     /// check guards the same invariant defensively (see `scan_hop`).
     pub(crate) fn scan_present<'a>(
         &'a self,
@@ -625,12 +625,13 @@ impl FjallCellCache {
 
     // --- Warm index: provisional coordinates + cold-seed latch ---------------
     //
-    // The warm provisional index the recovery sweep short-circuits on. It lives
+    // The warm provisional-coordinate cache the recovery sweep short-circuits
+    // on. It lives
     // in the per-partition `index` keyspace, cold at a fresh assignment and
     // dropped at revocation. It is the disk-spilling relocation of the former
-    // in-RAM `ProvisionalIndex`; the durable Cassandra `kind=Index` markers
-    // remain the authoritative cold-recovery source (a fresh assignment
-    // re-seeds from them).
+    // in-RAM `ProvisionalIndex`; the durable Cassandra event marker remains
+    // the authoritative cold-recovery source (a fresh assignment re-seeds
+    // from it).
 
     /// Whether `collection`'s one-time cold seed has run (the seeded latch).
     pub(crate) async fn index_seeded(
@@ -876,12 +877,12 @@ impl FjallCellCache {
 /// (the last raw key examined) when the hop stopped on a bound and more rows
 /// may remain, `None` when the range was exhausted.
 ///
-/// The fjall keyspace is shared across all collections, so a row outside the
-/// section prefix is never yielded: walking forward it marks the section's
-/// upper boundary (reachable only through the missing-successor unbounded high
-/// bound) and ends the scan; walking backward it *precedes* the section (the
-/// low byte bound pins the other side), so it is skipped but still counted
-/// against the budget, keeping every hop's work bounded.
+/// The fjall keyspace is shared across all collections, but both range edges
+/// carry the section prefix, so a row outside it is unreachable through the
+/// range — the per-row prefix check is a defensive guard. Should one ever
+/// appear, walking forward it marks the section's upper boundary and ends the
+/// scan; walking backward it *precedes* the section, so it is skipped but
+/// still counted against the budget, keeping every hop's work bounded.
 fn scan_hop(
     rows: impl Iterator<Item = Guard>,
     section_prefix: &[u8],
@@ -997,25 +998,21 @@ fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
     }
 }
 
-/// The fjall byte key bound opening a covered scan's low side. `Unbounded`
-/// starts at the section prefix itself (the least key in the section); a
-/// bounded coordinate appends to the prefix, preserving exclusivity.
-fn byte_low_bound(section_prefix: &[u8], lo: Bound<&Coordinate>) -> Bound<Vec<u8>> {
+/// The fjall byte key bound opening a covered scan's low side. The edge's
+/// coordinate appends to the section prefix, preserving exclusivity.
+fn byte_low_bound(section_prefix: &[u8], lo: ScanEdge<&Coordinate>) -> Bound<Vec<u8>> {
     match lo {
-        Bound::Unbounded => Bound::Included(section_prefix.to_vec()),
-        Bound::Included(c) => Bound::Included(byte_key(section_prefix, c)),
-        Bound::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
+        ScanEdge::Included(c) => Bound::Included(byte_key(section_prefix, c)),
+        ScanEdge::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
     }
 }
 
-/// The fjall byte key bound closing a covered scan's high side. `Unbounded`
-/// stops at the section's upper boundary (the successor prefix), so the scan
-/// never crosses into the next section or another collection.
-fn byte_high_bound(section_prefix: &[u8], hi: Bound<&Coordinate>) -> Bound<Vec<u8>> {
+/// The fjall byte key bound closing a covered scan's high side. The edge's
+/// coordinate appends to the section prefix, preserving exclusivity.
+fn byte_high_bound(section_prefix: &[u8], hi: ScanEdge<&Coordinate>) -> Bound<Vec<u8>> {
     match hi {
-        Bound::Unbounded => section_upper_bound(section_prefix),
-        Bound::Included(c) => Bound::Included(byte_key(section_prefix, c)),
-        Bound::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
+        ScanEdge::Included(c) => Bound::Included(byte_key(section_prefix, c)),
+        ScanEdge::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
     }
 }
 
@@ -1026,20 +1023,4 @@ fn byte_key(section_prefix: &[u8], coordinate: &Coordinate) -> Vec<u8> {
     key.extend_from_slice(section_prefix);
     key.extend_from_slice(coordinate);
     key
-}
-
-/// The smallest byte key strictly greater than every key carrying
-/// `section_prefix` — the lexicographic successor (increment the rightmost
-/// non-`0xFF` byte, drop the tail). An all-`0xFF` prefix has no successor, so
-/// the scan runs unbounded-high (the per-item prefix check then stops it).
-fn section_upper_bound(section_prefix: &[u8]) -> Bound<Vec<u8>> {
-    let mut bound = section_prefix.to_vec();
-    while let Some(last) = bound.last_mut() {
-        if *last < u8::MAX {
-            *last += 1;
-            return Bound::Excluded(bound);
-        }
-        bound.pop();
-    }
-    Bound::Unbounded
 }

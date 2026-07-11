@@ -6,6 +6,7 @@
 //! [`CassandraCellStoreError::Encoding`],
 //! [`CassandraCellStoreError::CorruptCell`],
 //! [`CassandraCellStoreError::CorruptUdt`],
+//! [`CassandraCellStoreError::MarkerPayload`],
 //! [`CassandraCellStoreError::VersionMismatch`] — are all
 //! permanent per-message data errors: retrying them indefinitely will not
 //! change the outcome.
@@ -14,6 +15,7 @@ use super::cell::CellCorruptReason;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::cell::EncodingError;
+use crate::state::marker::MarkerPayloadError;
 use thiserror::Error;
 
 /// See the module doc for retry classification.
@@ -35,6 +37,11 @@ pub enum CassandraCellStoreError {
     #[error("Cassandra event_ref UDT is corrupt: {0}")]
     CorruptUdt(#[from] CorruptUdtError),
 
+    /// The event-marker row's frozen payload failed to decode (or an
+    /// oversized stage failed to encode).
+    #[error("event-marker payload is corrupt: {0}")]
+    MarkerPayload(#[from] MarkerPayloadError),
+
     /// The value row's `version` stamp is not the version this
     /// build writes. Unreachable until identity migration ships; rejected
     /// defensively so a future-version cell is never misread.
@@ -55,6 +62,7 @@ impl ClassifyError for CassandraCellStoreError {
             Self::Encoding(_)
             | Self::CorruptCell(_)
             | Self::CorruptUdt(_)
+            | Self::MarkerPayload(_)
             | Self::VersionMismatch { .. } => ErrorCategory::Permanent,
         }
     }

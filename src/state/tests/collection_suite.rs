@@ -9,14 +9,21 @@
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
 //! caught. This single property covers dense-window / loose-bounds invariants,
-//! key/positional ordering, containment, and the bounds-and-entries-promote-
-//! together crash atomicity.
+//! key/positional ordering, containment, whole-collection `Clear` (in-event
+//! emptiness, survivor repopulation, abort exactness), and the
+//! bounds-and-entries-promote-together crash atomicity. The lifecycle
+//! properties run in **both** commit modes: `ReadCommitted` settles along the
+//! outcome, `ReadUncommitted` commits everything at `finalize` regardless of
+//! the outcome.
 //!
-//! Both op alphabets include the mid-handler `Flush`: the runner snapshots the
-//! scratch model at each flush, and on a non-committing outcome the committed
-//! read-back must equal the last flushed snapshot — flushed ops (entries *and*
-//! bookkeeping cells, as one batch) survive abort and crash-rollback while
-//! post-flush ops still roll back, the at-least-once flush contract.
+//! Both op alphabets include the mid-handler `Checkpoint`: the runner
+//! snapshots the scratch model at each checkpoint, and on a non-committing
+//! outcome the committed read-back must equal the last checkpointed snapshot —
+//! checkpointed ops (entries *and* bookkeeping cells, as one batch) survive
+//! abort and crash-rollback while post-checkpoint ops still roll back, the
+//! at-least-once checkpoint contract. A checkpoint-then-clear-then-abort
+//! trace therefore pins that abort restores the *checkpointed* state, never
+//! the pre-event state.
 //!
 //! Memory-backed only: the `cell_suite` runners already prove memory ↔
 //! Cassandra parity for the underlying store, and the collection logic lives
@@ -27,7 +34,10 @@ use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::map::bound_cells;
-use crate::state::descriptor::{DequeHandle, MapHandle, StateDescriptor, deque_state, map_state};
+use crate::state::descriptor::{
+    DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
+};
+use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
@@ -38,8 +48,8 @@ use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
-    CollectionId, CollectionRef, Direction, EventRef, PartitionBackend, StateKey, StateName,
-    StateType,
+    CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
+    StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, bail, eyre};
@@ -108,12 +118,12 @@ impl Arbitrary for Outcome {
     }
 }
 
-/// What one applied op observed: keep going, a mid-event flush happened (the
-/// runner snapshots the scratch model as immediately durable), or a return
-/// value diverged from the model (property failure).
+/// What one applied op observed: keep going, a mid-event checkpoint happened
+/// (the runner snapshots the scratch model as immediately durable), or a
+/// return value diverged from the model (property failure).
 enum OpOutcome {
     Continue,
-    Flushed,
+    Checkpointed,
     Mismatch,
 }
 
@@ -124,39 +134,43 @@ pub(crate) enum DequeOp {
     PushFront(u8),
     PopBack,
     PopFront,
-    Flush,
+    Clear,
+    Checkpoint,
 }
 
 impl Arbitrary for DequeOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 5 {
+        match u8::arbitrary(g) % 6 {
             0 => Self::PushBack(u8::arbitrary(g)),
             1 => Self::PushFront(u8::arbitrary(g)),
             2 => Self::PopBack,
             3 => Self::PopFront,
-            _ => Self::Flush,
+            4 => Self::Clear,
+            _ => Self::Checkpoint,
         }
     }
 }
 
-/// One map mutation, mid-trace read, or mid-handler flush over the bounded
-/// key pool.
+/// One map mutation, mid-trace read, whole-map clear, or mid-handler
+/// checkpoint over the bounded key pool.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MapOp {
     Set(i64, u8),
     Remove(i64),
     Get(i64),
-    Flush,
+    Clear,
+    Checkpoint,
 }
 
 impl Arbitrary for MapOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let key = g.choose(&KEY_POOL).copied().unwrap_or(0);
-        match u8::arbitrary(g) % 5 {
+        match u8::arbitrary(g) % 6 {
             0 | 1 => Self::Set(key, u8::arbitrary(g)),
             2 => Self::Remove(key),
             3 => Self::Get(key),
-            _ => Self::Flush,
+            4 => Self::Clear,
+            _ => Self::Checkpoint,
         }
     }
 }
@@ -206,6 +220,39 @@ pub(crate) type DequeTrace = Trace<DequeOp>;
 /// A map trace.
 pub(crate) type MapTrace = Trace<MapOp>;
 
+/// The bounded window width the deque-holes property ranges over.
+const MAX_DEQUE_WINDOW: usize = 8;
+
+/// The head-index pool for the deque-holes property — small and spanning the
+/// sign boundary so windows crossing zero are exercised.
+const HEAD_POOL: [i64; 7] = [-3, -2, -1, 0, 1, 2, 3];
+
+/// A directly-seeded sparse deque window: a `head` index and a run of per-index
+/// cells — `Some(v)` present, `None` a hole (a TTL-expired entry not yet
+/// swept). `tail = head + cells.len()`. Seeded straight into the store (never
+/// produced by the handle, which keeps the window dense) to pin the TTL'd-hole
+/// read contract: `len` an upper bound, `get`/`stream` skip holes without
+/// error.
+#[derive(Clone, Debug)]
+pub(crate) struct DequeHoles {
+    head: i64,
+    cells: Vec<Option<u8>>,
+}
+
+impl Arbitrary for DequeHoles {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            head: g.choose(&HEAD_POOL).copied().unwrap_or(0),
+            cells: capped_vec(g, MAX_DEQUE_WINDOW),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let head = self.head;
+        Box::new(self.cells.shrink().map(move |cells| Self { head, cells }))
+    }
+}
+
 /// Builds a fresh session for one event over the shared warm backing. Dropped
 /// senders are fine — `watch::Receiver::borrow` keeps returning the last value,
 /// so the session reads as non-terminated.
@@ -217,11 +264,34 @@ fn make_session(
     armed: &ArmedKeys,
     event: EventRef,
 ) -> SuiteSession {
+    make_session_with_dirty(
+        cells,
+        oracle,
+        registry,
+        state_key,
+        armed,
+        event,
+        Arc::default(),
+    )
+}
+
+/// [`make_session`] over a caller-owned dirty workspace, so a test can snapshot
+/// the per-event buffered cells (the Map TTL bound-refresh property inspects
+/// the staged-set composition through it).
+fn make_session_with_dirty(
+    cells: &MemoryCells,
+    oracle: &ScriptedOracle,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    armed: &ArmedKeys,
+    event: EventRef,
+    dirty: Arc<DirtyStore>,
+) -> SuiteSession {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     KeyedStateSession::new(SessionParts::<SuiteBackend, _> {
         cell: MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone()),
-        dirty: Arc::default(),
+        dirty,
         oracle: oracle.clone(),
         loader: MemoryLoader::new(),
         registry: registry.clone(),
@@ -233,17 +303,25 @@ fn make_session(
     })
 }
 
-/// Registers `name` and returns the shared registry plus the sweep ref.
+/// Registers `name` under `commit_mode` and returns the shared registry plus
+/// the sweep ref.
 fn registry_and_ref<D>(
     descriptor: &D,
     name: &str,
     state_key: &StateKey,
+    commit_mode: CommitMode,
 ) -> Result<(Arc<CollectionDefRegistry>, CollectionRef)>
 where
     D: StateDescriptor,
 {
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(descriptor, CollectionDef::new(None))?;
+    registry.register(
+        descriptor,
+        CollectionDef {
+            commit_mode,
+            ..CollectionDef::new(None)
+        },
+    )?;
     let collection_ref = CollectionRef::new(
         CollectionId::new(
             state_key.clone(),
@@ -301,16 +379,18 @@ struct Backing<'a> {
 /// for any collection kind — the Deque and Map suites differ only in the op
 /// alphabet, the model, and the assertions, so everything else lives here once:
 /// bind a fresh session per event, apply each op (`apply_op`, which also
-/// asserts mid-trace `pop`/`get` returns and reports mid-handler flushes),
+/// asserts mid-trace `pop`/`get` returns and reports mid-handler checkpoints),
 /// `finalize`, resolve along the event's outcome (promote / rollback / crash →
-/// sweep), advance the model — the full scratch on a commit, the last flushed
-/// snapshot otherwise — then assert the committed collection through a fresh
-/// read-back session (`assert`, which absorbs any kind-specific check such as
-/// Map's bound-cell superset).
+/// sweep), advance the model — the full scratch on a commit (or always, for a
+/// `ReadUncommitted` collection, whose `finalize` commits everything), the
+/// last checkpointed snapshot otherwise — then assert the committed collection
+/// through a fresh read-back session (`assert`, which absorbs any
+/// kind-specific check such as Map's bound-cell superset).
 async fn run_collection_trace<D, O, M, Apply, Assert>(
     trace: Trace<O>,
     descriptor: D,
     name: &str,
+    commit_mode: CommitMode,
     apply_op: Apply,
     assert: Assert,
 ) -> Result<bool>
@@ -324,7 +404,7 @@ where
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key)?;
+    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key, commit_mode)?;
     let armed: ArmedKeys = Arc::default();
     let backing = Backing {
         cells: &cells,
@@ -342,13 +422,14 @@ where
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         let mut scratch = model.clone();
-        // The scratch as of the last mid-handler flush — durable regardless of
-        // the event's outcome (the at-least-once flush contract).
-        let mut flushed: Option<M> = None;
+        // The scratch as of the last mid-handler checkpoint — durable
+        // regardless of the event's outcome (the at-least-once checkpoint
+        // contract).
+        let mut checkpointed: Option<M> = None;
         for op in &ev.ops {
             match apply_op(&handle, *op, &mut scratch).await? {
                 OpOutcome::Continue => {}
-                OpOutcome::Flushed => flushed = Some(scratch.clone()),
+                OpOutcome::Checkpointed => checkpointed = Some(scratch.clone()),
                 OpOutcome::Mismatch => return Ok(false),
             }
         }
@@ -375,13 +456,16 @@ where
         {
             return Ok(false);
         }
-        model = if ev.outcome.commits() {
+        model = if commit_mode == CommitMode::ReadUncommitted || ev.outcome.commits() {
+            // ReadUncommitted commits everything at `finalize` — any outcome
+            // that reached it takes the full scratch (nothing provisional
+            // exists to roll back or sweep).
             scratch
         } else {
-            // Abort / crash-rollback revert only the post-flush provisionals
-            // (their `prev` was captured after the flush landed); the flushed
-            // snapshot is already committed.
-            flushed.unwrap_or(model)
+            // Abort / crash-rollback revert only the post-checkpoint
+            // provisionals (their `prev` was captured after the checkpoint
+            // landed); the checkpointed snapshot is already committed.
+            checkpointed.unwrap_or(model)
         };
 
         // Read back through a fresh session (clean overlay) — pure committed.
@@ -405,11 +489,12 @@ where
 
 /// Drives a deque trace, asserting the handle equals a `VecDeque` model after
 /// every event and that each `pop` returns the model's value.
-pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
+pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) -> Result<bool> {
     run_collection_trace(
         trace,
         deque_state::<JsonCodec>("dq"),
         "dq",
+        commit_mode,
         async |handle, op, scratch: &mut VecDeque<Value>| match op {
             DequeOp::PushBack(b) => {
                 let v = Value::from(b);
@@ -429,9 +514,14 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
             DequeOp::PopFront => Ok(mismatch_unless(
                 handle.pop_front().await? == scratch.pop_front(),
             )),
-            DequeOp::Flush => {
-                handle.flush().await?;
-                Ok(OpOutcome::Flushed)
+            DequeOp::Clear => {
+                handle.clear().await?;
+                scratch.clear();
+                Ok(OpOutcome::Continue)
+            }
+            DequeOp::Checkpoint => {
+                handle.checkpoint().await?;
+                Ok(OpOutcome::Checkpointed)
             }
         },
         async |handle, model, _backing: &Backing<'_>| assert_deque(handle, model).await,
@@ -442,11 +532,12 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
 /// Drives a map trace, asserting the handle equals a `BTreeMap` model after
 /// every event, that each mid-trace `get` returns the model's value, and that
 /// the stored bounds cover a loose superset of the live key range.
-pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
+pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
     run_collection_trace(
         trace,
         map_state::<I64KeyCodec, JsonCodec>("mp"),
         "mp",
+        commit_mode,
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
             MapOp::Set(k, b) => {
                 let v = Value::from(b);
@@ -462,9 +553,14 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
             MapOp::Get(k) => Ok(mismatch_unless(
                 handle.get(&k).await? == scratch.get(&k).cloned(),
             )),
-            MapOp::Flush => {
-                handle.flush().await?;
-                Ok(OpOutcome::Flushed)
+            MapOp::Clear => {
+                handle.clear().await?;
+                scratch.clear();
+                Ok(OpOutcome::Continue)
+            }
+            MapOp::Checkpoint => {
+                handle.checkpoint().await?;
+                Ok(OpOutcome::Checkpointed)
             }
         },
         async |handle, model, backing: &Backing<'_>| {
@@ -480,6 +576,160 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
         },
     )
     .await
+}
+
+/// Map TTL bound-refresh (staged-set composition): on a collection **with a
+/// TTL**, every `set` buffers *both* bound cells — even a re-set of a key
+/// already within the committed bounds — so their TTL is refreshed and the
+/// bounds outlive every entry. Runs multiple committed events over a fresh
+/// per-event dirty workspace so a later set lands within *committed* bounds:
+/// the case a single-event snapshot cannot reach, because the first set always
+/// seeds both bounds into the dirty overlay, masking an extend-only regression.
+pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(
+        &descriptor,
+        CollectionDef::new(Some(CompactDuration::new(3_600))),
+    )?;
+    let registry = Arc::new(registry);
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("mp")?,
+    );
+    let armed: ArmedKeys = Arc::default();
+    let (min_cell, max_cell) = bound_cells();
+
+    for (index, ev) in trace.events.into_iter().enumerate() {
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(index as u128),
+        };
+        let dirty = Arc::new(DirtyStore::new());
+        let session = make_session_with_dirty(
+            &cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            dirty.clone(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        for op in &ev.ops {
+            match *op {
+                MapOp::Set(k, b) => {
+                    handle.set(k, Value::from(b)).await?;
+                    // Snapshot immediately, before any later Checkpoint
+                    // drains dirty.
+                    let snapshot = dirty.collection_snapshot(&id);
+                    let has_min = snapshot.iter().any(|(c, _)| *c == min_cell);
+                    let has_max = snapshot.iter().any(|(c, _)| *c == max_cell);
+                    if !(has_min && has_max) {
+                        return Ok(false);
+                    }
+                }
+                MapOp::Remove(k) => handle.remove(&k).await?,
+                MapOp::Get(k) => {
+                    handle.get(&k).await?;
+                }
+                MapOp::Clear => handle.clear().await?,
+                MapOp::Checkpoint => {
+                    handle.checkpoint().await?;
+                }
+            }
+        }
+        session
+            .finalize()
+            .await
+            .map_err(|e| eyre!("finalize: {e}"))?;
+        oracle
+            .record_message(event_dedup(event))
+            .await
+            .map_err(|e| eyre!("marker: {e}"))?;
+        session.commit_apply().await;
+    }
+    Ok(true)
+}
+
+/// Deque TTL-hole read contract: over a directly-seeded sparse window, `len`
+/// is the full span `tail − head` (an upper bound on the live count), `get`
+/// returns `None` at a hole and past the span, and both stream directions yield
+/// exactly the present values in index order (ascending forward, reversed
+/// backward) without error. Seeded directly — never via wall-clock TTL — the
+/// only way to reach a holed window the handle itself never produces.
+pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
+    use bytes::Bytes;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+
+    let head = shape.head;
+    let tail = head + shape.cells.len() as i64;
+    store
+        .write_resolved(
+            &collection_ref,
+            &[(
+                deque::meta_cell(),
+                Some(Bytes::from(deque::seed_frame(head, tail))),
+            )],
+            &[],
+        )
+        .await?;
+    for (i, cell) in shape.cells.iter().enumerate() {
+        if let Some(value) = cell {
+            let coordinate = I64KeyCodec::encode(&(head + i as i64));
+            let bytes = Bytes::from(serde_json::to_vec(&Value::from(*value))?);
+            store
+                .write_resolved(
+                    &collection_ref,
+                    &[(deque::entry_cell_for(&coordinate), Some(bytes))],
+                    &[],
+                )
+                .await?;
+        }
+    }
+
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+    let len = shape.cells.len();
+    if handle.len().await? != len {
+        return Ok(false);
+    }
+    for p in 0..len + 2 {
+        let expected = shape.cells.get(p).copied().flatten().map(Value::from);
+        if handle.get(p).await? != expected {
+            return Ok(false);
+        }
+    }
+    let present: Vec<Value> = shape
+        .cells
+        .iter()
+        .copied()
+        .filter_map(|c| c.map(Value::from))
+        .collect();
+    if collect_deque(&handle, Direction::Forward).await? != present {
+        return Ok(false);
+    }
+    let reversed: Vec<Value> = present.iter().rev().cloned().collect();
+    Ok(collect_deque(&handle, Direction::Backward).await? == reversed)
 }
 
 /// `MetaBoundsCoverLive` (Map): the stored `MapBound::Min`/`MapBound::Max`
@@ -619,27 +869,44 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     use crate::error::{ClassifyError, ErrorCategory};
     use crate::state::cell_key::Coordinate;
     use crate::state::descriptor::CellStateError;
-    use crate::state::descriptor::map::{MapStateError, entry_cell_for};
+    use crate::state::descriptor::map::{MapStateError, bound_cells, entry_cell_for};
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let fx = seed_map_entries_without_bounds()?;
-    let corrupt = entry_cell_for(&Coordinate::from_bytes(vec![1, 2, 3]));
-    block_on(fx.store.write_resolved(
-        &fx.collection_ref,
-        &[(
-            corrupt,
-            Some(Bytes::from(serde_json::to_vec(&Value::from(0_u8))?)),
-        )],
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+
+    // Bounds spanning the whole key space so a scan is issued and reaches the
+    // corrupt entry — a 3-byte coordinate that cannot decode as `I64KeyCodec`
+    // (which needs 8 bytes), placed inside `[encode(MIN), encode(MAX)]`.
+    let (min_cell, max_cell) = bound_cells();
+    let min_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&i64::MIN).as_bytes());
+    let max_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&i64::MAX).as_bytes());
+    let corrupt = entry_cell_for(&Coordinate::from_bytes(vec![0x80, 0x00, 0x00]));
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[
+            (min_cell, Some(min_bytes)),
+            (max_cell, Some(max_bytes)),
+            (
+                corrupt,
+                Some(Bytes::from(serde_json::to_vec(&Value::from(0_u8))?)),
+            ),
+        ],
+        &[],
     ))?;
 
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let armed: ArmedKeys = Arc::default();
     let session = make_session(
-        &fx.cells,
-        &fx.oracle,
-        &fx.registry,
-        &fx.state_key,
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
         &armed,
         read_event(0),
     );
@@ -659,8 +926,9 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     Ok(())
 }
 
-/// Durable meta-frame golden (Deque): after real pushes flush, the raw bounds
-/// cell sits at its frozen address — `Meta` section, *empty* coordinate — and
+/// Durable meta-frame golden (Deque): after real pushes checkpoint, the raw
+/// bounds cell sits at its frozen address — `Meta` section, *empty*
+/// coordinate — and
 /// stores exactly `head ‖ tail` as two plain big-endian `i64`s. The pair
 /// codec's own goldens pin that frame in isolation; this pins the deque's
 /// *binding* to it: the codec choice, the head-first tuple order, and the unit
@@ -675,7 +943,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
-    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key)?;
+    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
     let armed: ArmedKeys = Arc::default();
     let event = read_event(0);
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
@@ -686,7 +954,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     block_on(async {
         handle.push_back(Value::from(7_u8)).await?;
         handle.push_front(Value::from(9_u8)).await?;
-        handle.flush().await?;
+        handle.checkpoint().await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -709,124 +977,158 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     Ok(())
 }
 
-/// A Map registered as "mp" over a fresh warm store, seeded with three
-/// committed entries and deliberately **no** `MapBound::Min`/`MapBound::Max`
-/// bounds — the shared fixture for the two missing-bound fallback tests, each
-/// of which then adds back exactly the one bound it isolates (or none).
-struct MissingBoundFixture {
-    oracle: ScriptedOracle,
-    cells: MemoryCells,
-    state_key: StateKey,
-    registry: Arc<CollectionDefRegistry>,
-    collection_ref: CollectionRef,
-    store: MemoryCellStore<ScriptedOracle>,
-    model: BTreeMap<i64, Value>,
-}
-
-/// Builds the [`MissingBoundFixture`]: registers the Map and writes three
-/// committed entries with no bound cells.
-fn seed_map_entries_without_bounds() -> Result<MissingBoundFixture> {
-    use crate::state::descriptor::map::entry_cell_for;
+/// Deque clear, pinned at the physical grain a `VecDeque` model cannot reach
+/// (the reset window makes stale rows unreachable through the handle, so only
+/// raw reads can observe them):
+///
+/// * **Index-space reset** — `clear()` erases the window cell, so the next push
+///   starts a fresh window at index 0. A preserved (non-reset) index space
+///   would read `head = 2 ‖ tail = 3` here; the reset reads `head = 0 ‖ tail =
+///   1`.
+/// * **Committed erasure** — a committed `clear()` physically erases the
+///   pre-clear entry rows. The row outside the reused window must read absent;
+///   a lost clear leg would leave it standing as an orphan the window never
+///   addresses (unbounded leaked storage).
+#[test]
+fn deque_clear_resets_the_index_space() -> Result<()> {
+    use crate::state::descriptor::deque::{entry_cell_for, meta_cell};
     use bytes::Bytes;
     use futures::executor::block_on;
 
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let (registry, collection_ref) = registry_and_ref(&descriptor, "mp", &state_key)?;
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+    let armed: ArmedKeys = Arc::default();
+
+    // Event 1: two pushes, committed — the window becomes [0, 2).
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.push_back(Value::from(1_u8)).await?;
+        handle.push_back(Value::from(2_u8)).await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event1)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    // Event 2: clear then push, committed — the window resets to [0, 1).
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.clear().await?;
+        handle.push_back(Value::from(9_u8)).await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event2)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
 
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let seeded = [(-1_i64, 9_u8), (3, 4), (7, 1)];
-    for (key, value) in seeded {
-        let cell = entry_cell_for(&I64KeyCodec::encode(&key));
-        let bytes = Bytes::from(serde_json::to_vec(&Value::from(value))?);
-        block_on(store.write_resolved(&collection_ref, &[(cell, Some(bytes))]))?;
-    }
-    let model: BTreeMap<i64, Value> = seeded
-        .into_iter()
-        .map(|(key, value)| (key, Value::from(value)))
-        .collect();
-    Ok(MissingBoundFixture {
-        oracle,
-        cells,
-        state_key,
-        registry,
-        collection_ref,
-        store,
-        model,
-    })
-}
-
-/// Missing-bound fallback: with live entries committed but **no**
-/// `MapBound::Min` (exactly the post-TTL-expiry state, seeded directly),
-/// `stream` falls back to a full forward scan from the empty anchor and still
-/// yields every live entry in key order.
-#[test]
-fn map_missing_min_bound_falls_back_to_full_scan() -> Result<()> {
-    use futures::executor::block_on;
-
-    let fx = seed_map_entries_without_bounds()?;
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &fx.cells,
-        &fx.oracle,
-        &fx.registry,
-        &fx.state_key,
-        &armed,
-        read_event(0),
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("dq")?,
     );
-    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    if !block_on(assert_map(&handle, &fx.model))? {
-        return Err(eyre!("missing-bound fallback dropped a live entry"));
-    }
+    let Some(bytes) = block_on(store.get(&id, &meta_cell(), read_event(0)))?.into_inner() else {
+        bail!("bounds cell missing after the committed clear-then-push");
+    };
+    assert_eq!(
+        &bytes[..],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "clear resets the index space: the reused window is head = 0 ‖ tail = 1"
+    );
+
+    // The physical erasure half: index 1 sat outside the reused window, so
+    // only the clear's gap erase removes it — a stale committed row here is
+    // the leak the API can never surface.
+    let stale = entry_cell_for(&I64KeyCodec::encode(&1));
+    assert_eq!(
+        block_on(store.get(&id, &stale, read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must physically erase the out-of-window row"
+    );
+    let reused = entry_cell_for(&I64KeyCodec::encode(&0));
+    assert_eq!(
+        block_on(store.get(&id, &reused, read_event(0)))?.into_inner(),
+        Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
+        "the reused index holds exactly the post-clear push"
+    );
     Ok(())
 }
 
-/// Backward missing-bound fallback: with live entries and `MapBound::Min`
-/// committed but **no** `MapBound::Max` (the post-TTL-expiry state of just the
-/// high bound, seeded directly), `stream(Direction::Backward)` falls back to an
-/// `Unbounded` high anchor and still yields every live entry descending. The
-/// symmetric counterpart of [`map_missing_min_bound_falls_back_to_full_scan`],
-/// isolating the backward path while the forward bound stands.
+/// Map clear, pinned at the physical grain the loose-superset bounds
+/// invariant cannot reach (`assert_map_bounds` passes vacuously on an empty
+/// model, and after repopulation stale bounds still satisfy the superset
+/// check): a committed `clear()` erases both bound cells with the entries, so
+/// the absent-bounds ⇔ empty-map reading survives a cleared map. Stale bounds
+/// on a cleared map would keep issuing lower scans over the erased
+/// (tombstoned) range on every later `stream` — the tombstone paging the
+/// bounds exist to prevent.
 #[test]
-fn map_missing_max_bound_falls_back_to_full_scan() -> Result<()> {
-    use crate::state::descriptor::map::bound_cells;
-    use bytes::Bytes;
+fn map_clear_erases_the_bound_cells() -> Result<()> {
     use futures::executor::block_on;
 
-    let fx = seed_map_entries_without_bounds()?;
-    // Seed only MapBound::Min, leaving MapBound::Max expired/absent.
-    let (min_cell, _) = bound_cells();
-    let min_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&-1).as_bytes());
-    block_on(
-        fx.store
-            .write_resolved(&fx.collection_ref, &[(min_cell, Some(min_bytes))]),
-    )?;
-
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, _) = registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
     let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &fx.cells,
-        &fx.oracle,
-        &fx.registry,
-        &fx.state_key,
-        &armed,
-        read_event(0),
-    );
+
+    // Event 1: one committed set stamps both bound cells.
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    let descending: Vec<(i64, Value)> = fx
-        .model
-        .iter()
-        .rev()
-        .map(|(k, v)| (*k, v.clone()))
-        .collect();
-    if block_on(collect_map(&handle, Direction::Backward))? != descending {
-        return Err(eyre!(
-            "backward missing-max fallback dropped or misordered a live entry"
-        ));
-    }
+    block_on(async {
+        handle.set(7, Value::from(1_u8)).await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event1)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    // Event 2: committed clear.
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.clear().await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event2)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("mp")?,
+    );
+    let (min_cell, max_cell) = bound_cells();
+    assert_eq!(
+        block_on(store.get(&id, &min_cell, read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must erase the Min bound cell"
+    );
+    assert_eq!(
+        block_on(store.get(&id, &max_cell, read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must erase the Max bound cell"
+    );
     Ok(())
 }
 

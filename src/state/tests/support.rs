@@ -5,7 +5,7 @@
 
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Scan};
+use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::oracle::CommitOracle;
 use crate::state::session::CellSession;
@@ -19,6 +19,7 @@ use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::stream::{self, Stream};
 use parking_lot::Mutex as SyncMutex;
+use quickcheck::{Arbitrary, Gen};
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
@@ -114,6 +115,10 @@ where
         true
     }
 
+    fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
+        false
+    }
+
     fn verify_state_registration(
         &self,
         _name: &'static str,
@@ -160,7 +165,16 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn flush(
+    async fn clear_section(
+        &self,
+        _state_type: StateType,
+        _name: &StateName,
+        _section: Section,
+    ) -> Result<(), StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn checkpoint(
         &self,
         _state_type: StateType,
         _name: &StateName,
@@ -235,6 +249,18 @@ pub(crate) fn fixed_collection(name: &str) -> Result<CollectionId> {
         StateType::Application,
         StateName::try_new(name)?,
     ))
+}
+
+/// A short coordinate over a tiny null-prone byte alphabet, so a codec is
+/// exercised at the empty coordinate and at coordinates containing the bytes a
+/// length-delimited scheme might mishandle.
+pub(crate) fn arb_coordinate(g: &mut Gen) -> Coordinate {
+    const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
+    let len = usize::arbitrary(g) % 4;
+    let bytes: Vec<u8> = (0..len)
+        .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
+        .collect();
+    Coordinate::from_bytes(bytes)
 }
 
 /// A message event with the deterministic dedup id `Uuid::from_u128(n)`.

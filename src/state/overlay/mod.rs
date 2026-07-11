@@ -12,6 +12,10 @@
 //! - `scan_cells` lazily merges the dirty leg against `lower.scan_cells` in
 //!   `coordinate` order — **dirty wins on a key tie**, a dirty `Cleared`
 //!   **hides** the lower cell, an untouched cell falls through.
+//! - a standing **dirty clear marker** ([`DirtyStore::clear_section`]) hides
+//!   the whole lower section: `get` answers known-absence on a dirty-cell miss,
+//!   and `scan_cells` never issues the lower leg — the stream is the dirty
+//!   snapshot filtered to the range.
 //!
 //! The overlay deliberately does **not** implement [`CellStore`]: it exposes
 //! only the two transactional reads, so cache-fill and promote paths cannot
@@ -92,19 +96,28 @@ where
         match self.dirty.lookup(collection, cell) {
             Some(DirtyVal::Set(bytes)) => Ok(Committed::new(Some(bytes))),
             Some(DirtyVal::Cleared) => Ok(Committed::new(None)),
+            // A standing dirty clear marker answers known-absence for the
+            // whole section: the cell was erased at the clear and has not
+            // been repopulated (a repopulating `set` would have hit above).
+            None if self.dirty.section_cleared(collection, cell.section) => {
+                Ok(Committed::new(None))
+            }
             None => self.lower.get(collection, cell, own).await,
         }
     }
 
     /// Scans a range through the overlay, lazily merging the dirty leg
     /// against `lower.scan_cells` in `coordinate` order — dirty wins on a key
-    /// tie, a dirty `Cleared` hides the lower cell.
+    /// tie, a dirty `Cleared` hides the lower cell. A standing dirty clear
+    /// marker hides the whole lower section: the lower leg is never issued
+    /// and the stream is the dirty snapshot filtered to the range.
     pub fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
+        let cleared = self.dirty.section_cleared(collection, scan.section);
         let mut top = self.dirty.section_snapshot(collection, scan.section);
         // Bound the dirty leg to the scan's range in `dir` before merging:
         // `section_snapshot` yields the whole section, so without this a dirty
@@ -115,19 +128,35 @@ where
         if scan.dir == Direction::Backward {
             top.reverse();
         }
-        // Strip the limit from the lower leg: a dirty `Cleared` hides a lower
-        // cell and a dirty `Set` adds one, so the limit must bound the MERGED
-        // output, not the lower leg in isolation. It is counted below; the lower
-        // stream stays lazy, so dropping early stops its paging.
-        let bottom = self.lower.scan_cells(
-            collection,
-            Scan {
-                limit: None,
-                ..scan
-            },
-            own,
-        );
         try_stream! {
+            if cleared {
+                // The dirty clear marker hides the lower section: yield only
+                // the post-clear dirty `Set`s, honoring the limit.
+                let mut yielded = 0usize;
+                for (key, value) in &top {
+                    if scan.limit.is_some_and(|n| yielded >= n) {
+                        break;
+                    }
+                    if let DirtyVal::Set(bytes) = value {
+                        yield (key.clone(), bytes.clone());
+                        yielded += 1;
+                    }
+                }
+                return;
+            }
+            // Strip the limit from the lower leg: a dirty `Cleared` hides a
+            // lower cell and a dirty `Set` adds one, so the limit must bound
+            // the MERGED output, not the lower leg in isolation. It is counted
+            // below; the lower stream stays lazy, so dropping early stops its
+            // paging.
+            let bottom = self.lower.scan_cells(
+                collection,
+                Scan {
+                    limit: None,
+                    ..scan
+                },
+                own,
+            );
             // `top` is an owned, pre-sorted snapshot (the guard was dropped when
             // it was built), walked by index; `bottom` stays a lazy stream.
             let mut ti = 0usize;

@@ -79,14 +79,16 @@ impl Arbitrary for GenInterval {
 enum CovOp {
     Cover(GenInterval),
     Punch(u8),
+    /// The whole-section punch (a committed section clear's Cov-Clr eviction).
+    PunchSection,
 }
 
 impl Arbitrary for CovOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Cover(GenInterval::arbitrary(g))
-        } else {
-            Self::Punch(u8::arbitrary(g))
+        match u8::arbitrary(g) % 4 {
+            0 | 1 => Self::Cover(GenInterval::arbitrary(g)),
+            2 => Self::Punch(u8::arbitrary(g)),
+            _ => Self::PunchSection,
         }
     }
 }
@@ -213,6 +215,10 @@ fn prop_interval_set_bound_algebra() {
                     set.punch(&point(b));
                     model.remove(&b);
                 }
+                CovOp::PunchSection => {
+                    set.clear();
+                    model.clear();
+                }
             }
 
             if !set_well_formed(&set) {
@@ -273,6 +279,8 @@ enum LiveOp {
     Cover(GenInterval),
     CoverPoints(Vec<u8>),
     PunchMany(Vec<u8>),
+    /// The whole-section punch ([`Coverage::punch_section`]).
+    PunchSection,
 }
 
 impl Arbitrary for LiveOp {
@@ -282,16 +290,17 @@ impl Arbitrary for LiveOp {
                 .map(|_| u8::arbitrary(g))
                 .collect()
         };
-        match u8::arbitrary(g) % 3 {
+        match u8::arbitrary(g) % 4 {
             0 => Self::Cover(GenInterval::arbitrary(g)),
             1 => Self::CoverPoints(coords(g)),
-            _ => Self::PunchMany(coords(g)),
+            2 => Self::PunchMany(coords(g)),
+            _ => Self::PunchSection,
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         match self {
-            Self::Cover(_) => Box::new(empty()),
+            Self::Cover(_) | Self::PunchSection => Box::new(empty()),
             Self::CoverPoints(coords) => Box::new(coords.shrink().map(Self::CoverPoints)),
             Self::PunchMany(coords) => Box::new(coords.shrink().map(Self::PunchMany)),
         }
@@ -344,6 +353,10 @@ fn prop_coverage_memo_matches_durable_spill() {
                             model.remove(&(b % POOL));
                         }
                     }
+                    LiveOp::PunchSection => {
+                        warm.punch_section(&id, section).await?;
+                        model.clear();
+                    }
                 }
 
                 // A cold instance reloads the durable spill (empty memo).
@@ -378,15 +391,21 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
     use crate::state::fjall::test_db;
     use crate::state::tests::support::fresh_collection;
     use crate::test_util::TEST_RUNTIME;
+    use std::env;
     use std::slice::from_ref;
-
-    /// Race repetitions: each round is one full interleaving opportunity.
-    const ROUNDS: u32 = 64;
 
     /// A raw single-byte coordinate (not pool-folded like [`point`]).
     fn coord(b: u8) -> Coordinate {
         Coordinate::from_bytes(vec![b])
     }
+
+    // Race repetitions: each round is one full interleaving opportunity.
+    // Sourced from `QUICKCHECK_TESTS` so CI can crank the race schedule; the
+    // dev default matches the in-memory property-test count.
+    let rounds: u32 = env::var("QUICKCHECK_TESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
 
     TEST_RUNTIME.block_on(async {
         let coverage = Coverage::new(test_db::cache("cover_race")?);
@@ -396,7 +415,7 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
             Interval::new(Bound::Included(coord(a)), Bound::Included(coord(b)))
                 .ok_or_else(|| eyre!("non-empty interval"))
         };
-        for round in 0..ROUNDS {
+        for round in 0..rounds {
             // Re-cover the punch target, then race the punch against a cover
             // of a disjoint interval in the same section.
             coverage.cover(&id, section, iv(0, 10)?).await?;
@@ -430,7 +449,7 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
 #[test]
 fn prop_gap_cover_stride_frontier() {
     use super::super::{Cached, GAP_COVER_STRIDE};
-    use crate::state::cell_key::{CellKey, Direction, Scan};
+    use crate::state::cell_key::{CellKey, Direction, Scan, ScanEdge};
     use crate::state::event_ref::EventRef;
     use crate::state::fjall::test_db;
     use crate::state::identity::CollectionRef;
@@ -450,18 +469,14 @@ fn prop_gap_cover_stride_frontier() {
     async fn drain<L: CellStore>(
         cached: &Cached<L>,
         id: &CollectionId,
-        end: Bound<u8>,
+        end: ScanEdge<u8>,
         take: usize,
     ) -> Result<usize> {
         let start = Coordinate::from_bytes(vec![0]);
-        let end = match end {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(b) => Bound::Included(Coordinate::from_bytes(vec![b])),
-            Bound::Excluded(b) => Bound::Excluded(Coordinate::from_bytes(vec![b])),
-        };
+        let end = end.map(|b| Coordinate::from_bytes(vec![b]));
         let scan = Scan {
             section: Section::new(0),
-            start: Bound::Included(&start),
+            start: ScanEdge::Included(&start),
             dir: Direction::Forward,
             end: end.as_ref(),
             limit: None,
@@ -506,12 +521,12 @@ fn prop_gap_cover_stride_frontier() {
                 };
                 seed.push((cell, Some(bytes(1))));
             }
-            counting.write_resolved(&cref, &seed).await?;
+            counting.write_resolved(&cref, &seed, &[]).await?;
 
             let cached = Cached::new(test_db::cache("stride-frontier")?, counting.clone());
 
             // Drop the gap scan after `consumed` cells.
-            if drain(&cached, &id, Bound::Unbounded, consumed).await? != consumed {
+            if drain(&cached, &id, ScanEdge::Included(255), consumed).await? != consumed {
                 return Ok(false);
             }
 
@@ -519,7 +534,7 @@ fn prop_gap_cover_stride_frontier() {
             if covered > 0 {
                 counting.reset();
                 let end = u8::try_from(covered - 1)?;
-                let prefix = drain(&cached, &id, Bound::Included(end), usize::MAX).await?;
+                let prefix = drain(&cached, &id, ScanEdge::Included(end), usize::MAX).await?;
                 if prefix != covered || counting.lower_scans() != 0 {
                     return Ok(false);
                 }
@@ -528,7 +543,7 @@ fn prop_gap_cover_stride_frontier() {
             // Never over-covered: the full re-scan still yields EVERY cell, and
             // the unpersisted tail (if any) falls through to the lower store.
             counting.reset();
-            let all = drain(&cached, &id, Bound::Unbounded, usize::MAX).await?;
+            let all = drain(&cached, &id, ScanEdge::Included(255), usize::MAX).await?;
             if all != total {
                 return Ok(false);
             }

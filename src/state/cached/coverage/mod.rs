@@ -7,10 +7,11 @@
 //! are consumed. Because the cache is **write-through**, a write covers the
 //! coordinate it touched with the new committed projection — coverage *grows*
 //! on both reads and writes. `punch` (uncover) happens on a write-path publish
-//! that could not be established in fjall (self-heal on the next read), and on
+//! that could not be established in fjall (self-heal on the next read), on
 //! the raw `mark_resolved` promote, which cannot project the new committed
 //! value from keys alone and so drops the coordinate for the next read to
-//! re-publish.
+//! re-publish, and on a committed section clear
+//! ([`Coverage::punch_section`]), which drops a section's coverage wholesale.
 //!
 //! # Soundness invariants (the cache serves committed projections only)
 //!
@@ -121,12 +122,13 @@ const MEMO_SECTIONS: usize = 1024;
 /// resurrects stale coverage** — a wrong covered answer for the rest of the
 /// assignment. Per-key event serialization does **not** exclude this: session
 /// ops are `&self`, so one handler can hold two of them concurrently polled (a
-/// `join!`-ed flush and scan, a scan stream held across a get). Each mutation
-/// therefore serializes on a hash-sharded per-`(collection, section)` async
-/// lock, which also owns every **memo write**: a mutation refreshes the memo
-/// only after its store landed (and drops the entry when the store failed, so
-/// the next access reloads whatever fjall actually holds), and a read that
-/// misses the memo populates it under the same lock — so a stale read-side
+/// `join!`-ed checkpoint and scan, a scan stream held across a get). Each
+/// mutation therefore serializes on a hash-sharded per-`(collection, section)`
+/// async lock, which also owns every **memo write**: a mutation refreshes the
+/// memo only after its store landed (and drops the entry when the store
+/// failed, so the next access reloads whatever fjall actually holds), and a
+/// read that misses the memo populates it under the same lock — so a stale
+/// read-side
 /// load can never clobber a newer mutation's entry. Memo-hit reads
 /// (`covers`/`query`) stay lock-free: the memoized `Arc` snapshot is replaced
 /// wholesale, so a racing read sees the set before-or-after a mutation, and an
@@ -314,6 +316,20 @@ impl Coverage {
         })
         .await
     }
+
+    /// Punches the section's **whole** coverage — Cov-Clr's eviction
+    /// primitive: a committed section clear invalidates every covered value in
+    /// the section, so the interval set is dropped wholesale (never expressed
+    /// as an unbounded interval; the stored range is simply emptied). Like
+    /// [`punch_many`](Self::punch_many), a failure propagates and the `Cached`
+    /// call sites are must-succeed (`Cached::punch_sections_must_succeed`).
+    pub async fn punch_section(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+    ) -> Result<(), FjallCellCacheError> {
+        self.mutate(collection, section, IntervalSet::clear).await
+    }
 }
 
 /// A non-empty, absolute coordinate interval with [`Bound`] endpoints.
@@ -407,6 +423,12 @@ struct IntervalSet {
 }
 
 impl IntervalSet {
+    /// Drops every interval — the whole-section punch
+    /// ([`Coverage::punch_section`]).
+    fn clear(&mut self) {
+        self.intervals.clear();
+    }
+
     /// Rebuilds the set from stored `(lo, hi)` bound pairs (a fjall `Cover`
     /// range). Each pair round-trips through [`Interval::new`], so a degenerate
     /// on-disk interval is dropped — an empty interval is unrepresentable in

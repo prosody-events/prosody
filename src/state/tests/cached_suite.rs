@@ -19,17 +19,18 @@
 
 use super::super::cached::Cached;
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::fjall::Clock;
 use super::super::fjall::test_db;
+use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::store::CellStore;
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    CountingCellStore, OverlayTrace, SECTION, ScriptedOracle, Trace, bytes, cell_at,
-    run_crash_equivalence_trace, run_overlay_trace,
+    CountingCellStore, FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle,
+    SECTION, ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
 };
 use super::support::{fresh_collection as collection, probe};
 use crate::test_util::TEST_RUNTIME;
@@ -40,7 +41,7 @@ use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::ops::Bound;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -177,16 +178,18 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.write_provisional(collection, writes)
+        self.inner.write_provisional(collection, writes, marker)
     }
 
     fn write_resolved<'a>(
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.write_resolved(collection, cells)
+        self.inner.write_resolved(collection, cells, clears)
     }
 
     fn mark_resolved<'a>(
@@ -195,6 +198,30 @@ where
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         self.inner.mark_resolved(collection, cells)
+    }
+
+    fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
+        self.inner.standing_marker(collection)
+    }
+
+    fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.commit_provisional(collection, writes, clears)
+    }
+
+    fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.abort_provisional(collection, writes)
     }
 }
 
@@ -214,21 +241,23 @@ fn prop_memory_cached_overlay_view() {
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
-/// Collects a forward scan over `[start, end]` (inclusive), mapping each cell
-/// to its single coordinate byte.
-async fn scan_forward<S>(store: &S, id: &CollectionId, start: u8, end: Bound<u8>) -> Result<Vec<u8>>
+/// Collects a forward scan over `start` to `end`, mapping each cell to its
+/// single coordinate byte. A whole-section scan passes a `ScanEdge::Included`
+/// of a dominating sentinel (`255`) rather than an unbounded edge.
+async fn scan_forward<S>(
+    store: &S,
+    id: &CollectionId,
+    start: u8,
+    end: ScanEdge<u8>,
+) -> Result<Vec<u8>>
 where
     S: CellStore,
 {
     let start_c = Coordinate::from_bytes(vec![start]);
-    let end_c = match end {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(b) => Bound::Included(Coordinate::from_bytes(vec![b])),
-        Bound::Excluded(b) => Bound::Excluded(Coordinate::from_bytes(vec![b])),
-    };
+    let end_c = end.map(|b| Coordinate::from_bytes(vec![b]));
     let scan = Scan {
         section: SECTION,
-        start: Bound::Included(&start_c),
+        start: ScanEdge::Included(&start_c),
         dir: Direction::Forward,
         end: end_c.as_ref(),
         limit: None,
@@ -266,16 +295,16 @@ fn coverage_op_budget() -> Result<()> {
         // write-through publishes+covers its point.
         for c in [0u8, 2, 4, 6, 8] {
             cached
-                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
 
-        // Warm the whole section with one unbounded scan (covering the gaps),
+        // Warm the whole section with one full-range scan (covering the gaps),
         // then verify a covered re-scan issues ZERO lower scans.
-        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm, vec![0, 2, 4, 6, 8]);
         counting.reset();
-        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let covered = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(covered, vec![0, 2, 4, 6, 8]);
         assert_eq!(
             counting.lower_scans(),
@@ -305,10 +334,10 @@ fn coverage_op_budget() -> Result<()> {
         // re-scan serves entirely from the cache — ZERO lower reads after the
         // write (no read-after-write to the durable store).
         cached
-            .write_resolved(&cref, &[(cell_at(4), Some(bytes(40)))])
+            .write_resolved(&cref, &[(cell_at(4), Some(bytes(40)))], &[])
             .await?;
         counting.reset();
-        let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let after = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(after, vec![0, 2, 4, 6, 8]);
         assert_eq!(
             counting.lower_scans(),
@@ -334,7 +363,7 @@ fn coverage_op_budget() -> Result<()> {
         // scan issues one gap query, then a covered re-scan issues zero.
         let other = collection("budget-cold")?;
         counting.reset();
-        let uncovered = scan_forward(&cached, &other, 0, Bound::Included(20)).await?;
+        let uncovered = scan_forward(&cached, &other, 0, ScanEdge::Included(20)).await?;
         assert!(uncovered.is_empty());
         assert_eq!(
             counting.lower_scans(),
@@ -342,7 +371,7 @@ fn coverage_op_budget() -> Result<()> {
             "a never-covered range falls through once"
         );
         counting.reset();
-        let _ = scan_forward(&cached, &other, 0, Bound::Included(20)).await?;
+        let _ = scan_forward(&cached, &other, 0, ScanEdge::Included(20)).await?;
         assert_eq!(
             counting.lower_scans(),
             0,
@@ -355,8 +384,8 @@ fn coverage_op_budget() -> Result<()> {
 
 /// Warm survival within an assignment: a `Cached` rebuilt over the **same**
 /// fjall workspace (not a fresh assignment) is warm — its disk-backed
-/// provisional index and coverage both survive. The rebuilt cache's recovery
-/// sweep answers from the local fjall index with **zero** cold
+/// provisional-coordinate cache and coverage both survive. The rebuilt cache's
+/// recovery sweep answers from the local fjall index with **zero** cold
 /// `provisional_cells` sweeps (only bounded warm point reads), and a covered
 /// `get` serves with zero lower reads. This is the in-assignment-warm proxy the
 /// crash case (a fresh assignment) is the cold complement of.
@@ -377,17 +406,21 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
         // First cache instance: cover a value and leave a provisional cell.
         let cached = Cached::new(test_db::cache("warm")?, counting.clone());
         cached
-            .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))])
+            .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))], &[])
             .await?;
         let prev = cached.get(&id, &cell_at(3), event).await?;
-        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        let writes = [(
+            cell_at(3),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(&cref, &[(cell_at(3), write)])
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
-        // Prime the warm provisional index: the first sweep is a cold seed (one
-        // `provisional_cells` call), which records the coordinate into fjall and
-        // marks the collection seeded.
+        // Prime the warm provisional-coordinate cache: the first sweep is a cold
+        // seed (one `provisional_cells` call), which records the coordinate into
+        // fjall and marks the collection seeded.
         counting.reset();
         let cold = drain_provisional(&cached, &id).await?;
         assert_eq!(cold, vec![3], "the cold sweep finds the provisional cell");
@@ -463,14 +496,13 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
         // Leave a provisional cell, then seed the warm index with a cold sweep
         // (records the coordinate into fjall and marks the collection seeded).
         let prev = cached.get(&id, &cell_at(3), event).await?;
+        let writes = [(
+            cell_at(3),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(
-                    cell_at(3),
-                    ProvisionalWrite::new(Some(bytes(5)), prev, event),
-                )],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
         assert_eq!(
             drain_provisional(&cached, &id).await?,
@@ -522,14 +554,13 @@ fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
 
         // Leave a provisional cell.
         let prev = cached.get(&id, &cell_at(3), event).await?;
+        let writes = [(
+            cell_at(3),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(
-                &cref,
-                &[(
-                    cell_at(3),
-                    ProvisionalWrite::new(Some(bytes(5)), prev, event),
-                )],
-            )
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
         // Cold seed with a failing `index_record`: the sweep still finds the
@@ -581,7 +612,7 @@ where
 
 /// A covered scan never bleeds into another collection or section sharing the
 /// fjall partition: with two collections and a decoy section seeded in one
-/// cache, an unbounded scan of each section yields only its own cells.
+/// cache, a full-range scan of each section yields only its own cells.
 #[test]
 fn coverage_scan_isolation() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -602,29 +633,29 @@ fn coverage_scan_isolation() -> Result<()> {
         };
         for c in [10u8, 20, 30] {
             cached
-                .write_resolved(&a_ref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&a_ref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         for c in [40u8, 50] {
             cached
-                .write_resolved(&b_ref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&b_ref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         cached
-            .write_resolved(&a_ref, &[(decoy.clone(), Some(bytes(5)))])
+            .write_resolved(&a_ref, &[(decoy.clone(), Some(bytes(5)))], &[])
             .await?;
 
-        // An unbounded scan of A's entry section must yield only A's entries —
+        // A full-range scan of A's entry section must yield only A's entries —
         // not B's, and not the decoy section. Run twice so both the cold gap
         // fall-through and the warm covered serve are checked.
         for _ in 0..2u32 {
             assert_eq!(
-                scan_forward(&cached, &a, 0, Bound::Unbounded).await?,
+                scan_forward(&cached, &a, 0, ScanEdge::Included(255)).await?,
                 vec![10, 20, 30],
                 "scan of A's section must not bleed into B or the decoy section"
             );
             assert_eq!(
-                scan_forward(&cached, &b, 0, Bound::Unbounded).await?,
+                scan_forward(&cached, &b, 0, ScanEdge::Included(255)).await?,
                 vec![40, 50]
             );
         }
@@ -632,11 +663,10 @@ fn coverage_scan_isolation() -> Result<()> {
     })
 }
 
-/// Wide covered scan: a fully covered scan over more than the ~128-item coop
-/// threshold drives to completion and yields all N cells from the covered
-/// (fjall) serve.
+/// Wide covered scan: a fully covered re-scan over more cells than the item
+/// count yields every cell, in order, from the covered (fjall) serve.
 #[test]
-fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
+fn coverage_wide_covered_scan_yields_all() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         const N: u8 = 200;
         let oracle = ScriptedOracle::default();
@@ -647,46 +677,63 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
 
         for c in 0..N {
             cached
-                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
         // Warm coverage, then a fully covered re-scan from fjall must yield all
         // N cells.
-        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm.len(), usize::from(N));
-        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let covered = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(covered.len(), usize::from(N));
         assert!(covered.iter().copied().eq(0..N));
         Ok(())
     })
 }
 
-/// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>`: each
-/// resolution arm drives `commit_provisional`/`abort_provisional` (the
-/// publish-on-settle path), and a "crash" rebuilds the cache cold over the same
-/// warm memory cells (a fresh fjall partition — `CovVolatile`). The committed
-/// projection must converge to the model on every path, with the write-through
-/// publish and the dropped-coverage cold restart both exercised.
+/// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>` at
+/// the full clears-bearing alphabet: each resolution arm drives
+/// `commit_provisional`/`abort_provisional` (the publish-on-settle path), and
+/// a "crash" rebuilds the cache cold over the same warm memory cells (a fresh
+/// fjall partition — `CovVolatile`). The committed projection must converge
+/// to the model on every path — write-through publish, dropped-coverage cold
+/// restart, AND the Cov-Clr legs: every committed durable clear applied
+/// beneath the cache must punch its sections' coverage before the gap erase,
+/// with the lower fault seam (`FaultDepth::Lower` settle failures + directed
+/// post-failure reads, stage faults) firing beneath the cache.
 #[test]
 fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         // Each `make` yields a cold cache over the same warm memory cells +
-        // oracle, so a crash drops coverage but not durable state.
-        // `test_db::cold_cache` reuses the `crash` keyspace pair on the shared
-        // database and CLEARS it (a cheap journal marker, no fsync) — modeling a
-        // fresh assignment without a keyspace creation per make. Distinct v4 segments
-        // per iteration keep the shared keyspace's crashes disjoint.
-        let make = || {
-            let lower = MemoryCellStore::new(
-                cells.clone(),
-                oracle.clone(),
-                Arc::new(CollectionDefRegistry::default()),
+        // oracle, so a crash drops coverage but not durable state; the
+        // runner's lower fault seam sits between the cache and the bottom
+        // store. `test_db::cold_cache` reuses the `crash` keyspace pair on
+        // the shared database and CLEARS it (a cheap journal marker, no
+        // fsync) — modeling a fresh assignment without a keyspace creation
+        // per make. Distinct v4 segments per iteration keep the shared
+        // keyspace's crashes disjoint.
+        let make = |handle: &PoisonHandle| {
+            let lower = FailingCellStore::with_handle(
+                MemoryCellStore::new(
+                    cells.clone(),
+                    oracle.clone(),
+                    Arc::new(CollectionDefRegistry::default()),
+                ),
+                handle.clone(),
             );
             Ok(Cached::new(test_db::cold_cache("crash")?, lower))
         };
-        TEST_RUNTIME.block_on(run_crash_equivalence_trace(make, oracle.clone(), trace))
+        // The durable physical shape lives in the shared memory cells (fjall is
+        // only the cold-on-crash cache), so the row-absence probe reads them.
+        let probe = MemoryShapeProbe(cells.clone());
+        TEST_RUNTIME.block_on(run_crash_equivalence_trace(
+            make,
+            oracle.clone(),
+            trace,
+            &probe,
+        ))
     }
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
@@ -699,6 +746,11 @@ fn prop_memory_cached_crash_equivalence() {
 /// (Cov1). The lower store reports a live `TTL(data)`-style remaining
 /// ([`TtlAwareCellStore`]), so the floored re-stamp is exercised and asserted
 /// `≤` the row's death. No sleep; the clock is advanced directly.
+///
+/// Example test by necessity: the covered-vs-lower serving decision turns on a
+/// sub-second clock crossing whose counter grain sits below the model's
+/// abstraction, so the fall-through pin cannot be generalized into the
+/// generator.
 #[test]
 fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
     use std::sync::atomic::AtomicU64;
@@ -731,7 +783,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
 
         // Write through coordinate 7; it is now covered and served from fjall.
         cached
-            .write_resolved(&cref, &[(cell_at(7), Some(bytes(7)))])
+            .write_resolved(&cref, &[(cell_at(7), Some(bytes(7)))], &[])
             .await?;
         lower.reset();
         assert_eq!(
@@ -747,7 +799,7 @@ fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
         // still holds the stale (now-expired) `7` while the lower store holds
         // `70`. The expired covered get must fall through and yield `70`.
         lower
-            .write_resolved(&cref, &[(cell_at(7), Some(bytes(70)))])
+            .write_resolved(&cref, &[(cell_at(7), Some(bytes(70)))], &[])
             .await?;
         lower.reset();
         assert_eq!(
@@ -811,7 +863,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
 
         let cached = Cached::new(test_db::cache("volatile")?, lower.clone());
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         assert_eq!(
             cached.get(&id, &cell_at(1), probe(1)).await?.get(),
@@ -820,7 +872,7 @@ fn cov_volatile_cold_restart_falls_through() -> Result<()> {
 
         // Change the durable value out-of-band, leaving the stale fjall `1`.
         lower
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(99)))], &[])
             .await?;
 
         // Cold restart = a fresh assignment: a new cache + index keyspace pair, so
@@ -855,7 +907,7 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
 
         // First write publishes cleanly and covers `1`.
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         assert_eq!(
             cached.get(&id, &cell_at(1), probe(1)).await?.get(),
@@ -867,7 +919,7 @@ fn failed_publish_uncovers_and_self_heals() -> Result<()> {
         // is punched out of coverage.
         fail.store(true, Ordering::Relaxed);
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))], &[])
             .await?;
 
         // Heal the cache fault; the next get is now uncovered, so it falls
@@ -904,7 +956,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
         let update = [(cell_at(1), Some(bytes(11))), (cell_at(2), Some(bytes(22)))];
 
         // One multi-cell write-through publishes cleanly and covers both cells.
-        cached.write_resolved(&cref, &seed).await?;
+        cached.write_resolved(&cref, &seed, &[]).await?;
         for (c, v) in [(1u8, 1u8), (2, 2)] {
             assert_eq!(
                 cached
@@ -919,7 +971,7 @@ fn failed_batch_publish_uncovers_all_cells() -> Result<()> {
         // (durable truth is `11`/`22`), but the atomic batch lands nothing → all
         // coordinates in the batch are punched out of coverage.
         fail.store(true, Ordering::Relaxed);
-        cached.write_resolved(&cref, &update).await?;
+        cached.write_resolved(&cref, &update, &[]).await?;
 
         // Heal the fault; both gets are now uncovered, so each falls through to
         // its fresh durable value — never serving the stale batch.
@@ -964,12 +1016,16 @@ fn promote_punch_failure_never_freezes_stale_prev() -> Result<()> {
         // Committed base `1`, covered by write-through; stage `5` over it (the
         // stage publishes `prev` = 1, so the coordinate stays covered with 1).
         cached
-            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
             .await?;
         let prev = cached.get(&id, &cell_at(0), event).await?;
-        let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        let writes = [(
+            cell_at(0),
+            ProvisionalWrite::new(Some(bytes(5)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(&cref, &[(cell_at(0), write)])
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
         // The raw promote with the punch's next coverage rewrite failing: the
@@ -1015,12 +1071,12 @@ fn write_path_punch_retries_until_it_lands() -> Result<()> {
         // Cover `1` cleanly, then write `2` with the publish AND the first
         // punch rewrite failing.
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         fail_puts.store(true, Ordering::Relaxed);
         fail_covers.store(1, Ordering::Relaxed);
         cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))])
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(2)))], &[])
             .await?;
         fail_puts.store(false, Ordering::Relaxed);
 
@@ -1064,8 +1120,10 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         // may fail or not — irrelevant to this test).
         let prev = cached.get(&id, &cell_at(0), event).await?;
         let write = ProvisionalWrite::new(Some(bytes(5)), prev, event);
+        let writes = [(cell_at(0), write.clone())];
+        let marker = EventMarker::frozen(event, &writes, &[]);
         cached
-            .write_provisional(&cref, &[(cell_at(0), write.clone())])
+            .write_provisional(&cref, &writes, Some(&marker))
             .await?;
         // `probe(1)` is a message event with dedup id `1`; record it committed
         // so the promote arm resolves to `data`.
@@ -1075,7 +1133,7 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         // lower promote succeeded), never folded into an error.
         fail.store(true, Ordering::Relaxed);
         let result = cached
-            .commit_provisional(&cref, &[(cell_at(0), write)])
+            .commit_provisional(&cref, &[(cell_at(0), write)], &[])
             .await;
         assert!(
             result.is_ok(),
@@ -1092,6 +1150,239 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         );
         Ok(())
     })
+}
+
+/// The Cov3 pin over a faulted lower store: a failed lower `write_resolved`
+/// leaves coverage untouched serving the pre-write value with zero phantom
+/// publishes — and when the failed write carries a section clear, the
+/// punch-first contract degrades to a correct slow read, never a wrong one.
+///
+/// Example test by necessity: the crash/overlay properties observe values,
+/// not the serving layer — "which layer answered and how many lower reads it
+/// cost" is physical grain below the model's abstraction, so the counter pin
+/// cannot be generalized into the generator.
+#[test]
+fn failed_lower_write_leaves_coverage_serving_pre_write_value() -> Result<()> {
+    use crate::error::ErrorCategory;
+    use crate::state::StateName;
+
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let handle: PoisonHandle = Arc::default();
+        let cached = Cached::new(
+            test_db::cache("cov3_fault")?,
+            FailingCellStore::with_handle(counting.clone(), handle.clone()),
+        );
+        let id = collection("cov3-fault")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let name: StateName = id.name().clone();
+
+        // Seed a base value; the write-through covers it, so a get serves
+        // from fjall with zero lower reads — the arrange proof.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
+            .await?;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(1)).await?.get(),
+            Some(&bytes(1)),
+            "the seeded base serves covered"
+        );
+        assert_eq!(counting.lower_reads(), 0, "the arrange get is covered");
+
+        // A clears-free lower write fault: the write must surface Err and
+        // leave coverage untouched.
+        *handle.lock() = Some(Poison::WriteResolved(
+            name.clone(),
+            ErrorCategory::Transient,
+        ));
+        assert!(
+            cached
+                .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
+                .await
+                .is_err(),
+            "the armed lower write must be rejected"
+        );
+        *handle.lock() = None;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            Some(&bytes(1)),
+            "the failed write serves the PRE-write value"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "coverage untouched: still a covered fjall serve (a phantom publish would serve the \
+             new value; a spurious punch would cost a lower read)"
+        );
+
+        // A clears-bearing lower write fault: punch-first is the contract, so
+        // the section punch DID run before the lower rejection — the
+        // follow-up get serves the pre-write value via fall-through (exactly
+        // one lower read), then re-covers.
+        let cells = [(cell_at(3), Some(bytes(9)))];
+        let clear = SectionClear::frozen_resolved(SECTION, &cells);
+        *handle.lock() = Some(Poison::WriteResolved(name, ErrorCategory::Transient));
+        assert!(
+            cached
+                .write_resolved(&cref, &cells, slice::from_ref(&clear))
+                .await
+                .is_err(),
+            "the armed clears-bearing lower write must be rejected"
+        );
+        *handle.lock() = None;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(3)).await?.get(),
+            Some(&bytes(1)),
+            "punch-first on a failed apply degrades to a correct slow read, never a wrong one"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            1,
+            "the punched section falls through exactly once"
+        );
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(4)).await?.get(),
+            Some(&bytes(1)),
+            "the fall-through re-covered the coordinate"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "the re-covered get reads nothing"
+        );
+        Ok(())
+    })
+}
+
+/// The Cov-Clr eviction-precision pin: the cache evicts ONLY
+/// correctness-required punches — an aborted clears-bearing stage punches
+/// nothing, and a committed one punches exactly its cleared sections (a
+/// sibling section stays covered).
+///
+/// Example test by necessity: eviction breadth is invisible to the value
+/// model (over-eviction is correct-but-slow), so only the lower-read counters
+/// can pin it.
+#[test]
+fn clear_punch_evicts_only_correctness_required_coverage() -> Result<()> {
+    /// The cell at coordinate `c` in section 1 (the cleared section; the
+    /// shared [`cell_at`] addresses section 0, the surviving sibling).
+    fn sect1_cell(c: u8) -> CellKey {
+        CellKey {
+            section: Section::new(1),
+            coordinate: Coordinate::from_bytes(vec![c]),
+        }
+    }
+
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(test_db::cache("clear_punch")?, counting.clone());
+        let id = collection("clear-punch")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        // Seed + cover cells in section 0 AND section 1.
+        cached
+            .write_resolved(
+                &cref,
+                &[
+                    (cell_at(0), Some(bytes(10))),
+                    (sect1_cell(0), Some(bytes(20))),
+                ],
+                &[],
+            )
+            .await?;
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &cell_at(0), 2).await?,
+            (Some(bytes(10)), 0),
+            "section 0 starts covered"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 2).await?,
+            (Some(bytes(20)), 0),
+            "section 1 starts covered"
+        );
+
+        // Stage a clears-bearing event on section 1 only (one survivor
+        // write), then ABORT it: an uncommitted clear never punches — both
+        // sections still serve covered.
+        let stage = |writes: &[(CellKey, ProvisionalWrite)]| {
+            let clears = [SectionClear::frozen(Section::new(1), writes)];
+            (EventMarker::frozen(event, writes, &clears), clears)
+        };
+        let writes = [(
+            sect1_cell(1),
+            ProvisionalWrite::new(Some(bytes(21)), Committed::new(None), event),
+        )];
+        let (marker, _) = stage(&writes);
+        cached
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+        cached.abort_provisional(&cref, &writes).await?;
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &cell_at(0), 3).await?,
+            (Some(bytes(10)), 0),
+            "an uncommitted clear never punches the sibling section"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 3).await?,
+            (Some(bytes(20)), 0),
+            "an uncommitted clear never punches its own section"
+        );
+
+        // Stage again and COMMIT with the section-1 clear: section 0 stays
+        // covered (nothing beyond the required punch was evicted), section
+        // 1's non-survivor falls through exactly once, then re-covers.
+        let (marker, clears) = stage(&writes);
+        cached
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+        cached.commit_provisional(&cref, &writes, &clears).await?;
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &cell_at(0), 4).await?,
+            (Some(bytes(10)), 0),
+            "nothing beyond the required punch was evicted"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 5).await?,
+            (None, 1),
+            "the committed clear erased the non-survivor via exactly one fall-through"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 6).await?,
+            (None, 0),
+            "the fall-through re-covered the punched coordinate"
+        );
+        Ok(())
+    })
+}
+
+/// One `get` through `cached`, returning the value and the lower point reads
+/// it cost (the shared counter is reset first) — the eviction-precision pin's
+/// currency.
+async fn priced_get(
+    cached: &Cached<CountingCellStore<MemoryCellStore<ScriptedOracle>>>,
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    id: &CollectionId,
+    cell: &CellKey,
+    n: u128,
+) -> Result<(Option<Bytes>, usize)> {
+    counting.reset();
+    let value = cached.get(id, cell, probe(n)).await?.into_inner();
+    Ok((value, counting.lower_reads()))
 }
 
 /// One mutation in a co-expiry-anchor trace. The clock advances explicitly via
@@ -1235,7 +1526,7 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                 match *op {
                     TtlMut::Set(key, value) => {
                         cached
-                            .write_resolved(&cref, &[(cell_at(key), Some(bytes(value)))])
+                            .write_resolved(&cref, &[(cell_at(key), Some(bytes(value)))], &[])
                             .await?;
                         committed.insert(key, Committed::new(Some(bytes(value))));
                         death.insert(key, death_at(clock));
@@ -1246,8 +1537,10 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             prev_of(&committed, key),
                             event,
                         );
+                        let writes = [(cell_at(key), write)];
+                        let marker = EventMarker::frozen(event, &writes, &[]);
                         cached
-                            .write_provisional(&cref, &[(cell_at(key), write)])
+                            .write_provisional(&cref, &writes, Some(&marker))
                             .await?;
                         staged.insert(key, value);
                         death.insert(key, death_at(clock));
@@ -1262,7 +1555,7 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             event,
                         );
                         cached
-                            .commit_provisional(&cref, &[(cell_at(key), write)])
+                            .commit_provisional(&cref, &[(cell_at(key), write)], &[])
                             .await?;
                         committed.insert(key, Committed::new(Some(bytes(value))));
                         // `mark_resolved` keeps the stage TTL → death
@@ -1309,13 +1602,17 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
 
 /// The covered-SCAN expired-refill path (previously unproven): under FLOOR
 /// rounding a fjall entry expires slightly before its durable row, so a covered
-/// scan that meets an expired
-/// entry must REFILL that sub-range from the lower store — never read the
-/// expired coordinate as absent. Warms a covered scan, advances the clock past
-/// the floor expiry to a **sub-second** instant, asserts the re-scan still
-/// yields every coordinate and falls through, and asserts each refilled cell is
-/// re-stamped to `floor(now) + remaining` (`≤` the row death; Cov1) — the lower
-/// store reports a live `TTL(data)`-style remaining ([`TtlAwareCellStore`]).
+/// scan that meets an expired entry must REFILL that sub-range from the lower
+/// store — never read the expired coordinate as absent. Warms a covered scan,
+/// advances the clock past the floor expiry to a **sub-second** instant,
+/// asserts the re-scan still yields every coordinate and falls through, and
+/// asserts each refilled cell is re-stamped to `floor(now) + remaining` (`≤`
+/// the row death; Cov1) — the lower store reports a live `TTL(data)`-style
+/// remaining ([`TtlAwareCellStore`]).
+///
+/// Example test by necessity: the covered-vs-lower serving decision turns on a
+/// sub-second clock crossing whose counter grain sits below the model's
+/// abstraction, so the refill pin cannot be generalized into the generator.
 #[test]
 fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
     use std::sync::atomic::AtomicU64;
@@ -1349,13 +1646,13 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         // warm the whole section with one scan so the gaps cover too.
         for c in [3u8, 5, 7] {
             cached
-                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))])
+                .write_resolved(&cref, &[(cell_at(c), Some(bytes(c)))], &[])
                 .await?;
         }
-        let warm = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let warm = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(warm, vec![3, 5, 7]);
         lower.reset();
-        let covered = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let covered = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(covered, vec![3, 5, 7]);
         assert_eq!(lower.lower_scans(), 0, "a live covered scan reads nothing");
 
@@ -1364,7 +1661,7 @@ fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
         // coordinate as absent (Cov1).
         now.store(NOW_EXPIRED, Ordering::Relaxed);
         lower.reset();
-        let after = scan_forward(&cached, &id, 0, Bound::Unbounded).await?;
+        let after = scan_forward(&cached, &id, 0, ScanEdge::Included(255)).await?;
         assert_eq!(
             after,
             vec![3, 5, 7],

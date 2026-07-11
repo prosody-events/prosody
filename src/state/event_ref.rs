@@ -77,7 +77,7 @@ pub enum CommitDecision {
 /// Did this store call mutate authoritative state.
 ///
 /// Returned by the mid-handler write-through path
-/// ([`flush`](super::session::CellSession::flush)):
+/// ([`checkpoint`](super::session::CellSession::checkpoint)):
 /// [`StoreOutcome::Applied`] when buffered ops were written to the committed
 /// value, [`StoreOutcome::NoOp`] when nothing was buffered.
 ///

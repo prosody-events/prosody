@@ -60,7 +60,7 @@
 use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellSession;
@@ -76,7 +76,6 @@ use internment::Intern;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
-use std::ops::Bound;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
 use tracing::instrument;
@@ -658,6 +657,12 @@ impl<S: CellSession> CellScope<S> {
         &self.session
     }
 
+    /// Whether this collection carries a TTL — a cheap, allocation-free
+    /// registry lookup the Map bound refresh consults per `set`.
+    pub(in crate::state::descriptor) fn has_ttl(&self) -> bool {
+        self.session.collection_has_ttl(self.state_type, &self.name)
+    }
+
     /// Reads one cell's visible committed bytes.
     pub(in crate::state::descriptor) async fn raw_get(
         &self,
@@ -696,13 +701,25 @@ impl<S: CellSession> CellScope<S> {
         self.session.clear(self.state_type, &self.name, cell).await
     }
 
-    /// Drains this collection's buffered ops straight through to committed
-    /// state. At-least-once; see [`CellSession::flush`] for the contract.
-    pub(in crate::state::descriptor) async fn raw_flush(
+    /// Buffers a dirty clear marker over one section; see
+    /// [`CellSession::clear_section`].
+    pub(in crate::state::descriptor) async fn clear_section(
+        &self,
+        section: Section,
+    ) -> Result<(), StateAccessError> {
+        ensure_live(&self.session)?;
+        self.session
+            .clear_section(self.state_type, &self.name, section)
+            .await
+    }
+
+    /// Durably commits this collection's buffered ops mid-handler.
+    /// At-least-once; see [`CellSession::checkpoint`] for the contract.
+    pub(in crate::state::descriptor) async fn raw_checkpoint(
         &self,
     ) -> Result<StoreOutcome, StateAccessError> {
         ensure_live(&self.session)?;
-        self.session.flush(self.state_type, &self.name).await
+        self.session.checkpoint(self.state_type, &self.name).await
     }
 }
 
@@ -746,6 +763,24 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
             section: self.section,
             coordinate: <T::Key as OrderedKeyCodec>::encode(key),
         }
+    }
+
+    /// Whether this view's collection carries a TTL (see
+    /// [`CellScope::has_ttl`]).
+    pub(crate) fn has_ttl(&self) -> bool {
+        self.scope.has_ttl()
+    }
+
+    /// Buffers a dirty clear marker over this view's whole section: every
+    /// cell reads as deleted from this program point, and later `set`s
+    /// repopulate. See [`CellSession::clear_section`] for the transactional
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(crate) async fn clear_all(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.clear_section(self.section).await?)
     }
 }
 
@@ -826,16 +861,18 @@ where
         async move { Ok(self.scope.raw_clear(&cell).await?) }
     }
 
-    /// Drains this collection's buffered ops straight to committed state — the
-    /// single public flush home, draining the whole collection's buffered ops
+    /// Durably commits this collection's buffered ops mid-handler — the
+    /// single checkpoint home, draining the whole collection's buffered ops
     /// (every typed view over the scope), not just this view's cells.
-    /// At-least-once; see [`CellSession::flush`] for the contract.
+    /// At-least-once; see [`CellSession::checkpoint`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub(crate) async fn flush(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        Ok(self.scope.raw_flush().await?)
+    pub(crate) async fn checkpoint(
+        &self,
+    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.raw_checkpoint().await?)
     }
 
     /// Scans this section's cells in key order over the typed range
@@ -851,20 +888,20 @@ where
     /// at the first error.
     pub(crate) fn scan<'a>(
         &'a self,
-        start: Bound<&'a KeyOf<T>>,
+        start: ScanEdge<&'a KeyOf<T>>,
         dir: Direction,
-        end: Bound<&'a KeyOf<T>>,
+        end: ScanEdge<&'a KeyOf<T>>,
         limit: Option<usize>,
     ) -> impl Stream<Item = ScanItem<T>> + Send + 'a {
         try_stream! {
             ensure_live(self.scope.session())?;
             let session = self.scope.session();
-            // Encode the direction-relative bounds once, here — the owned
+            // Encode the direction-relative edges once, here — the owned
             // coordinates outlive the scan the generator drives to completion
             // below. (`Scan::start`/`end` follow `dir`; `Scan` itself derives
             // the byte-order low/high.)
-            let start = encode_bound::<T::Key>(start);
-            let end = encode_bound::<T::Key>(end);
+            let start = encode_edge::<T::Key>(start);
+            let end = encode_edge::<T::Key>(end);
             let scan = Scan {
                 section: self.section,
                 start: start.as_ref(),
@@ -966,16 +1003,16 @@ where
         self.view.clear(&()).await
     }
 
-    /// Drains the buffered op directly to authoritative state — a mid-handler
-    /// write-through. At-least-once; see [`CellSession::flush`] for the
+    /// Durably commits the buffered op mid-handler, so it survives a restart
+    /// after failure. At-least-once; see [`CellSession::checkpoint`] for the
     /// contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "value.flush", skip_all, fields(collection = self.view.name().as_str()), err)]
-    pub async fn flush(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        self.view.flush().await
+    #[instrument(name = "value.checkpoint", skip_all, fields(collection = self.view.name().as_str()), err)]
+    pub async fn checkpoint(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        self.view.checkpoint().await
     }
 }
 
@@ -1008,15 +1045,11 @@ pub(in crate::state::descriptor) fn encode_cell<C: Codec>(
     Ok(buf)
 }
 
-/// Lowers a typed scan bound to its order-preserving coordinate bound. Called
+/// Lowers a typed scan edge to its order-preserving coordinate edge. Called
 /// once per scan, on the stream's first poll; the owned coordinate — not the
 /// borrowed key — is what the running scan holds.
-fn encode_bound<K: OrderedKeyCodec>(bound: Bound<&K::Key>) -> Bound<Coordinate> {
-    match bound {
-        Bound::Included(key) => Bound::Included(K::encode(key)),
-        Bound::Excluded(key) => Bound::Excluded(K::encode(key)),
-        Bound::Unbounded => Bound::Unbounded,
-    }
+fn encode_edge<K: OrderedKeyCodec>(edge: ScanEdge<&K::Key>) -> ScanEdge<Coordinate> {
+    edge.map(K::encode)
 }
 
 /// Guards every cell operation: a session whose partition is shutting

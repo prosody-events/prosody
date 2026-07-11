@@ -1,6 +1,6 @@
 //! Index-addressed double-ended queue collection.
 //!
-//! A Deque is a dense window of cells over a monotonic `i64` index space. The
+//! A Deque is a window of cells over a monotonic `i64` index space. The
 //! [`DequeHandle`] composes the uniform `CellView` typed cell interface —
 //! there is no Deque-specific store, session, or backend. Build a descriptor
 //! with [`deque_state`], register it with the consumer, and bind the
@@ -19,20 +19,35 @@
 //!   big-endian index ([`I64KeyCodec`]) so the clustering byte order is the
 //!   signed index order, and typed by the element cell type `T`.
 //!
-//! # Invariant: dense, monotonic window
+//! # Invariant: monotonic window within its lifetime; dense without a TTL
 //!
-//! `[head, tail)` is a dense, fully-live, contiguous window: every index in the
-//! range maps to a present entry cell, `head ≤ tail`, and indices are monotonic
-//! and never reused — a pop advances `head`/`tail` past the freed index, never
-//! back into it. So `len` is `tail − head` (O(1) from the meta), `get(i)` is
-//! the single cell at `head + i`, and a scan anchored at `head` with `limit =
-//! tail − head` visits exactly the live window, never a popped tombstone (which
-//! sits below `head` or at/above `tail`). Co-stamping makes the window heal as
-//! a unit: a handler's entry mutation and the bounds move it buffers in one op
-//! stage in one batch with one write TS/TTL (see
-//! [`KeyedStateSession::finalize`](crate::state::session)) — and a mid-handler
-//! [`DequeHandle::flush`] drains them in one batch the same way — so the
-//! bounds cell can never outlive — or be outlived by — the entries it anchors.
+//! `[head, tail)` is a contiguous window with `head ≤ tail`, and indices are
+//! monotonic and never reused **within a window's lifetime** — a pop advances
+//! `head`/`tail` past the freed index, never back into it. So `len` is
+//! `tail − head` (O(1) from the meta), `get(i)` reads the single cell at
+//! `head + i`, and a scan anchored at `head` with `limit = tail − head`
+//! visits the window, never a popped tombstone (which sits below `head` or
+//! at/above `tail`). [`DequeHandle::clear`] ends the window's lifetime and
+//! **resets the index space**: the erased bounds cell reads `[0, 0)`, so the
+//! next push writes index 0. Reuse is safe — every pre-clear row is erased by
+//! the clear, and a later write to a reused coordinate out-stamps any earlier
+//! tombstone (single writer, monotonic timestamps). Co-stamping makes the
+//! window move heal as a unit: a handler's entry mutation and the bounds move
+//! it buffers in one op stage in one batch with one write TS/TTL (see
+//! [`KeyedStateSession::finalize`](crate::state::session)) — and a
+//! mid-handler [`DequeHandle::checkpoint`] drains them in one batch the same
+//! way.
+//!
+//! **Without a TTL the window is also dense**: every index in `[head, tail)`
+//! maps to a present entry cell, so `len` is exact and a scan yields exactly
+//! `len` elements. **With a TTL** an entry's expiry is anchored at its push, so
+//! entries can expire *inside* the window while it stays put — the window
+//! develops holes. The bounds cell is rewritten by every op, so it outlives the
+//! entries and `head`/`tail` are unaffected. Under holes `len` is an **upper
+//! bound** on the live count, and `get`/`stream` **skip** an expired index — an
+//! absent cell resolves as skipped (`get` → `None`, `stream` omits it), never
+//! an error. This is acceptable time-window semantics: a TTL'd deque is a
+//! sliding window of not-yet-expired elements.
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
@@ -42,7 +57,7 @@ use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
-use crate::state::cell_key::{Direction, Section};
+use crate::state::cell_key::{Direction, ScanEdge, Section};
 use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -51,7 +66,6 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
-use std::ops::Bound;
 use thiserror::Error;
 use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
@@ -107,7 +121,7 @@ impl TryFrom<i8> for DequeNs {
 /// Declare via [`deque_state`].
 pub type DequeDescriptor<T = JsonCodec> = Descriptor<DequeKind<T>>;
 
-/// The Deque [`CollectionSpec`]: a dense index window plus the head/tail bounds
+/// The Deque [`CollectionSpec`]: an index window plus the head/tail bounds
 /// cell. The index encoding is pinned by the kind ([`I64KeyCodec`]) — never a
 /// registration choice — and rides the identity's key-codec token like any
 /// other key axis.
@@ -209,9 +223,10 @@ where
 
     /// Streams the live elements in index order — front to back for
     /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
-    /// element is resolved as it is yielded. See the module's dense-window
-    /// invariant: the scan anchors at the window's leading edge and stops after
-    /// `len` cells, so a popped tombstone is never yielded.
+    /// element is resolved as it is yielded. See the module's window
+    /// invariant: the scan is bounded to the window `[head, tail − 1]`, so a
+    /// popped tombstone (below `head` or at/above `tail`) is never yielded;
+    /// `limit = len` is a belt-and-braces backstop over the fully-known window.
     pub fn stream(
         &self,
         dir: Direction,
@@ -233,22 +248,24 @@ where
             if len == 0 {
                 return;
             }
-            // The leading-edge index: `head` forward, the last live index
-            // `tail − 1` backward (`len > 0` proves it does not underflow).
-            let anchor = match dir {
-                Direction::Forward => window.head,
-                Direction::Backward => window
-                    .tail
-                    .checked_sub(1)
-                    .ok_or(MetaDecodeError::IndexOverflow)?,
+            // Anchor both edges on the window: front `head` to back `tail − 1`
+            // (`len > 0` proves `tail − 1` does not underflow), mirrored
+            // backward.
+            let head = window.head;
+            let last = window
+                .tail
+                .checked_sub(1)
+                .ok_or(MetaDecodeError::IndexOverflow)?;
+            let (start, end) = match dir {
+                Direction::Forward => (ScanEdge::Included(&head), ScanEdge::Included(&last)),
+                Direction::Backward => (ScanEdge::Included(&last), ScanEdge::Included(&head)),
             };
-            let inner = self
-                .entries
-                .scan(Bound::Included(&anchor), dir, Bound::Unbounded, Some(len));
+            let inner = self.entries.scan(start, dir, end, Some(len));
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
-                // The scan yields the decoded index; the dense window makes it
-                // redundant, so only the resolved element is exposed.
+                // The scan yields the decoded index; the module's window
+                // invariant makes it redundant, so only the resolved element is
+                // exposed.
                 let (_, value) = item?;
                 yield value;
             }
@@ -358,16 +375,33 @@ where
         Ok(value)
     }
 
-    /// Drains this deque's buffered ops — entries and the window bounds
-    /// together, in one batch — straight to committed state. At-least-once;
-    /// see [`CellSession::flush`] for the contract.
+    /// Removes every element and the window bounds, **resetting the index
+    /// space** (see the module's window invariant): within the event the
+    /// deque reads empty from this program point, and the next push writes
+    /// index 0. Committed, exactly the repopulated elements survive; aborted,
+    /// the deque is untouched. O(handler writes) — the entry section rides
+    /// the durable section clear; only the window cell takes the per-cell
+    /// path.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "deque.flush", skip_all, fields(collection = self.entries.name().as_str()), err)]
-    pub async fn flush(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
-        Ok(self.entries.flush().await?)
+    #[instrument(name = "deque.clear", skip_all, fields(collection = self.entries.name().as_str()), err)]
+    pub async fn clear(&self) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        self.entries.clear_all().await?;
+        self.meta.clear(&()).await.map_err(meta_err)
+    }
+
+    /// Durably commits this deque's buffered ops mid-handler — entries and
+    /// the window bounds together, in one batch. At-least-once; see
+    /// [`CellSession::checkpoint`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    #[instrument(name = "deque.checkpoint", skip_all, fields(collection = self.entries.name().as_str()), err)]
+    pub async fn checkpoint(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
+        Ok(self.entries.checkpoint().await?)
     }
 
     /// Buffers the bounds cell. Co-stamped with the entry mutation a single op
@@ -417,7 +451,7 @@ where
 /// The [`MetaCodec`] validates the wire *form* (exactly 16 bytes); this type
 /// validates the *meaning* (`head ≤ tail`), so a disordered window is
 /// unrepresentable past the meta boundary. It is deliberately not named
-/// `Bounds`: [`std::ops::Bound`] is in scope.
+/// `Bounds`, to avoid confusion with [`std::ops::Bound`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Window {
     head: i64,
@@ -520,6 +554,27 @@ pub(crate) fn meta_cell() -> CellKey {
         section: META_SECTION,
         coordinate: Coordinate::empty(),
     }
+}
+
+/// Test-only: the entry cell at index `coordinate` (already encoded through
+/// [`I64KeyCodec`]), so a test can seed a sparse window directly — entries with
+/// holes a live deque never produces — and prove the TTL'd-hole tolerance
+/// against the real store.
+#[cfg(test)]
+pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
+    CellKey {
+        section: ENTRY_SECTION,
+        coordinate: coordinate.clone(),
+    }
+}
+
+/// Test-only: the frozen `head ‖ tail` meta frame as raw bytes — two plain
+/// big-endian `i64`s, the [`MetaCodec`] layout pinned by
+/// `deque_meta_cell_bytes_are_frozen` — so a test can seed the bounds cell
+/// directly.
+#[cfg(test)]
+pub(crate) fn seed_frame(head: i64, tail: i64) -> Vec<u8> {
+    [head.to_be_bytes(), tail.to_be_bytes()].concat()
 }
 
 #[cfg(test)]

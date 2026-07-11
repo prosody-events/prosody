@@ -68,7 +68,7 @@ fn prop_memory_concurrent_identical_registration() {
             n,
         )) {
             Ok(true) => TestResult::passed(),
-            Ok(false) => TestResult::error("concurrent identical registration did not converge"),
+            Ok(false) => TestResult::failed(),
             Err(error) => TestResult::error(format!("{error:?}")),
         }
     }
@@ -83,7 +83,7 @@ fn prop_memory_concurrent_conflicting_registration() {
         let store = MemoryDescriptorIdentityStore::new();
         match block_on(run_concurrent_conflicting(&store, &group(), key_seed)) {
             Ok(true) => TestResult::passed(),
-            Ok(false) => TestResult::error("conflicting registration did not converge on a winner"),
+            Ok(false) => TestResult::failed(),
             Err(error) => TestResult::error(format!("{error:?}")),
         }
     }
@@ -344,10 +344,14 @@ async fn state_type_namespaces_cells() -> Result<()> {
     );
 
     store
-        .write_resolved(&app, &[(cell.clone(), Some(Bytes::from_static(b"app")))])
+        .write_resolved(
+            &app,
+            &[(cell.clone(), Some(Bytes::from_static(b"app")))],
+            &[],
+        )
         .await?;
     store
-        .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))])
+        .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))], &[])
         .await?;
 
     // A resolved cell never consults the oracle, so the probe event is inert.

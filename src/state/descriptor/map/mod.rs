@@ -28,15 +28,29 @@
 //! `set` ratchets the min/max bounds **outward only** and never reads the entry
 //! being written, so a blind last-writer-wins entry write is preserved and the
 //! bounds may name a key that was since removed — a *superset* of the live key
-//! range, never a subset. `stream` anchors its scan at the bound on its leading
-//! edge — the min bound for a forward (ascending) scan, the max for a backward
-//! (descending) one — each falling back to the section edge (`Unbounded`) when
-//! its bound is missing or expired, and relies on the store hiding cleared
-//! cells, so it yields exactly the live entries in key order regardless of
-//! stale bounds: a residue beyond the live range is never reached, a live key
-//! can never sit outside its bound, and the missing-bound fallback scans from
-//! the edge. The bounds are therefore self-healing — never an exact count, by
-//! design (a count would force a read-before-write on every mutation).
+//! range, never a subset. `stream` anchors **both** edges of its scan on the
+//! bounds — `[min, max]` ascending, mirrored descending — reading them
+//! concurrently, and relies on the store hiding cleared cells, so it yields
+//! exactly the live entries in key order regardless of stale bounds: a residue
+//! beyond the live range is never reached, and a live key can never sit outside
+//! its bounds, so bounding the scan to `[min, max]` drops no entry. When either
+//! bound is absent the map holds no live entries (see the TTL-refresh
+//! invariant), so no scan is issued at all. The bounds are therefore
+//! self-healing — never an exact count, by design (a count would force a
+//! read-before-write on every mutation). [`MapHandle::clear`] removes the
+//! bounds with the entries, so the absent-bounds ⇔ empty-map reading survives
+//! a cleared map.
+//!
+//! # Invariant: on a TTL'd map the bounds outlive every entry
+//!
+//! A bound cell carries the collection's TTL, but an entry `set` within the
+//! existing bounds would refresh only the entry's TTL — so, left alone, the
+//! bounds could expire while live entries remain. To prevent that skew, on a
+//! collection with a TTL every `set` rewrites *both* bound cells (with the
+//! ratcheted extremes), refreshing their TTL. So a bound cell always lives at
+//! least as long as the newest entry, and **absent bounds ⇔ no live entries**.
+//! A non-TTL'd map keeps the extend-only write — nothing expires, so the
+//! invariant holds vacuously.
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
@@ -46,7 +60,7 @@ use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
-use crate::state::cell_key::{Coordinate, Direction, Section};
+use crate::state::cell_key::{Coordinate, Direction, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::session::CellSession;
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -56,7 +70,6 @@ use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt::Display;
 use std::marker::PhantomData;
-use std::ops::Bound;
 use thiserror::Error;
 use tracing::{Instrument, info_span, instrument};
 
@@ -237,10 +250,11 @@ where
     /// Streams the live entries in key order — ascending for
     /// [`Direction::Forward`], descending for [`Direction::Backward`]. Each
     /// entry's value is resolved as it is yielded, and the entries view decodes
-    /// each yielded key, so the anchor bound is a logical key rather than a
-    /// coordinate. See the module's loose-superset invariant: a stale bound
-    /// never drops a live entry, it only ever costs an extra
-    /// scanned-but-cleared cell.
+    /// each yielded key, so the anchors are logical keys rather than
+    /// coordinates. See the module's loose-superset invariant: the scan is
+    /// bounded to `[min, max]`, so a stale bound never drops a live entry, it
+    /// only ever costs an extra scanned-but-cleared cell. When either bound is
+    /// absent the map holds no live entries, so no scan is issued.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
         // so each inner await is instrumented with a clone instead; the
@@ -254,15 +268,21 @@ where
             direction = ?dir,
         );
         try_stream! {
-            // Anchor at the bound on the scan's leading edge — the min bound for
-            // `Forward`, the max for `Backward` — falling back to the section
-            // edge (`Unbounded`) when that bound is missing or expired.
-            let anchor = match dir {
-                Direction::Forward => self.read_bound(MapBound::Min).instrument(span.clone()).await?,
-                Direction::Backward => self.read_bound(MapBound::Max).instrument(span.clone()).await?,
+            // Anchor both edges on the bounds, read concurrently. Both present
+            // or both absent are the only states (extend-only writes + the
+            // TTL-refresh invariant); both absent ⇒ empty map ⇒ no scan.
+            let (min, max) = tokio::try_join!(
+                self.read_bound(MapBound::Min).instrument(span.clone()),
+                self.read_bound(MapBound::Max).instrument(span.clone())
+            )?;
+            let (Some(min), Some(max)) = (min, max) else {
+                return;
             };
-            let start = anchor.as_ref().map_or(Bound::Unbounded, Bound::Included);
-            let inner = self.entries.scan(start, dir, Bound::Unbounded, None);
+            let (start, end) = match dir {
+                Direction::Forward => (ScanEdge::Included(&min), ScanEdge::Included(&max)),
+                Direction::Backward => (ScanEdge::Included(&max), ScanEdge::Included(&min)),
+            };
+            let inner = self.entries.scan(start, dir, end, None);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -323,30 +343,57 @@ where
         Ok(self.entries.clear(key).await?)
     }
 
-    /// Drains this map's buffered ops — entries and bound ratchets together,
-    /// in one batch — straight to committed state. At-least-once; see
-    /// [`CellSession::flush`] for the contract.
+    /// Removes every entry and both bounds: within the event the map reads
+    /// empty from this program point (later `set`s repopulate it); committed,
+    /// exactly the repopulated entries survive; aborted, the map is
+    /// untouched. O(handler writes) — the entry section rides the durable
+    /// section clear; only the fixed-cardinality bookkeeping cells take the
+    /// per-cell path.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
     #[instrument(
-        name = "map.flush",
+        name = "map.clear",
         skip_all,
         fields(collection = self.entries.name().as_str()),
         err
     )]
-    pub async fn flush(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
-        Ok(self.entries.flush().await?)
+    pub async fn clear(&self) -> Result<(), MapStateError<CellCodecError<V>>> {
+        self.entries.clear_all().await?;
+        self.meta.clear(&MapBound::Min).await.map_err(meta_err)?;
+        self.meta.clear(&MapBound::Max).await.map_err(meta_err)?;
+        Ok(())
+    }
+
+    /// Durably commits this map's buffered ops mid-handler — entries and
+    /// bound ratchets together, in one batch. At-least-once; see
+    /// [`CellSession::checkpoint`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    #[instrument(
+        name = "map.checkpoint",
+        skip_all,
+        fields(collection = self.entries.name().as_str()),
+        err
+    )]
+    pub async fn checkpoint(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
+        Ok(self.entries.checkpoint().await?)
     }
 
     /// Ratchets the min/max bounds outward to `key`. Reads both bound cells
-    /// concurrently (they are independent), then extends each that `key`
-    /// exceeds by [`Ord`] — the conditional sets stay sequential (cheap
-    /// in-memory buffering, nothing to overlap). `key` *moves* into the single
-    /// extending bound write, mirroring `HashMap::insert` taking its key by
-    /// value; it is cloned only when both bounds extend (the first insert seeds
-    /// Min and Max together).
+    /// concurrently (they are independent), then writes the ratcheted extremes.
+    ///
+    /// On a **TTL'd** collection both bound cells are rewritten every `set`,
+    /// even when neither extreme moves: that unconditional rewrite refreshes
+    /// the bounds' TTL so they outlive every entry (the module's
+    /// TTL-refresh invariant). On a **non-TTL'd** collection only a bound
+    /// that `key` extends by [`Ord`] is written — nothing expires, so a
+    /// rewrite would be pure churn. Either way the conditional sets stay
+    /// sequential (cheap in-memory buffering, nothing to overlap): `key` is
+    /// cloned into the lower write and moved into the upper.
     async fn ratchet_bounds(&self, key: KC::Key) -> Result<(), MapStateError<CellCodecError<V>>>
     where
         KC::Key: Clone,
@@ -355,6 +402,21 @@ where
             self.read_bound(MapBound::Min),
             self.read_bound(MapBound::Max)
         )?;
+        if self.meta.has_ttl() {
+            // Compute both ratcheted extremes before the moves: `new_min` may
+            // clone `key`, `new_max` consumes it.
+            let new_min = min.filter(|min| *min <= key).unwrap_or_else(|| key.clone());
+            let new_max = max.filter(|max| *max >= key).unwrap_or(key);
+            self.meta
+                .set(&MapBound::Min, new_min)
+                .await
+                .map_err(meta_err)?;
+            self.meta
+                .set(&MapBound::Max, new_max)
+                .await
+                .map_err(meta_err)?;
+            return Ok(());
+        }
         let extend_min = min.is_none_or(|min| key < min);
         let extend_max = max.is_none_or(|max| key > max);
         match (extend_min, extend_max) {
@@ -433,8 +495,8 @@ where
 }
 
 /// Test-only: the entry cell at key coordinate `coordinate`, so a test can
-/// seed raw entries directly (entries with a missing bound) and prove the
-/// missing-bound fallback against the real store.
+/// seed raw entry cells directly — including a coordinate that does not decode
+/// as the collection's key codec — to exercise the real store's scan path.
 #[cfg(test)]
 pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
     CellKey {

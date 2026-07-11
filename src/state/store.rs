@@ -50,6 +50,7 @@ use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Scan};
 use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
+use super::marker::{EventMarker, SectionClear};
 use crate::error::ClassifyError;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -67,10 +68,19 @@ use std::future::Future;
 /// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
 ///   each cell (the `ReadCommitted` outcome path).
 /// * [`Self::write_resolved`] — writes committed values with `event` and `prev`
-///   null (the `ReadUncommitted` direct write, the mid-handler flush, and
+///   null (the `ReadUncommitted` direct write, the mid-handler checkpoint, and
 ///   rollback resolution, where the committed value is the staged `prev`).
 /// * [`Self::mark_resolved`] — *promote*: nulls `event` and `prev`, keeping
 ///   `data`. O(1) regardless of value size; the commit arm of resolution.
+///
+/// # Committed absence is row absence
+///
+/// **Invariant:** a committed-absent cell is stored as *no row*. Every path
+/// that resolves a cell to absent deletes the row rather than leaving a
+/// null-blob residue. This is why [`Self::write_resolved`] partitions on data
+/// presence (a `None` value deletes) and why [`Self::commit_provisional`]
+/// routes an absent-data promote to `write_resolved(cell, None)` instead of the
+/// value-preserving [`Self::mark_resolved`] verb.
 pub trait CellStore: Clone + Send + Sync + 'static {
     /// Error type for cell-store operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -78,6 +88,17 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Reads one cell's visible committed value, resolving an in-flight
     /// provisional cell through the oracle (or short-circuiting to its `prev`
     /// when `own` owns it). A missing row resolves to `Committed(None)`.
+    ///
+    /// # The committed-unapplied read window
+    ///
+    /// Reads return **marker-resolved truth**: a standing **foreign** event
+    /// marker that carries section clears is resolved through the sweep path
+    /// (`help_read_window` in `resolve`) before the read is served, so a
+    /// committed-but-unapplied clear can never serve pre-clear rows. Markers
+    /// without clears are left standing — first-touch resolution stays
+    /// cell-grained and marker-free. [`Self::scan_cells`] and the cache-fill
+    /// twins ([`Self::get_for_cache`] / [`Self::scan_for_cache`]) share the
+    /// same implementation, so the contract holds across all four reads.
     ///
     /// # Errors
     ///
@@ -93,7 +114,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Complete, ordered, single-section scan (start positional, section
     /// required). Provisional cells in range are oracle-resolved here; cleared
     /// or absent cells are skipped, so the stream yields only present committed
-    /// bytes in `coordinate` byte order.
+    /// bytes in `coordinate` byte order. Returns marker-resolved truth exactly
+    /// as [`Self::get`] does (the committed-unapplied read window, stated
+    /// there).
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -145,9 +168,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Streams the whole partition's provisional cells (all sections) for the
     /// recovery sweep, filtering resolved rows in code.
     ///
-    /// This is the **cold** recovery source (the bounded durable `kind=Index`
-    /// range read + point reads on the Cassandra store). The warm short-circuit
-    /// that skips it on a quiescent sweep lives on
+    /// This is the **cold** recovery source: on the Cassandra store, the
+    /// event-marker point read (memoized per assignment) followed by one point
+    /// read per listed coordinate — cost ∝ #provisional, never partition size.
+    /// The warm short-circuit that skips it on a quiescent sweep lives on
     /// [`Cached`](super::cached::Cached).
     fn provisional_cells<'a>(
         &'a self,
@@ -170,7 +194,45 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a;
 
     /// Stages each `(cell, write)`'s provisional cell (`data | prev | event`)
-    /// in one same-partition batch, binding `collection`'s TTL.
+    /// in one same-partition batch, binding `collection`'s TTL, and
+    /// creates/overwrites the collection's **event marker** from the
+    /// pre-frozen `marker` — the durable recovery handle naming the staging
+    /// event, the coordinates it staged, and the sections it cleared.
+    ///
+    /// # The event-marker lifecycle (stated once, here)
+    ///
+    /// Exactly one verb family owns the marker: this verb (create/overwrite),
+    /// and [`commit_provisional`](Self::commit_provisional) /
+    /// [`abort_provisional`](Self::abort_provisional) / the recovery sweep
+    /// (delete). [`write_resolved`](Self::write_resolved) and
+    /// [`mark_resolved`](Self::mark_resolved) never touch it — there is nothing
+    /// provisional to recover — so a fresh-commit no-op marker write is
+    /// unrepresentable.
+    ///
+    /// `marker` carries the event's **whole** per-collection staged set
+    /// (`writes ⊆ marker.staged()`), so a stage that splits over the byte
+    /// budget passes the same union marker with every chunk rather than
+    /// stranding a coordinate (an unlisted durable row is invisible to the
+    /// recovery sweep). The session freezes it once per collection at
+    /// `finalize`; only a retry attempt re-running `finalize` re-stages,
+    /// replacing the same-event marker idempotently — handlers are assumed
+    /// deterministic across retries. `None` is the explicit empty-stage no-op
+    /// (`writes` must be empty): no marker, no boundary check — nothing to
+    /// strand. A **clears-only** stage is representable as `writes = []` with
+    /// a marker whose `staged()` is empty and `clears()` non-empty; it writes
+    /// the marker and runs the boundary check like any stage, because a
+    /// committed-unapplied clear is recoverable state.
+    ///
+    /// Before staging, the backend resolves any standing marker naming a
+    /// **different** event — the stage-boundary rule that keeps marker
+    /// uniqueness per collection an invariant; a resolution failure fails the
+    /// stage (the retry middleware handles it).
+    ///
+    /// The marker's `clears` are frozen here and **applied at settle** (see
+    /// [`commit_provisional`](Self::commit_provisional)), so re-apply during
+    /// recovery stays a pure function of durable staged data. The session's
+    /// `finalize` is the live producer: it freezes each cleared section's
+    /// survivors from the collection's staged writes.
     ///
     /// # Errors
     ///
@@ -179,11 +241,24 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Writes each `(cell, data)` as a resolved cell (`data` committed;
-    /// `event`/`prev` null) in one same-partition batch, binding `collection`'s
-    /// TTL.
+    /// Writes each `(cell, data)` as a resolved cell in one same-partition
+    /// batch, binding `collection`'s TTL, partitioning internally on data
+    /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
+    /// `None` **deletes the row** (the row-absence invariant). Covers the
+    /// `ReadUncommitted` direct clear, the mid-handler checkpoint of a clear,
+    /// and rollback-to-absent. Never touches the event marker (see
+    /// [`write_provisional`](Self::write_provisional)).
+    ///
+    /// `clears` names sections to erase before `cells` land — the direct-apply
+    /// twin of a staged clear: every non-survivor row of each cleared section
+    /// is deleted (on Cassandra as gap range tombstones between the sorted
+    /// survivors), with survivors excluded **positionally** via the frozen
+    /// list. The caller derives each clear's survivors from `cells`' own
+    /// present-data coordinates — the single survivor definition — so no
+    /// written row can overlap a gap range (batches stay row-disjoint).
     ///
     /// # Errors
     ///
@@ -192,11 +267,33 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    /// Point-reads the collection's standing **event marker**, or `None` when
+    /// none stands (≈ always). Feeds the recovery sweep's marker leg and the
+    /// stage-boundary rule. Required with no default: a defaulted `Ok(None)` on
+    /// a marker-bearing backend would be a silent recovery hole, so every impl
+    /// answers truthfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on a store failure.
+    fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a;
 
     /// Promotes each `cell`'s provisional cell to resolved: nulls `event` and
     /// `prev`, keeping `data`. O(1) bytes per cell. Idempotent — promoting a
     /// resolved cell is a harmless no-op write.
+    ///
+    /// **Precondition:** callers route an absent-data promote to
+    /// [`write_resolved`](Self::write_resolved)`(cell, None)` (the row-absence
+    /// invariant), so this verb only ever promotes present data. Promoting an
+    /// absent-data cell through it instead is not corruption — the row still
+    /// decodes `Committed(None)` — but it leaves a resolved-null residue row,
+    /// which is why the absent-data route exists.
     ///
     /// # Errors
     ///
@@ -207,12 +304,28 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Settles a staged set as **committed**: each cell's provisional `data`
-    /// becomes the committed value. The default is the O(1) promote
-    /// ([`Self::mark_resolved`] over the keys); the
-    /// [`Cached`](super::cached::Cached) cache overrides it to also publish the
-    /// committed `data` projection into fjall, returning the **lower** result
-    /// verbatim so a cache-publish failure never gates promotion.
+    /// Settles a staged set as **committed** AND deletes the collection's event
+    /// marker: each cell's provisional `data` becomes the committed value.
+    ///
+    /// Required with no default (`route_commit` is the reference routing the
+    /// memory backend calls; the Cassandra backend implements the identical
+    /// routing natively as one same-partition batch packing): with markers, a
+    /// defaulted override behind a trait default is a landmine — a wrapper
+    /// store that forgot to forward the verb would fall into a default routing
+    /// through the *wrapper's* verbs and bypass the inner store's marker
+    /// delete, a leaked marker with no compile error. Making both settle verbs
+    /// required makes that bug class uncompilable.
+    ///
+    /// `clears` (frozen at stage time) are **applied here**: each cleared
+    /// section's non-survivor rows are erased — on Cassandra as the n+1 gap
+    /// range deletes between sorted survivors, packed with the marker delete
+    /// into one indivisible batch unit (a marker delete landing without its
+    /// gaps would lose the committed clear forever). Erasing a
+    /// still-provisional **foreign** row is correct: single-writer ordering
+    /// puts the committed clear after every pre-existing row, so a
+    /// non-survivor's post-clear state is absent regardless of its unresolved
+    /// history (the erasure argument). Survivors are protected positionally by
+    /// the frozen list, never temporally. Idempotent; the sweep retries it.
     ///
     /// # Errors
     ///
@@ -221,18 +334,15 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        async move {
-            let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
-            self.mark_resolved(collection, &keys).await
-        }
-    }
+        clears: &'a [SectionClear],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Settles a staged set as **aborted**: each cell's committed base `prev`
-    /// is written back as the resolved value. The default is
-    /// [`Self::write_resolved`] over the `prev`s; the
-    /// [`Cached`](super::cached::Cached) cache overrides it to also publish the
-    /// `prev` projection into fjall, returning the **lower** result verbatim.
+    /// Settles a staged set as **aborted** AND deletes the collection's event
+    /// marker: each cell's committed base `prev` is written back as the
+    /// resolved value. Required with no default, for the reason on
+    /// [`commit_provisional`](Self::commit_provisional). The base was never
+    /// touched by the stage, so the rollback is exact and needs no per-section
+    /// discard. Idempotent; the sweep retries it.
     ///
     /// # Errors
     ///
@@ -241,13 +351,72 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        async move {
-            let cells: Vec<(CellKey, Option<Bytes>)> = writes
-                .iter()
-                .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
-                .collect();
-            self.write_resolved(collection, &cells).await
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+}
+
+/// Routes a committed settle to the primitive verbs: present-data cells promote
+/// in place ([`CellStore::mark_resolved`]); absent-data cells
+/// **delete** the row via [`CellStore::write_resolved`]`(cell, None)`,
+/// upholding the row-absence invariant. Both arms are idempotent and
+/// row-disjoint (an event stages each cell at most once), so the two sequential
+/// awaits are order-free; the sweep retries either on failure. A settle with no
+/// absent-data cells issues exactly one `mark_resolved` batch set.
+///
+/// The reference routing: the memory backend calls it before its marker
+/// delete; the Cassandra backend implements the identical routing natively as
+/// one same-partition batch packing (settle + marker delete in one round-trip
+/// set — a recorded divergence, not drift). Free (not a trait default) so a
+/// wrapper that forwards the verb cannot silently inherit it and bypass the
+/// inner store's marker delete.
+///
+/// # Errors
+///
+/// Returns the store's error on a promote / delete failure.
+pub(crate) async fn route_commit<S>(
+    store: &S,
+    collection: &CollectionRef,
+    writes: &[(CellKey, ProvisionalWrite)],
+) -> Result<(), S::Error>
+where
+    S: CellStore,
+{
+    let mut keeps: Vec<CellKey> = Vec::with_capacity(writes.len());
+    let mut clears: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(writes.len());
+    for (cell, write) in writes {
+        if write.data().is_some() {
+            keeps.push(cell.clone());
+        } else {
+            clears.push((cell.clone(), None));
         }
     }
+    if !keeps.is_empty() {
+        store.mark_resolved(collection, &keeps).await?;
+    }
+    if !clears.is_empty() {
+        store.write_resolved(collection, &clears, &[]).await?;
+    }
+    Ok(())
+}
+
+/// Routes an aborted settle to [`CellStore::write_resolved`] over the staged
+/// `prev`s (`prev = None` restores exact absence). The reference rollback
+/// routing — called by the memory backend, implemented natively as one batch
+/// packing by Cassandra — free, for the reason on [`route_commit`].
+///
+/// # Errors
+///
+/// Returns the store's error on a write failure.
+pub(crate) async fn route_abort<S>(
+    store: &S,
+    collection: &CollectionRef,
+    writes: &[(CellKey, ProvisionalWrite)],
+) -> Result<(), S::Error>
+where
+    S: CellStore,
+{
+    let cells: Vec<(CellKey, Option<Bytes>)> = writes
+        .iter()
+        .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
+        .collect();
+    store.write_resolved(collection, &cells, &[]).await
 }

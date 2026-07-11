@@ -26,6 +26,19 @@
 //! punches are therefore **must-succeed** (`Cached::punch_cells_must_succeed`):
 //! retried until they land, never degraded.
 //!
+//! Section clears carry their own punch invariant:
+//!
+//! - **Cov-Clr:** a *committed* clear's section coverage is punched
+//!   (must-succeed, whole-section) **before** its gap tombstones can land; an
+//!   *uncommitted* marker never invalidates coverage (the covered pre-clear
+//!   values are still the committed truth). Four sites uphold it, all through
+//!   `Cached::punch_sections_must_succeed`: `commit_provisional` and
+//!   `write_resolved` punch their own `clears` before the lower call, and the
+//!   `write_provisional` boundary punch plus the fall-through-read guard
+//!   (`punch_read_window`) punch a standing foreign clears-bearing marker's
+//!   staged coordinates and cleared sections before the lower store can resolve
+//!   that marker beneath the cache. The abort path never punches.
+//!
 //! The five soundness invariants (Cov1/Cov2/Cov3, `CovBuild`, `CovVolatile`,
 //! `GetNeverReadsOwnStaged`) are stated on the `coverage` module. The ones
 //! carried into this file:
@@ -86,10 +99,11 @@ mod coverage;
 use self::coverage::{Coverage, Interval, Piece};
 use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
+use super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, CoverDecision, FjallCellCache, ScanHit};
 use super::identity::{CollectionId, CollectionRef};
+use super::marker::{EventMarker, SectionClear};
 use super::store::CellStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
@@ -97,6 +111,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut, stream};
 use smallvec::SmallVec;
+use std::future::Future;
 use std::ops::Bound;
 use std::slice;
 use std::time::Duration;
@@ -134,8 +149,8 @@ pub struct Cached<L> {
 impl<L> Cached<L> {
     /// Composes a cache over `lower`, serving committed-value hits from `fjall`
     /// and covered scan sub-ranges from the (initially empty) coverage map.
-    /// Both the coverage map and the warm provisional index spill to
-    /// `fjall`'s `index` keyspace.
+    /// Both the coverage map and the warm provisional-coordinate cache spill
+    /// to `fjall`'s `index` keyspace.
     #[must_use]
     pub fn new(fjall: FjallCellCache, lower: L) -> Self {
         Self {
@@ -188,24 +203,25 @@ impl<L> Cached<L> {
         cells: impl Iterator<Item = &'c CellKey>,
     ) {
         for (section, coordinates) in group_by_section(cells) {
-            loop {
-                match self
-                    .coverage
-                    .punch_many(collection, section, &coordinates)
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(error) => {
-                        // Not a degrade: this punch is must-succeed, so a
-                        // transient failure retries in place.
-                        warn!(error = %error, "committed-value cache punch failed");
-                        if error.classify_error() == ErrorCategory::Permanent {
-                            break;
-                        }
-                        sleep(PUNCH_RETRY_DELAY).await;
-                    }
-                }
-            }
+            retry_punch(|| self.coverage.punch_many(collection, section, &coordinates)).await;
+        }
+    }
+
+    /// Punches each cleared section's **whole** coverage, retrying like
+    /// [`punch_cells_must_succeed`](Self::punch_cells_must_succeed) (same
+    /// correctness-not-a-hint rationale, same Permanent-break argument) —
+    /// the Cov-Clr eviction: a committed clear's covered pre-clear values are
+    /// wrong post-clear, so serving them is a bug, not a cache benefit.
+    /// Survivor coordinates need no exclusion: the punch drops the whole
+    /// section, survivors are re-covered by the settle's own publish, and an
+    /// over-punched survivor merely falls through once.
+    async fn punch_sections_must_succeed(
+        &self,
+        collection: &CollectionId,
+        clears: &[SectionClear],
+    ) {
+        for clear in clears {
+            retry_punch(|| self.coverage.punch_section(collection, clear.section())).await;
         }
     }
 
@@ -353,6 +369,38 @@ impl<L> Cached<L>
 where
     L: CellStore,
 {
+    /// The fall-through read's Cov-Clr guard: a lower read read-help-resolves
+    /// a standing foreign clears-bearing event marker **beneath** this cache
+    /// (the bottom store's committed-unapplied read window), settling the
+    /// marker WHOLE — gap tombstones land and staged cells promote while
+    /// sibling coordinates may still be covered with pre-settle values — a
+    /// settle no cache verb observes, so no punch would ever follow. Punch
+    /// the marker's staged coordinates and cleared sections BEFORE issuing
+    /// the lower read (mirroring the boundary punch in
+    /// [`write_provisional`](CellStore::write_provisional)): belt-and-braces
+    /// in production — a committed clears-bearing marker's punches already
+    /// ran at the settle attempt, or the workspace died with the assignment —
+    /// but load-bearing under the fault alphabet's skipped-settle window.
+    /// Verdict-blind like the boundary punch (rare path; correctness beats
+    /// eviction precision). The consult rides the lower store's RAM marker
+    /// memo, so the fast path adds no durable read.
+    async fn punch_read_window(
+        &self,
+        collection: &CollectionId,
+        own: EventRef,
+    ) -> Result<(), L::Error> {
+        if let Some(standing) = self.lower.standing_marker(collection).await?
+            && standing.event() != own
+            && !standing.clears().is_empty()
+        {
+            self.punch_cells_must_succeed(collection, standing.staged().iter())
+                .await;
+            self.punch_sections_must_succeed(collection, standing.clears())
+                .await;
+        }
+        Ok(())
+    }
+
     /// Serves one covered piece from fjall, falling through to the lower store
     /// for the remainder when a covered cell is missing-expired (a gap under
     /// floor rounding) or a fjall read errors — degradation is always a slower
@@ -370,9 +418,12 @@ where
         limit: Option<usize>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         try_stream! {
-            let covered = self
-                .fjall
-                .scan_present(collection, scan_for_piece(section, piece, dir, limit));
+            // A piece of a bounded request is always bounded, so `scan_for_piece`
+            // is `Some`; a `None` would mean an unbounded piece, served as empty.
+            let Some(scan) = scan_for_piece(section, piece, dir, limit) else {
+                return;
+            };
+            let covered = self.fjall.scan_present(collection, scan);
             pin_mut!(covered);
             let mut last: Option<Coordinate> = None;
             // Set when the covered serve must hand the remainder to the lower
@@ -434,7 +485,16 @@ where
             // read as exhaustion below and over-cover the unscanned tail. The
             // stream is lazy, so a limited caller dropping it early stops the
             // lower paging anyway.
-            let scan = scan_for_piece(section, piece, dir, None);
+            // A piece of a bounded request is always bounded (see
+            // `scan_for_piece`); a `None` would mean an unbounded piece, served
+            // as empty.
+            let Some(scan) = scan_for_piece(section, piece, dir, None) else {
+                return;
+            };
+            // The gap read can read-help-resolve a standing clears-bearing
+            // marker beneath the cache; punch its sections first (Cov-Clr, see
+            // `punch_read_window`).
+            self.punch_read_window(collection, own).await?;
             let inner = self.lower.scan_for_cache(collection, scan, own);
             pin_mut!(inner);
             let mut contiguous = true;
@@ -468,8 +528,8 @@ where
                 yield (cell, bytes);
             }
             // Exhausted with no hole: the empty tail is genuinely absent, so
-            // cover the whole gap (crucial for unbounded-end `iter()`), which
-            // subsumes any pending frontier.
+            // cover the whole gap (a covered re-scan then pays no lower read
+            // for that tail), which subsumes any pending frontier.
             if contiguous {
                 degrade_cover_mut(
                     "cover",
@@ -523,7 +583,10 @@ where
         // value plus its remaining TTL, publish, and cover the point
         // (cover-on-get). Sound because `get` is never called on a cell the
         // current event staged (GetNeverReadsOwnStaged), so the lower read is a
-        // settled committed projection.
+        // settled committed projection. The lower read can read-help-resolve a
+        // standing clears-bearing marker beneath the cache; punch its sections
+        // first (Cov-Clr, see `punch_read_window`).
+        self.punch_read_window(collection, own).await?;
         let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
         self.publish(collection, cell, &committed, remaining).await;
         Ok(committed)
@@ -542,7 +605,10 @@ where
         // direction-relative bounds map onto it (start = low forward / high
         // backward).
         let (lo, hi) = scan.low_high();
-        let request = Interval::new(lo.cloned(), hi.cloned());
+        // Every scan edge is concrete; the total `ScanEdge → Bound` conversion
+        // builds the coverage request the `IntervalSet` speaks (which keeps its
+        // own `Bound` endpoints — unaffected by the bounded-scan retype).
+        let request = Interval::new(lo.cloned().into(), hi.cloned().into());
         try_stream! {
             // An empty request (e.g. `(a, a)`) yields nothing.
             let Some(request) = request else {
@@ -599,19 +665,21 @@ where
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        // The disk-backed warm provisional index gates the recovery sweep. Warm
+        // The disk-backed warm provisional-coordinate cache gates the recovery
+        // sweep. Warm
         // (seeded): the local fjall snapshot answers with ZERO Cassandra queries
         // (the zero-query-on-quiescence goal); an empty snapshot yields nothing.
         // Cold (a fresh assignment after crash/rebalance mints an empty `index`
-        // keyspace): the lower store's unconditional bounded `kind=Index` seed
-        // runs (cost ∝ #provisional, never #cells), each coordinate is recorded
-        // into fjall as it streams, and the collection is marked seeded.
+        // keyspace): the lower store's bounded seed runs — the event-marker
+        // point read and its listed-coordinate point reads (cost ∝
+        // #provisional, never #cells) — each coordinate is recorded into fjall
+        // as it streams, and the collection is marked seeded.
         //
         // The sweep touches only provisional (= gap) coordinates, never covered
         // ones, so it needs no coverage interaction (the Cov2 corollary). A warm
         // read/write failure degrades toward the cold path (re-seed from durable
         // truth), never toward trusting a possibly-incomplete warm set — the
-        // fjall index is a hint over the authoritative `kind=Index` markers.
+        // fjall index is a hint over the authoritative durable event marker.
         try_stream! {
             // Resolve the warm coordinate list, or fall through to the cold seed.
             // A warm read failure — `is_seeded` OR `snapshot` — must degrade to
@@ -670,7 +738,7 @@ where
                 }
                 // Latch `seeded` only if the whole coords set landed on disk. If
                 // any record failed, leave it unseeded so the next sweep re-seeds
-                // cold from the durable `kind=Index` markers rather than
+                // cold from the durable event marker rather than
                 // short-circuiting on an incomplete snapshot and stranding a
                 // provisional cell — symmetric with `write_provisional`.
                 if all_recorded {
@@ -695,23 +763,56 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
+        // Boundary punch: the lower store's stage boundary resolves any
+        // standing FOREIGN event marker *beneath* this cache — a settle no
+        // wrapper verb observes, so no publish or punch would ever follow it.
+        // With a warm workspace still covering those cells' stage-time `prev`,
+        // a committed foreign marker resolved down there would promote durably
+        // while fjall keeps serving the stale covered `prev` — an unbounded
+        // stale window, because the boundary (unlike the sweep) never routes
+        // through this type's settle verbs. So punch the marker's staged
+        // coordinates — and its cleared sections, whose gap tombstones the
+        // boundary resolve lands under coverage (Cov-Clr) — BEFORE forwarding
+        // down (mirroring `mark_resolved`'s punch-first rationale): uncovering
+        // early only costs a fall-through (the lower read is
+        // oracle-resolving), and the uncommitted arm needs no special casing —
+        // the punch is verdict-blind (rare path; correctness beats eviction
+        // precision). RAM-warm via the lower store's marker memo, so the fast
+        // path adds no durable read.
+        if let Some(marker) = marker
+            && let Some(standing) = self.lower.standing_marker(collection.id()).await?
+            && standing.event() != marker.event()
+        {
+            self.punch_cells_must_succeed(collection.id(), standing.staged().iter())
+                .await;
+            self.punch_sections_must_succeed(collection.id(), standing.clears())
+                .await;
+        }
         // Anchor the co-expiry on a clock read taken BEFORE the lower write
         // (see the module's TTL co-expiry doc and `expiry_at`). Establish
-        // first (Cov3): a failed lower write leaves coverage untouched.
+        // first (Cov3): a failed lower write leaves coverage untouched. The
+        // marker lifecycle lives entirely in the lower store; the cache never
+        // caches markers.
         let stamped_at = self.fjall.clock().now_ms();
-        if let Err(error) = self.lower.write_provisional(collection, writes).await {
-            // A partial durable stage may have landed `kind=Index` markers the
-            // warm set now misses; drop the seeded latch so the next sweep
-            // re-seeds from the durable index and restores completeness (the
-            // warm-index invariant), closing the strand hole.
+        if let Err(error) = self
+            .lower
+            .write_provisional(collection, writes, marker)
+            .await
+        {
+            // A partial durable stage may have landed cells the warm set now
+            // misses; drop the seeded latch so the next sweep re-seeds from
+            // the durable event marker and restores completeness (the warm
+            // provisional-coordinate cache's invariant), closing the strand hole.
             degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
             return Err(error);
         }
-        // Record the staged coordinates into the warm index after the durable
-        // ack, as one atomic batch. A warm write failure drops the seeded
-        // latch so the next sweep re-seeds from the durable `kind=Index` —
-        // never leaving the latch true with an unaccounted coordinate.
+        // Record the staged coordinates into the warm provisional-coordinate
+        // cache after the durable ack, as one atomic batch. A warm write
+        // failure drops the seeded latch so the next sweep re-seeds from the
+        // durable event marker — never leaving the latch true with an
+        // unaccounted coordinate.
         if let Err(error) = self
             .fjall
             .index_record_batch(collection.id(), writes.iter().map(|(cell, _)| cell))
@@ -733,11 +834,24 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        // Cov-Clr punch, BEFORE the lower call. This is the marker-free direct
+        // apply (ReadUncommitted finalize / mid-handler checkpoint): a stale
+        // covered pre-clear value here has NO later repair — no marker exists
+        // for read-help to resolve — so punch-first is mandatory. A failed or
+        // cancelled lower write then leaves the sections merely uncovered (a
+        // slow read, never a wrong one); the punch is the one pre-ack coverage
+        // mutation Cov3 allows — nothing is published or covered before the
+        // lower ack.
+        if !clears.is_empty() {
+            self.punch_sections_must_succeed(collection.id(), clears)
+                .await;
+        }
         // Pre-write anchor (Cov1/FLOOR), establish-first (Cov3) — see
         // `write_provisional`.
         let stamped_at = self.fjall.clock().now_ms();
-        self.lower.write_resolved(collection, cells).await?;
+        self.lower.write_resolved(collection, cells, clears).await?;
         // Rollback/committed-write resolved the cells; drop their warm
         // provisional coordinates in one batch (a no-op for a never-staged
         // direct write). A failed clear is a harmless over-report the sweep's
@@ -793,14 +907,33 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // Promote in the lower store (the authoritative settle); see the
-        // module doc's Incomplete trap for why the result below is returned
-        // verbatim.
-        let keys: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
-        let result = self.lower.mark_resolved(collection, &keys).await;
+        // Cov-Clr punch, BEFORE the lower call (mirroring `mark_resolved`'s
+        // punch-first rationale): post-commit apply is best-effort, so
+        // punch-first means a failed or cancelled apply leaves the cleared
+        // sections uncovered — reads fall through and the bottom store's
+        // read-help catches the standing committed marker — while punch-after
+        // would leave gap tombstones landed under still-covered sections with
+        // no repair path. The punch retries inside the cache and never touches
+        // the `result` latch below (the Incomplete trap).
+        if !clears.is_empty() {
+            self.punch_sections_must_succeed(collection.id(), clears)
+                .await;
+        }
+        // Settle in the lower store (the authoritative settle) — the lower store
+        // owns the promote-vs-delete routing (present data promotes, a staged
+        // clear deletes the row, per the row-absence invariant) and the marker
+        // delete. See the module doc's Incomplete trap for why the result below
+        // is returned verbatim.
+        let result = self
+            .lower
+            .commit_provisional(collection, writes, clears)
+            .await;
         if result.is_ok() {
             // The provisional `data` is now the committed value; re-publish it.
+            // Covering a survivor (or an Absent tag) inside a just-punched
+            // cleared section is correct — it re-covers the post-clear truth.
             // `mark_resolved` does NOT re-stamp the durable TTL, so the
             // co-expiry must REUSE the stage-anchored expiry already on the
             // cell's fjall entry (see the module's TTL co-expiry doc). The
@@ -848,10 +981,16 @@ where
             .iter()
             .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
             .collect();
+        // No section punch here — Cov-Clr's second half: an uncommitted clear
+        // never invalidates coverage (the covered pre-clear values are still
+        // the committed truth the rollback restores).
         // Pre-write anchor (Cov1/FLOOR): the rollback re-writes `prev` with a
-        // fresh `USING TTL`, so it co-expires from this instant.
+        // fresh `USING TTL`, so it co-expires from this instant. Forward to the
+        // lower `abort_provisional` (not a bare `write_resolved`) so the lower
+        // store's marker delete runs — the cache owns only the fjall re-publish
+        // of the rolled-back `prev`, layered over the lower settle.
         let stamped_at = self.fjall.clock().now_ms();
-        let result = self.lower.write_resolved(collection, &cells).await;
+        let result = self.lower.abort_provisional(collection, writes).await;
         if result.is_ok() {
             // The rollback resolved the cells; drop their warm provisional
             // coordinates in one batch, then publish the rolled-back `prev`.
@@ -869,6 +1008,15 @@ where
             .await;
         }
         result
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        // The cache never caches markers — the marker lifecycle lives in the
+        // lower store — so forward straight through.
+        self.lower.standing_marker(collection).await
     }
 }
 
@@ -902,6 +1050,33 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
     }
 }
 
+/// Runs a must-succeed coverage `punch` to completion, holding the
+/// correctness-not-a-hint posture shared by
+/// [`Cached::punch_cells_must_succeed`] and
+/// [`Cached::punch_sections_must_succeed`] in one place: retry every transient
+/// failure after [`PUNCH_RETRY_DELAY`], and break on `Ok` or a **Permanent**
+/// error — a corrupt stored bound frame that deterministically degrades every
+/// read of the section anyway, so no stale covered serve is reachable and a
+/// retry could never succeed.
+async fn retry_punch<F, Fut>(mut punch: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), super::fjall::FjallCellCacheError>>,
+{
+    loop {
+        match punch().await {
+            Ok(()) => break,
+            Err(error) => {
+                warn!(error = %error, "committed-value cache punch failed");
+                if error.classify_error() == ErrorCategory::Permanent {
+                    break;
+                }
+                sleep(PUNCH_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
 /// Groups `cells` by section for the grouped coverage mutations
 /// ([`Cached::cover_cells`] / [`Cached::punch_cells_must_succeed`]): one
 /// coverage load + rewrite per touched section instead of per cell.
@@ -923,23 +1098,30 @@ fn group_by_section<'c>(cells: impl Iterator<Item = &'c CellKey>) -> SectionGrou
 /// `low → high`, backward `high → low`. `limit` is an optional per-piece cap
 /// on the covered serve; the stitched scan still applies the merged-output
 /// limit across pieces, and the gap serve must pass `None` (see `serve_gap`).
+///
+/// Returns `None` only when a piece endpoint is unbounded — which cannot
+/// happen here: `scan_cells` clamps every emitted piece to the bounded request
+/// (`query` intersects each interval with the concrete request bounds), so a
+/// bounded request yields only bounded pieces. The `Option` keeps that
+/// unreachability total (no `unwrap`/`panic`); callers short-circuit a `None`
+/// piece to an empty sub-stream.
 fn scan_for_piece(
     section: Section,
     piece: &Interval,
     dir: Direction,
     limit: Option<usize>,
-) -> Scan<'_> {
+) -> Option<Scan<'_>> {
     let (start, end) = match dir {
         Direction::Forward => (piece.low(), piece.high()),
         Direction::Backward => (piece.high(), piece.low()),
     };
-    Scan {
+    Some(Scan {
         section,
-        start,
+        start: ScanEdge::from_bound(start)?,
         dir,
-        end,
+        end: ScanEdge::from_bound(end)?,
         limit,
-    }
+    })
 }
 
 /// The covered piece's sub-range still unserved after a fjall error/expiry at
