@@ -700,13 +700,25 @@ impl<S: CellSession> CellScope<S> {
         self.session.clear(self.state_type, &self.name, cell).await
     }
 
-    /// Drains this collection's buffered ops straight through to committed
-    /// state. At-least-once; see [`CellSession::flush`] for the contract.
-    pub(in crate::state::descriptor) async fn raw_flush(
+    /// Buffers a dirty clear marker over one section; see
+    /// [`CellSession::clear_section`].
+    pub(in crate::state::descriptor) async fn clear_section(
+        &self,
+        section: Section,
+    ) -> Result<(), StateAccessError> {
+        ensure_live(&self.session)?;
+        self.session
+            .clear_section(self.state_type, &self.name, section)
+            .await
+    }
+
+    /// Durably commits this collection's buffered ops mid-handler.
+    /// At-least-once; see [`CellSession::checkpoint`] for the contract.
+    pub(in crate::state::descriptor) async fn raw_checkpoint(
         &self,
     ) -> Result<StoreOutcome, StateAccessError> {
         ensure_live(&self.session)?;
-        self.session.flush(self.state_type, &self.name).await
+        self.session.checkpoint(self.state_type, &self.name).await
     }
 }
 
@@ -751,6 +763,68 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// [`CellScope::has_ttl`]).
     pub(crate) fn has_ttl(&self) -> bool {
         self.scope.has_ttl()
+    }
+
+    /// Buffers a dirty clear marker over this view's whole section: every
+    /// cell reads as deleted from this program point, and later `set`s
+    /// repopulate. See [`CellSession::clear_section`] for the transactional
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(crate) async fn clear_all(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.clear_section(self.section).await?)
+    }
+
+    /// Interim lowering, deleted by the durable clear fast path: the erase is
+    /// expanded to per-cell clears over the collection's known-live extent.
+    /// Collects the section's live cell keys over the typed range
+    /// `[low, high]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(crate) async fn collect_live_keys(
+        &self,
+        low: &KeyOf<T>,
+        high: &KeyOf<T>,
+    ) -> Result<Vec<CellKey>, CellStateError<CellCodecError<T>>> {
+        let low = <T::Key as OrderedKeyCodec>::encode(low);
+        let high = <T::Key as OrderedKeyCodec>::encode(high);
+        let scan = Scan {
+            section: self.section,
+            start: ScanEdge::Included(&low),
+            dir: Direction::Forward,
+            end: ScanEdge::Included(&high),
+            limit: None,
+        };
+        let stream = self.scope.raw_scan(scan);
+        futures::pin_mut!(stream);
+        // Sized by the section's live cells — the interim expansion's one
+        // runtime-sized allocation, O(live cells), gone with the helper.
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (cell, _) = item?;
+            keys.push(cell);
+        }
+        Ok(keys)
+    }
+
+    /// Interim lowering, deleted by the durable clear fast path: buffers a
+    /// per-cell clear for each collected live key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(crate) async fn buffer_clears(
+        &self,
+        keys: &[CellKey],
+    ) -> Result<(), CellStateError<CellCodecError<T>>> {
+        for cell in keys {
+            self.scope.raw_clear(cell).await?;
+        }
+        Ok(())
     }
 }
 
@@ -831,16 +905,18 @@ where
         async move { Ok(self.scope.raw_clear(&cell).await?) }
     }
 
-    /// Drains this collection's buffered ops straight to committed state — the
-    /// single public flush home, draining the whole collection's buffered ops
+    /// Durably commits this collection's buffered ops mid-handler — the
+    /// single checkpoint home, draining the whole collection's buffered ops
     /// (every typed view over the scope), not just this view's cells.
-    /// At-least-once; see [`CellSession::flush`] for the contract.
+    /// At-least-once; see [`CellSession::checkpoint`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub(crate) async fn flush(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        Ok(self.scope.raw_flush().await?)
+    pub(crate) async fn checkpoint(
+        &self,
+    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.raw_checkpoint().await?)
     }
 
     /// Scans this section's cells in key order over the typed range
@@ -968,15 +1044,15 @@ where
         self.view.clear(&()).await
     }
 
-    /// Drains the buffered op directly to authoritative state — a mid-handler
-    /// write-through. At-least-once; see [`CellSession::flush`] for the
+    /// Durably commits the buffered op mid-handler, so it survives a restart
+    /// after failure. At-least-once; see [`CellSession::checkpoint`] for the
     /// contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub async fn flush(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        self.view.flush().await
+    pub async fn checkpoint(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        self.view.checkpoint().await
     }
 }
 

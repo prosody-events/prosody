@@ -1,7 +1,7 @@
 //! Session lifecycle property + the marker-ordering pin.
 //!
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of events —
-//! each a short op list (set/clear/mid-handler flush) plus a
+//! each a short op list (set/clear/mid-handler checkpoint) plus a
 //! commit/abort/reset/fail outcome — through the **real** production session
 //! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`) over **one
 //! partition-shared [`DirtyStore`]**, minting each event's session as an
@@ -10,18 +10,20 @@
 //! the committed projection and a fresh **overlay read** (the dirty
 //! short-circuit a `committed_value` probe bypasses), and that the shared
 //! dirty buffer is empty for the key — so a failed event's buffered write can
-//! neither linger nor be read as uncommitted. A flush advances the model's
-//! durable snapshot immediately, so the property also proves the at-least-once
-//! flush contract: flushed writes survive abort/reset/failure while post-flush
-//! ops still roll back. One focused example pins the ordering a trace cannot
-//! observe: the single marker flushes **exactly once, strictly after the
-//! stage** (the [`ScriptedOracle`] `record_message` counter); another pins the
-//! flush drain to its own collection.
+//! neither linger nor be read as uncommitted. A checkpoint advances the
+//! model's durable snapshot immediately, so the property also proves the
+//! at-least-once checkpoint contract: checkpointed writes survive
+//! abort/reset/failure while post-checkpoint ops still roll back. One focused
+//! example pins the ordering a trace cannot observe: the single marker
+//! flushes **exactly once, strictly after the stage** (the [`ScriptedOracle`]
+//! `record_message` counter); another pins the checkpoint drain to its own
+//! collection.
 
-use super::sealed::{FinalizeOutcome, StateLifecycle};
+use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
+use crate::state::cell_key::Section;
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
@@ -29,14 +31,14 @@ use crate::state::manager::EventStateScope;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
-use crate::state::tests::cell_suite::{ScriptedOracle, value_cell};
+use crate::state::tests::cell_suite::{ScriptedOracle, cell_at, value_cell};
 use crate::state::tests::support::probe;
 use crate::state::{
     CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::sync::Arc;
@@ -278,11 +280,11 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
     Ok(())
 }
 
-/// A mid-handler flush drains only its own collection: the flushed
+/// A mid-handler checkpoint drains only its own collection: the checkpointed
 /// collection's write is committed durably while the sibling's stays buffered
 /// and unwritten — the drain is collection-scoped, never key-scoped.
 #[tokio::test]
-async fn flush_drains_only_its_collection() -> Result<()> {
+async fn checkpoint_drains_only_its_collection() -> Result<()> {
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
     registry.register(
@@ -320,7 +322,7 @@ async fn flush_drains_only_its_collection() -> Result<()> {
         .await?;
 
     assert_eq!(
-        session.flush(StateType::Application, &cart).await?,
+        session.checkpoint(StateType::Application, &cart).await?,
         StoreOutcome::Applied,
     );
 
@@ -343,13 +345,17 @@ async fn flush_drains_only_its_collection() -> Result<()> {
         "the sibling collection's buffered op must not be written through",
     );
     let touched = dirty.touched(&state_key.key);
-    assert_eq!(touched.len(), 1, "only the un-flushed sibling stays dirty");
+    assert_eq!(
+        touched.len(),
+        1,
+        "only the un-checkpointed sibling stays dirty"
+    );
     assert_eq!(touched[0].0.1, wishlist);
     Ok(())
 }
 
-/// Cap on ops per event: enough for flush/mutate interleavings, small enough
-/// that a failing trace stays readable.
+/// Cap on ops per event: enough for checkpoint/mutate interleavings, small
+/// enough that a failing trace stays readable.
 const MAX_EVENT_OPS: usize = 4;
 
 /// One event in the Value lifecycle trace: a short op list and a terminal
@@ -366,7 +372,7 @@ enum ValueOp {
     Clear,
     /// The mid-handler write-through: everything buffered so far becomes
     /// durable immediately and survives every non-commit outcome.
-    Flush,
+    Checkpoint,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -382,11 +388,11 @@ enum Outcome {
 
 impl Arbitrary for ValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Sets weighted up so state actually accumulates between flushes.
+        // Sets weighted up so state actually accumulates between checkpoints.
         match u8::arbitrary(g) % 4 {
             0 | 1 => Self::Set(u8::arbitrary(g)),
             2 => Self::Clear,
-            _ => Self::Flush,
+            _ => Self::Checkpoint,
         }
     }
 }
@@ -436,10 +442,10 @@ impl Arbitrary for Trace {
 /// Drives the trace through the real session lifecycle, asserting the committed
 /// projection equals a plain `Option<Bytes>` model after every event.
 ///
-/// A mid-event flush snapshots the scratch model as immediately durable: on a
-/// commit the full scratch wins, on every other outcome the durable state must
-/// equal the last flushed snapshot (post-flush ops roll back; pre-flush ops
-/// survive) — the at-least-once flush contract.
+/// A mid-event checkpoint snapshots the scratch model as immediately durable:
+/// on a commit the full scratch wins, on every other outcome the durable state
+/// must equal the last checkpointed snapshot (post-checkpoint ops roll back;
+/// pre-checkpoint ops survive) — the at-least-once checkpoint contract.
 async fn run(trace: Trace) -> Result<bool> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
@@ -449,9 +455,11 @@ async fn run(trace: Trace) -> Result<bool> {
         let (event, dedup_id) = message(index as u128 + 1);
         // Committed + buffered projection as the ops run.
         let mut scratch = model.clone();
-        // The scratch as of the last flush — durable regardless of outcome.
-        let mut flushed: Option<Option<Bytes>> = None;
-        // Whether anything is buffered since event start / the last flush.
+        // The scratch as of the last checkpoint — durable regardless of
+        // outcome.
+        let mut checkpointed: Option<Option<Bytes>> = None;
+        // Whether anything is buffered since event start / the last
+        // checkpoint.
         let mut buffered = false;
         // The scope drops at the end of this block — the production per-event
         // lifetime that clears the shared dirty buffer.
@@ -480,9 +488,9 @@ async fn run(trace: Trace) -> Result<bool> {
                         scratch = None;
                         buffered = true;
                     }
-                    ValueOp::Flush => {
+                    ValueOp::Checkpoint => {
                         let outcome = session
-                            .flush(StateType::Application, &fx.value_name)
+                            .checkpoint(StateType::Application, &fx.value_name)
                             .await?;
                         // The outcome contract: `Applied` iff the drain found
                         // buffered ops.
@@ -494,7 +502,7 @@ async fn run(trace: Trace) -> Result<bool> {
                         if outcome != expected {
                             return Ok(false);
                         }
-                        flushed = Some(scratch.clone());
+                        checkpointed = Some(scratch.clone());
                         buffered = false;
                     }
                 }
@@ -512,23 +520,24 @@ async fn run(trace: Trace) -> Result<bool> {
                 Outcome::Abort => {
                     session.finalize().await?;
                     session.rollback_aborted().await;
-                    // Post-flush ops roll back to their `prev`, which finalize
-                    // captured *after* the flush landed — the flushed snapshot.
-                    model = flushed.unwrap_or(model);
+                    // Post-checkpoint ops roll back to their `prev`, which
+                    // finalize captured *after* the checkpoint landed — the
+                    // checkpointed snapshot.
+                    model = checkpointed.unwrap_or(model);
                 }
                 Outcome::Reset => {
                     session.finalize().await?;
                     // Discards dirty + staged; any provisional written by
-                    // `finalize` lingers but projects its `prev` (the flushed
-                    // snapshot, or the unchanged committed base).
+                    // `finalize` lingers but projects its `prev` (the
+                    // checkpointed snapshot, or the unchanged committed base).
                     session.reset();
-                    model = flushed.unwrap_or(model);
+                    model = checkpointed.unwrap_or(model);
                 }
-                // Final-error path: no `finalize`, no `reset`. Only the scope's
-                // `Drop` clears the buffered write — but a flush already wrote
-                // its snapshot through, and it must survive.
+                // Final-error path: no `finalize`, no `reset`. Only the
+                // scope's `Drop` clears the buffered write — but a checkpoint
+                // already wrote its snapshot through, and it must survive.
                 Outcome::Failed => {
-                    model = flushed.unwrap_or(model);
+                    model = checkpointed.unwrap_or(model);
                 }
             }
         }
@@ -564,49 +573,102 @@ fn prop_value_lifecycle_equivalence() {
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
 
-/// [`StagedRecord::append`] merges a re-staged cell to a single entry with the
-/// last write's data (the own-event-base-is-prev invariant lets the `prev`
-/// stay), while never dropping a disjoint cell — the append-only staged-record
-/// invariant the mid-handler flush seam relies on.
-#[test]
-fn staged_record_append_merges_last_write_and_keeps_disjoint() -> Result<()> {
-    use super::StagedRecord;
-    use crate::state::CollectionRef;
-    use crate::state::cell::{Committed, ProvisionalWrite};
-    use crate::state::tests::cell_suite::{bytes, cell_at};
-    use crate::state::tests::support::fresh_collection;
+/// A clears-only event still stages: `clear_section` with no cell writes
+/// records an (empty) staged-set entry, so `finalize` reports
+/// [`FinalizeOutcome::Staged`] — the backstop-arming rule — and `commit_apply`
+/// resolves that entry (never [`ApplyOutcome::NothingStaged`]).
+#[tokio::test]
+async fn clears_only_event_finalizes_staged() -> Result<()> {
+    let fx = Fixture::new()?;
+    let (event, _dedup_id) = message(1);
+    let session = fx.session(event).handle();
 
-    let cref = CollectionRef::new(fresh_collection("staged")?, None);
-    let event = probe(1);
-    let write = |value: u8| ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), event);
-
-    let mut record = StagedRecord::default();
-    record.append(
-        cref.clone(),
-        vec![(cell_at(0), write(10)), (cell_at(1), write(11))],
-    );
-    // Second stage of the same collection: re-stage cell 1 (new data), add cell 2.
-    record.append(cref, vec![(cell_at(1), write(99)), (cell_at(2), write(12))]);
-
-    let set = record.into_staged_set();
-    assert_eq!(set.len(), 1, "one collection");
-    let (_, cells) = &set[0];
-    assert_eq!(cells.len(), 3, "cell 1 merged to one entry, not duplicated");
+    session
+        .clear_section(StateType::Application, &fx.value_name, Section::new(0))
+        .await?;
     assert_eq!(
-        cells
-            .iter()
-            .find(|(cell, _)| *cell == cell_at(1))
-            .map(|(_, w)| w.data().cloned()),
-        Some(Some(bytes(99))),
-        "re-stage overwrites data (last write wins)"
+        session.finalize().await?,
+        FinalizeOutcome::Staged,
+        "a clears-only collection must stage so the backstop is armed"
+    );
+    assert_eq!(
+        session.commit_apply().await,
+        ApplyOutcome::Resolved,
+        "the staged entry exists to resolve — never NothingStaged"
+    );
+    Ok(())
+}
+
+/// A retry attempt re-runs `finalize`: the second stage **rebuilds** the same
+/// event's durable marker from its own staged set — never keeps the first
+/// attempt's frozen payload, never resolves it as foreign — the settle
+/// converges to the retried values, and no event marker stands afterwards.
+/// The two attempts stage *different* cell sets so a kept (stale) marker is
+/// observable: recovery resolves exactly the coordinates the marker lists, so
+/// a stale list would strand the retry's extra cell.
+#[tokio::test]
+async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
+    let fx = Fixture::new()?;
+    let (event, dedup_id) = message(1);
+    let session = fx.session(event).handle();
+    let extra = cell_at(7);
+
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
+        .await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+
+    // The retry boundary: discard dirty + staged + marker, then re-dispatch
+    // the same event.
+    session.reset();
+
+    // The retry stages a superset — the Value cell again plus one more cell —
+    // so the rebuilt marker's coordinate list differs from attempt one's.
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"v2")
+        .await?;
+    session
+        .set(StateType::Application, &fx.value_name, &extra, b"w")
+        .await?;
+    session.register_marker(dedup_id);
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+
+    // The standing durable marker is the retry's, rebuilt whole: same event,
+    // and its frozen coordinate list is attempt two's staged set — not
+    // attempt one's single cell.
+    let marker = fx
+        .cells
+        .standing_marker_of(&fx.value_id())
+        .ok_or_else(|| eyre!("no standing marker after the re-stage"))?;
+    assert_eq!(marker.event(), event, "the marker stays the same event's");
+    assert_eq!(
+        marker.staged(),
+        [value_cell(), extra.clone()],
+        "the re-run rebuilds the marker from its own staged set"
+    );
+
+    session.flush_marker().await?;
+    assert_eq!(session.commit_apply().await, ApplyOutcome::Resolved);
+
+    assert_eq!(
+        fx.committed_value().await?,
+        Some(Bytes::from_static(b"v2")),
+        "the retried attempt's value wins"
+    );
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    assert_eq!(
+        fx.cell_store()
+            .get(&fx.value_id(), &extra, probe)
+            .await?
+            .into_inner(),
+        Some(Bytes::from_static(b"w")),
+        "the retry's extra cell commits with the rest of its stage"
     );
     assert!(
-        cells.iter().any(|(cell, _)| *cell == cell_at(0)),
-        "disjoint cell 0 kept"
-    );
-    assert!(
-        cells.iter().any(|(cell, _)| *cell == cell_at(2)),
-        "new cell 2 added"
+        fx.cells.standing_marker_of(&fx.value_id()).is_none(),
+        "the settle deleted the single (overwritten) event marker"
     );
     Ok(())
 }

@@ -19,18 +19,24 @@
 //!   big-endian index ([`I64KeyCodec`]) so the clustering byte order is the
 //!   signed index order, and typed by the element cell type `T`.
 //!
-//! # Invariant: monotonic window; dense without a TTL
+//! # Invariant: monotonic window within its lifetime; dense without a TTL
 //!
 //! `[head, tail)` is a contiguous window with `head ≤ tail`, and indices are
-//! monotonic and never reused — a pop advances `head`/`tail` past the freed
-//! index, never back into it. So `len` is `tail − head` (O(1) from the meta),
-//! `get(i)` reads the single cell at `head + i`, and a scan anchored at `head`
-//! with `limit = tail − head` visits the window, never a popped tombstone
-//! (which sits below `head` or at/above `tail`). Co-stamping makes the window
-//! move heal as a unit: a handler's entry mutation and the bounds move it
-//! buffers in one op stage in one batch with one write TS/TTL (see
-//! [`KeyedStateSession::finalize`](crate::state::session)) — and a mid-handler
-//! [`DequeHandle::flush`] drains them in one batch the same way.
+//! monotonic and never reused **within a window's lifetime** — a pop advances
+//! `head`/`tail` past the freed index, never back into it. So `len` is
+//! `tail − head` (O(1) from the meta), `get(i)` reads the single cell at
+//! `head + i`, and a scan anchored at `head` with `limit = tail − head`
+//! visits the window, never a popped tombstone (which sits below `head` or
+//! at/above `tail`). [`DequeHandle::clear`] ends the window's lifetime and
+//! **resets the index space**: the erased bounds cell reads `[0, 0)`, so the
+//! next push writes index 0. Reuse is safe — every pre-clear row is erased by
+//! the clear, and a later write to a reused coordinate out-stamps any earlier
+//! tombstone (single writer, monotonic timestamps). Co-stamping makes the
+//! window move heal as a unit: a handler's entry mutation and the bounds move
+//! it buffers in one op stage in one batch with one write TS/TTL (see
+//! [`KeyedStateSession::finalize`](crate::state::session)) — and a
+//! mid-handler [`DequeHandle::checkpoint`] drains them in one batch the same
+//! way.
 //!
 //! **Without a TTL the window is also dense**: every index in `[head, tail)`
 //! maps to a present entry cell, so `len` is exact and a scan yields exactly
@@ -338,15 +344,46 @@ where
         Ok(value)
     }
 
-    /// Drains this deque's buffered ops — entries and the window bounds
-    /// together, in one batch — straight to committed state. At-least-once;
-    /// see [`CellSession::flush`] for the contract.
+    /// Removes every element and the window bounds, **resetting the index
+    /// space** (see the module's window invariant): within the event the
+    /// deque reads empty from this program point, and the next push writes
+    /// index 0. Committed, exactly the repopulated elements survive; aborted,
+    /// the deque is untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Permanent` meta error when the bounds cell is corrupt, or
+    /// an access error from the session.
+    pub async fn clear(&self) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        // Ordering is load-bearing — see `MapHandle::clear`: collect before
+        // the marker, which hides the lower scan leg. The live extent comes
+        // from a scan, not index iteration, so TTL holes are skipped and the
+        // cost stays O(live).
+        let window = self.bounds().await?;
+        let live = if window.head < window.tail {
+            let last = window
+                .tail
+                .checked_sub(1)
+                .ok_or(MetaDecodeError::IndexOverflow)?;
+            self.entries.collect_live_keys(&window.head, &last).await?
+        } else {
+            Vec::new()
+        };
+        self.entries.clear_all().await?;
+        self.entries.buffer_clears(&live).await?;
+        self.meta.clear(&()).await.map_err(meta_err)?;
+        Ok(())
+    }
+
+    /// Durably commits this deque's buffered ops mid-handler — entries and
+    /// the window bounds together, in one batch. At-least-once; see
+    /// [`CellSession::checkpoint`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub async fn flush(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
-        Ok(self.entries.flush().await?)
+    pub async fn checkpoint(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
+        Ok(self.entries.checkpoint().await?)
     }
 
     /// Buffers the bounds cell. Co-stamped with the entry mutation a single op

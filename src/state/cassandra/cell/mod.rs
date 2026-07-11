@@ -44,8 +44,8 @@
 //!   still needs an encoding).
 //! * [`write_resolved`](CellStore::write_resolved) — writes a committed value
 //!   with `prev_data`/`event` nulled, **or deletes the row** when the value is
-//!   absent (the `ReadUncommitted` direct write/clear, the mid-handler flush,
-//!   and rollback resolution).
+//!   absent (the `ReadUncommitted` direct write/clear, the mid-handler
+//!   checkpoint, and rollback resolution).
 //! * [`mark_resolved`](CellStore::mark_resolved) — *promote*: nulls `prev_data`
 //!   and `event` only, keeping `data` and its TTL. O(1) bytes; reserved for
 //!   present data.
@@ -674,9 +674,10 @@ where
                 let event = first.event();
                 // Stage boundary: resolve any standing FOREIGN marker (a
                 // different event) before overwriting it, establishing marker
-                // uniqueness per collection. A same-event marker (mid-handler
-                // flush / retry attempt) is overwritten, never resolved. A
-                // resolution failure fails the stage (retry middleware).
+                // uniqueness per collection. A same-event marker (a retry
+                // attempt re-running finalize) is overwritten, never
+                // resolved. A resolution failure fails the stage (retry
+                // middleware).
                 if let Some(marker) = self.standing_marker(collection.id()).await?
                     && marker.event() != event
                 {

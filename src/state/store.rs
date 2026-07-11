@@ -68,7 +68,7 @@ use std::future::Future;
 /// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
 ///   each cell (the `ReadCommitted` outcome path).
 /// * [`Self::write_resolved`] — writes committed values with `event` and `prev`
-///   null (the `ReadUncommitted` direct write, the mid-handler flush, and
+///   null (the `ReadUncommitted` direct write, the mid-handler checkpoint, and
 ///   rollback resolution, where the committed value is the staged `prev`).
 /// * [`Self::mark_resolved`] — *promote*: nulls `event` and `prev`, keeping
 ///   `data`. O(1) regardless of value size; the commit arm of resolution.
@@ -195,15 +195,16 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// provisional to recover — so a fresh-commit no-op marker write is
     /// unrepresentable.
     ///
-    /// `staged` is the session's **whole** per-collection staged record
+    /// `staged` is the event's **whole** per-collection staged set
     /// (`writes ⊆ staged`); the marker lists it, so a stage that splits over
-    /// the byte budget overwrites the marker with the running union rather than
-    /// dropping a previously staged coordinate (which would strand its durable
-    /// row from recovery). The staged record is append-only and owned by the
-    /// session for exactly this reason. An attempt N+1 stage replaces attempt
-    /// N's marker with N+1's record — handlers are assumed deterministic across
-    /// retries. An **empty** `staged` writes no marker and skips the boundary
-    /// check below (nothing staged ⇒ nothing to strand).
+    /// the byte budget overwrites the marker with the full set rather than
+    /// stranding a coordinate (an unlisted durable row is invisible to the
+    /// recovery sweep). The session builds it once per collection at
+    /// `finalize`; only a retry attempt re-running `finalize` re-stages,
+    /// replacing the same-event marker idempotently — handlers are assumed
+    /// deterministic across retries. An **empty** `staged` writes no marker
+    /// and skips the boundary check below (nothing staged ⇒ nothing to
+    /// strand).
     ///
     /// Before staging, the backend resolves any **foreign** standing marker (a
     /// different event) — the stage-boundary rule that keeps marker uniqueness
@@ -231,8 +232,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// batch, binding `collection`'s TTL, partitioning internally on data
     /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
     /// `None` **deletes the row** (the row-absence invariant). Covers the
-    /// `ReadUncommitted` direct clear, the mid-handler flush of a clear, and
-    /// rollback-to-absent. Never touches the event marker (see
+    /// `ReadUncommitted` direct clear, the mid-handler checkpoint of a clear,
+    /// and rollback-to-absent. Never touches the event marker (see
     /// [`write_provisional`](Self::write_provisional)).
     ///
     /// `clears` names sections to erase before applying `cells` — the

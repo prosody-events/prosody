@@ -1074,9 +1074,10 @@ where
 // ──────────────────────────────
 
 /// One op on a multi-cell collection view, intermixing point reads, range
-/// scans, dirty buffering, and committed writes so the property exercises their
-/// interaction — a `scan` between a `buffer_set` and a `clear`, a `get` after a
-/// dropped scan, and so on (TESTING.md "interleaved operations").
+/// scans, dirty buffering, section clears, and committed writes so the
+/// property exercises their interaction — a `scan` between a `buffer_set` and
+/// a `clear`, a `get` after a dropped scan, a `clear_section` between commits
+/// and buffers, and so on (TESTING.md "interleaved operations").
 #[derive(Clone, Copy, Debug)]
 enum OverlayOp {
     /// Buffer a set into the dirty leg.
@@ -1087,6 +1088,10 @@ enum OverlayOp {
     CommitSet(u8, u8),
     /// Commit a known-absent value to the lower store (resolved).
     CommitClear(u8),
+    /// Buffer a dirty clear marker over the whole test section: committed
+    /// cells vanish behind it (even ones committed later), post-clear
+    /// `BufferSet`s are survivors.
+    ClearSection,
     /// Run a range scan and assert it against the oracle (the range leg,
     /// intermixed with the point reads asserted after every op).
     Scan(ScanReq),
@@ -1095,11 +1100,12 @@ enum OverlayOp {
 impl Arbitrary for OverlayOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let c = u8::arbitrary(g) % CELLS;
-        match u8::arbitrary(g) % 5 {
+        match u8::arbitrary(g) % 6 {
             0 => Self::BufferSet(c, u8::arbitrary(g)),
             1 => Self::BufferClear(c),
             2 => Self::CommitSet(c, u8::arbitrary(g)),
             3 => Self::CommitClear(c),
+            4 => Self::ClearSection,
             _ => Self::Scan(ScanReq::arbitrary(g)),
         }
     }
@@ -1123,12 +1129,16 @@ impl Arbitrary for OverlayTrace {
     }
 }
 
-/// The visible-value model: dirty wins (`Set`→present, `Cleared`→absent), else
-/// the committed value (present or absent).
+/// The visible-value model: dirty wins (`Set`→present, `Cleared`→absent), a
+/// standing dirty clear marker hides the committed leg, else the committed
+/// value (present or absent).
 #[derive(Default)]
 struct CellModel {
     committed: BTreeMap<u8, Option<Bytes>>,
     dirty: BTreeMap<u8, Option<Bytes>>,
+    /// Whether a dirty clear marker stands over the (single) test section —
+    /// the committed leg is hidden while it does.
+    cleared: bool,
 }
 
 impl CellModel {
@@ -1136,6 +1146,7 @@ impl CellModel {
     fn visible(&self, c: u8) -> Option<Bytes> {
         match self.dirty.get(&c) {
             Some(value) => value.clone(),
+            None if self.cleared => None,
             None => self.committed.get(&c).cloned().flatten(),
         }
     }
@@ -1158,13 +1169,15 @@ impl CellModel {
 }
 
 /// Drives random ops over an [`Overlay`] of a multi-cell collection — dirty
-/// buffering, committed writes, and range scans **intermixed** — asserting both
-/// the range leg (each `Scan` op vs the sorted-map oracle, incl. early-stop)
-/// and the point leg (`get` per cell vs the dirty-over-committed oracle, after
-/// **every** op). This is the unified view property: point reads, range reads,
-/// and writes interleave so their interaction is exercised, not just each in
-/// isolation (dirty-wins, clear-hides, bounds, direction, limit —
-/// unified-view soundness and oracle-correctness properties).
+/// buffering, section clears, committed writes, and range scans
+/// **intermixed** — asserting both the range leg (each `Scan` op vs the
+/// sorted-map oracle, incl. early-stop) and the point leg (`get` per cell vs
+/// the dirty-over-committed oracle, after **every** op). This is the unified
+/// view property: point reads, range reads, and writes interleave so their
+/// interaction is exercised, not just each in isolation (dirty-wins,
+/// clear-hides, the dirty clear marker hiding the lower leg, bounds,
+/// direction, limit — unified-view soundness and oracle-correctness
+/// properties).
 pub(crate) async fn run_overlay_trace<S>(lower: S, trace: OverlayTrace) -> Result<bool>
 where
     S: CellStore,
@@ -1207,6 +1220,15 @@ where
                     .write_resolved(&collection_ref, &[(cell_at(c), None)], &[])
                     .await?;
                 model.committed.insert(c, None);
+            }
+            OverlayOp::ClearSection => {
+                overlay.dirty().clear_section(&id, SECTION);
+                // The marker wipes the section's buffered `Set`s and hides
+                // the committed leg (retained `Cleared` cells read the same
+                // as the marker: absent); later `BufferSet`s repopulate as
+                // survivors.
+                model.dirty.clear();
+                model.cleared = true;
             }
             OverlayOp::Scan(req) => {
                 let expected = scan_oracle(&model, req);

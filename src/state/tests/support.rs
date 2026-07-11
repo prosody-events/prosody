@@ -5,7 +5,7 @@
 
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Scan};
+use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::oracle::CommitOracle;
 use crate::state::session::CellSession;
@@ -164,7 +164,16 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn flush(
+    async fn clear_section(
+        &self,
+        _state_type: StateType,
+        _name: &StateName,
+        _section: Section,
+    ) -> Result<(), StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn checkpoint(
         &self,
         _state_type: StateType,
         _name: &StateName,

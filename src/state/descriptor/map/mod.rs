@@ -37,7 +37,9 @@
 //! bound is absent the map holds no live entries (see the TTL-refresh
 //! invariant), so no scan is issued at all. The bounds are therefore
 //! self-healing — never an exact count, by design (a count would force a
-//! read-before-write on every mutation).
+//! read-before-write on every mutation). [`MapHandle::clear`] removes the
+//! bounds with the entries, so the absent-bounds ⇔ empty-map reading survives
+//! a cleared map.
 //!
 //! # Invariant: on a TTL'd map the bounds outlive every entry
 //!
@@ -305,15 +307,49 @@ where
         Ok(self.entries.clear(key).await?)
     }
 
-    /// Drains this map's buffered ops — entries and bound ratchets together,
-    /// in one batch — straight to committed state. At-least-once; see
-    /// [`CellSession::flush`] for the contract.
+    /// Removes every entry and both bounds: within the event the map reads
+    /// empty from this program point (later `set`s repopulate it); committed,
+    /// exactly the repopulated entries survive; aborted, the map is
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session, or a `Permanent` key error
+    /// when a stored bound no longer decodes.
+    pub async fn clear(&self) -> Result<(), MapStateError<CellCodecError<V>>> {
+        // Ordering is load-bearing: collect the live extent BEFORE the dirty
+        // clear marker lands — the marker hides the lower scan leg, so a
+        // post-marker collect would see nothing. The expansion's per-cell
+        // clears follow `clear_all`, whose marker also wipes the section's
+        // buffered `Set`s.
+        let (min, max) = tokio::try_join!(
+            self.read_bound(MapBound::Min),
+            self.read_bound(MapBound::Max)
+        )?;
+        let live = match (min, max) {
+            (Some(min), Some(max)) => self.entries.collect_live_keys(&min, &max).await?,
+            // Absent bounds ⇔ no live entries (the TTL-refresh invariant):
+            // no scan is issued.
+            _ => Vec::new(),
+        };
+        self.entries.clear_all().await?;
+        self.entries.buffer_clears(&live).await?;
+        // The fixed-cardinality bookkeeping cells ride the per-cell path; the
+        // section-clear machinery is reserved for the unbounded entry set.
+        self.meta.clear(&MapBound::Min).await.map_err(meta_err)?;
+        self.meta.clear(&MapBound::Max).await.map_err(meta_err)?;
+        Ok(())
+    }
+
+    /// Durably commits this map's buffered ops mid-handler — entries and
+    /// bound ratchets together, in one batch. At-least-once; see
+    /// [`CellSession::checkpoint`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub async fn flush(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
-        Ok(self.entries.flush().await?)
+    pub async fn checkpoint(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
+        Ok(self.entries.checkpoint().await?)
     }
 
     /// Ratchets the min/max bounds outward to `key`. Reads both bound cells

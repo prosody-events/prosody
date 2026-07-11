@@ -9,14 +9,21 @@
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
 //! caught. This single property covers dense-window / loose-bounds invariants,
-//! key/positional ordering, containment, and the bounds-and-entries-promote-
-//! together crash atomicity.
+//! key/positional ordering, containment, whole-collection `Clear` (in-event
+//! emptiness, survivor repopulation, abort exactness), and the
+//! bounds-and-entries-promote-together crash atomicity. The lifecycle
+//! properties run in **both** commit modes: `ReadCommitted` settles along the
+//! outcome, `ReadUncommitted` commits everything at `finalize` regardless of
+//! the outcome.
 //!
-//! Both op alphabets include the mid-handler `Flush`: the runner snapshots the
-//! scratch model at each flush, and on a non-committing outcome the committed
-//! read-back must equal the last flushed snapshot — flushed ops (entries *and*
-//! bookkeeping cells, as one batch) survive abort and crash-rollback while
-//! post-flush ops still roll back, the at-least-once flush contract.
+//! Both op alphabets include the mid-handler `Checkpoint`: the runner
+//! snapshots the scratch model at each checkpoint, and on a non-committing
+//! outcome the committed read-back must equal the last checkpointed snapshot —
+//! checkpointed ops (entries *and* bookkeeping cells, as one batch) survive
+//! abort and crash-rollback while post-checkpoint ops still roll back, the
+//! at-least-once checkpoint contract. A checkpoint-then-clear-then-abort
+//! trace therefore pins that abort restores the *checkpointed* state, never
+//! the pre-event state.
 //!
 //! Memory-backed only: the `cell_suite` runners already prove memory ↔
 //! Cassandra parity for the underlying store, and the collection logic lives
@@ -41,8 +48,8 @@ use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
-    CollectionId, CollectionRef, Direction, EventRef, PartitionBackend, StateKey, StateName,
-    StateType,
+    CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
+    StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, bail, eyre};
@@ -111,12 +118,12 @@ impl Arbitrary for Outcome {
     }
 }
 
-/// What one applied op observed: keep going, a mid-event flush happened (the
-/// runner snapshots the scratch model as immediately durable), or a return
-/// value diverged from the model (property failure).
+/// What one applied op observed: keep going, a mid-event checkpoint happened
+/// (the runner snapshots the scratch model as immediately durable), or a
+/// return value diverged from the model (property failure).
 enum OpOutcome {
     Continue,
-    Flushed,
+    Checkpointed,
     Mismatch,
 }
 
@@ -127,39 +134,43 @@ pub(crate) enum DequeOp {
     PushFront(u8),
     PopBack,
     PopFront,
-    Flush,
+    Clear,
+    Checkpoint,
 }
 
 impl Arbitrary for DequeOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 5 {
+        match u8::arbitrary(g) % 6 {
             0 => Self::PushBack(u8::arbitrary(g)),
             1 => Self::PushFront(u8::arbitrary(g)),
             2 => Self::PopBack,
             3 => Self::PopFront,
-            _ => Self::Flush,
+            4 => Self::Clear,
+            _ => Self::Checkpoint,
         }
     }
 }
 
-/// One map mutation, mid-trace read, or mid-handler flush over the bounded
-/// key pool.
+/// One map mutation, mid-trace read, whole-map clear, or mid-handler
+/// checkpoint over the bounded key pool.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MapOp {
     Set(i64, u8),
     Remove(i64),
     Get(i64),
-    Flush,
+    Clear,
+    Checkpoint,
 }
 
 impl Arbitrary for MapOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let key = g.choose(&KEY_POOL).copied().unwrap_or(0);
-        match u8::arbitrary(g) % 5 {
+        match u8::arbitrary(g) % 6 {
             0 | 1 => Self::Set(key, u8::arbitrary(g)),
             2 => Self::Remove(key),
             3 => Self::Get(key),
-            _ => Self::Flush,
+            4 => Self::Clear,
+            _ => Self::Checkpoint,
         }
     }
 }
@@ -292,17 +303,25 @@ fn make_session_with_dirty(
     })
 }
 
-/// Registers `name` and returns the shared registry plus the sweep ref.
+/// Registers `name` under `commit_mode` and returns the shared registry plus
+/// the sweep ref.
 fn registry_and_ref<D>(
     descriptor: &D,
     name: &str,
     state_key: &StateKey,
+    commit_mode: CommitMode,
 ) -> Result<(Arc<CollectionDefRegistry>, CollectionRef)>
 where
     D: StateDescriptor,
 {
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(descriptor, CollectionDef::new(None))?;
+    registry.register(
+        descriptor,
+        CollectionDef {
+            commit_mode,
+            ..CollectionDef::new(None)
+        },
+    )?;
     let collection_ref = CollectionRef::new(
         CollectionId::new(
             state_key.clone(),
@@ -360,16 +379,18 @@ struct Backing<'a> {
 /// for any collection kind — the Deque and Map suites differ only in the op
 /// alphabet, the model, and the assertions, so everything else lives here once:
 /// bind a fresh session per event, apply each op (`apply_op`, which also
-/// asserts mid-trace `pop`/`get` returns and reports mid-handler flushes),
+/// asserts mid-trace `pop`/`get` returns and reports mid-handler checkpoints),
 /// `finalize`, resolve along the event's outcome (promote / rollback / crash →
-/// sweep), advance the model — the full scratch on a commit, the last flushed
-/// snapshot otherwise — then assert the committed collection through a fresh
-/// read-back session (`assert`, which absorbs any kind-specific check such as
-/// Map's bound-cell superset).
+/// sweep), advance the model — the full scratch on a commit (or always, for a
+/// `ReadUncommitted` collection, whose `finalize` commits everything), the
+/// last checkpointed snapshot otherwise — then assert the committed collection
+/// through a fresh read-back session (`assert`, which absorbs any
+/// kind-specific check such as Map's bound-cell superset).
 async fn run_collection_trace<D, O, M, Apply, Assert>(
     trace: Trace<O>,
     descriptor: D,
     name: &str,
+    commit_mode: CommitMode,
     apply_op: Apply,
     assert: Assert,
 ) -> Result<bool>
@@ -383,7 +404,7 @@ where
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key)?;
+    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key, commit_mode)?;
     let armed: ArmedKeys = Arc::default();
     let backing = Backing {
         cells: &cells,
@@ -401,13 +422,14 @@ where
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         let mut scratch = model.clone();
-        // The scratch as of the last mid-handler flush — durable regardless of
-        // the event's outcome (the at-least-once flush contract).
-        let mut flushed: Option<M> = None;
+        // The scratch as of the last mid-handler checkpoint — durable
+        // regardless of the event's outcome (the at-least-once checkpoint
+        // contract).
+        let mut checkpointed: Option<M> = None;
         for op in &ev.ops {
             match apply_op(&handle, *op, &mut scratch).await? {
                 OpOutcome::Continue => {}
-                OpOutcome::Flushed => flushed = Some(scratch.clone()),
+                OpOutcome::Checkpointed => checkpointed = Some(scratch.clone()),
                 OpOutcome::Mismatch => return Ok(false),
             }
         }
@@ -434,13 +456,16 @@ where
         {
             return Ok(false);
         }
-        model = if ev.outcome.commits() {
+        model = if commit_mode == CommitMode::ReadUncommitted || ev.outcome.commits() {
+            // ReadUncommitted commits everything at `finalize` — any outcome
+            // that reached it takes the full scratch (nothing provisional
+            // exists to roll back or sweep).
             scratch
         } else {
-            // Abort / crash-rollback revert only the post-flush provisionals
-            // (their `prev` was captured after the flush landed); the flushed
-            // snapshot is already committed.
-            flushed.unwrap_or(model)
+            // Abort / crash-rollback revert only the post-checkpoint
+            // provisionals (their `prev` was captured after the checkpoint
+            // landed); the checkpointed snapshot is already committed.
+            checkpointed.unwrap_or(model)
         };
 
         // Read back through a fresh session (clean overlay) — pure committed.
@@ -464,11 +489,12 @@ where
 
 /// Drives a deque trace, asserting the handle equals a `VecDeque` model after
 /// every event and that each `pop` returns the model's value.
-pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
+pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) -> Result<bool> {
     run_collection_trace(
         trace,
         deque_state::<JsonCodec>("dq"),
         "dq",
+        commit_mode,
         async |handle, op, scratch: &mut VecDeque<Value>| match op {
             DequeOp::PushBack(b) => {
                 let v = Value::from(b);
@@ -488,9 +514,14 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
             DequeOp::PopFront => Ok(mismatch_unless(
                 handle.pop_front().await? == scratch.pop_front(),
             )),
-            DequeOp::Flush => {
-                handle.flush().await?;
-                Ok(OpOutcome::Flushed)
+            DequeOp::Clear => {
+                handle.clear().await?;
+                scratch.clear();
+                Ok(OpOutcome::Continue)
+            }
+            DequeOp::Checkpoint => {
+                handle.checkpoint().await?;
+                Ok(OpOutcome::Checkpointed)
             }
         },
         async |handle, model, _backing: &Backing<'_>| assert_deque(handle, model).await,
@@ -501,11 +532,12 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace) -> Result<bool> {
 /// Drives a map trace, asserting the handle equals a `BTreeMap` model after
 /// every event, that each mid-trace `get` returns the model's value, and that
 /// the stored bounds cover a loose superset of the live key range.
-pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
+pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
     run_collection_trace(
         trace,
         map_state::<I64KeyCodec, JsonCodec>("mp"),
         "mp",
+        commit_mode,
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
             MapOp::Set(k, b) => {
                 let v = Value::from(b);
@@ -521,9 +553,14 @@ pub(crate) async fn run_map_trace(trace: MapTrace) -> Result<bool> {
             MapOp::Get(k) => Ok(mismatch_unless(
                 handle.get(&k).await? == scratch.get(&k).cloned(),
             )),
-            MapOp::Flush => {
-                handle.flush().await?;
-                Ok(OpOutcome::Flushed)
+            MapOp::Clear => {
+                handle.clear().await?;
+                scratch.clear();
+                Ok(OpOutcome::Continue)
+            }
+            MapOp::Checkpoint => {
+                handle.checkpoint().await?;
+                Ok(OpOutcome::Checkpointed)
             }
         },
         async |handle, model, backing: &Backing<'_>| {
@@ -586,7 +623,8 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
             match *op {
                 MapOp::Set(k, b) => {
                     handle.set(k, Value::from(b)).await?;
-                    // Snapshot immediately, before any later Flush drains dirty.
+                    // Snapshot immediately, before any later Checkpoint
+                    // drains dirty.
                     let snapshot = dirty.collection_snapshot(&id);
                     let has_min = snapshot.iter().any(|(c, _)| *c == min_cell);
                     let has_max = snapshot.iter().any(|(c, _)| *c == max_cell);
@@ -598,8 +636,9 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
                 MapOp::Get(k) => {
                     handle.get(&k).await?;
                 }
-                MapOp::Flush => {
-                    handle.flush().await?;
+                MapOp::Clear => handle.clear().await?,
+                MapOp::Checkpoint => {
+                    handle.checkpoint().await?;
                 }
             }
         }
@@ -629,7 +668,8 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
-    let (registry, collection_ref) = registry_and_ref(&descriptor, "dq", &state_key)?;
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
 
     let head = shape.head;
@@ -837,7 +877,8 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let (registry, collection_ref) = registry_and_ref(&descriptor, "mp", &state_key)?;
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
 
     // Bounds spanning the whole key space so a scan is issued and reaches the
@@ -885,8 +926,9 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     Ok(())
 }
 
-/// Durable meta-frame golden (Deque): after real pushes flush, the raw bounds
-/// cell sits at its frozen address — `Meta` section, *empty* coordinate — and
+/// Durable meta-frame golden (Deque): after real pushes checkpoint, the raw
+/// bounds cell sits at its frozen address — `Meta` section, *empty*
+/// coordinate — and
 /// stores exactly `head ‖ tail` as two plain big-endian `i64`s. The pair
 /// codec's own goldens pin that frame in isolation; this pins the deque's
 /// *binding* to it: the codec choice, the head-first tuple order, and the unit
@@ -901,7 +943,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
-    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key)?;
+    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
     let armed: ArmedKeys = Arc::default();
     let event = read_event(0);
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
@@ -912,7 +954,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     block_on(async {
         handle.push_back(Value::from(7_u8)).await?;
         handle.push_front(Value::from(9_u8)).await?;
-        handle.flush().await?;
+        handle.checkpoint().await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -931,6 +973,161 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 1
         ],
         "meta frame must be head ‖ tail as plain big-endian i64s"
+    );
+    Ok(())
+}
+
+/// Deque clear, pinned at the physical grain a `VecDeque` model cannot reach
+/// (the reset window makes stale rows unreachable through the handle, so only
+/// raw reads can observe them):
+///
+/// * **Index-space reset** — `clear()` erases the window cell, so the next push
+///   starts a fresh window at index 0. A preserved (non-reset) index space
+///   would read `head = 2 ‖ tail = 3` here; the reset reads `head = 0 ‖ tail =
+///   1`.
+/// * **Committed erasure** — a committed `clear()` physically erases the
+///   pre-clear entry rows. The row outside the reused window must read absent;
+///   a skipped per-cell clear would leave it standing as an orphan the window
+///   never addresses (unbounded leaked storage).
+#[test]
+fn deque_clear_resets_the_index_space() -> Result<()> {
+    use crate::state::descriptor::deque::{entry_cell_for, meta_cell};
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+    let armed: ArmedKeys = Arc::default();
+
+    // Event 1: two pushes, committed — the window becomes [0, 2).
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.push_back(Value::from(1_u8)).await?;
+        handle.push_back(Value::from(2_u8)).await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event1)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    // Event 2: clear then push, committed — the window resets to [0, 1).
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.clear().await?;
+        handle.push_back(Value::from(9_u8)).await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event2)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("dq")?,
+    );
+    let Some(bytes) = block_on(store.get(&id, &meta_cell(), read_event(0)))?.into_inner() else {
+        bail!("bounds cell missing after the committed clear-then-push");
+    };
+    assert_eq!(
+        &bytes[..],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "clear resets the index space: the reused window is head = 0 ‖ tail = 1"
+    );
+
+    // The physical erasure half: index 1 sat outside the reused window, so
+    // only its per-cell clear removes it — a stale committed row here is the
+    // leak the API can never surface.
+    let stale = entry_cell_for(&I64KeyCodec::encode(&1));
+    assert_eq!(
+        block_on(store.get(&id, &stale, read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must physically erase the out-of-window row"
+    );
+    let reused = entry_cell_for(&I64KeyCodec::encode(&0));
+    assert_eq!(
+        block_on(store.get(&id, &reused, read_event(0)))?.into_inner(),
+        Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
+        "the reused index holds exactly the post-clear push"
+    );
+    Ok(())
+}
+
+/// Map clear, pinned at the physical grain the loose-superset bounds
+/// invariant cannot reach (`assert_map_bounds` passes vacuously on an empty
+/// model, and after repopulation stale bounds still satisfy the superset
+/// check): a committed `clear()` erases both bound cells with the entries, so
+/// the absent-bounds ⇔ empty-map reading survives a cleared map. Stale bounds
+/// on a cleared map would keep issuing lower scans over the erased
+/// (tombstoned) range on every later `stream` — the tombstone paging the
+/// bounds exist to prevent.
+#[test]
+fn map_clear_erases_the_bound_cells() -> Result<()> {
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, _) = registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
+    let armed: ArmedKeys = Arc::default();
+
+    // Event 1: one committed set stamps both bound cells.
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(7, Value::from(1_u8)).await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event1)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    // Event 2: committed clear.
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.clear().await?;
+        session.finalize().await?;
+        oracle.record_message(event_dedup(event2)).await?;
+        session.commit_apply().await;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("mp")?,
+    );
+    let (min_cell, max_cell) = bound_cells();
+    assert_eq!(
+        block_on(store.get(&id, &min_cell, read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must erase the Min bound cell"
+    );
+    assert_eq!(
+        block_on(store.get(&id, &max_cell, read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must erase the Max bound cell"
     );
     Ok(())
 }

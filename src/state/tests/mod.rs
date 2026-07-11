@@ -15,11 +15,14 @@ use self::collection_suite::{
 };
 use self::support::fresh_collection;
 use super::cell::ProvisionalWrite;
+use super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use super::dirty::DirtyStore;
 use super::memory::{MemoryCellStore, MemoryCells};
 use super::oracle::CommitOracle;
+use super::overlay::Overlay;
 use super::registry::CollectionDefRegistry;
 use super::store::CellStore;
-use super::{CollectionRef, EventRef};
+use super::{CollectionRef, CommitMode, EventRef};
 use color_eyre::eyre::Result;
 use futures::StreamExt;
 use futures::executor;
@@ -113,6 +116,88 @@ fn prop_memory_overlay_view() {
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
+/// A dirty clear marker is scoped to exactly its section: clearing section 1
+/// hides section 1's committed cell from both `get` and `scan_cells` while the
+/// sibling section-0 cell stays visible through both. Pins the section
+/// argument of the overlay's two marker checks — the overlay property drives
+/// a single section, and through the collection handles the clear expansion
+/// masks the marker, so a marker consulted at the wrong section (serving a
+/// cleared section's stale rows, or hiding a live sibling section) is
+/// invisible to both.
+#[test]
+fn overlay_clear_marker_is_section_scoped() -> Result<()> {
+    executor::block_on(async {
+        let oracle = ScriptedOracle::default();
+        let lower = memory_store(MemoryCells::new(), oracle);
+        let id = fresh_collection("sections")?;
+        let collection = CollectionRef::new(id.clone(), None);
+        let own = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower);
+
+        // One committed cell in each of two sections, at the same coordinate.
+        let cell_in = |section: i8| CellKey {
+            section: Section::new(section),
+            coordinate: Coordinate::from_bytes(vec![0]),
+        };
+        for section in [0, 1] {
+            let cell = cell_in(section);
+            let value = Some(bytes(section.unsigned_abs()));
+            overlay
+                .lower()
+                .write_resolved(&collection, &[(cell, value)], &[])
+                .await?;
+        }
+
+        overlay.dirty().clear_section(&id, Section::new(1));
+
+        // `get`: the cleared section reads absent, the sibling stays visible.
+        assert_eq!(
+            overlay.get(&id, &cell_in(1), own).await?.into_inner(),
+            None,
+            "the cleared section's committed cell is hidden from get"
+        );
+        assert_eq!(
+            overlay.get(&id, &cell_in(0), own).await?.into_inner(),
+            Some(bytes(0)),
+            "the sibling section's committed cell stays visible to get"
+        );
+
+        // `scan_cells`: the same scoping through the range leg.
+        let low = Coordinate::empty();
+        let high = Coordinate::from_bytes(vec![u8::MAX]);
+        let mut scanned = Vec::new();
+        for section in [0, 1] {
+            let scan = Scan {
+                section: Section::new(section),
+                start: ScanEdge::Included(&low),
+                dir: Direction::Forward,
+                end: ScanEdge::Included(&high),
+                limit: None,
+            };
+            let stream = overlay.scan_cells(&id, scan, own);
+            futures::pin_mut!(stream);
+            let mut cells = Vec::new();
+            while let Some(item) = stream.next().await {
+                let (key, value) = item?;
+                cells.push((key, value));
+            }
+            scanned.push(cells);
+        }
+        assert_eq!(
+            scanned[0],
+            vec![(cell_in(0), bytes(0))],
+            "the sibling section's committed cell stays visible to scan"
+        );
+        assert!(
+            scanned[1].is_empty(),
+            "the cleared section's committed cell is hidden from scan"
+        );
+        Ok(())
+    })
+}
+
 /// Scan correctness directly over `MemoryCellStore::scan_cells` (no overlay):
 /// the backend's own ordering, range bounds, and limit handling match the
 /// committed-only oracle.
@@ -129,29 +214,54 @@ fn prop_memory_bottom_scan() {
 }
 
 /// Deque collection soundness over the real session lifecycle: random
-/// push/pop/mid-handler-flush traces with commit/abort/crash outcomes keep the
-/// handle's `len`/`stream`/`get` and every `pop` return value in step with a
-/// `VecDeque` oracle — the dense-window invariant, bounds+entries crash
-/// atomicity, and the at-least-once flush contract (flushed ops survive
-/// abort/crash-rollback; post-flush ops roll back).
+/// push/pop/clear/mid-handler-checkpoint traces with commit/abort/crash
+/// outcomes keep the handle's `len`/`stream`/`get` and every `pop` return
+/// value in step with a `VecDeque` oracle — the window invariant (incl. the
+/// index-space reset on clear), bounds+entries crash atomicity, and the
+/// at-least-once checkpoint contract (checkpointed ops survive
+/// abort/crash-rollback; post-checkpoint ops roll back — so
+/// checkpoint-then-clear-then-abort restores the checkpointed state).
 #[test]
 fn prop_deque_collection_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(trace))
+        executor::block_on(run_deque_trace(trace, CommitMode::ReadCommitted))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
+}
+
+/// The deque lifecycle property in `ReadUncommitted` mode: `finalize` commits
+/// everything, so every outcome that reaches it — including crash-abort —
+/// converges to the full scratch model.
+#[test]
+fn prop_deque_collection_lifecycle_read_uncommitted() {
+    fn property(trace: DequeTrace) -> Result<bool> {
+        executor::block_on(run_deque_trace(trace, CommitMode::ReadUncommitted))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
 }
 
 /// Map collection soundness over the real session lifecycle: random
-/// set/remove/get/mid-handler-flush traces with commit/abort/crash outcomes
-/// keep the handle's `get` and key-ordered `stream` in step with a `BTreeMap`
-/// oracle — the loose-superset bounds, crash atomicity, and the at-least-once
-/// flush contract (flushed ops survive abort/crash-rollback; post-flush ops
-/// roll back).
+/// set/remove/get/clear/mid-handler-checkpoint traces with commit/abort/crash
+/// outcomes keep the handle's `get` and key-ordered `stream` in step with a
+/// `BTreeMap` oracle — the loose-superset bounds (cleared with the entries),
+/// crash atomicity, and the at-least-once checkpoint contract (checkpointed
+/// ops survive abort/crash-rollback; post-checkpoint ops roll back — so
+/// checkpoint-then-clear-then-abort restores the checkpointed state).
 #[test]
 fn prop_map_collection_lifecycle() {
     fn property(trace: MapTrace) -> Result<bool> {
-        executor::block_on(run_map_trace(trace))
+        executor::block_on(run_map_trace(trace, CommitMode::ReadCommitted))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// The map lifecycle property in `ReadUncommitted` mode: `finalize` commits
+/// everything, so every outcome that reaches it — including crash-abort —
+/// converges to the full scratch model.
+#[test]
+fn prop_map_collection_lifecycle_read_uncommitted() {
+    fn property(trace: MapTrace) -> Result<bool> {
+        executor::block_on(run_map_trace(trace, CommitMode::ReadUncommitted))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }

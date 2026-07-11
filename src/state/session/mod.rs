@@ -19,8 +19,9 @@
 //!
 //! - [`CellSession`] — the read/buffer/mutate surface handlers reach through
 //!   collection handles: `get`/`scan` + the buffering mutators
-//!   `set`/`clear`/`flush`, plus `loader`/`is_terminated`/
-//!   `verify_state_registration`. [`EventContext::State`] bounds this.
+//!   `set`/`clear`/`clear_section` and the mid-handler `checkpoint`, plus
+//!   `loader`/`is_terminated`/`verify_state_registration`.
+//!   [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
 //!   (`finalize`/`commit_apply`/`rollback_aborted`/marker/reset), a
 //!   `pub(crate)` supertrait of [`CellSession`] that seals it: downstream
@@ -50,11 +51,11 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::access::StateAccessError;
 use crate::state::cell::ProvisionalWrite;
-use crate::state::cell_key::{CellKey, Scan};
+use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
 };
-use crate::state::dirty::{DirtyStore, DirtyVal, ResolvedCells};
+use crate::state::dirty::{ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::manager::ArmedKeys;
 use crate::state::oracle::CommitOracle;
@@ -83,76 +84,27 @@ use uuid::Uuid;
 #[cfg(test)]
 mod tests;
 
-/// The provisional cells `finalize` staged, grouped by collection (its ref
-/// carries the TTL). Only `ReadCommitted` collections appear; `ReadUncommitted`
-/// writes resolve at stage time with nothing to settle. Each `(cell, write)`'s
-/// `data` is the value to promote to, `prev` the committed base to roll back
-/// to.
+/// The per-event staged record: the provisional cells `finalize` staged,
+/// grouped by collection (its ref carries the TTL), that the lifecycle
+/// promotes or rolls back and that each collection's event marker lists.
+///
+/// Built exactly once per collection, at `finalize`, from the post-checkpoint
+/// dirty buffer — checkpointed cells are already committed and never
+/// marker-listed, so the record lists exactly the cells recovery owns. Only a
+/// retry attempt re-running `finalize` rebuilds it, overwriting the same-event
+/// marker idempotently. Only `ReadCommitted` collections appear;
+/// `ReadUncommitted` writes resolve at stage time with nothing to settle. Each
+/// `(cell, write)`'s `data` is the value to promote to, `prev` the committed
+/// base to roll back to; a clears-only collection appears with an empty write
+/// set — the entry that arms the recovery backstop.
 type StagedSet = Vec<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>;
-
-/// The per-event staged record: the provisional writes `finalize` staged,
-/// grouped by collection, that the lifecycle promotes or rolls back and that
-/// each collection's event marker lists.
-///
-/// # Invariant: the staged record is append-only
-///
-/// A coordinate durably staged by the event is **never dropped** from the
-/// record until settle or reset. A later stage of the same collection merges
-/// per cell ([`Self::append`]) — a re-staged cell replaces its entry (same
-/// committed `prev` by the own-event-base-is-prev invariant) — but never
-/// removes a previously staged cell. Dropping one would strand its durable
-/// provisional row: unlisted by the marker, it is invisible to the recovery
-/// sweep, and rollback would no longer be exact. `finalize` is the only stager
-/// this phase, so the merge path exists for the mid-handler flush the session
-/// will grow later; the record's invariant is what that seam relies on.
-#[derive(Default)]
-struct StagedRecord {
-    collections: StagedSet,
-}
-
-impl StagedRecord {
-    /// Merges one collection's staged writes into the record: a re-staged cell
-    /// replaces its prior entry, a new cell is appended, and a
-    /// not-yet-recorded collection is added. Never removes a staged cell.
-    fn append(&mut self, collection: CollectionRef, writes: Vec<(CellKey, ProvisionalWrite)>) {
-        match self
-            .collections
-            .iter_mut()
-            .find(|(existing, _)| *existing == collection)
-        {
-            Some((_, recorded)) => {
-                for (cell, write) in writes {
-                    match recorded.iter_mut().find(|(c, _)| *c == cell) {
-                        Some(slot) => slot.1 = write,
-                        None => recorded.push((cell, write)),
-                    }
-                }
-            }
-            None => self.collections.push((collection, writes)),
-        }
-    }
-
-    /// Whether nothing was staged.
-    fn is_empty(&self) -> bool {
-        self.collections.is_empty()
-    }
-
-    /// The recorded collections, for the recovery-delay fold.
-    fn collections(&self) -> &StagedSet {
-        &self.collections
-    }
-
-    /// Consumes the record into its grouped staged set, for resolution.
-    fn into_staged_set(self) -> StagedSet {
-        self.collections
-    }
-}
 
 /// The per-event session collections read, buffer, and mutate through.
 ///
 /// `get`/`scan` describe the session's **visible committed bytes** for a cell —
 /// [`KeyedStateSession`] realises that through the dirty overlay + oracle
-/// resolution — and `set`/`clear`/`flush` buffer this event's mutations. The
+/// resolution — and `set`/`clear`/`clear_section` buffer this event's
+/// mutations (`checkpoint` writes them through mid-handler). The
 /// framework reaches the manager-driven lifecycle through the sealed
 /// `StateLifecycle` supertrait, which is what seals `CellSession`: downstream
 /// crates can name it in bounds (e.g. [`EventContext::State`]) but can neither
@@ -243,20 +195,43 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
         cell: &CellKey,
     ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-    /// Drains the collection's buffered ops straight to committed state — the
-    /// mid-handler write-through escape hatch, valid in **either** commit
-    /// mode.
+    /// Buffers an in-RAM dirty clear marker for one section of the
+    /// collection: within this event the section reads as "deleted at this
+    /// program point" — `get` answers absence, `scan` yields only cells set
+    /// after the clear — and later `set`s repopulate it. Committed, the
+    /// section holds exactly the survivors; aborted, it is untouched.
     ///
-    /// Every currently-buffered cell of the collection is written resolved in
-    /// one same-partition batch and dropped from the dirty buffer, so
-    /// multi-cell kinds flush data and bookkeeping as a unit (a Map's entries
-    /// and bound ratchets, a Deque's entries and window bounds). The contract
-    /// is **at-least-once**: a flushed write is durable immediately, *not*
-    /// atomically with the event's commit marker — a handler that fails after
-    /// flushing re-runs against the already-applied state on retry or
-    /// redelivery, so flushed writes must be idempotent. Ops buffered *after*
-    /// the flush ride the collection's normal stage→promote path; reads
-    /// already see buffered writes without flushing.
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session.
+    fn clear_section(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
+    /// Durably commits the collection's buffered changes mid-handler, so they
+    /// survive a restart after failure. This is why it exists: a complex or
+    /// large handler (a materialization handler fanning one message into
+    /// thousands of writes) checkpoints incremental progress and resumes from
+    /// it on retry or redelivery instead of starting from scratch. Handler
+    /// idempotence across the resume is the contract.
+    ///
+    /// Every currently-buffered op of the collection is written straight to
+    /// committed state ([`write_resolved`]) in one same-partition batch and
+    /// dropped from the dirty buffer, so multi-cell kinds checkpoint data and
+    /// bookkeeping as a unit (a Map's entries and bound ratchets, a Deque's
+    /// entries and window bounds). Valid in **both** commit modes. The
+    /// guarantee is **at-least-once**: a checkpointed write is durable and
+    /// visible immediately — never provisional, never listed in any event
+    /// marker, never rolled back. Ops buffered *after* the checkpoint ride
+    /// the collection's normal stage→settle path; reads already see buffered
+    /// writes without checkpointing.
+    ///
+    /// Every collection handle exposes `checkpoint()` — Value, Map, and Deque
+    /// all do, and future collection kinds must too; the handles' docs link
+    /// back here.
     ///
     /// Returns [`StoreOutcome::Applied`] when buffered ops were written, or
     /// [`StoreOutcome::NoOp`] when nothing was buffered.
@@ -266,7 +241,9 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
     /// [`StateAccessError::Store`] when the underlying store fails (the
     /// buffer is left intact, so the ops still ride the normal commit path).
-    fn flush(
+    ///
+    /// [`write_resolved`]: crate::state::store::CellStore::write_resolved
+    fn checkpoint(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -469,7 +446,7 @@ where
     termination: TerminationWatch,
     /// The recorded staged set the lifecycle promotes or rolls back. `None`
     /// until `finalize` stages a `ReadCommitted` collection.
-    staged: SyncMutex<Option<StagedRecord>>,
+    staged: SyncMutex<Option<StagedSet>>,
     /// The registered message commit marker, flushed strictly after the stage
     /// and cleared by `reset`.
     marker: SyncMutex<Option<Uuid>>,
@@ -567,11 +544,11 @@ where
     where
         L: Send + Sync + 'static,
     {
-        let Some(record) = self.inner.staged.lock().take() else {
+        let Some(staged) = self.inner.staged.lock().take() else {
             return ApplyOutcome::NothingStaged;
         };
         let lower = self.inner.overlay.lower();
-        let all_resolved = stream::iter(record.into_staged_set())
+        let all_resolved = stream::iter(staged)
             .map(|(collection_ref, writes)| {
                 cooperative(async move {
                     let result = if committed {
@@ -700,7 +677,18 @@ where
         Ok(())
     }
 
-    async fn flush(
+    async fn clear_section(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+    ) -> Result<(), StateAccessError> {
+        let id = self.id_for(state_type, name);
+        self.inner.overlay.dirty().clear_section(&id, section);
+        Ok(())
+    }
+
+    async fn checkpoint(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -719,7 +707,10 @@ where
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         // Drain only after the write landed: a store failure leaves the
-        // buffer intact, so the ops still ride the normal commit path.
+        // buffer intact, so the ops still ride the normal commit path. The
+        // drain also drops the collection's dirty clear markers — sound
+        // because a cleared section's erase was expanded to per-cell clears
+        // in the same write.
         self.inner.overlay.dirty().remove_collection(&id);
         Ok(StoreOutcome::Applied)
     }
@@ -741,28 +732,21 @@ where
         let lower = self.inner.overlay.lower();
         let state_key = &self.inner.state_key;
         let staged: StagedSet = stream::iter(touched)
-            .map(|((state_type, name), cells)| {
+            .map(|((state_type, name), cleared, cells)| {
                 let id = CollectionId::new(state_key.clone(), state_type, name);
-                // `cooperative` adds a per-collection coop-budget checkpoint so a
-                // key touching many collections does not drain the batch in one
-                // poll; `buffer_unordered` keeps full concurrency.
-                cooperative(stage_collection(lower, registry, event, id, cells))
+                // `cooperative` adds a per-collection coop-budget yield point
+                // so a key touching many collections does not drain the batch
+                // in one poll; `buffer_unordered` keeps full concurrency.
+                cooperative(stage_collection(lower, registry, event, id, cleared, cells))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .try_filter_map(|opt| async move { Ok(opt) })
             .try_collect()
             .await?;
-        // Fold the staged collections into the append-only record. `touched`
-        // yields each collection once, so this is one append per collection; the
-        // merge path exists for the record's invariant, not for this call.
-        let mut record = StagedRecord::default();
-        for (collection_ref, writes) in staged {
-            record.append(collection_ref, writes);
-        }
-        if record.is_empty() {
+        if staged.is_empty() {
             Ok(FinalizeOutcome::Clean)
         } else {
-            *self.inner.staged.lock() = Some(record);
+            *self.inner.staged.lock() = Some(staged);
             Ok(FinalizeOutcome::Staged)
         }
     }
@@ -815,9 +799,8 @@ where
         // never appear here. The fold is sync (`recovery_within_for` is sync),
         // so no await runs under the `staged` lock.
         let floor = self.inner.recovery_delay;
-        self.inner.staged.lock().as_ref().map_or(floor, |record| {
-            record
-                .collections()
+        self.inner.staged.lock().as_ref().map_or(floor, |staged| {
+            staged
                 .iter()
                 .filter_map(|(collection, _)| {
                     let id = collection.id();
@@ -853,6 +836,7 @@ async fn stage_collection<S>(
     registry: &CollectionDefRegistry,
     event: EventRef,
     id: CollectionId,
+    cleared: ClearedSections,
     cells: impl IntoIterator<Item = (CellKey, DirtyVal)>,
 ) -> Result<Option<(CollectionRef, Vec<(CellKey, ProvisionalWrite)>)>, StateAccessError>
 where
@@ -886,9 +870,21 @@ where
                 .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
                 .try_collect()
                 .await?;
-            // `finalize` is the only stager this phase, so the staged union so
-            // far IS this single stage's writes; clears are empty (no
-            // section-clear producer exists yet).
+            if writes.is_empty() {
+                // Backstop-arming rule: a clears-only collection stages
+                // nothing durable (its erase was expanded to per-cell clears
+                // at the descriptor layer), but it still records an empty
+                // staged-set entry so `finalize` reports
+                // [`FinalizeOutcome::Staged`] and the boundary arms the
+                // `StateRecovery` backstop.
+                return Ok((!cleared.is_empty()).then(|| (collection_ref, Vec::new())));
+            }
+            // `finalize` builds the staged record exactly once per collection
+            // from the post-checkpoint dirty buffer, so `staged` IS this
+            // stage's writes; only a retry attempt re-running `finalize`
+            // re-stages (an idempotent same-event marker overwrite). `clears`
+            // stay empty: a cleared section's erase rides the per-cell clears
+            // above.
             lower
                 .write_provisional(&collection_ref, &writes, &[], &writes)
                 .await
@@ -900,6 +896,11 @@ where
                 .into_iter()
                 .map(|(cell, value)| (cell, value.into_data()))
                 .collect();
+            if resolved.is_empty() {
+                // A marker-only `ReadUncommitted` collection is a no-op: RU
+                // never stages, so there is nothing for recovery to arm.
+                return Ok(None);
+            }
             lower
                 .write_resolved(&collection_ref, &resolved, &[])
                 .await

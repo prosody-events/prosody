@@ -1,13 +1,18 @@
 use super::*;
-use crate::state::cell_key::{Coordinate, Section};
+use crate::state::StateKey;
+use crate::state::cell_key::Coordinate;
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::tests::support::fresh_collection;
 use color_eyre::eyre::Result;
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use uuid::Uuid;
 
 /// Regression: a `lookup` after a same-collection drain must return `None`
-/// promptly, never hang. `remove_collection` is the mid-handler flush path
-/// (the session drains the collection's buffered cells after writing them
-/// through); a subsequent `get` re-reads the dirty leg via `lookup`. The
+/// promptly, never hang. `remove_collection` is the mid-handler checkpoint
+/// path (the session drains the collection's buffered cells after writing
+/// them through); a subsequent `get` re-reads the dirty leg via `lookup`. The
 /// lock-free `peek_with` read makes this terminate — the lock-based
 /// `read_sync` spins forever here under single-threaded execution
 /// (scc 3.7.0).
@@ -93,4 +98,388 @@ fn section_snapshot_returns_whole_section_beside_a_lower_section() -> Result<()>
         "section snapshot dropped or misordered cells"
     );
     Ok(())
+}
+
+/// Regression (shrunk from the map lifecycle property, where a committed
+/// entry survived a double `MapHandle::clear`): a repeat `clear_section` must
+/// not lose an earlier clear's buffered `Cleared` cells — they carry the
+/// per-cell row-erasure work, and only buffered `Set`s are superseded by the
+/// marker.
+#[test]
+fn clear_section_retains_buffered_cleared_cells() -> Result<()> {
+    let store = DirtyStore::new();
+    let c = fresh_collection("c")?;
+    let section = Section::new(1);
+    let cleared_cell = CellKey {
+        section,
+        coordinate: Coordinate::from_bytes(vec![7]),
+    };
+    let set_cell = CellKey {
+        section,
+        coordinate: Coordinate::from_bytes(vec![9]),
+    };
+    store.clear(&c, &cleared_cell);
+    store.set(&c, &set_cell, b"x");
+    store.clear_section(&c, section);
+    assert_eq!(
+        store.lookup(&c, &cleared_cell),
+        Some(DirtyVal::Cleared),
+        "the buffered clear survives the marker"
+    );
+    assert_eq!(
+        store.lookup(&c, &set_cell),
+        None,
+        "the buffered set is superseded by the marker"
+    );
+    Ok(())
+}
+
+/// Regression, the marker tree's [`Edge`] fat-bound seek hazard (the analogue
+/// of [`section_snapshot_returns_whole_section_beside_a_lower_section`] for
+/// the cell tree): with the marker tree spanning multiple scc leaf nodes and a
+/// neighbouring key populated below, `touched` must report every marker in the
+/// key's sub-range, `remove_collection` (the mid-handler checkpoint drain)
+/// must remove exactly its collection's markers, and `clear_event` must remove
+/// exactly the key's. A fat collection bound seeks mid-span and leaves a
+/// leading dirty clear marker standing after the checkpoint wrote the erasure
+/// through — later same-event reads keep answering "cleared" for repopulated
+/// state.
+#[test]
+fn marker_scopes_span_multiple_leaf_nodes() -> Result<()> {
+    let store = DirtyStore::new();
+    let segment = Uuid::new_v4();
+    let coll = |key: &str, name: &str| -> Result<CollectionId> {
+        Ok(CollectionId::new(
+            StateKey::new(segment, Arc::from(key)),
+            StateType::Application,
+            StateName::try_new(name)?,
+        ))
+    };
+
+    // 40 collections × 2 sections under "kb", plus 40 markers under the
+    // neighbouring "ka" — 120 markers span many scc leaf nodes (capacity 15),
+    // so a fat range bound would seek mid-span and drop leading markers.
+    for i in 0..40_u8 {
+        let name = format!("c{i:02}");
+        store.clear_section(&coll("ka", &name)?, Section::new(0));
+        store.clear_section(&coll("kb", &name)?, Section::new(0));
+        store.clear_section(&coll("kb", &name)?, Section::new(1));
+    }
+
+    let kb: Key = Arc::from("kb");
+    let touched = store.touched(&kb);
+    assert_eq!(touched.len(), 40, "every kb collection is reported");
+    assert!(
+        touched
+            .iter()
+            .all(|(_, cleared, cells)| cleared.len() == 2 && cells.is_empty()),
+        "each kb collection reports both cleared sections and no cells"
+    );
+
+    // The collection scope's strict-`Edge` bounds are load-bearing for scc
+    // range *seeks*: a fat bound comparing `Equal` to a span that itself
+    // straddles leaf nodes lands mid-span and skips leading markers.
+    // `remove_range` cannot observe this (removal containment-checks each
+    // entry, so a fat bound removes exactly the same set), so the drains
+    // below are blind to it — probe the seek contract through a range read
+    // over one wide span, populated out of order like the cell tree's seek
+    // regression so the leaf layout diverges from rank order.
+    let wide = coll("kc", "wide")?;
+    for step in 0..60_i8 {
+        store.clear_section(&wide, Section::new(step));
+        store.clear_section(&wide, Section::new(-step - 1));
+    }
+    let sections: Vec<i8> = {
+        let guard = Guard::new();
+        store
+            .markers
+            .range(MarkerCollectionScope::range(&wide), &guard)
+            .map(|(marker, ())| i8::from(marker.section))
+            .collect()
+    };
+    let expected: Vec<i8> = (-60..60).collect();
+    assert_eq!(
+        sections, expected,
+        "the collection scope must span exactly its own markers"
+    );
+    // The key scope walks the same straddling span, so a fat key bound also
+    // lands mid-span here — deterministically, unlike the narrow kb spans.
+    let kc: Key = Arc::from("kc");
+    let kc_touched = store.touched(&kc);
+    assert!(
+        kc_touched.len() == 1 && kc_touched[0].1.len() == 120,
+        "the key scope must span every kc marker"
+    );
+
+    // Drain every even-numbered kb collection so the drains land throughout
+    // the multi-leaf layout, and `touched` proves each drain removed exactly
+    // its collection's markers.
+    for i in (0..40_u8).step_by(2) {
+        store.remove_collection(&coll("kb", &format!("c{i:02}"))?);
+    }
+    let survivors = store.touched(&kb);
+    let names: Vec<&str> = survivors
+        .iter()
+        .map(|((_, name), ..)| name.as_str())
+        .collect();
+    let expected: Vec<String> = (1..40_u8).step_by(2).map(|i| format!("c{i:02}")).collect();
+    assert_eq!(
+        names, expected,
+        "exactly the drained collections' markers vanish"
+    );
+    assert!(
+        survivors
+            .iter()
+            .all(|(_, cleared, cells)| cleared.len() == 2 && cells.is_empty()),
+        "each surviving kb collection keeps both cleared sections"
+    );
+
+    store.clear_event(&kb);
+    assert!(store.touched(&kb).is_empty(), "kb's markers are swept");
+    let ka: Key = Arc::from("ka");
+    assert_eq!(
+        store.touched(&ka).len(),
+        40,
+        "the neighbouring key's markers are untouched"
+    );
+    Ok(())
+}
+
+/// The bounded op pools the dirty-store trace ranges over: 2 keys × 2
+/// collections × 2 sections × 3 coordinates, small enough that ops collide.
+const OP_KEYS: u8 = 2;
+const OP_COLLS: u8 = 2;
+const OP_SECTIONS: i8 = 2;
+const OP_COORDS: u8 = 3;
+
+/// One dirty-store op over the bounded pools.
+#[derive(Clone, Copy, Debug)]
+enum DirtyOp {
+    Set(u8, u8, i8, u8, u8),
+    Clear(u8, u8, i8, u8),
+    ClearSection(u8, u8, i8),
+    RemoveCollection(u8, u8),
+    ClearEvent(u8),
+}
+
+impl Arbitrary for DirtyOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let key = u8::arbitrary(g) % OP_KEYS;
+        let coll = u8::arbitrary(g) % OP_COLLS;
+        let section = i8::arbitrary(g).rem_euclid(OP_SECTIONS);
+        let coord = u8::arbitrary(g) % OP_COORDS;
+        match u8::arbitrary(g) % 7 {
+            0 | 1 => Self::Set(key, coll, section, coord, u8::arbitrary(g)),
+            2 => Self::Clear(key, coll, section, coord),
+            3 | 4 => Self::ClearSection(key, coll, section),
+            5 => Self::RemoveCollection(key, coll),
+            _ => Self::ClearEvent(key),
+        }
+    }
+}
+
+/// A shrinkable dirty-store trace.
+#[derive(Clone, Debug)]
+struct DirtyTrace(Vec<DirtyOp>);
+
+impl Arbitrary for DirtyTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self(Vec::<DirtyOp>::arbitrary(g).into_iter().take(40).collect())
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.0.shrink().map(Self))
+    }
+}
+
+/// The plain dirty-store model: cells and markers keyed by pool indices.
+#[derive(Default)]
+struct DirtyModel {
+    cells: BTreeMap<(u8, u8, i8, u8), DirtyVal>,
+    markers: BTreeSet<(u8, u8, i8)>,
+}
+
+/// One canonicalized `touched` shape for comparison: collection index →
+/// (cleared sections, cells with outcomes).
+type Touched = BTreeMap<u8, (BTreeSet<i8>, Vec<(u8, DirtyVal)>)>;
+
+/// The pool cell at `(section, coord)` — single-byte coordinates, so byte
+/// order is numeric order.
+fn pool_cell(section: i8, coord: u8) -> CellKey {
+    CellKey {
+        section: Section::new(section),
+        coordinate: Coordinate::from_bytes(vec![coord]),
+    }
+}
+
+/// Asserts every read surface over the whole pool: `section_cleared`,
+/// `section_snapshot`, and `lookup` against the model, then `touched` per key
+/// (collected into [`Touched`]; a collection appearing twice violates
+/// `touched`'s grouping contract and fails outright — duplicate entries are
+/// never merged). Returns `false` on the first divergence.
+fn dirty_matches(
+    store: &DirtyStore,
+    ids: &[Vec<CollectionId>],
+    model: &DirtyModel,
+) -> Result<bool> {
+    for k in 0..OP_KEYS {
+        for c in 0..OP_COLLS {
+            let id = &ids[k as usize][c as usize];
+            for s in 0..OP_SECTIONS {
+                if store.section_cleared(id, Section::new(s)) != model.markers.contains(&(k, c, s))
+                {
+                    return Ok(false);
+                }
+                let snapshot: Vec<(u8, DirtyVal)> = store
+                    .section_snapshot(id, Section::new(s))
+                    .into_iter()
+                    .map(|(cell, val)| (cell.coordinate.as_bytes()[0], val))
+                    .collect();
+                let expected: Vec<(u8, DirtyVal)> = model
+                    .cells
+                    .iter()
+                    .filter(|&(&(k2, c2, s2, _), _)| k2 == k && c2 == c && s2 == s)
+                    .map(|(&(.., x), val)| (x, val.clone()))
+                    .collect();
+                if snapshot != expected {
+                    return Ok(false);
+                }
+                for x in 0..OP_COORDS {
+                    if store.lookup(id, &pool_cell(s, x)) != model.cells.get(&(k, c, s, x)).cloned()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    for k in 0..OP_KEYS {
+        let mut got: Touched = BTreeMap::new();
+        for ((state_type, name), cleared, cells) in
+            store.touched(&ids[k as usize][0].state_key().key)
+        {
+            if state_type != StateType::Application {
+                return Ok(false);
+            }
+            let c: u8 = name.as_str().trim_start_matches('c').parse()?;
+            let cleared = cleared.into_iter().map(i8::from).collect();
+            let cells = cells
+                .into_iter()
+                .map(|(cell, val)| (cell.coordinate.as_bytes()[0], val))
+                .collect();
+            // `touched` groups by collection — one entry carrying the
+            // collection's marker and cells together. A duplicate key is a
+            // split entry: a grouping-contract violation, never merged away.
+            if got.insert(c, (cleared, cells)).is_some() {
+                return Ok(false);
+            }
+        }
+        let mut expected: Touched = BTreeMap::new();
+        for (k2, c, s) in &model.markers {
+            if *k2 == k {
+                expected.entry(*c).or_default().0.insert(*s);
+            }
+        }
+        for ((k2, c, _, x), val) in &model.cells {
+            if *k2 == k {
+                expected.entry(*c).or_default().1.push((*x, val.clone()));
+            }
+        }
+        if got != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Drives a random op trace over both trees against a plain
+/// `BTreeMap`/`BTreeSet` model, asserting every read surface after every op
+/// ([`dirty_matches`]) — marker/set/clear interleavings, `clear_section`
+/// wiping exactly its section's cells, and `remove_collection`/`clear_event`
+/// sweeping exactly their scope in **both** trees.
+fn run_dirty_trace(DirtyTrace(ops): DirtyTrace) -> Result<bool> {
+    let segment = Uuid::new_v4();
+    let ids: Vec<Vec<CollectionId>> = (0..OP_KEYS)
+        .map(|k| {
+            (0..OP_COLLS)
+                .map(|c| {
+                    Ok(CollectionId::new(
+                        StateKey::new(segment, Arc::from(format!("k{k}").as_str())),
+                        StateType::Application,
+                        StateName::try_new(format!("c{c}"))?,
+                    ))
+                })
+                .collect::<Result<_>>()
+        })
+        .collect::<Result<_>>()?;
+    let store = DirtyStore::new();
+    let mut model = DirtyModel::default();
+
+    for op in ops {
+        match op {
+            DirtyOp::Set(key, coll, section, coord, value) => {
+                store.set(
+                    &ids[key as usize][coll as usize],
+                    &pool_cell(section, coord),
+                    &[value],
+                );
+                model.cells.insert(
+                    (key, coll, section, coord),
+                    DirtyVal::Set(Bytes::copy_from_slice(&[value])),
+                );
+            }
+            DirtyOp::Clear(key, coll, section, coord) => {
+                store.clear(
+                    &ids[key as usize][coll as usize],
+                    &pool_cell(section, coord),
+                );
+                model
+                    .cells
+                    .insert((key, coll, section, coord), DirtyVal::Cleared);
+            }
+            DirtyOp::ClearSection(key, coll, section) => {
+                store.clear_section(&ids[key as usize][coll as usize], Section::new(section));
+                model.markers.insert((key, coll, section));
+                // The marker supersedes buffered `Set`s; `Cleared` cells are
+                // retained (they still carry per-cell erasure work).
+                model.cells.retain(|&(k2, c2, s2, _), val| {
+                    !(k2 == key && c2 == coll && s2 == section) || *val == DirtyVal::Cleared
+                });
+            }
+            DirtyOp::RemoveCollection(key, coll) => {
+                store.remove_collection(&ids[key as usize][coll as usize]);
+                model
+                    .cells
+                    .retain(|&(k2, c2, ..), _| !(k2 == key && c2 == coll));
+                model
+                    .markers
+                    .retain(|&(k2, c2, _)| !(k2 == key && c2 == coll));
+            }
+            DirtyOp::ClearEvent(key) => {
+                store.clear_event(&ids[key as usize][0].state_key().key);
+                model.cells.retain(|&(k2, ..), _| k2 != key);
+                model.markers.retain(|&(k2, ..)| k2 != key);
+            }
+        }
+        if !dirty_matches(&store, &ids, &model)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The dirty store tracks the plain model over random
+/// set/clear/clear-section/remove/clear-event interleavings across 2 keys × 2
+/// collections × 2 sections — every read surface asserted after every op.
+#[test]
+fn prop_dirty_store_tracks_model() {
+    fn property(trace: DirtyTrace) -> TestResult {
+        match run_dirty_trace(trace) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::error("dirty store diverged from the model"),
+            Err(error) => TestResult::error(format!("trace errored: {error:#}")),
+        }
+    }
+    QuickCheck::new().quickcheck(property as fn(DirtyTrace) -> TestResult);
 }
