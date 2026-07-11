@@ -290,9 +290,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// **Precondition:** callers route an absent-data promote to
     /// [`write_resolved`](Self::write_resolved)`(cell, None)` (the row-absence
-    /// invariant), so this verb only ever promotes present data. Promoting a
-    /// staged clear through it anyway is harmless legacy residue — the row
-    /// decodes `Committed(None)`, never corruption — not an error.
+    /// invariant), so this verb only ever promotes present data. Promoting an
+    /// absent-data cell through it instead is not corruption — the row still
+    /// decodes `Committed(None)` — but it leaves a resolved-null residue row,
+    /// which is why the absent-data route exists.
     ///
     /// # Errors
     ///
@@ -354,12 +355,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 }
 
 /// Routes a committed settle to the primitive verbs: present-data cells promote
-/// in place ([`CellStore::mark_resolved`]); absent-data cells (staged clears)
+/// in place ([`CellStore::mark_resolved`]); absent-data cells
 /// **delete** the row via [`CellStore::write_resolved`]`(cell, None)`,
 /// upholding the row-absence invariant. Both arms are idempotent and
 /// row-disjoint (an event stages each cell at most once), so the two sequential
 /// awaits are order-free; the sweep retries either on failure. A settle with no
-/// clears issues exactly one `mark_resolved` batch set.
+/// absent-data cells issues exactly one `mark_resolved` batch set.
 ///
 /// The reference routing: the memory backend calls it before its marker
 /// delete; the Cassandra backend implements the identical routing natively as

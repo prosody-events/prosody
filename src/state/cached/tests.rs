@@ -92,23 +92,25 @@ fn error_at_the_far_endpoint_leaves_no_remainder() -> Result<()> {
     Ok(())
 }
 
-/// Drains up to `take` cells of a forward scan over `[0, end]`, mapping each
-/// to its coordinate byte; `take = usize::MAX` drains to exhaustion.
+/// Drains up to `take` cells of a `dir` scan from `start` to `end`, mapping
+/// each to its coordinate byte; `take = usize::MAX` drains to exhaustion.
 async fn scan_take<L>(
     cached: &Cached<L>,
     id: &CollectionId,
+    start: ScanEdge<u8>,
+    dir: Direction,
     end: ScanEdge<u8>,
     take: usize,
 ) -> Result<Vec<u8>>
 where
     L: CellStore,
 {
-    let start = c(0);
+    let start = start.map(c);
     let end = end.map(c);
     let scan = Scan {
         section: Section::new(0),
-        start: ScanEdge::Included(&start),
-        dir: Direction::Forward,
+        start: start.as_ref(),
+        dir,
         end: end.as_ref(),
         limit: None,
     };
@@ -133,63 +135,95 @@ where
 /// while everything past the frontier stays a gap: the full re-scan still
 /// yields every cell (falling through for the tail), proving the frontier
 /// under-covers on early drop but never over-covers.
+///
+/// Run in both directions: `cover_consumed`'s frontier arithmetic branches on
+/// direction (forward covers `[gap_lo, X]`, backward `[X, gap_hi]`), and
+/// production reaches the Backward arm via Deque reverse iteration. The
+/// answer-vs-oracle suites never trip the `GAP_COVER_STRIDE` early-drop window,
+/// so this pins both arms directly.
+async fn gap_frontier_case(dir: Direction) -> Result<()> {
+    // More than two strides of cells, consumed one stride + a partial.
+    const TOTAL: usize = 2 * GAP_COVER_STRIDE + 22;
+    let consumed = GAP_COVER_STRIDE + 10;
+
+    let counting = CountingCellStore::new(MemoryCellStore::new(
+        MemoryCells::new(),
+        ScriptedOracle::default(),
+        Arc::new(CollectionDefRegistry::default()),
+    ));
+    let id = CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("k")),
+        StateType::Application,
+        StateName::try_new("frontier")?,
+    );
+    let cref = CollectionRef::new(id.clone(), None);
+
+    // Seed the LOWER store directly (bypassing the cache) so the whole
+    // section is one uncovered gap.
+    let mut seed: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(TOTAL);
+    for i in 0..TOTAL {
+        seed.push((cell_at(u8::try_from(i)?), Some(bytes(1))));
+    }
+    counting.write_resolved(&cref, &seed, &[]).await?;
+
+    let cached = Cached::new(test_db::cache("frontier")?, counting.clone());
+
+    // The gap fill covers contiguously from the scan's leading edge: forward
+    // fills from coordinate 0 upward, backward from the high edge 255 downward.
+    // `boundary` is the last coordinate of the first fully persisted stride —
+    // the 10 cells consumed past it were pending and lost with the drop. The
+    // covered prefix `[start, boundary]` (direction-relative) must then serve
+    // with zero lower scans.
+    let (start, end, boundary) = match dir {
+        Direction::Forward => (
+            ScanEdge::Included(0u8),
+            ScanEdge::Included(255u8),
+            ScanEdge::Included(u8::try_from(GAP_COVER_STRIDE - 1)?),
+        ),
+        Direction::Backward => (
+            ScanEdge::Included(255u8),
+            ScanEdge::Included(0u8),
+            ScanEdge::Included(u8::try_from(TOTAL - GAP_COVER_STRIDE)?),
+        ),
+    };
+
+    // Drain part of the gap fill, then drop the stream mid-piece.
+    let partial = scan_take(&cached, &id, start, dir, end, consumed).await?;
+    assert_eq!(partial.len(), consumed);
+
+    // The persisted frontier serves covered: zero lower scans.
+    counting.reset();
+    let prefix = scan_take(&cached, &id, start, dir, boundary, usize::MAX).await?;
+    assert_eq!(prefix.len(), GAP_COVER_STRIDE);
+    assert_eq!(
+        counting.lower_scans(),
+        0,
+        "{dir:?}: the stride-persisted frontier must serve covered"
+    );
+
+    // Never over-covered: the full re-scan still yields EVERY cell — the
+    // unpersisted tail reads as a gap and falls through, so nothing past
+    // the frontier is served as covered-absent.
+    counting.reset();
+    let all = scan_take(&cached, &id, start, dir, end, usize::MAX).await?;
+    assert_eq!(
+        all.len(),
+        TOTAL,
+        "{dir:?}: no cell past the frontier may be lost"
+    );
+    assert!(
+        counting.lower_scans() > 0,
+        "{dir:?}: the unpersisted tail must fall through to the lower store"
+    );
+    Ok(())
+}
+
 #[test]
-fn gap_frontier_persists_mid_stream_and_never_over_covers() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        // More than two strides of cells, consumed one stride + a partial.
-        const TOTAL: usize = 2 * GAP_COVER_STRIDE + 22;
-        let consumed = GAP_COVER_STRIDE + 10;
-        // The last coordinate whose cover was persisted (stride boundary);
-        // the 10 consumed past it were pending and are lost with the drop.
-        let boundary = u8::try_from(GAP_COVER_STRIDE - 1)?;
+fn gap_frontier_persists_mid_stream_and_never_over_covers_forward() -> Result<()> {
+    TEST_RUNTIME.block_on(gap_frontier_case(Direction::Forward))
+}
 
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            ScriptedOracle::default(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let id = CollectionId::new(
-            StateKey::new(Uuid::new_v4(), Arc::from("k")),
-            StateType::Application,
-            StateName::try_new("frontier")?,
-        );
-        let cref = CollectionRef::new(id.clone(), None);
-
-        // Seed the LOWER store directly (bypassing the cache) so the whole
-        // section is one uncovered gap.
-        let mut seed: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(TOTAL);
-        for i in 0..TOTAL {
-            seed.push((cell_at(u8::try_from(i)?), Some(bytes(1))));
-        }
-        counting.write_resolved(&cref, &seed, &[]).await?;
-
-        let cached = Cached::new(test_db::cache("frontier")?, counting.clone());
-
-        // Drain part of the gap fill, then drop the stream mid-piece.
-        let partial = scan_take(&cached, &id, ScanEdge::Included(255), consumed).await?;
-        assert_eq!(partial.len(), consumed);
-
-        // The persisted frontier `[0, boundary]` serves covered: zero lower
-        // scans.
-        counting.reset();
-        let prefix = scan_take(&cached, &id, ScanEdge::Included(boundary), usize::MAX).await?;
-        assert_eq!(prefix.len(), GAP_COVER_STRIDE);
-        assert_eq!(
-            counting.lower_scans(),
-            0,
-            "the stride-persisted frontier must serve covered"
-        );
-
-        // Never over-covered: the full re-scan still yields EVERY cell — the
-        // unpersisted tail reads as a gap and falls through, so nothing past
-        // the frontier is served as covered-absent.
-        counting.reset();
-        let all = scan_take(&cached, &id, ScanEdge::Included(255), usize::MAX).await?;
-        assert_eq!(all.len(), TOTAL, "no cell past the frontier may be lost");
-        assert!(
-            counting.lower_scans() > 0,
-            "the unpersisted tail must fall through to the lower store"
-        );
-        Ok(())
-    })
+#[test]
+fn gap_frontier_persists_mid_stream_and_never_over_covers_backward() -> Result<()> {
+    TEST_RUNTIME.block_on(gap_frontier_case(Direction::Backward))
 }

@@ -1,6 +1,6 @@
 //! Index-addressed double-ended queue collection.
 //!
-//! A Deque is a dense window of cells over a monotonic `i64` index space. The
+//! A Deque is a window of cells over a monotonic `i64` index space. The
 //! [`DequeHandle`] composes the uniform `CellView` typed cell interface —
 //! there is no Deque-specific store, session, or backend. Build a descriptor
 //! with [`deque_state`], register it with the consumer, and bind the
@@ -120,7 +120,7 @@ impl TryFrom<i8> for DequeNs {
 /// Declare via [`deque_state`].
 pub type DequeDescriptor<T = JsonCodec> = Descriptor<DequeKind<T>>;
 
-/// The Deque [`CollectionSpec`]: a dense index window plus the head/tail bounds
+/// The Deque [`CollectionSpec`]: an index window plus the head/tail bounds
 /// cell. The index encoding is pinned by the kind ([`I64KeyCodec`]) — never a
 /// registration choice — and rides the identity's key-codec token like any
 /// other key axis.
@@ -208,7 +208,7 @@ where
 
     /// Streams the live elements in index order — front to back for
     /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
-    /// element is resolved as it is yielded. See the module's dense-window
+    /// element is resolved as it is yielded. See the module's window
     /// invariant: the scan is bounded to the window `[head, tail − 1]`, so a
     /// popped tombstone (below `head` or at/above `tail`) is never yielded;
     /// `limit = len` is a belt-and-braces backstop over the fully-known window.
@@ -237,8 +237,9 @@ where
             let inner = self.entries.scan(start, dir, end, Some(len));
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
-                // The scan yields the decoded index; the dense window makes it
-                // redundant, so only the resolved element is exposed.
+                // The scan yields the decoded index; the module's window
+                // invariant makes it redundant, so only the resolved element is
+                // exposed.
                 let (_, value) = item?;
                 yield value;
             }

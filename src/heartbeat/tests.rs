@@ -1,10 +1,11 @@
 use super::*;
-use tokio::time::{Duration, Instant as TokioInstant, sleep};
+use quanta::Clock;
+use tokio::time::{Duration, Instant as TokioInstant};
 
 #[test]
 fn test_heartbeat_initially_active() {
-    let threshold = Duration::from_millis(100);
-    let heartbeat = Heartbeat::new("test_initial", threshold);
+    let (clock, _mock) = Clock::mock();
+    let heartbeat = Heartbeat::with_clock("test_initial", Duration::from_millis(100), clock);
     heartbeat.beat();
     assert!(
         !heartbeat.is_stalled(),
@@ -12,17 +13,19 @@ fn test_heartbeat_initially_active() {
     );
 }
 
-#[tokio::test]
-async fn test_heartbeat_becomes_stalled() {
-    let threshold = Duration::from_millis(100);
-    let heartbeat = Heartbeat::new("test_stall", threshold);
+#[test]
+fn test_heartbeat_becomes_stalled() {
+    let (clock, mock) = Clock::mock();
+    let heartbeat = Heartbeat::with_clock("test_stall", Duration::from_millis(100), clock);
     heartbeat.beat();
-    sleep(Duration::from_millis(50)).await;
+
+    mock.increment(Duration::from_millis(50));
     assert!(
         !heartbeat.is_stalled(),
         "Heartbeat should be active before the stall threshold is exceeded"
     );
-    sleep(Duration::from_millis(60)).await;
+
+    mock.increment(Duration::from_millis(60));
     assert!(
         heartbeat.is_stalled(),
         "Heartbeat should be stalled after inactivity exceeds the threshold"
@@ -35,7 +38,7 @@ async fn test_heartbeat_becomes_stalled() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_next_sleep_duration() {
     let threshold = Duration::from_millis(100);
     let heartbeat = Heartbeat::new("test_next", threshold);

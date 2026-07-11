@@ -5,7 +5,7 @@
 
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::oracle::CommitOracle;
 use crate::state::session::CellSession;
@@ -19,6 +19,7 @@ use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::stream::{self, Stream};
 use parking_lot::Mutex as SyncMutex;
+use quickcheck::{Arbitrary, Gen};
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
@@ -248,6 +249,18 @@ pub(crate) fn fixed_collection(name: &str) -> Result<CollectionId> {
         StateType::Application,
         StateName::try_new(name)?,
     ))
+}
+
+/// A short coordinate over a tiny null-prone byte alphabet, so a codec is
+/// exercised at the empty coordinate and at coordinates containing the bytes a
+/// length-delimited scheme might mishandle.
+pub(crate) fn arb_coordinate(g: &mut Gen) -> Coordinate {
+    const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
+    let len = usize::arbitrary(g) % 4;
+    let bytes: Vec<u8> = (0..len)
+        .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
+        .collect();
+    Coordinate::from_bytes(bytes)
 }
 
 /// A message event with the deterministic dedup id `Uuid::from_u128(n)`.

@@ -391,15 +391,21 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
     use crate::state::fjall::test_db;
     use crate::state::tests::support::fresh_collection;
     use crate::test_util::TEST_RUNTIME;
+    use std::env;
     use std::slice::from_ref;
-
-    /// Race repetitions: each round is one full interleaving opportunity.
-    const ROUNDS: u32 = 64;
 
     /// A raw single-byte coordinate (not pool-folded like [`point`]).
     fn coord(b: u8) -> Coordinate {
         Coordinate::from_bytes(vec![b])
     }
+
+    // Race repetitions: each round is one full interleaving opportunity.
+    // Sourced from `QUICKCHECK_TESTS` so CI can crank the race schedule; the
+    // dev default matches the in-memory property-test count.
+    let rounds: u32 = env::var("QUICKCHECK_TESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
 
     TEST_RUNTIME.block_on(async {
         let coverage = Coverage::new(test_db::cache("cover_race")?);
@@ -409,7 +415,7 @@ fn concurrent_cover_never_resurrects_a_punched_coordinate() -> Result<()> {
             Interval::new(Bound::Included(coord(a)), Bound::Included(coord(b)))
                 .ok_or_else(|| eyre!("non-empty interval"))
         };
-        for round in 0..ROUNDS {
+        for round in 0..rounds {
             // Re-cover the punch target, then race the punch against a cover
             // of a disjoint interval in the same section.
             coverage.cover(&id, section, iv(0, 10)?).await?;

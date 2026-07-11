@@ -1596,30 +1596,10 @@ where
                 model.cleared.insert(s);
             }
             OverlayOp::CommitClearSection(clear) => {
-                let s = clear.sect;
-                // Survivors deduped last-writer-wins (no batch timestamp
-                // ties), exactly as `run_bottom_scan_trace`'s `SeedClear`.
-                let mut survivors: BTreeMap<u8, u8> = BTreeMap::new();
-                for (c, v) in clear.survivors {
-                    survivors.insert(c, v);
-                }
-                let cells: Vec<(CellKey, Option<Bytes>)> = survivors
-                    .iter()
-                    .map(|(&c, &v)| (cell_in(s, c), Some(bytes(v))))
-                    .collect();
-                let section_clear =
-                    SectionClear::frozen_resolved(SECTIONS[s as usize % SECTIONS.len()], &cells);
-                overlay
-                    .lower()
-                    .write_resolved(&collection_ref, &cells, slice::from_ref(&section_clear))
-                    .await?;
-                // The committed side of the cleared section collapses to
-                // exactly the survivors; the dirty leg and its markers are
-                // untouched (this is a committed write beneath the overlay).
-                model.committed.retain(|&(sect, _), _| sect != s);
-                for (&c, &v) in &survivors {
-                    model.committed.insert((s, c), Some(bytes(v)));
-                }
+                // A committed write beneath the overlay: the cleared section's
+                // committed leg collapses to exactly its survivors; the dirty
+                // leg and its markers are untouched.
+                seed_section_clear(overlay.lower(), &collection_ref, &mut model, clear).await?;
             }
             OverlayOp::Scan(req) => {
                 let expected = scan_oracle(&model, req);
@@ -1722,6 +1702,40 @@ impl Arbitrary for SeedClear {
                 .collect(),
         }
     }
+}
+
+/// Apply a durable section clear to `store` and mirror it into `model`'s
+/// committed leg. Survivors are deduped last-writer-wins (no batch timestamp
+/// ties — a repeated coordinate would put two writes of one row in one batch),
+/// written alongside the frozen [`SectionClear`], and the cleared section's
+/// committed leg collapses to exactly those survivors. Shared by the overlay
+/// trace's `CommitClearSection` and the bottom-scan trace's `SeedClear`, which
+/// stage the identical durable clear beneath their respective readers.
+async fn seed_section_clear<S: CellStore>(
+    store: &S,
+    collection: &CollectionRef,
+    model: &mut CellModel,
+    clear: SeedClear,
+) -> Result<()> {
+    let s = clear.sect;
+    let mut survivors: BTreeMap<u8, u8> = BTreeMap::new();
+    for (c, v) in clear.survivors {
+        survivors.insert(c, v);
+    }
+    let cells: Vec<(CellKey, Option<Bytes>)> = survivors
+        .iter()
+        .map(|(&c, &v)| (cell_in(s, c), Some(bytes(v))))
+        .collect();
+    let section_clear =
+        SectionClear::frozen_resolved(SECTIONS[s as usize % SECTIONS.len()], &cells);
+    store
+        .write_resolved(collection, &cells, slice::from_ref(&section_clear))
+        .await?;
+    model.committed.retain(|&(sect, _), _| sect != s);
+    for (&c, &v) in &survivors {
+        model.committed.insert((s, c), Some(bytes(v)));
+    }
+    Ok(())
 }
 
 /// A scan request over one sampled section with random anchor, direction,
@@ -1916,27 +1930,7 @@ where
                 model.committed.insert((s, c), None);
             }
             ScanStep::SeedClear(clear) => {
-                let s = clear.sect;
-                // Survivors deduped last-writer-wins: repeats would put two
-                // writes of one row in one batch (a timestamp tie).
-                let mut survivors: BTreeMap<u8, u8> = BTreeMap::new();
-                for (c, v) in clear.survivors {
-                    survivors.insert(c, v);
-                }
-                let cells: Vec<(CellKey, Option<Bytes>)> = survivors
-                    .iter()
-                    .map(|(&c, &v)| (cell_in(s, c), Some(bytes(v))))
-                    .collect();
-                let section_clear =
-                    SectionClear::frozen_resolved(SECTIONS[s as usize % SECTIONS.len()], &cells);
-                store
-                    .write_resolved(&collection_ref, &cells, slice::from_ref(&section_clear))
-                    .await?;
-                // The cleared section collapses to exactly the survivors.
-                model.committed.retain(|&(sect, _), _| sect != s);
-                for (&c, &v) in &survivors {
-                    model.committed.insert((s, c), Some(bytes(v)));
-                }
+                seed_section_clear(&store, &collection_ref, &mut model, clear).await?;
             }
             ScanStep::Scan(req) => {
                 let expected = scan_oracle(&model, req);
@@ -2131,8 +2125,12 @@ where
         .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &writes))
         .collect();
     if writes.is_empty() && clears.is_empty() {
-        // Nothing staged and nothing cleared — no marker, nothing to apply.
-        return Ok(true);
+        // Nothing staged and nothing cleared — no marker is written, so the
+        // apply machinery is a no-op. Verify rather than skip: the committed
+        // base must survive untouched (no marker, no provisional residue, and
+        // every base row still reads its seeded value).
+        let keys: BTreeSet<(u8, u8)> = base.keys().copied().collect();
+        return assert_apply_settled(&store, probe, &id, &base, &keys).await;
     }
     let marker = EventMarker::frozen(event, &writes, &clears);
     store

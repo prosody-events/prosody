@@ -4,6 +4,7 @@ use super::{
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::event_ref::EventRef;
+use crate::state::tests::support::arb_coordinate;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use uuid::Uuid;
 
@@ -15,25 +16,13 @@ fn event() -> EventRef {
     }
 }
 
-/// A short coordinate over a tiny null-prone byte alphabet, so the codec is
-/// exercised at the empty coordinate and at coordinates containing the byte a
-/// length-delimited scheme might mishandle.
-fn arb_coord(g: &mut Gen) -> Coordinate {
-    const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
-    let len = usize::arbitrary(g) % 4;
-    let bytes: Vec<u8> = (0..len)
-        .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
-        .collect();
-    Coordinate::from_bytes(bytes)
-}
-
 /// A cell over a tiny section range (so duplicate sections and cross-section
 /// ordering are reachable) and the null-prone coordinate alphabet.
 fn arb_cell(g: &mut Gen) -> CellKey {
     let section = Section::new(i8::arbitrary(g) % 3);
     CellKey {
         section,
-        coordinate: arb_coord(g),
+        coordinate: arb_coordinate(g),
     }
 }
 

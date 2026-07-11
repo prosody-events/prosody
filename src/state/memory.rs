@@ -147,6 +147,30 @@ where
         &self.cells.inner
     }
 
+    /// The committed-unapplied read window, shared verbatim by `get` and
+    /// `scan_cells`: resolve a standing FOREIGN clears-bearing marker
+    /// (`help_read_window`) before the raw read/snapshot, so both paths serve
+    /// post-clear truth. The marker map is RAM — the ~always marker-free fast
+    /// path costs one map read. Both read paths MUST run identical help;
+    /// funneling them through one helper makes drift structurally impossible.
+    async fn read_help(
+        &self,
+        collection_ref: &CollectionRef,
+        own: EventRef,
+    ) -> Result<(), ResolveCellError<Infallible, O::Error>> {
+        let marker = self.standing_marker(collection_ref.id()).await?;
+        help_read_window(
+            self,
+            self.resolver.oracle(),
+            collection_ref,
+            marker.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?;
+        Ok(())
+    }
+
     /// Applies one frozen section clear: removes every stored cell of the
     /// cleared section whose coordinate is not a survivor (positional
     /// exclusion — the frozen list is sorted, so a binary search decides), and
@@ -186,20 +210,7 @@ where
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
-        // The committed-unapplied read window: resolve a standing foreign
-        // clears-bearing marker before the raw read (`help_read_window`), so
-        // the read serves post-clear truth. The marker map is RAM — the
-        // ~always marker-free fast path costs one map read.
-        let marker = self.standing_marker(collection).await?;
-        help_read_window(
-            self,
-            self.resolver.oracle(),
-            &collection_ref,
-            marker.as_ref(),
-            own,
-        )
-        .await
-        .map_err(flatten_resolve)?;
+        self.read_help(&collection_ref, own).await?;
         let raw = self.read_raw(collection, cell);
         resolve_read(
             self,
@@ -221,13 +232,9 @@ where
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
-            // Read-help before the snapshot (see `get`): a standing foreign
-            // clears-bearing marker is resolved so the snapshot below reads
-            // post-clear truth.
-            let marker = self.standing_marker(collection).await?;
-            help_read_window(self, self.resolver.oracle(), &collection_ref, marker.as_ref(), own)
-                .await
-                .map_err(flatten_resolve)?;
+            // Read-help before the snapshot (see `read_help`), so the snapshot
+            // below reads post-clear truth.
+            self.read_help(&collection_ref, own).await?;
             // Snapshot the matching raw cells synchronously (scc holds no
             // borrowing iterator across an await), then resolve each lazily.
             let mut raw: Vec<(CellKey, Cell)> = Vec::new();

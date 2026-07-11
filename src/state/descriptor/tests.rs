@@ -104,15 +104,41 @@ pub(crate) fn test_session_with_armed(
     state_key: StateKey,
     armed: ArmedKeys,
 ) -> (TestSession, MemoryCellStore<FixedOracle>) {
+    let (parts, cell_store) = session_parts(loader, registry, state_key, armed, false);
+    (KeyedStateSession::new(parts), cell_store)
+}
+
+/// The partition backend every test-session fixture in this module shares: the
+/// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
+type TestBackend =
+    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+
+/// Assembles the [`SessionParts`] shared by every test-session fixture — a
+/// fresh memory cell store over `registry`, the committed oracle, and the given
+/// `loader`/`state_key`/`armed`. When `cancelled`, the per-event cancellation
+/// watch starts tripped (binding still succeeds — bind validates registration,
+/// not liveness — but every typed op then guards to
+/// [`StateAccessError::Terminated`]). Returns the parts plus a store clone
+/// sharing the durable `Arc`, so a caller can inspect the cell after driving
+/// the lifecycle.
+///
+/// [`StateAccessError::Terminated`]: crate::state::access::StateAccessError::Terminated
+fn session_parts<L>(
+    loader: L,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    armed: ArmedKeys,
+    cancelled: bool,
+) -> (SessionParts<TestBackend, L>, MemoryCellStore<FixedOracle>) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let (_cancel_tx, cancel_rx) = watch::channel(cancelled);
     let registry = Arc::new(registry);
     let cell_store = MemoryCellStore::new(
         MemoryCells::new(),
         FixedOracle::committed(),
         registry.clone(),
     );
-    let session = KeyedStateSession::new(SessionParts {
+    let parts = SessionParts {
         cell: cell_store.clone(),
         dirty: Arc::new(DirtyStore::new()),
         oracle: FixedOracle::committed(),
@@ -125,8 +151,8 @@ pub(crate) fn test_session_with_armed(
         recovery_delay: CompactDuration::new(30),
         armed,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    });
-    (session, cell_store)
+    };
+    (parts, cell_store)
 }
 
 fn cart() -> ValueDescriptor {
@@ -630,28 +656,14 @@ mod typed_cell_view {
 
     /// Builds a [`GateSession`] over a fresh memory store carrying `ladder`.
     fn gate_session(ladder: Arc<GateLadder>) -> GateSession {
-        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let registry = Arc::new(CollectionDefRegistry::new(None));
-        let cell = MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            registry.clone(),
+        let (parts, _) = session_parts(
+            GateLoader(ladder),
+            CollectionDefRegistry::new(None),
+            StateKey::new(Uuid::new_v4(), Arc::from("gate")),
+            Arc::default(),
+            false,
         );
-        KeyedStateSession::new(SessionParts {
-            cell,
-            dirty: Arc::new(DirtyStore::new()),
-            oracle: FixedOracle::committed(),
-            loader: GateLoader(ladder),
-            registry,
-            state_key: StateKey::new(Uuid::new_v4(), Arc::from("gate")),
-            event: EventRef::Message {
-                dedup_id: Uuid::new_v4(),
-            },
-            recovery_delay: CompactDuration::new(30),
-            armed: Arc::default(),
-            termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        })
+        KeyedStateSession::new(parts)
     }
 
     /// Seeds cells `0..n` (payload == key) into a fresh gated session, then
@@ -929,27 +941,13 @@ mod typed_cell_view {
         loader: MemoryLoader<Value>,
         registry: CollectionDefRegistry,
     ) -> TestSession {
-        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-        let (_cancel_tx, cancel_rx) = watch::channel(true);
-        let registry = Arc::new(registry);
-        let cell = MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            registry.clone(),
-        );
-        KeyedStateSession::new(SessionParts {
-            cell,
-            dirty: Arc::new(DirtyStore::new()),
-            oracle: FixedOracle::committed(),
+        let (parts, _) = session_parts(
             loader,
             registry,
-            state_key: StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-            event: EventRef::Message {
-                dedup_id: Uuid::new_v4(),
-            },
-            recovery_delay: CompactDuration::new(30),
-            armed: Arc::default(),
-            termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        })
+            StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+            Arc::default(),
+            true,
+        );
+        KeyedStateSession::new(parts)
     }
 }

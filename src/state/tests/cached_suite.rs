@@ -385,8 +385,7 @@ fn coverage_op_budget() -> Result<()> {
 /// Warm survival within an assignment: a `Cached` rebuilt over the **same**
 /// fjall workspace (not a fresh assignment) is warm — its disk-backed
 /// provisional-coordinate cache and coverage both survive. The rebuilt cache's
-/// recovery
-/// sweep answers from the local fjall index with **zero** cold
+/// recovery sweep answers from the local fjall index with **zero** cold
 /// `provisional_cells` sweeps (only bounded warm point reads), and a covered
 /// `get` serves with zero lower reads. This is the in-assignment-warm proxy the
 /// crash case (a fresh assignment) is the cold complement of.
@@ -420,9 +419,8 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
             .await?;
 
         // Prime the warm provisional-coordinate cache: the first sweep is a cold
-        // seed (one
-        // `provisional_cells` call), which records the coordinate into fjall and
-        // marks the collection seeded.
+        // seed (one `provisional_cells` call), which records the coordinate into
+        // fjall and marks the collection seeded.
         counting.reset();
         let cold = drain_provisional(&cached, &id).await?;
         assert_eq!(cold, vec![3], "the cold sweep finds the provisional cell");
@@ -665,11 +663,10 @@ fn coverage_scan_isolation() -> Result<()> {
     })
 }
 
-/// Wide covered scan: a fully covered scan over more than the ~128-item coop
-/// threshold drives to completion and yields all N cells from the covered
-/// (fjall) serve.
+/// Wide covered scan: a fully covered re-scan over more cells than the item
+/// count yields every cell, in order, from the covered (fjall) serve.
 #[test]
-fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
+fn coverage_wide_covered_scan_yields_all() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         const N: u8 = 200;
         let oracle = ScriptedOracle::default();
@@ -749,6 +746,11 @@ fn prop_memory_cached_crash_equivalence() {
 /// (Cov1). The lower store reports a live `TTL(data)`-style remaining
 /// ([`TtlAwareCellStore`]), so the floored re-stamp is exercised and asserted
 /// `≤` the row's death. No sleep; the clock is advanced directly.
+///
+/// Example test by necessity: the covered-vs-lower serving decision turns on a
+/// sub-second clock crossing whose counter grain sits below the model's
+/// abstraction, so the fall-through pin cannot be generalized into the
+/// generator.
 #[test]
 fn ttl_co_expiry_covered_read_falls_through() -> Result<()> {
     use std::sync::atomic::AtomicU64;
@@ -1600,13 +1602,17 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
 
 /// The covered-SCAN expired-refill path (previously unproven): under FLOOR
 /// rounding a fjall entry expires slightly before its durable row, so a covered
-/// scan that meets an expired
-/// entry must REFILL that sub-range from the lower store — never read the
-/// expired coordinate as absent. Warms a covered scan, advances the clock past
-/// the floor expiry to a **sub-second** instant, asserts the re-scan still
-/// yields every coordinate and falls through, and asserts each refilled cell is
-/// re-stamped to `floor(now) + remaining` (`≤` the row death; Cov1) — the lower
-/// store reports a live `TTL(data)`-style remaining ([`TtlAwareCellStore`]).
+/// scan that meets an expired entry must REFILL that sub-range from the lower
+/// store — never read the expired coordinate as absent. Warms a covered scan,
+/// advances the clock past the floor expiry to a **sub-second** instant,
+/// asserts the re-scan still yields every coordinate and falls through, and
+/// asserts each refilled cell is re-stamped to `floor(now) + remaining` (`≤`
+/// the row death; Cov1) — the lower store reports a live `TTL(data)`-style
+/// remaining ([`TtlAwareCellStore`]).
+///
+/// Example test by necessity: the covered-vs-lower serving decision turns on a
+/// sub-second clock crossing whose counter grain sits below the model's
+/// abstraction, so the refill pin cannot be generalized into the generator.
 #[test]
 fn ttl_co_expiry_covered_scan_refills() -> Result<()> {
     use std::sync::atomic::AtomicU64;

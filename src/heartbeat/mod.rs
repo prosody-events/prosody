@@ -21,7 +21,7 @@ use crossbeam_utils::CachePadded;
 use educe::Educe;
 use humantime::format_duration;
 use parking_lot::Mutex;
-use quanta::Instant;
+use quanta::{Clock, Instant};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -111,6 +111,12 @@ struct Inner {
     /// Duration of inactivity allowed before considering a partition stalled
     stall_threshold: Duration,
 
+    /// Clock source for all liveness measurements. Production uses
+    /// [`Clock::new`]; tests inject a [`Clock::mock`] so time advances
+    /// deterministically instead of by wall clock.
+    #[educe(Debug(ignore))]
+    clock: Clock,
+
     /// The reference instant when the partition started, used for liveness
     /// checks
     #[educe(Debug(ignore))]
@@ -132,11 +138,24 @@ impl Heartbeat {
     where
         T: Into<Cow<'static, str>>,
     {
+        Self::with_clock(name, stall_threshold, Clock::new())
+    }
+
+    /// Creates a heartbeat monitor driven by a caller-supplied clock.
+    ///
+    /// Production goes through [`Heartbeat::new`] with a real [`Clock`]; tests
+    /// pass a [`Clock::mock`] to advance time deterministically.
+    fn with_clock<T>(name: T, stall_threshold: Duration, clock: Clock) -> Self
+    where
+        T: Into<Cow<'static, str>>,
+    {
+        let epoch = clock.now();
         Self {
             inner: Arc::new(Inner {
                 name: name.into(),
                 stall_threshold,
-                epoch: Instant::now(),
+                clock,
+                epoch,
                 last_heartbeat: CachePadded::default(),
                 last_state: CachePadded::default(),
             }),
@@ -149,7 +168,11 @@ impl Heartbeat {
     /// indicate it's functioning normally.
     pub fn beat(&self) {
         self.inner.last_heartbeat.store(
-            Instant::now().duration_since(self.inner.epoch).as_millis() as u64,
+            self.inner
+                .clock
+                .now()
+                .duration_since(self.inner.epoch)
+                .as_millis() as u64,
             Ordering::Release,
         );
     }
@@ -169,7 +192,7 @@ impl Heartbeat {
         let heartbeat_millis = self.inner.last_heartbeat.load(Ordering::Acquire);
         let heartbeat_duration = Duration::from_millis(heartbeat_millis);
         let last_heartbeat = self.inner.epoch + heartbeat_duration;
-        let inactivity = last_heartbeat.elapsed();
+        let inactivity = self.inner.clock.now().duration_since(last_heartbeat);
         let is_stalled = inactivity > self.inner.stall_threshold;
         let last_state = self.inner.last_state.load(Ordering::Acquire);
 

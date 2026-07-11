@@ -4,7 +4,7 @@ use super::{
     index_seeded_key,
 };
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::tests::support::fixed_collection;
+use crate::state::tests::support::{arb_coordinate, fixed_collection};
 use crate::state::{CollectionId, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
@@ -249,20 +249,10 @@ impl Arbitrary for ArbBound {
         let polarity = u8::arbitrary(g) % 3;
         Self(match polarity {
             0 => Bound::Unbounded,
-            1 => Bound::Included(arb_coord(g)),
-            _ => Bound::Excluded(arb_coord(g)),
+            1 => Bound::Included(arb_coordinate(g)),
+            _ => Bound::Excluded(arb_coordinate(g)),
         })
     }
-}
-
-/// A short coordinate over a tiny byte alphabet.
-fn arb_coord(g: &mut Gen) -> Coordinate {
-    const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
-    let len = usize::arbitrary(g) % 4;
-    let bytes: Vec<u8> = (0..len)
-        .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
-        .collect();
-    Coordinate::from_bytes(bytes)
 }
 
 /// Every bound frame round-trips: `decode_bound(encode_bound(b)) == b` over the

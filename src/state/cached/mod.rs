@@ -111,6 +111,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut, stream};
 use smallvec::SmallVec;
+use std::future::Future;
 use std::ops::Bound;
 use std::slice;
 use std::time::Duration;
@@ -202,24 +203,7 @@ impl<L> Cached<L> {
         cells: impl Iterator<Item = &'c CellKey>,
     ) {
         for (section, coordinates) in group_by_section(cells) {
-            loop {
-                match self
-                    .coverage
-                    .punch_many(collection, section, &coordinates)
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(error) => {
-                        // Not a degrade: this punch is must-succeed, so a
-                        // transient failure retries in place.
-                        warn!(error = %error, "committed-value cache punch failed");
-                        if error.classify_error() == ErrorCategory::Permanent {
-                            break;
-                        }
-                        sleep(PUNCH_RETRY_DELAY).await;
-                    }
-                }
-            }
+            retry_punch(|| self.coverage.punch_many(collection, section, &coordinates)).await;
         }
     }
 
@@ -237,24 +221,7 @@ impl<L> Cached<L> {
         clears: &[SectionClear],
     ) {
         for clear in clears {
-            loop {
-                match self
-                    .coverage
-                    .punch_section(collection, clear.section())
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(error) => {
-                        // Not a degrade: this punch is must-succeed, so a
-                        // transient failure retries in place.
-                        warn!(error = %error, "committed-value cache section punch failed");
-                        if error.classify_error() == ErrorCategory::Permanent {
-                            break;
-                        }
-                        sleep(PUNCH_RETRY_DELAY).await;
-                    }
-                }
-            }
+            retry_punch(|| self.coverage.punch_section(collection, clear.section())).await;
         }
     }
 
@@ -836,15 +803,16 @@ where
         {
             // A partial durable stage may have landed cells the warm set now
             // misses; drop the seeded latch so the next sweep re-seeds from
-            // the durable event marker and restores completeness (the
-            // warm-index invariant), closing the strand hole.
+            // the durable event marker and restores completeness (the warm
+            // provisional-coordinate cache's invariant), closing the strand hole.
             degrade_cover_mut("unseed", self.fjall.index_unseed(collection.id()).await);
             return Err(error);
         }
-        // Record the staged coordinates into the warm index after the durable
-        // ack, as one atomic batch. A warm write failure drops the seeded
-        // latch so the next sweep re-seeds from the durable event marker —
-        // never leaving the latch true with an unaccounted coordinate.
+        // Record the staged coordinates into the warm provisional-coordinate
+        // cache after the durable ack, as one atomic batch. A warm write
+        // failure drops the seeded latch so the next sweep re-seeds from the
+        // durable event marker — never leaving the latch true with an
+        // unaccounted coordinate.
         if let Err(error) = self
             .fjall
             .index_record_batch(collection.id(), writes.iter().map(|(cell, _)| cell))
@@ -1079,6 +1047,33 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
             anchor.saturating_add(u64::from(remaining.seconds()).saturating_mul(1_000))
         }
         None => 0,
+    }
+}
+
+/// Runs a must-succeed coverage `punch` to completion, holding the
+/// correctness-not-a-hint posture shared by
+/// [`Cached::punch_cells_must_succeed`] and
+/// [`Cached::punch_sections_must_succeed`] in one place: retry every transient
+/// failure after [`PUNCH_RETRY_DELAY`], and break on `Ok` or a **Permanent**
+/// error — a corrupt stored bound frame that deterministically degrades every
+/// read of the section anyway, so no stale covered serve is reachable and a
+/// retry could never succeed.
+async fn retry_punch<F, Fut>(mut punch: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), super::fjall::FjallCellCacheError>>,
+{
+    loop {
+        match punch().await {
+            Ok(()) => break,
+            Err(error) => {
+                warn!(error = %error, "committed-value cache punch failed");
+                if error.classify_error() == ErrorCategory::Permanent {
+                    break;
+                }
+                sleep(PUNCH_RETRY_DELAY).await;
+            }
+        }
     }
 }
 
