@@ -68,6 +68,17 @@ aspirations — perform each one; do not merely agree with it:
   simulation), reproduce the on-disk / on-wire state directly — open the
   underlying store and seed it without going through the type whose Drop
   would clean up. Forgetting is never the shortcut.
+- **No unbounded keyed RAM.** Operating assumptions: partitions owned for
+  weeks, ~6 collections per key, 100M keys per instance, total in-memory
+  budget ≈ 1 GiB (about the fjall block cache). Any in-memory structure keyed
+  by user key or collection must have a fixed capacity bound — at that scale
+  even ~100 bytes per key×collection is 10–60 GiB. Acceptable homes for keyed
+  state: fjall (RAM = block cache + memtables; data spills to the
+  assignment-scoped disk workspace) and a capacity-bounded `quick_cache`. An
+  insert-only `scc` map/set keyed by key or collection is a defect regardless
+  of entry size (the `MarkerMemo.checked` bug class). Every in-memory map
+  names its removal path; self-draining maps (removed on settle/fire) are
+  fine but still need the drain named.
 
 **Allocation (tiger style / data-oriented — https://tigerstyle.dev/):**
 
