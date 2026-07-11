@@ -78,11 +78,16 @@ aspirations — perform each one; do not merely agree with it:
   `smallvec`), and never let it reallocate.
 - **`with_capacity` excuses the sizing, never the allocation.** A per-call heap
   allocation on a steady-state path is the defect itself, however well it is
-  bounded. When the size is a compile-time constant, use a stack array
-  (`[u8; N]`) — a heap `Vec` for a fixed-size key or frame is never acceptable
-  (the fjall index-key builders once did exactly this by copying a sibling).
-  `Vec::with_capacity` is for cardinality known only at runtime, where a heap
-  buffer is unavoidable anyway.
+  bounded. Pick the buffer by what is known about the size:
+  - **Compile-time constant** → stack array (`[u8; N]`). A heap `Vec` for a
+    fixed-size key or frame is never acceptable (the fjall index-key builders
+    once did exactly this by copying a sibling).
+  - **Runtime-varying, but almost always ≤ some small N** → `SmallVec<[T; N]>`
+    with N sized to the common case: the steady state stays on the stack and
+    only the rare outlier pays for a heap spill. This is what `smallvec` is
+    *for* — using it as a resizable `Vec` with extra steps misses the point.
+  - **Genuinely unbounded or large runtime cardinality** → `Vec::with_capacity`
+    sized once; heap is unavoidable there anyway.
 - **Never add a *gratuitous* allocation to satisfy the borrow checker or the
   compiler.** When a `.map(|x| ...)` closure trips a higher-ranked-lifetime
   error, reach for a **function item** (`.map(Type::method)`), an index, or a
