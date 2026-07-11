@@ -203,10 +203,10 @@ Exemplar: `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs`.
 ### Seeding stale state directly
 
 To test recovery paths that normal execution cannot produce (a pending
-index row with no WAL, a pre-existing identity row), write the rows
-through the store's low-level API — bypassing the type whose lifecycle
-would normally prevent the state — then assert the sweep/recovery path
-cleans it up.
+provisional cell with its event marker and no WAL, a pre-existing identity
+row), write the rows through the store's low-level API — bypassing the type
+whose lifecycle would normally prevent the state — then assert the
+sweep/recovery path cleans it up.
 
 Exemplar: the seed-stale-identity acquire path in
 `src/state/descriptor_identity/tests.rs` (a frozen identity row written

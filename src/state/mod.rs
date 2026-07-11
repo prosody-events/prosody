@@ -36,6 +36,36 @@
 //! its one concrete [`PartitionBackend`], and the [`StateBackendFactory`] that
 //! mints it per partition — belongs to no leaf and stays here.
 //!
+//! # Operational notes
+//!
+//! Accepted-inherent costs and deployment assumptions, recorded so an operator
+//! meets no surprises.
+//!
+//! **Partition width is the application's data model.** One collection is one
+//! Cassandra partition — required for transactional semantics (one batch, one
+//! timestamp, one recovery scope), so the cell layer cannot bound it without a
+//! per-mutation count, which would force a read-before-write and break the
+//! blind `remove` of [`descriptor::map`]. A [`descriptor::deque`] is naturally
+//! bounded by its window; a [`descriptor::map`] should be kept comfortably
+//! under Cassandra's wide-partition pain — on the order of 100 MB, low-millions
+//! of cells. A hard cardinality bound, if ever needed, belongs in
+//! collection-owned `Meta` bookkeeping (as the deque window already is), never
+//! as a cell-layer feature.
+//!
+//! **TTL mass-expiry is transient and self-healing.** When a TTL'd section's
+//! cells expire, the first scans over it hit a one-time tombstone wave; because
+//! every scan carries concrete [`ScanEdge`] bounds pinned to the collection's
+//! live extent, the range collapses as those bounds themselves expire, so the
+//! wave self-heals and never needs operator action.
+//!
+//! **Cross-assignment clock skew is a standard Cassandra assumption, not a new
+//! hazard.** Last-write-wins ordering *across* assignments — a new assignee's
+//! write or delete versus a prior assignee's write of the same coordinate —
+//! rests on wall clocks, because the monotonic timestamp generator is
+//! per-session. Row-absence and section-clear deletes make deletes more common
+//! but do not change this pre-existing class. Assume standard Cassandra
+//! operations: NTP with bounded skew well below the failover interval.
+//!
 //! [`Cell`]: cell::Cell
 //! [`Committed`]: cell::Committed
 //! [`ProvisionalCell`]: cell::ProvisionalCell

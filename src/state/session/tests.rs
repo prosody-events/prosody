@@ -587,6 +587,13 @@ fn prop_value_lifecycle_equivalence() {
 /// report [`FinalizeOutcome::Staged`] — the backstop-arming rule — and
 /// `commit_apply` resolves that entry (never
 /// [`ApplyOutcome::NothingStaged`]).
+///
+/// An example because the [`FinalizeOutcome::Staged`] backstop-arming signal
+/// and the [`ApplyOutcome::Resolved`] apply signal are protocol outcomes
+/// [`prop_value_lifecycle_equivalence`] cannot observe: that property asserts
+/// the committed value projection, which a clears-only event leaves empty
+/// whether or not the backstop armed, so only the finalize/apply outcomes and
+/// the standing event marker expose the staging.
 #[tokio::test]
 async fn clears_only_event_finalizes_staged() -> Result<()> {
     let fx = Fixture::new()?;
@@ -633,6 +640,11 @@ async fn clears_only_event_finalizes_staged() -> Result<()> {
 /// blind-deleted by the clears-only event's own settle, and the session's own
 /// clears-bearing marker is written by `finalize` then deleted by
 /// `commit_apply` (which also applies the clear's gap erase).
+///
+/// The generated crash/reassignment alphabet (the crash-trace generator's
+/// clears dimension) subsumes this shape; these two pins are kept as the fast,
+/// deterministic falsifiers for the clears-only boundary arm, mirroring the
+/// `boundary_resolve_pin` role in the `state::tests` crash-equivalence suite.
 async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     let fx = Fixture::new()?;
     let raw = fx.cell_store();

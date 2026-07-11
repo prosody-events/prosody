@@ -210,7 +210,9 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
 }
 
 /// A buffer that ends inside a declared field decodes to `Truncated`, never a
-/// silent prefix.
+/// silent prefix. An example because [`prop_marker_payload_round_trips`] only
+/// encodes valid markers, so it can never synthesize a corrupt buffer — the
+/// rejection paths are unreachable by that generator.
 #[test]
 fn truncated_payload_is_rejected() {
     // Claims one staged cell but carries no cell bytes.
@@ -224,7 +226,9 @@ fn truncated_payload_is_rejected() {
 /// A count-inflated buffer — a `u32::MAX` staged count over four bytes of
 /// payload — fails `Truncated` (the error is the observable; the decoder's
 /// capacity cap keeps the lying count from demanding an unbounded allocation
-/// on the way there).
+/// on the way there). An example for the same reason as
+/// `truncated_payload_is_rejected`: the round-trip property cannot forge a
+/// lying count.
 #[test]
 fn inflated_count_is_rejected() {
     let inflated = [0xFF, 0xFF, 0xFF, 0xFF];
@@ -234,7 +238,9 @@ fn inflated_count_is_rejected() {
     );
 }
 
-/// Bytes past the last declared field decode to `TrailingGarbage`.
+/// Bytes past the last declared field decode to `TrailingGarbage`. An example
+/// for the same reason as `truncated_payload_is_rejected`: the round-trip
+/// property encodes exact-length buffers and cannot append trailing bytes.
 #[test]
 fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
     let marker = EventMarker::frozen(event(), &[], &[]);
