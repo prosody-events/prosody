@@ -139,7 +139,9 @@ impl<T> ScanEdge<T> {
         }
     }
 
-    /// Borrows the inner value, preserving inclusivity.
+    /// Borrows the inner value, preserving inclusivity. No internal caller —
+    /// kept as public-API parity with [`Bound::as_ref`], the borrow half of the
+    /// `as_ref().cloned()` pair a downstream holder of an owned edge needs.
     #[must_use]
     pub fn as_ref(&self) -> ScanEdge<&T> {
         match self {

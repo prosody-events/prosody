@@ -286,7 +286,9 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
 
 /// A mid-handler checkpoint drains only its own collection: the checkpointed
 /// collection's write is committed durably while the sibling's stays buffered
-/// and unwritten — the drain is collection-scoped, never key-scoped.
+/// and unwritten — the drain is collection-scoped, never key-scoped. An example
+/// because the lifecycle property drives a single collection, so it cannot
+/// observe sibling-collection isolation on a checkpoint.
 #[tokio::test]
 async fn checkpoint_drains_only_its_collection() -> Result<()> {
     let mut registry = CollectionDefRegistry::new(None);
@@ -718,7 +720,10 @@ async fn clears_only_session_boundary_resolves_aborted_foreign_marker() -> Resul
 /// converges to the retried values, and no event marker stands afterwards.
 /// The two attempts stage *different* cell sets so a kept (stale) marker is
 /// observable: recovery resolves exactly the coordinates the marker lists, so
-/// a stale list would strand the retry's extra cell.
+/// a stale list would strand the retry's extra cell. An example because the
+/// lifecycle trace generator does not carry retry re-finalize, and the
+/// idempotent same-event marker overwrite is a narrow protocol edge the
+/// value-projection model does not observe.
 #[tokio::test]
 async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     let fx = Fixture::new()?;
@@ -782,6 +787,65 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     assert!(
         fx.cells.standing_marker_of(&fx.value_id()).is_none(),
         "the settle deleted the single (overwritten) event marker"
+    );
+    Ok(())
+}
+
+/// The own-event read-window guard: the staging event's own reads between stage
+/// and settle must NOT resolve their own in-flight event marker
+/// (`help_read_window`'s `marker.event() == own` disjunct). Resolving it would
+/// settle the event mid-flight — the reachable shape is a retry attempt reading
+/// its own predecessor attempt's still-standing clears-bearing marker. This is
+/// an example because the value-projection lifecycle property is structurally
+/// blind to it: a mid-flight self-resolution rolls the uncommitted stage back
+/// and the retry re-stages the same values, so the committed projection still
+/// converges — only the marker's standing state, observed here at the read
+/// path, exposes the premature settle.
+#[tokio::test]
+async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
+    let fx = Fixture::new()?;
+    let raw = fx.cell_store();
+    let id = fx.value_id();
+    let collection = CollectionRef::new(id.clone(), None);
+
+    // Stage event E's clears-bearing marker directly (one survivor cell in the
+    // cleared section) and leave E unrecorded — in-flight, uncommitted.
+    let (e, _e_dedup) = message(1);
+    let writes = [(
+        cell_at(0),
+        ProvisionalWrite::new(Some(Bytes::from_static(b"s")), Committed::new(None), e),
+    )];
+    let clears = [SectionClear::frozen(Section::new(0), &writes)];
+    let marker = EventMarker::frozen(e, &writes, &clears);
+    raw.write_provisional(&collection, &writes, Some(&marker))
+        .await?;
+
+    // E's own read hits the standing marker with `own == E`: the guard keeps
+    // the marker standing (E must not settle itself mid-flight) and E's staged
+    // cell stays provisional.
+    raw.get(&id, &cell_at(0), e).await?;
+    let standing = fx
+        .cells
+        .standing_marker_of(&id)
+        .ok_or_else(|| eyre!("an own-event read must leave the in-flight marker standing"))?;
+    assert_eq!(
+        standing.event(),
+        e,
+        "the own read left E's marker untouched"
+    );
+    assert!(
+        !fx.cells.provisional_coordinates(&id).is_empty(),
+        "the own read settled nothing — E's staged cell is still provisional",
+    );
+
+    // Contrast — the resolve path is reachable, so the guard (not an inert
+    // resolve) is what protects the own read: a *foreign* read of the same
+    // uncommitted marker resolves it (verdict: not committed → rolled back, the
+    // marker deleted).
+    raw.get(&id, &cell_at(0), probe(999)).await?;
+    assert!(
+        fx.cells.standing_marker_of(&id).is_none(),
+        "a foreign read resolves the uncommitted marker away",
     );
     Ok(())
 }

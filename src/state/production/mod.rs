@@ -123,9 +123,9 @@ where
         );
         // Production writer bottom: fjall write-through cache over the resolving
         // Cassandra cell store; the session wraps this in its per-event Overlay.
-        // `Cached` owns the fjall workspace, so its warm provisional index and
-        // its scan coverage both spill to the one per-partition `index`
-        // keyspace.
+        // `Cached` owns the fjall workspace, so its warm provisional-coordinate
+        // cache and its scan coverage both spill to the one per-partition
+        // `index` keyspace.
         let CassandraCellResources { session, queries } = &self.cell;
         let cassandra = CassandraStore::new(
             session.clone(),

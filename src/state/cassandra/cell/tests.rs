@@ -243,7 +243,9 @@ where
 }
 
 /// Stage a set, observe it provisional, promote, read back resolved — the
-/// hot-path round-trip — then a direct resolved clear reads back absent.
+/// hot-path round-trip — then a direct resolved clear reads back absent. A fast
+/// deterministic smoke of shapes the crash-equivalence property and its
+/// physical oracle (`assert_physical`) cover organically over generated traces.
 #[tokio::test]
 async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     init_test_logging();
@@ -541,7 +543,9 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
 /// row-absence invariant): the cell reads back absent, and no residue row
 /// lingers — a stale `encoding`/`version` would still be selected. Settles
 /// through the routed `commit_provisional` path (the promote arm that owns
-/// clear→delete).
+/// clear→delete). A deterministic falsifier of the row-absence shape
+/// `assert_physical` asserts for every model-absent coordinate on the crash
+/// traces; it isolates the committed-clear delete leg at the bottom store.
 #[tokio::test]
 async fn committed_clear_deletes_the_row() -> Result<()> {
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
@@ -630,7 +634,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
     let id = c.id();
 
     // Both blobs and `event` absent, `encoding` = 4 (RawZstdV1), `version` = 1
-    // (INITIAL_VERSION) — the legacy promote-of-clear residue shape.
+    // (INITIAL_VERSION) — the legacy null-null residue shape.
     let insert = format!(
         "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
          kind, section, coordinate, encoding, version) VALUES (?, ?, ?, ?, 0, ?, ?, 4, 1)"
@@ -1478,7 +1482,9 @@ async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
 /// event marker *beneath* the cache, so `Cached::write_provisional` must punch
 /// A's marker-listed coordinates BEFORE forwarding down — without the punch,
 /// A's untouched coordinate keeps serving the stale covered `prev` verbatim
-/// forever.
+/// forever. A deterministic falsifier of the punch-ordering the fault/crash
+/// alphabet surfaces as model divergence against the live `Cached` composition;
+/// it isolates the skipped-settle boundary window without a generated schedule.
 #[tokio::test]
 async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
     use crate::state::oracle::CommitOracle;

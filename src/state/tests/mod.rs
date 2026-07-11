@@ -326,6 +326,11 @@ fn boundary_resolves_aborted_foreign_marker() -> Result<()> {
 /// stands. The crash-trace generator's clears dimension produces this shape
 /// organically; this pin is its fast deterministic falsifier, matching the
 /// documented role of [`boundary_resolve_pin`].
+///
+/// Deliberately kept parallel to [`boundary_resolve_pin`] (B stages a
+/// **clears-only** marker here, cell writes there) rather than folded: a shared
+/// body would thread a "writes vs clears" flag through a ~60-line B stage — a
+/// flag-parameter contortion the net-negative bar rejects.
 async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();

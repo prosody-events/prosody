@@ -148,8 +148,8 @@ pub struct Cached<L> {
 impl<L> Cached<L> {
     /// Composes a cache over `lower`, serving committed-value hits from `fjall`
     /// and covered scan sub-ranges from the (initially empty) coverage map.
-    /// Both the coverage map and the warm provisional index spill to
-    /// `fjall`'s `index` keyspace.
+    /// Both the coverage map and the warm provisional-coordinate cache spill
+    /// to `fjall`'s `index` keyspace.
     #[must_use]
     pub fn new(fjall: FjallCellCache, lower: L) -> Self {
         Self {
@@ -698,7 +698,8 @@ where
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        // The disk-backed warm provisional index gates the recovery sweep. Warm
+        // The disk-backed warm provisional-coordinate cache gates the recovery
+        // sweep. Warm
         // (seeded): the local fjall snapshot answers with ZERO Cassandra queries
         // (the zero-query-on-quiescence goal); an empty snapshot yields nothing.
         // Cold (a fresh assignment after crash/rebalance mints an empty `index`

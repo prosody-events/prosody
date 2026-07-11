@@ -625,7 +625,8 @@ impl FjallCellCache {
 
     // --- Warm index: provisional coordinates + cold-seed latch ---------------
     //
-    // The warm provisional index the recovery sweep short-circuits on. It lives
+    // The warm provisional-coordinate cache the recovery sweep short-circuits
+    // on. It lives
     // in the per-partition `index` keyspace, cold at a fresh assignment and
     // dropped at revocation. It is the disk-spilling relocation of the former
     // in-RAM `ProvisionalIndex`; the durable Cassandra event marker remains

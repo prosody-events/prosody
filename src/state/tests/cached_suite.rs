@@ -384,7 +384,8 @@ fn coverage_op_budget() -> Result<()> {
 
 /// Warm survival within an assignment: a `Cached` rebuilt over the **same**
 /// fjall workspace (not a fresh assignment) is warm — its disk-backed
-/// provisional index and coverage both survive. The rebuilt cache's recovery
+/// provisional-coordinate cache and coverage both survive. The rebuilt cache's
+/// recovery
 /// sweep answers from the local fjall index with **zero** cold
 /// `provisional_cells` sweeps (only bounded warm point reads), and a covered
 /// `get` serves with zero lower reads. This is the in-assignment-warm proxy the
@@ -418,7 +419,8 @@ fn warm_index_and_coverage_survive_same_workspace_rebuild() -> Result<()> {
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
 
-        // Prime the warm provisional index: the first sweep is a cold seed (one
+        // Prime the warm provisional-coordinate cache: the first sweep is a cold
+        // seed (one
         // `provisional_cells` call), which records the coordinate into fjall and
         // marks the collection seeded.
         counting.reset();
