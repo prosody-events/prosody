@@ -77,7 +77,7 @@ impl SectionClear {
     }
 
     /// [`Self::frozen`]'s resolved-shape twin for the direct-apply paths
-    /// (`ReadUncommitted` finalize, the mid-handler checkpoint): survivors are
+    /// (`ReadUncommitted` finalize, the mid-handler `commit()`): survivors are
     /// the section's present-data resolved cells. Shares the survivor
     /// definition with `frozen` — only the input shape differs.
     #[must_use]

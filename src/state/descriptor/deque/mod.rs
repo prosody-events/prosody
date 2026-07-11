@@ -35,7 +35,7 @@
 //! window move heal as a unit: a handler's entry mutation and the bounds move
 //! it buffers in one op stage in one batch with one write TS/TTL (see
 //! [`KeyedStateSession::finalize`](crate::state::session)) — and a
-//! mid-handler [`DequeHandle::checkpoint`] drains them in one batch the same
+//! mid-handler [`DequeHandle::commit`] drains them in one batch the same
 //! way.
 //!
 //! **Without a TTL the window is also dense**: every index in `[head, tail)`
@@ -394,14 +394,23 @@ where
 
     /// Durably commits this deque's buffered ops mid-handler — entries and
     /// the window bounds together, in one batch. At-least-once; see
-    /// [`CellSession::checkpoint`] for the contract.
+    /// [`CellSession::commit`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "deque.checkpoint", skip_all, fields(collection = self.entries.name().as_str()), err)]
-    pub async fn checkpoint(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
-        Ok(self.entries.checkpoint().await?)
+    #[instrument(name = "deque.commit", skip_all, fields(collection = self.entries.name().as_str()), err)]
+    pub async fn commit(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
+        Ok(self.entries.commit().await?)
+    }
+
+    /// Discards this deque's buffered uncommitted ops — entries and the window
+    /// bounds together — reverting reads to the last [`commit`](Self::commit),
+    /// or the pre-event committed state if none. Sync and infallible; see
+    /// [`CellSession::rollback`] for the contract.
+    #[instrument(name = "deque.rollback", skip_all, fields(collection = self.entries.name().as_str()))]
+    pub fn rollback(&self) -> StoreOutcome {
+        self.entries.rollback()
     }
 
     /// Buffers the bounds cell. Co-stamped with the entry mutation a single op

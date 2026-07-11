@@ -122,7 +122,7 @@ const MEMO_SECTIONS: usize = 1024;
 /// resurrects stale coverage** — a wrong covered answer for the rest of the
 /// assignment. Per-key event serialization does **not** exclude this: session
 /// ops are `&self`, so one handler can hold two of them concurrently polled (a
-/// `join!`-ed checkpoint and scan, a scan stream held across a get). Each
+/// `join!`-ed `commit()` and scan, a scan stream held across a get). Each
 /// mutation therefore serializes on a hash-sharded per-`(collection, section)`
 /// async lock, which also owns every **memo write**: a mutation refreshes the
 /// memo only after its store landed (and drops the entry when the store

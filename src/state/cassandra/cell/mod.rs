@@ -60,7 +60,7 @@
 //! * [`write_resolved`](CellStore::write_resolved) — writes a committed value
 //!   with `prev_data`/`event` nulled, **or deletes the row** when the value is
 //!   absent (the `ReadUncommitted` direct write/clear, the mid-handler
-//!   checkpoint, and rollback resolution).
+//!   `commit()`, and rollback resolution).
 //! * [`mark_resolved`](CellStore::mark_resolved) — *promote*: nulls `prev_data`
 //!   and `event` only, keeping `data` and its TTL. O(1) bytes; reserved for
 //!   present data.
@@ -721,7 +721,7 @@ where
             // the marker's over-report is safe.
             let reads = stream::iter(coords)
                 .map(|key| {
-                    // `cooperative` adds a per-cell coop-budget checkpoint;
+                    // `cooperative` adds a per-cell coop-budget yield point;
                     // `buffered` keeps full concurrency (and the index order).
                     cooperative(async move {
                         #[cfg(test)]

@@ -368,19 +368,32 @@ where
 
     /// Durably commits this map's buffered ops mid-handler — entries and
     /// bound ratchets together, in one batch. At-least-once; see
-    /// [`CellSession::checkpoint`] for the contract.
+    /// [`CellSession::commit`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
     #[instrument(
-        name = "map.checkpoint",
+        name = "map.commit",
         skip_all,
         fields(collection = self.entries.name().as_str()),
         err
     )]
-    pub async fn checkpoint(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
-        Ok(self.entries.checkpoint().await?)
+    pub async fn commit(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
+        Ok(self.entries.commit().await?)
+    }
+
+    /// Discards this map's buffered uncommitted ops — entries and bound
+    /// ratchets together — reverting reads to the last
+    /// [`commit`](Self::commit), or the pre-event committed state if none.
+    /// Sync and infallible; see [`CellSession::rollback`] for the contract.
+    #[instrument(
+        name = "map.rollback",
+        skip_all,
+        fields(collection = self.entries.name().as_str())
+    )]
+    pub fn rollback(&self) -> StoreOutcome {
+        self.entries.rollback()
     }
 
     /// Ratchets the min/max bounds outward to `key`. Reads both bound cells

@@ -56,7 +56,7 @@ pub type CellSnapshot = SmallVec<[(CellKey, DirtyVal); CELLS_INLINE]>;
 
 /// One collection's dirty cells in committed-write form (`(cell, data)`),
 /// owned and coordinate-ordered — the [`CellStore::write_resolved`] input
-/// shape, inline like [`CellSnapshot`] so a checkpoint of a Value or a small
+/// shape, inline like [`CellSnapshot`] so a `commit()` of a Value or a small
 /// Map/Deque allocates nothing.
 ///
 /// [`CellStore::write_resolved`]: crate::state::store::CellStore::write_resolved
@@ -187,7 +187,7 @@ impl DirtyStore {
     /// (never interior-mutated), so the lock-free snapshot read is exactly
     /// right — and it avoids `read_sync`'s lock-retry loop, which spins
     /// forever on a key that was just drained by [`Self::remove_collection`]
-    /// in the same (single-threaded) event (the checkpoint → re-read path).
+    /// in the same (single-threaded) event (the `commit()` → re-read path).
     ///
     /// [`Overlay`]: crate::state::overlay::Overlay
     #[must_use]
@@ -216,7 +216,7 @@ impl DirtyStore {
 
     /// An owned, coordinate-ordered snapshot of one collection's dirty cells
     /// across every section, already in committed-write form — the mid-handler
-    /// checkpoint's drain read (cells only; [`Self::cleared_sections`] is its
+    /// `commit()`'s drain read (cells only; [`Self::cleared_sections`] is its
     /// clear half). Same owned-snapshot rationale as
     /// [`Self::section_snapshot`].
     #[must_use]
@@ -229,7 +229,7 @@ impl DirtyStore {
     }
 
     /// One collection's sections under a standing dirty clear marker — the
-    /// mid-handler checkpoint's clear half, beside
+    /// mid-handler `commit()`'s clear half, beside
     /// [`Self::collection_snapshot`].
     #[must_use]
     pub fn cleared_sections(&self, collection: &CollectionId) -> ClearedSections {
@@ -240,15 +240,33 @@ impl DirtyStore {
             .collect()
     }
 
-    /// Discards one collection's buffered outcomes and dirty clear markers
-    /// (after a mid-handler checkpoint wrote them through). Race-free for the
-    /// same reason as [`Self::clear_event`]: no handler op is in flight while
-    /// the handler itself awaits the checkpoint.
+    /// Discards one collection's buffered outcomes and dirty clear markers —
+    /// the drain shared by the mid-handler `commit()` (which first wrote them
+    /// through) and `rollback()` (which discards them outright). Race-free for
+    /// the same reason as [`Self::clear_event`]: no handler op is in flight
+    /// while the handler itself awaits the commit or calls the rollback.
     pub fn remove_collection(&self, collection: &CollectionId) {
         self.entries
             .remove_range_sync(CollectionScope::range(collection));
         self.markers
             .remove_range_sync(MarkerCollectionScope::range(collection));
+    }
+
+    /// Whether any dirty cell or clear marker is buffered for the collection —
+    /// the mid-handler `rollback()`'s `Applied`/`NoOp` probe, beside
+    /// [`Self::remove_collection`]. A lock-free range peek over both trees.
+    #[must_use]
+    pub fn collection_dirty(&self, collection: &CollectionId) -> bool {
+        let guard = Guard::new();
+        self.entries
+            .range(CollectionScope::range(collection), &guard)
+            .next()
+            .is_some()
+            || self
+                .markers
+                .range(MarkerCollectionScope::range(collection), &guard)
+                .next()
+                .is_some()
     }
 
     /// Groups this event's (one `key`) dirty state by collection — the
@@ -392,8 +410,9 @@ impl scc::Comparable<DirtyKey> for KeyScope {
 }
 
 /// Bounding query for every [`DirtyKey`] in one collection — the mid-handler
-/// checkpoint sub-range, for [`DirtyStore::collection_snapshot`] and
-/// [`DirtyStore::remove_collection`]. Compares on `(key, state_type, name)`,
+/// `commit()`/`rollback()` sub-range, for [`DirtyStore::collection_snapshot`]
+/// and [`DirtyStore::remove_collection`]. Compares on `(key, state_type,
+/// name)`,
 /// ignoring the cell, so the range spans the collection's cells across every
 /// section in coordinate order; see [`Edge`] for the strict-separator bounds.
 #[derive(Clone, PartialEq, Eq)]

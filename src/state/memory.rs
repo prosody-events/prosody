@@ -254,8 +254,8 @@ where
             // a limit slot (matching the Cassandra scan's `yielded` counter).
             //
             // The resolved fast path touches no tokio leaf, so a large in-memory
-            // scan would drain in one poll; a per-item `cooperative` checkpoint
-            // yields every ~128 items.
+            // scan would drain in one poll; a per-item `cooperative` yield point
+            // fires every ~128 items.
             let mut yielded = 0usize;
             for (cell, stored) in raw {
                 if limit.is_some_and(|n| yielded >= n) {
@@ -306,8 +306,8 @@ where
             };
             // Point-read each coordinate; a concurrently-resolved coordinate
             // decodes `Resolved` and is dropped (over-report-safe). The reads
-            // touch no tokio leaf, so a per-item `cooperative` checkpoint yields
-            // a large recovery drain to the runtime every ~128 items.
+            // touch no tokio leaf, so a per-item `cooperative` yield point
+            // releases a large recovery drain to the runtime every ~128 items.
             for cell in coords {
                 if let Cell::Provisional(provisional) = self.read_raw(collection, &cell) {
                     yield cooperative(async move { (cell, provisional) }).await;

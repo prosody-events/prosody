@@ -174,12 +174,17 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn checkpoint(
+    async fn commit(
         &self,
         _state_type: StateType,
         _name: &StateName,
     ) -> Result<StoreOutcome, StateAccessError> {
         Err(StateAccessError::Unavailable)
+    }
+
+    fn rollback(&self, _state_type: StateType, _name: &StateName) -> StoreOutcome {
+        // Stateless: nothing is ever buffered, so the discard is a NoOp.
+        StoreOutcome::NoOp
     }
 }
 

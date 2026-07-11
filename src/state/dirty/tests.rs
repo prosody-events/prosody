@@ -10,7 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Regression: a `lookup` after a same-collection drain must return `None`
-/// promptly, never hang. `remove_collection` is the mid-handler checkpoint
+/// promptly, never hang. `remove_collection` is the mid-handler `commit()`
 /// path (the session drains the collection's buffered cells after writing
 /// them through); a subsequent `get` re-reads the dirty leg via `lookup`. The
 /// lock-free `peek_with` read makes this terminate — the lock-based
@@ -104,10 +104,10 @@ fn section_snapshot_returns_whole_section_beside_a_lower_section() -> Result<()>
 /// of [`section_snapshot_returns_whole_section_beside_a_lower_section`] for
 /// the cell tree): with the marker tree spanning multiple scc leaf nodes and a
 /// neighbouring key populated below, `touched` must report every marker in the
-/// key's sub-range, `remove_collection` (the mid-handler checkpoint drain)
+/// key's sub-range, `remove_collection` (the mid-handler `commit()` drain)
 /// must remove exactly its collection's markers, and `clear_event` must remove
 /// exactly the key's. A fat collection bound seeks mid-span and leaves a
-/// leading dirty clear marker standing after the checkpoint wrote the erasure
+/// leading dirty clear marker standing after the `commit()` wrote the erasure
 /// through — later same-event reads keep answering "cleared" for repopulated
 /// state.
 #[test]
@@ -156,7 +156,7 @@ fn marker_scopes_span_multiple_leaf_nodes() -> Result<()> {
         store.clear_section(&wide, Section::new(-step - 1));
     }
     // `cleared_sections` IS the `MarkerCollectionScope` range walk (the
-    // checkpoint drain's clear half), so probing through it pins both the
+    // `commit()` drain's clear half), so probing through it pins both the
     // scope's seek contract and the accessor.
     let sections: Vec<i8> = store
         .cleared_sections(&wide)
@@ -291,7 +291,7 @@ fn dirty_matches(
     for k in 0..OP_KEYS {
         for c in 0..OP_COLLS {
             let id = &ids[k as usize][c as usize];
-            // The checkpoint drain's clear half: exactly the model's markers.
+            // The `commit()` drain's clear half: exactly the model's markers.
             let cleared: BTreeSet<i8> = store
                 .cleared_sections(id)
                 .into_iter()
@@ -304,6 +304,13 @@ fn dirty_matches(
                 .map(|&(.., s)| s)
                 .collect();
             if cleared != expected_cleared {
+                return Ok(false);
+            }
+            // `collection_dirty` is the rollback Applied/NoOp probe: it must
+            // agree with the model's emptiness for the collection.
+            let model_dirty = !expected_cleared.is_empty()
+                || model.cells.keys().any(|&(k2, c2, ..)| k2 == k && c2 == c);
+            if store.collection_dirty(id) != model_dirty {
                 return Ok(false);
             }
             for s in 0..OP_SECTIONS {

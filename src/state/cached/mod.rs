@@ -837,7 +837,7 @@ where
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // Cov-Clr punch, BEFORE the lower call. This is the marker-free direct
-        // apply (ReadUncommitted finalize / mid-handler checkpoint): a stale
+        // apply (ReadUncommitted finalize / mid-handler `commit()`): a stale
         // covered pre-clear value here has NO later repair — no marker exists
         // for read-help to resolve — so punch-first is mandatory. A failed or
         // cancelled lower write then leaves the sections merely uncovered (a

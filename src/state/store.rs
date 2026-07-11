@@ -68,7 +68,7 @@ use std::future::Future;
 /// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
 ///   each cell (the `ReadCommitted` outcome path).
 /// * [`Self::write_resolved`] — writes committed values with `event` and `prev`
-///   null (the `ReadUncommitted` direct write, the mid-handler checkpoint, and
+///   null (the `ReadUncommitted` direct write, the mid-handler `commit()`, and
 ///   rollback resolution, where the committed value is the staged `prev`).
 /// * [`Self::mark_resolved`] — *promote*: nulls `event` and `prev`, keeping
 ///   `data`. O(1) regardless of value size; the commit arm of resolution.
@@ -248,7 +248,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// batch, binding `collection`'s TTL, partitioning internally on data
     /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
     /// `None` **deletes the row** (the row-absence invariant). Covers the
-    /// `ReadUncommitted` direct clear, the mid-handler checkpoint of a clear,
+    /// `ReadUncommitted` direct clear, the mid-handler `commit()` of a clear,
     /// and rollback-to-absent. Never touches the event marker (see
     /// [`write_provisional`](Self::write_provisional)).
     ///

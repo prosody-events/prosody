@@ -62,8 +62,8 @@ impl TimerEventRef {
 /// [`EventRef`] against the upstream commit source (deduplication store for
 /// messages, timer-row tag for timers — see
 /// [`CommitOracle`](crate::state::oracle::CommitOracle)). Distinct from
-/// [`StoreOutcome`], which is the durable store's "did this call mutate
-/// state" signal: the oracle decides, the store acts on the decision.
+/// [`StoreOutcome`], which reports whether a call took effect: the oracle
+/// decides, the store — or the buffer drain — acts.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
     /// The event's provisional write committed: promote it to the committed
@@ -74,21 +74,22 @@ pub enum CommitDecision {
     NotCommitted,
 }
 
-/// Did this store call mutate authoritative state.
+/// Did this call take effect.
 ///
-/// Returned by the mid-handler write-through path
-/// ([`checkpoint`](super::session::CellSession::checkpoint)):
-/// [`StoreOutcome::Applied`] when buffered ops were written to the committed
-/// value, [`StoreOutcome::NoOp`] when nothing was buffered.
+/// Returned by the mid-handler transactional pair
+/// ([`commit`](super::session::CellSession::commit) /
+/// [`rollback`](super::session::CellSession::rollback)):
+/// [`StoreOutcome::Applied`] when buffered ops were drained — written to the
+/// committed value by `commit()`, discarded by `rollback()` —
+/// [`StoreOutcome::NoOp`] when nothing was buffered.
 ///
 /// Distinct from [`CommitDecision`]: the oracle decides whether a provisional
-/// cell should commit, the store reports whether it actually changed durable
-/// state when called.
+/// cell should commit, this reports whether the call actually took effect.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum StoreOutcome {
-    /// The call mutated authoritative state.
+    /// The call took effect.
     Applied,
 
-    /// No durable state changed (idempotent no-op).
+    /// Nothing was buffered (idempotent no-op).
     NoOp,
 }

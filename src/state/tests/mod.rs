@@ -150,13 +150,13 @@ fn prop_memory_bottom_scan() {
 }
 
 /// Deque collection soundness over the real session lifecycle: random
-/// push/pop/clear/mid-handler-checkpoint traces with commit/abort/crash
+/// push/pop/clear/mid-handler-commit traces with commit/abort/crash
 /// outcomes keep the handle's `len`/`stream`/`get` and every `pop` return
 /// value in step with a `VecDeque` oracle — the window invariant (incl. the
 /// index-space reset on clear), bounds+entries crash atomicity, and the
-/// at-least-once checkpoint contract (checkpointed ops survive
-/// abort/crash-rollback; post-checkpoint ops roll back — so
-/// checkpoint-then-clear-then-abort restores the checkpointed state).
+/// at-least-once `commit()` contract (`commit()`-landed ops survive
+/// abort/crash-rollback; post-commit ops roll back — so a
+/// commit-then-clear-then-abort trace restores the `commit()`-landed state).
 #[test]
 fn prop_deque_collection_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
@@ -177,12 +177,13 @@ fn prop_deque_collection_lifecycle_read_uncommitted() {
 }
 
 /// Map collection soundness over the real session lifecycle: random
-/// set/remove/get/clear/mid-handler-checkpoint traces with commit/abort/crash
+/// set/remove/get/clear/mid-handler-commit traces with commit/abort/crash
 /// outcomes keep the handle's `get` and key-ordered `stream` in step with a
 /// `BTreeMap` oracle — the loose-superset bounds (cleared with the entries),
-/// crash atomicity, and the at-least-once checkpoint contract (checkpointed
-/// ops survive abort/crash-rollback; post-checkpoint ops roll back — so
-/// checkpoint-then-clear-then-abort restores the checkpointed state).
+/// crash atomicity, and the at-least-once `commit()` contract
+/// (`commit()`-landed ops survive abort/crash-rollback; post-commit ops roll
+/// back — so a commit-then-clear-then-abort trace restores the
+/// `commit()`-landed state).
 #[test]
 fn prop_map_collection_lifecycle() {
     fn property(trace: MapTrace) -> Result<bool> {

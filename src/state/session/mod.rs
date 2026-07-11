@@ -19,7 +19,8 @@
 //!
 //! - [`CellSession`] — the read/buffer/mutate surface handlers reach through
 //!   collection handles: `get`/`scan` + the buffering mutators
-//!   `set`/`clear`/`clear_section` and the mid-handler `checkpoint`, plus
+//!   `set`/`clear`/`clear_section` and the mid-handler transactional pair
+//!   `commit`/`rollback`, plus
 //!   `loader`/`is_terminated`/`verify_state_registration`.
 //!   [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
@@ -90,9 +91,10 @@ mod tests;
 /// [`SectionClear`]s its event marker carries — what the lifecycle promotes
 /// or rolls back.
 ///
-/// Built exactly once per collection, at `finalize`, from the post-checkpoint
-/// dirty buffer — checkpointed cells are already committed and never
-/// marker-listed, so the record lists exactly the cells recovery owns. Only a
+/// Built exactly once per collection, at `finalize`, from the post-`commit()`
+/// dirty buffer — `commit()`-landed cells are already durably committed and
+/// never marker-listed, so the record lists exactly the cells recovery owns.
+/// Only a
 /// retry attempt re-running `finalize` rebuilds it, overwriting the same-event
 /// marker idempotently. Only `ReadCommitted` collections appear;
 /// `ReadUncommitted` writes resolve at stage time with nothing to settle. Each
@@ -112,7 +114,8 @@ type StagedSet = Vec<(
 /// `get`/`scan` describe the session's **visible committed bytes** for a cell —
 /// [`KeyedStateSession`] realises that through the dirty overlay + oracle
 /// resolution — and `set`/`clear`/`clear_section` buffer this event's
-/// mutations (`checkpoint` writes them through mid-handler). The
+/// mutations (`commit` writes them through mid-handler; `rollback` discards
+/// them). The
 /// framework reaches the manager-driven lifecycle through the sealed
 /// `StateLifecycle` supertrait, which is what seals `CellSession`: downstream
 /// crates can name it in bounds (e.g. [`EventContext::State`]) but can neither
@@ -222,24 +225,32 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Durably commits the collection's buffered changes mid-handler, so they
     /// survive a restart after failure. This is why it exists: a complex or
     /// large handler (a materialization handler fanning one message into
-    /// thousands of writes) checkpoints incremental progress and resumes from
+    /// thousands of writes) commits incremental progress and resumes from
     /// it on retry or redelivery instead of starting from scratch. Handler
     /// idempotence across the resume is the contract.
     ///
     /// Every currently-buffered op of the collection is written straight to
     /// committed state ([`write_resolved`]) in one same-partition batch and
-    /// dropped from the dirty buffer, so multi-cell kinds checkpoint data and
+    /// dropped from the dirty buffer, so multi-cell kinds commit data and
     /// bookkeeping as a unit (a Map's entries and bound ratchets, a Deque's
-    /// entries and window bounds). Valid in **both** commit modes. The
-    /// guarantee is **at-least-once**: a checkpointed write is durable and
+    /// entries and window bounds). The
+    /// guarantee is **at-least-once**: a `commit()`-landed write is durable and
     /// visible immediately — never provisional, never listed in any event
-    /// marker, never rolled back. Ops buffered *after* the checkpoint ride
+    /// marker, never rolled back. Ops buffered *after* the commit ride
     /// the collection's normal stage→settle path; reads already see buffered
-    /// writes without checkpointing.
+    /// writes without committing.
     ///
-    /// Every collection handle exposes `checkpoint()` — Value, Map, and Deque
+    /// **Orthogonal to [`CommitMode`]:** the mode governs how *un-committed*
+    /// writes settle at the event boundary — staged provisionally for
+    /// `ReadCommitted` (external readers observe committed values only after
+    /// the event commits), applied immediately for `ReadUncommitted`.
+    /// `commit()` bypasses that staging entirely: a `commit()`-landed write
+    /// on a `ReadCommitted` collection is externally visible at once and
+    /// survives an event abort.
+    ///
+    /// Every collection handle exposes `commit()` — Value, Map, and Deque
     /// all do, and future collection kinds must too; the handles' docs link
-    /// back here.
+    /// back here. [`Self::rollback`] is its discard twin.
     ///
     /// Returns [`StoreOutcome::Applied`] when buffered ops were written, or
     /// [`StoreOutcome::NoOp`] when nothing was buffered.
@@ -251,11 +262,34 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// buffer is left intact, so the ops still ride the normal commit path).
     ///
     /// [`write_resolved`]: crate::state::store::CellStore::write_resolved
-    fn checkpoint(
+    fn commit(
         &self,
         state_type: StateType,
         name: &StateName,
     ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
+
+    /// Discards the collection's buffered uncommitted ops mid-handler — cells
+    /// *and* dirty clear markers — reverting reads to the last
+    /// [`Self::commit`], or the pre-event committed value if none. It is
+    /// `commit()` minus the durable write: the same whole-collection drain,
+    /// to nothing.
+    ///
+    /// **It cannot cross a `commit()` floor.** A `commit()`-landed row is
+    /// durable and unreachable by rollback — only ops buffered since the last
+    /// `commit()` are discarded.
+    ///
+    /// Sync and infallible by design: it touches only the in-memory dirty
+    /// buffer, does no I/O, and cannot fail — deliberately asymmetric with the
+    /// async, fallible [`Self::commit`]. It is valid even on a terminated
+    /// session.
+    ///
+    /// Distinct from the settle boundary's rollback of staged provisional cells
+    /// (`rollback_aborted`, framework-only, after the handler returns): this is
+    /// the handler-facing mid-flight discard.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when buffered ops were discarded, or
+    /// [`StoreOutcome::NoOp`] on an empty buffer.
+    fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome;
 }
 
 /// Crate-sealed lifecycle half of [`CellSession`].
@@ -697,7 +731,7 @@ where
         Ok(())
     }
 
-    async fn checkpoint(
+    async fn commit(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -732,6 +766,18 @@ where
         // because the clears were applied durably in the same write.
         dirty.remove_collection(&id);
         Ok(StoreOutcome::Applied)
+    }
+
+    fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome {
+        let id = self.id_for(state_type, name);
+        let dirty = self.inner.overlay.dirty();
+        // Peek-then-drain is race-free per [`DirtyStore::remove_collection`]:
+        // no handler op is in flight while the handler itself calls rollback.
+        if !dirty.collection_dirty(&id) {
+            return StoreOutcome::NoOp;
+        }
+        dirty.remove_collection(&id);
+        StoreOutcome::Applied
     }
 }
 
@@ -886,7 +932,7 @@ where
             // provisional cell stands, so a retry re-stages over the same base
             // (idempotent) — a `Set` cell in a cleared section keeps its
             // committed pre-clear `prev` this way. `cooperative` adds a
-            // per-cell coop-budget checkpoint; `buffer_unordered` keeps full
+            // per-cell coop-budget yield point; `buffer_unordered` keeps full
             // concurrency. Reordering is irrelevant — the cells are distinct
             // coordinates landing in one same-partition batch. These reads are
             // all within this one collection (one shard), so they fan out
@@ -914,7 +960,7 @@ where
                 return Ok(None);
             }
             // `finalize` builds the staged record exactly once per collection
-            // from the post-checkpoint dirty buffer, so the marker lists
+            // from the post-`commit()` dirty buffer, so the marker lists
             // exactly this stage's writes and frozen clears; only a retry
             // attempt re-running `finalize` re-stages (an idempotent
             // same-event marker overwrite). A clears-only collection stages

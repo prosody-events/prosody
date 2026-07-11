@@ -16,13 +16,13 @@
 //! outcome, `ReadUncommitted` commits everything at `finalize` regardless of
 //! the outcome.
 //!
-//! Both op alphabets include the mid-handler `Checkpoint`: the runner
-//! snapshots the scratch model at each checkpoint, and on a non-committing
-//! outcome the committed read-back must equal the last checkpointed snapshot —
-//! checkpointed ops (entries *and* bookkeeping cells, as one batch) survive
-//! abort and crash-rollback while post-checkpoint ops still roll back, the
-//! at-least-once checkpoint contract. A checkpoint-then-clear-then-abort
-//! trace therefore pins that abort restores the *checkpointed* state, never
+//! Both op alphabets include the mid-handler `Commit`: the runner
+//! snapshots the scratch model at each `commit()`, and on a non-committing
+//! outcome the committed read-back must equal the last `commit()`-landed
+//! snapshot — `commit()`-landed ops (entries *and* bookkeeping cells, as one
+//! batch) survive abort and crash-rollback while post-commit ops still roll
+//! back, the at-least-once `commit()` contract. A commit-then-clear-then-abort
+//! trace therefore pins that abort restores the `commit()`-landed state, never
 //! the pre-event state.
 //!
 //! Memory-backed only: the `cell_suite` runners already prove memory ↔
@@ -118,12 +118,12 @@ impl Arbitrary for Outcome {
     }
 }
 
-/// What one applied op observed: keep going, a mid-event checkpoint happened
+/// What one applied op observed: keep going, a mid-handler `commit()` landed
 /// (the runner snapshots the scratch model as immediately durable), or a
 /// return value diverged from the model (property failure).
 enum OpOutcome {
     Continue,
-    Checkpointed,
+    Committed,
     Mismatch,
 }
 
@@ -135,7 +135,7 @@ pub(crate) enum DequeOp {
     PopBack,
     PopFront,
     Clear,
-    Checkpoint,
+    Commit,
 }
 
 impl Arbitrary for DequeOp {
@@ -146,20 +146,20 @@ impl Arbitrary for DequeOp {
             2 => Self::PopBack,
             3 => Self::PopFront,
             4 => Self::Clear,
-            _ => Self::Checkpoint,
+            _ => Self::Commit,
         }
     }
 }
 
 /// One map mutation, mid-trace read, whole-map clear, or mid-handler
-/// checkpoint over the bounded key pool.
+/// `commit()` over the bounded key pool.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MapOp {
     Set(i64, u8),
     Remove(i64),
     Get(i64),
     Clear,
-    Checkpoint,
+    Commit,
 }
 
 impl Arbitrary for MapOp {
@@ -170,7 +170,7 @@ impl Arbitrary for MapOp {
             2 => Self::Remove(key),
             3 => Self::Get(key),
             4 => Self::Clear,
-            _ => Self::Checkpoint,
+            _ => Self::Commit,
         }
     }
 }
@@ -379,12 +379,12 @@ struct Backing<'a> {
 /// for any collection kind — the Deque and Map suites differ only in the op
 /// alphabet, the model, and the assertions, so everything else lives here once:
 /// bind a fresh session per event, apply each op (`apply_op`, which also
-/// asserts mid-trace `pop`/`get` returns and reports mid-handler checkpoints),
+/// asserts mid-trace `pop`/`get` returns and reports mid-handler commits),
 /// `finalize`, resolve along the event's outcome (promote / rollback / crash →
 /// sweep), advance the model — the full scratch on a commit (or always, for a
 /// `ReadUncommitted` collection, whose `finalize` commits everything), the
-/// last checkpointed snapshot otherwise — then assert the committed collection
-/// through a fresh read-back session (`assert`, which absorbs any
+/// last `commit()`-landed snapshot otherwise — then assert the committed
+/// collection through a fresh read-back session (`assert`, which absorbs any
 /// kind-specific check such as Map's bound-cell superset).
 async fn run_collection_trace<D, O, M, Apply, Assert>(
     trace: Trace<O>,
@@ -422,14 +422,14 @@ where
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         let mut scratch = model.clone();
-        // The scratch as of the last mid-handler checkpoint — durable
-        // regardless of the event's outcome (the at-least-once checkpoint
+        // The scratch as of the last mid-handler `commit()` — durable
+        // regardless of the event's outcome (the at-least-once `commit()`
         // contract).
-        let mut checkpointed: Option<M> = None;
+        let mut commit_floor: Option<M> = None;
         for op in &ev.ops {
             match apply_op(&handle, *op, &mut scratch).await? {
                 OpOutcome::Continue => {}
-                OpOutcome::Checkpointed => checkpointed = Some(scratch.clone()),
+                OpOutcome::Committed => commit_floor = Some(scratch.clone()),
                 OpOutcome::Mismatch => return Ok(false),
             }
         }
@@ -462,10 +462,10 @@ where
             // exists to roll back or sweep).
             scratch
         } else {
-            // Abort / crash-rollback revert only the post-checkpoint
-            // provisionals (their `prev` was captured after the checkpoint
-            // landed); the checkpointed snapshot is already committed.
-            checkpointed.unwrap_or(model)
+            // Abort / crash-rollback revert only the post-commit
+            // provisionals (their `prev` was captured after the `commit()`
+            // landed); the `commit()`-landed snapshot is already committed.
+            commit_floor.unwrap_or(model)
         };
 
         // Read back through a fresh session (clean overlay) — pure committed.
@@ -519,9 +519,9 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) 
                 scratch.clear();
                 Ok(OpOutcome::Continue)
             }
-            DequeOp::Checkpoint => {
-                handle.checkpoint().await?;
-                Ok(OpOutcome::Checkpointed)
+            DequeOp::Commit => {
+                handle.commit().await?;
+                Ok(OpOutcome::Committed)
             }
         },
         async |handle, model, _backing: &Backing<'_>| assert_deque(handle, model).await,
@@ -558,9 +558,9 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
                 scratch.clear();
                 Ok(OpOutcome::Continue)
             }
-            MapOp::Checkpoint => {
-                handle.checkpoint().await?;
-                Ok(OpOutcome::Checkpointed)
+            MapOp::Commit => {
+                handle.commit().await?;
+                Ok(OpOutcome::Committed)
             }
         },
         async |handle, model, backing: &Backing<'_>| {
@@ -623,7 +623,7 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
             match *op {
                 MapOp::Set(k, b) => {
                     handle.set(k, Value::from(b)).await?;
-                    // Snapshot immediately, before any later Checkpoint
+                    // Snapshot immediately, before any later Commit
                     // drains dirty.
                     let snapshot = dirty.collection_snapshot(&id);
                     let has_min = snapshot.iter().any(|(c, _)| *c == min_cell);
@@ -637,8 +637,8 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
                     handle.get(&k).await?;
                 }
                 MapOp::Clear => handle.clear().await?,
-                MapOp::Checkpoint => {
-                    handle.checkpoint().await?;
+                MapOp::Commit => {
+                    handle.commit().await?;
                 }
             }
         }
@@ -926,7 +926,7 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     Ok(())
 }
 
-/// Durable meta-frame golden (Deque): after real pushes checkpoint, the raw
+/// Durable meta-frame golden (Deque): after real pushes `commit()`, the raw
 /// bounds cell sits at its frozen address — `Meta` section, *empty*
 /// coordinate — and
 /// stores exactly `head ‖ tail` as two plain big-endian `i64`s. The pair
@@ -954,7 +954,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     block_on(async {
         handle.push_back(Value::from(7_u8)).await?;
         handle.push_front(Value::from(9_u8)).await?;
-        handle.checkpoint().await?;
+        handle.commit().await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 

@@ -1,23 +1,26 @@
 //! Session lifecycle property + the marker-ordering pin.
 //!
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of events —
-//! each a short op list (set/clear/mid-handler checkpoint) plus a
+//! each a short op list (set/clear/mid-handler commit/rollback) plus a
 //! commit/abort/reset/fail outcome — through the **real** production session
 //! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`) over **one
 //! partition-shared [`DirtyStore`]**, minting each event's session as an
 //! [`EventStateScope`] that drops at event-end (the production lifecycle). It
-//! asserts, after every event, that a plain `Option<Bytes>` model equals both
-//! the committed projection and a fresh **overlay read** (the dirty
+//! asserts, after every operation, that a plain `Option<Bytes>` model equals
+//! the session's own overlay read, and after every event that the model equals
+//! both the committed projection and a fresh **overlay read** (the dirty
 //! short-circuit a `committed_value` probe bypasses), and that the shared
 //! dirty buffer is empty for the key — so a failed event's buffered write can
-//! neither linger nor be read as uncommitted. A checkpoint advances the
+//! neither linger nor be read as uncommitted. A `commit()` advances the
 //! model's durable snapshot immediately, so the property also proves the
-//! at-least-once checkpoint contract: checkpointed writes survive
-//! abort/reset/failure while post-checkpoint ops still roll back. One focused
-//! example pins the ordering a trace cannot observe: the single marker
-//! flushes **exactly once, strictly after the stage** (the [`ScriptedOracle`]
-//! `record_message` counter); another pins the checkpoint drain to its own
-//! collection.
+//! at-least-once `commit()` contract: `commit()`-landed writes survive
+//! abort/reset/failure while post-commit ops still roll back; a `Rollback`
+//! reverts reads to the commit floor (or the pre-event committed value) and the
+//! buffer to empty. Two focused examples pin ordering a trace cannot observe:
+//! the single marker flushes **exactly once, strictly after the stage** (the
+//! [`ScriptedOracle`] `record_message` counter); another pins the `commit()`
+//! drain to its own collection. Three deterministic pins nail the `rollback()`
+//! contract.
 
 use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
@@ -284,13 +287,13 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
     Ok(())
 }
 
-/// A mid-handler checkpoint drains only its own collection: the checkpointed
-/// collection's write is committed durably while the sibling's stays buffered
+/// A mid-handler `commit()` drains only its own collection: the
+/// `commit()`-landed write is durable while the sibling's stays buffered
 /// and unwritten — the drain is collection-scoped, never key-scoped. An example
 /// because the lifecycle property drives a single collection, so it cannot
-/// observe sibling-collection isolation on a checkpoint.
+/// observe sibling-collection isolation on a `commit()`.
 #[tokio::test]
-async fn checkpoint_drains_only_its_collection() -> Result<()> {
+async fn commit_drains_only_its_collection() -> Result<()> {
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
     registry.register(
@@ -328,7 +331,7 @@ async fn checkpoint_drains_only_its_collection() -> Result<()> {
         .await?;
 
     assert_eq!(
-        session.checkpoint(StateType::Application, &cart).await?,
+        session.commit(StateType::Application, &cart).await?,
         StoreOutcome::Applied,
     );
 
@@ -351,17 +354,191 @@ async fn checkpoint_drains_only_its_collection() -> Result<()> {
         "the sibling collection's buffered op must not be written through",
     );
     let touched = dirty.touched(&state_key.key);
-    assert_eq!(
-        touched.len(),
-        1,
-        "only the un-checkpointed sibling stays dirty"
-    );
+    assert_eq!(touched.len(), 1, "only the un-drained sibling stays dirty");
     assert_eq!(touched[0].0.1, wishlist);
     Ok(())
 }
 
-/// Cap on ops per event: enough for checkpoint/mutate interleavings, small
-/// enough that a failing trace stays readable.
+/// A mid-handler `rollback()` reverts reads to the `commit()` floor and issues
+/// **zero durable writes** — it is `commit()` minus the write. `commit(V)`
+/// lands `V`; a later `set(W)` then `rollback()` discards `W`, so the read is
+/// `V` again, the committed row is still `V` (no provisional, no marker), and
+/// the drain touched only this collection (the sibling's buffer stands).
+#[tokio::test]
+async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<()> {
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
+    registry.register(
+        &value_state::<JsonCodec>("wishlist"),
+        CollectionDef::new(None),
+    )?;
+    let registry = Arc::new(registry);
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let cell = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let state_key = StateKey::new(Uuid::from_u128(9), Arc::from("key"));
+    let dirty = Arc::new(DirtyStore::new());
+    let (event, _dedup) = message(1);
+    let session: Session = KeyedStateSession::new(SessionParts {
+        cell: cell.clone(),
+        dirty: dirty.clone(),
+        oracle,
+        loader: (),
+        registry,
+        state_key: state_key.clone(),
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    });
+
+    let cart = StateName::try_new("cart")?;
+    let wishlist = StateName::try_new("wishlist")?;
+
+    // Commit V as the floor.
+    session
+        .set(StateType::Application, &cart, &value_cell(), b"V")
+        .await?;
+    assert_eq!(
+        session.commit(StateType::Application, &cart).await?,
+        StoreOutcome::Applied,
+    );
+
+    // Buffer W over cart, and X over the sibling.
+    session
+        .set(StateType::Application, &cart, &value_cell(), b"W")
+        .await?;
+    session
+        .set(StateType::Application, &wishlist, &value_cell(), b"X")
+        .await?;
+
+    // Rollback cart: the buffered W vanishes.
+    assert_eq!(
+        session.rollback(StateType::Application, &cart),
+        StoreOutcome::Applied,
+    );
+
+    // The read is the floor V again.
+    assert_eq!(
+        session
+            .get(StateType::Application, &cart, &value_cell())
+            .await?,
+        Some(Bytes::from_static(b"V")),
+    );
+
+    // Zero durable writes by the rollback: the committed row is still V, and
+    // no provisional cell or event marker was created.
+    let cart_id = CollectionId::new(state_key.clone(), StateType::Application, cart);
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    assert_eq!(
+        cell.get(&cart_id, &value_cell(), probe).await?.into_inner(),
+        Some(Bytes::from_static(b"V")),
+    );
+    assert!(cells.provisional_coordinates(&cart_id).is_empty());
+    assert!(cells.standing_marker_of(&cart_id).is_none());
+
+    // Sibling isolation: the rollback drained only cart; wishlist stands.
+    let touched = dirty.touched(&state_key.key);
+    assert_eq!(touched.len(), 1, "the rollback drained only its collection");
+    assert_eq!(touched[0].0.1, wishlist);
+    Ok(())
+}
+
+/// A `rollback()` on an empty buffer is a `NoOp` — at event start (nothing
+/// buffered) and right after a `commit()` drained the buffer (the floor is not
+/// discardable). The committed value is unaffected.
+#[tokio::test]
+async fn rollback_on_an_empty_buffer_is_noop() -> Result<()> {
+    let fx = Fixture::new()?;
+    let (event, _dedup) = message(1);
+    let session = fx.session(event).handle();
+
+    // Event start: nothing buffered.
+    assert_eq!(
+        session.rollback(StateType::Application, &fx.value_name),
+        StoreOutcome::NoOp,
+    );
+
+    // Commit drains the buffer, so the follow-up rollback finds nothing.
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"V")
+        .await?;
+    assert_eq!(
+        session
+            .commit(StateType::Application, &fx.value_name)
+            .await?,
+        StoreOutcome::Applied,
+    );
+    assert_eq!(
+        session.rollback(StateType::Application, &fx.value_name),
+        StoreOutcome::NoOp,
+    );
+
+    // The committed floor stands.
+    assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"V")));
+    Ok(())
+}
+
+/// With no prior `commit()`, `rollback()` reverts to the **pre-event**
+/// committed value. Event 1 durably commits `V`; event 2 sets `W`, clears the
+/// section (the marker leg — a surviving dirty clear marker would mask the read
+/// to `None`), then rolls back: the read is the pre-event `V`, and `finalize`
+/// finds nothing to stage.
+#[tokio::test]
+async fn rollback_without_a_commit_restores_the_pre_event_value() -> Result<()> {
+    let fx = Fixture::new()?;
+    let key = fx.state_key.key.clone();
+
+    // Event 1: durably commit V as the pre-event committed value. The scope is
+    // dropped explicitly after the settle so the shared dirty buffer is clear
+    // before event 2.
+    let scope1 = fx.session(message(1).0);
+    let s1 = scope1.handle();
+    let (_event1, dedup) = message(1);
+    s1.set(StateType::Application, &fx.value_name, &value_cell(), b"V")
+        .await?;
+    s1.finalize().await?;
+    s1.register_marker(dedup);
+    s1.flush_marker().await?;
+    s1.commit_apply().await;
+    drop(scope1);
+    assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"V")));
+
+    // Event 2: set W and clear the section, then roll back with no commit().
+    let scope = fx.session(message(2).0);
+    let session = scope.handle();
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"W")
+        .await?;
+    session
+        .clear_section(StateType::Application, &fx.value_name, Section::new(0))
+        .await?;
+    assert_eq!(
+        session.rollback(StateType::Application, &fx.value_name),
+        StoreOutcome::Applied,
+    );
+
+    // The read is the pre-event committed value — a surviving clear marker
+    // would mask it to None.
+    assert_eq!(
+        session
+            .get(StateType::Application, &fx.value_name, &value_cell())
+            .await?,
+        Some(Bytes::from_static(b"V")),
+    );
+
+    // Nothing left to stage, and the buffer is empty for the key.
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Clean);
+    assert!(fx.dirty.touched(&key).is_empty());
+    Ok(())
+}
+
+/// Cap on ops per event: enough for commit/rollback/mutate interleavings,
+/// small enough that a failing trace stays readable.
 const MAX_EVENT_OPS: usize = 4;
 
 /// One event in the Value lifecycle trace: a short op list and a terminal
@@ -378,7 +555,10 @@ enum ValueOp {
     Clear,
     /// The mid-handler write-through: everything buffered so far becomes
     /// durable immediately and survives every non-commit outcome.
-    Checkpoint,
+    Commit,
+    /// The mid-handler discard: everything buffered since the last `Commit`
+    /// (or event start) vanishes; reads revert to the commit floor.
+    Rollback,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -394,21 +574,36 @@ enum Outcome {
 
 impl Arbitrary for ValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Sets weighted up so state actually accumulates between checkpoints.
-        match u8::arbitrary(g) % 4 {
-            0 | 1 => Self::Set(u8::arbitrary(g)),
-            2 => Self::Clear,
-            _ => Self::Checkpoint,
+        // Sets weighted up so state actually accumulates between commits.
+        match u8::arbitrary(g) % 6 {
+            0..=2 => Self::Set(u8::arbitrary(g)),
+            3 => Self::Clear,
+            4 => Self::Commit,
+            _ => Self::Rollback,
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        match *self {
+            Self::Set(b) => Box::new(b.shrink().map(Self::Set)),
+            Self::Clear | Self::Commit | Self::Rollback => quickcheck::empty_shrinker(),
         }
     }
 }
 
 impl Arbitrary for ValueEvent {
     fn arbitrary(g: &mut Gen) -> Self {
-        let ops = Vec::<ValueOp>::arbitrary(g)
+        let mut ops: Vec<ValueOp> = Vec::<ValueOp>::arbitrary(g)
             .into_iter()
             .take(MAX_EVENT_OPS)
             .collect();
+        // Precondition steering: roughly a quarter of events open with a
+        // Rollback on a provably empty buffer (event start), pinning the NoOp
+        // arm; the unconditioned draws above place Rollback after Set/Clear for
+        // the Applied arm.
+        if ops.len() < MAX_EVENT_OPS && u8::arbitrary(g) % 4 == 0 {
+            ops.insert(0, ValueOp::Rollback);
+        }
         let outcome = match u8::arbitrary(g) % 5 {
             0 => Outcome::Reset,
             1 => Outcome::Abort,
@@ -445,13 +640,111 @@ impl Arbitrary for Trace {
     }
 }
 
-/// Drives the trace through the real session lifecycle, asserting the committed
-/// projection equals a plain `Option<Bytes>` model after every event.
+/// The scratch as of the last mid-handler `commit()` this event — durable
+/// regardless of the event's outcome.
+#[derive(Clone)]
+enum Floor {
+    /// No `commit()` landed this event; a rollback or non-commit outcome falls
+    /// through to the pre-event committed value.
+    Unset,
+    /// The value the last `commit()` made durable.
+    Committed(Option<Bytes>),
+}
+
+impl Floor {
+    /// The durable value this floor pins, or `pre_event` when no `commit()`
+    /// landed this event.
+    fn resolve(&self, pre_event: Option<Bytes>) -> Option<Bytes> {
+        match self {
+            Self::Unset => pre_event,
+            Self::Committed(value) => value.clone(),
+        }
+    }
+}
+
+/// The per-event projection the property tracks in lockstep with the session:
+/// the running read (`scratch`), the last `commit()` snapshot (`floor`), and
+/// whether anything is buffered since the last drain.
+struct EventModel {
+    scratch: Option<Bytes>,
+    floor: Floor,
+    buffered: bool,
+}
+
+/// The mid-handler drain's `Applied`/`NoOp` contract: `Applied` iff the buffer
+/// held anything since the last drain.
+fn expected_outcome(buffered: bool) -> StoreOutcome {
+    if buffered {
+        StoreOutcome::Applied
+    } else {
+        StoreOutcome::NoOp
+    }
+}
+
+/// Applies one op to the session and `model`, returning `false` on a divergence
+/// (a wrong `Applied`/`NoOp` outcome, or a session read that no longer tracks
+/// the scratch model). `pre_event` is the committed value the event opened on —
+/// the rollback fallback when no `commit()` landed this event.
+async fn apply_value_op(
+    session: &Session,
+    name: &StateName,
+    op: ValueOp,
+    pre_event: Option<Bytes>,
+    model: &mut EventModel,
+) -> Result<bool> {
+    match op {
+        ValueOp::Set(byte) => {
+            session
+                .set(StateType::Application, name, &value_cell(), &[byte])
+                .await?;
+            model.scratch = Some(Bytes::copy_from_slice(&[byte]));
+            model.buffered = true;
+        }
+        ValueOp::Clear => {
+            session
+                .clear(StateType::Application, name, &value_cell())
+                .await?;
+            model.scratch = None;
+            model.buffered = true;
+        }
+        ValueOp::Commit => {
+            let outcome = session.commit(StateType::Application, name).await?;
+            if outcome != expected_outcome(model.buffered) {
+                return Ok(false);
+            }
+            model.floor = Floor::Committed(model.scratch.clone());
+            model.buffered = false;
+        }
+        ValueOp::Rollback => {
+            let outcome = session.rollback(StateType::Application, name);
+            if outcome != expected_outcome(model.buffered) {
+                return Ok(false);
+            }
+            // Reads revert to the commit floor, or the pre-event committed
+            // value if no commit() landed this event.
+            model.scratch = model.floor.resolve(pre_event);
+            model.buffered = false;
+        }
+    }
+    // Equivalence after every operation: the session's own overlay read tracks
+    // the scratch model, so a missed rollback discard or a lost buffered write
+    // surfaces at the op that caused it.
+    let read = session
+        .get(StateType::Application, name, &value_cell())
+        .await?;
+    Ok(read == model.scratch)
+}
+
+/// Drives the trace through the real session lifecycle, asserting the session's
+/// own read equals a plain `Option<Bytes>` model after every operation, and the
+/// committed projection equals the model after every event.
 ///
-/// A mid-event checkpoint snapshots the scratch model as immediately durable:
+/// A mid-event `commit()` snapshots the scratch model as immediately durable:
 /// on a commit the full scratch wins, on every other outcome the durable state
-/// must equal the last checkpointed snapshot (post-checkpoint ops roll back;
-/// pre-checkpoint ops survive) — the at-least-once checkpoint contract.
+/// must equal the last `commit()`-landed snapshot (post-commit ops roll back;
+/// `commit()`-landed ops survive) — the at-least-once `commit()` contract. A
+/// `Rollback` reverts the scratch to the commit floor (or the pre-event
+/// committed value) and must report `Applied` iff anything was buffered.
 async fn run(trace: Trace) -> Result<bool> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
@@ -459,14 +752,12 @@ async fn run(trace: Trace) -> Result<bool> {
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let (event, dedup_id) = message(index as u128 + 1);
-        // Committed + buffered projection as the ops run.
-        let mut scratch = model.clone();
-        // The scratch as of the last checkpoint — durable regardless of
-        // outcome.
-        let mut checkpointed: Option<Option<Bytes>> = None;
-        // Whether anything is buffered since event start / the last
-        // checkpoint.
-        let mut buffered = false;
+        // The per-event projection, tracked in lockstep with the session.
+        let mut ev_model = EventModel {
+            scratch: model.clone(),
+            floor: Floor::Unset,
+            buffered: false,
+        };
         // The scope drops at the end of this block — the production per-event
         // lifetime that clears the shared dirty buffer.
         {
@@ -474,43 +765,10 @@ async fn run(trace: Trace) -> Result<bool> {
             let session = scope.handle();
 
             for op in &ev.ops {
-                match *op {
-                    ValueOp::Set(byte) => {
-                        session
-                            .set(
-                                StateType::Application,
-                                &fx.value_name,
-                                &value_cell(),
-                                &[byte],
-                            )
-                            .await?;
-                        scratch = Some(Bytes::copy_from_slice(&[byte]));
-                        buffered = true;
-                    }
-                    ValueOp::Clear => {
-                        session
-                            .clear(StateType::Application, &fx.value_name, &value_cell())
-                            .await?;
-                        scratch = None;
-                        buffered = true;
-                    }
-                    ValueOp::Checkpoint => {
-                        let outcome = session
-                            .checkpoint(StateType::Application, &fx.value_name)
-                            .await?;
-                        // The outcome contract: `Applied` iff the drain found
-                        // buffered ops.
-                        let expected = if buffered {
-                            StoreOutcome::Applied
-                        } else {
-                            StoreOutcome::NoOp
-                        };
-                        if outcome != expected {
-                            return Ok(false);
-                        }
-                        checkpointed = Some(scratch.clone());
-                        buffered = false;
-                    }
+                if !apply_value_op(&session, &fx.value_name, *op, model.clone(), &mut ev_model)
+                    .await?
+                {
+                    return Ok(false);
                 }
             }
 
@@ -521,29 +779,30 @@ async fn run(trace: Trace) -> Result<bool> {
                     session.flush_marker().await?;
                     session.commit_apply().await;
                     // Commit advances the model (last-writer-wins).
-                    model = scratch;
+                    model = ev_model.scratch;
                 }
                 Outcome::Abort => {
                     session.finalize().await?;
                     session.rollback_aborted().await;
-                    // Post-checkpoint ops roll back to their `prev`, which
-                    // finalize captured *after* the checkpoint landed — the
-                    // checkpointed snapshot.
-                    model = checkpointed.unwrap_or(model);
+                    // Post-commit ops roll back to their `prev`, which
+                    // finalize captured *after* the `commit()` landed — the
+                    // `commit()`-landed snapshot.
+                    model = ev_model.floor.resolve(model);
                 }
                 Outcome::Reset => {
                     session.finalize().await?;
                     // Discards dirty + staged; any provisional written by
                     // `finalize` lingers but projects its `prev` (the
-                    // checkpointed snapshot, or the unchanged committed base).
+                    // `commit()`-landed snapshot, or the unchanged committed
+                    // base).
                     session.reset();
-                    model = checkpointed.unwrap_or(model);
+                    model = ev_model.floor.resolve(model);
                 }
                 // Final-error path: no `finalize`, no `reset`. Only the
-                // scope's `Drop` clears the buffered write — but a checkpoint
+                // scope's `Drop` clears the buffered write — but a `commit()`
                 // already wrote its snapshot through, and it must survive.
                 Outcome::Failed => {
-                    model = checkpointed.unwrap_or(model);
+                    model = ev_model.floor.resolve(model);
                 }
             }
         }

@@ -714,12 +714,18 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Durably commits this collection's buffered ops mid-handler.
-    /// At-least-once; see [`CellSession::checkpoint`] for the contract.
-    pub(in crate::state::descriptor) async fn raw_checkpoint(
+    /// At-least-once; see [`CellSession::commit`] for the contract.
+    pub(in crate::state::descriptor) async fn raw_commit(
         &self,
     ) -> Result<StoreOutcome, StateAccessError> {
         ensure_live(&self.session)?;
-        self.session.checkpoint(self.state_type, &self.name).await
+        self.session.commit(self.state_type, &self.name).await
+    }
+
+    /// Discards this collection's uncommitted buffered ops mid-handler; see
+    /// [`CellSession::rollback`] for the contract.
+    pub(in crate::state::descriptor) fn raw_rollback(&self) -> StoreOutcome {
+        self.session.rollback(self.state_type, &self.name)
     }
 }
 
@@ -781,6 +787,13 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// Returns an access error from the session.
     pub(crate) async fn clear_all(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
         Ok(self.scope.clear_section(self.section).await?)
+    }
+
+    /// Discards this collection's uncommitted buffered ops mid-handler — every
+    /// typed view over the scope, not just this view's cells; the discard twin
+    /// of [`Self::commit`]. See [`CellSession::rollback`] for the contract.
+    pub(crate) fn rollback(&self) -> StoreOutcome {
+        self.scope.raw_rollback()
     }
 }
 
@@ -862,17 +875,15 @@ where
     }
 
     /// Durably commits this collection's buffered ops mid-handler — the
-    /// single checkpoint home, draining the whole collection's buffered ops
+    /// single `commit()` home, draining the whole collection's buffered ops
     /// (every typed view over the scope), not just this view's cells.
-    /// At-least-once; see [`CellSession::checkpoint`] for the contract.
+    /// At-least-once; see [`CellSession::commit`] for the contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    pub(crate) async fn checkpoint(
-        &self,
-    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        Ok(self.scope.raw_checkpoint().await?)
+    pub(crate) async fn commit(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.raw_commit().await?)
     }
 
     /// Scans this section's cells in key order over the typed range
@@ -1004,15 +1015,23 @@ where
     }
 
     /// Durably commits the buffered op mid-handler, so it survives a restart
-    /// after failure. At-least-once; see [`CellSession::checkpoint`] for the
+    /// after failure. At-least-once; see [`CellSession::commit`] for the
     /// contract.
     ///
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "value.checkpoint", skip_all, fields(collection = self.view.name().as_str()), err)]
-    pub async fn checkpoint(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        self.view.checkpoint().await
+    #[instrument(name = "value.commit", skip_all, fields(collection = self.view.name().as_str()), err)]
+    pub async fn commit(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        self.view.commit().await
+    }
+
+    /// Discards the buffered uncommitted op, reverting reads to the last
+    /// [`commit`](Self::commit) — or the pre-event committed value if none.
+    /// Sync and infallible; see [`CellSession::rollback`] for the contract.
+    #[instrument(name = "value.rollback", skip_all, fields(collection = self.view.name().as_str()))]
+    pub fn rollback(&self) -> StoreOutcome {
+        self.view.rollback()
     }
 }
 

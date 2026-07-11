@@ -242,7 +242,7 @@ pub(crate) fn probed_parts(marker: &EventMarker) -> (RowKeys, ClearMap) {
 ///
 /// Enumerates the physically stored `kind=Cell` rows of a collection over the
 /// sampled [`SECTIONS`] pool, as `(section, first coordinate byte)` row keys.
-/// At any settled checkpoint the stored-row set must equal the model's
+/// At every settled point the stored-row set must equal the model's
 /// *present* set — a residue row (an absent value left with live
 /// columns/entry) shows up as an extra member, a lost row as a missing one, so
 /// exact equality catches both. Probe errors are environment errors
