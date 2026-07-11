@@ -100,40 +100,6 @@ fn section_snapshot_returns_whole_section_beside_a_lower_section() -> Result<()>
     Ok(())
 }
 
-/// Regression (shrunk from the map lifecycle property, where a committed
-/// entry survived a double `MapHandle::clear`): a repeat `clear_section` must
-/// not lose an earlier clear's buffered `Cleared` cells — they carry the
-/// per-cell row-erasure work, and only buffered `Set`s are superseded by the
-/// marker.
-#[test]
-fn clear_section_retains_buffered_cleared_cells() -> Result<()> {
-    let store = DirtyStore::new();
-    let c = fresh_collection("c")?;
-    let section = Section::new(1);
-    let cleared_cell = CellKey {
-        section,
-        coordinate: Coordinate::from_bytes(vec![7]),
-    };
-    let set_cell = CellKey {
-        section,
-        coordinate: Coordinate::from_bytes(vec![9]),
-    };
-    store.clear(&c, &cleared_cell);
-    store.set(&c, &set_cell, b"x");
-    store.clear_section(&c, section);
-    assert_eq!(
-        store.lookup(&c, &cleared_cell),
-        Some(DirtyVal::Cleared),
-        "the buffered clear survives the marker"
-    );
-    assert_eq!(
-        store.lookup(&c, &set_cell),
-        None,
-        "the buffered set is superseded by the marker"
-    );
-    Ok(())
-}
-
 /// Regression, the marker tree's [`Edge`] fat-bound seek hazard (the analogue
 /// of [`section_snapshot_returns_whole_section_beside_a_lower_section`] for
 /// the cell tree): with the marker tree spanning multiple scc leaf nodes and a
@@ -189,14 +155,14 @@ fn marker_scopes_span_multiple_leaf_nodes() -> Result<()> {
         store.clear_section(&wide, Section::new(step));
         store.clear_section(&wide, Section::new(-step - 1));
     }
-    let sections: Vec<i8> = {
-        let guard = Guard::new();
-        store
-            .markers
-            .range(MarkerCollectionScope::range(&wide), &guard)
-            .map(|(marker, ())| i8::from(marker.section))
-            .collect()
-    };
+    // `cleared_sections` IS the `MarkerCollectionScope` range walk (the
+    // checkpoint drain's clear half), so probing through it pins both the
+    // scope's seek contract and the accessor.
+    let sections: Vec<i8> = store
+        .cleared_sections(&wide)
+        .into_iter()
+        .map(i8::from)
+        .collect();
     let expected: Vec<i8> = (-60..60).collect();
     assert_eq!(
         sections, expected,
@@ -325,6 +291,21 @@ fn dirty_matches(
     for k in 0..OP_KEYS {
         for c in 0..OP_COLLS {
             let id = &ids[k as usize][c as usize];
+            // The checkpoint drain's clear half: exactly the model's markers.
+            let cleared: BTreeSet<i8> = store
+                .cleared_sections(id)
+                .into_iter()
+                .map(i8::from)
+                .collect();
+            let expected_cleared: BTreeSet<i8> = model
+                .markers
+                .iter()
+                .filter(|&&(k2, c2, _)| k2 == k && c2 == c)
+                .map(|&(.., s)| s)
+                .collect();
+            if cleared != expected_cleared {
+                return Ok(false);
+            }
             for s in 0..OP_SECTIONS {
                 if store.section_cleared(id, Section::new(s)) != model.markers.contains(&(k, c, s))
                 {
@@ -441,11 +422,11 @@ fn run_dirty_trace(DirtyTrace(ops): DirtyTrace) -> Result<bool> {
             DirtyOp::ClearSection(key, coll, section) => {
                 store.clear_section(&ids[key as usize][coll as usize], Section::new(section));
                 model.markers.insert((key, coll, section));
-                // The marker supersedes buffered `Set`s; `Cleared` cells are
-                // retained (they still carry per-cell erasure work).
-                model.cells.retain(|&(k2, c2, s2, _), val| {
-                    !(k2 == key && c2 == coll && s2 == section) || *val == DirtyVal::Cleared
-                });
+                // The marker supersedes every buffered outcome of its
+                // section: the durable clear's gap erase subsumes them all.
+                model
+                    .cells
+                    .retain(|&(k2, c2, s2, _), _| !(k2 == key && c2 == coll && s2 == section));
             }
             DirtyOp::RemoveCollection(key, coll) => {
                 store.remove_collection(&ids[key as usize][coll as usize]);

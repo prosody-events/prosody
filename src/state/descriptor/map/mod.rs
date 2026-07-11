@@ -310,32 +310,15 @@ where
     /// Removes every entry and both bounds: within the event the map reads
     /// empty from this program point (later `set`s repopulate it); committed,
     /// exactly the repopulated entries survive; aborted, the map is
-    /// untouched.
+    /// untouched. O(handler writes) — the entry section rides the durable
+    /// section clear; only the fixed-cardinality bookkeeping cells take the
+    /// per-cell path.
     ///
     /// # Errors
     ///
-    /// Returns an access error from the session, or a `Permanent` key error
-    /// when a stored bound no longer decodes.
+    /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), MapStateError<CellCodecError<V>>> {
-        // Ordering is load-bearing: collect the live extent BEFORE the dirty
-        // clear marker lands — the marker hides the lower scan leg, so a
-        // post-marker collect would see nothing. The expansion's per-cell
-        // clears follow `clear_all`, whose marker also wipes the section's
-        // buffered `Set`s.
-        let (min, max) = tokio::try_join!(
-            self.read_bound(MapBound::Min),
-            self.read_bound(MapBound::Max)
-        )?;
-        let live = match (min, max) {
-            (Some(min), Some(max)) => self.entries.collect_live_keys(&min, &max).await?,
-            // Absent bounds ⇔ no live entries (the TTL-refresh invariant):
-            // no scan is issued.
-            _ => Vec::new(),
-        };
         self.entries.clear_all().await?;
-        self.entries.buffer_clears(&live).await?;
-        // The fixed-cardinality bookkeeping cells ride the per-cell path; the
-        // section-clear machinery is reserved for the unbounded entry set.
         self.meta.clear(&MapBound::Min).await.map_err(meta_err)?;
         self.meta.clear(&MapBound::Max).await.map_err(meta_err)?;
         Ok(())

@@ -776,56 +776,6 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     pub(crate) async fn clear_all(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
         Ok(self.scope.clear_section(self.section).await?)
     }
-
-    /// Interim lowering, deleted by the durable clear fast path: the erase is
-    /// expanded to per-cell clears over the collection's known-live extent.
-    /// Collects the section's live cell keys over the typed range
-    /// `[low, high]`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(crate) async fn collect_live_keys(
-        &self,
-        low: &KeyOf<T>,
-        high: &KeyOf<T>,
-    ) -> Result<Vec<CellKey>, CellStateError<CellCodecError<T>>> {
-        let low = <T::Key as OrderedKeyCodec>::encode(low);
-        let high = <T::Key as OrderedKeyCodec>::encode(high);
-        let scan = Scan {
-            section: self.section,
-            start: ScanEdge::Included(&low),
-            dir: Direction::Forward,
-            end: ScanEdge::Included(&high),
-            limit: None,
-        };
-        let stream = self.scope.raw_scan(scan);
-        futures::pin_mut!(stream);
-        // Sized by the section's live cells — the interim expansion's one
-        // runtime-sized allocation, O(live cells), gone with the helper.
-        let mut keys = Vec::new();
-        while let Some(item) = stream.next().await {
-            let (cell, _) = item?;
-            keys.push(cell);
-        }
-        Ok(keys)
-    }
-
-    /// Interim lowering, deleted by the durable clear fast path: buffers a
-    /// per-cell clear for each collected live key.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(crate) async fn buffer_clears(
-        &self,
-        keys: &[CellKey],
-    ) -> Result<(), CellStateError<CellCodecError<T>>> {
-        for cell in keys {
-            self.scope.raw_clear(cell).await?;
-        }
-        Ok(())
-    }
 }
 
 impl<S, T> CellView<S, T>

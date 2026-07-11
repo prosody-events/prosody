@@ -348,31 +348,16 @@ where
     /// space** (see the module's window invariant): within the event the
     /// deque reads empty from this program point, and the next push writes
     /// index 0. Committed, exactly the repopulated elements survive; aborted,
-    /// the deque is untouched.
+    /// the deque is untouched. O(handler writes) — the entry section rides
+    /// the durable section clear; only the window cell takes the per-cell
+    /// path.
     ///
     /// # Errors
     ///
-    /// Returns a `Permanent` meta error when the bounds cell is corrupt, or
-    /// an access error from the session.
+    /// Returns an access error from the session.
     pub async fn clear(&self) -> Result<(), DequeStateError<CellCodecError<T>>> {
-        // Ordering is load-bearing — see `MapHandle::clear`: collect before
-        // the marker, which hides the lower scan leg. The live extent comes
-        // from a scan, not index iteration, so TTL holes are skipped and the
-        // cost stays O(live).
-        let window = self.bounds().await?;
-        let live = if window.head < window.tail {
-            let last = window
-                .tail
-                .checked_sub(1)
-                .ok_or(MetaDecodeError::IndexOverflow)?;
-            self.entries.collect_live_keys(&window.head, &last).await?
-        } else {
-            Vec::new()
-        };
         self.entries.clear_all().await?;
-        self.entries.buffer_clears(&live).await?;
-        self.meta.clear(&()).await.map_err(meta_err)?;
-        Ok(())
+        self.meta.clear(&()).await.map_err(meta_err)
     }
 
     /// Durably commits this deque's buffered ops mid-handler — entries and

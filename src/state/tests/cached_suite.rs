@@ -29,8 +29,8 @@ use super::super::registry::CollectionDefRegistry;
 use super::super::store::CellStore;
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    CountingCellStore, MemoryShapeProbe, OverlayTrace, SECTION, ScriptedOracle, Trace, bytes,
-    cell_at, run_crash_equivalence_trace, run_overlay_trace,
+    CountingCellStore, FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle,
+    SECTION, ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
 };
 use super::support::{fresh_collection as collection, probe};
 use crate::test_util::TEST_RUNTIME;
@@ -41,6 +41,7 @@ use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -691,32 +692,37 @@ fn coverage_covered_scan_coop_over_threshold() -> Result<()> {
     })
 }
 
-/// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>`: each
-/// resolution arm drives `commit_provisional`/`abort_provisional` (the
-/// publish-on-settle path), and a "crash" rebuilds the cache cold over the same
-/// warm memory cells (a fresh fjall partition — `CovVolatile`). The committed
-/// projection must converge to the model on every path, with the write-through
-/// publish and the dropped-coverage cold restart both exercised. Runs the
-/// trace **clears-free** ([`Trace::without_clears`]): a committed durable
-/// clear applied beneath `Cached` leaves covered stale values until the
-/// Cov-Clr coverage punch lands, whose phase un-strips this run.
+/// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>` at
+/// the full clears-bearing alphabet: each resolution arm drives
+/// `commit_provisional`/`abort_provisional` (the publish-on-settle path), and
+/// a "crash" rebuilds the cache cold over the same warm memory cells (a fresh
+/// fjall partition — `CovVolatile`). The committed projection must converge
+/// to the model on every path — write-through publish, dropped-coverage cold
+/// restart, AND the Cov-Clr legs: every committed durable clear applied
+/// beneath the cache must punch its sections' coverage before the gap erase,
+/// with the lower fault seam (`FaultDepth::Lower` settle failures + directed
+/// post-failure reads, stage faults) firing beneath the cache.
 #[test]
 fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
-        let trace = trace.without_clears();
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         // Each `make` yields a cold cache over the same warm memory cells +
-        // oracle, so a crash drops coverage but not durable state.
-        // `test_db::cold_cache` reuses the `crash` keyspace pair on the shared
-        // database and CLEARS it (a cheap journal marker, no fsync) — modeling a
-        // fresh assignment without a keyspace creation per make. Distinct v4 segments
-        // per iteration keep the shared keyspace's crashes disjoint.
-        let make = || {
-            let lower = MemoryCellStore::new(
-                cells.clone(),
-                oracle.clone(),
-                Arc::new(CollectionDefRegistry::default()),
+        // oracle, so a crash drops coverage but not durable state; the
+        // runner's lower fault seam sits between the cache and the bottom
+        // store. `test_db::cold_cache` reuses the `crash` keyspace pair on
+        // the shared database and CLEARS it (a cheap journal marker, no
+        // fsync) — modeling a fresh assignment without a keyspace creation
+        // per make. Distinct v4 segments per iteration keep the shared
+        // keyspace's crashes disjoint.
+        let make = |handle: &PoisonHandle| {
+            let lower = FailingCellStore::with_handle(
+                MemoryCellStore::new(
+                    cells.clone(),
+                    oracle.clone(),
+                    Arc::new(CollectionDefRegistry::default()),
+                ),
+                handle.clone(),
             );
             Ok(Cached::new(test_db::cold_cache("crash")?, lower))
         };
@@ -1140,6 +1146,239 @@ fn commit_provisional_swallows_fjall_publish_failure() -> Result<()> {
         );
         Ok(())
     })
+}
+
+/// The Cov3 pin over a faulted lower store: a failed lower `write_resolved`
+/// leaves coverage untouched serving the pre-write value with zero phantom
+/// publishes — and when the failed write carries a section clear, the
+/// punch-first contract degrades to a correct slow read, never a wrong one.
+///
+/// Example test by necessity: the crash/overlay properties observe values,
+/// not the serving layer — "which layer answered and how many lower reads it
+/// cost" is physical grain below the model's abstraction, so the counter pin
+/// cannot be generalized into the generator.
+#[test]
+fn failed_lower_write_leaves_coverage_serving_pre_write_value() -> Result<()> {
+    use crate::error::ErrorCategory;
+    use crate::state::StateName;
+
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let handle: PoisonHandle = Arc::default();
+        let cached = Cached::new(
+            test_db::cache("cov3_fault")?,
+            FailingCellStore::with_handle(counting.clone(), handle.clone()),
+        );
+        let id = collection("cov3-fault")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let name: StateName = id.name().clone();
+
+        // Seed a base value; the write-through covers it, so a get serves
+        // from fjall with zero lower reads — the arrange proof.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
+            .await?;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(1)).await?.get(),
+            Some(&bytes(1)),
+            "the seeded base serves covered"
+        );
+        assert_eq!(counting.lower_reads(), 0, "the arrange get is covered");
+
+        // A clears-free lower write fault: the write must surface Err and
+        // leave coverage untouched.
+        *handle.lock() = Some(Poison::WriteResolved(
+            name.clone(),
+            ErrorCategory::Transient,
+        ));
+        assert!(
+            cached
+                .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
+                .await
+                .is_err(),
+            "the armed lower write must be rejected"
+        );
+        *handle.lock() = None;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            Some(&bytes(1)),
+            "the failed write serves the PRE-write value"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "coverage untouched: still a covered fjall serve (a phantom publish would serve the \
+             new value; a spurious punch would cost a lower read)"
+        );
+
+        // A clears-bearing lower write fault: punch-first is the contract, so
+        // the section punch DID run before the lower rejection — the
+        // follow-up get serves the pre-write value via fall-through (exactly
+        // one lower read), then re-covers.
+        let cells = [(cell_at(3), Some(bytes(9)))];
+        let clear = SectionClear::frozen_resolved(SECTION, &cells);
+        *handle.lock() = Some(Poison::WriteResolved(name, ErrorCategory::Transient));
+        assert!(
+            cached
+                .write_resolved(&cref, &cells, slice::from_ref(&clear))
+                .await
+                .is_err(),
+            "the armed clears-bearing lower write must be rejected"
+        );
+        *handle.lock() = None;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(3)).await?.get(),
+            Some(&bytes(1)),
+            "punch-first on a failed apply degrades to a correct slow read, never a wrong one"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            1,
+            "the punched section falls through exactly once"
+        );
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(4)).await?.get(),
+            Some(&bytes(1)),
+            "the fall-through re-covered the coordinate"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "the re-covered get reads nothing"
+        );
+        Ok(())
+    })
+}
+
+/// The Cov-Clr eviction-precision pin: the cache evicts ONLY
+/// correctness-required punches — an aborted clears-bearing stage punches
+/// nothing, and a committed one punches exactly its cleared sections (a
+/// sibling section stays covered).
+///
+/// Example test by necessity: eviction breadth is invisible to the value
+/// model (over-eviction is correct-but-slow), so only the lower-read counters
+/// can pin it.
+#[test]
+fn clear_punch_evicts_only_correctness_required_coverage() -> Result<()> {
+    /// The cell at coordinate `c` in section 1 (the cleared section; the
+    /// shared [`cell_at`] addresses section 0, the surviving sibling).
+    fn sect1_cell(c: u8) -> CellKey {
+        CellKey {
+            section: Section::new(1),
+            coordinate: Coordinate::from_bytes(vec![c]),
+        }
+    }
+
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(test_db::cache("clear_punch")?, counting.clone());
+        let id = collection("clear-punch")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = probe(1);
+
+        // Seed + cover cells in section 0 AND section 1.
+        cached
+            .write_resolved(
+                &cref,
+                &[
+                    (cell_at(0), Some(bytes(10))),
+                    (sect1_cell(0), Some(bytes(20))),
+                ],
+                &[],
+            )
+            .await?;
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &cell_at(0), 2).await?,
+            (Some(bytes(10)), 0),
+            "section 0 starts covered"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 2).await?,
+            (Some(bytes(20)), 0),
+            "section 1 starts covered"
+        );
+
+        // Stage a clears-bearing event on section 1 only (one survivor
+        // write), then ABORT it: an uncommitted clear never punches — both
+        // sections still serve covered.
+        let stage = |writes: &[(CellKey, ProvisionalWrite)]| {
+            let clears = [SectionClear::frozen(Section::new(1), writes)];
+            (EventMarker::frozen(event, writes, &clears), clears)
+        };
+        let writes = [(
+            sect1_cell(1),
+            ProvisionalWrite::new(Some(bytes(21)), Committed::new(None), event),
+        )];
+        let (marker, _) = stage(&writes);
+        cached
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+        cached.abort_provisional(&cref, &writes).await?;
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &cell_at(0), 3).await?,
+            (Some(bytes(10)), 0),
+            "an uncommitted clear never punches the sibling section"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 3).await?,
+            (Some(bytes(20)), 0),
+            "an uncommitted clear never punches its own section"
+        );
+
+        // Stage again and COMMIT with the section-1 clear: section 0 stays
+        // covered (nothing beyond the required punch was evicted), section
+        // 1's non-survivor falls through exactly once, then re-covers.
+        let (marker, clears) = stage(&writes);
+        cached
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+        cached.commit_provisional(&cref, &writes, &clears).await?;
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &cell_at(0), 4).await?,
+            (Some(bytes(10)), 0),
+            "nothing beyond the required punch was evicted"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 5).await?,
+            (None, 1),
+            "the committed clear erased the non-survivor via exactly one fall-through"
+        );
+        assert_eq!(
+            priced_get(&cached, &counting, &id, &sect1_cell(0), 6).await?,
+            (None, 0),
+            "the fall-through re-covered the punched coordinate"
+        );
+        Ok(())
+    })
+}
+
+/// One `get` through `cached`, returning the value and the lower point reads
+/// it cost (the shared counter is reset first) — the eviction-precision pin's
+/// currency.
+async fn priced_get(
+    cached: &Cached<CountingCellStore<MemoryCellStore<ScriptedOracle>>>,
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    id: &CollectionId,
+    cell: &CellKey,
+    n: u128,
+) -> Result<(Option<Bytes>, usize)> {
+    counting.reset();
+    let value = cached.get(id, cell, probe(n)).await?.into_inner();
+    Ok((value, counting.lower_reads()))
 }
 
 /// One mutation in a co-expiry-anchor trace. The clock advances explicitly via

@@ -79,14 +79,16 @@ impl Arbitrary for GenInterval {
 enum CovOp {
     Cover(GenInterval),
     Punch(u8),
+    /// The whole-section punch (a committed section clear's Cov-Clr eviction).
+    PunchSection,
 }
 
 impl Arbitrary for CovOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Cover(GenInterval::arbitrary(g))
-        } else {
-            Self::Punch(u8::arbitrary(g))
+        match u8::arbitrary(g) % 4 {
+            0 | 1 => Self::Cover(GenInterval::arbitrary(g)),
+            2 => Self::Punch(u8::arbitrary(g)),
+            _ => Self::PunchSection,
         }
     }
 }
@@ -213,6 +215,10 @@ fn prop_interval_set_bound_algebra() {
                     set.punch(&point(b));
                     model.remove(&b);
                 }
+                CovOp::PunchSection => {
+                    set.clear();
+                    model.clear();
+                }
             }
 
             if !set_well_formed(&set) {
@@ -273,6 +279,8 @@ enum LiveOp {
     Cover(GenInterval),
     CoverPoints(Vec<u8>),
     PunchMany(Vec<u8>),
+    /// The whole-section punch ([`Coverage::punch_section`]).
+    PunchSection,
 }
 
 impl Arbitrary for LiveOp {
@@ -282,16 +290,17 @@ impl Arbitrary for LiveOp {
                 .map(|_| u8::arbitrary(g))
                 .collect()
         };
-        match u8::arbitrary(g) % 3 {
+        match u8::arbitrary(g) % 4 {
             0 => Self::Cover(GenInterval::arbitrary(g)),
             1 => Self::CoverPoints(coords(g)),
-            _ => Self::PunchMany(coords(g)),
+            2 => Self::PunchMany(coords(g)),
+            _ => Self::PunchSection,
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         match self {
-            Self::Cover(_) => Box::new(empty()),
+            Self::Cover(_) | Self::PunchSection => Box::new(empty()),
             Self::CoverPoints(coords) => Box::new(coords.shrink().map(Self::CoverPoints)),
             Self::PunchMany(coords) => Box::new(coords.shrink().map(Self::PunchMany)),
         }
@@ -343,6 +352,10 @@ fn prop_coverage_memo_matches_durable_spill() {
                         for b in coords {
                             model.remove(&(b % POOL));
                         }
+                    }
+                    LiveOp::PunchSection => {
+                        warm.punch_section(&id, section).await?;
+                        model.clear();
                     }
                 }
 

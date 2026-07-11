@@ -96,6 +96,67 @@ fn prop_marker_payload_round_trips() {
     QuickCheck::new().quickcheck(prop as fn(ArbMarker) -> TestResult);
 }
 
+/// The survivor definition pinned directly at its source: for any mix of
+/// present- and absent-data cells across sections, both constructors —
+/// [`SectionClear::frozen`] (staged shape) and
+/// [`SectionClear::frozen_resolved`] (resolved shape) — keep exactly the
+/// cleared section's present-data coordinates, sorted and deduped, dropping
+/// absent-data cells and cells of other sections. The two constructors must
+/// agree cell-for-cell.
+///
+/// This pins the survivor *selection* at the constructor rather than through a
+/// behavioral scan trace because the survivor list's observable effect lives
+/// only on Cassandra: its `write_resolved` excludes survivors from the gap
+/// range-deletes so a co-written survivor outlives the batch's delete-vs-write
+/// timestamp tie, whereas the memory store erases-then-rewrites — a survivor is
+/// always among the written cells, so the exclusion is redundant there. That
+/// physical grain sits below the memory backend's model, so `prop_memory_*`
+/// traces cannot falsify a wrong survivor filter; this property does.
+#[test]
+fn prop_section_clear_survivors_are_present_cells() {
+    /// Cells over a tiny section/coordinate alphabet so section collisions,
+    /// coordinate duplicates (dedup), and present/absent mixes all arise.
+    fn prop(raw_section: i8, raw_cells: Vec<(i8, u8, bool, u8)>) -> TestResult {
+        let section = Section::new(raw_section % 3);
+        let cell_at = |cell_section: i8, coord: u8| CellKey {
+            section: Section::new(cell_section % 3),
+            coordinate: Coordinate::from_bytes(vec![coord % 3]),
+        };
+
+        let resolved: Vec<(CellKey, Option<bytes::Bytes>)> = raw_cells
+            .into_iter()
+            .map(|(cell_section, coord, present, value)| {
+                (cell_at(cell_section, coord), present.then(|| bytes(value)))
+            })
+            .collect();
+        let staged: Vec<(CellKey, ProvisionalWrite)> = resolved
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    ProvisionalWrite::new(value.clone(), Committed::new(None), event()),
+                )
+            })
+            .collect();
+
+        let mut expected: Vec<Coordinate> = resolved
+            .iter()
+            .filter(|(key, value)| key.section == section && value.is_some())
+            .map(|(key, _)| key.coordinate.clone())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+
+        let from_resolved = SectionClear::frozen_resolved(section, &resolved);
+        let from_staged = SectionClear::frozen(section, &staged);
+        TestResult::from_bool(
+            from_resolved.survivors() == expected.as_slice()
+                && from_staged.survivors() == expected.as_slice(),
+        )
+    }
+    QuickCheck::new().quickcheck(prop as fn(i8, Vec<(i8, u8, bool, u8)>) -> TestResult);
+}
+
 /// The exact frozen bytes of a deterministic marker: two staged cells across
 /// two sections (one at the empty coordinate) and one clear with one survivor.
 /// A round-trip property cannot prove wire freezing, so pin the bytes.

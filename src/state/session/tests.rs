@@ -23,18 +23,22 @@ use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
 use super::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
+use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::Section;
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
 use crate::state::manager::EventStateScope;
+use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{ScriptedOracle, cell_at, value_cell};
 use crate::state::tests::support::probe;
 use crate::state::{
-    CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, StoreOutcome,
+    CollectionId, CollectionRef, EventRef, PartitionBackend, StateKey, StateName, StateType,
+    StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -573,10 +577,14 @@ fn prop_value_lifecycle_equivalence() {
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
 
-/// A clears-only event still stages: `clear_section` with no cell writes
-/// records an (empty) staged-set entry, so `finalize` reports
-/// [`FinalizeOutcome::Staged`] — the backstop-arming rule — and `commit_apply`
-/// resolves that entry (never [`ApplyOutcome::NothingStaged`]).
+/// A clears-only event still stages — durably: `clear_section` with no cell
+/// writes calls `write_provisional` with an empty write set under a
+/// clears-bearing marker, so the durable event marker stands after `finalize`
+/// (raw probe BEFORE any resolving read — a `get` would read-help-resolve the
+/// clears-bearing marker), the recorded staged-set entry makes `finalize`
+/// report [`FinalizeOutcome::Staged`] — the backstop-arming rule — and
+/// `commit_apply` resolves that entry (never
+/// [`ApplyOutcome::NothingStaged`]).
 #[tokio::test]
 async fn clears_only_event_finalizes_staged() -> Result<()> {
     let fx = Fixture::new()?;
@@ -591,12 +599,117 @@ async fn clears_only_event_finalizes_staged() -> Result<()> {
         FinalizeOutcome::Staged,
         "a clears-only collection must stage so the backstop is armed"
     );
+    let marker = fx
+        .cells
+        .standing_marker_of(&fx.value_id())
+        .ok_or_else(|| eyre!("a clears-only stage must land a durable event marker"))?;
+    assert_eq!(marker.event(), event, "the marker is this event's");
+    assert!(
+        marker.staged().is_empty(),
+        "a clears-only stage lists no staged cells"
+    );
+    assert_eq!(
+        marker
+            .clears()
+            .iter()
+            .map(SectionClear::section)
+            .collect::<Vec<_>>(),
+        [Section::new(0)],
+        "the marker carries the cleared section"
+    );
     assert_eq!(
         session.commit_apply().await,
         ApplyOutcome::Resolved,
         "the staged entry exists to resolve — never NothingStaged"
     );
     Ok(())
+}
+
+/// The clears-only stage runs the stage-boundary foreign-marker resolve: a
+/// standing **foreign** committed marker (seeded crash-style through a raw
+/// store handle) is resolved — its cells settle per its verdict — rather than
+/// blind-deleted by the clears-only event's own settle, and the session's own
+/// clears-bearing marker is written by `finalize` then deleted by
+/// `commit_apply` (which also applies the clear's gap erase).
+async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
+    let fx = Fixture::new()?;
+    let raw = fx.cell_store();
+    let id = fx.value_id();
+    let collection = CollectionRef::new(id.clone(), None);
+
+    // Seed event A's stage crash-style: two section-0 cells staged through
+    // the raw handle, its dedup id recorded per the arm's verdict, no settle.
+    let (a, a_dedup) = message(1);
+    let writes_a = [
+        (
+            cell_at(0),
+            ProvisionalWrite::new(Some(Bytes::from_static(b"a0")), Committed::new(None), a),
+        ),
+        (
+            cell_at(1),
+            ProvisionalWrite::new(Some(Bytes::from_static(b"a1")), Committed::new(None), a),
+        ),
+    ];
+    let marker_a = EventMarker::frozen(a, &writes_a, &[]);
+    raw.write_provisional(&collection, &writes_a, Some(&marker_a))
+        .await?;
+    if a_committed {
+        fx.oracle.record_message(a_dedup).await?;
+    }
+
+    // Event B: a bare clears-only session event.
+    let (b, b_dedup) = message(2);
+    let session = fx.session(b).handle();
+    session
+        .clear_section(StateType::Application, &fx.value_name, Section::new(0))
+        .await?;
+    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+
+    // Raw probes BEFORE any resolving read: the boundary resolved A's marker
+    // (nothing of A stays provisional; A's cells settled per its verdict) and
+    // B's clears-bearing marker replaced it.
+    let standing = fx
+        .cells
+        .standing_marker_of(&id)
+        .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
+    assert_eq!(standing.event(), b, "B's marker replaced A's");
+    assert!(
+        fx.cells.provisional_coordinates(&id).is_empty(),
+        "the boundary resolved all of A's cells; B staged nothing"
+    );
+    let a_rows = fx.cells.stored_coordinates(&id);
+    assert_eq!(
+        a_rows.len(),
+        if a_committed { 2 } else { 0 },
+        "A's cells settled per A's verdict at B's clears-only boundary"
+    );
+
+    // B's settle applies its clear (section 0's rows erased whole — A's
+    // committed cells are pre-clear rows) and deletes B's marker.
+    session.register_marker(b_dedup);
+    session.flush_marker().await?;
+    assert_eq!(session.commit_apply().await, ApplyOutcome::Resolved);
+    assert!(
+        fx.cells.standing_marker_of(&id).is_none(),
+        "the settle deleted B's clears-bearing marker"
+    );
+    assert!(
+        fx.cells.stored_coordinates(&id).is_empty(),
+        "B's committed clear erased the section"
+    );
+    Ok(())
+}
+
+/// Clears-only session boundary resolve when the foreign event committed.
+#[tokio::test]
+async fn clears_only_session_boundary_resolves_committed_foreign_marker() -> Result<()> {
+    clears_only_session_boundary(true).await
+}
+
+/// Clears-only session boundary resolve when the foreign event aborted.
+#[tokio::test]
+async fn clears_only_session_boundary_resolves_aborted_foreign_marker() -> Result<()> {
+    clears_only_session_boundary(false).await
 }
 
 /// A retry attempt re-runs `finalize`: the second stage **rebuilds** the same

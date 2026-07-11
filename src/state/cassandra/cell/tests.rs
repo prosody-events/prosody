@@ -22,13 +22,14 @@ use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::fjall::test_db;
-use crate::state::marker::EventMarker;
+use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{
-    ApplyTrace, OverlayTrace, OverwriteTrace, ProbedMarker, ScanTrace, ScriptedOracle, ShapeProbe,
-    Trace, probed_parts, run_apply_idempotence, run_bottom_scan_trace, run_crash_equivalence_trace,
-    run_overlay_trace, run_overwrite_trace, value_cell,
+    ApplyTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle, ProbedMarker,
+    ScanTrace, ScriptedOracle, ShapeProbe, Trace, probed_parts, run_apply_idempotence,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    value_cell,
 };
 use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
@@ -180,6 +181,11 @@ impl ShapeProbe for CassandraShapeProbe {
 /// The production committed bottom assembly: fjall write-through over the
 /// resolving Cassandra cell store.
 type Bottom = Cached<CassandraStore<ScriptedOracle>>;
+
+/// [`Bottom`] with the crash trace's lower fault seam between the cache and
+/// the resolving store, so generated lower-store faults fire beneath the
+/// cache.
+type FaultyBottom = Cached<FailingCellStore<CassandraStore<ScriptedOracle>>>;
 
 /// The shared driver session and prepared cell statements — the
 /// partition-independent half both the bottom store and the property assemblies
@@ -367,6 +373,36 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
         counts.cell_point_reads.load(Ordering::Relaxed),
         0,
         "a quiescent sweep issues no recovery point read"
+    );
+
+    // The clear leg adds NO steady-state queries: a second event stages with
+    // a section clear and settles through `commit_provisional(…, clears)` —
+    // the Cov-Clr punch is fjall/coverage-only and the boundary rides the RAM
+    // memo, so the durable marker-read count never moves again and both
+    // post-settle sweeps stay at zero durable reads.
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(
+            Some(Bytes::from_static(b"w")),
+            Committed::new(Some(Bytes::from_static(b"v"))),
+            event(2),
+        ),
+    )];
+    let clears = [SectionClear::frozen(cell.section, &writes)];
+    let marker = EventMarker::frozen(event(2), &writes, &clears);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    store.commit_provisional(&c, &writes, &clears).await?;
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    assert_eq!(
+        counts.marker_point_reads.load(Ordering::Relaxed),
+        staged_marker_reads,
+        "the clear leg's stage boundary and sweeps ride the memo — no new durable marker read"
+    );
+    assert_eq!(
+        counts.cell_point_reads.load(Ordering::Relaxed),
+        0,
+        "the clear leg adds no recovery point read"
     );
     Ok(())
 }
@@ -1124,57 +1160,33 @@ fn finish(result: Result<bool>) -> TestResult {
 }
 
 /// The crash-recovery-equivalence property over the production
-/// `Cached<CassandraStore>` assembly (crash-recovery equivalence and
-/// oracle-correctness properties). A "crash" rebuilds the cache cold over the
-/// same durable Cassandra rows and oracle set. The tempdir and fjall client
-/// outlive every store the `make` closure mints (the await completes before
-/// they drop). Runs the trace **clears-free** ([`Trace::without_clears`]): a
-/// committed durable clear applied beneath `Cached` leaves covered stale
-/// values until the Cov-Clr coverage punch lands, whose phase un-strips this
-/// run; the bare instantiation below carries the clear legs meanwhile.
+/// `Cached<CassandraStore>` assembly at the full clears-bearing alphabet
+/// (crash-recovery equivalence and oracle-correctness properties). A "crash"
+/// rebuilds the cache cold over the same durable Cassandra rows and oracle
+/// set, so every durable clear leg — gap range deletes, the indivisible
+/// gaps+marker-delete settle unit, the marker payload's clear half, read-help
+/// — runs beneath the production cache with its Cov-Clr punches, and the
+/// lower fault seam (`FaultDepth::Lower` settle failures + directed
+/// post-failure reads, stage faults) fires beneath the cache against live
+/// CQL. The tempdir and fjall client outlive every store the `make` closure
+/// mints (the await completes before they drop).
 #[test]
 fn prop_cassandra_cell_crash_equivalence() {
     async fn run(trace: Trace) -> Result<bool> {
-        let trace = trace.without_clears();
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
         // Each `make` is a crash: a cold fjall cache over the same durable
-        // Cassandra rows. `cold_cache` clears the shared `cassandra_crash`
-        // keyspace pair (a cheap journal marker, no keyspace-creation fsync)
-        // instead of minting a fresh workspace per make; distinct v4 segments
-        // per iteration keep the shared keyspace disjoint.
-        let make = || -> Result<Bottom> {
+        // Cassandra rows, with the runner's lower fault seam between them.
+        // `cold_cache` clears the shared `cassandra_crash` keyspace pair (a
+        // cheap journal marker, no keyspace-creation fsync) instead of
+        // minting a fresh workspace per make; distinct v4 segments per
+        // iteration keep the shared keyspace disjoint.
+        let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
             Ok(Cached::new(
                 test_db::cold_cache("cassandra_crash")?,
-                fx.bottom_store(oracle.clone()),
+                FailingCellStore::with_handle(fx.bottom_store(oracle.clone()), handle.clone()),
             ))
         };
-        let probe = CassandraShapeProbe {
-            session: fx.cassandra.clone(),
-        };
-        run_crash_equivalence_trace(make, oracle.clone(), trace, &probe).await
-    }
-
-    init_test_logging();
-    QuickCheck::new()
-        .tests(integration_test_count(25))
-        .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
-}
-
-/// The full (clears-bearing) crash property over the BARE resolving
-/// `CassandraStore` (no `Cached`): the durable clear legs — gap range deletes,
-/// the indivisible gaps+marker-delete settle unit, the marker payload's clear
-/// half — and the committed-unapplied read window (read-help) all run against
-/// live CQL. A "crash" mints a fresh store (a cold marker memo) over the same
-/// durable rows. Interim split: the `Cached` run above strips clears until the
-/// Cov-Clr coverage punch lands; that phase decides whether this folds back
-/// into the restored run.
-#[test]
-fn prop_cassandra_cell_crash_equivalence_bare() {
-    async fn run(trace: Trace) -> Result<bool> {
-        let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
-        let make = || Ok(fx.bottom_store(oracle.clone()));
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };

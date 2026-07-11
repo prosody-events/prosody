@@ -57,23 +57,46 @@ pub struct SectionClear {
 impl SectionClear {
     /// Freezes `section`'s survivors from the event's staged cells: the
     /// coordinates of that section's staged cells whose data is present,
-    /// ascending. The one survivor definition — the session builds these from
-    /// its staged record, the stage freezes them into the payload verbatim,
-    /// and the settle/sweep replay them from the payload verbatim. No
-    /// production caller constructs a clear while the session lowers clears by
-    /// per-cell expansion; the marker-payload tests and the backend suite
-    /// runners (crash, scan, and apply-idempotence traces) exercise it.
-    #[cfg(test)]
+    /// ascending. The one survivor definition — the session's `finalize`
+    /// builds these from its staged record, the stage freezes them into the
+    /// payload verbatim, and the settle/sweep replay them from the payload
+    /// verbatim.
     #[must_use]
     pub(in crate::state) fn frozen(
         section: Section,
         staged: &[(CellKey, ProvisionalWrite)],
     ) -> Self {
-        let mut survivors: Vec<Coordinate> = staged
-            .iter()
-            .filter(|(cell, write)| cell.section == section && write.data().is_some())
-            .map(|(cell, _)| cell.coordinate.clone())
-            .collect();
+        Self::from_survivors(
+            section,
+            staged
+                .iter()
+                .filter(|(cell, write)| cell.section == section && write.data().is_some())
+                .map(|(cell, _)| cell.coordinate.clone())
+                .collect(),
+        )
+    }
+
+    /// [`Self::frozen`]'s resolved-shape twin for the direct-apply paths
+    /// (`ReadUncommitted` finalize, the mid-handler checkpoint): survivors are
+    /// the section's present-data resolved cells. Shares the survivor
+    /// definition with `frozen` — only the input shape differs.
+    #[must_use]
+    pub(in crate::state) fn frozen_resolved(
+        section: Section,
+        cells: &[(CellKey, Option<Bytes>)],
+    ) -> Self {
+        Self::from_survivors(
+            section,
+            cells
+                .iter()
+                .filter(|(cell, data)| cell.section == section && data.is_some())
+                .map(|(cell, _)| cell.coordinate.clone())
+                .collect(),
+        )
+    }
+
+    /// The shared survivor-definition tail: ascending, deduped.
+    fn from_survivors(section: Section, mut survivors: Vec<Coordinate>) -> Self {
         survivors.sort_unstable();
         survivors.dedup();
         Self { section, survivors }

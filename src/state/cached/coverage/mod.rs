@@ -315,6 +315,20 @@ impl Coverage {
         })
         .await
     }
+
+    /// Punches the section's **whole** coverage — Cov-Clr's eviction
+    /// primitive: a committed section clear invalidates every covered value in
+    /// the section, so the interval set is dropped wholesale (never expressed
+    /// as an unbounded interval; the stored range is simply emptied). Like
+    /// [`punch_many`](Self::punch_many), a failure propagates and the `Cached`
+    /// call sites are must-succeed (`Cached::punch_sections_must_succeed`).
+    pub async fn punch_section(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+    ) -> Result<(), FjallCellCacheError> {
+        self.mutate(collection, section, IntervalSet::clear).await
+    }
 }
 
 /// A non-empty, absolute coordinate interval with [`Bound`] endpoints.
@@ -408,6 +422,12 @@ struct IntervalSet {
 }
 
 impl IntervalSet {
+    /// Drops every interval — the whole-section punch
+    /// ([`Coverage::punch_section`]).
+    fn clear(&mut self) {
+        self.intervals.clear();
+    }
+
     /// Rebuilds the set from stored `(lo, hi)` bound pairs (a fjall `Cover`
     /// range). Each pair round-trips through [`Interval::new`], so a degenerate
     /// on-disk interval is dropped — an empty interval is unrepresentable in

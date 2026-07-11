@@ -20,7 +20,7 @@
 //!
 //! Section clears ride a **sibling marker tree**: [`DirtyStore::clear_section`]
 //! upserts a *dirty clear marker* keyed `(key, state_type, name, section)` and
-//! discards the section's already-buffered `Set`s, so from that program point
+//! discards the section's already-buffered cells, so from that program point
 //! the section reads as deleted and later `set`s repopulate it. The overlay
 //! consults the marker on reads ([`DirtyStore::section_cleared`]);
 //! [`DirtyStore::touched`] reports each collection's cleared sections beside
@@ -153,29 +153,19 @@ impl DirtyStore {
     }
 
     /// Buffers a dirty clear marker for one collection-section and discards
-    /// the section's already-buffered `Set` cells: from this program point the
+    /// the section's already-buffered cells: from this program point the
     /// section reads as deleted, and later `set`s repopulate it —
-    /// last-writer-wins per cell plus the marker, no op algebra. Buffered
-    /// `Cleared` cells are **retained**: under the marker they read identically
-    /// (absent), and they still carry per-cell erasure work — a repeat clear
-    /// must not lose an earlier clear's buffered row erasures. Race-free per
-    /// key for the same reason as [`Self::clear_event`].
+    /// last-writer-wins per cell plus the marker, no op algebra. Discarding
+    /// buffered `Cleared` cells too is sound: under the marker they read
+    /// identically (absent), and the durable clear's gap erase subsumes every
+    /// pre-marker outcome — `finalize` skips a `Cleared` cell in a cleared
+    /// section for the same reason. Race-free per key for the same reason as
+    /// [`Self::clear_event`].
     pub fn clear_section(&self, collection: &CollectionId, section: Section) {
         self.markers
             .upsert_sync(marker_key(collection, section), ());
-        // Owned key list first (bounded by this handler's buffered cells), so
-        // the `!Send`-guard range iteration never interleaves with removal.
-        let sets: Vec<DirtyKey> = {
-            let guard = Guard::new();
-            self.entries
-                .range(SectionScope::range(collection, section), &guard)
-                .filter(|(_, value)| matches!(value, DirtyVal::Set(_)))
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
-        for key in &sets {
-            self.entries.remove_sync(key);
-        }
+        self.entries
+            .remove_range_sync(SectionScope::range(collection, section));
     }
 
     /// Whether a dirty clear marker stands for the collection-section — the
@@ -226,15 +216,27 @@ impl DirtyStore {
 
     /// An owned, coordinate-ordered snapshot of one collection's dirty cells
     /// across every section, already in committed-write form — the mid-handler
-    /// checkpoint's drain read (cells only; the checkpoint drops the
-    /// collection's dirty clear markers via [`Self::remove_collection`]). Same
-    /// owned-snapshot rationale as [`Self::section_snapshot`].
+    /// checkpoint's drain read (cells only; [`Self::cleared_sections`] is its
+    /// clear half). Same owned-snapshot rationale as
+    /// [`Self::section_snapshot`].
     #[must_use]
     pub fn collection_snapshot(&self, collection: &CollectionId) -> ResolvedCells {
         let guard = Guard::new();
         self.entries
             .range(CollectionScope::range(collection), &guard)
             .map(|(k, v)| (k.cell.clone(), v.clone().into_data()))
+            .collect()
+    }
+
+    /// One collection's sections under a standing dirty clear marker — the
+    /// mid-handler checkpoint's clear half, beside
+    /// [`Self::collection_snapshot`].
+    #[must_use]
+    pub fn cleared_sections(&self, collection: &CollectionId) -> ClearedSections {
+        let guard = Guard::new();
+        self.markers
+            .range(MarkerCollectionScope::range(collection), &guard)
+            .map(|(key, ())| key.section)
             .collect()
     }
 

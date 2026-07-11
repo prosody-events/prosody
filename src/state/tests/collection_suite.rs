@@ -987,8 +987,8 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
 ///   1`.
 /// * **Committed erasure** — a committed `clear()` physically erases the
 ///   pre-clear entry rows. The row outside the reused window must read absent;
-///   a skipped per-cell clear would leave it standing as an orphan the window
-///   never addresses (unbounded leaked storage).
+///   a lost clear leg would leave it standing as an orphan the window never
+///   addresses (unbounded leaked storage).
 #[test]
 fn deque_clear_resets_the_index_space() -> Result<()> {
     use crate::state::descriptor::deque::{entry_cell_for, meta_cell};
@@ -1048,8 +1048,8 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     );
 
     // The physical erasure half: index 1 sat outside the reused window, so
-    // only its per-cell clear removes it — a stale committed row here is the
-    // leak the API can never surface.
+    // only the clear's gap erase removes it — a stale committed row here is
+    // the leak the API can never surface.
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
         block_on(store.get(&id, &stale, read_event(0)))?.into_inner(),

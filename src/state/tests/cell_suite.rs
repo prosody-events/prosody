@@ -131,6 +131,16 @@ fn section_idx(s: u8) -> u8 {
     s % SECTIONS.len() as u8
 }
 
+/// The [`SECTIONS`] pool index of a sampled section — the inverse of
+/// [`cell_in`]'s folding. Every trace section is drawn from the pool, so the
+/// lookup always hits; the `unwrap_or_default` merely keeps it total.
+fn section_slot(section: Section) -> u8 {
+    SECTIONS
+        .iter()
+        .position(|&s| s == section)
+        .unwrap_or_default() as u8
+}
+
 /// The first coordinate byte of a scanned cell (the suites use single-byte
 /// coordinates).
 fn coord_of(key: &CellKey) -> u8 {
@@ -322,6 +332,28 @@ impl Arbitrary for Mutation {
     }
 }
 
+/// Where an injected settle failure fires: at the **wrapper** (outside the
+/// store under test — the settle provably never reaches it, so durable state
+/// and any warm coverage stay exactly as staged), or at the **lower** store
+/// (beneath any cache in the composition — a `Cached` instantiation runs its
+/// punch-first legs before the lower store rejects). For a bare store the two
+/// depths coincide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultDepth {
+    Wrapper,
+    Lower,
+}
+
+impl Arbitrary for FaultDepth {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            Self::Wrapper
+        } else {
+            Self::Lower
+        }
+    }
+}
+
 /// How an event resolved — the six distinct outcomes.
 #[derive(Clone, Copy, Debug)]
 enum Outcome {
@@ -339,17 +371,19 @@ enum Outcome {
     /// Only a prefix staged, commit marker never flushed, crash → recovery.
     CrashMidFanOut,
     /// Commit marker flushed (committed), then the settle attempt fails under
-    /// an armed poison: the stage lingers over the **warm** in-process store —
-    /// the committed-unapplied window (on the Cassandra instantiation, with
-    /// warm coverage still holding the stage-time `prev`s).
-    SettleFailure,
+    /// a poison armed at the generated [`FaultDepth`]: the stage lingers over
+    /// the **warm** in-process store — the committed-unapplied window (on a
+    /// `Cached` instantiation, with warm coverage still holding the
+    /// stage-time `prev`s at `Wrapper` depth, and Cov-Clr-punched cleared
+    /// sections at `Lower` depth).
+    SettleFailure(FaultDepth),
 }
 
 impl Outcome {
     fn marker_flushed(self) -> bool {
         matches!(
             self,
-            Self::CleanCommitted | Self::CrashAfterMarker | Self::SettleFailure
+            Self::CleanCommitted | Self::CrashAfterMarker | Self::SettleFailure(_)
         )
     }
 
@@ -367,16 +401,14 @@ impl Outcome {
 
 impl Arbitrary for Outcome {
     fn arbitrary(g: &mut Gen) -> Self {
-        g.choose(&[
-            Self::CleanCommitted,
-            Self::CleanRolledBack,
-            Self::CrashAfterStage,
-            Self::CrashAfterMarker,
-            Self::CrashMidFanOut,
-            Self::SettleFailure,
-        ])
-        .copied()
-        .unwrap_or(Self::CleanCommitted)
+        match u8::arbitrary(g) % 6 {
+            0 => Self::CleanCommitted,
+            1 => Self::CleanRolledBack,
+            2 => Self::CrashAfterStage,
+            3 => Self::CrashAfterMarker,
+            4 => Self::CrashMidFanOut,
+            _ => Self::SettleFailure(FaultDepth::arbitrary(g)),
+        }
     }
 }
 
@@ -424,6 +456,13 @@ struct TraceEvent {
     outcome: Outcome,
     recovery: Recovery,
     split: bool,
+    /// When set, the event's FIRST planned stage is rejected at the lower
+    /// store (a transient `write_provisional` fault) and the event is never
+    /// dispatched: the model, marker model, and deferrals stay untouched —
+    /// the rejected stage's boundary resolve never reached the bottom store,
+    /// so a lingering foreign stage still lingers. Weighted low; shrinks to
+    /// `false`.
+    stage_fault: bool,
 }
 
 impl Arbitrary for TraceEvent {
@@ -444,11 +483,16 @@ impl Arbitrary for TraceEvent {
             outcome: Outcome::arbitrary(g),
             recovery: Recovery::arbitrary(g),
             split: bool::arbitrary(g),
+            stage_fault: u8::arbitrary(g) % 8 == 0,
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         let base = self.clone();
+        let unfaulted = self.stage_fault.then(|| Self {
+            stage_fault: false,
+            ..base.clone()
+        });
         let writes = self.writes.shrink().map({
             let base = base.clone();
             move |writes| Self {
@@ -460,7 +504,7 @@ impl Arbitrary for TraceEvent {
             clears,
             ..base.clone()
         });
-        Box::new(writes.chain(clears))
+        Box::new(unfaulted.into_iter().chain(writes).chain(clears))
     }
 }
 
@@ -468,20 +512,6 @@ impl Arbitrary for TraceEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct Trace {
     events: Vec<TraceEvent>,
-}
-
-impl Trace {
-    /// Strips every event's durable section clears. Interim until the `Cached`
-    /// Cov-Clr coverage punch lands: a committed durable clear applied beneath
-    /// `Cached` leaves covered stale values, so the two `Cached` crash-trace
-    /// instantiations run clears-free; the punch's phase deletes this and
-    /// un-strips them.
-    pub(crate) fn without_clears(mut self) -> Self {
-        for event in &mut self.events {
-            event.clears.clear();
-        }
-        self
-    }
 }
 
 impl Arbitrary for Trace {
@@ -497,10 +527,13 @@ impl Arbitrary for Trace {
     }
 }
 
-/// One event's stage plan, grouped by collection: the pool slot, the collapsed
+/// One collection's stage-plan entry: the pool slot, the collapsed
 /// `((section idx, coord), mutation)` cell set staged atomically, and the
 /// section indices durably cleared.
-type StagePlan = Vec<(u8, Vec<((u8, u8), Mutation)>, Vec<u8>)>;
+type PlannedStage = (u8, Vec<((u8, u8), Mutation)>, Vec<u8>);
+
+/// One event's stage plan, grouped by collection.
+type StagePlan = Vec<PlannedStage>;
 
 /// Groups an event's flat writes by collection (first-seen order, repeats of a
 /// cell collapsed last-writer-wins) and merges in its durable clears — a
@@ -871,10 +904,11 @@ impl TraceState {
     }
 
     /// The non-crash settle arms: clean promote, clean rollback, or the
-    /// poisoned settle failure.
+    /// poisoned settle failure at its generated [`FaultDepth`].
     async fn settle<S>(
         &mut self,
         store: &FailingCellStore<S>,
+        lower: &PoisonHandle,
         refs: &[CollectionRef],
         staged_writes: &StagedWrites,
         ev: &TraceEvent,
@@ -885,30 +919,67 @@ impl TraceState {
         for (coll, cell_writes, clears) in staged_writes {
             let slot = *coll as usize;
             match ev.outcome {
-                Outcome::SettleFailure => {
+                Outcome::SettleFailure(depth) => {
                     // Committed, then the settle fails under the armed poison
                     // — the committed-unapplied window over the WARM store.
-                    // The poison fires at the wrapper, so the settle provably
-                    // never reaches the store: durable state and any warm
-                    // coverage stay exactly as staged. Injected faults are
-                    // not runtime errors: the armed settle MUST return `Err`
-                    // — an `Ok` is a red property.
-                    store.set_poison(Some(Poison::Collection(
+                    // `Wrapper` fires outside the store under test (the settle
+                    // provably never reaches it: durable state and any warm
+                    // coverage stay exactly as staged); `Lower` fires beneath
+                    // any cache (a `Cached` instantiation runs its Cov-Clr
+                    // punch before the lower store rejects). Injected faults
+                    // are not runtime errors: the armed settle MUST return
+                    // `Err` — an `Ok` is a red property.
+                    let poison = Poison::Collection(
                         refs[slot].id().name().clone(),
                         ErrorCategory::Transient,
-                    )));
+                    );
+                    match depth {
+                        FaultDepth::Wrapper => store.set_poison(Some(poison)),
+                        FaultDepth::Lower => *lower.lock() = Some(poison),
+                    }
                     let settled = store
                         .commit_provisional(&refs[slot], cell_writes, clears)
                         .await;
                     store.set_poison(None);
+                    *lower.lock() = None;
                     if settled.is_ok() {
                         return Ok(false);
                     }
-                    self.deferred[slot] = Some(Deferred {
-                        writes: cell_writes.clone(),
-                        committed: true,
-                        warm: true,
-                    });
+                    if depth == FaultDepth::Lower && !clears.is_empty() {
+                        // Directed post-failure reads: the punch-first
+                        // contract means a Lower-depth apply failure left the
+                        // cleared sections uncovered, so reading every cell of
+                        // each cleared section must serve marker-resolved
+                        // truth (the model advanced at flush — committed ⇒
+                        // post-clear values); a wrong, missing, or late punch
+                        // serves covered pre-clear values ⇒ divergence. These
+                        // reads read-help-resolve the standing marker WHOLE
+                        // (writes included), so the event is now settled: the
+                        // marker model drops and no deferral is recorded.
+                        let probe = EventRef::Message {
+                            dedup_id: Uuid::from_u128(u128::MAX / 2),
+                        };
+                        for clear in clears {
+                            let s = section_slot(clear.section());
+                            for c in 0..CRASH_CELLS {
+                                let got = store
+                                    .get(refs[slot].id(), &cell_in(s, c), probe)
+                                    .await?
+                                    .into_inner();
+                                let want = self.model[slot].get(&(s, c)).cloned().flatten();
+                                if got != want {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        self.marker_model[slot] = None;
+                    } else {
+                        self.deferred[slot] = Some(Deferred {
+                            writes: cell_writes.clone(),
+                            committed: true,
+                            warm: true,
+                        });
+                    }
                 }
                 Outcome::CleanCommitted => {
                     // Promote through the settle path (publishes `data` and
@@ -993,20 +1064,92 @@ where
     Ok(true)
 }
 
+/// The per-event closing pass: convergence + row shape wait for deferred
+/// collections; marker shape and staged coverage never wait (read-only
+/// probes). The convergence pass's own reads resolve foreign clears-bearing
+/// markers (read-help), which `note_read_help` folds into the marker model
+/// before the physical probe.
+async fn assert_event_end<S, P>(
+    store: &S,
+    ids: &[CollectionId],
+    probe: &P,
+    state: &mut TraceState,
+) -> Result<bool>
+where
+    S: CellStore,
+    P: ShapeProbe,
+{
+    let skip: Vec<bool> = state.deferred.iter().map(Option::is_some).collect();
+    if !assert_converged(store, ids, &state.model, &skip).await? {
+        return Ok(false);
+    }
+    state.note_read_help();
+    assert_physical(probe, ids, state).await
+}
+
+/// The stage-fault arm: attempts one collection's stage with the lower fault
+/// seam armed (`Poison::WriteProvisional`, transient), requiring the stage to
+/// be rejected — the injected fault is not a runtime error: an `Ok` is a red
+/// property. Prevs come from the model, never from store reads — a prev-read
+/// could first-touch-resolve a lingering foreign stage the fault must leave
+/// lingering; the rejected write lands nothing, so the staged prevs are never
+/// observed.
+async fn reject_stage<S>(
+    store: &FailingCellStore<S>,
+    lower: &PoisonHandle,
+    refs: &[CollectionRef],
+    state: &TraceState,
+    event: EventRef,
+    (coll, cells, cleared): &PlannedStage,
+) -> Result<bool>
+where
+    S: CellStore,
+{
+    let slot = *coll as usize;
+    let cell_writes: Vec<(CellKey, ProvisionalWrite)> = cells
+        .iter()
+        .map(|&((s, c), mutation)| {
+            let prev = Committed::new(state.model[slot].get(&(s, c)).cloned().flatten());
+            (
+                cell_in(s, c),
+                ProvisionalWrite::new(mutation.value(), prev, event),
+            )
+        })
+        .collect();
+    let clears: Vec<SectionClear> = cleared
+        .iter()
+        .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
+        .collect();
+    let marker = EventMarker::frozen(event, &cell_writes, &clears);
+    *lower.lock() = Some(Poison::WriteProvisional(
+        refs[slot].id().name().clone(),
+        ErrorCategory::Transient,
+    ));
+    let attempted = store
+        .write_provisional(&refs[slot], &cell_writes, Some(&marker))
+        .await;
+    *lower.lock() = None;
+    Ok(attempted.is_err())
+}
+
 /// Drives `trace` through stores built by `make_store` (each wrapped in a
-/// poison-armable [`FailingCellStore`]), asserting the committed projection
-/// equals the model after every event regardless of the resolution path. A
-/// crash rebuilds the store over the same warm backing the closure captures.
-/// Alongside the committed projection it tracks a standing-event-marker model
-/// (owner + staged set + clear half) checked with the staged-coverage
-/// postcondition after every event ([`assert_physical`]); [`stage_event`]'s
-/// split dimension exercises the same-event marker overwrite; the durable
-/// `clears` dimension (including clears-only stages) exercises the gap erase
-/// and the committed-unapplied read window (read-help); the `Defer` recovery
-/// and `SettleFailure` outcome make stage-over-a-standing-foreign-marker,
-/// committed-unapplied windows, and fresh-assignment recovery arise
-/// organically. A final sweep + full assertion pass closes every trace, so no
-/// trace ends unchecked.
+/// poison-armable [`FailingCellStore`]; the [`PoisonHandle`] argument is the
+/// **lower** fault seam each instantiation buries beneath any cache in its
+/// composition), asserting the committed projection equals the model after
+/// every event regardless of the resolution path. A crash rebuilds the store
+/// over the same warm backing the closure captures. Alongside the committed
+/// projection it tracks a standing-event-marker model (owner + staged set +
+/// clear half) checked with the staged-coverage postcondition after every
+/// event ([`assert_physical`]); [`stage_event`]'s split dimension exercises
+/// the same-event marker overwrite; the durable `clears` dimension (including
+/// clears-only stages) exercises the gap erase and the committed-unapplied
+/// read window (read-help); the `Defer` recovery, the depth-generated
+/// `SettleFailure` outcome (with directed post-failure reads pinning the
+/// Cov-Clr punch-first ordering), and the `stage_fault` dimension make
+/// stage-over-a-standing-foreign-marker, committed-unapplied windows,
+/// rejected stages, and fresh-assignment recovery arise organically. A final
+/// sweep + full assertion pass closes every trace, so no trace ends
+/// unchecked.
 pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -1015,12 +1158,13 @@ pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
 ) -> Result<bool>
 where
     S: CellStore,
-    F: Fn() -> Result<S>,
+    F: Fn(&PoisonHandle) -> Result<S>,
     P: ShapeProbe,
 {
     let (ids, refs) = pooled_collections()?;
     let poison: PoisonHandle = Arc::default();
-    let mut store = FailingCellStore::with_handle(make_store()?, poison.clone());
+    let lower: PoisonHandle = Arc::default();
+    let mut store = FailingCellStore::with_handle(make_store(&lower)?, poison.clone());
     let mut state = TraceState::new();
 
     for (index, ev) in trace.events.into_iter().enumerate() {
@@ -1039,6 +1183,24 @@ where
                 cells.pop();
             }
             staged.retain(|(_, cells, cleared)| !cells.is_empty() || !cleared.is_empty());
+        }
+
+        // Stage fault: the event's first planned stage is rejected at the
+        // lower store and the event is never dispatched — every model stays
+        // untouched. Decided BEFORE the deferral-take below (a rejected
+        // stage's boundary resolve never reached the bottom store, so a
+        // lingering foreign stage still lingers). The convergence and
+        // physical passes still run: this is where a phantom publish or a
+        // lost standing marker would surface.
+        if ev.stage_fault
+            && let Some(plan) = staged.first()
+        {
+            if !reject_stage(&store, &lower, &refs, &state, event, plan).await?
+                || !assert_event_end(&store, &ids, probe, &mut state).await?
+            {
+                return Ok(false);
+            }
+            continue;
         }
 
         // Restaging a deferred collection resolves its lingering stage — the
@@ -1098,27 +1260,21 @@ where
         // Resolve along the outcome's path.
         if ev.outcome.is_crash() {
             // Crash = a cold store over the same warm backing.
-            store = FailingCellStore::with_handle(make_store()?, poison.clone());
+            store = FailingCellStore::with_handle(make_store(&lower)?, poison.clone());
             if !state
                 .recover_crash(&store, &oracle, &refs, &staged_writes, &ev, index)
                 .await?
             {
                 return Ok(false);
             }
-        } else if !state.settle(&store, &refs, &staged_writes, &ev).await? {
+        } else if !state
+            .settle(&store, &lower, &refs, &staged_writes, &ev)
+            .await?
+        {
             return Ok(false);
         }
 
-        // Convergence + row shape wait for deferred collections; marker shape
-        // and staged coverage never wait (read-only probes). The convergence
-        // pass's own reads resolve foreign clears-bearing markers (read-help),
-        // which `note_read_help` folds into the marker model before the probe.
-        let skip: Vec<bool> = state.deferred.iter().map(Option::is_some).collect();
-        if !assert_converged(&store, &ids, &state.model, &skip).await? {
-            return Ok(false);
-        }
-        state.note_read_help();
-        if !assert_physical(probe, &ids, &state).await? {
+        if !assert_event_end(&store, &ids, probe, &mut state).await? {
             return Ok(false);
         }
     }
@@ -1272,7 +1428,7 @@ where
 /// property exercises their interaction — a `scan` between a `buffer_set` and
 /// a `clear`, a `get` after a dropped scan, a `clear_section` between commits
 /// and buffers, and so on (TESTING.md "interleaved operations").
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum OverlayOp {
     /// Buffer a set into the dirty leg at `(section idx, coord)`.
     BufferSet(u8, u8, u8),
@@ -1286,6 +1442,13 @@ enum OverlayOp {
     /// committed cells vanish behind it (even ones committed later) while its
     /// siblings stay visible; post-clear `BufferSet`s are survivors.
     ClearSection(u8),
+    /// Commit a durable section clear with survivors to the lower store
+    /// (`write_resolved` with a frozen [`SectionClear`]) — the generated
+    /// producer for the direct-apply clear leg beneath the overlay. On a
+    /// `Cached` lower store this is the op that kills a missing
+    /// `write_resolved` Cov-Clr punch: a covered pre-clear cell of the
+    /// cleared section would serve stale and diverge on the next point leg.
+    CommitClearSection(SeedClear),
     /// Run a range scan and assert it against the oracle (the range leg,
     /// intermixed with the point reads asserted after every op).
     Scan(ScanReq),
@@ -1295,12 +1458,13 @@ impl Arbitrary for OverlayOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let s = section_idx(u8::arbitrary(g));
         let c = u8::arbitrary(g) % CELLS;
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 7 {
             0 => Self::BufferSet(s, c, u8::arbitrary(g)),
             1 => Self::BufferClear(s, c),
             2 => Self::CommitSet(s, c, u8::arbitrary(g)),
             3 => Self::CommitClear(s, c),
             4 => Self::ClearSection(s),
+            5 => Self::CommitClearSection(SeedClear::arbitrary(g)),
             _ => Self::Scan(ScanReq::arbitrary(g)),
         }
     }
@@ -1425,12 +1589,37 @@ where
                 overlay
                     .dirty()
                     .clear_section(&id, SECTIONS[s as usize % SECTIONS.len()]);
-                // The marker wipes ITS section's buffered `Set`s and hides
-                // that section's committed leg (retained `Cleared` cells read
-                // the same as the marker: absent); siblings stay untouched;
+                // The marker wipes ITS section's buffered cells and hides
+                // that section's committed leg; siblings stay untouched;
                 // later `BufferSet`s repopulate as survivors.
                 model.dirty.retain(|&(sect, _), _| sect != s);
                 model.cleared.insert(s);
+            }
+            OverlayOp::CommitClearSection(clear) => {
+                let s = clear.sect;
+                // Survivors deduped last-writer-wins (no batch timestamp
+                // ties), exactly as `run_bottom_scan_trace`'s `SeedClear`.
+                let mut survivors: BTreeMap<u8, u8> = BTreeMap::new();
+                for (c, v) in clear.survivors {
+                    survivors.insert(c, v);
+                }
+                let cells: Vec<(CellKey, Option<Bytes>)> = survivors
+                    .iter()
+                    .map(|(&c, &v)| (cell_in(s, c), Some(bytes(v))))
+                    .collect();
+                let section_clear =
+                    SectionClear::frozen_resolved(SECTIONS[s as usize % SECTIONS.len()], &cells);
+                overlay
+                    .lower()
+                    .write_resolved(&collection_ref, &cells, slice::from_ref(&section_clear))
+                    .await?;
+                // The committed side of the cleared section collapses to
+                // exactly the survivors; the dirty leg and its markers are
+                // untouched (this is a committed write beneath the overlay).
+                model.committed.retain(|&(sect, _), _| sect != s);
+                for (&c, &v) in &survivors {
+                    model.committed.insert((s, c), Some(bytes(v)));
+                }
             }
             OverlayOp::Scan(req) => {
                 let expected = scan_oracle(&model, req);
@@ -1738,21 +1927,8 @@ where
                     .iter()
                     .map(|(&c, &v)| (cell_in(s, c), Some(bytes(v))))
                     .collect();
-                // `SectionClear::frozen`'s single survivor definition works
-                // over staged writes; lift the resolved survivor cells into
-                // that shape (the event is irrelevant to freezing — only
-                // present-data coordinates matter).
-                let staged: Vec<(CellKey, ProvisionalWrite)> = cells
-                    .iter()
-                    .map(|(cell, data)| {
-                        (
-                            cell.clone(),
-                            ProvisionalWrite::new(data.clone(), Committed::new(None), own),
-                        )
-                    })
-                    .collect();
                 let section_clear =
-                    SectionClear::frozen(SECTIONS[s as usize % SECTIONS.len()], &staged);
+                    SectionClear::frozen_resolved(SECTIONS[s as usize % SECTIONS.len()], &cells);
                 store
                     .write_resolved(&collection_ref, &cells, slice::from_ref(&section_clear))
                     .await?;
@@ -2295,8 +2471,13 @@ pub(crate) enum Poison {
     Cells(BTreeMap<u8, ErrorCategory>),
     /// Stage path: `write_provisional` fails with the given category for one
     /// named collection — drives the settle boundary's permanent-finalize-skip
-    /// arm (offset still commits, marker skipped, backstop armed).
+    /// arm (offset still commits, marker skipped, backstop armed) and the
+    /// crash trace's stage-fault dimension.
     WriteProvisional(StateName, ErrorCategory),
+    /// Direct-apply path: `write_resolved` fails with the given category for
+    /// one named collection — the Cov3 pin's lower-write fault (a failed
+    /// lower write must leave coverage untouched).
+    WriteResolved(StateName, ErrorCategory),
 }
 
 /// A runtime-armable poison slot shared by a [`FailingCellStore`], its
@@ -2374,7 +2555,7 @@ impl<S> FailingCellStore<S> {
             Some(Poison::Cells(targets)) => cells
                 .iter()
                 .find_map(|c| targets.get(&coord_of(c)).copied()),
-            Some(Poison::WriteProvisional(..)) | None => None,
+            Some(Poison::WriteProvisional(..) | Poison::WriteResolved(..)) | None => None,
         }
     }
 
@@ -2385,7 +2566,21 @@ impl<S> FailingCellStore<S> {
             Some(Poison::WriteProvisional(name, category)) => {
                 (*collection.id().name() == *name).then_some(*category)
             }
-            Some(Poison::Collection(..) | Poison::Cells(..)) | None => None,
+            Some(Poison::Collection(..) | Poison::Cells(..) | Poison::WriteResolved(..)) | None => {
+                None
+            }
+        }
+    }
+
+    /// The category to inject when `write_resolved` touches `collection`,
+    /// or `None`.
+    fn injected_resolved(&self, collection: &CollectionRef) -> Option<ErrorCategory> {
+        match &*self.poison.lock() {
+            Some(Poison::WriteResolved(name, category)) => {
+                (*collection.id().name() == *name).then_some(*category)
+            }
+            Some(Poison::Collection(..) | Poison::Cells(..) | Poison::WriteProvisional(..))
+            | None => None,
         }
     }
 }
@@ -2489,6 +2684,9 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        if let Some(category) = self.injected_resolved(collection) {
+            return Err(FailCellError::Poison(category));
+        }
         self.inner
             .write_resolved(collection, cells, clears)
             .await

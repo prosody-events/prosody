@@ -5,9 +5,9 @@ pub(crate) mod identity_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    ApplyTrace, MemoryShapeProbe, OverlayTrace, OverwriteTrace, ScanTrace, ScriptedOracle, Trace,
-    run_apply_idempotence, run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace,
-    run_overwrite_trace,
+    ApplyTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace, PoisonHandle,
+    ScanTrace, ScriptedOracle, Trace, run_apply_idempotence, run_bottom_scan_trace,
+    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
@@ -66,13 +66,19 @@ fn memory_store(cells: MemoryCells, oracle: ScriptedOracle) -> MemoryCellStore<S
 /// Crash-recovery equivalence over the memory cell store: every resolution path
 /// (clean promote, inline rollback, crash → sweep / first-touch) converges each
 /// cell's committed projection to the model (crash-recovery equivalence and
-/// oracle-correctness properties).
+/// oracle-correctness properties). For a bare store the runner's lower fault
+/// seam wraps the bottom store directly (wrapper and lower depth coincide).
 #[test]
 fn prop_memory_cell_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let make = || Ok(memory_store(cells.clone(), oracle.clone()));
+        let make = |lower: &PoisonHandle| {
+            Ok(FailingCellStore::with_handle(
+                memory_store(cells.clone(), oracle.clone()),
+                lower.clone(),
+            ))
+        };
         let probe = MemoryShapeProbe(cells.clone());
         executor::block_on(run_crash_equivalence_trace(
             make,

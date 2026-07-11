@@ -230,9 +230,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// The marker's `clears` are frozen here and **applied at settle** (see
     /// [`commit_provisional`](Self::commit_provisional)), so re-apply during
-    /// recovery stays a pure function of durable staged data. The session
-    /// still lowers handler clears by per-cell expansion and freezes no
-    /// clears; the recovery sweep replaying a marker is the live producer.
+    /// recovery stays a pure function of durable staged data. The session's
+    /// `finalize` is the live producer: it freezes each cleared section's
+    /// survivors from the collection's staged writes.
     ///
     /// # Errors
     ///
