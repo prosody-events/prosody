@@ -1,9 +1,9 @@
 //! Event identity and store/oracle verdicts.
 //!
 //! [`EventRef`] is the durable reference to the upstream event that owns a
-//! provisional cell. [`CommitDecision`] and [`StoreOutcome`] are the two
-//! distinct verdicts threaded through recovery: the oracle decides, the
-//! store acts and reports.
+//! provisional cell. [`CommitDecision`] is the oracle's recovery-time verdict
+//! on a provisional cell; [`StoreOutcome`] reports whether a mid-handler
+//! `commit()`/`rollback()` call took effect.
 
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;

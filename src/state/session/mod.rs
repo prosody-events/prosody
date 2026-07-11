@@ -94,9 +94,8 @@ mod tests;
 /// Built exactly once per collection, at `finalize`, from the post-`commit()`
 /// dirty buffer — `commit()`-landed cells are already durably committed and
 /// never marker-listed, so the record lists exactly the cells recovery owns.
-/// Only a
-/// retry attempt re-running `finalize` rebuilds it, overwriting the same-event
-/// marker idempotently. Only `ReadCommitted` collections appear;
+/// Only a retry attempt re-running `finalize` rebuilds it, overwriting the
+/// same-event marker idempotently. Only `ReadCommitted` collections appear;
 /// `ReadUncommitted` writes resolve at stage time with nothing to settle. Each
 /// `(cell, write)`'s `data` is the value to promote to, `prev` the committed
 /// base to roll back to; the clears apply on the commit arm only (rollback
@@ -115,11 +114,10 @@ type StagedSet = Vec<(
 /// [`KeyedStateSession`] realises that through the dirty overlay + oracle
 /// resolution — and `set`/`clear`/`clear_section` buffer this event's
 /// mutations (`commit` writes them through mid-handler; `rollback` discards
-/// them). The
-/// framework reaches the manager-driven lifecycle through the sealed
-/// `StateLifecycle` supertrait, which is what seals `CellSession`: downstream
-/// crates can name it in bounds (e.g. [`EventContext::State`]) but can neither
-/// implement it nor reach the lifecycle.
+/// them). The framework reaches the manager-driven lifecycle through the
+/// sealed `StateLifecycle` supertrait, which is what seals `CellSession`:
+/// downstream crates can name it in bounds (e.g. [`EventContext::State`]) but
+/// can neither implement it nor reach the lifecycle.
 pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
@@ -233,11 +231,11 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// committed state ([`write_resolved`]) in one same-partition batch and
     /// dropped from the dirty buffer, so multi-cell kinds commit data and
     /// bookkeeping as a unit (a Map's entries and bound ratchets, a Deque's
-    /// entries and window bounds). The
-    /// guarantee is **at-least-once**: a `commit()`-landed write is durable and
-    /// visible immediately — never provisional, never listed in any event
-    /// marker, never rolled back. Ops buffered *after* the commit ride
-    /// the collection's normal stage→settle path; reads already see buffered
+    /// entries and window bounds). The guarantee is **at-least-once**: a
+    /// `commit()`-landed write is durable and visible immediately — never
+    /// provisional, never listed in any event marker, never rolled back. Ops
+    /// buffered *after* the commit ride the collection's normal stage→settle
+    /// path; reads already see buffered
     /// writes without committing.
     ///
     /// **Orthogonal to [`CommitMode`]:** the mode governs how *un-committed*

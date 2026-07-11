@@ -69,9 +69,10 @@ use std::future::Future;
 ///   each cell (the `ReadCommitted` outcome path).
 /// * [`Self::write_resolved`] — writes committed values with `event` and `prev`
 ///   null (the `ReadUncommitted` direct write, the mid-handler `commit()`, and
-///   rollback resolution, where the committed value is the staged `prev`).
+///   abort resolution, where the committed value written back is the staged
+///   `prev`).
 /// * [`Self::mark_resolved`] — *promote*: nulls `event` and `prev`, keeping
-///   `data`. O(1) regardless of value size; the commit arm of resolution.
+///   `data`. O(1) regardless of value size.
 ///
 /// # Committed absence is row absence
 ///

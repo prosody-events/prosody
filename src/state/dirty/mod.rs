@@ -411,10 +411,10 @@ impl scc::Comparable<DirtyKey> for KeyScope {
 
 /// Bounding query for every [`DirtyKey`] in one collection — the mid-handler
 /// `commit()`/`rollback()` sub-range, for [`DirtyStore::collection_snapshot`]
-/// and [`DirtyStore::remove_collection`]. Compares on `(key, state_type,
-/// name)`,
-/// ignoring the cell, so the range spans the collection's cells across every
-/// section in coordinate order; see [`Edge`] for the strict-separator bounds.
+/// and [`DirtyStore::remove_collection`]. Compares on
+/// `(key, state_type, name)`, ignoring the cell, so the range spans the
+/// collection's cells across every section in coordinate order; see [`Edge`]
+/// for the strict-separator bounds.
 #[derive(Clone, PartialEq, Eq)]
 struct CollectionScope {
     key: Key,

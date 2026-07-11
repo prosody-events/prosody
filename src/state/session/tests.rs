@@ -84,11 +84,20 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self> {
+        Self::with_collections(&[VALUE_NAME])
+    }
+
+    /// A fixture whose registry holds one `ReadCommitted` value collection per
+    /// name; `value_name` is `names[0]`, so single-collection callers reach it
+    /// through the shared helpers unchanged.
+    fn with_collections(names: &[&str]) -> Result<Self> {
+        let value_name = names
+            .first()
+            .ok_or_else(|| eyre!("with_collections needs at least one collection"))?;
         let mut registry = CollectionDefRegistry::new(None);
-        registry.register(
-            &value_state::<JsonCodec>(VALUE_NAME),
-            CollectionDef::new(None),
-        )?;
+        for name in names {
+            registry.register(&value_state::<JsonCodec>(name), CollectionDef::new(None))?;
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         Ok(Self {
@@ -96,7 +105,7 @@ impl Fixture {
             oracle: ScriptedOracle::default(),
             registry: Arc::new(registry),
             state_key: StateKey::new(Uuid::from_u128(0x00C0_FFEE), Arc::from("key")),
-            value_name: StateName::try_new(VALUE_NAME)?,
+            value_name: StateName::try_new(value_name)?,
             dirty: Arc::new(DirtyStore::new()),
             shutdown_rx,
             cancel_rx,
@@ -294,32 +303,11 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
 /// observe sibling-collection isolation on a `commit()`.
 #[tokio::test]
 async fn commit_drains_only_its_collection() -> Result<()> {
-    let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
-    registry.register(
-        &value_state::<JsonCodec>("wishlist"),
-        CollectionDef::new(None),
-    )?;
-    let registry = Arc::new(registry);
-    let oracle = ScriptedOracle::default();
-    let cell = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let state_key = StateKey::new(Uuid::from_u128(8), Arc::from("key"));
-    let dirty = Arc::new(DirtyStore::new());
+    let fx = Fixture::with_collections(&["cart", "wishlist"])?;
     let (event, _dedup) = message(1);
-    let session: Session = KeyedStateSession::new(SessionParts {
-        cell: cell.clone(),
-        dirty: dirty.clone(),
-        oracle,
-        loader: (),
-        registry,
-        state_key: state_key.clone(),
-        event,
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
-        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    });
+    // The scope stays alive so its `Drop` clear does not race the dirty probe.
+    let scope = fx.session(event);
+    let session = scope.handle();
 
     let cart = StateName::try_new("cart")?;
     let wishlist = StateName::try_new("wishlist")?;
@@ -339,21 +327,28 @@ async fn commit_drains_only_its_collection() -> Result<()> {
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
     };
-    let cart_id = CollectionId::new(state_key.clone(), StateType::Application, cart);
+    let cart_id = CollectionId::new(fx.state_key.clone(), StateType::Application, cart);
     assert_eq!(
-        cell.get(&cart_id, &value_cell(), probe).await?.into_inner(),
+        fx.cell_store()
+            .get(&cart_id, &value_cell(), probe)
+            .await?
+            .into_inner(),
         Some(Bytes::from_static(b"a")),
     );
-    let wishlist_id =
-        CollectionId::new(state_key.clone(), StateType::Application, wishlist.clone());
+    let wishlist_id = CollectionId::new(
+        fx.state_key.clone(),
+        StateType::Application,
+        wishlist.clone(),
+    );
     assert_eq!(
-        cell.get(&wishlist_id, &value_cell(), probe)
+        fx.cell_store()
+            .get(&wishlist_id, &value_cell(), probe)
             .await?
             .into_inner(),
         None,
         "the sibling collection's buffered op must not be written through",
     );
-    let touched = dirty.touched(&state_key.key);
+    let touched = fx.dirty.touched(&fx.state_key.key);
     assert_eq!(touched.len(), 1, "only the un-drained sibling stays dirty");
     assert_eq!(touched[0].0.1, wishlist);
     Ok(())
@@ -366,33 +361,11 @@ async fn commit_drains_only_its_collection() -> Result<()> {
 /// the drain touched only this collection (the sibling's buffer stands).
 #[tokio::test]
 async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<()> {
-    let mut registry = CollectionDefRegistry::new(None);
-    registry.register(&value_state::<JsonCodec>("cart"), CollectionDef::new(None))?;
-    registry.register(
-        &value_state::<JsonCodec>("wishlist"),
-        CollectionDef::new(None),
-    )?;
-    let registry = Arc::new(registry);
-    let oracle = ScriptedOracle::default();
-    let cells = MemoryCells::new();
-    let cell = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let state_key = StateKey::new(Uuid::from_u128(9), Arc::from("key"));
-    let dirty = Arc::new(DirtyStore::new());
+    let fx = Fixture::with_collections(&["cart", "wishlist"])?;
     let (event, _dedup) = message(1);
-    let session: Session = KeyedStateSession::new(SessionParts {
-        cell: cell.clone(),
-        dirty: dirty.clone(),
-        oracle,
-        loader: (),
-        registry,
-        state_key: state_key.clone(),
-        event,
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
-        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    });
+    // The scope stays alive so its `Drop` clear does not race the dirty probe.
+    let scope = fx.session(event);
+    let session = scope.handle();
 
     let cart = StateName::try_new("cart")?;
     let wishlist = StateName::try_new("wishlist")?;
@@ -430,19 +403,22 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
 
     // Zero durable writes by the rollback: the committed row is still V, and
     // no provisional cell or event marker was created.
-    let cart_id = CollectionId::new(state_key.clone(), StateType::Application, cart);
+    let cart_id = CollectionId::new(fx.state_key.clone(), StateType::Application, cart);
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
     };
     assert_eq!(
-        cell.get(&cart_id, &value_cell(), probe).await?.into_inner(),
+        fx.cell_store()
+            .get(&cart_id, &value_cell(), probe)
+            .await?
+            .into_inner(),
         Some(Bytes::from_static(b"V")),
     );
-    assert!(cells.provisional_coordinates(&cart_id).is_empty());
-    assert!(cells.standing_marker_of(&cart_id).is_none());
+    assert!(fx.cells.provisional_coordinates(&cart_id).is_empty());
+    assert!(fx.cells.standing_marker_of(&cart_id).is_none());
 
     // Sibling isolation: the rollback drained only cart; wishlist stands.
-    let touched = dirty.touched(&state_key.key);
+    let touched = fx.dirty.touched(&fx.state_key.key);
     assert_eq!(touched.len(), 1, "the rollback drained only its collection");
     assert_eq!(touched[0].0.1, wishlist);
     Ok(())
