@@ -625,6 +625,20 @@ async fn promote_promotes_all_staged_cells() -> Result<()> {
     };
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
 
+    // Non-resolving probes: `committed()` reads through a resolving `get`, which
+    // heals a still-provisional cell to its "as if committed" value — so a
+    // promote that skipped `commit_provisional` would read back identically.
+    // Assert the provisional cell is actually gone before trusting the value.
+    assert!(
+        staged_cell(&cell, &id_for(&key, "cart")?).await?.is_none(),
+        "promote commits the cell — a skipped commit would leave it provisional",
+    );
+    assert!(
+        staged_cell(&cell, &id_for(&key, "wishlist")?)
+            .await?
+            .is_none(),
+        "promote commits the second cell too, leaving no provisional marker",
+    );
     assert_eq!(
         committed(&cell, &id_for(&key, "cart")?).await?,
         Some(bytes(7))

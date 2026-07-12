@@ -404,6 +404,7 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
 mod staged_rollback {
     use super::*;
     use crate::loader::MemoryLoader;
+    use crate::state::cell::Committed;
     use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::memory::MemoryCellStore;
@@ -411,7 +412,9 @@ mod staged_rollback {
     use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::StateLifecycle;
     use crate::state::store::CellStore;
-    use crate::state::{CollectionId, StateKey, StateName, StateType};
+    use crate::state::tests::cell_suite::value_cell;
+    use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType};
+    use bytes::Bytes;
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
     use quickcheck::{QuickCheck, TestResult};
@@ -429,6 +432,26 @@ mod staged_rollback {
         let stream = cell_store.provisional_cells(id);
         futures::pin_mut!(stream);
         Ok(stream.next().await.transpose()?.is_some())
+    }
+
+    /// The resolved committed value of the collection's single Value cell —
+    /// call only on a known-settled cell (a resolving `get` heals a
+    /// still-provisional one). Distinguishes "rolled back to the absent
+    /// base" (`None`) from "wrongly committed the staged value"
+    /// (`Some(..)`), which `is_provisional` alone cannot: both settle the
+    /// cell.
+    async fn committed_value(
+        cell_store: &MemoryCellStore<FixedOracle>,
+        id: &CollectionId,
+    ) -> Result<Option<Bytes>> {
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX),
+        };
+        cell_store
+            .get(id, &value_cell(), probe)
+            .await
+            .map(Committed::into_inner)
+            .map_err(|e| eyre!("read committed: {e}"))
     }
 
     type Ctx = MockEventContext<serde_json::Value, TestSession>;
@@ -493,7 +516,12 @@ mod staged_rollback {
         assert_eq!(committed.load(Ordering::SeqCst), 0);
         assert!(
             !is_provisional(&cell_store, &cart_id).await?,
-            "the receipt's rollback must restore the committed base",
+            "the receipt's rollback must settle the staged cell",
+        );
+        assert_eq!(
+            committed_value(&cell_store, &cart_id).await?,
+            None,
+            "rollback restores the absent committed base — not the staged value",
         );
         assert_eq!(
             log.lock().clone(),
