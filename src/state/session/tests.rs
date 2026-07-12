@@ -40,7 +40,7 @@ use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{ScriptedOracle, cell_at, value_cell};
-use crate::state::tests::support::probe;
+use crate::state::tests::support::{assert_no_settlement_residue, probe};
 use crate::state::{
     CollectionId, CollectionRef, EventRef, PartitionBackend, StateKey, StateName, StateType,
     StoreOutcome,
@@ -525,6 +525,9 @@ async fn rollback_without_a_commit_restores_the_pre_event_value() -> Result<()> 
         assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     }
     drop(scope1);
+    // Raw residue probe before the resolving read below, which would heal a
+    // skipped promote to the same bytes and mask it.
+    assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
     assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"V")));
 
     // Event 2: set W and clear the section, then roll back with no commit().
@@ -850,10 +853,16 @@ async fn run(trace: Trace) -> Result<bool> {
                     session.flush_marker().await?;
                     if let Finalized::Staged(staged) = finalized {
                         // The memory store never fails, so a healthy promote
-                        // must fully resolve.
+                        // must fully resolve — and leave no residue, checked
+                        // raw before the loop-tail resolving reads heal a
+                        // skipped settle to identical bytes and mask it. A
+                        // stage overwrites any marker a prior Reset/Failed
+                        // event abandoned, so the check is exact here (and
+                        // only here: those outcomes leave residue by design).
                         if staged.certify().promote().await != ApplyOutcome::Resolved {
                             return Ok(false);
                         }
+                        assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
                     }
                     // Commit advances the model (last-writer-wins).
                     model = ev_model.scratch;

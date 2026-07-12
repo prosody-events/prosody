@@ -30,6 +30,7 @@
 //! entirely in the descriptor layer above it.
 
 use super::cell_suite::{MAX_TRACE_OPS, ScriptedOracle, capped_vec};
+use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
@@ -375,17 +376,26 @@ async fn resolve_event(
             }
         }
     }
+    // Every outcome in this runner's alphabet settles fully (promote and
+    // rollback delete the marker; the sweep resolves it), so no settlement
+    // residue may remain — checked raw, before the resolving read-back below
+    // heals a skipped settle to identical bytes and masks it.
+    assert_no_settlement_residue(cells, collection_ref.id())?;
     Ok(true)
 }
 
 /// Settles one committed event end-to-end for a directed pin: `finalize`,
 /// record the event's marker, then consume the receipt with
-/// `certify().promote()` — erroring if a healthy store reports `Incomplete`.
+/// `certify().promote()` — erroring if a healthy store reports `Incomplete`,
+/// and asserting the promote left no settlement residue in `cells` (the raw
+/// probe a resolving read cannot make; see [`assert_no_settlement_residue`]).
 /// A `Clean` finalize just records the marker (nothing to promote).
 pub(crate) async fn finalize_and_promote<L>(
     session: &L,
     oracle: &ScriptedOracle,
     dedup_id: Uuid,
+    cells: &MemoryCells,
+    collection: &CollectionId,
 ) -> Result<()>
 where
     L: StateLifecycle,
@@ -398,10 +408,11 @@ where
         .record_message(dedup_id)
         .await
         .map_err(|e| eyre!("marker: {e}"))?;
-    if let Finalized::Staged(staged) = finalized
-        && staged.certify().promote().await != ApplyOutcome::Resolved
-    {
-        bail!("promote incomplete on a healthy store");
+    if let Finalized::Staged(staged) = finalized {
+        if staged.certify().promote().await != ApplyOutcome::Resolved {
+            bail!("promote incomplete on a healthy store");
+        }
+        assert_no_settlement_residue(cells, collection)?;
     }
     Ok(())
 }
@@ -684,7 +695,7 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
                 }
             }
         }
-        finalize_and_promote(&session, &oracle, event_dedup(event)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, &id).await?;
     }
     Ok(true)
 }
@@ -1033,7 +1044,9 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
-    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+    let id = collection_ref.id();
     let armed: ArmedKeys = Arc::default();
 
     // Event 1: two pushes, committed — the window becomes [0, 2).
@@ -1045,7 +1058,7 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     block_on(async {
         handle.push_back(Value::from(1_u8)).await?;
         handle.push_back(Value::from(2_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -1058,17 +1071,12 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     block_on(async {
         handle.clear().await?;
         handle.push_back(Value::from(9_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let id = CollectionId::new(
-        state_key.clone(),
-        StateType::Application,
-        StateName::try_new("dq")?,
-    );
-    let Some(bytes) = block_on(store.get(&id, &meta_cell(), read_event(0)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &meta_cell(), read_event(0)))?.into_inner() else {
         bail!("bounds cell missing after the committed clear-then-push");
     };
     assert_eq!(
@@ -1082,13 +1090,13 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     // the leak the API can never surface.
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
-        block_on(store.get(&id, &stale, read_event(0)))?.into_inner(),
+        block_on(store.get(id, &stale, read_event(0)))?.into_inner(),
         None,
         "the committed clear must physically erase the out-of-window row"
     );
     let reused = entry_cell_for(&I64KeyCodec::encode(&0));
     assert_eq!(
-        block_on(store.get(&id, &reused, read_event(0)))?.into_inner(),
+        block_on(store.get(id, &reused, read_event(0)))?.into_inner(),
         Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
         "the reused index holds exactly the post-clear push"
     );
@@ -1111,7 +1119,9 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let (registry, _) = registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
+    let id = collection_ref.id();
     let armed: ArmedKeys = Arc::default();
 
     // Event 1: one committed set stamps both bound cells.
@@ -1122,11 +1132,12 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(1_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
-    // Event 2: committed clear.
+    // Event 2: committed clear — stages the entries' section clear plus the
+    // two Cleared bound cells.
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
@@ -1134,24 +1145,19 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.clear().await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let id = CollectionId::new(
-        state_key.clone(),
-        StateType::Application,
-        StateName::try_new("mp")?,
-    );
     let (min_cell, max_cell) = bound_cells();
     assert_eq!(
-        block_on(store.get(&id, &min_cell, read_event(0)))?.into_inner(),
+        block_on(store.get(id, &min_cell, read_event(0)))?.into_inner(),
         None,
         "the committed clear must erase the Min bound cell"
     );
     assert_eq!(
-        block_on(store.get(&id, &max_cell, read_event(0)))?.into_inner(),
+        block_on(store.get(id, &max_cell, read_event(0)))?.into_inner(),
         None,
         "the committed clear must erase the Max bound cell"
     );

@@ -27,6 +27,7 @@ use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::CellStore;
 use super::{
     CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
+    StateName, StateType,
 };
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -526,7 +527,12 @@ fn empty_map_stream_issues_no_lower_scans() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?
             .set(0, Value::from(7_i64))
             .await?;
-        finalize_and_promote(&session, &oracle, Uuid::from_u128(1)).await?;
+        let id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("mp")?,
+        );
+        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
 
         counting.reset();
 

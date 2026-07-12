@@ -7,7 +7,7 @@ use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
-use crate::state::memory::MemoryCellStore;
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{CellSession, Finalized};
@@ -17,7 +17,7 @@ use crate::state::{
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 use futures::stream::{self, Stream};
 use parking_lot::Mutex as SyncMutex;
 use quickcheck::{Arbitrary, Gen};
@@ -269,4 +269,26 @@ pub(crate) fn probe(n: u128) -> EventRef {
     EventRef::Message {
         dedup_id: Uuid::from_u128(n),
     }
+}
+
+/// Asserts an explicit settle (promote, rollback, or sweep) left nothing
+/// behind for `id`: no provisional cell and no standing event marker, read
+/// **raw** from the durable maps. A resolving read cannot make this check —
+/// it heals a still-provisional cell to the same bytes a correct settle
+/// writes, so a skipped settle reads back identically. The marker leg is
+/// load-bearing for clears-only stages, which stage zero provisional cells:
+/// there the stranded marker is the only raw evidence of a skipped settle.
+///
+/// Call only where the harness guarantees the collection is fully settled;
+/// first-touch heals leave the marker standing by design, so an event that
+/// deliberately abandons its stage (reset, final-error) leaves residue a
+/// later resolving read absorbs — don't probe across such an event.
+pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionId) -> Result<()> {
+    if !cells.provisional_coordinates(id).is_empty() {
+        bail!("settlement left a provisional cell standing");
+    }
+    if cells.standing_marker_of(id).is_some() {
+        bail!("settlement left an event marker standing");
+    }
+    Ok(())
 }
