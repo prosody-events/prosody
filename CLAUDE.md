@@ -489,6 +489,19 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
   async interface (`insert_async` / `contains_async` / `remove_async`); pair it
   with `ahash::RandomState` as the hasher.
 - Use `tokio::sync` primitives (`Notify`, channels, `select!`) for async
+- **Independent I/O runs concurrently, never serially.** A path that issues N
+  independent reads — point gets, cell fetches, per-item durable loads — must not
+  `await` them one at a time. Serial round trips multiply latency exactly when it
+  hurts most: a cold cache after a rebalance turns one logical read of an N-item
+  window into N sequential coordinator round trips. Drive them through a bounded
+  `buffered(N)` (order-preserving) or `buffer_unordered(N)` (unordered), each
+  future wrapped in `cooperative` per the bullet below. "Independent" means the
+  ops don't race on shared mutable state — concurrent reads of distinct keys
+  qualify (per-key cache fills are already safe); writes whose correctness
+  depends on serialization do not. When the reads form a contiguous range, a
+  single bulk/range query beats N concurrent point reads — one round trip.
+  Reserve serial `await` for genuinely *dependent* reads, where each result
+  determines the next.
 - **Drive streams/futures over non-tokio primitives through the cooperative
   budget.** Tokio auto-decrements its per-task coop budget (and forces a yield
   when it hits zero) only at its *own* leaf awaits — network/channel/timer I/O.
