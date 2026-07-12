@@ -50,6 +50,7 @@ use super::error::FjallCellCacheError;
 use crate::state::CollectionId;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use bytes::Bytes;
+use smallvec::SmallVec;
 use xxhash_rust::xxh3::Xxh3;
 
 /// Length of the collection hash prefix that leads every fjall key (cell and
@@ -134,11 +135,16 @@ pub(super) const SECTION_PREFIX_LEN: usize = COLLECTION_PREFIX_LEN + 1;
 /// bytes. The prefix groups a collection's cells contiguously; the section +
 /// coordinate suffix orders them, so a Map/Deque prefix range is a contiguous
 /// fjall range that preserves user order.
+///
+/// Built per point read and per point write — the dominant steady-state path —
+/// so the key rides a [`SmallVec`] inline buffer: Value (17 B), Deque (25 B),
+/// and short-key Map entries stay on the stack; only a long Map key spills to
+/// the heap (its coordinate is genuinely unbounded).
 #[must_use]
-pub(super) fn cell_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
+pub(super) fn cell_key(id: &CollectionId, cell: &CellKey) -> SmallVec<[u8; 32]> {
     let prefix = collection_prefix(id);
     let coordinate = cell.coordinate.as_bytes();
-    let mut key = Vec::with_capacity(prefix.len() + 1 + coordinate.len());
+    let mut key = SmallVec::with_capacity(prefix.len() + 1 + coordinate.len());
     key.extend_from_slice(&prefix);
     key.push(i8::from(cell.section).cast_unsigned());
     key.extend_from_slice(coordinate);

@@ -13,6 +13,10 @@
 //! message commit marker is read from the session's event identity
 //! (`message_marker`), never deposited by middleware.
 //!
+//! The boundary also closes the session operation gate and holds its permit
+//! across the whole sequence, dropping it just before the apply hooks fire (the
+//! closure/permit contract is owned by [`SessionGate`](crate::state::session)).
+//!
 //! [`EventHandler`]: crate::consumer::EventHandler
 
 use std::error::Error as StdError;
@@ -119,7 +123,7 @@ enum StepOutcome<R> {
 /// therefore end only one of two ways, which makes "abort in normal operation"
 /// unrepresentable for the arm.
 pub(super) enum ArmOutcome {
-    /// The backstop is armed, or a standing one already stands for this commit.
+    /// The backstop is armed, or a standing one already guards this commit.
     Armed,
 
     /// Shutdown intervened before the backstop could be armed. The caller

@@ -1,6 +1,6 @@
 //! Error types for timer management operations.
 //!
-//! Defines [`TimerManagerError`] enum covering all error conditions in
+//! Defines [`TimerManagerError`] enum spanning all error conditions in
 //! [`super::manager::TimerManager`]: storage failures, scheduling failures,
 //! invalid datetime values, and timer lifecycle errors.
 

@@ -242,9 +242,10 @@ where
     /// resolves as skipped, never an error. Windows wider than
     /// `DEQUE_POINT_ITERATION_MAX` entries fall back to one durable range scan
     /// over the window: identical items in identical order, but a mid-stream
-    /// read failure may surface after a different-length yielded prefix (a
-    /// point read fails at its own index; the fallback fails at a page
-    /// boundary) — only error timing differs.
+    /// read failure may surface after a different-length yielded prefix (the
+    /// bounded arm materializes the window before yielding, so a read failure
+    /// surfaces before any item; the scan fallback may yield a prefix and then
+    /// fail at a page boundary).
     pub fn stream(
         &self,
         dir: Direction,

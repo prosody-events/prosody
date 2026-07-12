@@ -2143,21 +2143,7 @@ impl Replay {
             // The boundary delete is verdict-blind and unconditional on
             // clears: staged coordinates always drop; a clears-bearing stale
             // marker drops its section wholesale.
-            if let Some(stale) = &self.stale
-                && !stale.clears
-            {
-                let staged_keys: Vec<u8> = stale
-                    .staged
-                    .iter()
-                    .map(|cell| cell.coordinate.as_bytes()[0])
-                    .collect();
-                for key in staged_keys {
-                    self.warm.remove(&key);
-                }
-                self.stale = None;
-            } else {
-                self.model_stale_resolved();
-            }
+            self.model_stale_resolved();
         }
         self.model_publish(staged.iter().map(|(cell, _)| cell.coordinate.as_bytes()[0]));
         self.staged = Some(Staged {

@@ -114,10 +114,11 @@ pub enum Direction {
 /// unbounded case unrepresentable is the type-level enforcement of that rule
 /// (the twin of the timer system's watermark bound).
 ///
-/// The exclusive edge exists for range consumers that anchor past a known
-/// endpoint: the overlay merge and the bounded collection scans re-seek with
-/// an `Excluded` anchor so a resumed or endpoint-adjacent scan never re-reads
-/// the anchor row.
+/// The exclusive edge exists for callers that need an endpoint-exclusive
+/// range — e.g. resuming a scan just past the last coordinate seen. No
+/// production caller constructs it today; it is reached through the
+/// `Direction` × `ScanEdge` comparator dispatch in the Cassandra cell
+/// store, and property tests drive both variants.
 ///
 /// Generic over the borrowed inner so the same type serves a [`Scan`]'s
 /// `ScanEdge<&Coordinate>` and the typed cell view's `ScanEdge<&Key>`.
@@ -155,18 +156,6 @@ impl<T> ScanEdge<T> {
         match self {
             Self::Included(t) => ScanEdge::Included(f(t)),
             Self::Excluded(t) => ScanEdge::Excluded(f(t)),
-        }
-    }
-
-    /// Recovers a [`ScanEdge`] from a [`Bound`], or `None` for the unbounded
-    /// case a `ScanEdge` cannot represent. The one lossy direction; every
-    /// bounded bound round-trips.
-    #[must_use]
-    pub fn from_bound(bound: Bound<T>) -> Option<Self> {
-        match bound {
-            Bound::Included(t) => Some(Self::Included(t)),
-            Bound::Excluded(t) => Some(Self::Excluded(t)),
-            Bound::Unbounded => None,
         }
     }
 }

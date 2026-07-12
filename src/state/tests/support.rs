@@ -484,7 +484,9 @@ pub(crate) struct Hold {
 }
 
 impl Hold {
-    /// Arms the next `n` calls to park after their inner call.
+    /// Arms the next `n` calls to park after their inner call. Only one parked
+    /// call at a time is supported (single `Notify` pair) — arm the next charge
+    /// after releasing the previous one.
     pub(crate) fn arm(&self, n: usize) {
         self.armed.store(n, Ordering::Relaxed);
     }

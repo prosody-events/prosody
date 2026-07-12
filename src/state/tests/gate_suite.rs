@@ -56,6 +56,15 @@ use uuid::Uuid;
 /// The hang-guard for acquisitions that must proceed — never the assertion.
 const HANG_GUARD: Duration = Duration::from_secs(30);
 
+/// Yields until a just-spawned task has reached its park point (the gate
+/// acquire); 8 yields covers the deepest spawn → acquire chain, and the
+/// pins stay correct regardless (the gate serializes either way).
+async fn let_task_park() {
+    for _ in 0..8_u8 {
+        yield_now().await;
+    }
+}
+
 /// The gate suite's lower store: holds beneath counters beneath memory.
 type GateStore = HoldingCellStore<CountingCellStore<MemoryCellStore<ScriptedOracle>>>;
 
@@ -194,9 +203,7 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
                 Ok::<_, CellStateError<JsonCodecError>>(())
             }
         });
-        for _ in 0..8_u8 {
-            yield_now().await;
-        }
+        let_task_park().await;
         fx.holds.get_for_cache().release();
 
         let got = timeout(HANG_GUARD, get_task)
@@ -266,9 +273,7 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
             let handle = handle.clone();
             async move { handle.set(2, Value::from(20_i64)).await }
         });
-        for _ in 0..8_u8 {
-            yield_now().await;
-        }
+        let_task_park().await;
         fx.holds.write_resolved().release();
         timeout(HANG_GUARD, commit_task)
             .await
@@ -337,9 +342,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
             let handle = handle.clone();
             async move { handle.clear().await }
         });
-        for _ in 0..8_u8 {
-            yield_now().await;
-        }
+        let_task_park().await;
         fx.holds.get_for_cache().release();
         timeout(HANG_GUARD, set_task)
             .await
@@ -374,8 +377,8 @@ fn gate_serializes_set_against_clear() -> Result<()> {
             .await?
             .into_inner();
         assert_eq!(
-            (entry.is_some(), min.is_some()),
-            (entry.is_some(), entry.is_some()),
+            entry.is_some(),
+            min.is_some(),
             "the outcome equals a serial order: entry and bounds live or die together"
         );
         Ok(())
@@ -412,9 +415,7 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
             let handle = handle.clone();
             async move { handle.set(9, Value::from(9_i64)).await }
         });
-        for _ in 0..8_u8 {
-            yield_now().await;
-        }
+        let_task_park().await;
         fx.holds.get_for_cache().release();
         timeout(HANG_GUARD, first)
             .await
@@ -460,7 +461,8 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
 /// the whole pre-commit window in order, and the commit applies after. The
 /// window is wider than the prefetch width, so without the gate the parked
 /// materialization's unlaunched tail reads WOULD observe the commit (the
-/// red). Also re-checks the counting pin's shape: zero scans, `len + 1` gets.
+/// red). Also re-checks the counting pin's scan half: zero scans (the full
+/// `len + 1`-gets pin lives in `state::tests::deque_stream_issues_no_scans`).
 #[test]
 fn gate_excludes_commit_during_bounded_materialization() -> Result<()> {
     /// Wider than `WINDOW_PREFETCH` (16), under the scan threshold (128).
@@ -517,9 +519,7 @@ fn gate_excludes_commit_during_bounded_materialization() -> Result<()> {
                 Ok::<_, Report>(popped)
             }
         });
-        for _ in 0..8_u8 {
-            yield_now().await;
-        }
+        let_task_park().await;
         fx.counting.reset();
         fx.holds.get_for_cache().release();
 
@@ -611,9 +611,7 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
             let handle = handle.clone();
             async move { handle.get().await }
         });
-        for _ in 0..8_u8 {
-            yield_now().await;
-        }
+        let_task_park().await;
         queued.abort();
         assert!(queued.await.is_err(), "the queued op was dropped");
         fx.holds.get_for_cache().release();

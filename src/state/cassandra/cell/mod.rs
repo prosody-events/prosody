@@ -44,7 +44,7 @@
 //! delete landing without its gaps would lose the committed clear forever);
 //! [`write_resolved`](CellStore::write_resolved) applies its direct clears the
 //! same way, marker-free. Until the gaps land, reads are defended by
-//! **read-help**: `get`/`scan` (and their cache-fill twins) resolve a standing
+//! **read-help**: `get`/`scan` (and `get`'s cache-fill twin) resolve a standing
 //! foreign clears-bearing marker through the sweep path before serving — the
 //! committed-unapplied read-window contract stated on
 //! [`get`](CellStore::get) — riding the same memo, so the fast path pays no

@@ -777,7 +777,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
     Ok(collect_deque(&handle, Direction::Backward).await? == reversed)
 }
 
-/// `MetaBoundsCoverLive` (Map): the stored `MapBound::Min`/`MapBound::Max`
+/// `MetaBoundsSuperset` (Map): the stored `MapBound::Min`/`MapBound::Max`
 /// bound a loose **superset** of the live key range — every live key's
 /// coordinate lies within `[min, max]`. Read directly from the raw bound cells,
 /// so this proves the bound *values* are a correct superset, not just that

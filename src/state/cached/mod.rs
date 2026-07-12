@@ -159,8 +159,12 @@ use tokio::time::sleep;
 use tracing::warn;
 
 /// Delay between attempts of a must-succeed repair delete ([`retry_delete`])
-/// while fjall is transiently failing.
+/// while fjall is transiently failing. Zero under test: the bounded-retry
+/// pins assert lands-or-fuses, never pacing.
+#[cfg(not(test))]
 const DELETE_RETRY_DELAY: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const DELETE_RETRY_DELAY: Duration = Duration::ZERO;
 
 /// Attempts a must-succeed repair delete makes before blowing the cache fuse:
 /// the budget absorbs transient I/O hiccups (one must not cost a weeks-long
@@ -255,18 +259,19 @@ impl<L> Cached<L> {
         project: impl Fn(&T) -> Committed,
     ) {
         let expiry = expiry_at(stamped_at, collection.ttl());
-        // Build the bounded batch input once, then publish atomically: a
-        // multi-cell update is never torn, and the whole settle is one blocking
-        // thread-hop instead of N.
-        let batch: Vec<(CellKey, Committed, u64)> = cells
+        // Project each touched cell and publish atomically, streaming the batch
+        // input straight into `put_batch` (no intermediate collect): a multi-cell
+        // update is never torn, and the whole settle is one blocking thread-hop
+        // instead of N.
+        let projected = cells
             .iter()
-            .map(|(cell, value)| (cell.clone(), project(value), expiry))
-            .collect();
-        if let Err(error) = self.fjall.put_batch(collection.id(), &batch).await {
+            .map(|(cell, value)| (cell.clone(), project(value), expiry));
+        if let Err(error) = self.fjall.put_batch(collection.id(), projected).await {
             warn_skip("publish", &error);
-            let cells: Vec<CellKey> = batch.into_iter().map(|(cell, ..)| cell).collect();
+            // D1 repair: rebuild the delete keys from the `cells` param.
+            let keys: Vec<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "publish repair", || {
-                self.fjall.delete_batch(collection.id(), &cells)
+                self.fjall.delete_batch(collection.id(), &keys)
             })
             .await;
         }
@@ -806,6 +811,10 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 /// never fails upward and never stalls settlement — see the module's retry
 /// posture for why every failure class (there is no Permanent escape hatch)
 /// lands in the same bounded place.
+///
+/// A dropped settle future abandons the retry harmlessly: the drop coincides
+/// with assignment revocation (the workspace — and any stale entry — dies with
+/// it) or with an idempotent sweep re-run that re-attempts the repair.
 async fn retry_delete<F, Fut>(fjall: &FjallCellCache, op: &str, mut delete: F)
 where
     F: FnMut() -> Fut,

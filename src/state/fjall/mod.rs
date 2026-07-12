@@ -64,6 +64,7 @@ use educe::Educe;
 use fjall::{Database, Keyspace, OwnedWriteBatch, Slice};
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
+use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::ops::Bound;
 #[cfg(test)]
@@ -331,11 +332,13 @@ impl FjallCellCache {
     /// cache to a loud durable passthrough. Called by a must-succeed delete
     /// that exhausted its retry budget — the delete "lands or fuses", so a
     /// sick local disk can never stall settlement or leave a stale entry
-    /// reachable. Loud by contract: one warning and one metric bump per blow.
+    /// reachable. Loud by contract: the first blow warns and bumps the metric
+    /// once per degraded assignment; later calls are no-ops.
     pub(crate) fn blow_fuse(&self) {
-        self.fuse.store(true, Ordering::Relaxed);
-        warn!("keyed-state cache fuse blown; degrading the assignment to durable reads");
-        FUSE_BLOWN.add(1, &[]);
+        if !self.fuse.swap(true, Ordering::Relaxed) {
+            warn!("keyed-state cache fuse blown; degrading the assignment to durable reads");
+            FUSE_BLOWN.add(1, &[]);
+        }
     }
 
     /// Test handle on the [`put`](Self::put) fault seam: returns the shared
@@ -523,19 +526,25 @@ impl FjallCellCache {
     pub(crate) async fn put_batch(
         &self,
         collection: &CollectionId,
-        cells: &[(CellKey, Committed, u64)],
+        cells: impl IntoIterator<Item = (CellKey, Committed, u64)>,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
             return Err(FjallCellCacheError::Injected);
         }
-        // Encode every frame up front (bounded, sized once) so the blocking
-        // closure only touches fjall; the owned key/frame pairs move into it.
-        let mut framed: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(cells.len());
-        for (cell, value, expiry) in cells {
-            let frame = encode_frame(value.get(), *expiry);
-            framed.push((codec::cell_key(collection, cell), frame));
-        }
+        // Encode every key + frame up front (bounded, sized once from the
+        // caller's iterator) so the blocking closure only touches fjall; the
+        // owned key/frame pairs move into it. Building `framed` directly from the
+        // projected iterator avoids an intermediate collect on the settle path.
+        let framed: Vec<(SmallVec<[u8; 32]>, Bytes)> = cells
+            .into_iter()
+            .map(|(cell, value, expiry)| {
+                (
+                    codec::cell_key(collection, &cell),
+                    encode_frame(value.get(), expiry),
+                )
+            })
+            .collect();
         let handle = self.inner.handle().clone();
         let capacity = framed.len();
         self.run_batch(handle, capacity, move |batch, handle| {
@@ -588,7 +597,7 @@ impl FjallCellCache {
         }
         // Owned closure inputs, bounded and sized once: the cell key plus the
         // committed `data` to rewrite at its read-back stage expiry.
-        let mut inputs: Vec<(Vec<u8>, Option<Bytes>)> = Vec::with_capacity(writes.len());
+        let mut inputs: Vec<(SmallVec<[u8; 32]>, Option<Bytes>)> = Vec::with_capacity(writes.len());
         for (cell, write) in writes {
             inputs.push((codec::cell_key(collection, cell), write.data().cloned()));
         }
@@ -623,7 +632,7 @@ impl FjallCellCache {
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         self.injected_delete_failure()?;
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(cells.len());
+        let mut keys: Vec<SmallVec<[u8; 32]>> = Vec::with_capacity(cells.len());
         for cell in cells {
             keys.push(codec::cell_key(collection, cell));
         }
@@ -663,7 +672,7 @@ impl FjallCellCache {
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         self.injected_delete_failure()?;
-        let excluded: Arc<HashSet<Vec<u8>, RandomState>> = Arc::new(
+        let excluded: Arc<HashSet<SmallVec<[u8; 32]>, RandomState>> = Arc::new(
             exclude
                 .iter()
                 .map(|cell| codec::cell_key(collection, cell))
@@ -981,13 +990,15 @@ async fn read_cell(
 }
 
 /// Writes `cell` at `key`, overwriting any existing cell — one blocking hop.
+/// Generic over the key so a variable-length `SmallVec` cell key and a
+/// fixed-size `[u8; N]` index key both write without a bridging copy.
 async fn write_cell(
     cache: &Keyspace,
-    key: Vec<u8>,
+    key: impl AsRef<[u8]> + Send + 'static,
     cell: Bytes,
 ) -> Result<(), FjallCellCacheError> {
     let cache = cache.clone();
-    spawn_blocking(move || cache.insert(key.as_slice(), cell.as_ref())).await??;
+    spawn_blocking(move || cache.insert(key.as_ref(), cell.as_ref())).await??;
     Ok(())
 }
 
