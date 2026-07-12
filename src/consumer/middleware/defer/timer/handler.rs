@@ -28,11 +28,11 @@ use super::context::TimerDeferContext;
 use super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
-use crate::consumer::middleware::defer::{calculate_backoff, reset_state_session};
+use crate::consumer::middleware::{FallibleHandler, Settlement, SettlementHandler};
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::telemetry::event::TimerEventType;
@@ -203,6 +203,34 @@ where
 
     async fn shutdown(self) {
         self.handler.shutdown().await;
+    }
+}
+
+impl<T, S, D> SettlementHandler for TimerDeferHandler<T, S, D>
+where
+    T: SettlementHandler,
+    S: TimerDeferStore,
+    D: DeferralDecider,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: its result is the dispatch's outcome.
+            Ok(TimerDeferOutput::Inner(output)) => T::settlement(Ok(output)),
+            // Inner ran and its error surfaced.
+            Err(DeferError::Handler(error)) => T::settlement(Err(error)),
+            // `Deferred`/`NoInner` — parked for retry / queued behind /
+            // orphan cleanup: the outcome lives in the defer queue, so
+            // nothing here may stage or record. The error rows are the defer
+            // layer's own rescue failing (store/timer/loader/backoff
+            // computation) — a layer failure, never the event's outcome.
+            Ok(TimerDeferOutput::Deferred(_) | TimerDeferOutput::NoInner)
+            | Err(
+                DeferError::Store(_)
+                | DeferError::Timer(_)
+                | DeferError::Loader(_)
+                | DeferError::CompactTime(_),
+            ) => Settlement::Bypassed,
+        }
     }
 }
 
@@ -411,7 +439,6 @@ where
             "Deferred timer for timer-based retry"
         );
 
-        reset_state_session(&context);
         Ok(TimerDeferOutput::Deferred(inner_err))
     }
 
@@ -495,7 +522,6 @@ where
                     "Re-deferred timer after transient failure"
                 );
 
-                reset_state_session(context);
                 Ok(TimerDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {

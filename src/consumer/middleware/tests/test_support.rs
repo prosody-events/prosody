@@ -16,10 +16,12 @@ use tokio::sync::{Semaphore, watch};
 use tracing::Span;
 use uuid::Uuid;
 
+use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
-use crate::consumer::middleware::{DemandType, FallibleHandler};
+use crate::consumer::middleware::{DemandType, FallibleHandler, Settlement, SettlementHandler};
 use crate::consumer::partition::ShutdownPhase;
+use crate::consumer::{Keyed, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
@@ -29,10 +31,7 @@ use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{
-    CellSession, KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
-};
+use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::tests::support::UnavailableState;
 use crate::state::{
@@ -40,7 +39,7 @@ use crate::state::{
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::{TimerType, Trigger};
+use crate::timers::{TimerType, Trigger, UncommittedTimer};
 
 /// Timer-operation error the mock injects on demand, carrying the category to
 /// classify as. The backstop arm is must-succeed (invariant 8), so it retries
@@ -600,6 +599,56 @@ impl FallibleHandler for ScriptedHandler {
     async fn shutdown(self) {}
 }
 
+impl SettlementHandler for ScriptedHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
+
+/// Probe leaf whose settlement classification is `Bypassed` for every
+/// result, so a wrapper's delegating rows are provably delegating in the
+/// classification tables — a wrapper hardcoding `Final` fails against it.
+#[derive(Clone)]
+pub struct BypassedHandler;
+
+impl FallibleHandler for BypassedHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+impl SettlementHandler for BypassedHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Bypassed
+    }
+}
+
 /// Wraps `value` in a `ConsumerMessage` holding a fresh capacity permit.
 ///
 /// Surfaces the (never-in-practice) permit-acquisition failure rather than
@@ -622,6 +671,91 @@ pub fn create_test_message() -> color_eyre::Result<ConsumerMessage<Value>> {
 #[must_use]
 pub fn create_test_trigger_with(key: &str, time: u32, timer_type: TimerType) -> Trigger {
     Trigger::for_testing(Arc::from(key), CompactDateTime::from(time), timer_type)
+}
+
+/// Guard recording whether the trigger committed or aborted.
+pub struct RecordingTimerGuard {
+    committed: Arc<AtomicUsize>,
+    aborted: Arc<AtomicUsize>,
+}
+
+impl Uncommitted for RecordingTimerGuard {
+    async fn commit(self) {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn abort(self) {
+        self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Minimal [`UncommittedTimer`](crate::timers::UncommittedTimer) over a fixed
+/// trigger, so a timer dispatch can run through `EventHandler::on_timer` and
+/// its settle sequence. Returns `(timer, committed, aborted)` counters.
+pub struct RecordingTimer {
+    trigger: Trigger,
+    committed: Arc<AtomicUsize>,
+    aborted: Arc<AtomicUsize>,
+}
+
+impl RecordingTimer {
+    /// A timer over `trigger` plus its shared commit/abort counters.
+    #[must_use]
+    pub fn new(trigger: Trigger) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                trigger,
+                committed: committed.clone(),
+                aborted: aborted.clone(),
+            },
+            committed,
+            aborted,
+        )
+    }
+}
+
+impl Keyed for RecordingTimer {
+    type Key = Key;
+
+    fn key(&self) -> &Self::Key {
+        &self.trigger.key
+    }
+}
+
+impl Uncommitted for RecordingTimer {
+    async fn commit(self) {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn abort(self) {
+        self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl UncommittedTimer for RecordingTimer {
+    type CommitGuard = RecordingTimerGuard;
+
+    fn time(&self) -> CompactDateTime {
+        self.trigger.time
+    }
+
+    fn timer_type(&self) -> TimerType {
+        self.trigger.timer_type
+    }
+
+    fn span(&self) -> Span {
+        Span::current()
+    }
+
+    fn into_inner(self) -> (Trigger, Self::CommitGuard) {
+        let guard = RecordingTimerGuard {
+            committed: self.committed.clone(),
+            aborted: self.aborted.clone(),
+        };
+        (self.trigger, guard)
+    }
 }
 
 /// [`create_test_trigger_with`] over defaults: `test-key`, t=1000, default
@@ -695,18 +829,18 @@ impl OutcomeSlot {
 }
 
 // =========================================================================
-// Recording-session harness for the attempt-boundary session-reset tests
+// Recording-session harness for the settlement-boundary marker tests
 // =========================================================================
 //
 // The marker-hygiene triangle — retry between attempts, settle on the final
 // outcome, and every defer/route Err→Ok swallow — shares one observable
-// contract: a discarded attempt's buffered writes never commit and its
-// registered marker never flushes. These pieces build a **real**
-// `KeyedStateSession` whose marker flush routes through a recording oracle so
-// each seam's test can assert that contract directly.
+// contract: a `Bypassed` or discarded attempt's buffered writes never commit
+// and no marker records for it. These pieces build a **real**
+// `KeyedStateSession` whose marker record routes through a recording oracle
+// so each seam's test can assert that contract directly.
 
-/// Oracle that records every flushed marker and always resolves Committed, so
-/// a test can read back exactly which markers `settle` certified.
+/// Oracle that records every recorded marker and always resolves Committed,
+/// so a test can read back exactly which markers `settle` certified.
 #[derive(Clone)]
 pub struct RecordingOracle {
     recorded: Arc<Mutex<Vec<Uuid>>>,
@@ -772,10 +906,27 @@ pub type RecordingParts = (
     Arc<Mutex<Vec<Uuid>>>,
 );
 
-/// A real session over `registry` for `state_key`; see [`RecordingParts`]
-/// for the returned surfaces.
+/// A real session over `registry` for `state_key` and `event` (the identity
+/// the settle boundary reads its marker from); see [`RecordingParts`] for
+/// the returned surfaces.
 #[must_use]
-pub fn recording_session(registry: CollectionDefRegistry, state_key: StateKey) -> RecordingParts {
+pub fn recording_session(
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    event: EventRef,
+) -> RecordingParts {
+    recording_session_with_loader(registry, state_key, event, MemoryLoader::new())
+}
+
+/// [`recording_session`] over a caller-supplied loader, for reload tests
+/// that seed messages into it.
+#[must_use]
+pub fn recording_session_with_loader(
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    event: EventRef,
+    loader: MemoryLoader<Value>,
+) -> RecordingParts {
     let registry = Arc::new(registry);
     let oracle = RecordingOracle::new();
     let recorded = oracle.recorded();
@@ -787,12 +938,10 @@ pub fn recording_session(registry: CollectionDefRegistry, state_key: StateKey) -
         cell: cell_store.clone(),
         dirty: dirty.clone(),
         oracle,
-        loader: MemoryLoader::new(),
+        loader,
         registry,
         state_key,
-        event: EventRef::Message {
-            dedup_id: Uuid::new_v4(),
-        },
+        event,
         recovery_delay: CompactDuration::new(30),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
@@ -843,24 +992,20 @@ pub enum StagingHook {
 }
 
 /// Inner handler for the defer/route swallow tests: on every dispatch it
-/// binds `cart`, buffers one write, registers its marker, then fails
-/// Transient — the exact attempt whose session the swallow point must reset
-/// before absorbing the error into an `Ok`. Records its apply hooks so a test
-/// can prove the swallow path (not a surfaced error) handled the dispatch.
-#[derive(Clone)]
+/// binds `cart`, buffers one write, then fails Transient — the exact attempt
+/// whose swallow the settle boundary must classify `Bypassed` so nothing
+/// stages and no marker records. Records its apply hooks so a test can prove
+/// the swallow path (not a surfaced error) handled the dispatch.
+#[derive(Clone, Default)]
 pub struct StagingTransientHandler {
-    marker: Uuid,
     hooks: Arc<Mutex<Vec<StagingHook>>>,
 }
 
 impl StagingTransientHandler {
-    /// A handler registering `marker` on every attempt.
+    /// A handler staging one `cart` write per attempt.
     #[must_use]
-    pub fn new(marker: Uuid) -> Self {
-        Self {
-            marker,
-            hooks: Arc::default(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The `cart` collection every attempt writes; register it in the
@@ -876,8 +1021,7 @@ impl StagingTransientHandler {
         self.hooks.lock().clone()
     }
 
-    /// One failed attempt: buffer a `cart` write, register the marker, fail
-    /// Transient.
+    /// One failed attempt: buffer a `cart` write, fail Transient.
     async fn stage<C>(&self, context: &C) -> Result<(), StagingError>
     where
         C: EventContext<Payload = Value>,
@@ -889,10 +1033,6 @@ impl StagingTransientHandler {
             .set(json!({ "attempt": 1_i32 }))
             .await
             .map_err(|_| StagingError(ErrorCategory::Terminal))?;
-        let lifecycle = context
-            .lifecycle()
-            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
-        lifecycle.register_marker(self.marker);
         Err(StagingError(ErrorCategory::Transient))
     }
 }
@@ -941,4 +1081,10 @@ impl FallibleHandler for StagingTransientHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl SettlementHandler for StagingTransientHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
 }

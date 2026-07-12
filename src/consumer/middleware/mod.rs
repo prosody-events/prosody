@@ -182,8 +182,8 @@ pub mod timeout;
 pub mod topic;
 
 // Re-export providers for backwards compatibility and convenience
-pub use providers::{CloneProvider, FallibleCloneProvider};
-pub(crate) use settle::{abandon, settle};
+pub use providers::{CloneProvider, FallibleCloneProvider, LeafHandler};
+pub(crate) use settle::{MarkerWrite, Settlement, SettlementHandler, abandon, settle};
 
 /// Provides fallible handlers for processing messages from specific partitions.
 ///
@@ -249,17 +249,19 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// This method converts the middleware stack (which implements
     /// `HandlerMiddleware`) into a provider (which implements
     /// `FallibleHandlerProvider`) by terminating the stack with the given
-    /// handler as the innermost component.
+    /// handler as the innermost component — adapted through [`LeafHandler`],
+    /// the chain terminator that classifies the leaf's result as final for
+    /// the settlement boundary.
     ///
     /// See the [module-level usage example](crate::consumer::middleware) for a
     /// full composition; a single middleware terminates the chain the same way,
     /// e.g. `RetryMiddleware::new(config)?.into_provider(handler)`.
-    fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
+    fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<LeafHandler<H>>>
     where
         Self: Sized,
         H: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
     {
-        self.with_provider(FallibleCloneProvider::new(handler))
+        self.with_provider(FallibleCloneProvider::new(LeafHandler::new(handler)))
     }
 
     /// Adds a middleware layer on top of this middleware (inner-to-outer
@@ -676,18 +678,20 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// runs the keyed-state durability sequence in straight-line code:
 ///
 /// ```text
-/// final Ok  → stage provisional cells / write resolved (retry transient failures in place)
+/// Bypassed final                → commit → after_commit (no stage, no marker)
+/// Final Ok  → stage provisional cells / write resolved (retry transient failures in place)
 ///           → arm StateRecovery backstop (clear_and_schedule; per-key singleton)
-///           → flush registered dedup marker   (STRICTLY after the stage)
+///           → record the message marker (read from the session's event
+///             identity; STRICTLY after the stage)
 ///           → commit the offset / trigger marker
 ///           → promote the staged cells (the backstop stays armed; the sweep
 ///             self-clears once the key goes quiet)
 ///           → after_commit(Ok)
-/// final Err Transient/Permanent → flush registered marker → commit → after_commit(Err)
-/// final Err Terminal            → abort → after_abort
+/// Final Err Transient/Permanent → record marker iff Permanent → commit → after_commit(Err)
+/// Err Terminal                  → abort → after_abort
 /// ```
 ///
-/// Because the marker flush is textually *after* the stage in one function,
+/// Because the marker record is textually *after* the stage in one function,
 /// the marker-before-durable-state bug class is **unwritable**, not merely
 /// avoided. The crash-window argument for the full step order — including
 /// why promotion runs strictly after the commit — lives on
@@ -701,14 +705,14 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// `settle` / `abandon` functions, so the sequence still has a single
 /// owner. No other middleware should implement `EventHandler` directly.
 ///
-/// **Stack contract:** `settle` keys the stage to the *final* `Ok` the
-/// stack returns, not the inner handler's `Ok`. In the shipped stacks no
-/// reachable path maps an inner `Ok` to an outer `Err`; the defer
-/// middlewares *can* (a rescue failure after inner success), which is safe
-/// because retry's between-attempt reset discards the session and `settle`
-/// flushes a registered marker only on a `Permanent` final. A new
-/// middleware that converts inner `Ok` to outer `Err` must reset the
-/// session (`reset_state_session`) or rely on those same guards.
+/// **Stack contract:** whether a dispatch settles the event is a pure
+/// function of the *final* result the stack returns — the crate-internal
+/// `settlement()` classification. A middleware that swallows or rescues (a
+/// defer swallow into `Ok(Deferred)`, a DLQ route into `Ok(Routed)`, a dedup
+/// skip into `Ok(None)`) classifies its own variants `Bypassed`, so nothing
+/// stages and no marker records for the swallowed attempt; there is no reset
+/// protocol to remember. The blanket impl therefore requires the
+/// classification alongside this marker trait.
 ///
 /// Per-invocation apply-hook correctness is preserved: one inner invocation
 /// pairs with exactly one `after_commit` / `after_abort` firing.
@@ -745,8 +749,7 @@ where
 
 impl<T> EventHandler for T
 where
-    T: FallibleEventHandler,
-    T::Error: ClassifyError,
+    T: FallibleEventHandler + SettlementHandler,
 {
     type Payload = T::Payload;
 

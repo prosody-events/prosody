@@ -157,6 +157,7 @@ impl TestHarness {
             partition,
             sender,
             source: Arc::from("test"),
+            dedup_version: Arc::from("1"),
         };
 
         Ok(Self {

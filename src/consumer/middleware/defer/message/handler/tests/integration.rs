@@ -415,6 +415,7 @@ fn build_shutdown_proof_stack(
         partition,
         sender,
         source: Arc::from("test"),
+        dedup_version: Arc::from("1"),
     };
 
     Ok((handler, store, loader, inner, capture, decider))

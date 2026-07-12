@@ -31,9 +31,103 @@
 //! let provider = CloneProvider::new(my_event_handler);
 //! ```
 
-use crate::consumer::{EventHandler, HandlerProvider, Partition, Topic};
+use std::future::Future;
 
-use super::{FallibleHandler, FallibleHandlerProvider};
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::{DemandType, EventHandler, HandlerProvider, Partition, Topic};
+use crate::timers::Trigger;
+
+use super::{FallibleHandler, FallibleHandlerProvider, Settlement, SettlementHandler};
+
+/// The chain terminator [`into_provider`] mints around the user's leaf
+/// handler: a pure pass-through whose crate-internal settlement
+/// classification is final on both sides — the leaf's result is the event's
+/// own outcome, by definition. Minting it here (instead of a blanket
+/// classification over all handlers) keeps the classification an explicit,
+/// per-wrapper obligation inside the framework while leaving public leaf
+/// handlers untouched.
+///
+/// [`into_provider`]: super::HandlerMiddleware::into_provider
+#[derive(Clone, Debug)]
+pub struct LeafHandler<H>(H);
+
+impl<H> LeafHandler<H> {
+    /// Wraps the user's leaf handler; called only by
+    /// [`into_provider`](super::HandlerMiddleware::into_provider).
+    pub(crate) fn new(handler: H) -> Self {
+        Self(handler)
+    }
+}
+
+impl<H> FallibleHandler for LeafHandler<H>
+where
+    H: FallibleHandler,
+{
+    type Error = H::Error;
+    type Output = H::Output;
+    type Payload = H::Payload;
+
+    fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.0.on_message(context, message, demand_type)
+    }
+
+    fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.0.on_timer(context, trigger, demand_type)
+    }
+
+    fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Output, Self::Error>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.0.after_commit(context, result)
+    }
+
+    fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Output, Self::Error>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.0.after_abort(context, result)
+    }
+
+    fn shutdown(self) -> impl Future<Output = ()> + Send {
+        self.0.shutdown()
+    }
+}
+
+impl<H> SettlementHandler for LeafHandler<H>
+where
+    H: FallibleHandler,
+{
+    /// The handler's own result is the event's own outcome, by definition.
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
 
 /// A provider that clones the wrapped fallible handler for each partition.
 ///

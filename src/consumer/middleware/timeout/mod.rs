@@ -44,7 +44,9 @@ use validator::{Validate, ValidationErrors};
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::consumer::middleware::{
+    FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
+};
 use crate::timers::Trigger;
 use crate::util::from_option_duration_env;
 use crate::{Partition, Topic};
@@ -298,6 +300,17 @@ where
     async fn shutdown(self) {
         debug!("Timeout handler shutting down");
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for TimeoutHandler<T>
+where
+    T: SettlementHandler,
+{
+    /// Pass-through: timeout adds no Output or error variants of its own (a
+    /// timeout surfaces as the inner's own cancellation-shaped error).
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        T::settlement(result)
     }
 }
 

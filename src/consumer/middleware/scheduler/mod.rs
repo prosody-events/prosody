@@ -34,6 +34,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::scheduler::dispatch::{DispatchError, Dispatcher};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
@@ -43,6 +44,8 @@ use crate::{Partition, Topic, TopicPartitionKey};
 
 mod decay;
 mod dispatch;
+#[cfg(test)]
+mod tests;
 
 /// Configuration for the scheduler middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -390,5 +393,22 @@ where
 
     async fn shutdown(self) {
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for SchedulerHandler<T>
+where
+    T: SettlementHandler,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: delegate.
+            Ok(output) => T::settlement(Ok(output)),
+            Err(SchedulerError::Handler(error)) => T::settlement(Err(error)),
+            // Pre-inner admission rejection: the inner never ran. (Belt and
+            // braces — the variant classifies Terminal today, which settle's
+            // Terminal-first check abandons before consulting this.)
+            Err(SchedulerError::PermitAcquisition(_)) => Settlement::Bypassed,
+        }
     }
 }

@@ -3,6 +3,7 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
+use crate::consumer::middleware::MarkerWrite;
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
@@ -11,6 +12,7 @@ use crate::state::descriptor::StructuralIdentity;
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
+use crate::state::session::MessageMarker;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{CellSession, Finalized};
 use crate::state::store::CellStore;
@@ -23,7 +25,6 @@ use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
 use futures::stream::{self, Stream};
-use parking_lot::Mutex as SyncMutex;
 use quickcheck::{Arbitrary, Gen};
 use std::convert::Infallible;
 use std::fmt;
@@ -71,7 +72,6 @@ impl CommitOracle for FixedOracle {
 #[derive(Clone)]
 pub struct UnavailableState<P> {
     loader: MemoryLoader<P>,
-    markers: Arc<SyncMutex<Vec<Uuid>>>,
 }
 
 impl<P> UnavailableState<P>
@@ -83,13 +83,7 @@ where
     pub fn new() -> Self {
         Self {
             loader: MemoryLoader::new(),
-            markers: Arc::new(SyncMutex::new(Vec::new())),
         }
-    }
-
-    /// The markers registered against this stub (test observability).
-    pub(crate) fn registered_markers(&self) -> Vec<Uuid> {
-        self.markers.lock().clone()
     }
 }
 
@@ -205,19 +199,22 @@ where
         Ok(Finalized::Clean)
     }
 
-    fn register_marker(&self, dedup_id: Uuid) {
-        self.markers.lock().push(dedup_id);
+    fn set_reload_marker(&self, _marker: MessageMarker) {}
+
+    fn message_marker(&self) -> Option<MessageMarker> {
+        // Stateless: no event identity, so nothing filters or records.
+        None
     }
 
-    async fn flush_marker(&self) -> Result<(), StateAccessError> {
+    async fn record_marker(
+        &self,
+        _marker: MessageMarker,
+        _proof: MarkerWrite,
+    ) -> Result<(), StateAccessError> {
         Ok(())
     }
 
     fn discard_dirty(&self) {}
-
-    fn reset(&self) {
-        self.markers.lock().clear();
-    }
 
     fn recovery_floor(&self) -> CompactDuration {
         CompactDuration::MIN

@@ -310,6 +310,7 @@ impl DeferTestEnvironment {
                 message_provider,
                 failure_tracker,
                 loader,
+                "1",
                 &telemetry,
             )?;
 

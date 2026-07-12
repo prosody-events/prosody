@@ -58,6 +58,12 @@ impl ClassifyError for TestError {
 
 impl FallibleEventHandler for ProbeHandler {}
 
+impl SettlementHandler for ProbeHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
+
 /// Records every lifecycle hook firing for later assertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HookEvent {
@@ -352,6 +358,15 @@ where
 
 impl<T> FallibleEventHandler for PassThroughMiddleware<T> where T: FallibleHandler {}
 
+impl<T> SettlementHandler for PassThroughMiddleware<T>
+where
+    T: SettlementHandler,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        T::settlement(result)
+    }
+}
+
 #[tokio::test]
 async fn pass_through_middleware_forwards_output_to_inner_after_commit() -> color_eyre::Result<()> {
     let inner = ProbeHandler::ok(7);
@@ -409,8 +424,6 @@ mod staged_rollback {
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::LifecycleAccessExt;
-    use crate::state::session::sealed::StateLifecycle;
     use crate::state::store::CellStore;
     use crate::state::tests::cell_suite::value_cell;
     use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType};
@@ -589,14 +602,13 @@ mod staged_rollback {
             .with_session(session)
             .with_timer_tracking();
 
-        // Buffer a write and register a marker; do NOT finalize — `settle`
-        // owns the stage and must hit the poison itself.
+        // Buffer a write; do NOT finalize — `settle` owns the stage and must
+        // hit the poison itself. The session's message EventRef carries the
+        // marker the skip path must NOT record.
         let handle = context
             .state(Registered::new(cart()))
             .map_err(|e| eyre!("bind cart: {e}"))?;
         handle.set(json!({ "x": 1_i32 })).await?;
-        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-        lifecycle.register_marker(Uuid::from_u128(0x5EA1));
 
         let handler = ProbeHandler::ok(0);
         let committed = Arc::new(AtomicUsize::new(0));
@@ -733,7 +745,6 @@ mod hook_visibility {
     use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
     use crate::state::oracle::CommitOracle;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::sealed::StateLifecycle;
     use crate::state::session::{
         CellSession, KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
     };
@@ -850,6 +861,12 @@ mod hook_visibility {
         }
 
         async fn shutdown(self) {}
+    }
+
+    impl SettlementHandler for HookProbe {
+        fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+            Settlement::Final
+        }
     }
 
     /// Window 1 — `after_abort` after the arm-shutdown rollback reads the
@@ -986,7 +1003,6 @@ mod hook_visibility {
         session
             .set(StateType::Application, &cart, &value_cell(), b"staged")
             .await?;
-        session.register_marker(Uuid::from_u128(0x5EA2));
         let context = base.with_session(session);
 
         let handler = HookProbe::new(vec![cart]);
@@ -1087,7 +1103,6 @@ mod hook_visibility {
         session
             .set(StateType::Application, &wishlist, &value_cell(), b"B1")
             .await?;
-        session.register_marker(Uuid::from_u128(0x5EA3));
         let context = MockEventContext::new().with_session(session);
 
         let handler = HookProbe::new(vec![cart, wishlist]);
@@ -1104,8 +1119,8 @@ mod hook_visibility {
         assert_eq!(aborted.load(Ordering::SeqCst), 0);
         assert_eq!(
             recorded.lock().as_slice(),
-            [Uuid::from_u128(0x5EA3)],
-            "the marker flushed before the commit",
+            [Uuid::from_u128(0xF2)],
+            "the session's own message marker recorded before the commit",
         );
         assert_eq!(
             handler.reads(),
@@ -1515,13 +1530,17 @@ mod arm_backstop {
     }
 }
 
-/// The success-path marker flush is **must-succeed**: `settle` retries a
-/// failed flush of ANY category — Transient, Terminal, and Permanent alike —
+/// The success-path marker record is **must-succeed**: `settle` retries a
+/// failed record of ANY category — Transient, Terminal, and Permanent alike —
 /// until the marker lands. The marker is framework bookkeeping, never a data
 /// rejection: skipping a Permanent failure would commit the offset with the
 /// stage uncertified, and the armed sweep would then silently roll a
-/// successful handler's writes back with no redelivery to replay them.
-mod marker_flush_must_succeed {
+/// successful handler's writes back with no redelivery to replay them. The
+/// marker itself is the session's boundary-readable event identity
+/// (`message_marker()`), so these pins also cover the identity sources: a
+/// message session records its `EventRef` dedup id; a pure timer session
+/// records nothing.
+mod marker_record_must_succeed {
     use super::*;
     use crate::consumer::partition::ShutdownPhase;
     use crate::loader::MemoryLoader;
@@ -1532,14 +1551,13 @@ mod marker_flush_must_succeed {
     use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
     use crate::state::oracle::CommitOracle;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::sealed::StateLifecycle;
-    use crate::state::session::{
-        KeyedStateSession, LifecycleAccessExt, SessionParts, TerminationWatch,
-    };
+    use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
     use crate::state::store::CellStore;
     use crate::state::{
         CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
+        TimerEventRef,
     };
+    use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
     use color_eyre::eyre::Result;
     use futures::StreamExt;
@@ -1562,13 +1580,13 @@ mod marker_flush_must_succeed {
     }
 
     /// Oracle whose `record_message` fails a configured number of times with a
-    /// configured category before succeeding, counting successful records;
+    /// configured category before succeeding, logging every recorded id;
     /// `resolve` always answers Committed.
     #[derive(Clone)]
     struct FlakyMarkerOracle {
         remaining: Arc<AtomicUsize>,
         category: ErrorCategory,
-        recorded: Arc<AtomicUsize>,
+        recorded: Arc<Mutex<Vec<Uuid>>>,
     }
 
     impl FlakyMarkerOracle {
@@ -1576,15 +1594,19 @@ mod marker_flush_must_succeed {
             Self {
                 remaining: Arc::new(AtomicUsize::new(fail_count)),
                 category,
-                recorded: Arc::new(AtomicUsize::new(0)),
+                recorded: Arc::default(),
             }
+        }
+
+        fn recorded(&self) -> Vec<Uuid> {
+            self.recorded.lock().clone()
         }
     }
 
     impl CommitOracle for FlakyMarkerOracle {
         type Error = MockMarkerError;
 
-        async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
             // While the countdown is positive, decrement it and inject one
             // more failure; once exhausted, record the marker.
             if self
@@ -1594,7 +1616,7 @@ mod marker_flush_must_succeed {
             {
                 return Err(MockMarkerError(self.category));
             }
-            self.recorded.fetch_add(1, Ordering::SeqCst);
+            self.recorded.lock().push(dedup_id);
             Ok(())
         }
 
@@ -1614,15 +1636,20 @@ mod marker_flush_must_succeed {
     >;
     type FlakySession = KeyedStateSession<FlakyBackend, MemoryLoader<serde_json::Value>>;
 
+    /// The fixed message dedup id the sessions below carry on their
+    /// `EventRef` — the identity the boundary reads and records.
+    const DEDUP_ID: Uuid = Uuid::from_u128(0xFEE1);
+
     fn cart() -> ValueDescriptor {
         value_state("cart")
     }
 
-    /// A real session whose marker flush routes through `oracle`, plus the
-    /// shared durable cell store and the `cart` collection id for post-settle
-    /// inspection.
+    /// A real session for `event` whose marker record routes through
+    /// `oracle`, plus the shared durable cell store and the `cart`
+    /// collection id for post-settle inspection.
     fn flaky_session(
         oracle: FlakyMarkerOracle,
+        event: EventRef,
     ) -> Result<(
         FlakySession,
         MemoryCellStore<FlakyMarkerOracle>,
@@ -1642,9 +1669,7 @@ mod marker_flush_must_succeed {
             loader: MemoryLoader::new(),
             registry,
             state_key: state_key.clone(),
-            event: EventRef::Message {
-                dedup_id: Uuid::new_v4(),
-            },
+            event,
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
@@ -1657,21 +1682,50 @@ mod marker_flush_must_succeed {
         Ok((session, cell_store, cart_id))
     }
 
+    /// Asserts the `cart` cell has no durable residue — neither a
+    /// provisional cell nor a committed value — via raw probes that no
+    /// resolving read can heal.
+    async fn assert_no_durable_cart(
+        cell_store: &MemoryCellStore<FlakyMarkerOracle>,
+        cart_id: &CollectionId,
+    ) -> Result<()> {
+        let provisional = cell_store.provisional_cells(cart_id);
+        futures::pin_mut!(provisional);
+        assert!(
+            provisional.next().await.transpose()?.is_none(),
+            "no provisional cell may exist",
+        );
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX),
+        };
+        let cell = CellKey {
+            section: Section::new(0),
+            coordinate: Coordinate::empty(),
+        };
+        assert_eq!(
+            Committed::into_inner(cell_store.get(cart_id, &cell, probe).await?),
+            None,
+            "no committed value may exist",
+        );
+        Ok(())
+    }
+
     /// The error-path marker gate, Permanent direction: a **final** Permanent
-    /// error commits with a best-effort flush of the registered marker, so
-    /// the failed-but-final message deduplicates instead of re-running its
+    /// error records the session's message marker best-effort — with NO stage
+    /// (the buffered write must leave no durable residue) — so the
+    /// failed-but-final message deduplicates instead of re-running its
     /// failure on every redelivery.
     #[tokio::test]
-    async fn err_permanent_flushes_the_registered_marker() -> Result<()> {
-        use color_eyre::eyre::eyre;
-
-        // fail_count 0: the oracle never fails; `recorded` is the assert
-        // surface.
+    async fn err_permanent_records_the_marker_with_no_stage() -> Result<()> {
         let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
-        let (session, _cell_store, _cart_id) = flaky_session(oracle.clone())?;
+        let (session, cell_store, cart_id) =
+            flaky_session(oracle.clone(), EventRef::Message { dedup_id: DEDUP_ID })?;
         let context = MockEventContext::new().with_session(session);
-        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-        lifecycle.register_marker(Uuid::from_u128(0xFEE1));
+        // Stage a dirty write so "no stage" is a real claim, not vacuous.
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| color_eyre::eyre::eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
         let committed = Arc::new(AtomicUsize::new(0));
@@ -1690,28 +1744,29 @@ mod marker_flush_must_succeed {
         .await;
 
         assert_eq!(
-            oracle.recorded.load(Ordering::SeqCst),
-            1,
-            "a final Permanent error must flush the marker so the failure deduplicates",
+            oracle.recorded(),
+            vec![DEDUP_ID],
+            "a final Permanent error must record the message marker so the failure deduplicates",
         );
+        assert_no_durable_cart(&cell_store, &cart_id).await?;
         assert_eq!(committed.load(Ordering::SeqCst), 1, "final errors commit");
         assert_eq!(aborted.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
-    /// The error-path marker gate, Transient direction: the flush is gated to
-    /// Permanent. A custom stack that swallows a post-success failure into a
-    /// Transient final error (without resetting the session) must not have
-    /// that attempt's marker certify never-staged state.
+    /// The error-path marker gate, Transient direction: the record is gated
+    /// to Permanent. A Transient final (no retry layer below took it) is not
+    /// handled, so its marker must not certify anything.
     #[tokio::test]
-    async fn err_transient_never_flushes_the_registered_marker() -> Result<()> {
-        use color_eyre::eyre::eyre;
-
+    async fn err_transient_never_records_the_marker() -> Result<()> {
         let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
-        let (session, _cell_store, _cart_id) = flaky_session(oracle.clone())?;
+        let (session, cell_store, cart_id) =
+            flaky_session(oracle.clone(), EventRef::Message { dedup_id: DEDUP_ID })?;
         let context = MockEventContext::new().with_session(session);
-        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-        lifecycle.register_marker(Uuid::from_u128(0xFEE2));
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| color_eyre::eyre::eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
         let committed = Arc::new(AtomicUsize::new(0));
@@ -1729,24 +1784,64 @@ mod marker_flush_must_succeed {
         )
         .await;
 
-        assert_eq!(
-            oracle.recorded.load(Ordering::SeqCst),
-            0,
-            "a Transient final error must NOT flush the marker over never-staged state",
+        assert!(
+            oracle.recorded().is_empty(),
+            "a Transient final error must NOT record a marker over never-staged state",
         );
+        assert_no_durable_cart(&cell_store, &cart_id).await?;
         assert_eq!(committed.load(Ordering::SeqCst), 1, "final errors commit");
         assert_eq!(aborted.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
-    /// However many leading marker-flush failures of whatever category the
+    /// A pure timer never records a message marker on any path:
+    /// `message_marker()` is `None` on a timer session with no reload
+    /// override, so the Ok, Permanent, and Transient finals all settle
+    /// marker-free (the trigger commit is the timer's dedup).
+    #[tokio::test]
+    async fn pure_timer_never_records_a_message_marker() -> Result<()> {
+        let finals: [Result<u64, TestError>; 3] = [
+            Ok(0),
+            Err(TestError(ErrorCategory::Permanent, "final")),
+            Err(TestError(ErrorCategory::Transient, "final")),
+        ];
+        for result in finals {
+            let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
+            let timer = EventRef::Timer(TimerEventRef::new(
+                TimerType::Application,
+                CompactDateTime::from(1000_u32),
+                0,
+            ));
+            let (session, _cell_store, _cart_id) = flaky_session(oracle.clone(), timer)?;
+            let context = MockEventContext::new().with_session(session);
+            let handler = ProbeHandler::ok(0);
+            let committed = Arc::new(AtomicUsize::new(0));
+            let aborted = Arc::new(AtomicUsize::new(0));
+            let guard = RecordingGuard {
+                committed: committed.clone(),
+                aborted: aborted.clone(),
+            };
+
+            settle(&handler, context, guard, result).await;
+
+            assert!(
+                oracle.recorded().is_empty(),
+                "a pure timer must never record a message marker",
+            );
+            assert_eq!(committed.load(Ordering::SeqCst), 1, "the trigger commits");
+            assert_eq!(aborted.load(Ordering::SeqCst), 0);
+        }
+        Ok(())
+    }
+
+    /// However many leading marker-record failures of whatever category the
     /// oracle throws, `settle`'s success path self-heals: the offset commits
     /// exactly once, the marker is recorded exactly once (the stage is
     /// certified), and the staged cell is promoted — never left provisional
     /// for the sweep to roll back. Each iteration runs on its own paused
     /// runtime so the retry backoff advances instantly.
     #[test]
-    fn prop_marker_flush_self_heals_to_certified_commit() {
+    fn prop_marker_record_self_heals_to_certified_commit() {
         fn property(fail_count: u8, category_sel: u8) -> TestResult {
             let fail_count = usize::from(fail_count % 6);
             let category = match category_sel % 3 {
@@ -1763,7 +1858,8 @@ mod marker_flush_must_succeed {
             };
             runtime.block_on(async move {
                 let oracle = FlakyMarkerOracle::new(fail_count, category);
-                let (session, cell_store, cart_id) = match flaky_session(oracle.clone()) {
+                let event = EventRef::Message { dedup_id: DEDUP_ID };
+                let (session, cell_store, cart_id) = match flaky_session(oracle.clone(), event) {
                     Ok(parts) => parts,
                     Err(e) => return TestResult::error(format!("setup: {e}")),
                 };
@@ -1774,10 +1870,6 @@ mod marker_flush_must_succeed {
                 if let Err(e) = handle.set(json!({ "x": 1_i32 })).await {
                     return TestResult::error(format!("set: {e}"));
                 }
-                let Ok(lifecycle) = context.lifecycle() else {
-                    return TestResult::error("lifecycle bind failed");
-                };
-                lifecycle.register_marker(Uuid::from_u128(0xFEED));
 
                 let handler = ProbeHandler::ok(0);
                 let committed = Arc::new(AtomicUsize::new(0));
@@ -1791,7 +1883,7 @@ mod marker_flush_must_succeed {
 
                 let committed = committed.load(Ordering::SeqCst);
                 let aborted = aborted.load(Ordering::SeqCst);
-                let recorded = oracle.recorded.load(Ordering::SeqCst);
+                let recorded = oracle.recorded();
                 let provisional = cell_store.provisional_cells(&cart_id);
                 futures::pin_mut!(provisional);
                 let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
@@ -1815,13 +1907,13 @@ mod marker_flush_must_succeed {
 
                 if committed != 1
                     || aborted != 0
-                    || recorded != 1
+                    || recorded != vec![DEDUP_ID]
                     || still_provisional
                     || value.is_none()
                 {
                     return TestResult::error(format!(
                         "category={category:?} fail_count={fail_count}: committed={committed} \
-                         aborted={aborted} recorded={recorded} provisional={still_provisional} \
+                         aborted={aborted} recorded={recorded:?} provisional={still_provisional} \
                          promoted={}",
                         value.is_some()
                     ));
@@ -1830,5 +1922,118 @@ mod marker_flush_must_succeed {
             })
         }
         QuickCheck::new().quickcheck(property as fn(u8, u8) -> TestResult);
+    }
+}
+
+/// Settlement classification tables for the wrappers without their own
+/// tests module: the scheduler's admission split, the pure pass-throughs
+/// (retry mid-stack, log, timeout, telemetry), `OptionHandler`'s per-branch
+/// delegation, and the `LeafHandler` chain terminator. Delegation is proven
+/// against [`BypassedHandler`], whose classification is `Bypassed` for every
+/// result — a wrapper hardcoding `Final` fails those rows.
+mod settlement_classification {
+    use super::*;
+    use crate::consumer::middleware::log::LogHandler;
+    use crate::consumer::middleware::optional::{OptionError, OptionHandler, OptionOutput};
+    use crate::consumer::middleware::providers::LeafHandler;
+    use crate::consumer::middleware::retry::RetryHandler;
+    use crate::consumer::middleware::telemetry::TelemetryHandler;
+    use crate::consumer::middleware::tests::test_support::{
+        BypassedHandler, ScriptedHandler, TestError as SupportError,
+    };
+    use crate::consumer::middleware::timeout::TimeoutHandler;
+    use crate::consumer::middleware::{Settlement, SettlementHandler};
+
+    /// The pure pass-throughs (retry mid-stack, log, timeout, telemetry, the
+    /// test pass-through) delegate both sides verbatim.
+    #[test]
+    fn passthrough_wrappers_delegate_settlement() {
+        fn assert_delegates<W, P>(label: &str)
+        where
+            W: SettlementHandler<Output = (), Error = SupportError>,
+            P: SettlementHandler<Output = (), Error = SupportError>,
+        {
+            let ok: Result<(), SupportError> = Ok(());
+            let err: Result<(), SupportError> = Err(SupportError(ErrorCategory::Permanent));
+            assert_eq!(W::settlement(ok.as_ref()), Settlement::Final, "{label} Ok");
+            assert_eq!(
+                W::settlement(err.as_ref()),
+                Settlement::Final,
+                "{label} Err"
+            );
+            // Over a Bypassed probe, both sides stay Bypassed — the wrapper
+            // is delegating, not hardcoding Final.
+            assert_eq!(
+                P::settlement(ok.as_ref()),
+                Settlement::Bypassed,
+                "{label} probe Ok"
+            );
+            assert_eq!(
+                P::settlement(err.as_ref()),
+                Settlement::Bypassed,
+                "{label} probe Err"
+            );
+        }
+
+        assert_delegates::<RetryHandler<ScriptedHandler>, RetryHandler<BypassedHandler>>("retry");
+        assert_delegates::<LogHandler<ScriptedHandler>, LogHandler<BypassedHandler>>("log");
+        assert_delegates::<TimeoutHandler<ScriptedHandler>, TimeoutHandler<BypassedHandler>>(
+            "timeout",
+        );
+        assert_delegates::<TelemetryHandler<ScriptedHandler>, TelemetryHandler<BypassedHandler>>(
+            "telemetry",
+        );
+        assert_delegates::<
+            PassThroughMiddleware<ScriptedHandler>,
+            PassThroughMiddleware<BypassedHandler>,
+        >("pass-through");
+    }
+
+    /// The chain terminator classifies `Final` on both sides — the leaf's
+    /// result is the event's own outcome, by definition.
+    #[test]
+    fn leaf_handler_is_final_on_both_sides() {
+        type Subject = LeafHandler<ScriptedHandler>;
+        let ok: Result<(), SupportError> = Ok(());
+        let err: Result<(), SupportError> = Err(SupportError(ErrorCategory::Permanent));
+        assert_eq!(Subject::settlement(ok.as_ref()), Settlement::Final);
+        assert_eq!(Subject::settlement(err.as_ref()), Settlement::Final);
+    }
+
+    /// `OptionHandler` delegates to whichever branch produced the result,
+    /// on both sides.
+    #[test]
+    fn option_handler_delegates_per_branch() {
+        type Subject = OptionHandler<ScriptedHandler, BypassedHandler>;
+        type Out = OptionOutput<(), ()>;
+        type Err_ = OptionError<SupportError, SupportError>;
+
+        let rows: Vec<(&str, Result<Out, Err_>, Settlement)> = vec![
+            (
+                "Enabled Ok delegates to the enabled branch (Final)",
+                Ok(OptionOutput::Enabled(())),
+                Settlement::Final,
+            ),
+            (
+                "Disabled Ok delegates to the disabled branch (Bypassed probe)",
+                Ok(OptionOutput::Disabled(())),
+                Settlement::Bypassed,
+            ),
+            (
+                "Enabled Err delegates to the enabled branch (Final)",
+                Err(OptionError::Enabled(SupportError(ErrorCategory::Permanent))),
+                Settlement::Final,
+            ),
+            (
+                "Disabled Err delegates to the disabled branch (Bypassed probe)",
+                Err(OptionError::Disabled(SupportError(
+                    ErrorCategory::Permanent,
+                ))),
+                Settlement::Bypassed,
+            ),
+        ];
+        for (label, result, expected) in rows {
+            assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
+        }
     }
 }

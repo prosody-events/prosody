@@ -1,5 +1,5 @@
 //! The keyed-state durability sequence — the single owner of
-//! stage → arm → marker-flush → commit → promote, run once per event after
+//! stage → arm → marker-record → commit → promote, run once per event after
 //! the middleware stack returns its final result.
 //!
 //! Both durability boundaries — the blanket [`EventHandler`] impl in the
@@ -7,7 +7,11 @@
 //! their final outcome through [`settle`] / [`abandon`] here, so the
 //! sequence's ordering contracts (marker strictly after stage, promote
 //! strictly after commit) live in one straight-line function and cannot be
-//! written in the wrong order elsewhere.
+//! written in the wrong order elsewhere. The commit decision itself is a pure
+//! function of the stack's final result: [`SettlementHandler::settlement`]
+//! classifies it as [`Settlement::Final`] or [`Settlement::Bypassed`], and the
+//! message commit marker is read from the session's event identity
+//! (`message_marker`), never deposited by middleware.
 //!
 //! [`EventHandler`]: crate::consumer::EventHandler
 
@@ -22,16 +26,67 @@ use super::FallibleHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::event_context::EventContext;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::session::MessageMarker;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
 use crate::state::session::{Finalized, LifecycleAccessExt};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 
-/// Delay between retries of a durability step (stage / arm / marker flush)
+/// Delay between retries of a durability step (stage / arm / marker record)
 /// that failed transiently. Mirrors the timer commit retry cadence
 /// ([`crate::timers::uncommitted`]) and the state-manager init loop.
 const DURABILITY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// How the settlement boundary treats the stack's final result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settlement {
+    /// The result is the event's own outcome (the dispatch reached the
+    /// handler layer). Ok: stage, record the marker, commit, promote.
+    /// Err: record the marker iff the category is Permanent; commit.
+    Final,
+
+    /// The outcome lives elsewhere (defer queue, failure topic, an earlier
+    /// commit of the same message) or the error belongs to a middleware
+    /// layer, not the event (a rescue/admission failure where the marker
+    /// must not certify anything). Nothing stages, no marker records; the
+    /// offset/trigger commits. The event scope's drop discards any dirty
+    /// residue, and skipping `finalize` is exact parity with finalizing an
+    /// empty buffer: an empty finalize yields [`Finalized::Clean`], and the
+    /// Clean arm never arms the recovery backstop (arming is
+    /// possession-driven, gated on `Finalized::Staged`).
+    Bypassed,
+}
+
+/// Crate-internal middleware-chain surface: classifies the final result for
+/// the settlement boundary.
+///
+/// Required and non-defaulted so a future swallowing middleware cannot
+/// inherit [`Settlement::Final`] by omission — a swallow classified `Final`
+/// records the swallowed message's marker and dedup-filters its own retry,
+/// the lost-write bug class this trait exists to close. For the same reason
+/// there is deliberately **no blanket impl** over all [`FallibleHandler`]s:
+/// exactly one concrete leaf adapter
+/// ([`LeafHandler`](super::providers::LeafHandler), minted at
+/// `into_provider`) hardcodes `Final`, and every framework wrapper writes one
+/// explicit impl classifying its own Output and error variants (delegating on
+/// pass-through shapes).
+pub(crate) trait SettlementHandler: FallibleHandler {
+    /// Classifies the stack's final result — both sides — for [`settle`].
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement;
+}
+
+/// Capability witnessing the settlement boundary: the only constructor is in
+/// this module, so the oracle marker write does not compile anywhere else.
+/// (Nominally `pub` inside this private module — the sealed-item idiom — so
+/// the sealed lifecycle trait can carry it in a signature; its effective
+/// visibility stays crate-internal.)
+///
+/// This is module privacy, NOT a proof-of-stage token — a `Clean` success and
+/// a Permanent-no-stage final both legitimately record a marker with no
+/// stage; stage-before-marker ordering stays enforced by the one
+/// straight-line [`settle_committed`].
+pub struct MarkerWrite(());
 
 /// Outcome of one durability step driven by [`retry_step`].
 enum StepOutcome<R> {
@@ -40,9 +95,9 @@ enum StepOutcome<R> {
 
     /// The step failed permanently. Only a genuine data rejection is skipped
     /// (the `finalize` stage): the sequence continues defensively, and it
-    /// never flushes a marker over an uncertain stage. Steps whose permanent
+    /// never records a marker over an uncertain stage. Steps whose permanent
     /// failure is *not* a data rejection — the backstop arm and the
-    /// success-path marker flush, both pure framework bookkeeping — retry
+    /// success-path marker record, both pure framework bookkeeping — retry
     /// past `Skip` in their own loops instead.
     Skip,
 
@@ -74,12 +129,21 @@ pub(super) enum ArmOutcome {
     ShuttingDown,
 }
 
-/// The durability sequence: the single owner of stage → arm → marker-flush →
+/// The durability sequence: the single owner of stage → arm → marker-record →
 /// commit → promote, run once per event after the stack returns its final
 /// `result`. Both the blanket [`EventHandler`] impl and
 /// [`RetryHandler`](super::retry::RetryHandler) route their final outcome
 /// here, so the wrong ordering (marker before stage) is structurally
 /// unwritable.
+///
+/// Branches on the typed [`Settlement`] classification first, the error
+/// category second: a [`Settlement::Bypassed`] result stages nothing and
+/// records no marker (see the variant's parity argument); a
+/// [`Settlement::Final`] result runs the full sequence on `Ok`, records the
+/// marker without a stage on a Permanent error, and commits bare on a
+/// Transient one. A Terminal error always abandons, before the
+/// classification is even consulted — commit-on-Terminal is unwritable
+/// regardless of any wrapper's `settlement()`.
 ///
 /// Fires exactly one apply hook (`after_commit` / `after_abort`) carrying
 /// `result`, preserving the per-invocation apply-hook invariant.
@@ -91,8 +155,7 @@ pub(crate) async fn settle<T, C, G>(
     guard: G,
     result: Result<T::Output, T::Error>,
 ) where
-    T: FallibleHandler,
-    T::Error: ClassifyError,
+    T: SettlementHandler,
     C: EventContext<Payload = T::Payload>,
     G: Uncommitted + Send,
 {
@@ -101,47 +164,69 @@ pub(crate) async fn settle<T, C, G>(
     // (mirrors the timeout middleware uncancelling after the inner returns).
     context.uncancel();
 
+    let category = result.as_ref().err().map(ClassifyError::classify_error);
+    // Terminal: the marker aborts; the event redelivers and re-runs. Nothing
+    // staged (finalize runs only on a Final Ok), and abandon touches no
+    // state. Checked before the settlement classification so a Terminal
+    // error abandons even when a wrapper classifies it Bypassed.
+    if category == Some(ErrorCategory::Terminal) {
+        abandon(handler, context, guard, result).await;
+        return;
+    }
+
     // Reach the event's lifecycle handle. Every live context carries one —
     // `LifecycleAccess` binds unconditionally — so `None` means only an
     // invalidated context, which cannot stage anyway.
     let lifecycle = context.lifecycle().ok();
 
-    match result.as_ref().err().map(ClassifyError::classify_error) {
-        // Terminal: the marker aborts; the event redelivers and re-runs.
-        // Nothing staged (finalize runs only on Ok), and abandon touches no
-        // state.
-        Some(ErrorCategory::Terminal) => {
-            abandon(handler, context, guard, result).await;
-        }
-        // Final error (Transient/Permanent): nothing staged (finalize runs
-        // only on Ok). On a Permanent error the dedup middleware registered
-        // the marker; flush it so the failed-but-final message deduplicates.
-        // The flush is gated to Permanent: in the shipped stacks a Transient
-        // final has no registered marker anyway, but a custom stack whose
-        // middleware swallows a post-success failure into a Transient error
-        // (without resetting the session) must not have that attempt's
-        // marker certify never-staged state. Then commit and fire the hook.
-        Some(category) => {
-            if category == ErrorCategory::Permanent
-                && let Some(lifecycle) = &lifecycle
-            {
-                flush_marker_best_effort(&context, lifecycle).await;
-            }
+    match T::settlement(result.as_ref()) {
+        // The outcome lives elsewhere: no stage, no marker; commit the
+        // offset/trigger and fire the hook. Skipping `finalize` here is
+        // equivalent to finalizing an emptied buffer: an empty finalize
+        // yields `Finalized::Clean`, and Clean never arms the backstop.
+        Settlement::Bypassed => {
             guard.commit().await;
             handler.after_commit(context, result).await;
         }
-        // Success: run the full durability sequence.
-        None => settle_committed(handler, context, guard, result, lifecycle).await,
+        Settlement::Final => match category {
+            // A failed-but-final message: record its marker best-effort (no
+            // stage exists — finalize runs only on Ok) so redelivery
+            // dedup-filters the known-permanent failure, then commit.
+            Some(ErrorCategory::Permanent) => {
+                if let Some(lifecycle) = &lifecycle
+                    && let Some(marker) = lifecycle.message_marker()
+                {
+                    record_marker_best_effort(&context, lifecycle, marker).await;
+                }
+                guard.commit().await;
+                handler.after_commit(context, result).await;
+            }
+            // Transient final (no retry layer below took it): no marker —
+            // the event is not handled — just commit and fire the hook.
+            // (Terminal returned above.)
+            Some(_) => {
+                guard.commit().await;
+                handler.after_commit(context, result).await;
+            }
+            // Success: run the full durability sequence.
+            None => settle_committed(handler, context, guard, result, lifecycle).await,
+        },
     }
 }
 
-/// The success arm of [`settle`]: stage, arm the backstop, flush the marker
+/// The success arm of [`settle`]: stage, arm the backstop, record the marker
 /// strictly after the stage, commit, then promote the staged cells through
 /// the receipt.
 ///
+/// The marker is read from the session's event identity
+/// (`message_marker()`: the message `EventRef`'s dedup id, or the
+/// deferred-reload override) and written through the settlement-private
+/// [`MarkerWrite`] capability — no middleware deposits it, so
+/// stage-before-marker is enforced by this one straight-line function.
+///
 /// # Crash windows
 ///
-/// The step order — stage → **arm** → marker flush → **commit** → promote —
+/// The step order — stage → **arm** → marker record → **commit** → promote —
 /// closes every crash window without any acquisition-time sweep (there is
 /// none):
 ///
@@ -151,7 +236,7 @@ pub(crate) async fn settle<T, C, G>(
 /// * Crash after the arm, before the commit: still uncommitted → redelivery,
 ///   *and* the backstop is armed → the sweep resolves it either way.
 /// * Crash after the commit, before the promote: committed (no redelivery), but
-///   the backstop is armed → the sweep resolves; the flushed marker also
+///   the backstop is armed → the sweep resolves; the recorded marker also
 ///   dedup-filters any redelivery.
 ///
 /// So every durable provisional cell is covered by redelivery
@@ -185,7 +270,7 @@ async fn settle_committed<T, C, G>(
             StepOutcome::Skip => {
                 // Permanent stage failure: a partial stage may be durable. Arm
                 // the backstop defensively so the sweep resolves it, skip the
-                // marker flush (invariant: marker present ⇒ stage durable),
+                // marker record (invariant: marker present ⇒ stage durable),
                 // and commit. A shutdown `ShuttingDown` from the arm is
                 // deliberately ignored: committing a permanently-unstageable
                 // event beats livelocking, and first-touch covers the unarmed
@@ -219,7 +304,7 @@ async fn settle_committed<T, C, G>(
     // staged provisional cell resolves before its TTL, so we must NOT certify
     // the stage until it is armed. `arm_backstop` is must-succeed — it retries
     // every non-shutdown failure forever — so the only non-`Armed` outcome is
-    // a shutdown, which aborts *before* the marker flush: the receipt rolls
+    // a shutdown, which aborts *before* the marker record: the receipt rolls
     // the staged cells back to their committed base (no lingering provisional,
     // nothing to TTL out) and the offset aborts so the event redelivers,
     // re-runs, and re-arms.
@@ -229,9 +314,9 @@ async fn settle_committed<T, C, G>(
             match arm_backstop(&context, &lifecycle, staged.recovery_delay()).await {
                 ArmOutcome::Armed => Some(staged.certify()),
                 ArmOutcome::ShuttingDown => {
-                    // The ONE reachable rollback site — before any marker-flush
-                    // attempt, so restoring the committed base is sound; past
-                    // `certify` a rollback no longer compiles.
+                    // The ONE reachable rollback site — before any
+                    // marker-record attempt, so restoring the committed base
+                    // is sound; past `certify` a rollback no longer compiles.
                     guard.abort().await;
                     staged.rollback().await;
                     handler.after_abort(context, result).await;
@@ -241,29 +326,34 @@ async fn settle_committed<T, C, G>(
         }
     };
 
-    // 3. Flush the registered dedup marker — STRICTLY after the stage, so a
-    // present marker always certifies a durable stage. Like the arm, the
-    // flush is must-succeed: the marker is framework data (a bare dedup id),
+    // 3. Record the message commit marker — STRICTLY after the stage, so a
+    // present marker always certifies a durable stage. Timer events carry no
+    // message marker (`message_marker()` is `None` on a timer session with no
+    // reload override); the trigger commit is their dedup. Like the arm, the
+    // record is must-succeed: the marker is framework data (a bare dedup id),
     // so no failure here is a data rejection the sequence may skip.
     // Committing with the stage uncertified would have the armed sweep
     // silently roll a successful handler's writes back — with the offset
     // committed, nothing ever replays them. A permanently-failing store
     // therefore retries until it heals (or the liveness probe restarts the
     // process, the visible last resort); only shutdown abandons.
-    loop {
-        match retry_step(&context, "keyed-state marker flush", || {
-            lifecycle.flush_marker()
-        })
-        .await
-        {
-            StepOutcome::Done(()) => break,
-            StepOutcome::Skip => sleep(DURABILITY_RETRY_DELAY).await,
-            StepOutcome::Abandon => {
-                // A flush attempt was made: marker durability is ambiguous, so
-                // the staged cells must not (and structurally cannot) roll back
-                // — see [`StagedState::certify`]; the armed sweep resolves them.
-                abandon(handler, context, guard, result).await;
-                return;
+    if let Some(marker) = lifecycle.message_marker() {
+        loop {
+            match retry_step(&context, "keyed-state marker record", || {
+                lifecycle.record_marker(marker, MarkerWrite(()))
+            })
+            .await
+            {
+                StepOutcome::Done(()) => break,
+                StepOutcome::Skip => sleep(DURABILITY_RETRY_DELAY).await,
+                StepOutcome::Abandon => {
+                    // A record attempt was made: marker durability is
+                    // ambiguous, so the staged cells must not (and
+                    // structurally cannot) roll back — see
+                    // [`StagedState::certify`]; the armed sweep resolves them.
+                    abandon(handler, context, guard, result).await;
+                    return;
+                }
             }
         }
     }
@@ -442,15 +532,15 @@ where
     }
 }
 
-/// Flushes the registered marker, retrying transient failures; a permanent
+/// Records `marker` best-effort, retrying transient failures; a permanent
 /// failure or shutdown is tolerated (the failed-but-final message simply
 /// isn't deduplicated and re-runs, re-failing the same way).
-async fn flush_marker_best_effort<C>(context: &C, lifecycle: &C::State)
+async fn record_marker_best_effort<C>(context: &C, lifecycle: &C::State, marker: MessageMarker)
 where
     C: EventContext,
 {
-    let _ = retry_step(context, "keyed-state marker flush", || {
-        lifecycle.flush_marker()
+    let _ = retry_step(context, "keyed-state marker record", || {
+        lifecycle.record_marker(marker, MarkerWrite(()))
     })
     .await;
 }

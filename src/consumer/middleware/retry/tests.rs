@@ -752,33 +752,32 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
 }
 
 // =========================================================================
-// Between-attempt reset over a real keyed-state session
+// Between-attempt dirty discard over a real keyed-state session
 // =========================================================================
 //
-// The load-bearing `lifecycle.reset()` in the retry loop discards a failed
-// attempt's buffered dirty ops *and* its registered dedup marker before the
-// next attempt runs, so a later successful attempt stages and certifies only
-// its own writes — the marker-before-durable-state class the settle boundary
-// was rebuilt to make unwritable. Every other retry test drives the inert
-// `UnavailableState` session (whose `finalize` is always `Clean` and whose
-// `reset` is a no-op), so this is the one test that exercises the reset over a
-// **real** session end to end through `settle`.
+// The load-bearing `lifecycle.discard_dirty()` in the retry loop discards a
+// failed attempt's buffered dirty ops before the next attempt runs, so a
+// later successful attempt stages only its own writes — and the settle
+// boundary records the event's marker (read from the session's `EventRef`)
+// exactly once, for the final attempt. Every other retry test drives the
+// inert `UnavailableState` session (whose `finalize` is always `Clean`), so
+// this is the one test that exercises the attempt boundary over a **real**
+// session end to end through `settle`.
 
-mod reset_between_attempts {
+mod discard_between_attempts {
     use super::*;
     use crate::codec::JsonCodec;
     use crate::consumer::middleware::tests::test_support::{committed_value, recording_session};
-    use crate::state::StateKey;
+    use crate::consumer::middleware::{Settlement, SettlementHandler};
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::LifecycleAccessExt;
+    use crate::state::{EventRef, StateKey};
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    /// Attempt 1 stages `cart` + registers this marker, then fails Transient.
-    const ATTEMPT_1_MARKER: Uuid = Uuid::from_u128(0xA11);
-    /// Attempt 2 stages `wishlist` + registers this marker, then succeeds.
-    const ATTEMPT_2_MARKER: Uuid = Uuid::from_u128(0xA22);
+    /// The message's dedup id on the session `EventRef` — the one marker the
+    /// boundary may record, once, for the final attempt.
+    const MSG_DEDUP_ID: Uuid = Uuid::from_u128(0xA11);
 
     fn cart() -> ValueDescriptor {
         value_state::<JsonCodec>("cart")
@@ -788,11 +787,10 @@ mod reset_between_attempts {
         value_state::<JsonCodec>("wishlist")
     }
 
-    /// Fails attempt 1 (`Normal`) after staging `cart` + registering marker M1;
-    /// succeeds attempt 2 (`Failure`) after staging `wishlist` + registering
-    /// marker M2. The two attempts touch **disjoint** collections and distinct
-    /// markers, so a leaked attempt-1 write would surface as a committed
-    /// `cart`.
+    /// Fails attempt 1 (`Normal`) after staging `cart`; succeeds attempt 2
+    /// (`Failure`) after staging `wishlist`. The two attempts touch
+    /// **disjoint** collections, so a leaked attempt-1 write would surface
+    /// as a committed `cart`.
     #[derive(Clone)]
     struct AttemptAwareHandler {
         calls: Arc<AtomicUsize>,
@@ -813,9 +811,6 @@ mod reset_between_attempts {
             C: EventContext<Payload = Self::Payload>,
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let lifecycle = context
-                .lifecycle()
-                .map_err(|_| TestError(ErrorCategory::Terminal))?;
             match demand_type {
                 DemandType::Normal => {
                     let handle = context
@@ -825,7 +820,6 @@ mod reset_between_attempts {
                         .set(json!({ "attempt": 1_i32 }))
                         .await
                         .map_err(|_| TestError(ErrorCategory::Terminal))?;
-                    lifecycle.register_marker(ATTEMPT_1_MARKER);
                     Err(TestError(ErrorCategory::Transient))
                 }
                 DemandType::Failure => {
@@ -836,7 +830,6 @@ mod reset_between_attempts {
                         .set(json!({ "attempt": 2_i32 }))
                         .await
                         .map_err(|_| TestError(ErrorCategory::Terminal))?;
-                    lifecycle.register_marker(ATTEMPT_2_MARKER);
                     Ok(())
                 }
             }
@@ -857,25 +850,38 @@ mod reset_between_attempts {
         async fn shutdown(self) {}
     }
 
-    /// Retry over a real session: attempt 1 stages `cart` and registers marker
-    /// M1 then fails Transient; the loop's `after_abort` + `lifecycle.reset()`
-    /// discards both; attempt 2 stages `wishlist`, registers M2, and succeeds;
-    /// `settle` then certifies only attempt 2's work. The committed state must
-    /// show `wishlist` present and `cart` **absent**, and the oracle must have
-    /// recorded exactly attempt 2's marker.
+    impl SettlementHandler for AttemptAwareHandler {
+        fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+            Settlement::Final
+        }
+    }
+
+    /// Retry over a real session: attempt 1 stages `cart` then fails
+    /// Transient; the loop's `after_abort` + `lifecycle.discard_dirty()`
+    /// discards it; attempt 2 stages `wishlist` and succeeds; `settle` then
+    /// certifies only attempt 2's work and records the event's marker
+    /// **exactly once** (a retried event yields one marker — the final
+    /// attempt's). The committed state must show `wishlist` present and
+    /// `cart` **absent**.
     ///
-    /// Deleting the between-attempt `reset()` fails this: attempt 1's `cart`
-    /// write would survive in the dirty overlay, `finalize` would stage it
-    /// alongside `wishlist`, and the read-back would find `cart` committed to
-    /// attempt 1's value — precisely the leak the reset exists to prevent.
+    /// Deleting the between-attempt `discard_dirty()` fails this: attempt
+    /// 1's `cart` write would survive in the dirty overlay, `finalize` would
+    /// stage it alongside `wishlist`, and the read-back would find `cart`
+    /// committed to attempt 1's value — precisely the leak the discard
+    /// exists to prevent.
     #[tokio::test]
-    async fn retry_resets_session_between_attempts() -> Result<()> {
+    async fn retry_discards_dirty_between_attempts_and_records_one_marker() -> Result<()> {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&cart(), CollectionDef::new(None))?;
         registry.register(&wishlist(), CollectionDef::new(None))?;
         let state_key = StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1"));
-        let (session, cell_store, _dirty, recorded) =
-            recording_session(registry, state_key.clone());
+        let (session, cell_store, _dirty, recorded) = recording_session(
+            registry,
+            state_key.clone(),
+            EventRef::Message {
+                dedup_id: MSG_DEDUP_ID,
+            },
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let handler = AttemptAwareHandler {
             calls: calls.clone(),
@@ -913,8 +919,8 @@ mod reset_between_attempts {
         );
         assert_eq!(
             recorded.lock().clone(),
-            vec![ATTEMPT_2_MARKER],
-            "settle must certify only attempt 2's marker, exactly once",
+            vec![MSG_DEDUP_ID],
+            "a retried event records exactly one marker — the final attempt's",
         );
         assert_eq!(
             tracker.shutdown().await,

@@ -55,6 +55,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -227,6 +228,30 @@ where
     async fn shutdown(self) {
         debug!("shutting down cancellation handler");
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for CancellationHandler<T>
+where
+    T: SettlementHandler,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: delegate. `ShutdownAfterInner` carries the inner's
+            // own error, so its settlement is the inner's — though the
+            // variant classifies Terminal, and settle's Terminal-first check
+            // abandons before this classification is consulted.
+            Ok(output) => T::settlement(Ok(output)),
+            Err(
+                CancellationError::Handler(error) | CancellationError::ShutdownAfterInner(error),
+            ) => T::settlement(Err(error)),
+            // Pre-inner admission rejections: the inner never ran, so the
+            // result is this layer's, not the event's. (Belt and braces for
+            // `Shutdown` — Terminal-first already owns its abandon.)
+            Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {
+                Settlement::Bypassed
+            }
+        }
     }
 }
 

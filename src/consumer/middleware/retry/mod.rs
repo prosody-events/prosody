@@ -73,7 +73,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
-    abandon, settle,
+    Settlement, SettlementHandler, abandon, settle,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
 use crate::state::session::LifecycleAccessExt;
@@ -354,13 +354,14 @@ impl<T> RetryHandler<T> {
                     // to another attempt on the next loop iteration.
                     apply_abort(error).await;
 
-                    // Attempt boundary: reset the event's keyed-state
-                    // session so the failed attempt's dirty ops never leak
-                    // into the next attempt's transaction — and so its
-                    // registered dedup marker is discarded rather than
-                    // flushed by `settle` after a later attempt succeeds.
+                    // Attempt boundary: discard the failed attempt's dirty
+                    // ops so they never leak into the next attempt's
+                    // transaction. Attempt isolation only — the reload
+                    // identity override persists by design (it is identity,
+                    // not decision, and each re-dispatch would recompute the
+                    // same value or overwrite it last-wins).
                     if let Ok(lifecycle) = context.lifecycle() {
-                        lifecycle.reset();
+                        lifecycle.discard_dirty();
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -488,6 +489,7 @@ where
 impl<T> HandlerProvider for RetryProvider<T>
 where
     T: FallibleHandlerProvider,
+    T::Handler: SettlementHandler,
 {
     type Handler = RetryHandler<T::Handler>;
 
@@ -502,6 +504,15 @@ where
 //
 // As an inner middleware, transient errors are capped at `max_retries` so an
 // outer DLQ middleware can take over. All error variants collapse to `Err`.
+//
+// Settle-once: THIS impl is the mid-stack position — it loops attempts and
+// RETURNS the final result without ever settling. Only the outermost
+// position, consumed through the `EventHandler` impl below, routes
+// `Resolution::Commit`/`Abort` to `settle`/`abandon`. So in a DLQ sandwich
+// (retry → topic → retry → handler) the inner retry's exhaustion surfaces as
+// an `Err` into the topic layer, and settlement happens exactly once, at the
+// outermost boundary, over the fully-wrapped result — no marker can record
+// before the topic layer has spoken.
 //
 // Apply-hook contract: a single retry session is ONE dispatch from the outer
 // middleware's view. The outer (or the blanket impl) inspects the final
@@ -610,6 +621,17 @@ where
     }
 }
 
+impl<T> SettlementHandler for RetryHandler<T>
+where
+    T: SettlementHandler,
+{
+    /// Pass-through: retry adds no Output or error variants of its own, so
+    /// the final attempt's result classifies exactly as the inner's would.
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        T::settlement(result)
+    }
+}
+
 // ============================================================================
 // EventHandler impl
 // ============================================================================
@@ -618,15 +640,16 @@ where
 // fallback exists below). This impl owns the commit-vs-abort *decision* — a
 // shutdown abort must redeliver, not commit, which only the `Resolution` from
 // `run` distinguishes — but it delegates the durability *sequence* (stage →
-// arm → marker flush → commit → promote) to the shared `settle` / `abandon`
+// arm → marker record → commit → promote) to the shared `settle` / `abandon`
 // functions, the single owner of that sequence (see the `FallibleEventHandler`
-// docs). Per-attempt apply hooks are `run`'s responsibility — see its
-// apply-hook split.
+// docs). Settle-once, mirrored from the `FallibleHandler` impl above: only
+// this outermost position settles; the mid-stack impl loops and returns.
+// Per-attempt apply hooks are `run`'s responsibility — see its apply-hook
+// split.
 
 impl<T> EventHandler for RetryHandler<T>
 where
-    T: FallibleHandler,
-    T::Error: ClassifyError,
+    T: SettlementHandler,
 {
     type Payload = T::Payload;
 

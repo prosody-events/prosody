@@ -82,9 +82,9 @@ use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::reset_state_session;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
@@ -268,14 +268,10 @@ where
             .timestamp()
             .to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        // Attempt to process the message with the wrapped handler. Keep a
-        // clone of the context: the routed arm below swallows the inner
-        // error into `Ok(Routed)` and must reset the keyed-state session
-        // first, like every other Err→Ok swallow point.
-        let inner_context = context.clone();
+        // Attempt to process the message with the wrapped handler.
         let error = match self
             .handler
-            .on_message(inner_context, message.clone(), demand_type)
+            .on_message(context, message.clone(), demand_type)
             .await
         {
             Ok(output) => return Ok(FailureTopicOutput::Inner(output)),
@@ -323,14 +319,11 @@ where
             .send(headers, self.topic, key, message.payload().clone())
             .await
         {
-            Ok(()) => {
-                // The inner attempt failed but the dispatch resolves `Ok`:
-                // reset the session so the failed attempt's dirty ops never
-                // stage and its registered marker never flushes (the same
-                // attempt-boundary reset both defer swallow points perform).
-                reset_state_session(&context);
-                Ok(FailureTopicOutput::Routed(error))
-            }
+            // The inner attempt failed but the dispatch resolves `Ok`: the
+            // `Routed` variant classifies `Bypassed` at the settle boundary,
+            // so the failed attempt's dirty ops never stage and no marker
+            // records — the swallow's safety is the result value itself.
+            Ok(()) => Ok(FailureTopicOutput::Routed(error)),
             Err(producer) => Err(FailureTopicError::DlqSendFailed {
                 inner: error,
                 producer,
@@ -426,6 +419,38 @@ where
         // No failure topic-specific state to clean up (producer is shared)
         // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
+    }
+}
+
+impl<T, Enc> SettlementHandler for FailureTopicHandler<T, Enc>
+where
+    T: SettlementHandler,
+    Enc: Codec<Payload = T::Payload>,
+    T::Payload: Clone + EventIdentity,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran and succeeded: its result is the dispatch's outcome.
+            Ok(FailureTopicOutput::Inner(output)) => T::settlement(Ok(output)),
+            // Routed to the DLQ: the outcome lives there — nothing here may
+            // stage or record.
+            Ok(FailureTopicOutput::Routed(_)) => Settlement::Bypassed,
+            // Inner ran and its error surfaced un-rescued.
+            Err(FailureTopicError::Handler(error)) => T::settlement(Err(error)),
+            // Marker eligibility follows the INNER error (the register rule),
+            // guarded by its category, even though the retry-facing
+            // classification is the producer's:
+            // - a Permanent inner would have certified on its own (it is final regardless of the
+            //   DLQ), so delegate its settlement;
+            // - a Transient inner never certifies — the message is neither handled nor in the DLQ,
+            //   so a marker here would silently filter its redelivery under a Permanent producer
+            //   error. An unconditional delegate would bottom out at the leaf's `Final` and do
+            //   exactly that.
+            Err(FailureTopicError::DlqSendFailed { inner, .. }) => match inner.classify_error() {
+                ErrorCategory::Permanent => T::settlement(Err(inner)),
+                _ => Settlement::Bypassed,
+            },
+        }
     }
 }
 

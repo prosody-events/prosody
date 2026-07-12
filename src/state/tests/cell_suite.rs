@@ -163,17 +163,7 @@ pub(crate) struct ScriptedOracle {
     committed: Arc<scc::HashSet<Uuid, RandomState>>,
 }
 
-impl ScriptedOracle {
-    /// Whether `record_message` has durably recorded this dedup id.
-    pub(crate) async fn is_recorded(&self, dedup_id: Uuid) -> bool {
-        self.committed.contains_async(&dedup_id).await
-    }
-
-    /// The number of markers recorded — pins "flushed exactly once".
-    pub(crate) fn recorded_count(&self) -> usize {
-        self.committed.len()
-    }
-}
+impl ScriptedOracle {}
 
 impl CommitOracle for ScriptedOracle {
     type Error = Infallible;

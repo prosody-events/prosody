@@ -8,6 +8,7 @@ use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -421,4 +422,56 @@ async fn open_interval_closed_on_completion() -> Result<()> {
 /// never a wall-clock wait.
 async fn drain_telemetry() {
     sleep(Duration::from_millis(1)).await;
+}
+
+/// The settlement classification table: inner-ran rows delegate; the
+/// pre-inner admission rejection is `Bypassed`. Delegation is proven against
+/// a `Bypassed`-classifying probe.
+#[test]
+fn settlement_classification_table() {
+    use crate::consumer::middleware::tests::test_support::BypassedHandler;
+    use crate::consumer::middleware::{Settlement, SettlementHandler};
+
+    type Subject = MonopolizationHandler<ScriptedHandler>;
+    type Probe = MonopolizationHandler<BypassedHandler>;
+    type Err_ = MonopolizationError<TestError>;
+
+    fn monopolization() -> Err_ {
+        MonopolizationError::Monopolization {
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
+            key: Arc::from("key"),
+            percentage: 99.0_f64,
+            threshold: 90.0_f64,
+            window: Duration::from_mins(1),
+        }
+    }
+
+    let rows: Vec<(&str, Result<(), Err_>, Settlement)> = vec![
+        (
+            "Ok delegates to the leaf's Final",
+            Ok(()),
+            Settlement::Final,
+        ),
+        (
+            "Handler delegates to the leaf's Final",
+            Err(MonopolizationError::Handler(TestError(
+                ErrorCategory::Permanent,
+            ))),
+            Settlement::Final,
+        ),
+        (
+            "Monopolization (pre-inner admission) is Bypassed",
+            Err(monopolization()),
+            Settlement::Bypassed,
+        ),
+    ];
+    for (label, result, expected) in rows {
+        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
+    }
+
+    // Delegation proof: over a Bypassed-classifying inner the delegating
+    // rows stay Bypassed.
+    let ok: Result<(), Err_> = Ok(());
+    assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
 }

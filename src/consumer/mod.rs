@@ -124,7 +124,6 @@ pub use crate::consumer::kafka_state::{
 pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
 pub use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::HandlerMiddleware;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration,
@@ -149,6 +148,7 @@ use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
 };
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
+use crate::consumer::middleware::{ComposedMiddleware, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
@@ -805,14 +805,13 @@ impl PipelineMiddlewareStack {
         //
         // The keyed-state durability sequence is NOT in this stack — it runs
         // once after the stack returns, owned by the `settle` boundary (see
-        // `consumer::middleware`'s `FallibleEventHandler` docs). Three residual
-        // order facts remain: retry stays OUTERMOST so each attempt is a fresh
-        // dispatch that resets the event's session (and the registered marker);
-        // the defer middlewares sit OUTSIDE the common block so a defer-swallow
-        // resets the session before swallowing into `Ok(Deferred)`, leaving no
-        // marker to flush (the reload is therefore not deduped); and `dedup`
-        // stays in-stack as a duplicate filter so the deferred-message reload
-        // still filters producer duplicates. `monopolization` is state-agnostic.
+        // `consumer::middleware`'s `FallibleEventHandler` docs), which decides
+        // commit-vs-bypass from the typed `Settlement` classification of the
+        // final result. Two residual order facts remain: retry stays OUTERMOST
+        // so each attempt is a fresh dispatch isolated by `discard_dirty()`
+        // between attempts; and the dedup filter sits INSIDE message-defer so
+        // a deferred reload's duplicate check sees the reload identity
+        // override. `monopolization` is state-agnostic.
         let common_middleware = build_common_middleware::<DP, C::Payload>(
             &self.common_config,
             &self.consumer_config,
@@ -976,12 +975,31 @@ async fn prepare_pipeline_stack(
 /// Because the deduplication middleware needs the per-partition dedup store,
 /// this is called INSIDE the storage `match` arm where the concrete
 /// `dedup_provider` is in hand.
+/// The concrete common-block composition [`build_common_middleware`] returns
+/// (innermost `telemetry` to outermost `dedup`). Named — not an opaque `impl
+/// HandlerMiddleware` — so the chains layered on top stay fully concrete and
+/// the crate-internal settlement classification of the composed handler
+/// remains provable at the `EventHandler` boundary.
+type CommonMiddleware<DP, P> = ComposedMiddleware<
+    DeduplicationMiddleware<DP, P>,
+    ComposedMiddleware<
+        CancellationMiddleware,
+        ComposedMiddleware<
+            SchedulerMiddleware,
+            ComposedMiddleware<TimeoutMiddleware, TelemetryMiddleware, P>,
+            P,
+        >,
+        P,
+    >,
+    P,
+>;
+
 fn build_common_middleware<DP, P>(
     config: &CommonConfiguration,
     consumer_config: &ConsumerConfiguration,
     telemetry: Telemetry,
     dedup_provider: DP,
-) -> Result<impl HandlerMiddleware<P>, ConsumerError>
+) -> Result<CommonMiddleware<DP, P>, ConsumerError>
 where
     DP: DeduplicationStoreProvider,
     P: Send + Sync + 'static + EventIdentity,
@@ -991,11 +1009,8 @@ where
         TimeoutMiddleware::new(&config.timeout, consumer_config.stall_threshold)?;
     let telemetry_middleware =
         TelemetryMiddleware::new(telemetry, Arc::from(consumer_config.group_id.as_str()));
-    let dedup_middleware = DeduplicationMiddleware::new(
-        config.dedup.clone(),
-        &consumer_config.group_id,
-        dedup_provider,
-    )?;
+    let dedup_middleware =
+        DeduplicationMiddleware::new(&config.dedup, &consumer_config.group_id, dedup_provider)?;
 
     Ok(telemetry_middleware
         .layer(timeout_middleware)
@@ -1375,6 +1390,7 @@ where
                     message_provider,
                     stack.failure_tracker.clone(),
                     loader,
+                    &stack.common_config.dedup.version,
                     &stack.telemetry,
                 )?;
                 stack.build::<_, _, _, _, _, _, _, C>(
@@ -1415,6 +1431,7 @@ where
                     message_provider,
                     stack.failure_tracker.clone(),
                     loader,
+                    &stack.common_config.dedup.version,
                     &stack.telemetry,
                 )?;
                 stack.build::<_, _, _, _, _, _, _, C>(

@@ -8,10 +8,10 @@
 //! [`KeyedStateSession`] is the sole implementation — the real session, minted
 //! per event by the partition's state manager. It holds **one uniform
 //! `Overlay`** (the per-event `DirtyStore` over the partition's committed
-//! cell store): clones share the per-event dirty overlay and marker slot plus
-//! the cross-event singletons (the commit oracle, the armed backstop, the
-//! event, the registry), so repeated descriptor binds of one collection
-//! accumulate into one write.
+//! cell store): clones share the per-event dirty overlay and reload-marker
+//! override plus the cross-event singletons (the commit oracle, the armed
+//! backstop, the event, the registry), so repeated descriptor binds of one
+//! collection accumulate into one write.
 //!
 //! # The session / lifecycle split
 //!
@@ -24,7 +24,7 @@
 //!   `loader`/`is_terminated`/`verify_state_registration`.
 //!   [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
-//!   (`finalize`/marker/reset — settling moved onto the receipt `finalize`
+//!   (`finalize`/marker identity — settling moved onto the receipt `finalize`
 //!   returns), a `pub(crate)` supertrait of [`CellSession`] that seals it:
 //!   downstream crates can name `CellSession` in bounds but can neither
 //!   implement it nor reach the lifecycle.
@@ -35,23 +35,25 @@
 //! (`crate::consumer::middleware`'s blanket `EventHandler` impl) in
 //! straight-line code:
 //!
-//! 1. Handler ops buffer into the dirty overlay; the deduplication middleware
-//!    buffers the message's commit marker via `register_marker` during unwind.
-//! 2. On the final handler success, `finalize` groups the one dirty map by
+//! 1. Handler ops buffer into the dirty overlay.
+//! 2. On a final handler success, `finalize` groups the one dirty map by
 //!    collection and stages each in one same-partition batch — `ReadCommitted`
 //!    collections stage provisional cells, `ReadUncommitted` ones write
 //!    resolved values — draining the event's dirty range (the stage consumes
 //!    the buffered ops) and returning the staged work as a linear `Finalized`
 //!    receipt.
-//! 3. Strictly after the stage, `flush_marker` writes the registered dedup
-//!    marker through the commit oracle. After the offset/trigger commit the
-//!    boundary consumes the receipt: `certify().promote()` promotes the staged
-//!    cells; on an arm-shutdown abort `rollback()` restores their committed
-//!    bases.
-//! 4. At attempt boundaries (retry, defer), `reset` discards the dirty overlay
-//!    and the registered marker.
+//! 3. Strictly after the stage, the boundary records the message commit marker
+//!    read from the session's event identity — the message `EventRef`'s dedup
+//!    id, or the deferred-reload override (`message_marker`) — through the
+//!    commit oracle. After the offset/trigger commit the boundary consumes the
+//!    receipt: `certify().promote()` promotes the staged cells; on an
+//!    arm-shutdown abort `rollback()` restores their committed bases.
+//! 4. At attempt boundaries, retry calls `discard_dirty` so the next attempt
+//!    starts from a clean buffer; the identity override persists by design (it
+//!    is identity, not decision).
 
 use crate::consumer::event_context::EventContext;
+use crate::consumer::middleware::MarkerWrite;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::access::StateAccessError;
 use crate::state::cell::ProvisionalWrite;
@@ -77,7 +79,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
-pub(crate) use sealed::Finalized;
+pub(crate) use sealed::{Finalized, MessageMarker};
 use sealed::{StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
@@ -287,9 +289,36 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
 /// promoting, and resetting are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Future,
+        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Future, MarkerWrite,
         ProvisionalWrite, SectionClear, StateAccessError, Uuid, resolve_collections,
     };
+
+    /// The message commit-marker identity: the dedup id the settlement
+    /// boundary records through the commit oracle and the deduplication
+    /// filter reads. A newtype so it cannot be confused with any other
+    /// `Uuid` at the oracle-write signature.
+    ///
+    /// Two sources feed it, one accessor reads it
+    /// ([`StateLifecycle::message_marker`]): a message session's own
+    /// [`EventRef::Message`](crate::state::EventRef) dedup id, or the
+    /// deferred-reload identity override
+    /// ([`StateLifecycle::set_reload_marker`]) on a timer session.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MessageMarker(Uuid);
+
+    impl MessageMarker {
+        /// Wraps a message's dedup id.
+        #[must_use]
+        pub(crate) fn new(dedup_id: Uuid) -> Self {
+            Self(dedup_id)
+        }
+
+        /// The raw dedup id, for the oracle write and the dedup-store lookup.
+        #[must_use]
+        pub(crate) fn into_uuid(self) -> Uuid {
+            self.0
+        }
+    }
 
     /// One collection's frozen settlement record: the provisional cells
     /// `finalize` staged (the ref carries the TTL) plus the frozen
@@ -448,36 +477,53 @@ pub(crate) mod sealed {
             &self,
         ) -> impl Future<Output = Result<Finalized<Self::Cell>, StateAccessError>> + Send;
 
-        /// Buffers the message commit marker (`dedup_id`) for this event.
+        /// Sets the deferred-reload identity override: the dedup id of the
+        /// message the current dispatch loaded from the defer queue, set at
+        /// exactly one site — the message-defer reload path, immediately
+        /// after the load succeeds and before the inner dispatch.
         ///
-        /// Infallible and last-wins. The marker rides the session — not derived
-        /// from the session's `EventRef` — because on a deferred-message reload
-        /// the marker is the reloaded *message's* dedup id while the session
-        /// stages under the *timer's* `EventRef`. The boundary flushes it
-        /// strictly after the stage; [`Self::reset`] discards it.
-        fn register_marker(&self, dedup_id: Uuid);
+        /// **Last-wins and never cleared.** Last-wins is load-bearing: a
+        /// retry re-dispatch of the same defer timer after an ambiguous
+        /// durable queue advance loads the *next* queued message — a
+        /// different id — and the override must re-point at it (a set-once
+        /// cell would dispatch message B under message A's identity). Never
+        /// cleared is safe because every settle arm that consults
+        /// [`Self::message_marker`] implies the final attempt's inner ran,
+        /// which implies that attempt's reload performed the set — a stale
+        /// read is unreachable, not merely forbidden.
+        fn set_reload_marker(&self, marker: MessageMarker);
 
-        /// Writes the registered marker through the commit oracle, clearing the
-        /// slot only on success so the boundary can retry a transient failure.
-        /// A no-op when no marker is registered (returns `Ok`).
-        fn flush_marker(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+        /// The message commit-marker identity for this event: a message
+        /// session's [`EventRef::Message`](crate::state::EventRef) dedup id;
+        /// on a timer session, the reload override; else `None` (a pure
+        /// timer, whose trigger commit is its dedup). A message session
+        /// never reads the override — the match arm structurally ignores it,
+        /// so a divergent override is unreadable rather than forbidden.
+        fn message_marker(&self) -> Option<MessageMarker>;
 
-        /// Discards the per-event dirty overlay and the registered marker, so
-        /// the next attempt starts clean.
-        fn reset(&self);
+        /// Records `marker` through the commit oracle. Idempotent — the
+        /// oracle write is a bare upsert — so the boundary retries failures
+        /// freely. [`MarkerWrite`] is constructible only inside the
+        /// settlement module, so this does not compile anywhere else.
+        fn record_marker(
+            &self,
+            marker: MessageMarker,
+            proof: MarkerWrite,
+        ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Discards just this event's buffered dirty cells — the failure-path
-        /// backstop that
+        /// Discards just this event's buffered dirty cells — retry's
+        /// attempt-boundary isolation, and the failure-path backstop that
         /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
         /// runs on every exit path (error, abandon, panic unwind).
         ///
         /// The dirty workspace is partition-lifetime (manager-owned, shared by
-        /// every session clone), so it must be cleared explicitly per event;
-        /// the marker lives on the per-event session and dies with it, so it
-        /// is not cleared here. On the success path [`Self::finalize`] has
-        /// already drained the buffer (the stage consumes it), making the
-        /// scope-drop clear a no-op there; the receipt's promote/rollback read
-        /// only receipt-owned data, never dirty.
+        /// every session clone), so it must be cleared explicitly per event.
+        /// The reload identity override is deliberately **not** cleared here
+        /// (never cleared at all — see [`Self::set_reload_marker`]). On the
+        /// success path [`Self::finalize`] has already drained the buffer
+        /// (the stage consumes it), making the scope-drop clear a no-op
+        /// there; the receipt's promote/rollback read only receipt-owned
+        /// data, never dirty.
         fn discard_dirty(&self);
 
         /// The always-on `recovery_delay` floor (a plain config read). The
@@ -581,17 +627,20 @@ where
     recovery_delay: CompactDuration,
     armed: ArmedKeys,
     termination: TerminationWatch,
-    /// The registered message commit marker, flushed strictly after the stage
-    /// and cleared by `reset`.
-    marker: SyncMutex<Option<Uuid>>,
+    /// The deferred-reload identity override: the dedup id of the message
+    /// the current dispatch loaded, on a timer session. Last-wins and never
+    /// cleared — see [`sealed::StateLifecycle::set_reload_marker`]. Carries
+    /// identity only; the commit decision lives in the settle boundary's
+    /// typed classification, never in this cell's occupancy.
+    reload_marker: SyncMutex<Option<MessageMarker>>,
 }
 
 /// The real per-event session over a partition's cell store.
 ///
 /// One session is minted per event by the partition's state manager; clones
-/// share the per-event dirty overlay and marker slot plus the cross-event
-/// singletons. `B` is the per-partition [`StateBackend`] bundle; `L` is the
-/// message loader.
+/// share the per-event dirty overlay and reload-marker override plus the
+/// cross-event singletons. `B` is the per-partition [`StateBackend`] bundle;
+/// `L` is the message loader.
 pub struct KeyedStateSession<B, L>
 where
     B: StateBackend,
@@ -653,7 +702,7 @@ where
                 recovery_delay,
                 armed,
                 termination,
-                marker: SyncMutex::new(None),
+                reload_marker: SyncMutex::new(None),
             }),
         }
     }
@@ -894,21 +943,35 @@ where
         }))
     }
 
-    fn register_marker(&self, dedup_id: Uuid) {
-        *self.inner.marker.lock() = Some(dedup_id);
+    fn set_reload_marker(&self, marker: MessageMarker) {
+        // Override implies timer session: only the deferred-message reload
+        // sets it, and that reload always dispatches under a timer EventRef.
+        debug_assert!(
+            matches!(self.inner.event, EventRef::Timer(_)),
+            "the reload override is set only on timer sessions"
+        );
+        *self.inner.reload_marker.lock() = Some(marker);
     }
 
-    async fn flush_marker(&self) -> Result<(), StateAccessError> {
-        let Some(dedup_id) = *self.inner.marker.lock() else {
-            return Ok(());
-        };
+    fn message_marker(&self) -> Option<MessageMarker> {
+        match self.inner.event {
+            // The message's own id — the override is never read here, so a
+            // divergent override on a message session is unreadable.
+            EventRef::Message { dedup_id } => Some(MessageMarker::new(dedup_id)),
+            EventRef::Timer(_) => *self.inner.reload_marker.lock(),
+        }
+    }
+
+    async fn record_marker(
+        &self,
+        marker: MessageMarker,
+        _proof: MarkerWrite,
+    ) -> Result<(), StateAccessError> {
         self.inner
             .oracle
-            .record_message(dedup_id)
+            .record_message(marker.into_uuid())
             .await
-            .map_err(|e| StateAccessError::store(&e))?;
-        *self.inner.marker.lock() = None;
-        Ok(())
+            .map_err(|e| StateAccessError::store(&e))
     }
 
     fn discard_dirty(&self) {
@@ -917,11 +980,6 @@ where
             .overlay
             .dirty()
             .clear_event(&self.inner.state_key.key);
-    }
-
-    fn reset(&self) {
-        self.discard_dirty();
-        *self.inner.marker.lock() = None;
     }
 
     fn recovery_floor(&self) -> CompactDuration {

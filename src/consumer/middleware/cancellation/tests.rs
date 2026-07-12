@@ -344,3 +344,61 @@ async fn apply_hooks_suppressed_when_inner_did_not_run() {
     assert!(recorder.abort_calls.lock().is_empty());
     assert!(recorder.commit_calls.lock().is_empty());
 }
+
+/// The settlement classification table: inner-ran rows delegate (including
+/// `ShutdownAfterInner`, which carries the inner's own error); the pre-inner
+/// admission rejections are `Bypassed`. Delegation is proven against a
+/// `Bypassed`-classifying probe.
+#[test]
+fn settlement_classification_table() {
+    use crate::consumer::middleware::tests::test_support::BypassedHandler;
+    use crate::consumer::middleware::{Settlement, SettlementHandler};
+
+    type Subject = CancellationHandler<ScriptedHandler>;
+    type Probe = CancellationHandler<BypassedHandler>;
+    type Err_ = CancellationError<TestError>;
+
+    let rows: Vec<(&str, Result<(), Err_>, Settlement)> = vec![
+        (
+            "Ok delegates to the leaf's Final",
+            Ok(()),
+            Settlement::Final,
+        ),
+        (
+            "Handler delegates to the leaf's Final",
+            Err(CancellationError::Handler(TestError(
+                ErrorCategory::Permanent,
+            ))),
+            Settlement::Final,
+        ),
+        (
+            "ShutdownAfterInner delegates on the carried inner error",
+            Err(CancellationError::ShutdownAfterInner(TestError(
+                ErrorCategory::Transient,
+            ))),
+            Settlement::Final,
+        ),
+        (
+            "Shutdown (pre-inner) is Bypassed",
+            Err(CancellationError::Shutdown),
+            Settlement::Bypassed,
+        ),
+        (
+            "MessageCancelled (pre-inner) is Bypassed",
+            Err(CancellationError::MessageCancelled),
+            Settlement::Bypassed,
+        ),
+    ];
+    for (label, result, expected) in rows {
+        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
+    }
+
+    // Delegation proof: over a Bypassed-classifying inner the delegating
+    // rows stay Bypassed.
+    let ok: Result<(), Err_> = Ok(());
+    assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
+    let inner_err: Result<(), Err_> = Err(CancellationError::Handler(TestError(
+        ErrorCategory::Permanent,
+    )));
+    assert_eq!(Probe::settlement(inner_err.as_ref()), Settlement::Bypassed);
+}

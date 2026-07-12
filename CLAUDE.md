@@ -380,12 +380,19 @@ terminates the chain with the handler as the **INNERMOST** component.
 after the stack returns, owned by the `settle` boundary in
 `src/consumer/middleware/settle.rs` (called from the blanket
 `FallibleEventHandler → EventHandler` impl; `retry` routes its final outcome
-through the same `settle`/`abandon`). The full
-stage → arm-backstop → marker-flush → commit → promote order, its crash-window
-argument, and the sweep's mirrored posture are documented once on their owning
-items — `settle`/`settle_committed`, `arm_backstop`/`ArmOutcome`, and
-`StateManager::recover` — read those doc comments before touching any of it.
-The anchors code comments cite by name:
+through the same `settle`/`abandon`). Whether a dispatch settles the event at
+all is a pure function of the stack's final result: the crate-internal
+`Settlement` classification (`SettlementHandler::settlement`, one explicit
+impl per framework wrapper, the leaf adapter minted at `into_provider`
+hardcoding `Final`) decides `Final` vs `Bypassed` before the error category is
+consulted; the message commit marker is read from the session's event identity
+(`message_marker()` — the message `EventRef`'s dedup id, or the
+deferred-reload's last-wins identity override), never deposited by middleware.
+The full stage → arm-backstop → marker-record → commit → promote order, its
+crash-window argument, and the sweep's mirrored posture are documented once on
+their owning items — `settle`/`settle_committed`, `arm_backstop`/`ArmOutcome`,
+and `StateManager::recover` — read those doc comments before touching any of
+it. The anchors code comments cite by name:
 
 - **Invariant 8:** arming the backstop is must-succeed. `arm_backstop` retries
   every non-shutdown failure and can only report `ShuttingDown`, so "abort in
@@ -401,20 +408,18 @@ The anchors code comments cite by name:
   key-range clears) is never a durability or recovery source — recovery is
   Cassandra provisional cells + the commit oracle. Do not re-add a disk-backed
   dirty store; fjall remains only the committed-value cache (`FjallCellCache`).
-  The marker flush sits textually after the stage inside one function, so
+  The marker record sits textually after the stage inside one function, so
   "marker before durable state" is unwritable.
 
-Three residual order facts govern middleware placement:
-  - `retry` stays OUTERMOST so each attempt is a fresh dispatch that resets the
-    session **and the registered marker** between attempts.
-  - The defer middlewares sit OUTSIDE the common block so a defer-swallow
-    `reset()`s the session *before* swallowing a transient error into
-    `Ok(Deferred)` — discarding the registered marker, so the deferred reload
-    is **not** deduped.
-  - `dedup` stays in the stack as a duplicate **filter** that registers the
-    marker (on `Ok`/`Permanent`); it never writes the dedup store — the
-    boundary flushes the marker. (`monopolization` is state-agnostic; its
-    position is immaterial.)
+Two residual order facts govern middleware placement:
+  - `retry` stays OUTERMOST so each attempt is a fresh dispatch, isolated by
+    `discard_dirty()` between attempts.
+  - The dedup filter sits INSIDE message-defer so a deferred reload's
+    duplicate check sees the reload identity override. `dedup` is a stateless
+    duplicate **filter** over the boundary-readable message marker; the settle
+    boundary records it — the `Settlement` classification decides whether a
+    dispatch settles the event at all. (`monopolization` is state-agnostic;
+    its position is immaterial.)
 
 **Timer System:** Slab-based time partitioning (TimerManager → Store + Scheduler + SlabLoader)
 

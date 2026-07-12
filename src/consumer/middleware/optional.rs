@@ -31,6 +31,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -226,6 +227,23 @@ where
         match self {
             Self::Enabled(handler) => handler.shutdown().await,
             Self::Disabled(handler) => handler.shutdown().await,
+        }
+    }
+}
+
+impl<E, D> SettlementHandler for OptionHandler<E, D>
+where
+    E: SettlementHandler,
+    D: SettlementHandler<Payload = E::Payload>,
+{
+    /// Delegates to whichever branch produced the result, mirroring the
+    /// apply-hook routing above.
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            Ok(OptionOutput::Enabled(output)) => E::settlement(Ok(output)),
+            Ok(OptionOutput::Disabled(output)) => D::settlement(Ok(output)),
+            Err(OptionError::Enabled(error)) => E::settlement(Err(error)),
+            Err(OptionError::Disabled(error)) => D::settlement(Err(error)),
         }
     }
 }

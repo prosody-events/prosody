@@ -343,50 +343,55 @@ fn configuration_accepts_valid_failure_topic() {
         "Non-empty failure topic should pass validation"
     );
 }
-
-/// The routed swallow's session reset, end to end through the settle
-/// boundary: the inner attempt buffers a `cart` write and registers a dedup
-/// marker before failing Transient; the DLQ route swallows that error into
-/// `Ok(Routed)` — so the offset commits — but only after
-/// `reset_state_session` discards the failed attempt's dirty ops and marker
-/// (the same attempt-boundary reset both defer swallow points perform).
-mod routed_swallow {
+/// The routed swallow through the settle boundary: the inner attempt buffers
+/// a `cart` write and fails Transient; the DLQ route swallows that error into
+/// `Ok(Routed)` — classified `Bypassed`, so the offset commits while nothing
+/// stages and no marker records (the same result-typed guarantee both defer
+/// swallow points get). Plus the `DlqSendFailed` divergence pin and the
+/// settlement classification table.
+mod settlement_pins {
     use super::*;
     use crate::Key;
     use crate::consumer::EventHandler;
+    use crate::consumer::Uncommitted;
     use crate::consumer::message::ConsumerMessageValue;
-    use crate::consumer::middleware::FallibleEventHandler;
+    use crate::consumer::message::UncommittedMessage;
     use crate::consumer::middleware::tests::test_support::{
-        MockEventContext as SessionContext, StagingHook, StagingTransientHandler, committed_value,
-        recording_session,
+        MockEventContext as SessionContext, RecordingParts, StagingError, StagingHook,
+        StagingTransientHandler, committed_value, recording_session,
     };
+    use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
     use crate::consumer::partition::offsets::OffsetTracker;
-    use crate::state::StateKey;
+    use crate::state::manager::EventStateScope;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::{EventRef, StateKey};
     use crossbeam_utils::CachePadded;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
     use uuid::Uuid;
 
     impl FallibleEventHandler for FailureTopicHandler<StagingTransientHandler, JsonCodec> {}
 
-    #[tokio::test]
-    async fn routed_swallow_resets_the_state_session() -> color_eyre::Result<()> {
-        const MARKER: Uuid = Uuid::from_u128(0xDEF3);
+    const DEDUP_ID: Uuid = Uuid::from_u128(0xDEF3);
 
+    fn session_fixture() -> color_eyre::Result<(RecordingParts, StateKey)> {
         let mut registry = CollectionDefRegistry::default();
         registry.register(
             &StagingTransientHandler::collection(),
             CollectionDef::new(None),
         )?;
         let state_key = StateKey::new(Uuid::from_u128(0xD3), Arc::from("user-1"));
-        let (session, cell_store, dirty, recorded) = recording_session(registry, state_key.clone());
+        let parts = recording_session(
+            registry,
+            state_key.clone(),
+            EventRef::Message { dedup_id: DEDUP_ID },
+        );
+        Ok((parts, state_key))
+    }
 
-        let inner = StagingTransientHandler::new(MARKER);
-        let handler = make_handler(inner.clone())?;
-
-        let context = SessionContext::new().with_session(session);
+    async fn uncommitted_message()
+    -> color_eyre::Result<(UncommittedMessage<serde_json::Value>, OffsetTracker)> {
         let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
         let tracker =
             OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version);
@@ -399,6 +404,22 @@ mod routed_swallow {
             permit,
         )
         .into_uncommitted(uncommitted_offset);
+        Ok((message, tracker))
+    }
+
+    /// `Ok(Routed)` records nothing and stages nothing: the outcome lives in
+    /// the DLQ, so the settle boundary bypasses stage and marker while
+    /// committing the offset; the dirty residue dies with the scope drop.
+    #[tokio::test]
+    async fn routed_swallow_records_nothing_and_stages_nothing() -> color_eyre::Result<()> {
+        let ((session, cell_store, dirty, recorded), state_key) = session_fixture()?;
+        let scope = EventStateScope::new(session);
+
+        let inner = StagingTransientHandler::new();
+        let handler = make_handler(inner.clone())?;
+
+        let context = SessionContext::new().with_session(scope.handle());
+        let (message, tracker) = uncommitted_message().await?;
 
         EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
@@ -406,23 +427,18 @@ mod routed_swallow {
         // swallows the inner sees `after_commit(Err)` — the routing pinned by
         // the "commit x Routed(Err)" row of `apply_hook_routing_matrix`.
         assert_eq!(inner.hooks(), vec![StagingHook::Commit]);
-        // The reset's contract: nothing from the failed attempt survives.
+        // The Bypassed contract: nothing from the failed attempt settles.
         // These are also the positive control that the ROUTED swallow ran:
-        // had the error surfaced instead (no route, no reset), the buffered
-        // write would still sit in the dirty store.
+        // had the error surfaced instead (no route), the boundary would have
+        // recorded the Permanent marker or re-driven.
         assert_eq!(
             committed_value(&cell_store, state_key, "cart").await?,
             None,
             "the failed attempt's buffered write must not commit",
         );
-        let key: Key = Arc::from("user-1");
-        assert!(
-            dirty.touched(&key).is_empty(),
-            "the session's dirty buffer must be empty after the swallow",
-        );
         assert!(
             recorded.lock().is_empty(),
-            "the failed attempt's marker must not flush — a redelivery of the routed message must \
+            "the routed attempt must record no marker — a redelivery of the routed message must \
              not be dedup-filtered",
         );
         assert_eq!(
@@ -430,6 +446,148 @@ mod routed_swallow {
             Some(0),
             "the routed dispatch commits the offset",
         );
+        drop(scope);
+        let key: Key = Arc::from("user-1");
+        assert!(
+            dirty.touched(&key).is_empty(),
+            "the scope drop sweeps the routed attempt's dirty residue",
+        );
+        Ok(())
+    }
+
+    /// `DlqSendFailed { inner: Transient, producer: Permanent }` records NO
+    /// marker: the message is neither handled nor in the DLQ, so a marker
+    /// would silently dedup-filter its redelivery. Driven at the settle
+    /// level (the producer cannot be made to fail on demand in a unit
+    /// test); the classification cells below are the pure-function pin.
+    #[tokio::test]
+    async fn dlq_send_failed_with_transient_inner_records_no_marker() -> color_eyre::Result<()> {
+        use crate::codec::JsonCodecError;
+        use crate::consumer::middleware::settle;
+
+        let ((session, _cell_store, _dirty, recorded), _state_key) = session_fixture()?;
+        let scope = EventStateScope::new(session);
+        let context = SessionContext::new().with_session(scope.handle());
+
+        let inner = StagingTransientHandler::new();
+        let handler = make_handler(inner)?;
+
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = Guard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        // The composite the stack would surface: a Transient inner under a
+        // Permanent producer error (a serialization rejection).
+        let result: Result<
+            FailureTopicOutput<(), StagingError>,
+            FailureTopicError<StagingError, JsonCodecError>,
+        > = Err(FailureTopicError::DlqSendFailed {
+            inner: StagingError(ErrorCategory::Transient),
+            producer: permanent_producer()?,
+        });
+
+        settle(&handler, context, guard, result).await;
+
+        assert!(
+            recorded.lock().is_empty(),
+            "a Transient inner under a Permanent producer error must record NO marker",
+        );
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            1,
+            "the Bypassed final commits the offset",
+        );
+        assert_eq!(aborted.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// Offset guard recording which terminal the settle-level pin chose.
+    struct Guard {
+        committed: Arc<AtomicUsize>,
+        aborted: Arc<AtomicUsize>,
+    }
+
+    impl Uncommitted for Guard {
+        async fn commit(self) {
+            self.committed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn abort(self) {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A Permanent producer error (a payload serialization rejection), for
+    /// the `DlqSendFailed` cells.
+    fn permanent_producer() -> color_eyre::Result<ProducerError<JsonCodecError>> {
+        let Err(serde_err) = serde_json::from_str::<serde_json::Value>("{") else {
+            color_eyre::eyre::bail!("malformed JSON must fail to parse");
+        };
+        Ok(ProducerError::Serialization(JsonCodecError::Serde(
+            serde_err,
+        )))
+    }
+
+    /// The settlement classification table for the failure-topic wrapper:
+    /// every Output and error variant, including the `DlqSendFailed` guard
+    /// cells (inner-Permanent delegates; inner-Transient/Terminal bypass).
+    #[test]
+    fn settlement_classification_table() -> color_eyre::Result<()> {
+        use crate::codec::JsonCodecError;
+
+        type Subject = FailureTopicHandler<StagingTransientHandler, JsonCodec>;
+        type Out = FailureTopicOutput<(), StagingError>;
+        type TableErr = FailureTopicError<StagingError, JsonCodecError>;
+
+        fn dlq(inner: ErrorCategory) -> color_eyre::Result<TableErr> {
+            Ok(FailureTopicError::DlqSendFailed {
+                inner: StagingError(inner),
+                producer: permanent_producer()?,
+            })
+        }
+
+        let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
+            (
+                "Inner(Ok) delegates to the leaf's Final",
+                Ok(FailureTopicOutput::Inner(())),
+                Settlement::Final,
+            ),
+            (
+                "Routed is Bypassed (outcome lives in the DLQ)",
+                Ok(FailureTopicOutput::Routed(StagingError(
+                    ErrorCategory::Transient,
+                ))),
+                Settlement::Bypassed,
+            ),
+            (
+                "Handler delegates to the leaf's Final",
+                Err(FailureTopicError::Handler(StagingError(
+                    ErrorCategory::Permanent,
+                ))),
+                Settlement::Final,
+            ),
+            (
+                "DlqSendFailed with a Permanent inner delegates (it would have certified)",
+                Err(dlq(ErrorCategory::Permanent)?),
+                Settlement::Final,
+            ),
+            (
+                "DlqSendFailed with a Transient inner is Bypassed (never certifies)",
+                Err(dlq(ErrorCategory::Transient)?),
+                Settlement::Bypassed,
+            ),
+            (
+                "DlqSendFailed with a Terminal inner is Bypassed (never certifies)",
+                Err(dlq(ErrorCategory::Terminal)?),
+                Settlement::Bypassed,
+            ),
+        ];
+        for (label, result, expected) in rows {
+            assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
+        }
         Ok(())
     }
 }

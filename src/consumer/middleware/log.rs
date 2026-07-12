@@ -50,7 +50,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
-    HandlerMiddleware,
+    HandlerMiddleware, Settlement, SettlementHandler,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -114,6 +114,7 @@ where
 impl<T> HandlerProvider for LogProvider<T>
 where
     T: FallibleHandlerProvider,
+    T::Handler: SettlementHandler,
 {
     type Handler = LogHandler<T::Handler>;
 
@@ -189,6 +190,16 @@ where
         // No log-specific state to clean up (logging is stateless)
         // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for LogHandler<T>
+where
+    T: SettlementHandler,
+{
+    /// Pass-through: logging adds no Output or error variants of its own.
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        T::settlement(result)
     }
 }
 

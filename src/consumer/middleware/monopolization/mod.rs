@@ -58,6 +58,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
@@ -335,6 +336,22 @@ where
             "Monopolization handler shutting down"
         );
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for MonopolizationHandler<T>
+where
+    T: SettlementHandler,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: delegate.
+            Ok(output) => T::settlement(Ok(output)),
+            Err(MonopolizationError::Handler(error)) => T::settlement(Err(error)),
+            // Pre-inner admission rejection (Transient): the inner never
+            // ran, so the result is this layer's, not the event's.
+            Err(MonopolizationError::Monopolization { .. }) => Settlement::Bypassed,
+        }
     }
 }
 

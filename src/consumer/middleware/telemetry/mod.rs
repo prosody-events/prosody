@@ -52,7 +52,9 @@ use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::consumer::middleware::{
+    FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
+};
 use crate::error::ClassifyError;
 use crate::telemetry::event::TimerEventType;
 use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
@@ -299,6 +301,16 @@ where
         // No telemetry-specific state to clean up (sender is shared)
         // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for TelemetryHandler<T>
+where
+    T: SettlementHandler,
+{
+    /// Pass-through: telemetry adds no Output or error variants of its own.
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        T::settlement(result)
     }
 }
 

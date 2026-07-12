@@ -27,9 +27,6 @@
 //!
 //! Message and timer defer middlewares compose independently via `.layer()`.
 
-use crate::consumer::event_context::EventContext;
-use crate::state::session::LifecycleAccessExt;
-use crate::state::session::sealed::StateLifecycle;
 use crate::timers::duration::CompactDuration;
 use rand::RngExt;
 use std::cmp::min;
@@ -87,25 +84,4 @@ pub fn calculate_backoff(config: &DeferConfiguration, retry_count: u32) -> Compa
     let jittered_seconds = rand::rng().random_range(1..=capped_seconds);
 
     CompactDuration::new(jittered_seconds)
-}
-
-/// Resets the event's keyed-state session at a defer-swallow boundary.
-///
-/// When a transient inner error is absorbed into an `Ok(Deferred…)`
-/// output, the durability marker for this dispatch commits — but the
-/// failed attempt's dirty state ops must not stage under it, and its
-/// registered dedup marker must not flush. The `settle` boundary runs the
-/// durability sequence on the stack's *final* `Ok`, so this reset is what
-/// keeps the swallow safe: it discards the failed attempt's dirty ops, the
-/// per-event transaction map, **and the registered marker**, leaving
-/// `settle` an empty session — nothing stages, no marker flushes, and the
-/// deferred reload is therefore not deduplicated and re-runs the handler
-/// from clean state.
-pub(crate) fn reset_state_session<C>(context: &C)
-where
-    C: EventContext,
-{
-    if let Ok(lifecycle) = context.lifecycle() {
-        lifecycle.reset();
-    }
 }

@@ -4,10 +4,10 @@
 //! each a short op list (set / clear / section-clear / mid-handler
 //! commit/rollback) plus a commit/abort/reset/fail outcome, some commits
 //! scheduling a promote failure — through the **real** production session
-//! lifecycle (the `finalize`-minted receipt's `promote`/`rollback` plus
-//! `reset`) over **one partition-shared [`DirtyStore`]**, minting each event's
-//! session as an [`EventStateScope`] that drops at event-end (the production
-//! lifecycle). Its clauses:
+//! lifecycle (the `finalize`-minted receipt's `promote`/`rollback` plus the
+//! attempt-boundary `discard_dirty`) over **one partition-shared
+//! [`DirtyStore`]**, minting each event's session as an [`EventStateScope`]
+//! that drops at event-end (the production lifecycle). Its clauses:
 //!
 //! - after every operation the session's own overlay read equals a plain
 //!   `Option<Bytes>` model, and the mid-handler `commit()`/`rollback()` drains
@@ -34,15 +34,16 @@
 //! event's buffered write can neither linger nor be read as uncommitted.
 //!
 //! The surviving examples pin what the single-collection value trace cannot
-//! observe: the marker flushes exactly once, strictly after the stage (the
-//! [`ScriptedOracle`] `record_message` counter); the `commit()`/`rollback()`
-//! drains are collection-scoped (sibling isolation, zero durable writes on
-//! rollback); a terminated session's rollback is a `NoOp` so a stale clone
-//! cannot drain a later same-key event's buffer; a mid-stage failure leaves
-//! the buffer whole for an idempotent retry; a retry re-finalize rebuilds the
-//! same event's marker; an own-event read leaves its in-flight marker
-//! standing; and the clears-only stage boundary resolves a seeded foreign
-//! marker.
+//! observe: the `commit()`/`rollback()` drains are collection-scoped (sibling
+//! isolation, zero durable writes on rollback); a terminated session's
+//! rollback is a `NoOp` so a stale clone cannot drain a later same-key
+//! event's buffer; a mid-stage failure leaves the buffer whole for an
+//! idempotent retry; a retry re-finalize rebuilds the same event's marker; an
+//! own-event read leaves its in-flight marker standing; and the clears-only
+//! stage boundary resolves a seeded foreign marker. (The settle boundary's
+//! own marker-record ordering and exactly-once pins live in
+//! `consumer::middleware::tests` and the defer/retry pin suites, where the
+//! real boundary is driven.)
 
 use super::sealed::{ApplyOutcome, StagedState, StateLifecycle};
 use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
@@ -341,43 +342,6 @@ fn prop_finalize_folds_recovery_delay_against_floor() {
     QuickCheck::new().quickcheck(prop as fn(Vec<Option<u16>>) -> TestResult);
 }
 
-/// The single marker flushes **exactly once, strictly after the stage**: it is
-/// not recorded after `finalize` alone, is recorded after `flush_marker`, and a
-/// second flush writes nothing (the slot clears on success). Pins an ordering a
-/// committed-projection trace cannot observe.
-#[tokio::test]
-async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
-    let fx = Fixture::new()?;
-    let (event, dedup_id) = message(1);
-    let session = fx.session(event).handle();
-
-    session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
-        .await?;
-    session.register_marker(dedup_id);
-
-    // The receipt is deliberately dropped: the pin is about marker ordering,
-    // and a dropped receipt is safe (recovery never reads the in-memory
-    // record).
-    assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
-    assert!(
-        !fx.oracle.is_recorded(dedup_id).await,
-        "the marker must not be flushed by the stage",
-    );
-
-    session.flush_marker().await?;
-    assert!(fx.oracle.is_recorded(dedup_id).await);
-    assert_eq!(fx.oracle.recorded_count(), 1, "exactly one marker");
-
-    session.flush_marker().await?;
-    assert_eq!(
-        fx.oracle.recorded_count(),
-        1,
-        "the slot clears on success, so a second flush is a no-op",
-    );
-    Ok(())
-}
-
 /// A mid-handler `commit()` drains only its own collection: the
 /// `commit()`-landed write is durable while the sibling's stays buffered
 /// and unwritten — the drain is collection-scoped, never key-scoped. An example
@@ -595,10 +559,12 @@ enum Outcome {
         fail_promote: bool,
     },
     Abort,
+    /// The attempt-boundary discard (retry between attempts): the receipt is
+    /// dropped and `discard_dirty` clears the buffer.
     Reset,
-    /// The final-error path: the event ends with no `finalize` and no `reset`
-    /// (settle's error arms never finalize). The buffered write must neither
-    /// commit nor linger — only the scope's `Drop` clears it.
+    /// The final-error path: the event ends with no `finalize` and no
+    /// discard (settle's error arms never finalize). The buffered write must
+    /// neither commit nor linger — only the scope's `Drop` clears it.
     Failed,
 }
 
@@ -920,8 +886,11 @@ async fn run(trace: Trace) -> Result<()> {
                 Outcome::Commit { fail_promote } => {
                     let finalized =
                         checked_finalize(&fx, &session, event, ev_model.buffered).await?;
-                    session.register_marker(dedup_id);
-                    session.flush_marker().await?;
+                    // The driver simulates the settle boundary's marker
+                    // record — a direct oracle write, strictly after the
+                    // stage (the session exposes no marker write; the real
+                    // one is settlement-module-private).
+                    fx.oracle.record_message(dedup_id).await?;
                     if let Finalized::Staged(staged) = finalized {
                         promote_receipt(&fx, staged, fail_promote).await?;
                     }
@@ -950,10 +919,10 @@ async fn run(trace: Trace) -> Result<()> {
                     // Dropping the receipt leaves any provisional written by
                     // `finalize` standing, projecting its `prev` (the
                     // `commit()`-landed snapshot, or the unchanged committed
-                    // base) — exactly the discarded-stage behavior `reset`
-                    // pairs with.
+                    // base) — exactly the discarded-stage behavior the
+                    // attempt-boundary `discard_dirty` pairs with.
                     drop(finalized);
-                    session.reset();
+                    session.discard_dirty();
                     model = ev_model.floor.resolve(model);
                 }
                 // Final-error path: no `finalize`, no `reset`. Only the
@@ -1045,11 +1014,10 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
     // Heal the store: the retried finalize re-stages from the intact buffer
     // and the settle converges to both buffered values.
     fx.set_poison(None);
-    session.register_marker(dedup_id);
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the healed retry must re-stage from the intact buffer");
     };
-    session.flush_marker().await?;
+    fx.oracle.record_message(dedup_id).await?;
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
         let id = CollectionId::new(fx.state_key.clone(), StateType::Application, name.clone());
@@ -1134,8 +1102,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
 
     // B's settle applies its clear (section 0's rows erased whole — A's
     // committed cells are pre-clear rows) and deletes B's marker.
-    session.register_marker(b_dedup);
-    session.flush_marker().await?;
+    fx.oracle.record_message(b_dedup).await?;
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     assert!(
         fx.cells.standing_marker_of(&id).is_none(),
@@ -1184,9 +1151,9 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     // retry boundary pairs with `reset`.
     assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
 
-    // The retry boundary: discard dirty + marker, then re-dispatch the same
-    // event.
-    session.reset();
+    // The retry boundary: discard the attempt's dirty ops, then re-dispatch
+    // the same event.
+    session.discard_dirty();
 
     // The retry stages a superset — the Value cell again plus one more cell —
     // so the rebuilt marker's coordinate list differs from attempt one's.
@@ -1196,7 +1163,6 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     session
         .set(StateType::Application, &fx.value_name, &extra, b"w")
         .await?;
-    session.register_marker(dedup_id);
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the retry re-stage must mint a receipt");
     };
@@ -1215,7 +1181,7 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         "the re-run rebuilds the marker from its own staged set"
     );
 
-    session.flush_marker().await?;
+    fx.oracle.record_message(dedup_id).await?;
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
 
     assert_eq!(
