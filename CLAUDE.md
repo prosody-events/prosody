@@ -82,6 +82,9 @@ aspirations — perform each one; do not merely agree with it:
 
 **Allocation (tiger style / data-oriented — https://tigerstyle.dev/):**
 
+Tiger style and data-oriented design agree: minimize allocation, and never
+*pessimize* a path whose size you know.
+
 - **No hot-path allocation that isn't upfront and bounded.** A steady-state
   path (per message, per timer fire, per event, per cell) must not allocate a
   buffer whose size is discovered at runtime and grown to "whatever's needed."
@@ -113,7 +116,10 @@ aspirations — perform each one; do not merely agree with it:
   win: prefer the reading that's clearest. Zero-alloc and simple are usually
   *not* in conflict — the fn-item fix above removed an allocation *and* a line.
   When they genuinely do conflict, keep it simple and leave a comment naming the
-  allocation; do not contort the code to shave a bounded, upfront `Vec`.
+  allocation; do not contort the code — manual stack buffers, `unsafe`, lifetime
+  gymnastics — to shave a bounded, upfront `Vec`. A `Vec → SmallVec` swap is
+  **not** such a contortion: it is the idiomatic tool for a known-small size, so
+  this clause never shields a `Vec` where a `SmallVec` fits.
 
 **Code Quality:**
 
