@@ -348,7 +348,7 @@ async fn assert_state_and_reads(
 
 /// Absent → Inline → Overflow → demotion via delete → Absent.
 ///
-/// Covers: Absent→Inline (schedule), Inline→Overflow (insert/promote),
+/// Exercises: Absent→Inline (schedule), Inline→Overflow (insert/promote),
 /// Overflow→Inline (delete demotion 2→1), Inline→Absent (delete 1→0).
 #[tokio::test]
 async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
@@ -474,7 +474,7 @@ async fn test_promote_preserves_tag() -> Result<()> {
 /// Overflow→Inline via `clear_and_schedule_key`, `clear_key_triggers`
 /// paths, Inline→Inline reschedule.
 ///
-/// Covers: Overflow→Inline (`clear_and_schedule`), Inline→Absent (clear),
+/// Exercises: Overflow→Inline (`clear_and_schedule`), Inline→Absent (clear),
 /// Overflow→Absent (clear), Inline→Inline (reschedule, 0 tombstones).
 #[tokio::test]
 async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
@@ -571,7 +571,7 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
 /// Post-V3: inserting on any cold or warm cache with Absent state always
 /// goes to `set_state_inline` (no more clustering-only path).
 ///
-/// Covers: Absent→Inline (insert on cold cache), Inline→Absent (delete
+/// Exercises: Absent→Inline (insert on cold cache), Inline→Absent (delete
 /// match), Absent→Inline (insert on warm/cached Absent).
 #[tokio::test]
 async fn test_state_transitions_insert_and_delete() -> Result<()> {

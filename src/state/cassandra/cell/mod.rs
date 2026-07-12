@@ -220,7 +220,7 @@ pub type CellStoreError<OracleErr> = ResolveCellError<CassandraCellStoreError, O
 /// The session + prepared statements a [`CassandraStore`] is built from, shared
 /// across partitions. The per-partition oracle and registry are supplied at
 /// [`CassandraStateBackendFactory::for_partition`] time, so the resolving cell
-/// store cannot be pre-built — this holds the partition-independent pieces.
+/// store cannot be pre-built — this holds the partition-independent parts.
 ///
 /// [`CassandraStateBackendFactory::for_partition`]: crate::state::production::CassandraStateBackendFactory
 #[derive(Clone)]
@@ -503,19 +503,13 @@ where
     }
 
     /// The single resolving section scan, yielding each present cell's
-    /// committed bytes **and** its cache-fill co-expiry TTL (the remaining TTL
-    /// of whichever blob the row carries — [`decode`]'s `blob_ttl`).
-    /// [`scan_cells`](CellStore::scan_cells) drops the TTL;
-    /// [`scan_for_cache`](CellStore::scan_for_cache) keeps it.
+    /// committed bytes — the body behind [`scan_cells`](CellStore::scan_cells).
     fn scan_inner<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
-    ) -> impl Stream<
-        Item = Result<(CellKey, Bytes, Option<CompactDuration>), CellStoreError<O::Error>>,
-    > + Send
-    + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError<O::Error>>> + Send + 'a {
         let section = i8::from(scan.section);
         let dir = scan.dir;
         let limit = scan.limit;
@@ -581,8 +575,8 @@ where
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let (key, raw, ttl) =
-                    decode::try_decode_keyed_cell_ttl(row).map_err(ResolveCellError::Store)?;
+                let (key, raw) =
+                    decode::try_decode_keyed_cell(row).map_err(ResolveCellError::Store)?;
                 if past_end(dir, &key, end.as_ref()) {
                     break;
                 }
@@ -591,7 +585,7 @@ where
                         .await
                         .map_err(flatten_resolve)?;
                 if let Some(bytes) = committed.into_inner() {
-                    yield (key, bytes, ttl_seconds_to_duration(ttl));
+                    yield (key, bytes);
                     yielded += 1;
                 }
             }
@@ -672,25 +666,13 @@ where
         Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
-    fn scan_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes, Option<CompactDuration>), Self::Error>> + Send + 'a
-    {
-        self.scan_inner(collection, scan, own)
-    }
-
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        // Same scan, dropping the per-cell TTL the cache-fill variant keeps.
         self.scan_inner(collection, scan, own)
-            .map_ok(|(key, bytes, _ttl)| (key, bytes))
     }
 
     fn provisional_cells<'a>(
@@ -1640,7 +1622,7 @@ fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreEr
 
 /// Whether `key` has walked past the in-code `end` edge for the scan
 /// direction. An `Excluded` edge also stops *on* the endpoint (the exclusive
-/// variant for coverage gap fall-through).
+/// variant for exclusive scan anchors).
 fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&Coordinate>) -> bool {
     let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
@@ -1715,7 +1697,7 @@ cassandra_queries! {
     /// `ORDER BY` direction cannot be bound (forward/backward), and the
     /// **start-side comparator** cannot be bound either, so each direction
     /// carries two start variants — inclusive (`>=`/`<=`) and exclusive
-    /// (`>`/`<`, for coverage gap fall-through). Every scan binds a concrete
+    /// (`>`/`<`, for exclusive anchors). Every scan binds a concrete
     /// start coordinate ([`ScanEdge`] has no unbounded variant). The end bound
     /// is enforced in code (`past_end`), so it needs no statement variant. The
     /// `marker_*` statements maintain and point-read the one fixed-address
@@ -1747,8 +1729,7 @@ cassandra_queries! {
 
         /// Forward single-section scan from an inclusive `coordinate` anchor.
         scan_forward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
-             TTL(prev_data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate >= ? \
@@ -1758,8 +1739,7 @@ cassandra_queries! {
 
         /// Forward single-section scan from an exclusive `coordinate` anchor.
         scan_forward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
-             TTL(prev_data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate > ? \
@@ -1769,8 +1749,7 @@ cassandra_queries! {
 
         /// Backward single-section scan from an inclusive `coordinate` anchor.
         scan_backward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
-             TTL(prev_data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate <= ? \
@@ -1780,8 +1759,7 @@ cassandra_queries! {
 
         /// Backward single-section scan from an exclusive `coordinate` anchor.
         scan_backward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event, TTL(data), \
-             TTL(prev_data) \
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate < ? \
@@ -1840,7 +1818,7 @@ cassandra_queries! {
 
         /// Row-level delete of one `kind=Cell` row: the committed-absent shape
         /// (see the `CellStore` row-absence invariant). One row tombstone that
-        /// also covers any future columns — strictly better than nulling every
+        /// also includes any future columns — strictly better than nulling every
         /// column. No TTL clause (deletes carry none). Its CQL text matches
         /// `marker_delete`; the two are kept separate because they die
         /// separately and bind a different constant `kind`.
@@ -1914,7 +1892,7 @@ cassandra_queries! {
 
         /// Gap delete between two adjacent survivors
         /// (`coordinate > ? AND coordinate < ?` — both exclusive, so the
-        /// survivors themselves are never covered).
+        /// survivors themselves are never inside a gap range).
         gap_between: (
             "DELETE FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \

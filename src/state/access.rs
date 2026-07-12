@@ -44,6 +44,12 @@ pub enum StateAccessError {
     #[error("state access attempted on a terminated context")]
     Terminated,
 
+    /// A state mutation was attempted after the event settled: the settlement
+    /// boundary closed the session, so it no longer accepts writes (reads
+    /// still answer, serving the post-settle apply hooks).
+    #[error("state mutation attempted on a settled session")]
+    SessionClosed,
+
     /// The underlying state store failed (type-erased).
     #[error("keyed-state store failed: {message}")]
     Store {
@@ -94,9 +100,12 @@ impl StateAccessError {
 impl ClassifyError for StateAccessError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Unavailable | Self::Unregistered { .. } | Self::IdentityMismatch { .. } => {
-                ErrorCategory::Permanent
-            }
+            Self::Unavailable
+            | Self::Unregistered { .. }
+            | Self::IdentityMismatch { .. }
+            // The event settled; retrying the same op on the same session can
+            // never succeed.
+            | Self::SessionClosed => ErrorCategory::Permanent,
             // Aligned with the cancellation middleware: a terminated
             // context is a transient condition (retry decides).
             Self::Terminated => ErrorCategory::Transient,

@@ -39,7 +39,7 @@ fn prop_pool_capacity_is_monotonic(sizes: Vec<u16>) -> Result<()> {
 /// capacities back into the pool on drop.
 ///
 /// The monotonicity property above never holds two guards at once, so this
-/// is the only coverage of the simultaneous-borrow path that a refactor
+/// is the only test of the simultaneous-borrow path that a refactor
 /// holding a `RefMut` (instead of `take`-ing the `Vec`) would silently
 /// break with a double-borrow panic.
 #[quickcheck]

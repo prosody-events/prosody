@@ -78,7 +78,7 @@ impl Arbitrary for MigrationTestInput {
         let trigger_count = usize::arbitrary(g) % 51;
         let mut triggers = Vec::with_capacity(trigger_count);
 
-        // Use small key pool for better collision coverage
+        // Use small key pool for better collision density
         let key_pool: Vec<Key> = (0_i32..5_i32).map(|i| format!("key-{i}").into()).collect();
 
         for _ in 0..trigger_count {

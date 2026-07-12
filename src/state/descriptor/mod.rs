@@ -63,7 +63,7 @@ use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::CollectionDef;
-use crate::state::session::CellSession;
+use crate::state::session::{CellSession, OpPermit};
 use crate::state::{
     CollectionKindId, CommitMode, SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome,
 };
@@ -723,12 +723,13 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Discards this collection's uncommitted buffered ops mid-handler; see
-    /// [`CellSession::rollback`] for the contract. The terminated-session guard
-    /// lives in the session impl (as a `NoOp`), not here: the infallible
-    /// signature cannot surface [`StateAccessError::Terminated`] the way
-    /// `ensure_live` does for the fallible ops.
-    pub(in crate::state::descriptor) fn raw_rollback(&self) -> StoreOutcome {
-        self.session.rollback(self.state_type, &self.name)
+    /// [`CellSession::rollback`] for the contract. The terminated- and
+    /// closed-session guards live in the session impl (as a `NoOp`), not
+    /// here: the infallible signature cannot surface an error the way
+    /// `ensure_live` does for the fallible ops, and the session's rollback
+    /// owns the gate acquire (a handle-level acquire here would re-enter it).
+    pub(in crate::state::descriptor) async fn raw_rollback(&self) -> StoreOutcome {
+        self.session.rollback(self.state_type, &self.name).await
     }
 }
 
@@ -765,6 +766,24 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
         &self.scope.name
     }
 
+    /// Acquires the session operation gate for a read — the top of every
+    /// gated public read wrapper (the handles' `get`/`len`/stream inits).
+    /// The view's own ops are gate-free helpers; per the factoring rule each
+    /// public op acquires exactly once, so composing ops (a Map `set` = entry
+    /// set + bound ratchet) hold ONE permit across their whole body.
+    pub(in crate::state::descriptor) async fn read_permit(&self) -> OpPermit<'_> {
+        self.scope.session().gate().read().await
+    }
+
+    /// Acquires the session operation gate for a mutator, erroring
+    /// [`StateAccessError::SessionClosed`] once the settle boundary closed the
+    /// session. See [`Self::read_permit`] for the factoring rule.
+    pub(in crate::state::descriptor) async fn mutate_permit(
+        &self,
+    ) -> Result<OpPermit<'_>, StateAccessError> {
+        self.scope.session().gate().mutate().await
+    }
+
     /// The full cell address for `key` in this view's section — the sole place
     /// a typed key is lowered to its order-preserving coordinate.
     fn cell(&self, key: &KeyOf<T>) -> CellKey {
@@ -794,9 +813,10 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
 
     /// Discards this collection's uncommitted buffered ops mid-handler — every
     /// typed view over the scope, not just this view's cells; the discard twin
-    /// of [`Self::commit`]. See [`CellSession::rollback`] for the contract.
-    pub(crate) fn rollback(&self) -> StoreOutcome {
-        self.scope.raw_rollback()
+    /// of [`Self::commit`]. See [`CellSession::rollback`] for the contract
+    /// (the session owns the gate acquire, so this stays permit-free).
+    pub(crate) async fn rollback(&self) -> StoreOutcome {
+        self.scope.raw_rollback().await
     }
 }
 
@@ -990,6 +1010,7 @@ where
     /// resolver.
     #[instrument(name = "value.get", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn get(&self) -> Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>> {
+        let _permit = self.view.read_permit().await;
         self.view.get(&()).await
     }
 
@@ -1004,6 +1025,7 @@ where
         &self,
         value: WriteOf<'_, T>,
     ) -> Result<(), CellStateError<CellCodecError<T>>> {
+        let _permit = self.view.mutate_permit().await?;
         self.view.set(&(), value).await
     }
 
@@ -1014,6 +1036,7 @@ where
     /// Returns an access error from the session.
     #[instrument(name = "value.clear", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn clear(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
+        let _permit = self.view.mutate_permit().await?;
         self.view.clear(&()).await
     }
 
@@ -1026,15 +1049,16 @@ where
     /// Returns an access error from the session.
     #[instrument(name = "value.commit", skip_all, fields(collection = self.view.name().as_str()), err)]
     pub async fn commit(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        let _permit = self.view.mutate_permit().await?;
         self.view.commit().await
     }
 
     /// Discards the buffered uncommitted op, reverting reads to the last
     /// [`commit`](Self::commit) — or the pre-event committed value if none.
-    /// Sync and infallible; see [`CellSession::rollback`] for the contract.
+    /// Infallible; see [`CellSession::rollback`] for the contract.
     #[instrument(name = "value.rollback", skip_all, fields(collection = self.view.name().as_str()))]
-    pub fn rollback(&self) -> StoreOutcome {
-        self.view.rollback()
+    pub async fn rollback(&self) -> StoreOutcome {
+        self.view.rollback().await
     }
 }
 

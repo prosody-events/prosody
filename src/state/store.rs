@@ -54,7 +54,7 @@ use super::marker::{EventMarker, SectionClear};
 use crate::error::ClassifyError;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use std::error::Error;
 use std::future::Future;
 
@@ -98,8 +98,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// committed-but-unapplied clear can never serve pre-clear rows. Markers
     /// without clears are left standing — first-touch resolution stays
     /// cell-grained and marker-free. [`Self::scan_cells`] and the cache-fill
-    /// twins ([`Self::get_for_cache`] / [`Self::scan_for_cache`]) share the
-    /// same implementation, so the contract holds across all four reads.
+    /// twin [`Self::get_for_cache`] share the same implementation, so the
+    /// contract holds across all three reads.
     ///
     /// # Errors
     ///
@@ -147,23 +147,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
     {
         async move { Ok((self.get(collection, cell, own).await?, None)) }
-    }
-
-    /// Cache-fill scan: each present cell's committed bytes **plus** its
-    /// remaining TTL, for the [`Cached`](super::cached::Cached) cache to mirror
-    /// a covered gap with co-expiring fjall entries. The default delegates
-    /// to [`Self::scan_cells`] with a `None` TTL per cell; only the
-    /// Cassandra store overrides it (selecting the TTL of whichever blob
-    /// resolution returns).
-    fn scan_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes, Option<CompactDuration>), Self::Error>> + Send + 'a
-    {
-        self.scan_cells(collection, scan, own)
-            .map(|item| item.map(|(cell, bytes)| (cell, bytes, None)))
     }
 
     /// Streams the whole partition's provisional cells (all sections) for the
@@ -248,7 +231,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Writes each `(cell, data)` as a resolved cell in one same-partition
     /// batch, binding `collection`'s TTL, partitioning internally on data
     /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
-    /// `None` **deletes the row** (the row-absence invariant). Covers the
+    /// `None` **deletes the row** (the row-absence invariant). Handles the
     /// `ReadUncommitted` direct clear, the mid-handler `commit()` of a clear,
     /// and rollback-to-absent. Never touches the event marker (see
     /// [`write_provisional`](Self::write_provisional)).

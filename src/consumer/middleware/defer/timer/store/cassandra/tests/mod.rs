@@ -50,7 +50,7 @@ crate::timer_defer_store_tests!(async { build_test_store().await });
 
 /// End-to-end smoke test of the single-key lifecycle against a live cluster:
 /// absent → `defer_first_timer` → `get_next_deferred_timer` → `delete_key` →
-/// absent. The shared `timer_defer_store_tests!` suite covers the invariants;
+/// absent. The shared `timer_defer_store_tests!` suite proves the invariants;
 /// this guards the happy path with a readable, concrete assertion.
 #[tokio::test]
 async fn test_cassandra_timer_defer_store() -> color_eyre::Result<()> {

@@ -409,7 +409,7 @@ where
 
     /// Defers a timer for the first time after the inner handler returned a
     /// transient error. Schedules retry timer before storing to ensure timer
-    /// coverage on partial failure.
+    /// still fires on partial failure.
     ///
     /// Returns [`TimerDeferOutput::Deferred`] carrying the inner error so the
     /// apply hooks can drive `after_abort(Err(inner_err))` on the inner: the
@@ -424,7 +424,7 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Timer first, then store: ensures timer coverage on partial failure
+        // Timer first, then store: the timer still fires on partial failure
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store

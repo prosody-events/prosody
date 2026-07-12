@@ -114,10 +114,10 @@ pub enum Direction {
 /// unbounded case unrepresentable is the type-level enforcement of that rule
 /// (the twin of the timer system's watermark bound).
 ///
-/// The exclusive edge exists for the coverage cache's gap fall-through: the
-/// open `(p, q)` interval between two separately-covered sub-ranges (whose
-/// endpoints `p`/`q` are already covered) is exactly an `Excluded`/`Excluded`
-/// scan, and a punched singleton `{X}` is `Included(X)`/`Included(X)`.
+/// The exclusive edge exists for range consumers that anchor past a known
+/// endpoint: the overlay merge and the bounded collection scans re-seek with
+/// an `Excluded` anchor so a resumed or endpoint-adjacent scan never re-reads
+/// the anchor row.
 ///
 /// Generic over the borrowed inner so the same type serves a [`Scan`]'s
 /// `ScanEdge<&Coordinate>` and the typed cell view's `ScanEdge<&Key>`.

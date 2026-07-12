@@ -575,7 +575,7 @@ where
     }
 
     /// Defers a message for the first time. Schedules timer before storing
-    /// to ensure timer coverage on partial failure.
+    /// to ensure the timer still fires on partial failure.
     ///
     /// `inner_error` is the transient error returned by the inner handler
     /// for *this* dispatch — it is preserved in the returned
@@ -592,7 +592,7 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Timer first, then store: ensures timer coverage on partial failure.
+        // Timer first, then store: the timer still fires on partial failure.
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store

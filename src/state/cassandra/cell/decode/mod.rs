@@ -59,12 +59,9 @@ pub(super) type RawCellRow = (
     Option<RawEventRef>, // event (validated into EventRef during decode)
 );
 
-/// Nine-column shape produced by `SELECT section, coordinate, data,
-/// prev_data, encoding, version, event, TTL(data), TTL(prev_data)` — a
-/// [`RawCellRow`] prefixed with the clustering columns and suffixed with the
-/// per-blob remaining TTLs [`blob_ttl`] coalesces. Used by scans, the recovery
-/// sweep, and the cache-fill scan; the resolving paths discard the trailing
-/// TTL, the cache-fill path keeps it.
+/// Seven-column shape produced by `SELECT section, coordinate, data,
+/// prev_data, encoding, version, event` — a [`RawCellRow`] prefixed with the
+/// clustering columns. Used by the section scans.
 pub(super) type KeyedCellRow = (
     i8,      // section
     Vec<u8>, // coordinate
@@ -73,8 +70,6 @@ pub(super) type KeyedCellRow = (
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
-    Option<i32>, // TTL(data) in whole seconds
-    Option<i32>, // TTL(prev_data) in whole seconds
 );
 
 /// Seven-column shape produced by `SELECT data, prev_data, encoding, version,
@@ -129,18 +124,16 @@ pub(super) fn try_decode_marker(row: MarkerRow) -> Result<EventMarker, Cassandra
     Ok(decode_marker_payload(event, &payload)?)
 }
 
-/// Decodes a keyed cell row into its [`CellKey`], [`Cell`], and cache-fill
-/// co-expiry TTL ([`blob_ttl`], whole seconds), for the cache-fill scan.
-/// Fails with the same corruption errors as [`try_decode_cell`].
-pub(super) fn try_decode_keyed_cell_ttl(
+/// Decodes a keyed cell row into its [`CellKey`] and [`Cell`], for the
+/// section scans. Fails with the same corruption errors as
+/// [`try_decode_cell`].
+pub(super) fn try_decode_keyed_cell(
     row: KeyedCellRow,
-) -> Result<(CellKey, Cell, Option<i32>), CassandraCellStoreError> {
-    let (section, coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
+) -> Result<(CellKey, Cell), CassandraCellStoreError> {
+    let (section, coordinate, data, prev_data, encoding, version, event) = row;
     let key = clustered_cell_key(section, coordinate);
-    let (cell, ttl) = try_decode_cell_ttl((
-        data, prev_data, encoding, version, event, ttl_data, ttl_prev,
-    ))?;
-    Ok((key, cell, ttl))
+    let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
+    Ok((key, cell))
 }
 
 /// Decodes a cache-fill point row into its [`Cell`] and co-expiry TTL

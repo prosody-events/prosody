@@ -59,13 +59,13 @@ impl Slab {
         self.id
     }
 
-    /// Returns the duration each slab covers.
+    /// Returns the duration each slab spans.
     #[must_use]
     pub fn size(&self) -> CompactDuration {
         self.size
     }
 
-    /// Returns the time range covered by this slab.
+    /// Returns the slab's time range.
     ///
     /// The range starts at `id * size` (inclusive) and extends to
     /// `start + size` (exclusive).

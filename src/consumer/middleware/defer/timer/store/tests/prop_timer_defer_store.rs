@@ -157,7 +157,7 @@ impl Arbitrary for TimerDeferTestInput {
                 // Compound operations (60%)
                 0..=14 => {
                     // DeferFirst (15%) - only if not already deferred; 10% of
-                    // those become SeedLegacy (legacy on-read repair coverage).
+                    // those become SeedLegacy (the legacy on-read repair arm).
                     if deferred_indices.contains(&key_index) {
                         // Use DeferAdditional instead
                         TimerDeferOperation::DeferAdditional { key_index, time }

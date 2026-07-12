@@ -243,9 +243,10 @@ impl DirtyStore {
 
     /// Discards one collection's buffered outcomes and dirty clear markers —
     /// the drain shared by the mid-handler `commit()` (which first wrote them
-    /// through) and `rollback()` (which discards them outright). Race-free for
-    /// the same reason as [`Self::clear_event`]: no handler op is in flight
-    /// while the handler itself awaits the commit or calls the rollback.
+    /// through) and `rollback()` (which discards them outright). Race-free
+    /// because both callers hold the session operation gate
+    /// (`SessionGate` in [`crate::state::session`]) for their whole body, so
+    /// no other session op can interleave with the drain.
     pub fn remove_collection(&self, collection: &CollectionId) {
         remove_span(&self.entries, CollectionScope::range(collection));
         remove_span(&self.markers, MarkerCollectionScope::range(collection));

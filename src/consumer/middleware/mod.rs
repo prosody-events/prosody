@@ -318,7 +318,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// - [`shutdown`](Self::shutdown) — called when the consumer stops or a
 ///   partition is revoked.
 ///
-/// Two optional pieces extend the basic shape for handlers that stage
+/// Two optional parts extend the basic shape for handlers that stage
 /// external work during processing:
 ///
 /// - [`Output`](Self::Output) — a typed value the handler returns on success
@@ -331,9 +331,9 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// The consumer pipeline is itself a stack of `FallibleHandler` impls
 /// (retry, deduplication, defer, telemetry, your handler at the bottom),
 /// so middleware authors implement this same trait. The [module-level
-/// docs](self) cover how impls are composed (layering, providers,
+/// docs](self) describe how impls are composed (layering, providers,
 /// execution flow); [Implementing as middleware](#implementing-as-middleware)
-/// below covers what an individual middleware impl owes its inner
+/// below states what an individual middleware impl owes its inner
 /// handler.
 ///
 /// # Error classification
@@ -406,7 +406,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// # Implementing as middleware
 ///
 /// You can skip this section if your handler sits at the bottom of the
-/// stack. It covers what a `FallibleHandler` middleware (a wrapper around
+/// stack. It states what a `FallibleHandler` middleware (a wrapper around
 /// an inner handler) must do.
 ///
 /// 1. **Forward the handler methods.** Call `self.inner.on_message(...)` and

@@ -1,7 +1,7 @@
 use super::*;
 
 /// Asserts the persisted static `next_timer` anchor for `k` has the
-/// expected time (or is absent). `None` covers the unrepaired/empty case.
+/// expected time (or is absent). `None` handles the unrepaired/empty case.
 async fn assert_next_timer(
     store: &CassandraTimerDeferStore,
     k: &Key,

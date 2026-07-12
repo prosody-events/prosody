@@ -1,6 +1,6 @@
 //! Cell-addressing invariants.
 //!
-//! Covers the `CellKey` ordering contract `(section, coordinate)` and
+//! Proves the `CellKey` ordering contract `(section, coordinate)` and
 //! `Coordinate`'s least-element/round-trip behaviour. The [`Section`]
 //! discriminant is **opaque** here — the cell layer never validates it — so the
 //! per-collection discriminant freeze and unknown-rejection lives with the

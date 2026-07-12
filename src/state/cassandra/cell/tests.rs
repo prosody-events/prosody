@@ -264,7 +264,7 @@ where
 /// Stage a set, observe it provisional, promote, read back resolved — the
 /// hot-path round-trip — then a direct resolved clear reads back absent. A fast
 /// deterministic smoke of shapes the crash-equivalence property and its
-/// physical oracle (`assert_physical`) cover organically over generated traces.
+/// physical oracle (`assert_physical`) reach organically over generated traces.
 #[tokio::test]
 async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     init_test_logging();
@@ -398,8 +398,8 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 
     // The clear leg adds NO steady-state queries: a second event stages with
     // a section clear and settles through `commit_provisional(…, clears)` —
-    // the Cov-Clr punch is fjall/coverage-only and the boundary rides the
-    // memo, so the durable marker-read count never moves again and both
+    // the D4 section delete is fjall-only and the boundary rides the memo,
+    // so the durable marker-read count never moves again and both
     // post-settle sweeps stay at zero durable reads.
     let writes = [(
         cell.clone(),
@@ -1281,7 +1281,7 @@ fn finish(result: Result<bool>) -> TestResult {
 /// rebuilds the cache cold over the same durable Cassandra rows and oracle
 /// set, so every durable clear leg — gap range deletes, the indivisible
 /// gaps+marker-delete settle unit, the marker payload's clear half, read-help
-/// — runs beneath the production cache with its Cov-Clr punches, and the
+/// — runs beneath the production cache with its D3/D4 deletes, and the
 /// lower fault seam (`FaultDepth::Lower` settle failures + directed
 /// post-failure reads, stage faults) fires beneath the cache against live
 /// CQL. The tempdir and fjall client outlive every store the `make` closure
@@ -1462,14 +1462,13 @@ fn ttl_seconds_surfacing_distinguishes_no_ttl_from_sub_second() {
 /// The cache-fill co-expiry matches the value actually returned, not the
 /// pre-resolution `TTL(data)`. A staged clear over a present base (`data`
 /// NULL, `prev_data` present, finite stage TTL) whose event the oracle never
-/// committed rolls back to `prev` on read — and both cache-fill paths must
+/// committed rolls back to `prev` on read — and the cache-fill point read must
 /// report a finite co-expiry no later than the stage TTL. Reporting `None`
 /// ("never expires", the old `TTL(data)`-only read) stamped the fjall entry
 /// to strictly outlive the durable row, serving the value after the row died.
 #[tokio::test]
 async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     use crate::timers::duration::CompactDuration;
-    use futures::TryStreamExt;
 
     init_test_logging();
     let fx = fixture().await?;
@@ -1477,59 +1476,33 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     let ttl = CompactDuration::new(3_600);
     let old = Bytes::from_static(b"old");
 
-    // One collection per cache-fill path — resolution mutates the cell, so the
-    // two paths each need their own rolled-back read.
-    for path in ["get_for_cache", "scan_for_cache"] {
-        let c = CollectionRef::new(
-            collection(&format!("co-expiry-{path}"))?.id().clone(),
-            Some(ttl),
-        );
-        let cell = value_cell();
-        store
-            .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
-            .await?;
-        // `event(1)` is never recorded in the oracle, so resolution rolls the
-        // staged clear back to `prev`.
-        let writes = [(
-            cell.clone(),
-            ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
-        )];
-        let marker = EventMarker::frozen(event(1), &writes, &[]);
-        store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let c = CollectionRef::new(collection("co-expiry-get")?.id().clone(), Some(ttl));
+    let cell = value_cell();
+    store
+        .write_resolved(&c, &[(cell.clone(), Some(old.clone()))], &[])
+        .await?;
+    // `event(1)` is never recorded in the oracle, so resolution rolls the
+    // staged clear back to `prev`.
+    let writes = [(
+        cell.clone(),
+        ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
+    )];
+    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
 
-        let (value, co_expiry) = if path == "get_for_cache" {
-            let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
-            (committed.into_inner(), co_expiry)
-        } else {
-            // A concrete edge pair covering the single value cell (empty
-            // coordinate) — a whole-section scan with `ScanEdge`.
-            let low = Coordinate::empty();
-            let high = Coordinate::from_bytes(vec![0xFF, 0xFF, 0xFF, 0xFF]);
-            let scan = Scan {
-                section: Section::new(0),
-                start: ScanEdge::Included(&low),
-                dir: Direction::Forward,
-                end: ScanEdge::Included(&high),
-                limit: None,
-            };
-            let stream = store.scan_for_cache(c.id(), scan, event(2));
-            futures::pin_mut!(stream);
-            let (_, bytes, co_expiry) = stream
-                .try_next()
-                .await?
-                .ok_or_else(|| eyre!("{path}: the rolled-back cell must scan back present"))?;
-            (Some(bytes), co_expiry)
-        };
-
-        assert_eq!(value.as_ref(), Some(&old), "{path}: rollback returns prev");
-        let co_expiry = co_expiry.ok_or_else(|| {
-            eyre!("{path}: a rolled-back staged clear must report a finite co-expiry, not never")
-        })?;
-        assert!(
-            co_expiry <= ttl,
-            "{path}: co-expiry {co_expiry:?} must not exceed the stage TTL {ttl:?}"
-        );
-    }
+    let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
+    assert_eq!(
+        committed.into_inner().as_ref(),
+        Some(&old),
+        "rollback returns prev"
+    );
+    let co_expiry = co_expiry.ok_or_else(|| {
+        eyre!("a rolled-back staged clear must report a finite co-expiry, not never")
+    })?;
+    assert!(
+        co_expiry <= ttl,
+        "co-expiry {co_expiry:?} must not exceed the stage TTL {ttl:?}"
+    );
     Ok(())
 }
 
@@ -1598,34 +1571,35 @@ async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
     Ok(())
 }
 
-/// The `Cached` stage-boundary punch: event A stages two coordinates through
-/// the cached assembly (fjall covers A's stage-time `prev`s as the committed
+/// The `Cached` stage-boundary D3: event A stages two coordinates through
+/// the cached assembly (fjall holds A's stage-time `prev`s as the committed
 /// projections), A's commit marker is recorded but the settle never runs (the
 /// skipped-settle window); event B then stages ONE overlapping coordinate
 /// through the same assembly. The lower store's stage boundary resolves A's
-/// event marker *beneath* the cache, so `Cached::write_provisional` must punch
-/// A's marker-listed coordinates BEFORE forwarding down — without the punch,
-/// A's untouched coordinate keeps serving the stale covered `prev` verbatim
-/// forever. A deterministic falsifier of the punch-ordering the fault/crash
-/// alphabet surfaces as model divergence against the live `Cached` composition;
-/// it isolates the skipped-settle boundary window without a generated schedule.
+/// event marker *beneath* the cache, so `Cached::write_provisional` must
+/// delete A's marker-listed coordinates' entries BEFORE forwarding down —
+/// without the delete, A's untouched coordinate keeps serving the stale warm
+/// `prev` verbatim forever. A deterministic falsifier of the delete-ordering
+/// the fault/crash alphabet surfaces as model divergence against the live
+/// `Cached` composition; it isolates the skipped-settle boundary window
+/// without a generated schedule.
 #[tokio::test]
-async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
+async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
     use crate::state::oracle::CommitOracle;
 
     init_test_logging();
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
     let store = Cached::new(
-        test_db::cache("cassandra_boundary_punch")?,
+        test_db::cache("cassandra_boundary_delete")?,
         fx.bottom_store(oracle.clone()),
     );
-    let c = collection("boundary-punch")?;
+    let c = collection("boundary-delete")?;
     let id = c.id().clone();
     let (cell0, cell1) = (cell_i(0), cell_i(1));
     let (base0, base1) = (Bytes::from_static(b"base0"), Bytes::from_static(b"base1"));
 
-    // Committed bases, covered by the write-through publish.
+    // Committed bases, warmed by the write-through publish.
     store
         .write_resolved(
             &c,
@@ -1638,7 +1612,7 @@ async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
         .await?;
 
     // Event A stages over both coordinates; its stage re-publishes the prevs
-    // (the bases) as the covered committed projections. A's commit marker is
+    // (the bases) as the warm committed projections. A's commit marker is
     // recorded — A is committed — but the settle is never attempted.
     let writes_a = [
         (
@@ -1665,9 +1639,9 @@ async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
     oracle.record_message(Uuid::from_u128(1)).await?;
 
     // Event B stages the overlapping coordinate 1. Its prev-read may serve
-    // the covered pre-settle value (the accepted bounded window — nothing is
-    // asserted on it); the stage's boundary then resolves A's marker beneath
-    // the cache and the punch drops A's listed coordinates from coverage.
+    // the warm pre-settle value (the accepted bounded window — nothing is
+    // asserted on it); the stage's boundary then deletes A's listed
+    // coordinates' entries before the lower resolve beneath the cache.
     let prev_b = store.get(&id, &cell1, event(2)).await?;
     let writes_b = [(
         cell1.clone(),
@@ -1678,13 +1652,13 @@ async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
         .write_provisional(&c, &writes_b, Some(&marker_b))
         .await?;
 
-    // A's untouched coordinate 0 must read A's committed data: the punch
-    // uncovered it, so the read falls through to the boundary-promoted row
-    // instead of serving the stale covered prev.
+    // A's untouched coordinate 0 must read A's committed data: the boundary
+    // delete evicted it, so the read falls through to the boundary-promoted
+    // row instead of serving the stale warm prev.
     assert_eq!(
         store.get(&id, &cell0, event(3)).await?,
         Committed::new(Some(Bytes::from_static(b"a0"))),
-        "the stage-boundary punch must drop the stale covered prev"
+        "the stage-boundary delete must drop the stale warm prev"
     );
     Ok(())
 }
@@ -1694,8 +1668,8 @@ async fn stage_boundary_punches_foreign_marker_coverage() -> Result<()> {
 /// within the byte budget AND the unit count is within the statement budget.
 /// (The intra-call tear of an over-budget stage cannot be injected through
 /// the trait; the ordering is enforced by the two sequential awaits plus this
-/// decision, and the staged-coverage postcondition guards the durable shape
-/// on every generated trace.)
+/// decision, and the marker-completeness postcondition guards the durable
+/// shape on every generated trace.)
 #[test]
 fn fits_one_batch_decides_on_both_budgets() {
     // Strictly under both budgets, and exactly at both boundaries.

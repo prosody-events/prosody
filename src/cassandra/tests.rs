@@ -1,7 +1,7 @@
 //! Offline unit/property tests for the Cassandra infrastructure module.
 //!
 //! These need no cluster: they pin the pure [`chunk_boundaries`] packer with
-//! plain numbers. The live batch *execution* path is covered by the cell-store
+//! plain numbers. The live batch *execution* path is proven by the cell-store
 //! integration tests (one real batch) composed with this proof of the
 //! boundaries, so it needs no separate fixture.
 
@@ -16,7 +16,7 @@ use std::ops::Range;
 /// Three falsifiable clauses over random weights / limits (including weights
 /// heavier than `max_bytes`, which exercise the oversized-row arm):
 ///
-/// * **cover + contiguity** — the chunks concatenate to exactly `0..n`, each
+/// * **span + contiguity** — the chunks concatenate to exactly `0..n`, each
 ///   non-empty, in order (a dropped or duplicated row breaks this);
 /// * **within limits** — each chunk has `len ≤ max_count` and `sum ≤
 ///   max_bytes`, the sole exception being a single oversized row (`len == 1`) —
@@ -30,7 +30,7 @@ use std::ops::Range;
 ///   `max_bytes = 5` needs 3 parts, not 2.)
 ///
 /// `chunk_boundaries` treats each weight as an atomic, unsplittable element, so
-/// this cover+contiguity clause is exactly the guarantee a unit-based caller —
+/// this span+contiguity clause is exactly the guarantee a unit-based caller —
 /// [`super::CassandraStore::execute_unlogged_batches`], where one weight is a
 /// caller-defined atomic row group — relies on to keep a unit's rows in
 /// one batch: an atomic row group is never split across batches.
@@ -50,7 +50,7 @@ fn chunk_boundaries_are_minimal_and_within_limits(
     let ranges: Vec<Range<usize>> =
         chunk_boundaries(weights.iter().copied(), max_bytes, max_count).collect();
 
-    // Cover + contiguity: ranges concatenate to exactly 0..n, each non-empty.
+    // Span + contiguity: ranges concatenate to exactly 0..n, each non-empty.
     let mut next_start = 0_usize;
     for range in &ranges {
         if range.start != next_start || range.end <= range.start {

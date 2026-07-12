@@ -1,6 +1,7 @@
 mod cached_suite;
 pub(crate) mod cell_suite;
 mod collection_suite;
+mod gate_suite;
 pub(crate) mod identity_suite;
 pub(crate) mod support;
 

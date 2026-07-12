@@ -13,7 +13,7 @@ fn pair_format_id_and_width_are_derived() {
 }
 
 /// Frozen-bytes golden: `(I64Codec, I64Codec)` writes exactly `a ‖ b` as two
-/// big-endian `i64`s (16 bytes) — the deque's head/tail meta frame. Covers a
+/// big-endian `i64`s (16 bytes) — the deque's head/tail meta frame. Checks a
 /// sign-crossing first component (`push_front` drives an index negative).
 #[test]
 fn i64_pair_bytes_are_frozen() -> color_eyre::Result<()> {

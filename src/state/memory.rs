@@ -73,7 +73,7 @@ impl MemoryCells {
     }
 
     /// The stored cell keys currently in the `Provisional` variant — the
-    /// staged-coverage probe's raw view (never routed through the resolving
+    /// staged-cell probe's raw view (never routed through the resolving
     /// store, which would first-touch-resolve what it reads).
     #[cfg(test)]
     pub(crate) fn provisional_coordinates(&self, collection: &CollectionId) -> Vec<CellKey> {

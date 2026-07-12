@@ -238,7 +238,7 @@ fn encoding_wire_contract_is_frozen() -> Result<()> {
 }
 
 /// Payload round-trip over arbitrary bytes:
-/// `decode_payload(encode_payload(b)) == b` — the property that covers the
+/// `decode_payload(encode_payload(b)) == b` — the property that proves the
 /// zstd leg the shape-table examples only touch implicitly.
 #[test]
 fn prop_payload_encoding_round_trips() {

@@ -59,14 +59,15 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::cell_key::{Direction, ScanEdge, Section};
 use crate::state::order_codec::{I64KeyCodec, UnitKey};
-use crate::state::session::CellSession;
+use crate::state::session::{CellSession, OpPermit};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
 use thiserror::Error;
+use tokio::task::coop::cooperative;
 use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
 /// The deque's head/tail meta codec: two big-endian `i64`s composed with no
@@ -84,9 +85,15 @@ const ENTRY_SECTION: Section = Section::new(DequeNs::Entries as i8);
 
 /// Iteration shape threshold: a window of at most this many entries streams
 /// by per-index point gets — each a cacheable committed point read — while a
-/// wider window pays one durable range scan instead of `len` serialized
-/// point round-trips. A shape choice, not configuration.
+/// wider window pays one durable range scan instead of `len` point reads. A
+/// shape choice, not configuration.
 pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
+
+/// Concurrency width of the bounded materialization's ordered point gets
+/// (`.buffered(WINDOW_PREFETCH)`): bounded and named, sized to overlap the
+/// durable round-trips of a cold window (a warm window's fjall hits gain
+/// nothing and lose nothing), not for throughput.
+const WINDOW_PREFETCH: usize = 16;
 
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so
@@ -175,6 +182,7 @@ where
     /// session.
     #[instrument(name = "deque.len", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn len(&self) -> Result<usize, DequeStateError<CellCodecError<T>>> {
+        let _permit = self.entries.read_permit().await;
         Ok(self.bounds().await?.len()?)
     }
 
@@ -186,6 +194,7 @@ where
     /// corrupt, or an access error from the session.
     #[instrument(name = "deque.is_empty", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, DequeStateError<CellCodecError<T>>> {
+        let _permit = self.entries.read_permit().await;
         let window = self.bounds().await?;
         Ok(window.head == window.tail)
     }
@@ -215,6 +224,7 @@ where
         if let Ok(index) = i64::try_from(index) {
             Span::current().record("deque.index", index);
         }
+        let _permit = self.entries.read_permit().await;
         let window = self.bounds().await?;
         if index >= window.len()? {
             return Ok(None);
@@ -251,27 +261,54 @@ where
             direction = ?dir,
         );
         try_stream! {
+            // The split stream contract (see `SessionGate`): the bounded arm
+            // materializes under ONE gate hold — bounds plus every listed
+            // entry, ≤ DEQUE_POINT_ITERATION_MAX in memory — released before
+            // the first yield; the scan arm drops the permit after the bounds
+            // read and streams per-item live.
+            let permit = self.entries.read_permit().instrument(span.clone()).await;
             let window = self.bounds().instrument(span.clone()).await?;
             let len = window.len()?;
             if len == 0 {
                 return;
             }
             if len <= DEQUE_POINT_ITERATION_MAX {
-                // Sequential point gets by design: concurrent prefetch was
-                // rejected — it adds a resolver-concurrency proof obligation for
-                // a once-per-assignment cold window.
-                for i in 0..len {
-                    let position = match dir {
-                        Direction::Forward => i,
-                        Direction::Backward => len - 1 - i,
-                    };
-                    let index = window.absolute(position)?;
-                    if let Some(value) = self.entries.get(&index).instrument(span.clone()).await? {
-                        yield value;
+                // Concurrent ordered point gets: the gate hold above is the
+                // safety argument (commit()/set cannot interleave with the
+                // materialization — the exclusion is the gate, not a serial
+                // loop), the per-cell reads are write-free except the per-key
+                // cache fill and commute across distinct coordinates, and
+                // `buffered(WINDOW_PREFETCH)` overlaps the cold window's
+                // durable round-trips while yielding in index order.
+                let gets = stream::iter(0..len)
+                    .map(|i| {
+                        let position = match dir {
+                            Direction::Forward => i,
+                            Direction::Backward => len - 1 - i,
+                        };
+                        cooperative(async move {
+                            let index = window.absolute(position)?;
+                            Ok::<_, DequeStateError<CellCodecError<T>>>(
+                                self.entries.get(&index).await?,
+                            )
+                        })
+                    })
+                    .buffered(WINDOW_PREFETCH);
+                futures::pin_mut!(gets);
+                let mut buffer: Vec<ResolvedOf<T>> = Vec::with_capacity(len);
+                while let Some(item) = gets.next().instrument(span.clone()).await {
+                    // A `None` is a TTL hole: skipped, never an error.
+                    if let Some(value) = item? {
+                        buffer.push(value);
                     }
+                }
+                drop(permit);
+                for value in buffer {
+                    yield value;
                 }
                 return;
             }
+            drop(permit);
             // Anchor both edges on the window: front `head` to back `tail − 1`
             // (`len > 0` proves `tail − 1` does not underflow), mirrored
             // backward.
@@ -317,6 +354,7 @@ where
         &self,
         value: WriteOf<'_, T>,
     ) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        let _permit = self.mutate_permit().await?;
         let window = self.bounds().await?;
         let next_tail = window
             .tail
@@ -337,6 +375,7 @@ where
         &self,
         value: WriteOf<'_, T>,
     ) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        let _permit = self.mutate_permit().await?;
         let window = self.bounds().await?;
         let prev_head = window
             .head
@@ -360,6 +399,7 @@ where
     pub async fn pop_front(
         &self,
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let _permit = self.mutate_permit().await?;
         let window = self.bounds().await?;
         if window.head >= window.tail {
             return Ok(None);
@@ -385,6 +425,7 @@ where
     pub async fn pop_back(
         &self,
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let _permit = self.mutate_permit().await?;
         let window = self.bounds().await?;
         if window.head >= window.tail {
             return Ok(None);
@@ -412,6 +453,7 @@ where
     /// Returns an access error from the session.
     #[instrument(name = "deque.clear", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn clear(&self) -> Result<(), DequeStateError<CellCodecError<T>>> {
+        let _permit = self.mutate_permit().await?;
         self.entries.clear_all().await?;
         self.meta.clear(&()).await.map_err(meta_err)
     }
@@ -425,16 +467,28 @@ where
     /// Returns an access error from the session.
     #[instrument(name = "deque.commit", skip_all, fields(collection = self.entries.name().as_str()), err)]
     pub async fn commit(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>> {
+        let _permit = self.mutate_permit().await?;
         Ok(self.entries.commit().await?)
     }
 
     /// Discards this deque's buffered uncommitted ops — entries and the window
     /// bounds together — reverting reads to the last [`commit`](Self::commit),
-    /// or the pre-event committed state if none. Sync and infallible; see
+    /// or the pre-event committed state if none. Infallible; see
     /// [`CellSession::rollback`] for the contract.
     #[instrument(name = "deque.rollback", skip_all, fields(collection = self.entries.name().as_str()))]
-    pub fn rollback(&self) -> StoreOutcome {
-        self.entries.rollback()
+    pub async fn rollback(&self) -> StoreOutcome {
+        self.entries.rollback().await
+    }
+
+    /// Acquires the session operation gate for a mutator, re-homing the
+    /// closed-session error under the deque's error type. Every gated public
+    /// wrapper above holds the returned permit for its whole body (the
+    /// factoring rule on `SessionGate`).
+    async fn mutate_permit(&self) -> Result<OpPermit<'_>, DequeStateError<CellCodecError<T>>> {
+        self.entries
+            .mutate_permit()
+            .await
+            .map_err(|e| CellStateError::Access(e).into())
     }
 
     /// Buffers the bounds cell. Co-stamped with the entry mutation a single op

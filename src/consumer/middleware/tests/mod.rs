@@ -1537,7 +1537,7 @@ mod arm_backstop {
 /// stage uncertified, and the armed sweep would then silently roll a
 /// successful handler's writes back with no redelivery to replay them. The
 /// marker itself is the session's boundary-readable event identity
-/// (`message_marker()`), so these pins also cover the identity sources: a
+/// (`message_marker()`), so these pins also prove the identity sources: a
 /// message session records its `EventRef` dedup id; a pure timer session
 /// records nothing.
 mod marker_record_must_succeed {

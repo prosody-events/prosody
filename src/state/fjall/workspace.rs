@@ -105,7 +105,7 @@ impl FjallClient {
     /// Mints a fresh per-Kafka-partition workspace.
     ///
     /// Opens two named Fjall keyspaces — `cache` (committed-value mirror) and
-    /// `index` (the warm provisional-coordinate index + scan coverage) —
+    /// `index` (the warm provisional-coordinate index and latches) —
     /// sharing one fresh UUID (v4). **A workspace's keyspaces are born cold**:
     /// their names are minted fresh per assignment and never derived from
     /// anything, so no workspace can ever open another assignment's data.
@@ -172,7 +172,7 @@ impl FjallWorkspace {
     }
 
     /// Returns the warm-index keyspace handle (provisional coordinates,
-    /// scan coverage, and the cold-seed and marker-presence latches).
+    /// and the cold-seed and marker-presence latches).
     #[must_use]
     pub fn index_handle(&self) -> &Keyspace {
         &self.index

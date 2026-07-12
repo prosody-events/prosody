@@ -252,7 +252,7 @@ pub(crate) trait ShapeProbe {
 
     /// The row keys whose stored rows are physically **provisional**, read
     /// raw. Together with [`Self::standing_marker`] this feeds the
-    /// staged-coverage postcondition: a provisional row unlisted by the
+    /// marker-completeness postcondition: a provisional row unlisted by the
     /// standing marker is stranded from recovery.
     async fn provisional_rows(&self, id: &CollectionId) -> Result<RowKeys>;
 }
@@ -321,10 +321,10 @@ impl Arbitrary for Mutation {
 
 /// Where an injected settle failure fires: at the **wrapper** (outside the
 /// store under test — the settle provably never reaches it, so durable state
-/// and any warm coverage stay exactly as staged), or at the **lower** store
-/// (beneath any cache in the composition — a `Cached` instantiation runs its
-/// punch-first legs before the lower store rejects). For a bare store the two
-/// depths coincide.
+/// and any warm cache entries stay exactly as staged), or at the **lower**
+/// store (beneath any cache in the composition — a `Cached` instantiation
+/// runs its delete-first repair legs before the lower store rejects). For a
+/// bare store the two depths coincide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaultDepth {
     Wrapper,
@@ -360,9 +360,9 @@ enum Outcome {
     /// Commit marker recorded (committed), then the settle attempt fails under
     /// a poison armed at the generated [`FaultDepth`]: the stage lingers over
     /// the **warm** in-process store — the committed-unapplied window (on a
-    /// `Cached` instantiation, with warm coverage still holding the
-    /// stage-time `prev`s at `Wrapper` depth, and Cov-Clr-punched cleared
-    /// sections at `Lower` depth).
+    /// `Cached` instantiation, `Wrapper` depth leaves the settle transform
+    /// unrun, and `Lower` depth leaves it run with the cleared sections
+    /// deleted).
     SettleFailure(FaultDepth),
 }
 
@@ -658,7 +658,7 @@ type StagedWrites = Vec<(u8, Vec<(CellKey, ProvisionalWrite)>, Vec<SectionClear>
 ///
 /// `stale_prev_ok[i]` accepts a stale prev-read on collection `i`: a restage
 /// over a **warm** committed-unapplied stage (a settle failure with the
-/// in-process cache intact) may legitimately read the covered pre-settle value
+/// in-process cache intact) may legitimately read the warm pre-settle value
 /// — the accepted bounded window. The staged prev still feeds the write, so a
 /// later rollback restores exactly what was read (mirrored in the model by the
 /// rollback-restores-staged-prev rule).
@@ -717,7 +717,7 @@ where
 /// `prev`s a rollback restores), whether the owning event committed, and
 /// whether the stage lingers over the **warm** in-process store (a settle
 /// failure) rather than a crash rebuild — warm deferral is what makes a stale
-/// covered prev-read reachable on the next restage.
+/// warm prev-read reachable on the next restage.
 struct Deferred {
     writes: Vec<(CellKey, ProvisionalWrite)>,
     committed: bool,
@@ -895,6 +895,7 @@ impl TraceState {
     async fn settle<S>(
         &mut self,
         store: &FailingCellStore<S>,
+        oracle: &ScriptedOracle,
         lower: &PoisonHandle,
         refs: &[CollectionRef],
         staged_writes: &StagedWrites,
@@ -911,11 +912,11 @@ impl TraceState {
                     // — the committed-unapplied window over the WARM store.
                     // `Wrapper` fires outside the store under test (the settle
                     // provably never reaches it: durable state and any warm
-                    // coverage stay exactly as staged); `Lower` fires beneath
-                    // any cache (a `Cached` instantiation runs its Cov-Clr
-                    // punch before the lower store rejects). Injected faults
-                    // are not runtime errors: the armed settle MUST return
-                    // `Err` — an `Ok` is a red property.
+                    // entries stay exactly as staged); `Lower` fires beneath
+                    // any cache (a `Cached` instantiation runs its transform
+                    // and section deletes before the lower store rejects).
+                    // Injected faults are not runtime errors: the armed settle
+                    // MUST return `Err` — an `Ok` is a red property.
                     let poison = Poison::Collection(
                         refs[slot].id().name().clone(),
                         ErrorCategory::Transient,
@@ -933,16 +934,16 @@ impl TraceState {
                         return Ok(false);
                     }
                     if depth == FaultDepth::Lower && !clears.is_empty() {
-                        // Directed post-failure reads: the punch-first
-                        // contract means a Lower-depth apply failure left the
-                        // cleared sections uncovered, so reading every cell of
-                        // each cleared section must serve marker-resolved
-                        // truth (the model advanced at flush — committed ⇒
-                        // post-clear values); a wrong, missing, or late punch
-                        // serves covered pre-clear values ⇒ divergence. These
-                        // reads read-help-resolve the standing marker WHOLE
-                        // (writes included), so the event is now settled: the
-                        // marker model drops and no deferral is recorded.
+                        // Directed post-failure reads: the pre-call repairs
+                        // (the settle transform + the scoped section deletes)
+                        // mean a Lower-depth apply failure leaves every read
+                        // of the cleared sections serving marker-resolved
+                        // truth — a warm staged cell holds the verdict's
+                        // `data`, an evicted one falls through and
+                        // read-help-resolves (the model advanced at flush —
+                        // committed ⇒ post-clear values); a wrong, missing, or
+                        // late repair serves stale pre-clear values ⇒
+                        // divergence.
                         let probe = EventRef::Message {
                             dedup_id: Uuid::from_u128(u128::MAX / 2),
                         };
@@ -959,6 +960,12 @@ impl TraceState {
                                 }
                             }
                         }
+                        // Warm staged cells never reach the lower store, so
+                        // the reads alone may leave the marker standing (the
+                        // commit-warmth contract); resolve it the way
+                        // production does — the armed sweep — which is a
+                        // no-op where a fall-through read already settled it.
+                        sweep_provisional(store, oracle, &refs[slot]).await?;
                         self.marker_model[slot] = None;
                     } else {
                         self.deferred[slot] = Some(Deferred {
@@ -1001,8 +1008,8 @@ impl TraceState {
 /// * **Marker shape** (always): the standing event marker matches the model —
 ///   owning event, frozen staged row keys, AND the payload's clear half — or is
 ///   absent.
-/// * **Staged coverage** (always — the universal marker-first invariant): every
-///   physically provisional row is listed by the standing marker; with no
+/// * **Marker completeness** (always — the universal marker-first invariant):
+///   every physically provisional row is listed by the standing marker; with no
 ///   marker standing, no provisional row exists. A violation is a strand.
 async fn assert_physical<P>(probe: &P, ids: &[CollectionId], state: &TraceState) -> Result<bool>
 where
@@ -1052,7 +1059,7 @@ where
 }
 
 /// The per-event closing pass: convergence + row shape wait for deferred
-/// collections; marker shape and staged coverage never wait (read-only
+/// collections; marker shape and marker completeness never wait (read-only
 /// probes). The convergence pass's own reads resolve foreign clears-bearing
 /// markers (read-help), which `note_read_help` folds into the marker model
 /// before the physical probe.
@@ -1126,13 +1133,13 @@ where
 /// every event regardless of the resolution path. A crash rebuilds the store
 /// over the same warm backing the closure captures. Alongside the committed
 /// projection it tracks a standing-event-marker model (owner + staged set +
-/// clear half) checked with the staged-coverage postcondition after every
+/// clear half) checked with the marker-completeness postcondition after every
 /// event ([`assert_physical`]); [`stage_event`]'s split dimension exercises
 /// the same-event marker overwrite; the durable `clears` dimension (including
 /// clears-only stages) exercises the gap erase and the committed-unapplied
 /// read window (read-help); the `Defer` recovery, the depth-generated
 /// `SettleFailure` outcome (with directed post-failure reads pinning the
-/// Cov-Clr punch-first ordering), and the `stage_fault` dimension make
+/// delete-first D4 ordering), and the `stage_fault` dimension make
 /// stage-over-a-standing-foreign-marker, committed-unapplied windows,
 /// rejected stages, and fresh-assignment recovery arise organically. A final
 /// sweep + full assertion pass closes every trace, so no trace ends
@@ -1255,7 +1262,7 @@ where
                 return Ok(false);
             }
         } else if !state
-            .settle(&store, &lower, &refs, &staged_writes, &ev)
+            .settle(&store, &oracle, &lower, &refs, &staged_writes, &ev)
             .await?
         {
             return Ok(false);
@@ -1433,7 +1440,7 @@ enum OverlayOp {
     /// (`write_resolved` with a frozen [`SectionClear`]) — the generated
     /// producer for the direct-apply clear leg beneath the overlay. On a
     /// `Cached` lower store this is the op that kills a missing
-    /// `write_resolved` Cov-Clr punch: a covered pre-clear cell of the
+    /// `write_resolved` D4 section delete: a warm pre-clear cell of the
     /// cleared section would serve stale and diverge on the next point leg.
     CommitClearSection(SeedClear),
     /// Run a range scan and assert it against the oracle (the range leg,
@@ -1748,8 +1755,8 @@ impl Arbitrary for ScanReq {
             sect: section_idx(u8::arbitrary(g)),
             start: u8::arbitrary(g) % (CELLS + 1),
             forward: bool::arbitrary(g),
-            // Exclusive bounds exercise the gap-fall-through statement variants
-            // and the open `(p, q)` intervals coverage stitching produces.
+            // Exclusive bounds exercise the exclusive-anchor statement
+            // variants and open `(p, q)` ranges.
             start_excl: bool::arbitrary(g),
             end_excl: bool::arbitrary(g),
             end: u8::arbitrary(g) % (CELLS + 1),
@@ -2249,8 +2256,8 @@ pub(crate) enum Poison {
     /// crash trace's stage-fault dimension.
     WriteProvisional(StateName, ErrorCategory),
     /// Direct-apply path: `write_resolved` fails with the given category for
-    /// one named collection — the Cov3 pin's lower-write fault (a failed
-    /// lower write must leave coverage untouched).
+    /// one named collection — the establish-then-publish pin's lower-write
+    /// fault (a failed lower write must leave the cache untouched).
     WriteResolved(StateName, ErrorCategory),
 }
 

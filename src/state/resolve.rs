@@ -306,7 +306,7 @@ where
 ///
 /// Two legs, both with the retry-forever posture: the **marker leg** first
 /// ([`resolve_marker`] on any standing event marker), then the per-cell
-/// **mop-up** (the cold `provisional_cells` scan) that covers any cells the
+/// **mop-up** (the cold `provisional_cells` scan) that resolves any cells the
 /// marker leg left behind (a Permanent-skipped cell, a marker-listed
 /// coordinate resolved concurrently). A `Permanent` failure in either leg is
 /// logged and skipped, leaving the work for first-touch or a later sweep and

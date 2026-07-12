@@ -1,14 +1,19 @@
 //! Fjall-backed cell cache.
 //!
 //! [`FjallCellCache`] stores one tagged cell per [`CellKey`] in a fjall
-//! keyspace. It is the committed-value cache the
-//! [`Cached`](crate::state::cached::Cached) coverage combinator serves from:
-//! point `get`s and, over a covered scan sub-range,
-//! ordered `scan_present` range reads. It does
+//! keyspace: the committed-cell K/V store
+//! [`Cached`](crate::state::cached::Cached) serves point hits from. It does
 //! **not** implement [`CellStore`](crate::state::store::CellStore): it is a
 //! concrete *partial* upper (it can only answer what it has mirrored), so a
-//! bare cache view can never be mistaken for a complete store — completeness is
-//! the coverage map's job, owned by `Cached`.
+//! bare cache view can never be mistaken for a complete store — a miss asserts
+//! nothing and always falls through (KV2, owned by `Cached`).
+//!
+//! Three consumers share the workspace: the committed cell entries (the
+//! `cache` keyspace), the warm provisional index + seeded latch (the `index`
+//! keyspace), and the `MarkerPresence` latch (also `index`). All three
+//! observe the one shared **cache fuse** (`FjallCellCache::fuse_blown`);
+//! how a blown fuse partitions them is documented on `Cached`'s retry
+//! posture.
 //!
 //! # Workspace ownership
 //!
@@ -52,28 +57,41 @@ pub use workspace::{FjallClient, FjallClientError, FjallWorkspace};
 use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use async_stream::try_stream;
+use crate::state::cell_key::{CellKey, Section};
+use ahash::RandomState;
 use bytes::Bytes;
 use educe::Educe;
-use fjall::{Database, Guard, Keyspace, OwnedWriteBatch, Slice};
-use futures::{Stream, StreamExt};
+use fjall::{Database, Keyspace, OwnedWriteBatch, Slice};
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Counter;
+use std::collections::HashSet;
 use std::ops::Bound;
-use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::task::coop::cooperative;
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
 /// Rows examined per blocking hop of a chunked
-/// [`scan_present`](FjallCellCache::scan_present): each hop collects at most
-/// this many rows in one [`spawn_blocking`], then re-seeks from the last key it
-/// saw. A covered drain therefore holds O(hop) hits in RAM — never the whole
-/// covered interval — while the synchronous fjall range guard still never
-/// crosses an `.await`.
+/// [`delete_section`](FjallCellCache::delete_section) walk: each hop collects
+/// at most this many keys in one [`spawn_blocking`], deletes them in one
+/// bounded write batch, then re-seeks from the last key it saw. A section
+/// delete therefore holds O(hop) keys in RAM — never the whole section (the
+/// bounded-RAM invariant) — while the synchronous fjall range guard still
+/// never crosses an `.await`.
 const SCAN_HOP_ROWS: usize = 256;
+
+/// The one-way cache-fuse counter, bumped once per blow (see
+/// [`FjallCellCache::blow_fuse`]).
+static FUSE_BLOWN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("prosody.state.cache_fuse_blown")
+        .with_description("Keyed-state cache fuses blown (one per degraded assignment)")
+        .with_unit("{fuse}")
+        .build()
+});
 
 /// The cache's `now` source for TTL co-expiry, in milliseconds since the Unix
 /// epoch.
@@ -117,34 +135,9 @@ pub(crate) enum CacheRead {
     /// An entry exists but its stamped expiry has passed; the caller falls
     /// through to the lower store and re-publishes a fresh entry.
     Expired,
-    /// No entry exists (never written, or a gap within a covered scan range).
+    /// No entry exists (the cell was never published, or its entry was
+    /// deleted by a repair).
     Miss,
-}
-
-/// One item of a `FjallCellCache::scan_present` covered serve: a live present
-/// cell, or an expired covered coordinate the caller must re-fetch from the
-/// lower store (FLOOR rounding can expire a fjall entry just before its durable
-/// row, so an expired covered coordinate is a gap, not an absence).
-#[derive(Clone, Debug)]
-pub enum ScanHit {
-    /// An unexpired present cell, served straight from the cache.
-    Present(CellKey, Bytes),
-    /// A covered coordinate whose fjall entry expired; fall through to the
-    /// lower store for it.
-    Expired(CellKey),
-}
-
-/// The per-cell outcome [`FjallCellCache::commit_batch`] reports: whether the
-/// re-published committed value now **covers** the coordinate, or the
-/// coordinate must be **uncovered** (its stage entry was missing/unreadable,
-/// or the atomic batch commit failed) so the next read falls through and
-/// self-heals.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum CoverDecision {
-    /// The committed value was re-published; cover the coordinate.
-    Cover,
-    /// Uncover the coordinate; the next read re-publishes from the lower store.
-    Punch,
 }
 
 /// Fjall-backed cell cache.
@@ -154,9 +147,15 @@ pub struct FjallCellCache {
     #[educe(Debug(ignore))]
     inner: Arc<Inner>,
     clock: Clock,
-    /// Test-only fault seam: when set, every [`put`](Self::put) returns an
-    /// engine error without touching fjall, so a test can force the publish
-    /// failure that uncovers a coordinate (the only mutator `punch`).
+    /// The one-way **cache fuse**, shared by every clone and every
+    /// [`MarkerPresence`] handle of one workspace (see
+    /// [`fuse_blown`](Self::fuse_blown)).
+    #[educe(Debug(ignore))]
+    fuse: Arc<AtomicBool>,
+    /// Test-only fault seam: when set, every [`put`](Self::put),
+    /// [`put_batch`](Self::put_batch), and [`commit_batch`](Self::commit_batch)
+    /// returns an engine error without touching fjall, so a test can force a
+    /// publish failure (the D1 repair path).
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_puts: Arc<AtomicBool>,
@@ -177,13 +176,16 @@ pub struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_index_record: Arc<AtomicBool>,
-    /// Test-only fault seam: a countdown of [`cover_store`](Self::cover_store)
-    /// calls to fail (each failure decrements it), so a test can make exactly
-    /// the next N coverage rewrites fail — forcing the must-succeed punch's
-    /// retry path — and then heal automatically.
+    /// Test-only fault seam: a countdown of delete-side calls to fail — each
+    /// failure decrements it — consulted by
+    /// [`delete_batch`](Self::delete_batch),
+    /// [`delete_section`](Self::delete_section), and
+    /// [`index_unseed`](Self::index_unseed), so a test can make exactly the
+    /// next N must-succeed deletes fail (forcing the retry path, or blowing
+    /// the fuse past the budget) and then heal automatically.
     #[cfg(test)]
     #[educe(Debug(ignore))]
-    fail_cover_stores: Arc<AtomicU64>,
+    fail_deletes: Arc<AtomicU64>,
 }
 
 /// Backing for a [`FjallCellCache`]: either a bare cache handle plus its
@@ -193,8 +195,8 @@ pub struct FjallCellCache {
 ///
 /// The [`Database`] is held in both arms because batch writes are issued
 /// through [`Database::batch`], not the keyspace handle. The `index` keyspace
-/// (warm provisional coordinates, scan coverage, and the cold-seed and
-/// marker-presence latches)
+/// (warm provisional coordinates and the cold-seed and marker-presence
+/// latches)
 /// rides alongside `cache` in
 /// both arms purely for lifecycle co-location — it shares the workspace's
 /// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
@@ -219,8 +221,8 @@ impl Inner {
         }
     }
 
-    /// The warm-index keyspace handle (provisional coordinates, coverage, and
-    /// the cold-seed and marker-presence latches).
+    /// The warm-index keyspace handle (provisional coordinates and the
+    /// cold-seed and marker-presence latches).
     fn index_handle(&self) -> &Keyspace {
         match self {
             Self::Bare { index, .. } => index,
@@ -298,6 +300,7 @@ impl FjallCellCache {
         Self {
             inner: Arc::new(inner),
             clock,
+            fuse: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_puts: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -305,8 +308,34 @@ impl FjallCellCache {
             #[cfg(test)]
             fail_index_record: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            fail_cover_stores: Arc::new(AtomicU64::new(0)),
+            fail_deletes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Whether the workspace's one-way **cache fuse** has blown.
+    ///
+    /// The fuse lives in the shared inner state, so every [`Cached`] clone and
+    /// [`MarkerPresence`] handle of one workspace observes the same bit — a
+    /// per-clone fuse would let the next event's intact clone serve the very
+    /// stale hit the blown clone made unreachable. Consumers snapshot it once
+    /// at their own entry (one admission decision per verb); it never resets
+    /// within an assignment and dies with the workspace (its removal path).
+    ///
+    /// [`Cached`]: crate::state::cached::Cached
+    #[must_use]
+    pub(crate) fn fuse_blown(&self) -> bool {
+        self.fuse.load(Ordering::Relaxed)
+    }
+
+    /// Blows the cache fuse: permanently (for this assignment) degrades the
+    /// cache to a loud durable passthrough. Called by a must-succeed delete
+    /// that exhausted its retry budget — the delete "lands or fuses", so a
+    /// sick local disk can never stall settlement or leave a stale entry
+    /// reachable. Loud by contract: one warning and one metric bump per blow.
+    pub(crate) fn blow_fuse(&self) {
+        self.fuse.store(true, Ordering::Relaxed);
+        warn!("keyed-state cache fuse blown; degrading the assignment to durable reads");
+        FUSE_BLOWN.add(1, &[]);
     }
 
     /// Test handle on the [`put`](Self::put) fault seam: returns the shared
@@ -334,12 +363,28 @@ impl FjallCellCache {
         self.fail_index_record.clone()
     }
 
-    /// Test handle on the [`cover_store`](Self::cover_store) fault seam: the
-    /// shared countdown of coverage rewrites to fail before healing.
+    /// Test handle on the delete-side fault seam: the shared countdown of
+    /// [`delete_batch`](Self::delete_batch) /
+    /// [`delete_section`](Self::delete_section)
+    /// / [`index_unseed`](Self::index_unseed) calls to fail before healing.
     #[cfg(test)]
     #[must_use]
-    pub fn fail_cover_stores(&self) -> Arc<AtomicU64> {
-        self.fail_cover_stores.clone()
+    pub fn fail_deletes(&self) -> Arc<AtomicU64> {
+        self.fail_deletes.clone()
+    }
+
+    /// Consumes one charge of the delete-side fault seam, returning the
+    /// injected error while charges remain.
+    #[cfg(test)]
+    fn injected_delete_failure(&self) -> Result<(), FjallCellCacheError> {
+        if self
+            .fail_deletes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(FjallCellCacheError::Injected);
+        }
+        Ok(())
     }
 
     /// The cache's `now` source, shared by reads (expiry checks) and the
@@ -350,6 +395,23 @@ impl FjallCellCache {
         &self.clock
     }
 
+    /// Test-only: writes raw `bytes` verbatim at the cell's key, so a test can
+    /// seed a corrupt frame the read path must degrade on.
+    #[cfg(test)]
+    pub(crate) async fn seed_raw_cell(
+        &self,
+        collection: &CollectionId,
+        cell: &CellKey,
+        bytes: Bytes,
+    ) -> Result<(), FjallCellCacheError> {
+        write_cell(
+            self.inner.handle(),
+            codec::cell_key(collection, cell),
+            bytes,
+        )
+        .await
+    }
+
     /// Mints a [`MarkerPresence`] handle over this cache's warm-index keyspace
     /// — the bottom store's bounded marker-checked latch, sharing the
     /// workspace's per-assignment lifecycle (cold exactly when the store's RAM
@@ -358,6 +420,7 @@ impl FjallCellCache {
     pub(crate) fn presence(&self) -> MarkerPresence {
         MarkerPresence {
             index: self.inner.index_handle().clone(),
+            fuse: self.fuse.clone(),
         }
     }
 
@@ -366,10 +429,10 @@ impl FjallCellCache {
     /// [`Expired`](CacheRead::Expired) when the entry exists but its stamped
     /// expiry has passed, or a [`Miss`](CacheRead::Miss) when no entry exists.
     ///
-    /// The caller distinguishes these because a covered coordinate may be a gap
-    /// with no entry (genuine absence) — a `Miss` — or an entry that floor-
-    /// expired (a gap to re-fetch) — an `Expired`. Both differ from a present
-    /// `Absent` tag (`Hit(Committed(None))`).
+    /// The caller distinguishes these because a coordinate may have no entry
+    /// (nothing was ever published — a `Miss`) or an entry that floor-expired
+    /// (fall through and re-fetch — an `Expired`). Both differ from a present
+    /// `Absent` tag (`Hit(Committed(None))`), which is an authoritative answer.
     pub(crate) async fn get(
         &self,
         collection: &CollectionId,
@@ -455,7 +518,7 @@ impl FjallCellCache {
     /// BATCH` the Cassandra side uses). This collapses the per-cell settle
     /// writes from N blocking thread-hops to one. The single-cell write-through
     /// paths keep [`put`](Self::put). On a batch commit failure, the caller
-    /// uncovers every coordinate (Cov3 — see
+    /// deletes every written cell's entry (D1 — see
     /// [`Cached`](crate::state::cached::Cached)'s module doc).
     pub(crate) async fn put_batch(
         &self,
@@ -484,33 +547,47 @@ impl FjallCellCache {
         .await
     }
 
-    /// Promotes a batch of staged cells into committed cache entries in a
-    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`]: for
-    /// each write it reads the cell's stage-anchored expiry back from fjall and
-    /// re-publishes `data` at that **same** expiry, then commits the whole set
-    /// at once. Reusing the stage expiry is load-bearing — the lower promote
-    /// keeps `data`'s death set at stage time, so a fresh `now + ttl` would
-    /// overhang it (Cov1 — see [`Cached`](crate::state::cached::Cached)'s
-    /// module doc).
+    /// The **settle transform** (D5): rewrites each staged cell's entry
+    /// `prev → data` at its **stage-anchored** expiry, atomically, in a single
+    /// [`spawn_blocking`] over one [`OwnedWriteBatch`]. Called by
+    /// [`Cached::commit_provisional`](crate::state::cached::Cached) strictly
+    /// **before** the lower promote — the commit verdict is already fixed when
+    /// that verb runs, so `data` *is* the logical committed projection and
+    /// installing it pre-call keeps the staged cells warm and correct even if
+    /// the promote then fails or the settle future is dropped. Reusing the
+    /// stage expiry is load-bearing: the lower promote keeps `data`'s death
+    /// set at stage time, so a fresh `now + ttl` would overhang the durable
+    /// row's death.
     ///
-    /// Returns one [`CoverDecision`] per write, aligned to `writes` order:
-    /// [`Cover`](CoverDecision::Cover) when the cell was re-published,
-    /// [`Punch`](CoverDecision::Punch) when its stage entry was missing or
-    /// unreadable, or — for **every** write — when the batch commit failed.
-    /// Best-effort: it never returns an error, so the caller can return the
-    /// lower promote's `Result` verbatim (the Incomplete trap — likewise
-    /// defined there).
+    /// **Idempotent because the frame is not marked.** fjall frames carry no
+    /// stage/committed discriminator — `stage_expiry` decodes any valid cell
+    /// frame — so a sweep-retried transform re-reads the stage-anchored expiry
+    /// it wrote the first time and rewrites byte-equivalent bytes. The delete
+    /// arm (a missing or unreadable entry is removed in the same atomic batch)
+    /// is reached only by genuinely missing/corrupt entries, never by a retry.
+    /// The supporting routing lemma: between transform attempts no successful
+    /// fill can restamp a coordinate still eligible for the next transform — a
+    /// fall-through read of a still-listed provisional coordinate must
+    /// *resolve* it first, and the sweep rebuilds its write set from durable
+    /// provisional state, so a resolved coordinate drops out before the retry
+    /// ever sees it. A drop between this transform and the commit site's
+    /// scoped section delete is equivalent to a drop before the verb: the
+    /// armed sweep re-runs both, and both are idempotent.
+    ///
+    /// Any failure — including the `fail_puts` seam and a join error — returns
+    /// `Err` so the caller runs its must-succeed delete fallback over the same
+    /// entries.
     pub(crate) async fn commit_batch(
         &self,
         collection: &CollectionId,
         writes: &[(CellKey, ProvisionalWrite)],
-    ) -> Vec<CoverDecision> {
+    ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
-            return vec![CoverDecision::Punch; writes.len()];
+            return Err(FjallCellCacheError::Injected);
         }
         // Owned closure inputs, bounded and sized once: the cell key plus the
-        // committed `data` to re-publish at its read-back stage expiry.
+        // committed `data` to rewrite at its read-back stage expiry.
         let mut inputs: Vec<(Vec<u8>, Option<Bytes>)> = Vec::with_capacity(writes.len());
         for (cell, write) in writes {
             inputs.push((codec::cell_key(collection, cell), write.data().cloned()));
@@ -519,122 +596,123 @@ impl FjallCellCache {
         let handle = self.inner.handle().clone();
         spawn_blocking(move || {
             let mut batch = OwnedWriteBatch::with_capacity(database, inputs.len());
-            let mut decisions = Vec::with_capacity(inputs.len());
             for (key, data) in &inputs {
                 match stage_expiry(&handle, key) {
                     Some(expiry) => {
                         let frame = encode_frame(data.as_ref(), expiry);
                         batch.insert(&handle, key.as_slice(), frame.as_ref());
-                        decisions.push(CoverDecision::Cover);
                     }
-                    None => decisions.push(CoverDecision::Punch),
+                    // Missing/unreadable stage entry: delete it in the same
+                    // atomic batch (cold, safe — the next read falls through).
+                    None => batch.remove(&handle, key.as_slice()),
                 }
             }
-            // A commit failure means none of the inserts landed, so uncover
-            // every coordinate (not just the ones marked Cover).
-            if batch.commit().is_ok() {
-                decisions
-            } else {
-                vec![CoverDecision::Punch; inputs.len()]
+            batch.commit()
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Deletes a batch of committed cell entries in one atomic
+    /// [`OwnedWriteBatch`] — the D-site repair primitive (keys built at exact
+    /// size). Idempotent: removing an absent key is a no-op.
+    pub(crate) async fn delete_batch(
+        &self,
+        collection: &CollectionId,
+        cells: &[CellKey],
+    ) -> Result<(), FjallCellCacheError> {
+        #[cfg(test)]
+        self.injected_delete_failure()?;
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(cells.len());
+        for cell in cells {
+            keys.push(codec::cell_key(collection, cell));
+        }
+        let handle = self.inner.handle().clone();
+        let capacity = keys.len();
+        self.run_batch(handle, capacity, move |batch, handle| {
+            for key in &keys {
+                batch.remove(handle, key.as_slice());
             }
+            Ok(())
         })
         .await
-        .unwrap_or_else(|error| {
-            warn!(%error, "committed-value cache commit batch task failed; uncovering");
-            vec![CoverDecision::Punch; writes.len()]
-        })
     }
 
-    /// Streams the committed cells of one `(collection, section)` over the
-    /// scan's coordinate range, in [`Scan::dir`] order — the range-read the
-    /// coverage cache serves a covered scan sub-range from.
+    /// Deletes one `(collection, section)`'s committed cell entries, walking
+    /// the section's key range in fixed hops of [`SCAN_HOP_ROWS`]: each hop is
+    /// one [`spawn_blocking`] that collects at most a hop of keys, deletes
+    /// them in one bounded write batch, and re-seeks past the last key it
+    /// examined. Never one whole-section batch — that would hold O(cached
+    /// cells) keys in RAM (the bounded-RAM invariant). Idempotent (a deleted
+    /// key is not found again), so a must-succeed retry re-walks safely.
     ///
-    /// `Absent` (cleared) entries are skipped, so the stream yields only
-    /// present cells, exactly as the lower store's `scan_cells` does for a
-    /// covered range. An **expired** present cell is yielded as
-    /// [`ScanHit::Expired`] so the covered serve can fall through and
-    /// re-fetch it (FLOOR rounding makes an entry expire slightly before
-    /// its durable row, so an expired covered coordinate must not read as
-    /// absent — it is treated as a gap).
-    ///
-    /// The drain is **chunked**: each [`spawn_blocking`] hop examines at most
-    /// `SCAN_HOP_ROWS` rows and re-seeks from the last key it saw, so a
-    /// covered interval of any size costs O(hop) RAM per hop — never one
-    /// whole-interval buffer — while fjall's synchronous range guard still
-    /// never crosses an `.await`. [`Scan::limit`] caps the total hits yielded
-    /// (a caller consuming fewer simply stops polling, ending the hops early).
-    /// Each yielded item is coop-wrapped so a large drain yields to the
-    /// runtime.
-    ///
-    /// The fjall keyspace is shared across **all** collections, so the scan is
-    /// bounded to the `(collection, section)` byte prefix on both ends — both
-    /// scan edges append their coordinates to that prefix, so the range never
-    /// bleeds into the next section or another collection. A per-row prefix
-    /// check guards the same invariant defensively (see `scan_hop`).
-    pub(crate) fn scan_present<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<ScanHit, FjallCellCacheError>> + Send + 'a {
-        self.scan_present_hopping(collection, scan, SCAN_HOP_ROWS)
-    }
-
-    /// [`scan_present`](Self::scan_present) with an explicit per-hop row
-    /// budget, so tests can drive many re-seek hops over a small fixture.
-    fn scan_present_hopping<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        hop_rows: usize,
-    ) -> impl Stream<Item = Result<ScanHit, FjallCellCacheError>> + Send + 'a {
+    /// `exclude` names cells whose entries survive the delete — the commit
+    /// site's staged coordinates (the set equation on
+    /// [`Cached::commit_provisional`](crate::state::cached::Cached)); every
+    /// other caller passes `&[]` for a whole-section delete. The exclusion set
+    /// is encoded **once, in the committed-cell key form** (`codec::cell_key`
+    /// — the same form the walk yields; the provisional-*index* encoding
+    /// carries an extra kind byte and would never match, silently deleting the
+    /// staged survivors) and held hashed, so each walked key costs O(1)
+    /// expected and memory stays O(|exclude| + one hop).
+    pub(crate) async fn delete_section(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        exclude: &[CellKey],
+    ) -> Result<(), FjallCellCacheError> {
+        #[cfg(test)]
+        self.injected_delete_failure()?;
+        let excluded: Arc<HashSet<Vec<u8>, RandomState>> = Arc::new(
+            exclude
+                .iter()
+                .map(|cell| codec::cell_key(collection, cell))
+                .collect(),
+        );
+        let prefix = codec::section_prefix(collection, section);
         let handle = self.inner.handle().clone();
-        let section = scan.section;
-        let dir = scan.dir;
-        let section_prefix = codec::section_prefix(collection, section);
-        let (lo, hi) = scan.low_high();
-        let mut lo_bound = byte_low_bound(&section_prefix, lo);
-        let mut hi_bound = byte_high_bound(&section_prefix, hi);
-        let mut remaining = scan.limit;
-        let now = self.clock.now_ms();
-
-        try_stream! {
-            loop {
-                if remaining == Some(0) {
-                    break;
-                }
-                let budget = hop_rows.max(1);
-                let need = remaining.map_or(budget, |n| n.min(budget));
-                let hop_handle = handle.clone();
-                let hop_prefix = section_prefix;
-                let (hop_lo, hop_hi) = (lo_bound.clone(), hi_bound.clone());
-                let (hits, resume) = spawn_blocking(move || {
-                    let rows = hop_handle.range((hop_lo, hop_hi));
-                    match dir {
-                        Direction::Forward => {
-                            scan_hop(rows, &hop_prefix, section, now, budget, need, dir)
-                        }
-                        Direction::Backward => {
-                            scan_hop(rows.rev(), &hop_prefix, section, now, budget, need, dir)
-                        }
+        let database = self.inner.database().clone();
+        let mut lo: Bound<Vec<u8>> = Bound::Included(prefix.to_vec());
+        loop {
+            let hop_handle = handle.clone();
+            let hop_database = database.clone();
+            let hop_excluded = excluded.clone();
+            let hop_lo = lo;
+            let resume = spawn_blocking(move || -> fjall::Result<Option<Vec<u8>>> {
+                let mut doomed: Vec<Vec<u8>> = Vec::new();
+                let mut resume: Option<Vec<u8>> = None;
+                let mut examined = 0usize;
+                for guard in hop_handle.range((hop_lo, Bound::Unbounded)) {
+                    let (key, _) = guard.into_inner()?;
+                    // The range's upper side is open; the prefix check is what
+                    // stops the walk at the section boundary.
+                    if !key.starts_with(&prefix) {
+                        break;
                     }
-                })
-                .await??;
-                remaining = remaining.map(|n| n.saturating_sub(hits.len()));
-                for hit in hits {
-                    yield hit;
+                    examined += 1;
+                    if !hop_excluded.contains(key.as_ref()) {
+                        doomed.push(key.to_vec());
+                    }
+                    if examined >= SCAN_HOP_ROWS {
+                        resume = Some(key.to_vec());
+                        break;
+                    }
                 }
-                match resume {
-                    // The hop stopped on a budget/need bound; re-seek just past
-                    // the last examined key on the direction's moving side.
-                    Some(key) => match dir {
-                        Direction::Forward => lo_bound = Bound::Excluded(key),
-                        Direction::Backward => hi_bound = Bound::Excluded(key),
-                    },
-                    None => break,
+                let mut batch = OwnedWriteBatch::with_capacity(hop_database, doomed.len());
+                for key in &doomed {
+                    batch.remove(&hop_handle, key.as_slice());
                 }
+                batch.commit()?;
+                Ok(resume)
+            })
+            .await??;
+            match resume {
+                // The hop stopped on its budget; re-seek just past the last
+                // examined key.
+                Some(key) => lo = Bound::Excluded(key),
+                None => return Ok(()),
             }
         }
-        .then(|item| cooperative(async move { item }))
     }
 
     // --- Warm index: provisional coordinates + cold-seed latch ---------------
@@ -675,10 +753,15 @@ impl FjallCellCache {
     /// Drops `collection`'s seeded latch, forcing the next sweep to re-seed
     /// from the durable index (used when a stage write fails and a
     /// coordinate may have landed durably that the coords set now misses).
+    /// A delete-side op: must-succeed at its call sites (a latch left true
+    /// over an incomplete snapshot would short-circuit every later sweep), so
+    /// it honors the shared delete fault seam.
     pub(crate) async fn index_unseed(
         &self,
         collection: &CollectionId,
     ) -> Result<(), FjallCellCacheError> {
+        #[cfg(test)]
+        self.injected_delete_failure()?;
         let handle = self.inner.index_handle().clone();
         let key = codec::index_seeded_key(collection);
         spawn_blocking(move || handle.remove(key.as_slice())).await??;
@@ -780,94 +863,12 @@ impl FjallCellCache {
         .await?
     }
 
-    // --- Warm coverage: on-disk `(collection, section)` interval sets ---------
-    //
-    // Each `(collection, section)`'s covered intervals live as a `Cover` prefix
-    // range in the `index` keyspace, one entry per interval keyed by its
-    // low-bound frame → high-bound frame. This is the disk-spilling relocation
-    // of the former in-RAM `Coverage.sections` map: reads load the bounded
-    // per-section interval list, writes rewrite it, all within one blocking hop.
-
-    /// Loads one `(collection, section)`'s stored coverage intervals as
-    /// `(lo, hi)` bound pairs in the fjall range's raw key order, which is
-    /// tag-first and **not** `cmp_low` — the caller re-sorts via
-    /// `IntervalSet::from_pairs`. Bounded by the section's merged interval
-    /// count.
-    pub(crate) async fn cover_load(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-    ) -> Result<Vec<(Bound<Coordinate>, Bound<Coordinate>)>, FjallCellCacheError> {
-        let handle = self.inner.index_handle().clone();
-        let prefix = codec::index_cover_prefix(collection, section);
-        spawn_blocking(move || {
-            let mut out: Vec<(Bound<Coordinate>, Bound<Coordinate>)> = Vec::new();
-            for guard in handle.prefix(prefix) {
-                let (key, value) = guard.into_inner()?;
-                let lo = codec::cover_low_bound(&key)?;
-                let hi = codec::decode_bound(value.as_ref())?;
-                out.push((lo, hi));
-            }
-            Ok(out)
-        })
-        .await?
-    }
-
-    /// Rewrites one `(collection, section)`'s coverage: clears its whole
-    /// `Cover` prefix range and re-inserts `intervals`, atomically in one
-    /// [`OwnedWriteBatch`]. Rewriting the whole section (never incremental key
-    /// edits) means a merge that shifts a low bound can never leave a stale
-    /// interval key behind.
-    pub(crate) async fn cover_store(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        intervals: &[(Bound<Coordinate>, Bound<Coordinate>)],
-    ) -> Result<(), FjallCellCacheError> {
-        #[cfg(test)]
-        if self
-            .fail_cover_stores
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(FjallCellCacheError::Injected);
-        }
-        let handle = self.inner.index_handle().clone();
-        let prefix = codec::index_cover_prefix(collection, section);
-        // Encode every key/value frame up front (bounded, sized once) so the
-        // blocking closure only touches fjall.
-        let mut framed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(intervals.len());
-        for (lo, hi) in intervals {
-            framed.push((
-                codec::index_cover_key(collection, section, lo),
-                codec::encode_bound(hi),
-            ));
-        }
-        let capacity = framed.len() + 1;
-        self.run_batch(handle, capacity, move |batch, handle| {
-            // Clear the section's whole existing range, then re-insert the merged
-            // set. `remove_range`-by-prefix has no batch primitive, so stale keys
-            // are removed by first collecting them in the same guard scan.
-            let stale: Vec<Slice> = handle
-                .prefix(prefix)
-                .map(|guard| guard.into_inner().map(|(key, _)| key))
-                .collect::<Result<_, _>>()?;
-            for key in &stale {
-                batch.remove(handle, key.as_ref());
-            }
-            for (key, value) in &framed {
-                batch.insert(handle, key.as_slice(), value.as_slice());
-            }
-            Ok(())
-        })
-        .await
-    }
-
     /// Runs `fill` over a fresh [`OwnedWriteBatch`] against `handle` and
     /// commits it, all in a single blocking hop — the shared ceremony behind
     /// every all-or-nothing batch mutator except
-    /// [`commit_batch`](Self::commit_batch), which reports a per-cell
-    /// [`CoverDecision`] instead of a bare result.
+    /// [`commit_batch`](Self::commit_batch) (which reads stage expiries inside
+    /// its own closure) and the hopping
+    /// [`delete_section`](Self::delete_section).
     async fn run_batch(
         &self,
         handle: Keyspace,
@@ -901,11 +902,17 @@ impl FjallCellCache {
 /// heals), never a wrong answer. Neither can lose a durable marker: the
 /// standing RAM map is untouched by presence failures (the memo and ownership
 /// invariants live on the bottom store's `MarkerMemo`).
+///
+/// A blown cache fuse fuses this latch too — `contains` answers unchecked and
+/// `set` no-ops — purely for uniformity (blown means zero fjall dependence);
+/// the contract above already makes the degradation safe.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub(crate) struct MarkerPresence {
     #[educe(Debug(ignore))]
     index: Keyspace,
+    #[educe(Debug(ignore))]
+    fuse: Arc<AtomicBool>,
 }
 
 impl MarkerPresence {
@@ -913,6 +920,9 @@ impl MarkerPresence {
     /// assignment. Any fjall error reads as **unchecked** (`false`) — a
     /// redundant durable re-check, never an under-report.
     pub(crate) async fn contains(&self, collection: &CollectionId) -> bool {
+        if self.fuse.load(Ordering::Relaxed) {
+            return false;
+        }
         match read_cell(&self.index, codec::index_presence_key(collection)).await {
             Ok(raw) => raw.is_some(),
             Err(error) => {
@@ -926,62 +936,15 @@ impl MarkerPresence {
     /// swallowed (warn): the collection stays unchecked and the next consult
     /// pays one redundant durable read.
     pub(crate) async fn set(&self, collection: &CollectionId) {
+        if self.fuse.load(Ordering::Relaxed) {
+            return;
+        }
         if let Err(error) =
             write_index_empty(&self.index, codec::index_presence_key(collection)).await
         {
             warn!(%error, "marker-presence write failed; leaving collection unchecked");
         }
     }
-}
-
-/// One bounded hop of a chunked [`FjallCellCache::scan_present`]: walks `rows`
-/// (already oriented in the scan direction) collecting up to `need` hits from
-/// at most `budget` rows, and returns the hits plus the re-seek key — `Some`
-/// (the last raw key examined) when the hop stopped on a bound and more rows
-/// may remain, `None` when the range was exhausted.
-///
-/// The fjall keyspace is shared across all collections, but both range edges
-/// carry the section prefix, so a row outside it is unreachable through the
-/// range — the per-row prefix check is a defensive guard. Should one ever
-/// appear, walking forward it marks the section's upper boundary and ends the
-/// scan; walking backward it *precedes* the section, so it is skipped but
-/// still counted against the budget, keeping every hop's work bounded.
-fn scan_hop(
-    rows: impl Iterator<Item = Guard>,
-    section_prefix: &[u8],
-    section: Section,
-    now: u64,
-    budget: usize,
-    need: usize,
-    dir: Direction,
-) -> Result<(Vec<ScanHit>, Option<Vec<u8>>), FjallCellCacheError> {
-    let mut hits: Vec<ScanHit> = Vec::with_capacity(need);
-    let mut examined = 0usize;
-    for guard in rows {
-        let (key, value) = guard.into_inner()?;
-        examined += 1;
-        if key.starts_with(section_prefix) {
-            let (expiry, read) = codec::decode_cell(Some(value.as_ref()))?;
-            let cell = CellKey {
-                section,
-                coordinate: codec::coordinate_of(&key),
-            };
-            if expired(expiry, now) {
-                // The fjall entry expired before its durable row could have
-                // (FLOOR): the covered coordinate must fall through, not read
-                // as absent.
-                hits.push(ScanHit::Expired(cell));
-            } else if let Read::Present(payload) = read {
-                hits.push(ScanHit::Present(cell, payload));
-            }
-        } else if dir == Direction::Forward {
-            return Ok((hits, None));
-        }
-        if hits.len() >= need || examined >= budget {
-            return Ok((hits, Some(key.as_ref().to_vec())));
-        }
-    }
-    Ok((hits, None))
 }
 
 /// Encodes a cell's presence/absence into its stored frame at `expiry`: a
@@ -1046,9 +1009,9 @@ fn expired(expiry: u64, now: u64) -> bool {
 }
 
 /// Reads the absolute stage expiry stamped on the cell at `key` back from the
-/// cache keyspace, or `None` when no entry exists or the read/decode fails (a
-/// failure logs and degrades — the caller then uncovers the coordinate so the
-/// next read self-heals). Runs inside
+/// cache keyspace, or `None` when no entry exists or the read/decode fails —
+/// the transform then deletes the entry in the same atomic batch so the next
+/// read falls through and self-heals. Runs inside
 /// [`commit_batch`](FjallCellCache::commit_batch)'s blocking closure, so it
 /// uses the synchronous keyspace `get` directly.
 fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
@@ -1067,31 +1030,4 @@ fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
             None
         }
     }
-}
-
-/// The fjall byte key bound opening a covered scan's low side. The edge's
-/// coordinate appends to the section prefix, preserving exclusivity.
-fn byte_low_bound(section_prefix: &[u8], lo: ScanEdge<&Coordinate>) -> Bound<Vec<u8>> {
-    match lo {
-        ScanEdge::Included(c) => Bound::Included(byte_key(section_prefix, c)),
-        ScanEdge::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
-    }
-}
-
-/// The fjall byte key bound closing a covered scan's high side. The edge's
-/// coordinate appends to the section prefix, preserving exclusivity.
-fn byte_high_bound(section_prefix: &[u8], hi: ScanEdge<&Coordinate>) -> Bound<Vec<u8>> {
-    match hi {
-        ScanEdge::Included(c) => Bound::Included(byte_key(section_prefix, c)),
-        ScanEdge::Excluded(c) => Bound::Excluded(byte_key(section_prefix, c)),
-    }
-}
-
-/// The full fjall key for `coordinate` within `section_prefix`.
-fn byte_key(section_prefix: &[u8], coordinate: &Coordinate) -> Vec<u8> {
-    let coordinate = coordinate.as_bytes();
-    let mut key = Vec::with_capacity(section_prefix.len() + coordinate.len());
-    key.extend_from_slice(section_prefix);
-    key.extend_from_slice(coordinate);
-    key
 }

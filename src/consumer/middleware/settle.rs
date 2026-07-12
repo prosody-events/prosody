@@ -26,9 +26,8 @@ use super::FallibleHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::event_context::EventContext;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::session::MessageMarker;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
-use crate::state::session::{Finalized, LifecycleAccessExt};
+use crate::state::session::{Finalized, LifecycleAccessExt, MessageMarker, OpPermit};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -120,7 +119,7 @@ enum StepOutcome<R> {
 /// therefore end only one of two ways, which makes "abort in normal operation"
 /// unrepresentable for the arm.
 pub(super) enum ArmOutcome {
-    /// The backstop is armed, or a standing one already covers this commit.
+    /// The backstop is armed, or a standing one already stands for this commit.
     Armed,
 
     /// Shutdown intervened before the backstop could be armed. The caller
@@ -179,6 +178,17 @@ pub(crate) async fn settle<T, C, G>(
     // invalidated context, which cannot stage anyway.
     let lifecycle = context.lifecycle().ok();
 
+    // Close the session operation gate and HOLD the permit across the whole
+    // durability sequence: closure fences mutators (a detached op errors
+    // `SessionClosed` instead of mutating a session this boundary already
+    // snapshotted) while the held permit keeps any queued read serialized
+    // behind the settle. Dropped just before the apply hooks fire, so the
+    // hooks' post-settle state READS proceed and observe fully-settled state.
+    let permit = match &lifecycle {
+        Some(lifecycle) => Some(lifecycle.close_gate().await),
+        None => None,
+    };
+
     match T::settlement(result.as_ref()) {
         // The outcome lives elsewhere: no stage, no marker; commit the
         // offset/trigger and fire the hook. Skipping `finalize` here is
@@ -186,6 +196,7 @@ pub(crate) async fn settle<T, C, G>(
         // yields `Finalized::Clean`, and Clean never arms the backstop.
         Settlement::Bypassed => {
             guard.commit().await;
+            drop(permit);
             handler.after_commit(context, result).await;
         }
         Settlement::Final => match category {
@@ -199,6 +210,7 @@ pub(crate) async fn settle<T, C, G>(
                     record_marker_best_effort(&context, lifecycle, marker).await;
                 }
                 guard.commit().await;
+                drop(permit);
                 handler.after_commit(context, result).await;
             }
             // Transient final (no retry layer below took it): no marker —
@@ -206,10 +218,13 @@ pub(crate) async fn settle<T, C, G>(
             // (Terminal returned above.)
             Some(_) => {
                 guard.commit().await;
+                drop(permit);
                 handler.after_commit(context, result).await;
             }
             // Success: run the full durability sequence.
-            None => settle_committed(handler, context, guard, result, lifecycle).await,
+            None => {
+                settle_committed(handler, context, guard, result, lifecycle.as_ref(), permit).await;
+            }
         },
     }
 }
@@ -239,17 +254,18 @@ pub(crate) async fn settle<T, C, G>(
 ///   the backstop is armed → the sweep resolves; the recorded marker also
 ///   dedup-filters any redelivery.
 ///
-/// So every durable provisional cell is covered by redelivery
+/// So every durable provisional cell is reached by redelivery
 /// (arm-precedes-commit) or an armed backstop. The lone first-touch-only
 /// residual is the permanent-partial-stage path below (a `finalize` `Skip`
 /// committed unarmed), an accepted edge bounded by first-touch and the cell
 /// TTL.
-async fn settle_committed<T, C, G>(
+async fn settle_committed<'a, T, C, G>(
     handler: &T,
     context: C,
     guard: G,
     result: Result<T::Output, T::Error>,
-    lifecycle: Option<C::State>,
+    lifecycle: Option<&'a C::State>,
+    permit: Option<OpPermit<'a>>,
 ) where
     T: FallibleHandler,
     C: EventContext<Payload = T::Payload>,
@@ -258,6 +274,7 @@ async fn settle_committed<T, C, G>(
     let Some(lifecycle) = lifecycle else {
         // Invalidated / stateless context: just commit and fire the hook.
         guard.commit().await;
+        drop(permit);
         handler.after_commit(context, result).await;
         return;
     };
@@ -273,13 +290,14 @@ async fn settle_committed<T, C, G>(
                 // marker record (invariant: marker present ⇒ stage durable),
                 // and commit. A shutdown `ShuttingDown` from the arm is
                 // deliberately ignored: committing a permanently-unstageable
-                // event beats livelocking, and first-touch covers the unarmed
+                // event beats livelocking, and first-touch heals the unarmed
                 // cell (the sole first-touch-only recovery residual —
                 // everything else is redelivery or an armed sweep). No receipt
                 // exists to carry a finalize-folded delay, so the defensive
                 // arm uses the plain floor.
-                let _ = arm_backstop(&context, &lifecycle, lifecycle.recovery_floor()).await;
+                let _ = arm_backstop(&context, lifecycle, lifecycle.recovery_floor()).await;
                 guard.commit().await;
+                drop(permit);
                 handler.after_commit(context, result).await;
                 return;
             }
@@ -287,7 +305,9 @@ async fn settle_committed<T, C, G>(
                 // Shutdown before a receipt exists: nothing is recorded to
                 // roll back (finalize mints the receipt only on full success);
                 // redelivery re-runs from clean state, and recovery owns any
-                // partial durable stage.
+                // partial durable stage. Drop the permit first: `abandon`
+                // performs its own idempotent gate close.
+                drop(permit);
                 abandon(handler, context, guard, result).await;
                 return;
             }
@@ -311,7 +331,7 @@ async fn settle_committed<T, C, G>(
     let promotable = match finalized {
         Finalized::Clean => None,
         Finalized::Staged(staged) => {
-            match arm_backstop(&context, &lifecycle, staged.recovery_delay()).await {
+            match arm_backstop(&context, lifecycle, staged.recovery_delay()).await {
                 ArmOutcome::Armed => Some(staged.certify()),
                 ArmOutcome::ShuttingDown => {
                     // The ONE reachable rollback site — before any
@@ -319,6 +339,7 @@ async fn settle_committed<T, C, G>(
                     // is sound; past `certify` a rollback no longer compiles.
                     guard.abort().await;
                     staged.rollback().await;
+                    drop(permit);
                     handler.after_abort(context, result).await;
                     return;
                 }
@@ -351,6 +372,7 @@ async fn settle_committed<T, C, G>(
                     // ambiguous, so the staged cells must not (and
                     // structurally cannot) roll back — see
                     // [`StagedState::certify`]; the armed sweep resolves them.
+                    drop(permit);
                     abandon(handler, context, guard, result).await;
                     return;
                 }
@@ -374,7 +396,9 @@ async fn settle_committed<T, C, G>(
         warn!("keyed-state promote incomplete; the StateRecovery sweep will retry");
     }
 
-    // 6. After-commit hook (telemetry, dedup forwarding, ...).
+    // 6. After-commit hook (telemetry, dedup forwarding, ...). The permit
+    // drops first, so the hooks' post-settle state reads proceed.
+    drop(permit);
     handler.after_commit(context, result).await;
 }
 
@@ -397,7 +421,17 @@ pub(crate) async fn abandon<T, C, G>(
     C: EventContext<Payload = T::Payload>,
     G: Uncommitted + Send,
 {
+    // Close the session gate here too — retry calls `abandon` directly, so
+    // the fence must not depend on routing through `settle`. Idempotent: a
+    // second close after `settle`'s own (its arms drop their permit before
+    // delegating here) merely re-acquires and re-marks `Closed`.
+    let lifecycle = context.lifecycle().ok();
+    let permit = match &lifecycle {
+        Some(lifecycle) => Some(lifecycle.close_gate().await),
+        None => None,
+    };
     guard.abort().await;
+    drop(permit);
     handler.after_abort(context, result).await;
 }
 
@@ -473,7 +507,7 @@ where
             }
         };
         // Arm-if-sooner: a standing backstop that fires no later than this one
-        // already covers this commit's staged cells, so skip re-arming. Per-key
+        // already sweeps this commit's staged cells, so skip re-arming. Per-key
         // serialization makes the standing fire reliable — the sweep that
         // consumes it cannot run while this commit decides. `ArmedKeys` is
         // minted empty per acquisition while a prior epoch's backstop survives

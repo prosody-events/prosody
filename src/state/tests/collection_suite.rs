@@ -8,7 +8,7 @@
 //! collection's observable state must equal a plain `VecDeque`/`BTreeMap` model
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
-//! caught. This single property covers dense-window / loose-bounds invariants,
+//! caught. This single property proves dense-window / loose-bounds invariants,
 //! key/positional ordering, containment, whole-collection `Clear` (in-event
 //! emptiness, survivor repopulation, abort exactness), and the
 //! bounds-and-entries-promote-together crash atomicity. The lifecycle
@@ -584,7 +584,7 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) 
 
 /// Drives a map trace, asserting the handle equals a `BTreeMap` model after
 /// every event, that each mid-trace `get` returns the model's value, and that
-/// the stored bounds cover a loose superset of the live key range.
+/// the stored bounds hold a loose superset of the live key range.
 pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
     run_collection_trace(
         trace,

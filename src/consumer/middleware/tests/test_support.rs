@@ -835,7 +835,7 @@ impl OutcomeSlot {
 // The marker-hygiene triangle — retry between attempts, settle on the final
 // outcome, and every defer/route Err→Ok swallow — shares one observable
 // contract: a `Bypassed` or discarded attempt's buffered writes never commit
-// and no marker records for it. These pieces build a **real**
+// and no marker records for it. These parts build a **real**
 // `KeyedStateSession` whose marker record routes through a recording oracle
 // so each seam's test can assert that contract directly.
 

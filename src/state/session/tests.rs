@@ -435,7 +435,7 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
 
     // Rollback cart: the buffered W vanishes.
     assert_eq!(
-        session.rollback(StateType::Application, &cart),
+        session.rollback(StateType::Application, &cart).await,
         StoreOutcome::Applied,
     );
 
@@ -506,7 +506,7 @@ async fn rollback_on_a_terminated_session_is_noop() -> Result<()> {
 
     // The stale clone's rollback finds a terminated session: NoOp, no drain.
     assert_eq!(
-        stale.rollback(StateType::Application, &fx.value_name),
+        stale.rollback(StateType::Application, &fx.value_name).await,
         StoreOutcome::NoOp,
     );
 
@@ -738,7 +738,7 @@ async fn apply_value_op(
             model.buffered = false;
         }
         ValueOp::Rollback => {
-            let outcome = session.rollback(StateType::Application, name);
+            let outcome = session.rollback(StateType::Application, name).await;
             if outcome != expected_outcome(model.buffered) {
                 return Ok(false);
             }

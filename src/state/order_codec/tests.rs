@@ -1,6 +1,6 @@
 //! Order-preserving key codec invariants.
 //!
-//! Covers the codec half of the order-preserving invariant (clustering
+//! Proves the codec half of the order-preserving invariant (clustering
 //! byte-order == logical key order): a per-codec monotonicity differential
 //! over random key pairs plus round-trip, and the frozen-bytes golden for the
 //! Deque sign-flip index — a durable wire-format-freeze contract.

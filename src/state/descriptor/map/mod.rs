@@ -244,6 +244,7 @@ where
         &self,
         key: &KC::Key,
     ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>> {
+        let _permit = self.entries.read_permit().await;
         Ok(self.entries.get(key).await?)
     }
 
@@ -268,13 +269,18 @@ where
             direction = ?dir,
         );
         try_stream! {
-            // Anchor both edges on the bounds, read concurrently. Both present
-            // or both absent are the only states (extend-only writes + the
-            // TTL-refresh invariant); both absent ⇒ empty map ⇒ no scan.
+            // The scan-path split contract (see `SessionGate`): the gate is
+            // held only for the init metadata read — both bound cells, read
+            // concurrently — and dropped before the per-item live scan, so it
+            // is never held across a yield to user code. Both present or both
+            // absent are the only states (extend-only writes + the TTL-refresh
+            // invariant); both absent ⇒ empty map ⇒ no scan.
+            let permit = self.entries.read_permit().instrument(span.clone()).await;
             let (min, max) = tokio::try_join!(
                 self.read_bound(MapBound::Min).instrument(span.clone()),
                 self.read_bound(MapBound::Max).instrument(span.clone())
             )?;
+            drop(permit);
             let (Some(min), Some(max)) = (min, max) else {
                 return;
             };
@@ -322,6 +328,14 @@ where
     where
         KC::Key: Clone,
     {
+        // ONE permit across the entry set AND the bound ratchet: the ratchet
+        // is a read-modify-write over the two bound cells, so an interleaved
+        // sibling `set` could lose an extension without the shared hold.
+        let _permit = self
+            .entries
+            .mutate_permit()
+            .await
+            .map_err(CellStateError::Access)?;
         self.entries.set(&key, value).await?;
         self.ratchet_bounds(key).await?;
         Ok(())
@@ -340,6 +354,11 @@ where
         err
     )]
     pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
+        let _permit = self
+            .entries
+            .mutate_permit()
+            .await
+            .map_err(CellStateError::Access)?;
         Ok(self.entries.clear(key).await?)
     }
 
@@ -360,6 +379,11 @@ where
         err
     )]
     pub async fn clear(&self) -> Result<(), MapStateError<CellCodecError<V>>> {
+        let _permit = self
+            .entries
+            .mutate_permit()
+            .await
+            .map_err(CellStateError::Access)?;
         self.entries.clear_all().await?;
         self.meta.clear(&MapBound::Min).await.map_err(meta_err)?;
         self.meta.clear(&MapBound::Max).await.map_err(meta_err)?;
@@ -380,20 +404,25 @@ where
         err
     )]
     pub async fn commit(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
+        let _permit = self
+            .entries
+            .mutate_permit()
+            .await
+            .map_err(CellStateError::Access)?;
         Ok(self.entries.commit().await?)
     }
 
     /// Discards this map's buffered uncommitted ops — entries and bound
     /// ratchets together — reverting reads to the last
     /// [`commit`](Self::commit), or the pre-event committed state if none.
-    /// Sync and infallible; see [`CellSession::rollback`] for the contract.
+    /// Infallible; see [`CellSession::rollback`] for the contract.
     #[instrument(
         name = "map.rollback",
         skip_all,
         fields(collection = self.entries.name().as_str())
     )]
-    pub fn rollback(&self) -> StoreOutcome {
-        self.entries.rollback()
+    pub async fn rollback(&self) -> StoreOutcome {
+        self.entries.rollback().await
     }
 
     /// Ratchets the min/max bounds outward to `key`. Reads both bound cells

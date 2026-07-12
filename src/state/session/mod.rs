@@ -79,11 +79,12 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
-pub(crate) use sealed::{Finalized, MessageMarker};
+pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, SessionGate};
 use sealed::{StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
 use tracing::warn;
@@ -264,14 +265,17 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// durable and unreachable by rollback — only ops buffered since the last
     /// `commit()` are discarded.
     ///
-    /// Sync and infallible by design: it touches only the in-memory dirty
-    /// buffer, does no I/O, and cannot fail — deliberately asymmetric with the
-    /// async, fallible [`Self::commit`]. A terminated session (partition
-    /// shutting down, or the event cancelled) discards nothing and returns
-    /// [`StoreOutcome::NoOp`]: this is the same containment every other cell op
-    /// gets from the descriptor's live-guard, expressed as a `NoOp` because the
-    /// infallible signature cannot surface `Terminated`. It keeps a stale clone
-    /// that outlived its event from draining a later same-key event's buffer.
+    /// Async because it joins the session operation gate (`SessionGate`): a
+    /// buffer drain racing `commit()`'s snapshot→write→drain could otherwise
+    /// persist a partial set no serial order explains. Still infallible: it
+    /// touches only the in-memory dirty buffer and cannot fail. A terminated
+    /// session (partition shutting down, or the event cancelled) and a
+    /// **closed** session (the settle boundary already snapshotted it) both
+    /// discard nothing and return [`StoreOutcome::NoOp`] — the containment
+    /// every other cell op gets from the live-guard and the gate's closure
+    /// check, expressed as a `NoOp` because the infallible signature cannot
+    /// surface an error. It keeps a stale clone that outlived its event from
+    /// draining a later same-key event's buffer.
     ///
     /// Distinct from the settle boundary's rollback of staged provisional cells
     /// (the receipt's `StagedState::rollback`, framework-only, after the
@@ -279,7 +283,11 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     ///
     /// Returns [`StoreOutcome::Applied`] when buffered ops were discarded, or
     /// [`StoreOutcome::NoOp`] on an empty buffer.
-    fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome;
+    fn rollback(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> impl Future<Output = StoreOutcome> + Send;
 }
 
 /// Crate-sealed lifecycle half of [`CellSession`].
@@ -289,9 +297,173 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
 /// promoting, and discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Future, MarkerWrite,
-        ProvisionalWrite, SectionClear, StateAccessError, Uuid, resolve_collections,
+        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
+        MarkerWrite, ProvisionalWrite, SectionClear, StateAccessError, Uuid, resolve_collections,
     };
+    use opentelemetry::global::meter;
+    use opentelemetry::metrics::Counter;
+    use std::sync::LazyLock;
+    use tokio::sync::{Mutex as TokioMutex, MutexGuard};
+    use tokio::time::timeout;
+
+    /// How long a settle-boundary gate acquire waits between rate-limited
+    /// warnings while a still-running session op holds the gate.
+    const GATE_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Settle-boundary gate waits that crossed a warn interval, bumped once per
+    /// tick (see [`SessionGate::close`]).
+    static SETTLE_GATE_WAITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter("prosody")
+            .u64_counter("prosody.state.settle_gate_waits")
+            .with_description("Settle-boundary session-gate waits past a warn interval")
+            .with_unit("{wait}")
+            .build()
+    });
+
+    /// The per-event **session operation gate** — the in-handler leg of KV4 (a
+    /// read-back fill can never overwrite a newer write-through; the invariant
+    /// lives on [`Cached`](crate::state::cached::Cached)'s module doc).
+    ///
+    /// One gate per event session, acquired by every collection-handle
+    /// operation for its **whole body**: a `get` holds it from the overlay
+    /// check through the fill's publish; `commit()` across snapshot →
+    /// durable write → drain; `set`/`remove`/`clear` across their
+    /// entry-and-meta updates. `join!`-ed ops therefore execute in *some*
+    /// serial order — which also closes two lost-update races the dirty
+    /// store's old "no handler op is in flight" comment papered
+    /// over: `commit()`'s snapshot→drain window dropping a concurrent `set`,
+    /// and the map bound-ratchet read-modify-write under `join!`-ed sets.
+    ///
+    /// **Each public op acquires the gate exactly once** (a stream's
+    /// acquisition is its init); nothing beneath a public wrapper
+    /// re-acquires — a tokio `Mutex` is not reentrant, so an internal
+    /// re-acquire is a deadlock the KV4 pins would surface as a hang. The
+    /// factoring rule that enforces this: every descriptor operation is one
+    /// gated public wrapper over gate-free private helpers, and
+    /// no helper ever calls a public wrapper.
+    ///
+    /// **Streams have a split contract.** A *bounded* stream (a sub-threshold
+    /// deque window) materializes under one gate hold at init — membership and
+    /// every listed entry read, bounded memory — releases, then yields from the
+    /// buffer; the gate is never held across a yield to user code. A
+    /// *scan-path* stream takes the gate only for its init metadata read
+    /// and is per-item live thereafter. A cold bounded materialization is
+    /// the accepted worst case: it holds the gate across up to N+1 durable
+    /// point reads, and `join!`-ed ops (and settle's closure acquire) queue
+    /// FIFO behind it.
+    ///
+    /// **The gate also closes the session lifecycle**: settle acquires it once
+    /// via [`close`](Self::close) and marks the session `Closed`, holding
+    /// the permit across the whole durability sequence. After closure,
+    /// mutators error [`StateAccessError::SessionClosed`] (checked *after*
+    /// acquiring, so an op parked behind the closing settle errors instead
+    /// of mutating a session the boundary already snapshotted) while reads
+    /// still proceed — they serialize after settle and observe
+    /// fully-settled state, preserving the post-settle apply-hook read
+    /// contract.
+    ///
+    /// **The one forbidden pattern** (futurelock): never hold a session-op
+    /// future alive but un-polled while issuing more session ops — drop it
+    /// instead. *Dropping* a session-op future is always safe (a dropped
+    /// waiter leaves the FIFO queue; a granted-then-dropped guard
+    /// releases), and is pinned by the cancel-safety test. An
+    /// alive-but-un-polled future that was granted the gate wedges every
+    /// later op, including settlement — settle warns loudly past
+    /// [`GATE_WARN_INTERVAL`] but **never** proceeds without the gate (settling
+    /// around a still-executing op would snapshot a half-applied session).
+    ///
+    /// Perf posture: uncontended for any handler that does not `join!` its
+    /// session ops — one uncontended tokio `Mutex` lock per op; the phase
+    /// adds no other RAM structure.
+    pub struct SessionGate {
+        inner: TokioMutex<SessionPhase>,
+    }
+
+    /// Whether the session still accepts mutators, guarded by the gate's mutex.
+    enum SessionPhase {
+        /// The handler is (or may still be) running; all ops proceed.
+        Open,
+        /// The settle boundary closed the session; mutators error, reads
+        /// proceed.
+        Closed,
+    }
+
+    impl SessionGate {
+        /// A fresh, open gate for one event session.
+        pub(crate) fn new() -> Self {
+            Self {
+                inner: TokioMutex::new(SessionPhase::Open),
+            }
+        }
+
+        /// Acquires the gate for a read. No closure check: reads stay legal
+        /// after settlement closes the session (the apply hooks read
+        /// state through it), serializing after the settle so they
+        /// observe fully-settled state.
+        pub(crate) async fn read(&self) -> OpPermit<'_> {
+            OpPermit(self.inner.lock().await)
+        }
+
+        /// Acquires the gate for a mutator, re-checking closure **after** the
+        /// acquire (not just before waiting): an op parked behind the closing
+        /// settle errors [`StateAccessError::SessionClosed`] instead of
+        /// mutating a session the boundary already snapshotted.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StateAccessError::SessionClosed`] once the settle boundary
+        /// has closed the session.
+        pub(crate) async fn mutate(&self) -> Result<OpPermit<'_>, StateAccessError> {
+            let guard = self.inner.lock().await;
+            if matches!(*guard, SessionPhase::Closed) {
+                return Err(StateAccessError::SessionClosed);
+            }
+            Ok(OpPermit(guard))
+        }
+
+        /// Closes the session for settlement: acquires the gate once, marks the
+        /// phase `Closed`, and returns the held permit — the settle boundary
+        /// retains it across the whole durability sequence and drops it just
+        /// before the apply hooks fire.
+        ///
+        /// Pins ONE lock future and warns against `&mut` of it per
+        /// [`GATE_WARN_INTERVAL`] tick (`warn_tick` receives the seconds
+        /// waited; the caller tags it with the event and key) —
+        /// re-issuing `lock()` per tick would forfeit FIFO position and
+        /// could starve settlement. It never proceeds without the gate,
+        /// whatever the wait: a diagnosable wedge beats snapshotting a
+        /// half-applied session. Idempotent: a second close (retry's
+        /// `abandon` after settle's own) re-acquires and re-marks `Closed`.
+        pub(crate) async fn close(&self, mut warn_tick: impl FnMut(u64)) -> OpPermit<'_> {
+            let lock = self.inner.lock();
+            tokio::pin!(lock);
+            let mut waited = 0u64;
+            let mut guard = loop {
+                match timeout(GATE_WARN_INTERVAL, lock.as_mut()).await {
+                    Ok(guard) => break guard,
+                    Err(_elapsed) => {
+                        waited += GATE_WARN_INTERVAL.as_secs();
+                        SETTLE_GATE_WAITS.add(1, &[]);
+                        warn_tick(waited);
+                    }
+                }
+            };
+            *guard = SessionPhase::Closed;
+            OpPermit(guard)
+        }
+    }
+
+    /// A held [`SessionGate`] permit (RAII: dropping it releases the gate).
+    pub struct OpPermit<'a>(MutexGuard<'a, SessionPhase>);
+
+    impl OpPermit<'_> {
+        /// Whether the settle boundary has closed the session — consulted by
+        /// [`CellSession::rollback`], whose infallible contract answers a
+        /// closed session with `NoOp` instead of an error.
+        pub(crate) fn is_closed(&self) -> bool {
+            matches!(*self.0, SessionPhase::Closed)
+        }
+    }
 
     /// The message commit-marker identity: the dedup id the settlement
     /// boundary records through the commit oracle and the deduplication
@@ -458,6 +630,17 @@ pub(crate) mod sealed {
         /// [`KeyedStateSession`](super::KeyedStateSession) projects its
         /// backend's store (`B::Cell`).
         type Cell: CellStore;
+
+        /// The session's operation gate (KV4) — the descriptor handles acquire
+        /// their per-op permits through this accessor. On the sealed trait,
+        /// not public [`CellSession`](super::CellSession): the gate is
+        /// framework plumbing, never a handler surface.
+        fn gate(&self) -> &SessionGate;
+
+        /// Closes the session's gate for settlement — one acquire, phase
+        /// `Closed`, permit returned — tagging the wait warnings with this
+        /// session's event and key. See [`SessionGate::close`].
+        fn close_gate(&self) -> impl Future<Output = OpPermit<'_>> + Send;
 
         /// Resolves every touched collection by its commit mode:
         /// `ReadCommitted` collections stage a provisional cell,
@@ -634,6 +817,8 @@ where
     /// identity only; the commit decision lives in the settle boundary's
     /// typed classification, never in this cell's occupancy.
     reload_marker: SyncMutex<Option<MessageMarker>>,
+    /// The per-event session operation gate (KV4) — see [`SessionGate`].
+    gate: SessionGate,
 }
 
 /// The real per-event session over a partition's cell store.
@@ -704,6 +889,7 @@ where
                 armed,
                 termination,
                 reload_marker: SyncMutex::new(None),
+                gate: SessionGate::new(),
             }),
         }
     }
@@ -859,22 +1045,27 @@ where
         Ok(StoreOutcome::Applied)
     }
 
-    fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome {
+    async fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome {
+        // The gate acquire for rollback lives HERE, not in the handles (every
+        // handle path is a single delegating call): the drain must serialize
+        // with commit()'s snapshot→write→drain (KV4), and rollback's
+        // infallible contract needs the gate's phase — a CLOSED session (the
+        // settle boundary already snapshotted it) discards nothing, expressed
+        // as a NoOp because the signature cannot surface `SessionClosed`.
+        let permit = self.inner.gate.read().await;
         // A terminated session must not mutate the shared per-partition dirty
-        // store. Every other cell op refuses a terminated session through the
-        // descriptor's `ensure_live`; rollback, being sync + infallible, cannot
-        // return `Terminated`, so it expresses the same containment as a NoOp —
-        // a terminated session discards nothing. Without this, a stale clone of
-        // a cancelled or shutting-down event (a handle moved into a spawned
-        // task) could drain a later same-key event's live buffer: a silent lost
-        // write.
-        if self.is_terminated() {
+        // store either. Every other cell op refuses a terminated session
+        // through the descriptor's `ensure_live`; rollback expresses the same
+        // containment as a NoOp. Without this, a stale clone of a cancelled or
+        // shutting-down event (a handle moved into a spawned task) could drain
+        // a later same-key event's live buffer: a silent lost write.
+        if permit.is_closed() || self.is_terminated() {
             return StoreOutcome::NoOp;
         }
         let id = self.id_for(state_type, name);
         let dirty = self.inner.overlay.dirty();
-        // Peek-then-drain is race-free per [`DirtyStore::remove_collection`]:
-        // no handler op is in flight while the handler itself calls rollback.
+        // Peek-then-drain is race-free under the held gate permit: no other
+        // session op can interleave between the probe and the drain.
         if !dirty.collection_dirty(&id) {
             return StoreOutcome::NoOp;
         }
@@ -889,6 +1080,27 @@ where
     L: Clone + Send + Sync + 'static,
 {
     type Cell = B::Cell;
+
+    fn gate(&self) -> &SessionGate {
+        &self.inner.gate
+    }
+
+    async fn close_gate(&self) -> OpPermit<'_> {
+        let event = self.inner.event;
+        let key = &self.inner.state_key.key;
+        self.inner
+            .gate
+            .close(|waited_s| {
+                warn!(
+                    event = ?event,
+                    key = %key,
+                    waited_s,
+                    "settle waiting on the session operation gate; a session op future may be \
+                     held un-polled"
+                );
+            })
+            .await
+    }
 
     async fn finalize(&self) -> Result<Finalized<B::Cell>, StateAccessError> {
         let touched = self
@@ -976,7 +1188,11 @@ where
     }
 
     fn discard_dirty(&self) {
-        // Per-key serialization means no handler op is in flight here.
+        // Sync and ungated (Drop paths cannot await). Precondition: by the
+        // time this runs, either the settle boundary held the closed gate
+        // permit (boundary paths), or the dispatch future completed and the
+        // session gate's no-un-polled-ops contract holds (retry attempt
+        // boundaries) — so no session op is in flight over this key's range.
         self.inner
             .overlay
             .dirty()

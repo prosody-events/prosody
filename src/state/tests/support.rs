@@ -12,9 +12,8 @@ use crate::state::descriptor::StructuralIdentity;
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
-use crate::state::session::MessageMarker;
 use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{CellSession, Finalized};
+use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
@@ -31,6 +30,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
@@ -72,6 +72,8 @@ impl CommitOracle for FixedOracle {
 #[derive(Clone)]
 pub struct UnavailableState<P> {
     loader: MemoryLoader<P>,
+    /// Inert but present: the sealed lifecycle requires a gate accessor.
+    gate: Arc<SessionGate>,
 }
 
 impl<P> UnavailableState<P>
@@ -83,6 +85,7 @@ where
     pub fn new() -> Self {
         Self {
             loader: MemoryLoader::new(),
+            gate: Arc::new(SessionGate::new()),
         }
     }
 }
@@ -183,7 +186,7 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    fn rollback(&self, _state_type: StateType, _name: &StateName) -> StoreOutcome {
+    async fn rollback(&self, _state_type: StateType, _name: &StateName) -> StoreOutcome {
         // Stateless: nothing is ever buffered, so the discard is a NoOp.
         StoreOutcome::NoOp
     }
@@ -194,6 +197,15 @@ where
     P: Clone + Send + Sync + 'static,
 {
     type Cell = MemoryCellStore<FixedOracle>;
+
+    fn gate(&self) -> &SessionGate {
+        &self.gate
+    }
+
+    async fn close_gate(&self) -> OpPermit<'_> {
+        // Inert session: nothing contends, so no wait tags are needed.
+        self.gate.close(|_waited_s| {}).await
+    }
 
     async fn finalize(&self) -> Result<Finalized<Self::Cell>, StateAccessError> {
         Ok(Finalized::Clean)
@@ -277,15 +289,15 @@ impl<S> CountingCellStore<S> {
         self.counts.standing_marker.load(Ordering::Relaxed)
     }
 
-    /// Point reads issued to the lower store — zero on a covered-negative
-    /// `Cached::get`.
+    /// Point reads issued to the lower store — zero on a warm `Cached::get`
+    /// hit (present or negative-cached).
     pub(crate) fn lower_reads(&self) -> usize {
         self.counts.get.load(Ordering::Relaxed)
     }
 
-    /// Range scans issued to the lower store — one per coverage gap query, so
-    /// the op-budget property can pin "N covered ranges ⇒ exactly the gap
-    /// queries, never a section-wide re-scan".
+    /// Range scans issued to the lower store — exactly one per `Cached`
+    /// scan (KV3: scans bypass the cache), so budget pins can assert a path
+    /// issued no scans at all.
     pub(crate) fn lower_scans(&self) -> usize {
         self.counts.scan_cells.load(Ordering::Relaxed)
     }
@@ -435,6 +447,212 @@ where
             .abort_provisional
             .fetch_add(1, Ordering::Relaxed);
         self.inner.abort_provisional(collection, writes).await
+    }
+}
+
+/// A [`CellStore`] decorator whose per-verb responses can be **withheld** —
+/// the deterministic-schedule seam behind the KV4 gate pins and the D5
+/// drop-arm pin. Each armed hold lets the inner call **complete**, then parks
+/// the response on a release [`Notify`] (so the caller's future is suspended
+/// at a point where the durable effect has or has not landed by the test's
+/// choice of verb). Cancel-safe: dropping a parked future abandons the wait
+/// harmlessly.
+#[derive(Clone)]
+pub(crate) struct HoldingCellStore<S> {
+    inner: S,
+    holds: Arc<Holds>,
+}
+
+/// One hold seam per withholdable verb.
+#[derive(Default)]
+pub(crate) struct Holds {
+    get_for_cache: Hold,
+    write_resolved: Hold,
+    commit_provisional: Hold,
+}
+
+/// One verb's hold: `armed` calls park after their inner call completes;
+/// `entered` signals the test a call is parked; `release` resumes it;
+/// `landed` counts inner completions (the D5 pin's "the lower batch landed"
+/// probe).
+#[derive(Default)]
+pub(crate) struct Hold {
+    armed: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+    landed: AtomicUsize,
+}
+
+impl Hold {
+    /// Arms the next `n` calls to park after their inner call.
+    pub(crate) fn arm(&self, n: usize) {
+        self.armed.store(n, Ordering::Relaxed);
+    }
+
+    /// Waits until a parked call signals it entered the hold.
+    pub(crate) async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Releases one parked call.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    /// Inner-call completions so far — the "durable effect landed" probe.
+    pub(crate) fn landed(&self) -> usize {
+        self.landed.load(Ordering::Relaxed)
+    }
+
+    /// Runs `inner`, then parks the response while a hold charge is armed.
+    async fn pass<T>(&self, inner: impl Future<Output = T>) -> T {
+        let out = inner.await;
+        self.landed.fetch_add(1, Ordering::Relaxed);
+        let parked = self
+            .armed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok();
+        if parked {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        out
+    }
+}
+
+impl<S> HoldingCellStore<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            holds: Arc::new(Holds::default()),
+        }
+    }
+
+    /// The shared per-verb hold seams, for the test to arm and release.
+    pub(crate) fn holds(&self) -> Arc<Holds> {
+        self.holds.clone()
+    }
+}
+
+impl Holds {
+    pub(crate) fn get_for_cache(&self) -> &Hold {
+        &self.get_for_cache
+    }
+
+    pub(crate) fn write_resolved(&self) -> &Hold {
+        &self.write_resolved
+    }
+
+    pub(crate) fn commit_provisional(&self) -> &Hold {
+        &self.commit_provisional
+    }
+}
+
+impl<S> CellStore for HoldingCellStore<S>
+where
+    S: CellStore,
+{
+    type Error = S::Error;
+
+    fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
+        self.inner.get(collection, cell, own)
+    }
+
+    fn scan_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        self.inner.scan_cells(collection, scan, own)
+    }
+
+    async fn get_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
+        self.holds
+            .get_for_cache
+            .pass(self.inner.get_for_cache(collection, cell, own))
+            .await
+    }
+
+    fn provisional_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
+        self.inner.provisional_cells(collection)
+    }
+
+    fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+        self.inner.provisional_cell_at(collection, cell)
+    }
+
+    fn write_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.write_provisional(collection, writes, marker)
+    }
+
+    async fn write_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        self.holds
+            .write_resolved
+            .pass(self.inner.write_resolved(collection, cells, clears))
+            .await
+    }
+
+    fn mark_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [CellKey],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.mark_resolved(collection, cells)
+    }
+
+    fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
+        self.inner.standing_marker(collection)
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        self.holds
+            .commit_provisional
+            .pass(self.inner.commit_provisional(collection, writes, clears))
+            .await
+    }
+
+    fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        self.inner.abort_provisional(collection, writes)
     }
 }
 

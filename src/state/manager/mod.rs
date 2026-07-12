@@ -4,7 +4,7 @@
 //! a [`PartitionStateProvider`] (mirroring
 //! [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider)),
 //! then mints one [`KeyedStateSession`] per event from it. The manager owns the
-//! partition-lifetime pieces — the uniform cell store
+//! partition-lifetime parts — the uniform cell store
 //! ([`StateBackend::Cell`]), the commit oracle, the shared dirty workspace, and
 //! the message loader — while each session gets `Arc`-clones and wraps the cell
 //! store in its own per-event `Overlay`. The
