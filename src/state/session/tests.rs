@@ -821,21 +821,21 @@ fn finalize_matches_model(
 /// Finalizes the event and checks the Clean-iff / receipt-consistency clause
 /// ([`finalize_matches_model`]) plus drain-on-success — the stage consumed the
 /// receipt's mint source, so a second finalize finds an empty buffer and
-/// returns `Clean`. Yields the receipt, or the divergence reason.
+/// returns `Clean`. Yields the receipt; a divergence is an error.
 async fn checked_finalize(
     fx: &Fixture,
     session: &Session,
     event: EventRef,
     buffered: bool,
-) -> Result<Result<Finalized<TestStore>, &'static str>> {
+) -> Result<Finalized<TestStore>> {
     let finalized = session.finalize().await?;
     if let Some(reason) = finalize_matches_model(fx, event, &finalized, buffered) {
-        return Ok(Err(reason));
+        bail!("{reason}");
     }
     if !matches!(session.finalize().await?, Finalized::Clean) {
-        return Ok(Err("a second finalize after success was not Clean"));
+        bail!("a second finalize after success was not Clean");
     }
-    Ok(Ok(finalized))
+    Ok(finalized)
 }
 
 /// Consumes a committed event's receipt, `fail_promote` scheduling a transient
@@ -849,13 +849,12 @@ async fn checked_finalize(
 /// exact on the healthy arm — and only there: those outcomes leave residue by
 /// design. A poisoned promote must report `Incomplete`, leaving the stranded
 /// stage for the loop-tail heals (cell-grained for staged writes, whole-marker
-/// via the read window for clears — durable recovery converges). Returns the
-/// divergence reason, or `None`.
+/// via the read window for clears — durable recovery converges).
 async fn promote_receipt(
     fx: &Fixture,
     staged: StagedState<TestStore>,
     fail_promote: bool,
-) -> Result<Option<&'static str>> {
+) -> Result<()> {
     if fail_promote {
         fx.set_poison(Some(Poison::Collection(
             fx.value_name.clone(),
@@ -867,11 +866,11 @@ async fn promote_receipt(
     match (fail_promote, outcome) {
         (false, ApplyOutcome::Resolved) => {
             assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
-            Ok(None)
+            Ok(())
         }
-        (false, ApplyOutcome::Incomplete) => Ok(Some("a healthy promote reported Incomplete")),
-        (true, ApplyOutcome::Incomplete) => Ok(None),
-        (true, ApplyOutcome::Resolved) => Ok(Some("a poisoned promote reported Resolved")),
+        (false, ApplyOutcome::Incomplete) => bail!("a healthy promote reported Incomplete"),
+        (true, ApplyOutcome::Incomplete) => Ok(()),
+        (true, ApplyOutcome::Resolved) => bail!("a poisoned promote reported Resolved"),
     }
 }
 
@@ -881,8 +880,8 @@ async fn promote_receipt(
 /// answers `Clean` iff nothing was buffered (with the receipt's frozen records
 /// matching the durable marker, and a second finalize `Clean`), the consumed
 /// receipt converges, and the overlay + committed projections equal the model
-/// after every event. Returns the divergence reason, or `None` when the trace
-/// upholds the property.
+/// after every event. Errors carry the divergence reason; `Ok(())` means the
+/// trace upholds the property.
 ///
 /// A mid-event `commit()` snapshots the scratch model as immediately durable:
 /// on a commit the full scratch wins, on every other outcome the durable state
@@ -890,7 +889,7 @@ async fn promote_receipt(
 /// `commit()`-landed ops survive) — the at-least-once `commit()` contract. A
 /// `Rollback` reverts the scratch to the commit floor (or the pre-event
 /// committed value) and must report `Applied` iff anything was buffered.
-async fn run(trace: Trace) -> Result<Option<&'static str>> {
+async fn run(trace: Trace) -> Result<()> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
     let key = fx.state_key.key.clone();
@@ -913,33 +912,25 @@ async fn run(trace: Trace) -> Result<Option<&'static str>> {
                 if !apply_value_op(&session, &fx.value_name, *op, model.clone(), &mut ev_model)
                     .await?
                 {
-                    return Ok(Some("an op outcome or read diverged from the model"));
+                    bail!("an op outcome or read diverged from the model");
                 }
             }
 
             match ev.outcome {
                 Outcome::Commit { fail_promote } => {
                     let finalized =
-                        match checked_finalize(&fx, &session, event, ev_model.buffered).await? {
-                            Ok(finalized) => finalized,
-                            Err(reason) => return Ok(Some(reason)),
-                        };
+                        checked_finalize(&fx, &session, event, ev_model.buffered).await?;
                     session.register_marker(dedup_id);
                     session.flush_marker().await?;
-                    if let Finalized::Staged(staged) = finalized
-                        && let Some(reason) = promote_receipt(&fx, staged, fail_promote).await?
-                    {
-                        return Ok(Some(reason));
+                    if let Finalized::Staged(staged) = finalized {
+                        promote_receipt(&fx, staged, fail_promote).await?;
                     }
                     // Commit advances the model (last-writer-wins).
                     model = ev_model.scratch;
                 }
                 Outcome::Abort => {
                     let finalized =
-                        match checked_finalize(&fx, &session, event, ev_model.buffered).await? {
-                            Ok(finalized) => finalized,
-                            Err(reason) => return Ok(Some(reason)),
-                        };
+                        checked_finalize(&fx, &session, event, ev_model.buffered).await?;
                     if let Finalized::Staged(staged) = finalized {
                         staged.rollback().await;
                         // Same raw probe as `promote_receipt`'s healthy arm: a
@@ -955,10 +946,7 @@ async fn run(trace: Trace) -> Result<Option<&'static str>> {
                 }
                 Outcome::Reset => {
                     let finalized =
-                        match checked_finalize(&fx, &session, event, ev_model.buffered).await? {
-                            Ok(finalized) => finalized,
-                            Err(reason) => return Ok(Some(reason)),
-                        };
+                        checked_finalize(&fx, &session, event, ev_model.buffered).await?;
                     // Dropping the receipt leaves any provisional written by
                     // `finalize` standing, projecting its `prev` (the
                     // `commit()`-landed snapshot, or the unchanged committed
@@ -979,19 +967,19 @@ async fn run(trace: Trace) -> Result<Option<&'static str>> {
 
         // The shared dirty buffer is empty for the key — no per-event leak.
         if !fx.dirty.touched(&key).is_empty() {
-            return Ok(Some("the shared dirty buffer leaked past the event"));
+            bail!("the shared dirty buffer leaked past the event");
         }
         // A fresh overlay read (the dirty short-circuit path) tracks the model:
         // a leaked dirty cell would surface here as a read of uncommitted state.
         if fx.overlay_value().await? != model {
-            return Ok(Some("the overlay read diverged from the model"));
+            bail!("the overlay read diverged from the model");
         }
         // The committed projection still tracks the model.
         if fx.committed_value().await? != model {
-            return Ok(Some("the committed projection diverged from the model"));
+            bail!("the committed projection diverged from the model");
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 /// The central settlement property: the Value session lifecycle is sound over
@@ -1000,9 +988,8 @@ async fn run(trace: Trace) -> Result<Option<&'static str>> {
 fn prop_value_lifecycle_equivalence() {
     fn prop(trace: Trace) -> TestResult {
         match executor::block_on(run(trace)) {
-            Ok(None) => TestResult::passed(),
-            Ok(Some(reason)) => TestResult::error(reason),
-            Err(error) => TestResult::error(format!("trace errored: {error:#}")),
+            Ok(()) => TestResult::passed(),
+            Err(error) => TestResult::error(format!("{error:#}")),
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
