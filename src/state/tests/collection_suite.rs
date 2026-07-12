@@ -34,7 +34,7 @@ use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::descriptor::map::bound_cells;
+use crate::state::descriptor::map::{bound_cells, keyset_cell};
 use crate::state::descriptor::{
     DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
 };
@@ -306,25 +306,19 @@ fn make_session_with_dirty(
     })
 }
 
-/// Registers `name` under `commit_mode` and returns the shared registry plus
-/// the sweep ref.
+/// Registers `name` under `def` and returns the shared registry plus the sweep
+/// ref.
 fn registry_and_ref<D>(
     descriptor: &D,
     name: &str,
     state_key: &StateKey,
-    commit_mode: CommitMode,
+    def: CollectionDef,
 ) -> Result<(Arc<CollectionDefRegistry>, CollectionRef)>
 where
     D: StateDescriptor,
 {
     let mut registry = CollectionDefRegistry::new(None);
-    registry.register(
-        descriptor,
-        CollectionDef {
-            commit_mode,
-            ..CollectionDef::new(None)
-        },
-    )?;
+    registry.register(descriptor, def)?;
     let collection_ref = CollectionRef::new(
         CollectionId::new(
             state_key.clone(),
@@ -442,7 +436,7 @@ async fn run_collection_trace<D, O, M, Apply, Assert>(
     trace: Trace<O>,
     descriptor: D,
     name: &str,
-    commit_mode: CommitMode,
+    def: CollectionDef,
     apply_op: Apply,
     assert: Assert,
 ) -> Result<bool>
@@ -453,10 +447,11 @@ where
     Apply: AsyncFn(&D::Handle<SuiteSession>, O, &mut M) -> Result<OpOutcome>,
     Assert: AsyncFn(&D::Handle<SuiteSession>, &M, &Backing<'_>) -> Result<bool>,
 {
+    let commit_mode = def.commit_mode;
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key, commit_mode)?;
+    let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key, def)?;
     let armed: ArmedKeys = Arc::default();
     let backing = Backing {
         cells: &cells,
@@ -547,7 +542,10 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) 
         trace,
         deque_state::<JsonCodec>("dq"),
         "dq",
-        commit_mode,
+        CollectionDef {
+            commit_mode,
+            ..CollectionDef::new(None)
+        },
         async |handle, op, scratch: &mut VecDeque<Value>| match op {
             DequeOp::PushBack(b) => {
                 let v = Value::from(b);
@@ -590,7 +588,15 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
         trace,
         map_state::<I64KeyCodec, JsonCodec>("mp"),
         "mp",
-        commit_mode,
+        // A small keyset limit under the 5-key pool, so generated traces cross
+        // Tracked → Overflowed, hit the already-tracked fast path, and
+        // interleave removes/clears — while the BTreeMap model stays oblivious
+        // to the keyset's existence (the property proves it cannot tell).
+        CollectionDef {
+            commit_mode,
+            keyset_limit: 3,
+            ..CollectionDef::new(None)
+        },
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
             MapOp::Set(k, b) => {
                 let v = Value::from(b);
@@ -646,7 +652,10 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(
         &descriptor,
-        CollectionDef::new(Some(CompactDuration::new(3_600))),
+        CollectionDef {
+            keyset_limit: 3,
+            ..CollectionDef::new(Some(CompactDuration::new(3_600)))
+        },
     )?;
     let registry = Arc::new(registry);
     let id = CollectionId::new(
@@ -656,6 +665,7 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
     );
     let armed: ArmedKeys = Arc::default();
     let (min_cell, max_cell) = bound_cells();
+    let keyset_cell = keyset_cell();
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let event = EventRef::Message {
@@ -681,7 +691,11 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
                     let snapshot = dirty.collection_snapshot(&id);
                     let has_min = snapshot.iter().any(|(c, _)| *c == min_cell);
                     let has_max = snapshot.iter().any(|(c, _)| *c == max_cell);
-                    if !(has_min && has_max) {
+                    // On a TTL'd map every set rewrites the keyset too, covering
+                    // both no-write fast paths (already-tracked and Overflowed
+                    // are reached with pool 5 / limit 3).
+                    let has_keyset = snapshot.iter().any(|(c, _)| *c == keyset_cell);
+                    if !(has_min && has_max && has_keyset) {
                         return Ok(false);
                     }
                 }
@@ -714,7 +728,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
     let (registry, collection_ref) =
-        registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+        registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
 
     let head = shape.head;
@@ -923,7 +937,7 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
-        registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
 
     // Bounds spanning the whole key space so a scan is issued and reaches the
@@ -988,7 +1002,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
-    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+    let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
     let armed: ArmedKeys = Arc::default();
     let event = read_event(0);
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
@@ -1045,7 +1059,7 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
     let (registry, collection_ref) =
-        registry_and_ref(&descriptor, "dq", &state_key, CommitMode::ReadCommitted)?;
+        registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
     let armed: ArmedKeys = Arc::default();
 
@@ -1106,11 +1120,12 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
 /// Map clear, pinned at the physical grain the loose-superset bounds
 /// invariant cannot reach (`assert_map_bounds` passes vacuously on an empty
 /// model, and after repopulation stale bounds still satisfy the superset
-/// check): a committed `clear()` erases both bound cells with the entries, so
-/// the absent-bounds ⇔ empty-map reading survives a cleared map. Stale bounds
-/// on a cleared map would keep issuing lower scans over the erased
-/// (tombstoned) range on every later `stream` — the tombstone paging the
-/// bounds exist to prevent.
+/// check): a committed `clear()` erases both bound cells **and the keyset**
+/// with the entries, so the absent-bounds ⇔ empty-map reading survives a
+/// cleared map. Stale bounds on a cleared map would keep issuing lower scans
+/// over the erased (tombstoned) range on every later `stream` — the tombstone
+/// paging the bounds exist to prevent. A later set then starts a fresh
+/// `Tracked` keyset (clear resets the tracking, not just the entries).
 #[test]
 fn map_clear_erases_the_bound_cells() -> Result<()> {
     use futures::executor::block_on;
@@ -1120,7 +1135,7 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
-        registry_and_ref(&descriptor, "mp", &state_key, CommitMode::ReadCommitted)?;
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
     let armed: ArmedKeys = Arc::default();
 
@@ -1160,6 +1175,519 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
         block_on(store.get(id, &max_cell, read_event(0)))?.into_inner(),
         None,
         "the committed clear must erase the Max bound cell"
+    );
+    assert_eq!(
+        block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner(),
+        None,
+        "the committed clear must erase the keyset cell"
+    );
+
+    // Event 3: one committed set repopulates a fresh single-key Tracked keyset
+    // (bounds absent after clear ⇒ the empty map ⇒ a fresh singleton, not a
+    // stale pre-clear list).
+    let event3 = EventRef::Message {
+        dedup_id: Uuid::from_u128(3),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event3);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(7, Value::from(1_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event3), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    assert_eq!(
+        block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner(),
+        Some(bytes::Bytes::from(tracked_frame(&[7]))),
+        "a set after clear writes a fresh single-key Tracked keyset"
+    );
+    Ok(())
+}
+
+/// The exact `Tracked` frame bytes over `i64` keys (assumed ascending): tag
+/// `0`, `u32` BE count, then per key a `u32` BE length and the 8-byte
+/// sign-flipped BE coordinate — built from the real codec so a
+/// coordinate-encoding change moves with it.
+fn tracked_frame(keys: &[i64]) -> Vec<u8> {
+    let mut frame = vec![TRACKED_TAG_BYTE];
+    frame.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for k in keys {
+        let coordinate = I64KeyCodec::encode(k);
+        frame.extend_from_slice(&(coordinate.as_bytes().len() as u32).to_be_bytes());
+        frame.extend_from_slice(coordinate.as_bytes());
+    }
+    frame
+}
+
+/// The frozen `Tracked` tag byte (`MapKeysetCodec` — mirrored here so the
+/// suite's golden frames pin the same value the codec writes).
+const TRACKED_TAG_BYTE: u8 = 0;
+
+/// The frozen `Overflowed` sentinel frame (`[1]`).
+const OVERFLOWED_FRAME: [u8; 1] = [1];
+
+/// Durable keyset frame golden: after committed sets the raw keyset cell holds
+/// the exact `Tracked` frame — tag, `u32` count, per-key `u32` length +
+/// sign-flipped BE coordinate, sort order, and the `[2]` address, all in one
+/// probe — and the first set past the limit collapses it to the exact
+/// `Overflowed` sentinel.
+#[test]
+fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) = registry_and_ref(
+        &descriptor,
+        "mp",
+        &state_key,
+        CollectionDef {
+            keyset_limit: 2,
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let id = collection_ref.id();
+    let armed: ArmedKeys = Arc::default();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+
+    // Event 1: keys 1 and 2 fill the limit-2 keyset — a two-key Tracked frame.
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(1, Value::from(1_u8)).await?;
+        handle.set(2, Value::from(2_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
+        bail!("the committed sets must have written a keyset cell");
+    };
+    assert_eq!(
+        &bytes[..],
+        [
+            0, 0, 0, 0, 2, 0, 0, 0, 8, 0x80, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 8, 0x80, 0, 0, 0, 0, 0,
+            0, 2
+        ],
+        "the two-key Tracked frame is frozen (tag, count, lengths, coordinates, order, address)"
+    );
+
+    // Event 2: key 3 exceeds the limit → the Overflowed sentinel.
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(3, Value::from(3_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+        bail!("the overflowing set must have written a keyset cell");
+    };
+    assert_eq!(
+        &bytes[..],
+        OVERFLOWED_FRAME,
+        "the first set past the limit writes the Overflowed sentinel"
+    );
+    Ok(())
+}
+
+/// On a **TTL'd** map every set rewrites the keyset with its current contents
+/// (not `Overflowed`): two committed sets under the limit leave the exact
+/// two-key `Tracked` frame. Guards against a TTL-refresh that collapses to
+/// `Overflowed` — invisible to a presence-only snapshot assert.
+#[test]
+fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) = registry_and_ref(
+        &descriptor,
+        "mp",
+        &state_key,
+        CollectionDef {
+            keyset_limit: 3,
+            ..CollectionDef::new(Some(CompactDuration::new(3_600)))
+        },
+    )?;
+    let id = collection_ref.id();
+    let armed: ArmedKeys = Arc::default();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(1, Value::from(1_u8)).await?;
+        handle.set(2, Value::from(2_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    assert_eq!(
+        block_on(store.get(id, &keyset_cell(), read_event(0)))?
+            .into_inner()
+            .map(|b| b.to_vec()),
+        Some(tracked_frame(&[1, 2])),
+        "a TTL'd map keeps a Tracked keyset, never collapses to Overflowed"
+    );
+    Ok(())
+}
+
+/// The conservative Absent-with-bounds transition, unreachable by the property
+/// (every handle path leaving bounds present also writes the keyset): seeded
+/// pre-keyset rows (bounds + an entry, no keyset cell), then one committed set
+/// of a new key writes `Overflowed` (membership unknown), and the scan path
+/// still yields both entries.
+#[test]
+fn map_keyset_conservative_on_pre_keyset_rows() -> Result<()> {
+    use crate::state::descriptor::map::entry_cell_for;
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
+    let id = collection_ref.id();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let armed: ArmedKeys = Arc::default();
+
+    // Pre-keyset shape: bounds [enc(1), enc(1)] + one entry at key 1, no keyset.
+    let (min_cell, max_cell) = bound_cells();
+    let bound_bytes = Bytes::copy_from_slice(I64KeyCodec::encode(&1).as_bytes());
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[
+            (min_cell, Some(bound_bytes.clone())),
+            (max_cell, Some(bound_bytes)),
+            (
+                entry_cell_for(&I64KeyCodec::encode(&1)),
+                Some(Bytes::from(serde_json::to_vec(&Value::from(10_u8))?)),
+            ),
+        ],
+        &[],
+    ))?;
+
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let items = block_on(async {
+        handle.set(5, Value::from(50_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        let read = make_session(
+            &cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            read_event(0),
+        );
+        let read_handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+        collect_map(&read_handle, Direction::Forward).await
+    })?;
+
+    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+        bail!("the set must have written a keyset cell");
+    };
+    assert_eq!(
+        &bytes[..],
+        OVERFLOWED_FRAME,
+        "Absent keyset + bounds present ⇒ conservatively Overflowed"
+    );
+    assert_eq!(
+        items,
+        vec![(1, Value::from(10_u8)), (5, Value::from(50_u8))],
+        "the bounds scan still yields both the seeded and the new entry"
+    );
+    Ok(())
+}
+
+/// A malformed keyset frame degrades iteration to the scan (never errors) and
+/// is healed by the next set (which writes `Overflowed`).
+#[test]
+fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
+    let id = collection_ref.id();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let armed: ArmedKeys = Arc::default();
+
+    // Event 1: a committed two-key map (writes a valid Tracked keyset).
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(1, Value::from(1_u8)).await?;
+        handle.set(2, Value::from(2_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    // Corrupt the keyset cell raw (unknown tag).
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[(keyset_cell(), Some(Bytes::from(vec![9_u8])))],
+        &[],
+    ))?;
+
+    // A fresh stream degrades to the scan and yields both entries (no error).
+    let read = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let read_handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+    let items = block_on(collect_map(&read_handle, Direction::Forward))?;
+    assert_eq!(
+        items,
+        vec![(1, Value::from(1_u8)), (2, Value::from(2_u8))],
+        "a malformed keyset degrades to the scan, not an error"
+    );
+
+    // Event 2: a committed set heals the cell (malformed → Overflowed).
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(1, Value::from(9_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+        bail!("the healing set must have written a keyset cell");
+    };
+    assert_eq!(
+        &bytes[..],
+        OVERFLOWED_FRAME,
+        "the next set heals the malformed frame to Overflowed"
+    );
+    Ok(())
+}
+
+/// An oversized (but valid) stored `Tracked` frame — more keys than the
+/// registered limit — degrades iteration to the scan, and the next set of an
+/// **already-listed** key collapses it to `Overflowed`: the size check runs
+/// before the already-present fast path.
+#[test]
+fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
+    use crate::state::descriptor::map::entry_cell_for;
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) = registry_and_ref(
+        &descriptor,
+        "mp",
+        &state_key,
+        CollectionDef {
+            keyset_limit: 3,
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let id = collection_ref.id();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let armed: ArmedKeys = Arc::default();
+
+    // Seed a valid 5-key Tracked keyset (over limit 3) plus bounds and entries.
+    let (min_cell, max_cell) = bound_cells();
+    let mut seed = vec![
+        (
+            min_cell,
+            Some(Bytes::copy_from_slice(I64KeyCodec::encode(&1).as_bytes())),
+        ),
+        (
+            max_cell,
+            Some(Bytes::copy_from_slice(I64KeyCodec::encode(&5).as_bytes())),
+        ),
+        (
+            keyset_cell(),
+            Some(Bytes::from(tracked_frame(&[1, 2, 3, 4, 5]))),
+        ),
+    ];
+    for k in 1..=5_i64 {
+        seed.push((
+            entry_cell_for(&I64KeyCodec::encode(&k)),
+            Some(Bytes::from(serde_json::to_vec(&Value::from(
+                u8::try_from(k)?,
+            ))?)),
+        ));
+    }
+    block_on(store.write_resolved(&collection_ref, &seed, &[]))?;
+
+    // The oversized Tracked keyset degrades to the scan (yields all 5).
+    let read = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let read_handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+    let items = block_on(collect_map(&read_handle, Direction::Forward))?;
+    assert_eq!(items.len(), 5, "the oversized keyset degrades to the scan");
+
+    // A set of an ALREADY-LISTED key collapses to Overflowed — the size check
+    // ran before the already-present fast path.
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(1, Value::from(11_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+        bail!("the set must have written a keyset cell");
+    };
+    assert_eq!(
+        &bytes[..],
+        OVERFLOWED_FRAME,
+        "an oversized Tracked collapses to Overflowed even when the key is already listed"
+    );
+    Ok(())
+}
+
+/// The encoded-byte ceiling overflows the keyset even when the key count is far
+/// under the limit: two committed sets of ~40 KiB string keys exceed the 64 KiB
+/// frame ceiling on the second, writing `Overflowed`.
+#[test]
+fn map_keyset_byte_ceiling_overflows() -> Result<()> {
+    use crate::state::order_codec::Utf8KeyCodec;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<Utf8KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
+    let id = collection_ref.id();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let armed: ArmedKeys = Arc::default();
+
+    let big_a = "a".repeat(40 * 1024);
+    let big_b = "b".repeat(40 * 1024);
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(big_a, Value::from(1_u8)).await?;
+        handle.set(big_b, Value::from(2_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
+        bail!("the sets must have written a keyset cell");
+    };
+    assert_eq!(
+        &bytes[..],
+        OVERFLOWED_FRAME,
+        "two ~40 KiB keys exceed the 64 KiB frame ceiling (count far under the limit)"
+    );
+    Ok(())
+}
+
+/// On a non-TTL'd map a set of an already-tracked key writes **no** keyset
+/// cell, and `remove` never writes it (remove stays a blind entry clear) — both
+/// invisible to a value-only assert, so probed on the dirty write set itself.
+#[test]
+fn map_keyset_skips_rewrite_when_tracked() -> Result<()> {
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&descriptor, CollectionDef::new(None))?;
+    let registry = Arc::new(registry);
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("mp")?,
+    );
+    let armed: ArmedKeys = Arc::default();
+
+    // Event 1: set key 7 committed (a fresh single-key Tracked keyset).
+    let event1 = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(7, Value::from(1_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, &id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+
+    // Event 2 over a caller-owned dirty workspace: re-set 7, then remove it.
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let dirty = Arc::new(DirtyStore::new());
+    let session = make_session_with_dirty(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event2,
+        dirty.clone(),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(7, Value::from(2_u8)).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let after_reset = dirty.collection_snapshot(&id);
+    assert!(
+        !after_reset.iter().any(|(c, _)| *c == keyset_cell()),
+        "a non-TTL re-set of a tracked key writes no keyset cell"
+    );
+    block_on(async {
+        handle.remove(&7).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    let after_remove = dirty.collection_snapshot(&id);
+    assert!(
+        !after_remove.iter().any(|(c, _)| *c == keyset_cell()),
+        "remove never writes the keyset cell (it stays a blind entry clear)"
     );
     Ok(())
 }

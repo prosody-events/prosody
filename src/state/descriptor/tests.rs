@@ -415,6 +415,15 @@ fn reregistration_updates_operational_settings() -> Result<()> {
     Ok(())
 }
 
+/// The Map-only `keyset_limit` fluent method threads into the collection def
+/// (uncompilable on a Value or Deque, which is a type-level property, not a
+/// runtime one).
+#[test]
+fn keyset_limit_threads_into_the_collection_def() {
+    let descriptor: MapDescriptor<I64KeyCodec> = map_state("m");
+    assert_eq!(descriptor.keyset_limit(7).collection_def().keyset_limit, 7);
+}
+
 /// An empty descriptor name fails loudly at registration — the
 /// fallible boundary backing the infallible `value_state`.
 #[test]

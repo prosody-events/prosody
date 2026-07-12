@@ -12,6 +12,7 @@ use crate::state::descriptor::StructuralIdentity;
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
+use crate::state::registry::DEFAULT_KEYSET_LIMIT;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::CellStore;
@@ -121,6 +122,12 @@ where
 
     fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
         false
+    }
+
+    fn collection_keyset_limit(&self, _state_type: StateType, _name: &StateName) -> usize {
+        // Unreachable in practice: every op on this stub errors `Unavailable`
+        // first. The default keeps the trait total.
+        DEFAULT_KEYSET_LIMIT
     }
 
     fn verify_state_registration(

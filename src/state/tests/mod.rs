@@ -469,14 +469,34 @@ fn counting_session(
     })
 }
 
-/// Streaming a never-written map issues **no** lower-store scan: the
-/// bounds-absent early return in `MapHandle::stream` (both `MapBound` cells
-/// absent ⇒ empty map ⇒ no scan) short-circuits before any range read reaches
-/// the cell store. Non-vacuity is proved in the same test — one committed entry
-/// makes a later stream scan the lower store — so the zero assertion cannot
-/// pass by the counter being dead.
+/// Binds `map_state(name)` on `session` and fully drains its `stream(dir)`.
+/// Called with a fresh (clean-overlay) session so every read falls through to
+/// the underlying store.
+async fn drain_map_stream(
+    session: &KeyedStateSession<CountingBackend, MemoryLoader<Value>>,
+    name: &str,
+    dir: Direction,
+) -> Result<Vec<(i64, Value)>> {
+    let handle = map_state::<I64KeyCodec, JsonCodec>(name)
+        .bind(session)
+        .map_err(|e| eyre!("bind: {e}"))?;
+    let mut out = Vec::new();
+    let stream = handle.stream(dir);
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+/// The Map keyset budget pins for the point-get arms (parity of
+/// `deque_stream_issues_no_scans`): a never-written map yields nothing and
+/// issues zero scans, and a small committed map streams as pure point gets —
+/// zero scans and exactly `len + 1` gets (the keyset cell plus one per entry,
+/// no bound reads), in both directions. The liveness of these zeros is proved
+/// by `map_overflowed_stream_issues_one_scan`.
 #[test]
-fn empty_map_stream_issues_no_lower_scans() -> Result<()> {
+fn map_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
@@ -494,41 +514,30 @@ fn empty_map_stream_issues_no_lower_scans() -> Result<()> {
         ));
         let armed: ArmedKeys = Arc::default();
 
-        // 1. Stream the never-written map: no bounds ⇒ no scan.
+        // Empty-map arm: no keyset ⇒ scan fallback ⇒ no bounds ⇒ no scan.
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(0),
         };
         let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
-        let handle = map_state::<I64KeyCodec, JsonCodec>("mp")
-            .bind(&session)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        let mut drained = 0usize;
-        {
-            let stream = handle.stream(Direction::Forward);
-            futures::pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                item.map_err(|e| eyre!("stream: {e}"))?;
-                drained += 1;
-            }
-        }
-        assert_eq!(drained, 0, "an unwritten map yields no entries");
+        let drained = drain_map_stream(&session, "mp", Direction::Forward).await?;
+        assert!(drained.is_empty(), "an unwritten map yields no entries");
         assert_eq!(
             counting.lower_scans(),
             0,
             "streaming an empty map must issue no lower-store scan"
         );
 
-        // 2. Commit one entry, then stream in a fresh session — now a lower scan MUST
-        //    be issued, proving the zero above is a live counter.
+        // Commit a three-entry map — its keyset tracks all three keys.
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(1),
         };
         let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
-        map_state::<I64KeyCodec, JsonCodec>("mp")
+        let handle = map_state::<I64KeyCodec, JsonCodec>("mp")
             .bind(&session)
-            .map_err(|e| eyre!("bind: {e}"))?
-            .set(0, Value::from(7_i64))
-            .await?;
+            .map_err(|e| eyre!("bind: {e}"))?;
+        handle.set(0, Value::from(10_i64)).await?;
+        handle.set(1, Value::from(11_i64)).await?;
+        handle.set(2, Value::from(12_i64)).await?;
         let id = CollectionId::new(
             state_key.clone(),
             StateType::Application,
@@ -536,28 +545,106 @@ fn empty_map_stream_issues_no_lower_scans() -> Result<()> {
         );
         finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
 
-        counting.reset();
+        // Warm-Tracked arm: pure point gets in key order, both directions.
+        for (n, (dir, expected)) in [
+            (Direction::Forward, vec![(0_i64, 10_i64), (1, 11), (2, 12)]),
+            (Direction::Backward, vec![(2_i64, 12_i64), (1, 11), (0, 10)]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            counting.reset();
+            let event = EventRef::Message {
+                dedup_id: Uuid::from_u128(u128::MAX - n as u128),
+            };
+            let session =
+                counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+            let out = drain_map_stream(&session, "mp", dir).await?;
+            let want: Vec<(i64, Value)> = expected
+                .into_iter()
+                .map(|(k, v)| (k, Value::from(v)))
+                .collect();
+            assert_eq!(
+                out, want,
+                "{dir:?} Tracked stream yields the committed entries"
+            );
+            assert_eq!(
+                counting.lower_scans(),
+                0,
+                "a Tracked stream must issue no lower scan"
+            );
+            assert_eq!(
+                counting.lower_reads(),
+                4,
+                "the keyset cell plus three entry gets — no bound reads"
+            );
+        }
+        Ok(())
+    })
+}
+
+/// The overflowed-map budget pin (the liveness proof for
+/// `map_stream_issues_no_scans`): a keyset-disabled map (`keyset_limit = 0`)
+/// overflows on its first set and streams through **exactly one** scan (plus
+/// the keyset and both bound gets).
+#[test]
+fn map_overflowed_stream_issues_one_scan() -> Result<()> {
+    executor::block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let mut registry = CollectionDefRegistry::new(None);
+        registry.register(
+            &map_state::<I64KeyCodec, JsonCodec>("mp-of"),
+            CollectionDef {
+                keyset_limit: 0,
+                ..CollectionDef::new(None)
+            },
+        )?;
+        let registry = Arc::new(registry);
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            registry.clone(),
+        ));
+        let armed: ArmedKeys = Arc::default();
 
         let event = EventRef::Message {
-            dedup_id: Uuid::from_u128(2),
+            dedup_id: Uuid::from_u128(0),
         };
         let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
-        let handle = map_state::<I64KeyCodec, JsonCodec>("mp")
+        map_state::<I64KeyCodec, JsonCodec>("mp-of")
             .bind(&session)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        let mut drained = 0usize;
-        {
-            let stream = handle.stream(Direction::Forward);
-            futures::pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                item.map_err(|e| eyre!("stream: {e}"))?;
-                drained += 1;
-            }
-        }
-        assert_eq!(drained, 1, "the committed entry streams back");
-        assert!(
-            counting.lower_scans() > 0,
-            "streaming a populated map must issue a lower-store scan"
+            .map_err(|e| eyre!("bind: {e}"))?
+            .set(0, Value::from(99_i64))
+            .await?;
+        let of_id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("mp-of")?,
+        );
+        finalize_and_promote(&session, &oracle, Uuid::from_u128(0), &cells, &of_id).await?;
+
+        counting.reset();
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX - 100),
+        };
+        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let out = drain_map_stream(&session, "mp-of", Direction::Forward).await?;
+        assert_eq!(
+            out,
+            vec![(0_i64, Value::from(99_i64))],
+            "the overflowed map streams its entry via the scan"
+        );
+        assert_eq!(
+            counting.lower_scans(),
+            1,
+            "an overflowed map issues exactly one lower scan"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            3,
+            "the keyset cell plus both bound cells"
         );
         Ok(())
     })

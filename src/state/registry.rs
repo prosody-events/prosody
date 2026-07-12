@@ -10,6 +10,16 @@ use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Default Map keyset bound — the distinct-key universe a map tracks before it
+/// overflows to the durable bounds scan. Applied to any collection not
+/// overriding it and to names absent from the registry.
+pub(crate) const DEFAULT_KEYSET_LIMIT: usize = 128;
+
+/// Registration ceiling on the Map keyset bound: a larger limit is rejected at
+/// build ([`RegisterStateError::KeysetLimit`]) so a single map can never hold
+/// an unbounded keyset cell in RAM or on the wire.
+const MAX_KEYSET_LIMIT: usize = 4096;
+
 /// Persistence mode for a collection's state changes, chosen per collection
 /// at registration
 /// ([`StateDescriptor::read_uncommitted`](crate::state::descriptor::StateDescriptor::read_uncommitted);
@@ -85,6 +95,15 @@ pub struct CollectionDef {
     /// Per-collection recovery-convergence bound (see the type doc).
     /// `None` uses the always-on `recovery_delay` floor.
     pub recovery_within: Option<CompactDuration>,
+
+    /// Map keyset bound: the number of **distinct keys since `clear`** a map
+    /// tracks in its keyset cell before overflowing to the durable bounds scan
+    /// (not the live entry count). Meaningful for Map collections only; ignored
+    /// by Value and Deque. `0` disables tracking (every map overflows on its
+    /// first `set`). Operational, never part of the frozen
+    /// [`StructuralIdentity`] — changing it needs no migration. Validated
+    /// `<= 4096` at registration ([`RegisterStateError::KeysetLimit`]).
+    pub keyset_limit: usize,
 }
 
 impl CollectionDef {
@@ -97,6 +116,7 @@ impl CollectionDef {
             ttl,
             commit_mode: CommitMode::ReadCommitted,
             recovery_within: None,
+            keyset_limit: DEFAULT_KEYSET_LIMIT,
         }
     }
 }
@@ -186,6 +206,12 @@ impl CollectionDefRegistry {
                 seconds: ttl.seconds(),
             });
         }
+        if def.keyset_limit > MAX_KEYSET_LIMIT {
+            return Err(RegisterStateError::KeysetLimit {
+                name,
+                limit: def.keyset_limit,
+            });
+        }
         let namespace = self.defs.entry(state_type).or_default();
         if let Some(existing) = namespace.get(&name)
             && existing.identity != identity
@@ -241,6 +267,14 @@ impl CollectionDefRegistry {
     ) -> Option<CompactDuration> {
         self.lookup_collection(state_type, name)
             .map_or(self.default_ttl, |c| c.def.ttl)
+    }
+
+    /// Returns the Map keyset bound for `(state_type, name)`, falling back to
+    /// [`DEFAULT_KEYSET_LIMIT`] for names not in the registry.
+    #[must_use]
+    pub(crate) fn keyset_limit_for(&self, state_type: StateType, name: &StateName) -> usize {
+        self.lookup_collection(state_type, name)
+            .map_or(DEFAULT_KEYSET_LIMIT, |c| c.def.keyset_limit)
     }
 
     /// Returns the commit mode bound to `(state_type, name)`, falling back to
@@ -319,6 +353,19 @@ pub enum RegisterStateError {
 
         /// The configured recovery delay, in seconds.
         recovery_seconds: u32,
+    },
+
+    /// The collection's Map keyset limit exceeds the maximum of `4096`.
+    /// Rejected at registration — the single choke point behind every
+    /// `keyset_limit_for` read — so a misconfigured limit that would let one
+    /// map hold an unbounded keyset cell fails fast at build time.
+    #[error("state collection {name:?} keyset limit {limit} exceeds the maximum of 4096")]
+    KeysetLimit {
+        /// Collection name whose keyset limit is over the ceiling.
+        name: StateName,
+
+        /// The offending keyset limit.
+        limit: usize,
     },
 
     /// The name is already registered with a different structural identity.

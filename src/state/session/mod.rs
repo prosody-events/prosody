@@ -128,6 +128,12 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// real session.
     fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool;
 
+    /// The Map keyset bound for `(state_type, name)` — the distinct-key
+    /// universe a map tracks before overflowing to the durable bounds scan.
+    /// Read per `set`/`stream` on a Map handle. No default impl: a wrong
+    /// silent default would mis-size the keyset for a real session.
+    fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize;
+
     /// Validates that the keyed-state collection named `(state_type, name)` is
     /// registered with the asserted structural identity, returning the
     /// canonical [`StateName`].
@@ -917,6 +923,10 @@ where
 
     fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool {
         self.inner.registry.ttl_for(state_type, name).is_some()
+    }
+
+    fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize {
+        self.inner.registry.keyset_limit_for(state_type, name)
     }
 
     fn verify_state_registration(

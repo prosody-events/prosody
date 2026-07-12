@@ -663,6 +663,13 @@ impl<S: CellSession> CellScope<S> {
         self.session.collection_has_ttl(self.state_type, &self.name)
     }
 
+    /// This collection's Map keyset bound — a cheap registry lookup the Map
+    /// keyset transition consults per `set`/`stream`.
+    pub(in crate::state::descriptor) fn keyset_limit(&self) -> usize {
+        self.session
+            .collection_keyset_limit(self.state_type, &self.name)
+    }
+
     /// Reads one cell's visible committed bytes.
     pub(in crate::state::descriptor) async fn raw_get(
         &self,
@@ -797,6 +804,12 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// [`CellScope::has_ttl`]).
     pub(crate) fn has_ttl(&self) -> bool {
         self.scope.has_ttl()
+    }
+
+    /// This view's collection Map keyset bound (see
+    /// [`CellScope::keyset_limit`]).
+    pub(crate) fn keyset_limit(&self) -> usize {
+        self.scope.keyset_limit()
     }
 
     /// Buffers a dirty clear marker over this view's whole section: every

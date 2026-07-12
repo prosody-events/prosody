@@ -19,7 +19,7 @@
 
 use super::super::cached::Cached;
 use super::super::descriptor::{
-    CellStateError, StateDescriptor, deque, deque_state, map_state, value_state,
+    CellStateError, MapStateError, StateDescriptor, deque, deque_state, map_state, value_state,
 };
 use super::super::manager::ArmedKeys;
 use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -97,6 +97,13 @@ impl GateFixture {
             CollectionDef::new(None),
         )?;
         registry.register(&deque_state::<JsonCodec>("d"), CollectionDef::new(None))?;
+        registry.register(
+            &map_state::<I64KeyCodec, JsonCodec>("ks"),
+            CollectionDef {
+                keyset_limit: 3,
+                ..CollectionDef::new(None)
+            },
+        )?;
         let registry = Arc::new(registry);
         let counting = CountingCellStore::new(MemoryCellStore::new(
             cells.clone(),
@@ -376,22 +383,37 @@ fn gate_serializes_set_against_clear() -> Result<()> {
             .get(&fx.id("m")?, &min_cell, probe(99))
             .await?
             .into_inner();
+        let keyset = fx
+            .counting
+            .get(
+                &fx.id("m")?,
+                &super::super::descriptor::map::keyset_cell(),
+                probe(99),
+            )
+            .await?
+            .into_inner();
         assert_eq!(
             entry.is_some(),
             min.is_some(),
             "the outcome equals a serial order: entry and bounds live or die together"
+        );
+        assert_eq!(
+            entry.is_some(),
+            keyset.is_some(),
+            "the outcome equals a serial order: entry and keyset live or die together"
         );
         Ok(())
     })
 }
 
 /// The ratchet-lost-update pin (the pre-existing `ratchet_bounds`
-/// read-modify-write race the gate closes): two racing sets of the extremes
-/// serialize under the gate, so the final bounds hold BOTH extremes and a
-/// stream yields both entries. Red-proven by deleting the permit acquisition:
-/// the parked set's stale bound reads overwrite the other's ratchet, the
-/// bounds lose an extension, and the loose-superset invariant breaks (the
-/// stream drops the out-of-bounds entry).
+/// read-modify-write race the gate closes) and the set/set-from-empty keyset
+/// pin: two racing sets of the extremes serialize under the gate, so the final
+/// bounds hold BOTH extremes, the keyset is the UNION of both keys (not a
+/// last-wins singleton), and a stream yields both entries. Red-proven by
+/// deleting the permit acquisition: the parked set's stale reads overwrite the
+/// other's ratchet and keyset update, the bounds lose an extension and the
+/// keyset loses a key, and the loose-superset invariant breaks.
 #[test]
 fn gate_serializes_racing_ratchets() -> Result<()> {
     runtime()?.block_on(async {
@@ -451,6 +473,266 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
             keys,
             vec![1, 9],
             "serialized ratchets hold both extremes — no lost bound extension"
+        );
+
+        // The bounds-ratchet twin: no live key lands outside the stored bounds.
+        let id = fx.id("m")?;
+        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let min = fx
+            .counting
+            .get(&id, &min_cell, probe(99))
+            .await?
+            .into_inner()
+            .ok_or_else(|| eyre!("missing Min bound"))?;
+        let max = fx
+            .counting
+            .get(&id, &max_cell, probe(99))
+            .await?
+            .into_inner()
+            .ok_or_else(|| eyre!("missing Max bound"))?;
+        assert!(
+            min[..] <= I64KeyCodec::encode(&1).as_bytes()[..]
+                && max[..] >= I64KeyCodec::encode(&9).as_bytes()[..],
+            "the stored bounds contain both keys — no live key outside them"
+        );
+
+        // The keyset is the UNION {1, 9}, not a last-wins singleton.
+        let keyset = fx
+            .counting
+            .get(
+                &id,
+                &super::super::descriptor::map::keyset_cell(),
+                probe(99),
+            )
+            .await?
+            .into_inner()
+            .ok_or_else(|| eyre!("missing keyset cell"))?;
+        assert_eq!(
+            keyset[..],
+            two_key_tracked_frame(1, 9),
+            "the serialized keyset updates union both keys"
+        );
+        Ok(())
+    })
+}
+
+/// The exact two-key `Tracked` frame over ascending `i64` keys `a < b`, built
+/// from the real codec.
+fn two_key_tracked_frame(a: i64, b: i64) -> Vec<u8> {
+    let mut frame = vec![0u8, 0, 0, 0, 2];
+    for k in [a, b] {
+        let coordinate = I64KeyCodec::encode(&k);
+        frame.extend_from_slice(&(coordinate.as_bytes().len() as u32).to_be_bytes());
+        frame.extend_from_slice(coordinate.as_bytes());
+    }
+    frame
+}
+
+/// The set/set-nearly-full keyset pin: two racing sets on a map already at
+/// `limit - 1` keys serialize under the gate, so the second observes the
+/// first's insert and overflows — the raw keyset is the `Overflowed` sentinel
+/// and the map holds all four entries. Red without the gate: both sets read the
+/// same two-key keyset, both compute a fitting three-key list, and a last-wins
+/// keyset write silently under-tracks (a three-of-four Tracked frame survives).
+#[test]
+fn gate_overflows_keyset_at_the_limit() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_keyset_overflow")?;
+        let id = fx.id("ks")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Seed a two-key keyset (limit 3) beneath the cache, so event ops read
+        // cold and land on the armed hold.
+        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
+        let entry =
+            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
+        fx.counting
+            .write_resolved(
+                &cref,
+                &[
+                    (min_cell, Some(bound(1))),
+                    (max_cell, Some(bound(2))),
+                    (
+                        super::super::descriptor::map::keyset_cell(),
+                        Some(Bytes::from(two_key_tracked_frame(1, 2))),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        Some(entry(1)?),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        Some(entry(2)?),
+                    ),
+                ],
+                &[],
+            )
+            .await?;
+
+        let session = fx.session(1);
+        let handle = map_state::<I64KeyCodec, JsonCodec>("ks")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // set(3) parks in its cold meta read while holding the gate; set(4)
+        // parks on the gate behind it.
+        fx.holds.get_for_cache().arm(1);
+        let first = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.set(3, Value::from(3_i64)).await }
+        });
+        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+            .await
+            .map_err(|_| eyre!("set(3) never reached its hold"))?;
+        let second = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.set(4, Value::from(4_i64)).await }
+        });
+        let_task_park().await;
+        fx.holds.get_for_cache().release();
+        timeout(HANG_GUARD, first)
+            .await
+            .map_err(|_| eyre!("set(3) hung"))??
+            .map_err(|e| eyre!("set(3): {e}"))?;
+        timeout(HANG_GUARD, second)
+            .await
+            .map_err(|_| eyre!("set(4) hung"))??
+            .map_err(|e| eyre!("set(4): {e}"))?;
+
+        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
+
+        // The serial second set exceeds the limit → Overflowed.
+        let keyset = fx
+            .counting
+            .get(
+                &id,
+                &super::super::descriptor::map::keyset_cell(),
+                probe(99),
+            )
+            .await?
+            .into_inner()
+            .ok_or_else(|| eyre!("missing keyset cell"))?;
+        assert_eq!(
+            keyset[..],
+            [1],
+            "the second set over the limit collapses the keyset to Overflowed"
+        );
+
+        // No entry was lost: the map holds all four keys (via the scan path).
+        let verify = fx.session(2);
+        let fresh = map_state::<I64KeyCodec, JsonCodec>("ks")
+            .bind(&verify)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        let mut keys = Vec::new();
+        {
+            let stream = fresh.stream(Direction::Forward);
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;
+                keys.push(key);
+            }
+        }
+        assert_eq!(
+            keys,
+            vec![1, 2, 3, 4],
+            "no entry was dropped by the overflow"
+        );
+        Ok(())
+    })
+}
+
+/// The set-racing-stream pin (the split-stream bounded-arm materialization
+/// contract): the keyset stream materializes under one gate hold, so a racing
+/// `set` of a listed key cannot interleave — the drain yields EXACTLY the
+/// init-materialized state (stronger than some-serial-order), and the set
+/// applies after. Red without the gate: the set completes while the stream is
+/// parked at its keyset read, the dirty overlay wins the entry read, and the
+/// stream yields the new value.
+#[test]
+fn gate_excludes_set_during_keyset_stream() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_keyset_stream")?;
+        let id = fx.id("ks")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Seed {1: 10, 2: 20} with a two-key keyset beneath the cache (cold).
+        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
+        let entry =
+            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
+        fx.counting
+            .write_resolved(
+                &cref,
+                &[
+                    (min_cell, Some(bound(1))),
+                    (max_cell, Some(bound(2))),
+                    (
+                        super::super::descriptor::map::keyset_cell(),
+                        Some(Bytes::from(two_key_tracked_frame(1, 2))),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        Some(entry(10)?),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        Some(entry(20)?),
+                    ),
+                ],
+                &[],
+            )
+            .await?;
+
+        let session = fx.session(1);
+        let handle = map_state::<I64KeyCodec, JsonCodec>("ks")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // The stream's FIRST cold read is the keyset cell — park it there,
+        // holding the gate.
+        fx.holds.get_for_cache().arm(1);
+        let stream_task = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                let mut out = Vec::new();
+                let stream = handle.stream(Direction::Forward);
+                futures::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    out.push(item?);
+                }
+                Ok::<_, MapStateError<JsonCodecError>>(out)
+            }
+        });
+        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+            .await
+            .map_err(|_| eyre!("the stream never reached its keyset hold"))?;
+
+        // The racing set of a listed key parks on the gate.
+        let set_task = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.set(1, Value::from(99_i64)).await }
+        });
+        let_task_park().await;
+        fx.holds.get_for_cache().release();
+
+        let yielded = timeout(HANG_GUARD, stream_task)
+            .await
+            .map_err(|_| eyre!("stream hung"))??
+            .map_err(|e| eyre!("stream: {e}"))?;
+        assert_eq!(
+            yielded,
+            vec![(1, Value::from(10_i64)), (2, Value::from(20_i64))],
+            "the stream yields the init-materialized state, not the racing set"
+        );
+        timeout(HANG_GUARD, set_task)
+            .await
+            .map_err(|_| eyre!("set hung"))??
+            .map_err(|e| eyre!("set: {e}"))?;
+        assert_eq!(
+            handle.get(&1).await.map_err(|e| eyre!("{e}"))?,
+            Some(Value::from(99_i64)),
+            "the set applied after the whole stream materialized"
         );
         Ok(())
     })
