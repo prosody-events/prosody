@@ -259,13 +259,9 @@ async fn settle_committed<T, C, G>(
             StepOutcome::Done(()) => break,
             StepOutcome::Skip => sleep(DURABILITY_RETRY_DELAY).await,
             StepOutcome::Abandon => {
-                // A marker-flush attempt was made before shutdown: its
-                // durability is ambiguous, so the staged cells must NOT roll
-                // back — and cannot: `certify` consumed the receipt, and
-                // `Promotable` has no rollback. They stay provisional and the
-                // armed sweep resolves them through the oracle, which reads
-                // whether the marker landed. Dropping the receipt here is
-                // safe: recovery never depends on the in-memory record.
+                // A flush attempt was made: marker durability is ambiguous, so
+                // the staged cells must not (and structurally cannot) roll back
+                // — see [`StagedState::certify`]; the armed sweep resolves them.
                 abandon(handler, context, guard, result).await;
                 return;
             }

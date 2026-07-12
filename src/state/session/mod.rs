@@ -428,10 +428,6 @@ pub(crate) mod sealed {
         /// The uniform durable cell store the session settles against —
         /// [`KeyedStateSession`](super::KeyedStateSession) projects its
         /// backend's store (`B::Cell`).
-        // Ruling: zero-consumer today, nominally "don't build surface ahead
-        // of a caller" — owner-confirmed sequencing exception: the settlement
-        // receipt consumes it (`finalize` returning a store-parameterized
-        // receipt), carried early solely to keep that diff reviewable.
         type Cell: CellStore;
 
         /// Resolves every touched collection by its commit mode:
@@ -818,9 +814,10 @@ where
         // store. Every other cell op refuses a terminated session through the
         // descriptor's `ensure_live`; rollback, being sync + infallible, cannot
         // return `Terminated`, so it expresses the same containment as a NoOp —
-        // a terminated session discards nothing. Without this, a stale clone
-        // outliving its event (a handle moved into a spawned task) could drain a
-        // later same-key event's live buffer: a silent lost write.
+        // a terminated session discards nothing. Without this, a stale clone of
+        // a cancelled or shutting-down event (a handle moved into a spawned
+        // task) could drain a later same-key event's live buffer: a silent lost
+        // write.
         if self.is_terminated() {
             return StoreOutcome::NoOp;
         }
