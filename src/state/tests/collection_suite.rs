@@ -1299,8 +1299,12 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
 
 /// On a **TTL'd** map every set rewrites the keyset with its current contents
 /// (not `Overflowed`): two committed sets under the limit leave the exact
-/// two-key `Tracked` frame. Guards against a TTL-refresh that collapses to
-/// `Overflowed` — invisible to a presence-only snapshot assert.
+/// two-key `Tracked` frame, and re-setting an already-tracked key still
+/// refreshes that same `Tracked` frame rather than collapsing it. Guards
+/// against a TTL-refresh that writes `Overflowed` — invisible to a
+/// presence-only snapshot assert. The re-set of an already-tracked key is what
+/// exercises the `Ok(_)` TTL fast-path arm; two distinct fresh keys never reach
+/// it.
 #[test]
 fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     use futures::executor::block_on;
@@ -1339,6 +1343,28 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
             .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "a TTL'd map keeps a Tracked keyset, never collapses to Overflowed"
+    );
+
+    // Re-set an ALREADY-tracked key on the TTL'd map: the already-tracked fast
+    // path must still rewrite the keyset to refresh its TTL, and with the SAME
+    // Tracked contents — never `Overflowed`. This is the `Ok(_)` TTL arm the two
+    // fresh keys above never reach.
+    let event2 = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        handle.set(1, Value::from(1_u8)).await?;
+        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    assert_eq!(
+        block_on(store.get(id, &keyset_cell(), read_event(1)))?
+            .into_inner()
+            .map(|b| b.to_vec()),
+        Some(tracked_frame(&[1, 2])),
+        "re-setting a tracked key on a TTL'd map keeps the Tracked frame, never Overflowed"
     );
     Ok(())
 }

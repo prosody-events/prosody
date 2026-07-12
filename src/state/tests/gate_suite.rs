@@ -46,6 +46,7 @@ use color_eyre::eyre::{Report, Result, bail, eyre};
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
@@ -319,88 +320,135 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
     })
 }
 
-/// KV4 pin (c): a `set` racing `clear()`. The set is suspended mid-body (its
-/// bound-ratchet read withheld) while holding the gate; the clear parks
-/// behind it, so the outcome equals the serial set-then-clear order — entry
-/// AND bounds gone. Red-proven by deleting the permit acquisition: the clear
-/// interleaves between the entry buffer and the bound ratchet, leaving a
-/// half-applied state (entry gone, bounds present) no serial order explains.
+/// KV4 pin (c): a `set` racing `clear()`, proving the map's core invariant —
+/// **every live entry is covered by present bounds and a present keyset** —
+/// survives the race. The teeth need a *non-empty* map: on an empty map both
+/// serial orders leave a valid loose-superset state, so the invariant can't be
+/// violated. Seeded cold with `{0,1,2}`, bounds `[0,2]`, keyset
+/// `Tracked{0,1,2}`, then `set(1)` (a key already in bounds and already
+/// tracked, so on a non-TTL map its bound-ratchet and keyset writes are both
+/// suppressed) parks at its cold Min read HOLDING the gate. `clear()` is polled
+/// exactly once: with the gate it parks (a single deterministic
+/// `Poll::Pending`, no scheduler heuristic) and runs only after the set
+/// completes — set-then-clear leaves the map empty. Red-proven by deleting the
+/// permit acquisition in `set` OR `clear`: the first poll runs `clear` to
+/// completion, then the resumed `set` writes ONLY the entry (its meta writes
+/// suppressed), stranding a live entry with absent bounds and keyset — the
+/// invariant the gate protects.
 #[test]
 fn gate_serializes_set_against_clear() -> Result<()> {
     runtime()?.block_on(async {
         let fx = GateFixture::new("gate_set_clear")?;
+        let id = fx.id("m")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Seed a valid, cold, non-TTL map: entries {0,1,2}, bounds [0,2], a
+        // three-key Tracked keyset. Cold so the event's meta reads land on the
+        // armed hold.
+        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
+        let entry =
+            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
+        fx.counting
+            .write_resolved(
+                &cref,
+                &[
+                    (min_cell.clone(), Some(bound(0))),
+                    (max_cell.clone(), Some(bound(2))),
+                    (
+                        super::super::descriptor::map::keyset_cell(),
+                        Some(Bytes::from(tracked_frame(&[0, 1, 2]))),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&0)),
+                        Some(entry(0)?),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        Some(entry(1)?),
+                    ),
+                    (
+                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        Some(entry(2)?),
+                    ),
+                ],
+                &[],
+            )
+            .await?;
+
         let session = fx.session(1);
         let handle = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
 
-        // The set buffers its entry, then parks at its Min-bound read (a cold
-        // meta cell → a held lower read) while HOLDING the gate.
+        // set(1) parks at its cold Min read (a held lower read) while HOLDING
+        // the gate. 1 is already in [0,2] and already tracked, so once it
+        // resumes its only write is the entry.
         fx.holds.get_for_cache().arm(1);
         let set_task = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(1, Value::from(10_i64)).await }
+            async move { handle.set(1, Value::from(99_i64)).await }
         });
         timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
             .await
             .map_err(|_| eyre!("the set never reached its hold"))?;
 
-        let clear_task = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.clear().await }
-        });
-        let_task_park().await;
+        // Poll clear ONCE. With the gate it hits the held permit and returns
+        // Pending deterministically; without it, clear runs to completion in
+        // this single poll (every op is Ready).
+        let clear = handle.clear();
+        futures::pin_mut!(clear);
+        let first_clear_poll = futures::poll!(clear.as_mut());
+
         fx.holds.get_for_cache().release();
         timeout(HANG_GUARD, set_task)
             .await
             .map_err(|_| eyre!("set hung"))??
             .map_err(|e| eyre!("set: {e}"))?;
-        timeout(HANG_GUARD, clear_task)
-            .await
-            .map_err(|_| eyre!("clear hung"))??
-            .map_err(|e| eyre!("clear: {e}"))?;
+        match first_clear_poll {
+            Poll::Ready(result) => result.map_err(|e| eyre!("clear: {e}"))?,
+            Poll::Pending => timeout(HANG_GUARD, clear)
+                .await
+                .map_err(|_| eyre!("clear hung"))?
+                .map_err(|e| eyre!("clear: {e}"))?,
+        }
 
-        // Settle, then probe the physical state: the outcome must equal ONE
-        // serial order — set-then-clear (all gone) or clear-then-set (entry
-        // AND bounds present). The half-applied interleaving (entry gone,
-        // bounds present) is what the gate excludes.
-        finalize_and_promote(
-            &session,
-            &fx.oracle,
-            Uuid::from_u128(1),
-            &fx.cells,
-            &fx.id("m")?,
-        )
-        .await?;
+        // Settle, then probe the physical state: no live entry may survive with
+        // absent bounds or keyset. With the gate the outcome is set-then-clear
+        // (empty); the injected race strands entry 1 with cleared meta.
+        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
         let verify = fx.session(2);
         let fresh = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&verify)
             .map_err(|e| eyre!("bind: {e}"))?;
         let entry = fresh.get(&1).await.map_err(|e| eyre!("{e}"))?;
-        let (min_cell, _) = super::super::descriptor::map::bound_cells();
         let min = fx
             .counting
-            .get(&fx.id("m")?, &min_cell, probe(99))
+            .get(&id, &min_cell, probe(99))
+            .await?
+            .into_inner();
+        let max = fx
+            .counting
+            .get(&id, &max_cell, probe(99))
             .await?
             .into_inner();
         let keyset = fx
             .counting
             .get(
-                &fx.id("m")?,
+                &id,
                 &super::super::descriptor::map::keyset_cell(),
                 probe(99),
             )
             .await?
             .into_inner();
-        assert_eq!(
+        assert!(
+            entry.is_none() || (min.is_some() && max.is_some() && keyset.is_some()),
+            "a live entry must be covered by present bounds and keyset (entry={:?}, min={:?}, \
+             max={:?}, keyset={:?})",
             entry.is_some(),
             min.is_some(),
-            "the outcome equals a serial order: entry and bounds live or die together"
-        );
-        assert_eq!(
-            entry.is_some(),
+            max.is_some(),
             keyset.is_some(),
-            "the outcome equals a serial order: entry and keyset live or die together"
         );
         Ok(())
     })
@@ -509,19 +557,21 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
             .ok_or_else(|| eyre!("missing keyset cell"))?;
         assert_eq!(
             keyset[..],
-            two_key_tracked_frame(1, 9),
+            tracked_frame(&[1, 9]),
             "the serialized keyset updates union both keys"
         );
         Ok(())
     })
 }
 
-/// The exact two-key `Tracked` frame over ascending `i64` keys `a < b`, built
-/// from the real codec.
-fn two_key_tracked_frame(a: i64, b: i64) -> Vec<u8> {
-    let mut frame = vec![0u8, 0, 0, 0, 2];
-    for k in [a, b] {
-        let coordinate = I64KeyCodec::encode(&k);
+/// The exact `Tracked` frame over ascending `i64` `keys`, built from the real
+/// codec: tag `0`, `u32` BE count, then per key a `u32` BE length and its
+/// coordinate bytes.
+fn tracked_frame(keys: &[i64]) -> Vec<u8> {
+    let mut frame = vec![0u8];
+    frame.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for k in keys {
+        let coordinate = I64KeyCodec::encode(k);
         frame.extend_from_slice(&(coordinate.as_bytes().len() as u32).to_be_bytes());
         frame.extend_from_slice(coordinate.as_bytes());
     }
@@ -555,7 +605,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
                     (max_cell, Some(bound(2))),
                     (
                         super::super::descriptor::map::keyset_cell(),
-                        Some(Bytes::from(two_key_tracked_frame(1, 2))),
+                        Some(Bytes::from(tracked_frame(&[1, 2]))),
                     ),
                     (
                         super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
@@ -669,7 +719,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
                     (max_cell, Some(bound(2))),
                     (
                         super::super::descriptor::map::keyset_cell(),
-                        Some(Bytes::from(two_key_tracked_frame(1, 2))),
+                        Some(Bytes::from(tracked_frame(&[1, 2]))),
                     ),
                     (
                         super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
