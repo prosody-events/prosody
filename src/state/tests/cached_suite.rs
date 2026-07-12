@@ -29,10 +29,10 @@ use super::super::registry::CollectionDefRegistry;
 use super::super::store::CellStore;
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    CountingCellStore, FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle,
-    SECTION, ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
+    FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle, SECTION,
+    ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
 };
-use super::support::{fresh_collection as collection, probe};
+use super::support::{CountingCellStore, fresh_collection as collection, probe};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;

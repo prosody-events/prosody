@@ -5,23 +5,23 @@ pub(crate) mod identity_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    ApplyTrace, CountingCellStore, FailingCellStore, MemoryShapeProbe, OverlayTrace,
-    OverwriteTrace, PoisonHandle, ScanTrace, ScriptedOracle, Trace, run_apply_idempotence,
-    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    ApplyTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace, PoisonHandle,
+    ScanTrace, ScriptedOracle, Trace, run_apply_idempotence, run_bottom_scan_trace,
+    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
     DequeHoles, DequeTrace, MapTrace, finalize_and_promote, run_deque_holes, run_deque_trace,
     run_map_trace, run_map_ttl_bounds_trace,
 };
-use self::support::fresh_collection;
+use self::support::{CountingCellStore, fresh_collection};
 use super::cell::ProvisionalWrite;
-use super::descriptor::{StateDescriptor, map_state};
+use super::descriptor::{StateDescriptor, deque, deque_state, map_state};
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
 use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use super::oracle::CommitOracle;
-use super::order_codec::I64KeyCodec;
+use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::CellStore;
@@ -33,6 +33,7 @@ use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::timers::duration::CompactDuration;
+use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use futures::executor;
@@ -556,6 +557,147 @@ fn empty_map_stream_issues_no_lower_scans() -> Result<()> {
         assert!(
             counting.lower_scans() > 0,
             "streaming a populated map must issue a lower-store scan"
+        );
+        Ok(())
+    })
+}
+
+/// Binds `deque_state(name)` on `session` and fully drains its `stream(dir)`,
+/// returning the yielded values. Called with a fresh (clean-overlay) session so
+/// every read falls through to the underlying store.
+async fn drain_deque_stream(
+    session: &KeyedStateSession<CountingBackend, MemoryLoader<Value>>,
+    name: &str,
+    dir: Direction,
+) -> Result<Vec<Value>> {
+    let handle = deque_state::<JsonCodec>(name)
+        .bind(session)
+        .map_err(|e| eyre!("bind: {e}"))?;
+    let mut out = Vec::new();
+    let stream = handle.stream(dir);
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+/// Sub-threshold deque iteration is pure point reads: streaming a small
+/// committed deque issues **zero** lower-store scans and exactly `len + 1`
+/// lower gets (`len` entries plus the bounds cell), in both directions. The
+/// companion wide-window assertions prove the counters are live and pin the
+/// fallback: a directly-seeded window wider than
+/// [`deque::DEQUE_POINT_ITERATION_MAX`] streams through exactly one lower
+/// scan (plus the one bounds get).
+#[test]
+fn deque_stream_issues_no_scans() -> Result<()> {
+    executor::block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let mut registry = CollectionDefRegistry::new(None);
+        registry.register(&deque_state::<JsonCodec>("dq"), CollectionDef::new(None))?;
+        registry.register(
+            &deque_state::<JsonCodec>("dq-wide"),
+            CollectionDef::new(None),
+        )?;
+        let registry = Arc::new(registry);
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            registry.clone(),
+        ));
+        let armed: ArmedKeys = Arc::default();
+
+        // One committed event of pushes and pops: the deque reads [0, 1, 2].
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let handle = deque_state::<JsonCodec>("dq")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        handle.push_back(Value::from(1_u8)).await?;
+        handle.push_back(Value::from(2_u8)).await?;
+        handle.push_back(Value::from(9_u8)).await?;
+        handle.push_front(Value::from(0_u8)).await?;
+        assert_eq!(handle.pop_back().await?, Some(Value::from(9_u8)));
+        let id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("dq")?,
+        );
+        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+        // Stream in both directions; each is a pure sequence of point gets.
+        for (n, (dir, expected)) in [
+            (Direction::Forward, [0_u8, 1, 2]),
+            (Direction::Backward, [2_u8, 1, 0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            counting.reset();
+            let event = EventRef::Message {
+                dedup_id: Uuid::from_u128(u128::MAX - n as u128),
+            };
+            let session =
+                counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+            let out = drain_deque_stream(&session, "dq", dir).await?;
+            let expected: Vec<Value> = expected.into_iter().map(Value::from).collect();
+            assert_eq!(out, expected, "{dir:?} stream yields the committed window");
+            assert_eq!(
+                counting.lower_scans(),
+                0,
+                "a sub-threshold stream must issue no lower scan"
+            );
+            assert_eq!(
+                counting.lower_reads(),
+                expected.len() + 1,
+                "exactly len entry gets plus the bounds get"
+            );
+        }
+
+        // Companion: a directly-seeded window one wider than the threshold
+        // falls back to exactly one lower scan — proving the zero above is a
+        // live counter and pinning the fallback arm.
+        let wide_id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("dq-wide")?,
+        );
+        let wide_ref = CollectionRef::new(wide_id, None);
+        let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
+        let mut seeded = vec![(
+            deque::meta_cell(),
+            Some(Bytes::from(deque::seed_frame(0, i64::try_from(width)?))),
+        )];
+        for i in 0..width {
+            seeded.push((
+                deque::entry_cell_for(&I64KeyCodec::encode(&i64::try_from(i)?)),
+                Some(Bytes::from(serde_json::to_vec(&Value::from(7_u8))?)),
+            ));
+        }
+        counting.write_resolved(&wide_ref, &seeded, &[]).await?;
+
+        counting.reset();
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX - 2),
+        };
+        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let drained = drain_deque_stream(&session, "dq-wide", Direction::Forward)
+            .await?
+            .len();
+        assert_eq!(drained, width, "the wide window streams every seeded entry");
+        assert_eq!(
+            counting.lower_scans(),
+            1,
+            "a wide window pays exactly one lower scan"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            1,
+            "the wide arm reads only the bounds cell"
         );
         Ok(())
     })

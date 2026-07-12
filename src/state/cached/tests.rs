@@ -18,7 +18,8 @@ use crate::state::identity::{CollectionId, CollectionRef, StateKey, StateName, S
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
-use crate::state::tests::cell_suite::{CountingCellStore, ScriptedOracle, bytes, cell_at};
+use crate::state::tests::cell_suite::{ScriptedOracle, bytes, cell_at};
+use crate::state::tests::support::CountingCellStore;
 use crate::test_util::TEST_RUNTIME;
 use ::bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};

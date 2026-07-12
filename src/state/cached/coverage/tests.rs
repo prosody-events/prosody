@@ -456,8 +456,8 @@ fn prop_gap_cover_stride_frontier() {
     use crate::state::memory::{MemoryCellStore, MemoryCells};
     use crate::state::registry::CollectionDefRegistry;
     use crate::state::store::CellStore;
-    use crate::state::tests::cell_suite::{CountingCellStore, ScriptedOracle, bytes};
-    use crate::state::tests::support::fresh_collection;
+    use crate::state::tests::cell_suite::{ScriptedOracle, bytes};
+    use crate::state::tests::support::{CountingCellStore, fresh_collection};
     use crate::test_util::TEST_RUNTIME;
     use ::bytes::Bytes;
     use futures::StreamExt;

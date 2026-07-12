@@ -5,14 +5,18 @@
 
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
+use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
+use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{CellSession, Finalized};
+use crate::state::store::CellStore;
 use crate::state::{
-    CollectionId, CommitDecision, EventRef, StateKey, StateName, StateType, StoreOutcome,
+    CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
+    StoreOutcome,
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -23,7 +27,9 @@ use parking_lot::Mutex as SyncMutex;
 use quickcheck::{Arbitrary, Gen};
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
@@ -222,6 +228,217 @@ where
     }
 
     async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
+}
+
+/// A [`CellStore`] decorator counting every durable mutation, shared by the
+/// sweep-idempotence and op-budget pins. Delegates to `inner`; the counters
+/// ride an `Arc` so `Clone` shares them.
+#[derive(Clone)]
+pub(crate) struct CountingCellStore<S> {
+    inner: S,
+    counts: Arc<OpCounts>,
+}
+
+#[derive(Default)]
+struct OpCounts {
+    write_provisional: AtomicUsize,
+    write_resolved: AtomicUsize,
+    mark_resolved: AtomicUsize,
+    commit_provisional: AtomicUsize,
+    abort_provisional: AtomicUsize,
+    standing_marker: AtomicUsize,
+    get: AtomicUsize,
+    scan_cells: AtomicUsize,
+    provisional_cells: AtomicUsize,
+    provisional_cell_at: AtomicUsize,
+}
+
+impl<S> CountingCellStore<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            counts: Arc::new(OpCounts::default()),
+        }
+    }
+
+    /// Total durable mutations (excludes reads). Folds the two settle verbs in:
+    /// a forwarded `commit_provisional` / `abort_provisional` routes through
+    /// the *inner* store's `mark_resolved` / `write_resolved`, invisible to
+    /// this wrapper's per-primitive counters, so the settle itself is
+    /// counted here.
+    pub(crate) fn durable_writes(&self) -> usize {
+        self.counts.write_provisional.load(Ordering::Relaxed)
+            + self.counts.write_resolved.load(Ordering::Relaxed)
+            + self.counts.mark_resolved.load(Ordering::Relaxed)
+            + self.counts.commit_provisional.load(Ordering::Relaxed)
+            + self.counts.abort_provisional.load(Ordering::Relaxed)
+    }
+
+    /// Standing-marker point reads — the quiescence counter: one per sweep
+    /// marker leg. A read, so excluded from [`Self::durable_writes`].
+    pub(crate) fn marker_reads(&self) -> usize {
+        self.counts.standing_marker.load(Ordering::Relaxed)
+    }
+
+    /// Point reads issued to the lower store — zero on a covered-negative
+    /// `Cached::get`.
+    pub(crate) fn lower_reads(&self) -> usize {
+        self.counts.get.load(Ordering::Relaxed)
+    }
+
+    /// Range scans issued to the lower store — one per coverage gap query, so
+    /// the op-budget property can pin "N covered ranges ⇒ exactly the gap
+    /// queries, never a section-wide re-scan".
+    pub(crate) fn lower_scans(&self) -> usize {
+        self.counts.scan_cells.load(Ordering::Relaxed)
+    }
+
+    /// Recovery-sweep entries — one per `provisional_cells` (cold seed) call,
+    /// so a test can pin how many times the sweep hit the durable cold
+    /// source.
+    pub(crate) fn recovery_sweeps(&self) -> usize {
+        self.counts.provisional_cells.load(Ordering::Relaxed)
+    }
+
+    /// Warm-sweep point reads — one per `provisional_cell_at`, the reads a warm
+    /// (seeded) sweep issues (bounded by #provisional).
+    pub(crate) fn warm_point_reads(&self) -> usize {
+        self.counts.provisional_cell_at.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.counts.write_provisional.store(0, Ordering::Relaxed);
+        self.counts.write_resolved.store(0, Ordering::Relaxed);
+        self.counts.mark_resolved.store(0, Ordering::Relaxed);
+        self.counts.commit_provisional.store(0, Ordering::Relaxed);
+        self.counts.abort_provisional.store(0, Ordering::Relaxed);
+        self.counts.standing_marker.store(0, Ordering::Relaxed);
+        self.counts.get.store(0, Ordering::Relaxed);
+        self.counts.scan_cells.store(0, Ordering::Relaxed);
+        self.counts.provisional_cells.store(0, Ordering::Relaxed);
+        self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
+    }
+}
+
+impl<S> CellStore for CountingCellStore<S>
+where
+    S: CellStore,
+{
+    type Error = S::Error;
+
+    fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
+        self.counts.get.fetch_add(1, Ordering::Relaxed);
+        self.inner.get(collection, cell, own)
+    }
+
+    fn scan_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+        // One increment per scan *request* (a gap query), not per yielded cell.
+        self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
+        self.inner.scan_cells(collection, scan, own)
+    }
+
+    fn provisional_cells<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
+        // One increment per sweep entry, not per yielded provisional cell.
+        self.counts
+            .provisional_cells
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.provisional_cells(collection)
+    }
+
+    async fn provisional_cell_at<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Option<ProvisionalCell>, Self::Error> {
+        // One increment per warm-sweep point read.
+        self.counts
+            .provisional_cell_at
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.provisional_cell_at(collection, cell).await
+    }
+
+    async fn write_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        marker: Option<&'a EventMarker>,
+    ) -> Result<(), Self::Error> {
+        // One increment per collection-grain batch call (not one per cell).
+        self.counts
+            .write_provisional
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .write_provisional(collection, writes, marker)
+            .await
+    }
+
+    async fn write_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [(CellKey, Option<Bytes>)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        self.counts.write_resolved.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_resolved(collection, cells, clears).await
+    }
+
+    async fn mark_resolved<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        cells: &'a [CellKey],
+    ) -> Result<(), Self::Error> {
+        self.counts.mark_resolved.fetch_add(1, Ordering::Relaxed);
+        self.inner.mark_resolved(collection, cells).await
+    }
+
+    async fn standing_marker<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<Option<EventMarker>, Self::Error> {
+        self.counts.standing_marker.fetch_add(1, Ordering::Relaxed);
+        self.inner.standing_marker(collection).await
+    }
+
+    async fn commit_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+        clears: &'a [SectionClear],
+    ) -> Result<(), Self::Error> {
+        // Count the settle itself: the inner store routes to `mark_resolved` /
+        // `write_resolved` on *itself*, so those never reach this wrapper's
+        // per-primitive counters.
+        self.counts
+            .commit_provisional
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .commit_provisional(collection, writes, clears)
+            .await
+    }
+
+    async fn abort_provisional<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        writes: &'a [(CellKey, ProvisionalWrite)],
+    ) -> Result<(), Self::Error> {
+        self.counts
+            .abort_provisional
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.abort_provisional(collection, writes).await
+    }
 }
 
 /// A collection identity over a fresh v4 segment per call.

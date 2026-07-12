@@ -25,9 +25,9 @@
 //! monotonic and never reused **within a window's lifetime** — a pop advances
 //! `head`/`tail` past the freed index, never back into it. So `len` is
 //! `tail − head` (O(1) from the meta), `get(i)` reads the single cell at
-//! `head + i`, and a scan anchored at `head` with `limit = tail − head`
-//! visits the window, never a popped tombstone (which sits below `head` or
-//! at/above `tail`). [`DequeHandle::clear`] ends the window's lifetime and
+//! `head + i`, and iteration point-reads each index in `[head, tail)`, never a
+//! popped tombstone (which sits below `head` or at/above `tail`).
+//! [`DequeHandle::clear`] ends the window's lifetime and
 //! **resets the index space**: the erased bounds cell reads `[0, 0)`, so the
 //! next push writes index 0. Reuse is safe — every pre-clear row is erased by
 //! the clear, and a later write to a reused coordinate out-stamps any earlier
@@ -39,7 +39,7 @@
 //! way.
 //!
 //! **Without a TTL the window is also dense**: every index in `[head, tail)`
-//! maps to a present entry cell, so `len` is exact and a scan yields exactly
+//! maps to a present entry cell, so `len` is exact and iteration yields exactly
 //! `len` elements. **With a TTL** an entry's expiry is anchored at its push, so
 //! entries can expire *inside* the window while it stays put — the window
 //! develops holes. The bounds cell is rewritten by every op, so it outlives the
@@ -81,6 +81,12 @@ const META_SECTION: Section = Section::new(DequeNs::Meta as i8);
 
 /// The `Entries` section, holding one cell per live element.
 const ENTRY_SECTION: Section = Section::new(DequeNs::Entries as i8);
+
+/// Iteration shape threshold: a window of at most this many entries streams
+/// by per-index point gets — each a cacheable committed point read — while a
+/// wider window pays one durable range scan instead of `len` serialized
+/// point round-trips. A shape choice, not configuration.
+pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
 
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so
@@ -223,10 +229,16 @@ where
 
     /// Streams the live elements in index order — front to back for
     /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
-    /// element is resolved as it is yielded. See the module's window
-    /// invariant: the scan is bounded to the window `[head, tail − 1]`, so a
-    /// popped tombstone (below `head` or at/above `tail`) is never yielded;
-    /// `limit = len` is a belt-and-braces backstop over the fully-known window.
+    /// element is resolved as it is yielded.
+    ///
+    /// Iteration point-reads each index in `[head, tail)` (see the module's
+    /// window invariant) and **skips** an absent index — a TTL-expired entry
+    /// resolves as skipped, never an error. Windows wider than
+    /// `DEQUE_POINT_ITERATION_MAX` entries fall back to one durable range scan
+    /// over the window: identical items in identical order, but a mid-stream
+    /// read failure may surface after a different-length yielded prefix (a
+    /// point read fails at its own index; the fallback fails at a page
+    /// boundary) — only error timing differs.
     pub fn stream(
         &self,
         dir: Direction,
@@ -235,7 +247,7 @@ where
         // so each inner await is instrumented with a clone instead; the
         // span's recorded time is the stream's own work. Unlike the sibling
         // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing scan ends with an OK-status span, and the
+        // the span — a failing stream ends with an OK-status span, and the
         // yielded `Err` surfaces to the caller inside this span's scope.
         let span = info_span!(
             "deque.stream",
@@ -246,6 +258,27 @@ where
             let window = self.bounds().instrument(span.clone()).await?;
             let len = window.len()?;
             if len == 0 {
+                return;
+            }
+            if len <= DEQUE_POINT_ITERATION_MAX {
+                // Sequential point gets by design: concurrent prefetch was
+                // rejected — it adds a resolver-concurrency proof obligation for
+                // a once-per-assignment cold window.
+                for i in 0..len {
+                    let position = match dir {
+                        Direction::Forward => i,
+                        Direction::Backward => len - 1 - i,
+                    };
+                    let offset =
+                        i64::try_from(position).map_err(|_| MetaDecodeError::IndexOverflow)?;
+                    let index = window
+                        .head
+                        .checked_add(offset)
+                        .ok_or(MetaDecodeError::IndexOverflow)?;
+                    if let Some(value) = self.entries.get(&index).instrument(span.clone()).await? {
+                        yield value;
+                    }
+                }
                 return;
             }
             // Anchor both edges on the window: front `head` to back `tail − 1`
