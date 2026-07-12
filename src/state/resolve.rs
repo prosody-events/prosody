@@ -106,10 +106,16 @@ where
 /// resolving `get`/`scan_cells`.
 ///
 /// A resolved cell is already committed; a provisional cell owned by `own` is
-/// the running handler's own (provably uncommitted) write, so the committed
-/// base is its `prev` — returned without an oracle consult or a durable write
-/// (the own-event-base-is-prev invariant); any other provisional cell is
-/// resolved through the oracle (eager write-back) via [`resolve_cell`].
+/// the running handler's own write — provably uncommitted while the handler
+/// runs — so the committed base is its `prev`, returned without an oracle
+/// consult or a durable write (the own-event-base-is-prev invariant); any
+/// other provisional cell is resolved through the oracle (eager write-back)
+/// via [`resolve_cell`]. Post-settle contexts (the apply hooks, running after
+/// `finalize` drained the event's dirty buffer) can hold an own [`EventRef`]
+/// for an event that already committed — a partially-promoted stage — where
+/// the short-circuit still answers `prev`: a per-cell committed projection,
+/// accepted as the best-effort hook-window contract rather than an oracle
+/// consult.
 pub(crate) async fn resolve_read<S, O>(
     store: &S,
     oracle: &O,

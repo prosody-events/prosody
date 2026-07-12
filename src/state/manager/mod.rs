@@ -98,7 +98,10 @@ pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomSt
 /// clears the event's buffered dirty cells on **every** exit path — success,
 /// error, abandon, or panic unwind. That makes "clear the buffer when the
 /// event ends" structural rather than a scattered manual call a new code path
-/// could forget.
+/// could forget. On the success path `finalize` has already drained the
+/// buffer (the sealed lifecycle's `discard_dirty` doc owns that invariant),
+/// so the Drop clear is a no-op there: the scope is the failure-path
+/// backstop.
 ///
 /// The session itself stays a freely-cloned `Arc`-backed handle
 /// ([`CellSession`]): the

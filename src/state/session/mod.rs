@@ -40,7 +40,8 @@
 //! 2. On the final handler success, `finalize` groups the one dirty map by
 //!    collection and stages each in one same-partition batch — `ReadCommitted`
 //!    collections stage provisional cells, `ReadUncommitted` ones write
-//!    resolved values — returning the staged work as a linear `Finalized`
+//!    resolved values — draining the event's dirty range (the stage consumes
+//!    the buffered ops) and returning the staged work as a linear `Finalized`
 //!    receipt.
 //! 3. Strictly after the stage, `flush_marker` writes the registered dedup
 //!    marker through the commit oracle. After the offset/trigger commit the
@@ -95,7 +96,11 @@ mod tests;
 /// [`KeyedStateSession`] realises that through the dirty overlay + oracle
 /// resolution — and `set`/`clear`/`clear_section` buffer this event's
 /// mutations (`commit` writes them through mid-handler; `rollback` discards
-/// them). The framework reaches the manager-driven lifecycle through the
+/// them). After the settle boundary's stage drains the buffer (`finalize` on
+/// success), a handle's reads fall through to the lower store: the apply
+/// hooks observe the per-cell committed projection (an own-event provisional
+/// cell reads as its committed base `prev`), not the event's pre-settle
+/// overlay. The framework reaches the manager-driven lifecycle through the
 /// sealed `StateLifecycle` supertrait, which is what seals `CellSession`:
 /// downstream crates can name it in bounds (e.g. [`EventContext::State`]) but
 /// can neither implement it nor reach the lifecycle.
@@ -436,6 +441,13 @@ pub(crate) mod sealed {
         /// consumes. Stages all collections before returning, so a stage
         /// error returns before the textually-later marker flush; a staging
         /// failure is a type-erased store error with no receipt minted.
+        ///
+        /// On success the event's dirty range is drained — the stage consumes
+        /// the buffered ops (including a [`Finalized::Clean`] return whose
+        /// only work was `ReadUncommitted` resolved writes), so a second
+        /// `finalize` finds an empty buffer and returns `Clean`: one stage
+        /// mints at most one receipt. Failure paths leave the buffer whole so
+        /// a retried `finalize` re-stages idempotently.
         fn finalize(
             &self,
         ) -> impl Future<Output = Result<Finalized<Self::Cell>, StateAccessError>> + Send;
@@ -458,17 +470,18 @@ pub(crate) mod sealed {
         /// the next attempt starts clean.
         fn reset(&self);
 
-        /// Discards just this event's buffered dirty cells — the per-event
-        /// lifecycle clear that
+        /// Discards just this event's buffered dirty cells — the failure-path
+        /// backstop that
         /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
-        /// runs on every exit path.
+        /// runs on every exit path (error, abandon, panic unwind).
         ///
         /// The dirty workspace is partition-lifetime (manager-owned, shared by
         /// every session clone), so it must be cleared explicitly per event;
         /// the marker lives on the per-event session and dies with it, so it
-        /// is not cleared here. Safe to run after dispatch returns: the
-        /// receipt's promote/rollback read only receipt-owned data, never
-        /// dirty, so the buffer is dead once `finalize` has run.
+        /// is not cleared here. On the success path [`Self::finalize`] has
+        /// already drained the buffer (the stage consumes it), making the
+        /// scope-drop clear a no-op there; the receipt's promote/rollback read
+        /// only receipt-owned data, never dirty.
         fn discard_dirty(&self);
 
         /// The always-on `recovery_delay` floor (a plain config read). The
@@ -858,6 +871,16 @@ where
                 Ok(acc)
             })
             .await?;
+        // Drain-on-success: the stage consumes the event's dirty range — one
+        // whole-key clear, strictly after the per-collection aggregate
+        // succeeded, never per collection. A collection failing after
+        // siblings staged durably must exit with the buffer whole (the `?`
+        // above) so the retried `finalize` re-stages idempotently. This
+        // consumes the receipt's mint source — a second `finalize` finds an
+        // empty buffer and returns `Clean` — and covers RU-only events too:
+        // their values were durably written above. Nothing past this point
+        // is fallible or `.await`s a store.
+        self.discard_dirty();
         if collections.is_empty() {
             return Ok(Finalized::Clean);
         }

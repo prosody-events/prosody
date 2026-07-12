@@ -28,6 +28,7 @@ use super::sealed::{ApplyOutcome, StateLifecycle};
 use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::ErrorCategory;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::Section;
 use crate::state::descriptor::value_state;
@@ -39,7 +40,7 @@ use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentit
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
-use crate::state::tests::cell_suite::{ScriptedOracle, cell_at, value_cell};
+use crate::state::tests::cell_suite::{FailingCellStore, ScriptedOracle, cell_at, value_cell};
 use crate::state::tests::support::{assert_no_settlement_residue, probe};
 use crate::state::{
     CollectionId, CollectionRef, EventRef, PartitionBackend, StateKey, StateName, StateType,
@@ -928,6 +929,135 @@ fn prop_value_lifecycle_equivalence() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
+}
+
+/// Drain-on-success: `finalize` consumes the event's dirty range as part of
+/// its success path, so the receipt's mint source is consumed — a second
+/// `finalize` finds an empty buffer and returns [`Finalized::Clean`], never a
+/// second receipt for the same stage.
+#[tokio::test]
+async fn second_finalize_after_success_returns_clean() -> Result<()> {
+    let fx = Fixture::new()?;
+    let (event, dedup_id) = message(1);
+    // The scope stays alive so its Drop clear cannot mask the finalize drain.
+    let scope = fx.session(event);
+    let session = scope.handle();
+
+    session
+        .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
+        .await?;
+    session.register_marker(dedup_id);
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("the buffered write must mint a receipt");
+    };
+    assert!(
+        fx.dirty.touched(&fx.state_key.key).is_empty(),
+        "finalize drains the event's dirty range on success",
+    );
+
+    assert!(
+        matches!(session.finalize().await?, Finalized::Clean),
+        "the mint source is consumed — a second finalize returns Clean",
+    );
+
+    // The receipt still settles normally after the drain.
+    session.flush_marker().await?;
+    assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
+    assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"v1")));
+    Ok(())
+}
+
+/// A collection failing mid-stage exits `finalize` with the buffer **whole**
+/// — the drain runs strictly after the whole per-collection aggregate
+/// succeeded, never per collection — so the retried `finalize` re-stages the
+/// same buffered ops idempotently and converges once the store heals. A
+/// per-collection (or pre-error) drain would strand the healed retry with an
+/// empty buffer.
+#[tokio::test]
+async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
+    type FailingBackend = PartitionBackend<
+        ScriptedOracle,
+        MemoryDescriptorIdentityStore,
+        FailingCellStore<MemoryCellStore<ScriptedOracle>>,
+    >;
+
+    let cart = StateName::try_new("cart")?;
+    let wishlist = StateName::try_new("wishlist")?;
+    let mut registry = CollectionDefRegistry::new(None);
+    for name in ["cart", "wishlist"] {
+        registry.register(&value_state::<JsonCodec>(name), CollectionDef::new(None))?;
+    }
+    let registry = Arc::new(registry);
+    let oracle = ScriptedOracle::default();
+    // Poison wishlist's stage: `write_provisional` fails Transient while cart
+    // (racing under buffer_unordered) may or may not have staged first.
+    let store = FailingCellStore::failing_write_provisional(
+        MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+        wishlist.clone(),
+        ErrorCategory::Transient,
+    );
+    let dirty = Arc::new(DirtyStore::new());
+    let state_key = StateKey::new(Uuid::from_u128(0xE0), Arc::from("key"));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let (event, dedup_id) = message(1);
+    let session: KeyedStateSession<FailingBackend, ()> = KeyedStateSession::new(SessionParts {
+        cell: store.clone(),
+        dirty: dirty.clone(),
+        oracle,
+        loader: (),
+        registry,
+        state_key: state_key.clone(),
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    });
+
+    session
+        .set(StateType::Application, &cart, &value_cell(), b"c1")
+        .await?;
+    session
+        .set(StateType::Application, &wishlist, &value_cell(), b"w1")
+        .await?;
+
+    assert!(
+        session.finalize().await.is_err(),
+        "the poisoned stage must fail the aggregate",
+    );
+    let touched: Vec<StateName> = dirty
+        .touched(&state_key.key)
+        .into_iter()
+        .map(|((_, name), ..)| name)
+        .collect();
+    assert_eq!(
+        touched.len(),
+        2,
+        "a failed finalize keeps BOTH collections buffered: {touched:?}",
+    );
+    assert!(touched.contains(&cart) && touched.contains(&wishlist));
+
+    // Heal the store: the retried finalize re-stages from the intact buffer
+    // and the settle converges to both buffered values.
+    store.set_poison(None);
+    session.register_marker(dedup_id);
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("the healed retry must re-stage from the intact buffer");
+    };
+    session.flush_marker().await?;
+    assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
+    for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
+        let id = CollectionId::new(state_key.clone(), StateType::Application, name.clone());
+        assert_eq!(
+            store
+                .get(&id, &value_cell(), probe(u128::MAX))
+                .await?
+                .into_inner(),
+            Some(Bytes::from_static(expected)),
+            "{name:?} must commit its buffered value on the healed retry",
+        );
+    }
+    Ok(())
 }
 
 /// A clears-only event still stages — durably: `clear_section` with no cell

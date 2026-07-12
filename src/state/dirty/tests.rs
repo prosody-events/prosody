@@ -100,6 +100,80 @@ fn section_snapshot_returns_whole_section_beside_a_lower_section() -> Result<()>
     Ok(())
 }
 
+/// Regression: after `clear_section` sweeps one section, range reads over the
+/// **sibling** section must still see every buffered cell.
+///
+/// With `clear_section` built on [`scc::TreeIndex::remove_range_sync`] (scc
+/// 3.8.4), this exact insert order left the tree in a shape where a later
+/// `range` seek through the strict-separator bounds ([`Edge`]) answered
+/// **empty** for the surviving sibling section — `section_snapshot` and
+/// `touched` both missed all seven cells while point `lookup`s still found
+/// them, so `finalize` would silently stage nothing: a lost write. The fix is
+/// [`remove_span`]'s snapshot-then-point-remove; this pin replays the shrunk
+/// trace that exposed it (from `prop_memory_cached_overlay_view`).
+#[test]
+fn clear_section_keeps_sibling_section_ranges() -> Result<()> {
+    let store = DirtyStore::new();
+    let c = fresh_collection("entries")?;
+    let cell = |section: i8, coord: u8| CellKey {
+        section: Section::new(section),
+        coordinate: Coordinate::from_bytes(vec![coord]),
+    };
+    // The exact buffered-op order that shaped the failing tree; `None` is a
+    // buffered clear, `Some` a buffered set.
+    let ops: &[(i8, u8, Option<u8>)] = &[
+        (1, 0, None),
+        (1, 7, None),
+        (0, 10, Some(211)),
+        (0, 4, Some(83)),
+        (1, 1, Some(106)),
+        (0, 11, Some(119)),
+        (1, 7, Some(94)),
+        (0, 7, None),
+        (1, 2, Some(174)),
+        (0, 5, None),
+        (1, 0, None),
+        (1, 5, None),
+        (0, 2, None),
+        (1, 9, Some(139)),
+        (1, 4, None),
+        (0, 3, Some(219)),
+    ];
+    for &(section, coord, value) in ops {
+        match value {
+            Some(byte) => store.set(&c, &cell(section, coord), &[byte]),
+            None => store.clear(&c, &cell(section, coord)),
+        }
+    }
+
+    store.clear_section(&c, Section::new(0));
+
+    // Section 1's seven buffered cells survive the sibling sweep — for the
+    // scan leg (section_snapshot) and the finalize work-list (touched) alike.
+    let survivors: Vec<u8> = store
+        .section_snapshot(&c, Section::new(1))
+        .iter()
+        .filter_map(|(key, _)| key.coordinate.as_bytes().first().copied())
+        .collect();
+    assert_eq!(
+        survivors,
+        [0, 1, 2, 4, 5, 7, 9],
+        "the sibling section's snapshot lost cells after clear_section"
+    );
+    let touched = store.touched(&c.state_key().key);
+    let [((state_type, name), cleared, cells)] = touched.as_slice() else {
+        color_eyre::eyre::bail!("expected exactly one touched collection: {touched:?}");
+    };
+    assert_eq!((*state_type, name), (StateType::Application, c.name()));
+    assert_eq!(cleared.as_slice(), [Section::new(0)]);
+    assert_eq!(
+        cells.len(),
+        7,
+        "the finalize work-list lost the sibling section's cells: {cells:?}"
+    );
+    Ok(())
+}
+
 /// Regression, the marker tree's [`Edge`] fat-bound seek hazard (the analogue
 /// of [`section_snapshot_returns_whole_section_beside_a_lower_section`] for
 /// the cell tree): with the marker tree spanning multiple scc leaf nodes and a
@@ -144,12 +218,12 @@ fn marker_scopes_span_multiple_leaf_nodes() -> Result<()> {
 
     // The collection scope's strict-`Edge` bounds are load-bearing for scc
     // range *seeks*: a fat bound comparing `Equal` to a span that itself
-    // straddles leaf nodes lands mid-span and skips leading markers.
-    // `remove_range` cannot observe this (removal containment-checks each
-    // entry, so a fat bound removes exactly the same set), so the drains
-    // below are blind to it — probe the seek contract through a range read
-    // over one wide span, populated out of order like the cell tree's seek
-    // regression so the leaf layout diverges from rank order.
+    // straddles leaf nodes lands mid-span and skips leading markers. Probe
+    // the seek contract directly through a range read over one wide span,
+    // populated out of order like the cell tree's seek regression so the
+    // leaf layout diverges from rank order (the drains below exercise the
+    // same seek through `remove_span`'s doomed-key snapshot, but a read
+    // asserts the yielded set explicitly).
     let wide = coll("kc", "wide")?;
     for step in 0..60_i8 {
         store.clear_section(&wide, Section::new(step));

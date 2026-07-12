@@ -13,10 +13,12 @@
 //! `DirtyKey` = `(key, state_type, name, cell)`, ordered so a single event's
 //! cells (one Kafka `key`) form a contiguous sub-range. Single-writer-per-key
 //! makes one key's sub-range exclusively owned during its event, so
-//! [`DirtyStore::clear_event`] (a [`scc::TreeIndex::remove_range_sync`] over
-//! that key's sub-range) is race-free and allocates nothing per event — no
-//! `Mutex`, no per-event map. The full `(state_type, name)` in the key prevents
-//! same-key / different-collection collisions in the shared tree.
+//! [`DirtyStore::clear_event`] (a point-removal sweep over that key's
+//! sub-range — see [`remove_span`] for why not `remove_range_sync`) is
+//! race-free, with no `Mutex` and no per-event map; its only allocation is
+//! the doomed-key snapshot, bounded by what the event buffered. The full
+//! `(state_type, name)` in the key prevents same-key / different-collection
+//! collisions in the shared tree.
 //!
 //! Section clears ride a **sibling marker tree**: [`DirtyStore::clear_section`]
 //! upserts a *dirty clear marker* keyed `(key, state_type, name, section)` and
@@ -164,8 +166,7 @@ impl DirtyStore {
     pub fn clear_section(&self, collection: &CollectionId, section: Section) {
         self.markers
             .upsert_sync(marker_key(collection, section), ());
-        self.entries
-            .remove_range_sync(SectionScope::range(collection, section));
+        remove_span(&self.entries, SectionScope::range(collection, section));
     }
 
     /// Whether a dirty clear marker stands for the collection-section — the
@@ -246,10 +247,8 @@ impl DirtyStore {
     /// the same reason as [`Self::clear_event`]: no handler op is in flight
     /// while the handler itself awaits the commit or calls the rollback.
     pub fn remove_collection(&self, collection: &CollectionId) {
-        self.entries
-            .remove_range_sync(CollectionScope::range(collection));
-        self.markers
-            .remove_range_sync(MarkerCollectionScope::range(collection));
+        remove_span(&self.entries, CollectionScope::range(collection));
+        remove_span(&self.markers, MarkerCollectionScope::range(collection));
     }
 
     /// Whether any dirty cell or clear marker is buffered for the collection —
@@ -313,14 +312,43 @@ impl DirtyStore {
     /// single-writer-per-key makes this key's sub-range exclusively owned
     /// during its event.
     pub fn clear_event(&self, key: &Key) {
-        self.entries.remove_range_sync(KeyScope::range(key.clone()));
-        self.markers
-            .remove_range_sync(MarkerKeyScope::range(key.clone()));
+        remove_span(&self.entries, KeyScope::range(key.clone()));
+        remove_span(&self.markers, MarkerKeyScope::range(key.clone()));
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// Removes every entry of `tree` inside `range`: snapshot the span's keys
+/// through the range read, then remove each key point-wise.
+///
+/// Deliberately **not** [`scc::TreeIndex::remove_range_sync`]: scc 3.8's bulk
+/// range removal can leave the tree in a shape where a later `range` seek
+/// through this module's strict-separator bounds ([`Edge`]) misses surviving
+/// entries even though point reads still find them — observed as `touched` /
+/// `section_snapshot` answering empty after a `clear_section`, i.e. buffered
+/// writes silently dropped from the stage. Point removal keeps every later
+/// seek sound (pinned by `clear_section_keeps_sibling_section_ranges` in the
+/// sibling tests). The doomed-key snapshot is bounded by what this event
+/// buffered, inline for the common handful of cells.
+fn remove_span<K, V, Q>(tree: &scc::TreeIndex<K, V>, range: RangeInclusive<Q>)
+where
+    K: Clone + Ord + 'static,
+    V: Clone + 'static,
+    Q: scc::Comparable<K>,
+{
+    let guard = Guard::new();
+    let doomed: SmallVec<[K; CELLS_INLINE]> = tree
+        .range(range, &guard)
+        .map(|(key, _)| key.clone())
+        .collect();
+    drop(guard);
+    for key in &doomed {
+        tree.remove_sync(key);
+    }
+}
+
 /// Builds the tree key for one cell of a collection.
 fn dirty_key(collection: &CollectionId, cell: &CellKey) -> DirtyKey {
     DirtyKey {
