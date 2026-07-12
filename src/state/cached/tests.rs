@@ -139,9 +139,9 @@ where
 ///
 /// Run in both directions: `cover_consumed`'s frontier arithmetic branches on
 /// direction (forward covers `[gap_lo, X]`, backward `[X, gap_hi]`), and
-/// production reaches the Backward arm via Deque reverse iteration. The
-/// answer-vs-oracle suites never trip the `GAP_COVER_STRIDE` early-drop window,
-/// so this pins both arms directly.
+/// production reaches the Backward arm via wide-window Deque reverse iteration.
+/// The answer-vs-oracle suites never trip the `GAP_COVER_STRIDE` early-drop
+/// window, so this pins both arms directly.
 async fn gap_frontier_case(dir: Direction) -> Result<()> {
     // More than two strides of cells, consumed one stride + a partial.
     const TOTAL: usize = 2 * GAP_COVER_STRIDE + 22;

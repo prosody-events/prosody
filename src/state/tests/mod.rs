@@ -582,13 +582,43 @@ async fn drain_deque_stream(
     Ok(out)
 }
 
+/// Seeds a committed deque window of `width` entries named `name` directly into
+/// `counting`'s lower store, valued by its own index so a stream-order
+/// assertion is possible.
+async fn seed_wide_deque(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    state_key: &StateKey,
+    name: &str,
+    width: usize,
+) -> Result<()> {
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new(name)?,
+    );
+    let wide_ref = CollectionRef::new(id, None);
+    let mut seeded = vec![(
+        deque::meta_cell(),
+        Some(Bytes::from(deque::seed_frame(0, i64::try_from(width)?))),
+    )];
+    for i in 0..width {
+        let index = i64::try_from(i)?;
+        seeded.push((
+            deque::entry_cell_for(&I64KeyCodec::encode(&index)),
+            Some(Bytes::from(serde_json::to_vec(&Value::from(index))?)),
+        ));
+    }
+    counting.write_resolved(&wide_ref, &seeded, &[]).await?;
+    Ok(())
+}
+
 /// Sub-threshold deque iteration is pure point reads: streaming a small
 /// committed deque issues **zero** lower-store scans and exactly `len + 1`
 /// lower gets (`len` entries plus the bounds cell), in both directions. The
 /// companion wide-window assertions prove the counters are live and pin the
 /// fallback: a directly-seeded window wider than
-/// [`deque::DEQUE_POINT_ITERATION_MAX`] streams through exactly one lower
-/// scan (plus the one bounds get).
+/// [`deque::DEQUE_POINT_ITERATION_MAX`] streams every entry in order through
+/// exactly one lower scan (plus the one bounds get).
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
@@ -660,35 +690,27 @@ fn deque_stream_issues_no_scans() -> Result<()> {
 
         // Companion: a directly-seeded window one wider than the threshold
         // falls back to exactly one lower scan — proving the zero above is a
-        // live counter and pinning the fallback arm.
-        let wide_id = CollectionId::new(
-            state_key.clone(),
-            StateType::Application,
-            StateName::try_new("dq-wide")?,
-        );
-        let wide_ref = CollectionRef::new(wide_id, None);
+        // live counter and pinning the fallback arm streams every entry in
+        // order.
         let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
-        let mut seeded = vec![(
-            deque::meta_cell(),
-            Some(Bytes::from(deque::seed_frame(0, i64::try_from(width)?))),
-        )];
-        for i in 0..width {
-            seeded.push((
-                deque::entry_cell_for(&I64KeyCodec::encode(&i64::try_from(i)?)),
-                Some(Bytes::from(serde_json::to_vec(&Value::from(7_u8))?)),
-            ));
-        }
-        counting.write_resolved(&wide_ref, &seeded, &[]).await?;
+        seed_wide_deque(&counting, &state_key, "dq-wide", width).await?;
 
         counting.reset();
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(u128::MAX - 2),
         };
         let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
-        let drained = drain_deque_stream(&session, "dq-wide", Direction::Forward)
-            .await?
-            .len();
-        assert_eq!(drained, width, "the wide window streams every seeded entry");
+        let drained = drain_deque_stream(&session, "dq-wide", Direction::Forward).await?;
+        let expected: Vec<Value> = (0..width)
+            .map(i64::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(Value::from)
+            .collect();
+        assert_eq!(
+            drained, expected,
+            "the wide window streams every seeded entry in order"
+        );
         assert_eq!(
             counting.lower_scans(),
             1,

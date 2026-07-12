@@ -219,11 +219,7 @@ where
         if index >= window.len()? {
             return Ok(None);
         }
-        let offset = i64::try_from(index).map_err(|_| MetaDecodeError::IndexOverflow)?;
-        let absolute = window
-            .head
-            .checked_add(offset)
-            .ok_or(MetaDecodeError::IndexOverflow)?;
+        let absolute = window.absolute(index)?;
         Ok(self.entries.get(&absolute).await?)
     }
 
@@ -269,12 +265,7 @@ where
                         Direction::Forward => i,
                         Direction::Backward => len - 1 - i,
                     };
-                    let offset =
-                        i64::try_from(position).map_err(|_| MetaDecodeError::IndexOverflow)?;
-                    let index = window
-                        .head
-                        .checked_add(offset)
-                        .ok_or(MetaDecodeError::IndexOverflow)?;
+                    let index = window.absolute(position)?;
                     if let Some(value) = self.entries.get(&index).instrument(span.clone()).await? {
                         yield value;
                     }
@@ -519,6 +510,15 @@ impl Window {
             .checked_sub(self.head)
             .ok_or(MetaDecodeError::IndexOverflow)?;
         usize::try_from(span).map_err(|_| MetaDecodeError::IndexOverflow)
+    }
+
+    /// Maps a front-relative position to its absolute index `head + position`,
+    /// failing [`MetaDecodeError::IndexOverflow`] past the index space.
+    fn absolute(self, position: usize) -> Result<i64, MetaDecodeError> {
+        let offset = i64::try_from(position).map_err(|_| MetaDecodeError::IndexOverflow)?;
+        self.head
+            .checked_add(offset)
+            .ok_or(MetaDecodeError::IndexOverflow)
     }
 }
 
