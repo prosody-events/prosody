@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::future::{self, Future};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use educe::Educe;
 use parking_lot::Mutex;
@@ -108,6 +108,11 @@ pub struct MockEventContext<P = Value, S = UnavailableState<P>> {
     /// The category the leading failures classify as.
     timer_fail_category: ErrorCategory,
 
+    /// When set, the next `scheduled()` read flips the shutdown watch as a
+    /// side effect — see
+    /// [`with_shutdown_on_timer_read`](Self::with_shutdown_on_timer_read).
+    shutdown_on_timer_read: Arc<AtomicBool>,
+
     /// Keyed-state session descriptor binds route to; defaults to the
     /// [`UnavailableState`] stub.
     session: S,
@@ -145,6 +150,7 @@ where
             durable_timers: Arc::new(Mutex::new(Vec::new())),
             timer_fail_count: Arc::new(AtomicUsize::new(0)),
             timer_fail_category: ErrorCategory::Permanent,
+            shutdown_on_timer_read: Arc::new(AtomicBool::new(false)),
             session: UnavailableState::new(),
             _payload: PhantomData,
         }
@@ -164,6 +170,7 @@ impl<P, S> MockEventContext<P, S> {
             durable_timers: self.durable_timers,
             timer_fail_count: self.timer_fail_count,
             timer_fail_category: self.timer_fail_category,
+            shutdown_on_timer_read: self.shutdown_on_timer_read,
             session,
             _payload: PhantomData,
         }
@@ -207,6 +214,16 @@ impl<P, S> MockEventContext<P, S> {
     #[must_use]
     pub fn with_shutdown(self) -> Self {
         self.shutdown_tx.send_replace(ShutdownPhase::Cancelling);
+        self
+    }
+
+    /// Flip the shutdown watch as a side effect of every `scheduled()` read —
+    /// deterministic "shutdown arrives during the backstop arm" for the settle
+    /// boundary's arm-shutdown rollback test (the read completes, then the
+    /// arm's next retry step sees shutdown at its loop top).
+    #[must_use]
+    pub fn with_shutdown_on_timer_read(self) -> Self {
+        self.shutdown_on_timer_read.store(true, Ordering::SeqCst);
         self
     }
 
@@ -404,6 +421,9 @@ where
         &self,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        if self.shutdown_on_timer_read.load(Ordering::SeqCst) {
+            self.request_shutdown();
+        }
         future::ready(Ok(self.durable_scheduled(timer_type)))
     }
 }

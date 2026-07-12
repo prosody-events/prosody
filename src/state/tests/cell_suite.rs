@@ -2460,7 +2460,7 @@ where
 #[derive(Clone)]
 pub(crate) enum Poison {
     /// Promote path: `mark_resolved` fails with the given category for every
-    /// cell of one named collection — the session's best-effort `commit_apply`
+    /// cell of one named collection — the receipt's best-effort `promote`
     /// and the manager's recovery sweep.
     Collection(StateName, ErrorCategory),
     /// Promote path: `mark_resolved` fails for the chosen single-byte
@@ -2485,8 +2485,8 @@ pub(crate) type PoisonHandle = Arc<parking_lot::Mutex<Option<Poison>>>;
 
 /// A [`CellStore`] wrapper whose `mark_resolved`/`commit_provisional`
 /// (promote path) or `write_provisional` (stage path) fails for a chosen
-/// target, delegating everything else to `inner`. Drives the session's
-/// best-effort `commit_apply` (one poisoned cell yields `Incomplete` without
+/// target, delegating everything else to `inner`. Drives the receipt's
+/// best-effort `promote` (one poisoned cell yields `Incomplete` without
 /// cancelling siblings), the manager's no-strand recovery (a failed
 /// resolution leaves the backstop armed), the sweep's per-cell `try_fold`
 /// failure arm, the settle boundary's finalize-`Skip` arm, and the generated

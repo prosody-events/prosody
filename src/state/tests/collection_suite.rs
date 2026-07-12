@@ -44,8 +44,10 @@ use crate::state::oracle::CommitOracle;
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
-use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
+use crate::state::session::{
+    CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
+};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
@@ -277,7 +279,7 @@ fn make_session(
 
 /// [`make_session`] over a caller-owned dirty workspace, so a test can snapshot
 /// the per-event buffered cells (the Map TTL bound-refresh property inspects
-/// the staged-set composition through it).
+/// what `finalize` will stage through it).
 fn make_session_with_dirty(
     cells: &MemoryCells,
     oracle: &ScriptedOracle,
@@ -333,10 +335,12 @@ where
     Ok((Arc::new(registry), collection_ref))
 }
 
-/// Resolves the event along its outcome's path: promote/rollback inline, or
-/// crash → fresh store → sweep. Returns `false` only if a sweep strands a cell.
+/// Resolves the event along its outcome's path: consume the `finalize`
+/// receipt inline (promote/rollback), or crash → fresh store → sweep.
+/// Returns `false` only if a sweep strands a cell.
 async fn resolve_event(
     session: SuiteSession,
+    finalized: Finalized<MemoryCellStore<ScriptedOracle>>,
     outcome: Outcome,
     cells: &MemoryCells,
     oracle: &ScriptedOracle,
@@ -345,12 +349,21 @@ async fn resolve_event(
 ) -> Result<bool> {
     match outcome {
         Outcome::Commit => {
-            session.commit_apply().await;
+            if let Finalized::Staged(staged) = finalized
+                && staged.certify().promote().await != ApplyOutcome::Resolved
+            {
+                return Err(eyre!("promote incomplete on a healthy store"));
+            }
         }
         Outcome::Abort => {
-            session.rollback_aborted().await;
+            if let Finalized::Staged(staged) = finalized {
+                staged.rollback().await;
+            }
         }
         Outcome::CrashCommitted | Outcome::CrashAborted => {
+            // Dropping the receipt (and session) IS the crash: the durable
+            // staged cells and the oracle survive; the in-memory record dies.
+            drop(finalized);
             drop(session);
             // A cold store over the same warm backing — exactly a restart.
             let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
@@ -363,6 +376,34 @@ async fn resolve_event(
         }
     }
     Ok(true)
+}
+
+/// Settles one committed event end-to-end for a directed pin: `finalize`,
+/// record the event's marker, then consume the receipt with
+/// `certify().promote()` — erroring if a healthy store reports `Incomplete`.
+/// A `Clean` finalize just records the marker (nothing to promote).
+pub(crate) async fn finalize_and_promote<L>(
+    session: &L,
+    oracle: &ScriptedOracle,
+    dedup_id: Uuid,
+) -> Result<()>
+where
+    L: StateLifecycle,
+{
+    let finalized = session
+        .finalize()
+        .await
+        .map_err(|e| eyre!("finalize: {e}"))?;
+    oracle
+        .record_message(dedup_id)
+        .await
+        .map_err(|e| eyre!("marker: {e}"))?;
+    if let Finalized::Staged(staged) = finalized
+        && staged.certify().promote().await != ApplyOutcome::Resolved
+    {
+        bail!("promote incomplete on a healthy store");
+    }
+    Ok(())
 }
 
 /// The warm backing shared across a trace's events, handed to the read-back
@@ -434,7 +475,7 @@ where
             }
         }
 
-        session
+        let finalized = session
             .finalize()
             .await
             .map_err(|e| eyre!("finalize: {e}"))?;
@@ -446,6 +487,7 @@ where
         }
         if !resolve_event(
             session,
+            finalized,
             ev.outcome,
             &cells,
             &oracle,
@@ -578,7 +620,7 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
     .await
 }
 
-/// Map TTL bound-refresh (staged-set composition): on a collection **with a
+/// Map TTL bound-refresh (what `finalize` stages): on a collection **with a
 /// TTL**, every `set` buffers *both* bound cells — even a re-set of a key
 /// already within the committed bounds — so their TTL is refreshed and the
 /// bounds outlive every entry. Runs multiple committed events over a fresh
@@ -642,15 +684,7 @@ pub(crate) async fn run_map_ttl_bounds_trace(trace: MapTrace) -> Result<bool> {
                 }
             }
         }
-        session
-            .finalize()
-            .await
-            .map_err(|e| eyre!("finalize: {e}"))?;
-        oracle
-            .record_message(event_dedup(event))
-            .await
-            .map_err(|e| eyre!("marker: {e}"))?;
-        session.commit_apply().await;
+        finalize_and_promote(&session, &oracle, event_dedup(event)).await?;
     }
     Ok(true)
 }
@@ -1011,9 +1045,7 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     block_on(async {
         handle.push_back(Value::from(1_u8)).await?;
         handle.push_back(Value::from(2_u8)).await?;
-        session.finalize().await?;
-        oracle.record_message(event_dedup(event1)).await?;
-        session.commit_apply().await;
+        finalize_and_promote(&session, &oracle, event_dedup(event1)).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -1026,9 +1058,7 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     block_on(async {
         handle.clear().await?;
         handle.push_back(Value::from(9_u8)).await?;
-        session.finalize().await?;
-        oracle.record_message(event_dedup(event2)).await?;
-        session.commit_apply().await;
+        finalize_and_promote(&session, &oracle, event_dedup(event2)).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -1092,9 +1122,7 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(1_u8)).await?;
-        session.finalize().await?;
-        oracle.record_message(event_dedup(event1)).await?;
-        session.commit_apply().await;
+        finalize_and_promote(&session, &oracle, event_dedup(event1)).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -1106,9 +1134,7 @@ fn map_clear_erases_the_bound_cells() -> Result<()> {
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.clear().await?;
-        session.finalize().await?;
-        oracle.record_message(event_dedup(event2)).await?;
-        session.commit_apply().await;
+        finalize_and_promote(&session, &oracle, event_dedup(event2)).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 

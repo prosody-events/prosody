@@ -11,8 +11,8 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeHoles, DequeTrace, MapTrace, run_deque_holes, run_deque_trace, run_map_trace,
-    run_map_ttl_bounds_trace,
+    DequeHoles, DequeTrace, MapTrace, finalize_and_promote, run_deque_holes, run_deque_trace,
+    run_map_trace, run_map_ttl_bounds_trace,
 };
 use self::support::fresh_collection;
 use super::cell::ProvisionalWrite;
@@ -23,7 +23,6 @@ use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore}
 use super::oracle::CommitOracle;
 use super::order_codec::I64KeyCodec;
 use super::registry::{CollectionDef, CollectionDefRegistry};
-use super::session::sealed::StateLifecycle;
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::CellStore;
 use super::{
@@ -527,15 +526,7 @@ fn empty_map_stream_issues_no_lower_scans() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?
             .set(0, Value::from(7_i64))
             .await?;
-        session
-            .finalize()
-            .await
-            .map_err(|e| eyre!("finalize: {e}"))?;
-        oracle
-            .record_message(Uuid::from_u128(1))
-            .await
-            .map_err(|e| eyre!("marker: {e}"))?;
-        session.commit_apply().await;
+        finalize_and_promote(&session, &oracle, Uuid::from_u128(1)).await?;
 
         counting.reset();
 

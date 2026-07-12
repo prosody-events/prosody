@@ -183,7 +183,7 @@ pub mod topic;
 
 // Re-export providers for backwards compatibility and convenience
 pub use providers::{CloneProvider, FallibleCloneProvider};
-pub(crate) use settle::{RollbackSafety, abandon, settle};
+pub(crate) use settle::{abandon, settle};
 
 /// Provides fallible handlers for processing messages from specific partitions.
 ///
@@ -684,7 +684,7 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 ///             self-clears once the key goes quiet)
 ///           → after_commit(Ok)
 /// final Err Transient/Permanent → flush registered marker → commit → after_commit(Err)
-/// final Err Terminal            → abort → roll back → after_abort
+/// final Err Terminal            → abort → after_abort
 /// ```
 ///
 /// Because the marker flush is textually *after* the stage in one function,

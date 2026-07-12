@@ -395,22 +395,20 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
     Ok(())
 }
 
-/// Rollback-only-before-flush: inline `abandon` rolls a staged
-/// set back to its committed base ONLY before a marker flush is attempted.
-/// After an attempt the flush's durability is ambiguous, so the staged cells
-/// must stay provisional for the armed sweep to resolve through the oracle —
-/// rolling back here could erase a committed write that redelivery then
-/// dedup-filters away.
-mod rollback_safety {
+/// The settle boundary's single staged-rollback site: shutdown at the
+/// backstop arm — after a successful stage, before any marker-flush attempt —
+/// rolls the staged cells back to their committed base. `abandon` has no
+/// state access, and a rollback past `certify` does not compile
+/// (`Promotable` has no rollback), so rollback-after-a-marker-flush-attempt
+/// is unwritable rather than tested.
+mod staged_rollback {
     use super::*;
-    use crate::consumer::Uncommitted;
     use crate::loader::MemoryLoader;
     use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
     use crate::state::session::LifecycleAccessExt;
-    use crate::state::session::sealed::FinalizeOutcome;
     use crate::state::session::sealed::StateLifecycle;
     use crate::state::store::CellStore;
     use crate::state::{CollectionId, StateKey, StateName, StateType};
@@ -433,15 +431,6 @@ mod rollback_safety {
         Ok(stream.next().await.transpose()?.is_some())
     }
 
-    /// A commit guard that records nothing — `abandon` only `abort`s it.
-    struct NoopGuard;
-
-    impl Uncommitted for NoopGuard {
-        async fn commit(self) {}
-
-        async fn abort(self) {}
-    }
-
     type Ctx = MockEventContext<serde_json::Value, TestSession>;
 
     /// The `cart` descriptor with the default JSON codec.
@@ -449,11 +438,12 @@ mod rollback_safety {
         value_state("cart")
     }
 
-    /// Stages one provisional cell on `cart` through a real session and returns
-    /// the context (ready to abandon / settle), the durable store, and the cell
-    /// id. `configure` applies context modifiers (`with_timer_failures`,
-    /// `with_shutdown`, ...) before staging.
-    async fn staged(
+    /// Buffers one value write on `cart` through a real session — no finalize:
+    /// `settle` owns the only stage, from the intact dirty buffer. Returns the
+    /// context (ready to settle), the durable store, and the cell id.
+    /// `configure` applies context modifiers (`with_timer_failures`,
+    /// `with_shutdown`, ...) before the write.
+    async fn buffered(
         configure: impl FnOnce(Ctx) -> Ctx,
     ) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
         let mut registry = CollectionDefRegistry::default();
@@ -463,72 +453,52 @@ mod rollback_safety {
             test_session_parts(MemoryLoader::new(), registry, state_key.clone());
         let context: Ctx = configure(MockEventContext::new().with_session(session));
 
-        // Write a value and finalize → one provisional cell staged durably.
         let handle = context
             .state(Registered::new(cart()))
             .map_err(|e| eyre!("bind cart: {e}"))?;
         handle.set(json!({ "x": 1_i32 })).await?;
-        let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-        let outcome = lifecycle
-            .finalize()
-            .await
-            .map_err(|e| eyre!("finalize: {e}"))?;
-        assert_eq!(outcome, FinalizeOutcome::Staged);
 
         let cart_id = CollectionId::new(
             state_key,
             StateType::Application,
             StateName::try_new("cart")?,
         );
-        assert!(
-            is_provisional(&cell_store, &cart_id).await?,
-            "the cell must be provisional after staging"
-        );
         Ok((context, cell_store, cart_id))
     }
 
-    /// After a marker-flush attempt, abandon must NOT roll back: the cell stays
-    /// provisional for the sweep to resolve through the oracle.
+    /// Shutdown between a successful stage and the backstop arm drives
+    /// settle's ONE reachable rollback: the guard aborts, the staged cell
+    /// rolls back to its committed base (here absent, so the cell resolves
+    /// away), and `after_abort` fires. The abort itself proves the staged arm
+    /// ran — a `Clean` finalize would have committed instead.
     #[tokio::test]
-    async fn after_marker_flush_keeps_the_cell_provisional() -> Result<()> {
-        let (context, cell_store, cart_id) = staged(|c| c).await?;
+    async fn arm_shutdown_rolls_the_staged_cells_back() -> Result<()> {
+        let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
         let handler = ProbeHandler::ok(0);
+        let log = handler.log.clone();
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
 
-        abandon(
-            &handler,
-            context,
-            NoopGuard,
-            Err(TestError(ErrorCategory::Terminal, "shutdown mid-flush")),
-            RollbackSafety::AfterMarkerFlush,
-        )
-        .await;
+        settle(&handler, context, guard, Ok(0)).await;
 
-        assert!(
-            is_provisional(&cell_store, &cart_id).await?,
-            "AfterMarkerFlush must leave the staged cell provisional",
+        assert_eq!(
+            aborted.load(Ordering::SeqCst),
+            1,
+            "arm-shutdown must abort the guard"
         );
-        Ok(())
-    }
-
-    /// Before any marker flush, abandon rolls the staged cell back to its
-    /// committed base — here the empty base, so the cell resolves to absent.
-    #[tokio::test]
-    async fn before_marker_flush_rolls_the_cell_back() -> Result<()> {
-        let (context, cell_store, cart_id) = staged(|c| c).await?;
-        let handler = ProbeHandler::ok(0);
-
-        abandon(
-            &handler,
-            context,
-            NoopGuard,
-            Err(TestError(ErrorCategory::Terminal, "terminal handler error")),
-            RollbackSafety::BeforeMarkerFlush,
-        )
-        .await;
-
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
         assert!(
             !is_provisional(&cell_store, &cart_id).await?,
-            "BeforeMarkerFlush must roll the staged cell back to resolved",
+            "the receipt's rollback must restore the committed base",
+        );
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::AfterAbort(Ok(0))],
+            "the arm-shutdown abort fires after_abort exactly once",
         );
         Ok(())
     }
@@ -629,18 +599,16 @@ mod rollback_safety {
     }
 
     /// Abort-only-on-shutdown, end to end through `settle`'s success path: a
-    /// shutdown is the *sole* thing that stops the durability sequence short of
-    /// a commit — it abandons *before* the marker flush, so the staged cell
-    /// rolls back to its committed base and the offset aborts (the event
-    /// redelivers and re-runs). Every store failure instead retries forever.
-    /// This is exercised by the `prop_settle_aborts_iff_shutdown` property
-    /// below (its `shutdown` / non-`shutdown` × `fail_count` axes subsume the
-    /// abort-on-shutdown and retry-forever-self-heal directed cases).
+    /// shutdown is the *sole* thing that stops the durability sequence short
+    /// of a commit — a shutdown seen before the finalize stage abandons with
+    /// nothing ever staged, so nothing is left provisional; the offset aborts
+    /// either way (the event redelivers and re-runs). Every store failure
+    /// instead retries forever.
     ///
     /// The never-abort-except-shutdown invariant, as a property over a
     /// generated leading-failure count, the **category** those failures
     /// classify as, and a shutdown flag: `settle`'s success path aborts the
-    /// offset **iff** shutdown (rolling the staged cell back), and
+    /// offset **iff** shutdown (leaving nothing provisional), and
     /// otherwise self-heals to a commit **no matter how many** failures —
     /// of **any** category — the arm hits first (the arm is must-succeed,
     /// invariant 8) — then flushes the marker, commits, and promotes the
@@ -672,8 +640,8 @@ mod rollback_safety {
                     let c = c.with_timer_failures(fail_count, category);
                     if shutdown { c.with_shutdown() } else { c }
                 };
-                let Ok((context, cell_store, cart_id)) = staged(configure).await else {
-                    return TestResult::error("failed to stage");
+                let Ok((context, cell_store, cart_id)) = buffered(configure).await else {
+                    return TestResult::error("failed to buffer the write");
                 };
                 let handler = ProbeHandler::ok(0);
                 let committed = Arc::new(AtomicUsize::new(0));
@@ -692,10 +660,11 @@ mod rollback_safety {
                 let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
 
                 if shutdown {
-                    // Abort iff shutdown: the offset aborts and the cell rolls back.
+                    // Abort iff shutdown: the offset aborts, and nothing was
+                    // ever staged (settle's finalize step sees shutdown first).
                     if aborted != 1 || committed != 0 || still_provisional {
                         return TestResult::error(format!(
-                            "shutdown must abort+rollback: committed={committed} \
+                            "shutdown must abort with nothing staged: committed={committed} \
                              aborted={aborted} provisional={still_provisional}"
                         ));
                     }
@@ -726,9 +695,9 @@ mod backstop_amortization {
     use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
     use crate::state::manager::ArmedKeys;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::StateLifecycle;
-    use color_eyre::eyre::{Result, eyre};
+    use crate::state::session::{Finalized, LifecycleAccessExt};
+    use color_eyre::eyre::{Result, bail, eyre};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -767,12 +736,15 @@ mod backstop_amortization {
                 .map_err(|e| eyre!("bind: {e}"))?;
             handle.set(json!({ "i": i as i32 })).await?;
             let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-            lifecycle
+            let Finalized::Staged(staged) = lifecycle
                 .finalize()
                 .await
-                .map_err(|e| eyre!("finalize: {e}"))?;
+                .map_err(|e| eyre!("finalize: {e}"))?
+            else {
+                bail!("expected a staged receipt");
+            };
 
-            let outcome = arm_backstop(&context, &lifecycle).await;
+            let outcome = arm_backstop(&context, &lifecycle, staged.recovery_delay()).await;
             assert!(
                 matches!(outcome, ArmOutcome::Armed),
                 "arm must succeed every commit"
@@ -808,11 +780,14 @@ mod backstop_amortization {
                 .map_err(|e| eyre!("bind: {e}"))?;
             handle.set(json!({ "x": 1_i32 })).await?;
             let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-            lifecycle
+            let Finalized::Staged(staged) = lifecycle
                 .finalize()
                 .await
-                .map_err(|e| eyre!("finalize: {e}"))?;
-            arm_backstop(&context, &lifecycle).await;
+                .map_err(|e| eyre!("finalize: {e}"))?
+            else {
+                bail!("expected a staged receipt");
+            };
+            arm_backstop(&context, &lifecycle, staged.recovery_delay()).await;
             scheduled += context.count_scheduled(TimerType::StateRecovery);
         }
 
@@ -838,10 +813,10 @@ mod arm_backstop {
     use crate::state::descriptor::{Registered, value_state};
     use crate::state::manager::ArmedKeys;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::LifecycleAccessExt;
     use crate::state::session::sealed::StateLifecycle;
+    use crate::state::session::{Finalized, LifecycleAccessExt};
     use crate::timers::duration::CompactDuration;
-    use color_eyre::eyre::{Result, eyre};
+    use color_eyre::eyre::{Result, bail, eyre};
     use futures::executor;
     use quickcheck::{QuickCheck, TestResult};
     use serde_json::json;
@@ -899,12 +874,15 @@ mod arm_backstop {
             handle.set(json!({ "v": i as i32 })).await?;
         }
         let lifecycle = context.lifecycle().map_err(|e| eyre!("lifecycle: {e}"))?;
-        lifecycle
+        let Finalized::Staged(staged) = lifecycle
             .finalize()
             .await
-            .map_err(|e| eyre!("finalize: {e}"))?;
+            .map_err(|e| eyre!("finalize: {e}"))?
+        else {
+            bail!("expected a staged receipt (the props stage at least one collection)");
+        };
         let before = CompactDateTime::now()?;
-        arm_backstop(&context, &lifecycle).await;
+        arm_backstop(&context, &lifecycle, staged.recovery_delay()).await;
         let after = CompactDateTime::now()?;
         Ok((before, after, context))
     }

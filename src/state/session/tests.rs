@@ -3,7 +3,8 @@
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of events —
 //! each a short op list (set/clear/mid-handler commit/rollback) plus a
 //! commit/abort/reset/fail outcome — through the **real** production session
-//! lifecycle (`finalize`/`commit_apply`/`rollback_aborted`/`reset`) over **one
+//! lifecycle (the `finalize`-minted receipt's `promote`/`rollback` plus
+//! `reset`) over **one
 //! partition-shared [`DirtyStore`]**, minting each event's session as an
 //! [`EventStateScope`] that drops at event-end (the production lifecycle). It
 //! asserts, after every operation, that a plain `Option<Bytes>` model equals
@@ -23,8 +24,8 @@
 //! contract, including that a terminated session's rollback is a `NoOp` so a
 //! stale clone cannot drain a later same-key event's buffer.
 
-use super::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
-use super::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use super::sealed::{ApplyOutcome, StateLifecycle};
+use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::cell::{Committed, ProvisionalWrite};
@@ -46,7 +47,7 @@ use crate::state::{
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::sync::Arc;
@@ -215,9 +216,13 @@ fn message(n: u128) -> (EventRef, Uuid) {
 
 /// Builds a session whose registry has one `ReadCommitted` value collection per
 /// entry in `bounds` (each carrying that `recovery_within`), stages one cell in
-/// every collection, finalizes, and returns the resulting
-/// `recovery_fire_delay`. `floor_secs` is the `recovery_delay`.
-async fn staged_fire_delay(bounds: &[Option<u32>], floor_secs: u32) -> Result<CompactDuration> {
+/// every collection, finalizes, and returns the receipt's `recovery_delay` —
+/// `None` when nothing staged (a clean event mints no receipt). `floor_secs`
+/// is the `recovery_delay` floor.
+async fn staged_fire_delay(
+    bounds: &[Option<u32>],
+    floor_secs: u32,
+) -> Result<Option<CompactDuration>> {
     let mut registry = CollectionDefRegistry::new(None);
     let mut names = Vec::with_capacity(bounds.len());
     for (i, within) in bounds.iter().enumerate() {
@@ -255,15 +260,19 @@ async fn staged_fire_delay(bounds: &[Option<u32>], floor_secs: u32) -> Result<Co
             .set(StateType::Application, name, &value_cell(), b"v")
             .await?;
     }
-    session.finalize().await?;
-    Ok(session.recovery_fire_delay())
+    match session.finalize().await? {
+        Finalized::Staged(staged) => Ok(Some(staged.recovery_delay())),
+        Finalized::Clean => Ok(None),
+    }
 }
 
-/// `recovery_fire_delay` is `min(recovery_delay, min over staged collections'
-/// recovery_within)`: a `None` bound or one above the floor is inert, a tighter
-/// one pulls the delay down, and a clean (empty) staged set keeps the floor.
+/// The receipt's `recovery_delay` is `min(recovery_delay floor, min over
+/// staged collections' recovery_within)`: a `None` bound or one above the
+/// floor is inert, a tighter one pulls the delay down, and a clean event
+/// stages nothing so it mints no receipt at all — the recovery delay of a
+/// never-staged event is unrepresentable.
 #[test]
-fn prop_recovery_fire_delay_folds_bounds_against_floor() {
+fn prop_finalize_folds_recovery_delay_against_floor() {
     const FLOOR_SECS: u32 = 30;
 
     fn prop(raw: Vec<Option<u16>>) -> TestResult {
@@ -272,12 +281,16 @@ fn prop_recovery_fire_delay_folds_bounds_against_floor() {
             return TestResult::discard();
         }
         let bounds: Vec<Option<u32>> = raw.into_iter().map(|o| o.map(u32::from)).collect();
-        // Empty (nothing staged) → floor; otherwise the floor tightened by the
-        // smallest declared bound.
+        // Non-empty → the floor tightened by the smallest declared bound.
         let expected = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
         match executor::block_on(staged_fire_delay(&bounds, FLOOR_SECS)) {
-            Ok(delay) if delay.seconds() == expected => TestResult::passed(),
-            Ok(delay) => TestResult::error(format!(
+            Ok(None) if bounds.is_empty() => TestResult::passed(),
+            Ok(None) => TestResult::error(format!("expected a receipt for {bounds:?}, got Clean")),
+            Ok(Some(_)) if bounds.is_empty() => {
+                TestResult::error("a clean event must mint no receipt")
+            }
+            Ok(Some(delay)) if delay.seconds() == expected => TestResult::passed(),
+            Ok(Some(delay)) => TestResult::error(format!(
                 "expected {expected}s, got {}s for {bounds:?}",
                 delay.seconds(),
             )),
@@ -302,7 +315,10 @@ async fn marker_flushes_exactly_once_strictly_after_stage() -> Result<()> {
         .await?;
     session.register_marker(dedup_id);
 
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    // The receipt is deliberately dropped: the pin is about marker ordering,
+    // and a dropped receipt is safe (recovery never reads the in-memory
+    // record).
+    assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
     assert!(
         !fx.oracle.is_recorded(dedup_id).await,
         "the marker must not be flushed by the stage",
@@ -502,10 +518,12 @@ async fn rollback_without_a_commit_restores_the_pre_event_value() -> Result<()> 
     let (_event1, dedup) = message(1);
     s1.set(StateType::Application, &fx.value_name, &value_cell(), b"V")
         .await?;
-    s1.finalize().await?;
+    let finalized = s1.finalize().await?;
     s1.register_marker(dedup);
     s1.flush_marker().await?;
-    s1.commit_apply().await;
+    if let Finalized::Staged(staged) = finalized {
+        assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
+    }
     drop(scope1);
     assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"V")));
 
@@ -533,7 +551,7 @@ async fn rollback_without_a_commit_restores_the_pre_event_value() -> Result<()> 
     );
 
     // Nothing left to stage, and the buffer is empty for the key.
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Clean);
+    assert!(matches!(session.finalize().await?, Finalized::Clean));
     assert!(fx.dirty.touched(&key).is_empty());
     Ok(())
 }
@@ -827,27 +845,35 @@ async fn run(trace: Trace) -> Result<bool> {
 
             match ev.outcome {
                 Outcome::Commit => {
-                    session.finalize().await?;
+                    let finalized = session.finalize().await?;
                     session.register_marker(dedup_id);
                     session.flush_marker().await?;
-                    session.commit_apply().await;
+                    if let Finalized::Staged(staged) = finalized {
+                        // The memory store never fails, so a healthy promote
+                        // must fully resolve.
+                        if staged.certify().promote().await != ApplyOutcome::Resolved {
+                            return Ok(false);
+                        }
+                    }
                     // Commit advances the model (last-writer-wins).
                     model = ev_model.scratch;
                 }
                 Outcome::Abort => {
-                    session.finalize().await?;
-                    session.rollback_aborted().await;
+                    if let Finalized::Staged(staged) = session.finalize().await? {
+                        staged.rollback().await;
+                    }
                     // Post-commit ops roll back to their `prev`, which
                     // finalize captured *after* the `commit()` landed — the
                     // `commit()`-landed snapshot.
                     model = ev_model.floor.resolve(model);
                 }
                 Outcome::Reset => {
-                    session.finalize().await?;
-                    // Discards dirty + staged; any provisional written by
-                    // `finalize` lingers but projects its `prev` (the
+                    // Dropping the receipt leaves any provisional written by
+                    // `finalize` standing, projecting its `prev` (the
                     // `commit()`-landed snapshot, or the unchanged committed
-                    // base).
+                    // base) — exactly the discarded-stage behavior `reset`
+                    // pairs with.
+                    let _finalized = session.finalize().await?;
                     session.reset();
                     model = ev_model.floor.resolve(model);
                 }
@@ -895,12 +921,11 @@ fn prop_value_lifecycle_equivalence() {
 /// writes calls `write_provisional` with an empty write set under a
 /// clears-bearing marker, so the durable event marker stands after `finalize`
 /// (raw probe BEFORE any resolving read — a `get` would read-help-resolve the
-/// clears-bearing marker), the recorded staged-set entry makes `finalize`
-/// report [`FinalizeOutcome::Staged`] — the backstop-arming rule — and
-/// `commit_apply` resolves that entry (never
-/// [`ApplyOutcome::NothingStaged`]).
+/// clears-bearing marker), the staged entry makes `finalize` return
+/// [`Finalized::Staged`] — the backstop-arming rule — and the receipt's
+/// `promote` resolves that entry (the receipt exists to consume).
 ///
-/// An example because the [`FinalizeOutcome::Staged`] backstop-arming signal
+/// An example because the [`Finalized::Staged`] backstop-arming signal
 /// and the [`ApplyOutcome::Resolved`] apply signal are protocol outcomes
 /// [`prop_value_lifecycle_equivalence`] cannot observe: that property asserts
 /// the committed value projection, which a clears-only event leaves empty
@@ -915,11 +940,9 @@ async fn clears_only_event_finalizes_staged() -> Result<()> {
     session
         .clear_section(StateType::Application, &fx.value_name, Section::new(0))
         .await?;
-    assert_eq!(
-        session.finalize().await?,
-        FinalizeOutcome::Staged,
-        "a clears-only collection must stage so the backstop is armed"
-    );
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("a clears-only collection must stage so the backstop is armed");
+    };
     let marker = fx
         .cells
         .standing_marker_of(&fx.value_id())
@@ -939,9 +962,9 @@ async fn clears_only_event_finalizes_staged() -> Result<()> {
         "the marker carries the cleared section"
     );
     assert_eq!(
-        session.commit_apply().await,
+        staged.certify().promote().await,
         ApplyOutcome::Resolved,
-        "the staged entry exists to resolve — never NothingStaged"
+        "the staged entry exists to resolve"
     );
     Ok(())
 }
@@ -950,8 +973,8 @@ async fn clears_only_event_finalizes_staged() -> Result<()> {
 /// standing **foreign** committed marker (seeded crash-style through a raw
 /// store handle) is resolved — its cells settle per its verdict — rather than
 /// blind-deleted by the clears-only event's own settle, and the session's own
-/// clears-bearing marker is written by `finalize` then deleted by
-/// `commit_apply` (which also applies the clear's gap erase).
+/// clears-bearing marker is written by `finalize` then deleted by the
+/// receipt's `promote` (which also applies the clear's gap erase).
 ///
 /// The generated crash/reassignment alphabet (the crash-trace generator's
 /// clears dimension) subsumes this shape; these two pins are kept as the fast,
@@ -989,7 +1012,10 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     session
         .clear_section(StateType::Application, &fx.value_name, Section::new(0))
         .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    // The receipt is held across the raw probes below, then consumed.
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("the clears-only event must stage");
+    };
 
     // Raw probes BEFORE any resolving read: the boundary resolved A's marker
     // (nothing of A stays provisional; A's cells settled per its verdict) and
@@ -1014,7 +1040,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     // committed cells are pre-clear rows) and deletes B's marker.
     session.register_marker(b_dedup);
     session.flush_marker().await?;
-    assert_eq!(session.commit_apply().await, ApplyOutcome::Resolved);
+    assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     assert!(
         fx.cells.standing_marker_of(&id).is_none(),
         "the settle deleted B's clears-bearing marker"
@@ -1058,10 +1084,12 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     session
         .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
         .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    // Attempt one's receipt is deliberately dropped — the discarded stage the
+    // retry boundary pairs with `reset`.
+    assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
 
-    // The retry boundary: discard dirty + staged + marker, then re-dispatch
-    // the same event.
+    // The retry boundary: discard dirty + marker, then re-dispatch the same
+    // event.
     session.reset();
 
     // The retry stages a superset — the Value cell again plus one more cell —
@@ -1073,7 +1101,9 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         .set(StateType::Application, &fx.value_name, &extra, b"w")
         .await?;
     session.register_marker(dedup_id);
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("the retry re-stage must mint a receipt");
+    };
 
     // The standing durable marker is the retry's, rebuilt whole: same event,
     // and its frozen coordinate list is attempt two's staged set — not
@@ -1090,7 +1120,7 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     );
 
     session.flush_marker().await?;
-    assert_eq!(session.commit_apply().await, ApplyOutcome::Resolved);
+    assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
 
     assert_eq!(
         fx.committed_value().await?,

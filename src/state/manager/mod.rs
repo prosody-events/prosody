@@ -389,7 +389,7 @@ where
     ///
     /// The fire delay is the `recovery_delay` floor tightened by the smallest
     /// `recovery_within` among the registered collections — the same
-    /// tightening the durability boundary's `recovery_fire_delay` applies at
+    /// tightening `finalize` folds onto the receipt's recovery delay at
     /// commit time, so a transient sweep failure does not stretch a tightly
     /// bounded collection's convergence out to the full floor. Which
     /// collections still hold provisional cells is unknown here (the sweep

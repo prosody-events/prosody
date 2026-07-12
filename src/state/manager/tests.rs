@@ -7,7 +7,7 @@
 //! provisional cell staged under a real [`EventRef`] through the oracle (commit
 //! **and** abort arms), clearing the per-key armed flag, unscheduling the
 //! backstop **only** when every cell is resolved (no strand-back), and the
-//! mixed-mode `finalize`/`commit_apply`/`rollback_aborted` over the real
+//! mixed-mode `finalize` + receipt settle (`promote`/`rollback`) over the real
 //! session. The manager is Kafka-agnostic, so these mint a session from a key
 //! and an `EventRef` directly; all are broker-free.
 //!
@@ -22,8 +22,8 @@ use crate::state::cell::{Committed, ProvisionalCell};
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDef;
-use crate::state::session::CellSession;
-use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
+use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
+use crate::state::session::{CellSession, Finalized};
 use crate::state::tests::cell_suite::{FailingCellStore, bytes, value_cell};
 use crate::state::tests::support::FixedOracle;
 use crate::state::{CommitMode, EventRef, PartitionBackend, SharedStateBackend, TimerEventRef};
@@ -36,7 +36,7 @@ use crate::timers::{
     PendingTimer, TimerManagerConfig, TimerRequest, TimerSemaphores, TimerType, Trigger,
 };
 use bytes::Bytes;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 use futures::{Stream, StreamExt};
 use quickcheck::{QuickCheck, TestResult};
 use std::array::from_fn;
@@ -278,7 +278,9 @@ async fn stage_under_timer(
             &bytes(value),
         )
         .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    // The receipt is deliberately dropped: the crash window under test is
+    // "staged, its promote never ran".
+    assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
     // `insert_async` returns `Err(...)` if already present — harmless; the entry
     // is idempotent. The stored fire is immaterial to `recover`, which only
     // removes the key.
@@ -440,7 +442,7 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
         session
             .set(StateType::Application, &cart, &value_cell(), &bytes(7))
             .await?;
-        if session.finalize().await? != FinalizeOutcome::Staged {
+        if !matches!(session.finalize().await?, Finalized::Staged(_)) {
             return Ok(TestResult::error("expected the cell to stage"));
         }
 
@@ -579,7 +581,8 @@ async fn finalize_stages_mixed_collections_by_mode() -> Result<()> {
     let key: Key = Arc::from("k");
 
     let (session, event) = write_mixed(&manager, &key).await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    // The receipt is dropped: the probes below observe the stage itself.
+    assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
 
     assert_eq!(
         staged_cell(&cell, &id_for(&key, "cart")?).await?,
@@ -605,10 +608,11 @@ async fn finalize_stages_mixed_collections_by_mode() -> Result<()> {
     Ok(())
 }
 
-/// After `finalize`, `commit_apply` promotes every staged `ReadCommitted` cell
-/// to its committed data; the `ReadUncommitted` cell was already resolved.
+/// After `finalize`, the receipt's `promote` promotes every staged
+/// `ReadCommitted` cell to its committed data; the `ReadUncommitted` cell was
+/// already resolved.
 #[tokio::test]
-async fn commit_apply_promotes_all_staged_cells() -> Result<()> {
+async fn promote_promotes_all_staged_cells() -> Result<()> {
     let oracle = FixedOracle::committed();
     let registry = registry_with_mixed()?;
     let cell = cell_store(oracle.clone(), &registry);
@@ -616,8 +620,10 @@ async fn commit_apply_promotes_all_staged_cells() -> Result<()> {
     let key: Key = Arc::from("k");
 
     let (session, _event) = write_mixed(&manager, &key).await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    assert_eq!(session.commit_apply().await, ApplyOutcome::Resolved);
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("expected a staged receipt");
+    };
+    assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
 
     assert_eq!(
         committed(&cell, &id_for(&key, "cart")?).await?,
@@ -634,10 +640,11 @@ async fn commit_apply_promotes_all_staged_cells() -> Result<()> {
     Ok(())
 }
 
-/// After `finalize`, `rollback_aborted` rolls every staged `ReadCommitted` cell
-/// back to its committed base (here absent).
+/// After `finalize`, the receipt's `rollback` rolls every staged
+/// `ReadCommitted` cell back to its committed base (here absent) — asserted
+/// through `committed()` reads, since `rollback` returns nothing.
 #[tokio::test]
-async fn rollback_aborted_rolls_back_all_staged_cells() -> Result<()> {
+async fn rollback_rolls_back_all_staged_cells() -> Result<()> {
     let oracle = FixedOracle::committed();
     let registry = registry_with_mixed()?;
     let cell = cell_store(oracle.clone(), &registry);
@@ -645,20 +652,23 @@ async fn rollback_aborted_rolls_back_all_staged_cells() -> Result<()> {
     let key: Key = Arc::from("k");
 
     let (session, _event) = write_mixed(&manager, &key).await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
-    assert_eq!(session.rollback_aborted().await, ApplyOutcome::Resolved);
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("expected a staged receipt");
+    };
+    staged.rollback().await;
 
     assert_eq!(committed(&cell, &id_for(&key, "cart")?).await?, None);
     assert_eq!(committed(&cell, &id_for(&key, "wishlist")?).await?, None);
     Ok(())
 }
 
-/// `commit_apply` is best-effort under a per-cell promote failure: the poisoned
-/// `ReadCommitted` cell is left provisional (for the sweep) and the outcome is
-/// `Incomplete`, but every healthy sibling still promotes. Pins the
-/// `fold`-not-`try_fold` reduction — one failure must never cancel the rest.
+/// The receipt's `promote` is best-effort under a per-cell promote failure:
+/// the poisoned `ReadCommitted` cell is left provisional (for the sweep) and
+/// the outcome is `Incomplete`, but every healthy sibling still promotes. Pins
+/// the `fold`-not-`try_fold` reduction — one failure must never cancel the
+/// rest.
 #[tokio::test]
-async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
+async fn promote_is_best_effort_when_one_fails() -> Result<()> {
     let registry = registry_with_mixed()?;
     let inner = cell_store(FixedOracle::committed(), &registry);
     let cell = FailingCellStore::new(inner, StateName::try_new("wishlist")?);
@@ -686,10 +696,12 @@ async fn commit_apply_is_best_effort_when_one_promote_fails() -> Result<()> {
             &bytes(13),
         )
         .await?;
-    assert_eq!(session.finalize().await?, FinalizeOutcome::Staged);
+    let Finalized::Staged(staged) = session.finalize().await? else {
+        bail!("expected a staged receipt");
+    };
 
     assert_eq!(
-        session.commit_apply().await,
+        staged.certify().promote().await,
         ApplyOutcome::Incomplete,
         "a failed promote yields Incomplete so the boundary leaves the backstop armed",
     );

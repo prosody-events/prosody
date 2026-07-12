@@ -9,8 +9,8 @@ use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::memory::MemoryCellStore;
 use crate::state::oracle::CommitOracle;
-use crate::state::session::CellSession;
-use crate::state::session::sealed::{ApplyOutcome, FinalizeOutcome, StateLifecycle};
+use crate::state::session::sealed::StateLifecycle;
+use crate::state::session::{CellSession, Finalized};
 use crate::state::{
     CollectionId, CommitDecision, EventRef, StateKey, StateName, StateType, StoreOutcome,
 };
@@ -195,16 +195,8 @@ where
 {
     type Cell = MemoryCellStore<FixedOracle>;
 
-    async fn finalize(&self) -> Result<FinalizeOutcome, StateAccessError> {
-        Ok(FinalizeOutcome::Clean)
-    }
-
-    async fn commit_apply(&self) -> ApplyOutcome {
-        ApplyOutcome::NothingStaged
-    }
-
-    async fn rollback_aborted(&self) -> ApplyOutcome {
-        ApplyOutcome::NothingStaged
+    async fn finalize(&self) -> Result<Finalized<Self::Cell>, StateAccessError> {
+        Ok(Finalized::Clean)
     }
 
     fn register_marker(&self, dedup_id: Uuid) {
@@ -221,7 +213,7 @@ where
         self.markers.lock().clear();
     }
 
-    fn recovery_fire_delay(&self) -> CompactDuration {
+    fn recovery_floor(&self) -> CompactDuration {
         CompactDuration::MIN
     }
 
