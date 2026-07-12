@@ -1,33 +1,50 @@
-//! Session lifecycle property + the marker-ordering pin.
+//! The central settlement property + the protocol pins it cannot observe.
 //!
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of events —
-//! each a short op list (set/clear/mid-handler commit/rollback) plus a
-//! commit/abort/reset/fail outcome — through the **real** production session
+//! each a short op list (set / clear / section-clear / mid-handler
+//! commit/rollback) plus a commit/abort/reset/fail outcome, some commits
+//! scheduling a promote failure — through the **real** production session
 //! lifecycle (the `finalize`-minted receipt's `promote`/`rollback` plus
-//! `reset`) over **one
-//! partition-shared [`DirtyStore`]**, minting each event's session as an
-//! [`EventStateScope`] that drops at event-end (the production lifecycle). It
-//! asserts, after every operation, that a plain `Option<Bytes>` model equals
-//! the session's own overlay read, and after every event that the model equals
-//! both the committed projection and a fresh **overlay read** (the dirty
-//! short-circuit a `committed_value` probe bypasses), and that the shared
-//! dirty buffer is empty for the key — so a failed event's buffered write can
-//! neither linger nor be read as uncommitted. A `commit()` advances the
-//! model's durable snapshot immediately, so the property also proves the
-//! at-least-once `commit()` contract: `commit()`-landed writes survive
-//! abort/reset/failure while post-commit ops still roll back; a `Rollback`
-//! reverts reads to the commit floor (or the pre-event committed value) and the
-//! buffer to empty. Two focused examples pin ordering a trace cannot observe:
-//! the single marker flushes **exactly once, strictly after the stage** (the
-//! [`ScriptedOracle`] `record_message` counter); another pins the `commit()`
-//! drain to its own collection. Four deterministic pins nail the `rollback()`
-//! contract, including that a terminated session's rollback is a `NoOp` so a
-//! stale clone cannot drain a later same-key event's buffer.
-//! Two further pins nail the drain-on-success contract: a successful
-//! `finalize` consumes the buffer — a second call returns `Clean` — and a
-//! mid-stage failure leaves the buffer whole for an idempotent retry.
+//! `reset`) over **one partition-shared [`DirtyStore`]**, minting each event's
+//! session as an [`EventStateScope`] that drops at event-end (the production
+//! lifecycle). Its clauses:
+//!
+//! - after every operation the session's own overlay read equals a plain
+//!   `Option<Bytes>` model, and the mid-handler `commit()`/`rollback()` drains
+//!   report `Applied` iff anything was buffered since the last drain;
+//! - `finalize` returns `Clean` iff nothing was buffered, else one linear
+//!   receipt whose frozen records equal the durable event marker the stage
+//!   wrote (receipt/durable-marker consistency; survivor semantics are owned by
+//!   the crash-equivalence suite's clears dimension in
+//!   `state::tests::cell_suite`);
+//! - a second `finalize` after success returns `Clean` — the stage consumed the
+//!   receipt's mint source (drain-on-success);
+//! - consuming the receipt converges: `promote` to the model's post-event
+//!   state, `rollback` to the commit-inclusive committed base — a successful
+//!   `commit()` is an irreversible floor that abort/reset/failure can never
+//!   undo, while post-`commit()` staged work never survives a non-commit
+//!   outcome (never the pre-event state when a `commit()` landed);
+//! - a scheduled promote failure yields `Incomplete`, and durable recovery
+//!   converges: the loop-tail resolving reads heal the stranded stage through
+//!   the oracle, asserted by the same overlay/committed equivalence.
+//!
+//! After every event the shared dirty buffer is empty for the key and both a
+//! fresh overlay read (the dirty short-circuit a `committed_value` probe
+//! bypasses) and the committed projection equal the model — so a failed
+//! event's buffered write can neither linger nor be read as uncommitted.
+//!
+//! The surviving examples pin what the single-collection value trace cannot
+//! observe: the marker flushes exactly once, strictly after the stage (the
+//! [`ScriptedOracle`] `record_message` counter); the `commit()`/`rollback()`
+//! drains are collection-scoped (sibling isolation, zero durable writes on
+//! rollback); a terminated session's rollback is a `NoOp` so a stale clone
+//! cannot drain a later same-key event's buffer; a mid-stage failure leaves
+//! the buffer whole for an idempotent retry; a retry re-finalize rebuilds the
+//! same event's marker; an own-event read leaves its in-flight marker
+//! standing; and the clears-only stage boundary resolves a seeded foreign
+//! marker.
 
-use super::sealed::{ApplyOutcome, StateLifecycle};
+use super::sealed::{ApplyOutcome, StagedState, StateLifecycle};
 use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -43,7 +60,9 @@ use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentit
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
-use crate::state::tests::cell_suite::{FailingCellStore, ScriptedOracle, cell_at, value_cell};
+use crate::state::tests::cell_suite::{
+    FailingCellStore, Poison, PoisonHandle, ScriptedOracle, cell_at, value_cell,
+};
 use crate::state::tests::support::{assert_no_settlement_residue, probe};
 use crate::state::{
     CollectionId, CollectionRef, EventRef, PartitionBackend, StateKey, StateName, StateType,
@@ -60,12 +79,13 @@ use uuid::Uuid;
 
 const VALUE_NAME: &str = "cart";
 
+/// The poison-armable cell store the fixture mints: a [`FailingCellStore`]
+/// over the shared in-memory cells, disarmed (`None`) by default so it
+/// delegates cleanly — the property arms it to schedule stage and promote
+/// failures at runtime.
+type TestStore = FailingCellStore<MemoryCellStore<ScriptedOracle>>;
+type TestBackend = PartitionBackend<ScriptedOracle, MemoryDescriptorIdentityStore, TestStore>;
 /// The per-event session type the fixture mints (loader slot unused, so `()`).
-type TestBackend = PartitionBackend<
-    ScriptedOracle,
-    MemoryDescriptorIdentityStore,
-    MemoryCellStore<ScriptedOracle>,
->;
 type Session = KeyedStateSession<TestBackend, ()>;
 
 /// Fixture sharing the partition-lifetime cell store across the per-event
@@ -80,6 +100,9 @@ struct Fixture {
     /// into — exactly the per-partition store whose missing per-event clear is
     /// the bug under test.
     dirty: Arc<DirtyStore>,
+    /// The runtime poison slot every minted store clone shares — `None`
+    /// delegates cleanly; a test arms it for exactly one stage or settle.
+    poison: PoisonHandle,
     shutdown_rx: watch::Receiver<ShutdownPhase>,
     cancel_rx: watch::Receiver<bool>,
     armed: ArmedKeys,
@@ -113,6 +136,7 @@ impl Fixture {
             state_key: StateKey::new(Uuid::from_u128(0x00C0_FFEE), Arc::from("key")),
             value_name: StateName::try_new(value_name)?,
             dirty: Arc::new(DirtyStore::new()),
+            poison: Arc::default(),
             shutdown_rx,
             cancel_rx,
             armed: Arc::default(),
@@ -121,13 +145,23 @@ impl Fixture {
         })
     }
 
-    /// The partition-lifetime cell store (a clone sharing the durable cells).
-    fn cell_store(&self) -> MemoryCellStore<ScriptedOracle> {
-        MemoryCellStore::new(
-            self.cells.clone(),
-            self.oracle.clone(),
-            self.registry.clone(),
+    /// The partition-lifetime cell store (a clone sharing the durable cells
+    /// and the runtime poison slot).
+    fn cell_store(&self) -> TestStore {
+        FailingCellStore::with_handle(
+            MemoryCellStore::new(
+                self.cells.clone(),
+                self.oracle.clone(),
+                self.registry.clone(),
+            ),
+            self.poison.clone(),
         )
+    }
+
+    /// Arms (`Some`) or disarms (`None`) the poison slot shared by every
+    /// store clone the fixture minted.
+    fn set_poison(&self, poison: Option<Poison>) {
+        *self.poison.lock() = poison;
     }
 
     /// Mints the per-event scope for `event` over clones of the shared store,
@@ -244,7 +278,10 @@ async fn staged_fire_delay(
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let registry = Arc::new(registry);
     let oracle = ScriptedOracle::default();
-    let cell = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let cell = FailingCellStore::with_handle(
+        MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+        PoisonHandle::default(),
+    );
     let session: Session = KeyedStateSession::new(SessionParts {
         cell,
         dirty: Arc::new(DirtyStore::new()),
@@ -469,100 +506,6 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
     Ok(())
 }
 
-/// A `rollback()` on an empty buffer is a `NoOp` — at event start (nothing
-/// buffered) and right after a `commit()` drained the buffer (the floor is not
-/// discardable). The committed value is unaffected.
-#[tokio::test]
-async fn rollback_on_an_empty_buffer_is_noop() -> Result<()> {
-    let fx = Fixture::new()?;
-    let (event, _dedup) = message(1);
-    let session = fx.session(event).handle();
-
-    // Event start: nothing buffered.
-    assert_eq!(
-        session.rollback(StateType::Application, &fx.value_name),
-        StoreOutcome::NoOp,
-    );
-
-    // Commit drains the buffer, so the follow-up rollback finds nothing.
-    session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"V")
-        .await?;
-    assert_eq!(
-        session
-            .commit(StateType::Application, &fx.value_name)
-            .await?,
-        StoreOutcome::Applied,
-    );
-    assert_eq!(
-        session.rollback(StateType::Application, &fx.value_name),
-        StoreOutcome::NoOp,
-    );
-
-    // The committed floor stands.
-    assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"V")));
-    Ok(())
-}
-
-/// With no prior `commit()`, `rollback()` reverts to the **pre-event**
-/// committed value. Event 1 durably commits `V`; event 2 sets `W`, clears the
-/// section (the marker leg — a surviving dirty clear marker would mask the read
-/// to `None`), then rolls back: the read is the pre-event `V`, and `finalize`
-/// finds nothing to stage.
-#[tokio::test]
-async fn rollback_without_a_commit_restores_the_pre_event_value() -> Result<()> {
-    let fx = Fixture::new()?;
-    let key = fx.state_key.key.clone();
-
-    // Event 1: durably commit V as the pre-event committed value. The scope is
-    // dropped explicitly after the settle so the shared dirty buffer is clear
-    // before event 2.
-    let scope1 = fx.session(message(1).0);
-    let s1 = scope1.handle();
-    let (_event1, dedup) = message(1);
-    s1.set(StateType::Application, &fx.value_name, &value_cell(), b"V")
-        .await?;
-    let finalized = s1.finalize().await?;
-    s1.register_marker(dedup);
-    s1.flush_marker().await?;
-    if let Finalized::Staged(staged) = finalized {
-        assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
-    }
-    drop(scope1);
-    // Raw residue probe before the resolving read below, which would heal a
-    // skipped promote to the same bytes and mask it.
-    assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
-    assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"V")));
-
-    // Event 2: set W and clear the section, then roll back with no commit().
-    let scope = fx.session(message(2).0);
-    let session = scope.handle();
-    session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"W")
-        .await?;
-    session
-        .clear_section(StateType::Application, &fx.value_name, Section::new(0))
-        .await?;
-    assert_eq!(
-        session.rollback(StateType::Application, &fx.value_name),
-        StoreOutcome::Applied,
-    );
-
-    // The read is the pre-event committed value — a surviving clear marker
-    // would mask it to None.
-    assert_eq!(
-        session
-            .get(StateType::Application, &fx.value_name, &value_cell())
-            .await?,
-        Some(Bytes::from_static(b"V")),
-    );
-
-    // Nothing left to stage, and the buffer is empty for the key.
-    assert!(matches!(session.finalize().await?, Finalized::Clean));
-    assert!(fx.dirty.touched(&key).is_empty());
-    Ok(())
-}
-
 /// A stale, terminated session clone must **not** drain a later same-key
 /// event's live buffer. The dirty workspace is shared per partition and keyed
 /// only by `(key, collection)` — no event identity — so a handle a handler
@@ -631,6 +574,10 @@ struct ValueEvent {
 enum ValueOp {
     Set(u8),
     Clear,
+    /// The section-clear marker leg: buffers a dirty clear of the value's
+    /// section, so the stage carries a clears-bearing durable marker — a lone
+    /// `ClearSection` produces a clears-only stage with an empty write set.
+    ClearSection,
     /// The mid-handler write-through: everything buffered so far becomes
     /// durable immediately and survives every non-commit outcome.
     Commit,
@@ -641,7 +588,12 @@ enum ValueOp {
 
 #[derive(Clone, Copy, Debug)]
 enum Outcome {
-    Commit,
+    /// The success path. `fail_promote` schedules a transient promote failure
+    /// for the event's settle, so it yields [`ApplyOutcome::Incomplete`] and
+    /// durable recovery must converge through the loop-tail resolving reads.
+    Commit {
+        fail_promote: bool,
+    },
     Abort,
     Reset,
     /// The final-error path: the event ends with no `finalize` and no `reset`
@@ -653,10 +605,11 @@ enum Outcome {
 impl Arbitrary for ValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
         // Sets weighted up so state actually accumulates between commits.
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 7 {
             0..=2 => Self::Set(u8::arbitrary(g)),
             3 => Self::Clear,
-            4 => Self::Commit,
+            4 => Self::ClearSection,
+            5 => Self::Commit,
             _ => Self::Rollback,
         }
     }
@@ -664,7 +617,9 @@ impl Arbitrary for ValueOp {
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         match *self {
             Self::Set(b) => Box::new(b.shrink().map(Self::Set)),
-            Self::Clear | Self::Commit | Self::Rollback => quickcheck::empty_shrinker(),
+            Self::Clear | Self::ClearSection | Self::Commit | Self::Rollback => {
+                quickcheck::empty_shrinker()
+            }
         }
     }
 }
@@ -686,14 +641,28 @@ impl Arbitrary for ValueEvent {
             0 => Outcome::Reset,
             1 => Outcome::Abort,
             2 => Outcome::Failed,
-            _ => Outcome::Commit,
+            _ => Outcome::Commit {
+                fail_promote: u8::arbitrary(g) % 4 == 0,
+            },
         };
         Self { ops, outcome }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         let outcome = self.outcome;
-        Box::new(self.ops.shrink().map(move |ops| Self { ops, outcome }))
+        // A scheduled promote failure shrinks toward the calmer schedule
+        // first, then the op list shrinks as usual.
+        let calmed = matches!(outcome, Outcome::Commit { fail_promote: true }).then(|| Self {
+            ops: self.ops.clone(),
+            outcome: Outcome::Commit {
+                fail_promote: false,
+            },
+        });
+        Box::new(
+            calmed
+                .into_iter()
+                .chain(self.ops.shrink().map(move |ops| Self { ops, outcome })),
+        )
     }
 }
 
@@ -785,6 +754,15 @@ async fn apply_value_op(
             model.scratch = None;
             model.buffered = true;
         }
+        ValueOp::ClearSection => {
+            // The value cell lives in section 0, so the dirty clear marker
+            // masks it to absent within the event.
+            session
+                .clear_section(StateType::Application, name, Section::new(0))
+                .await?;
+            model.scratch = None;
+            model.buffered = true;
+        }
         ValueOp::Commit => {
             let outcome = session.commit(StateType::Application, name).await?;
             if outcome != expected_outcome(model.buffered) {
@@ -813,9 +791,98 @@ async fn apply_value_op(
     Ok(read == model.scratch)
 }
 
-/// Drives the trace through the real session lifecycle, asserting the session's
-/// own read equals a plain `Option<Bytes>` model after every operation, and the
-/// committed projection equals the model after every event.
+/// Clause of the central property: `finalize` returns `Clean` iff nothing was
+/// buffered since the event's last drain, and a `Staged` receipt's frozen
+/// records equal the durable event marker the stage wrote. This is
+/// receipt/durable-marker CONSISTENCY (both sides freeze through
+/// [`EventMarker::frozen`]); survivor semantics are owned by the
+/// crash-equivalence suite's clears dimension in `state::tests::cell_suite`.
+fn finalize_matches_model(
+    fx: &Fixture,
+    event: EventRef,
+    finalized: &Finalized<TestStore>,
+    buffered: bool,
+) -> Option<&'static str> {
+    match finalized {
+        Finalized::Clean if buffered => Some("finalize returned Clean over a buffered op"),
+        Finalized::Staged(_) if !buffered => Some("finalize staged a receipt for a drained buffer"),
+        Finalized::Clean => None,
+        Finalized::Staged(staged) => {
+            let [collection] = staged.collections.as_slice() else {
+                return Some("the single-collection trace staged more than one record");
+            };
+            let expected = EventMarker::frozen(event, &collection.writes, &collection.clears);
+            (fx.cells.standing_marker_of(&fx.value_id()) != Some(expected))
+                .then_some("the receipt's frozen records diverge from the durable event marker")
+        }
+    }
+}
+
+/// Finalizes the event and checks the Clean-iff / receipt-consistency clause
+/// ([`finalize_matches_model`]) plus drain-on-success — the stage consumed the
+/// receipt's mint source, so a second finalize finds an empty buffer and
+/// returns `Clean`. Yields the receipt, or the divergence reason.
+async fn checked_finalize(
+    fx: &Fixture,
+    session: &Session,
+    event: EventRef,
+    buffered: bool,
+) -> Result<Result<Finalized<TestStore>, &'static str>> {
+    let finalized = session.finalize().await?;
+    if let Some(reason) = finalize_matches_model(fx, event, &finalized, buffered) {
+        return Ok(Err(reason));
+    }
+    if !matches!(session.finalize().await?, Finalized::Clean) {
+        return Ok(Err("a second finalize after success was not Clean"));
+    }
+    Ok(Ok(finalized))
+}
+
+/// Consumes a committed event's receipt, `fail_promote` scheduling a transient
+/// promote failure for exactly this settle. The memory store never fails, so a
+/// healthy promote must fully resolve — and leave no residue, checked raw
+/// before the loop-tail resolving reads heal a skipped settle to identical
+/// bytes and mask it. A stage overwrites any marker a prior
+/// Reset/Failed/Incomplete-promote event left standing (a clear-free marker
+/// stands, cells healed, until the next stage; a clears-bearing one is
+/// resolved by its own event's loop-tail read window), so the residue check is
+/// exact on the healthy arm — and only there: those outcomes leave residue by
+/// design. A poisoned promote must report `Incomplete`, leaving the stranded
+/// stage for the loop-tail heals (cell-grained for staged writes, whole-marker
+/// via the read window for clears — durable recovery converges). Returns the
+/// divergence reason, or `None`.
+async fn promote_receipt(
+    fx: &Fixture,
+    staged: StagedState<TestStore>,
+    fail_promote: bool,
+) -> Result<Option<&'static str>> {
+    if fail_promote {
+        fx.set_poison(Some(Poison::Collection(
+            fx.value_name.clone(),
+            ErrorCategory::Transient,
+        )));
+    }
+    let outcome = staged.certify().promote().await;
+    fx.set_poison(None);
+    match (fail_promote, outcome) {
+        (false, ApplyOutcome::Resolved) => {
+            assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
+            Ok(None)
+        }
+        (false, ApplyOutcome::Incomplete) => Ok(Some("a healthy promote reported Incomplete")),
+        (true, ApplyOutcome::Incomplete) => Ok(None),
+        (true, ApplyOutcome::Resolved) => Ok(Some("a poisoned promote reported Resolved")),
+    }
+}
+
+/// Drives the trace through the real session lifecycle, checking the central
+/// property's clauses (the module doc lists them): the session's own read
+/// equals a plain `Option<Bytes>` model after every operation, `finalize`
+/// answers `Clean` iff nothing was buffered (with the receipt's frozen records
+/// matching the durable marker, and a second finalize `Clean`), the consumed
+/// receipt converges, and the overlay + committed projections equal the model
+/// after every event. Returns the divergence reason, or `None` when the trace
+/// upholds the property.
 ///
 /// A mid-event `commit()` snapshots the scratch model as immediately durable:
 /// on a commit the full scratch wins, on every other outcome the durable state
@@ -823,7 +890,7 @@ async fn apply_value_op(
 /// `commit()`-landed ops survive) — the at-least-once `commit()` contract. A
 /// `Rollback` reverts the scratch to the commit floor (or the pre-event
 /// committed value) and must report `Applied` iff anything was buffered.
-async fn run(trace: Trace) -> Result<bool> {
+async fn run(trace: Trace) -> Result<Option<&'static str>> {
     let fx = Fixture::new()?;
     let mut model: Option<Bytes> = None;
     let key = fx.state_key.key.clone();
@@ -846,37 +913,39 @@ async fn run(trace: Trace) -> Result<bool> {
                 if !apply_value_op(&session, &fx.value_name, *op, model.clone(), &mut ev_model)
                     .await?
                 {
-                    return Ok(false);
+                    return Ok(Some("an op outcome or read diverged from the model"));
                 }
             }
 
             match ev.outcome {
-                Outcome::Commit => {
-                    let finalized = session.finalize().await?;
+                Outcome::Commit { fail_promote } => {
+                    let finalized =
+                        match checked_finalize(&fx, &session, event, ev_model.buffered).await? {
+                            Ok(finalized) => finalized,
+                            Err(reason) => return Ok(Some(reason)),
+                        };
                     session.register_marker(dedup_id);
                     session.flush_marker().await?;
-                    if let Finalized::Staged(staged) = finalized {
-                        // The memory store never fails, so a healthy promote
-                        // must fully resolve — and leave no residue, checked
-                        // raw before the loop-tail resolving reads heal a
-                        // skipped settle to identical bytes and mask it. A
-                        // stage overwrites any marker a prior Reset/Failed
-                        // event abandoned, so the check is exact here (and
-                        // only here: those outcomes leave residue by design).
-                        if staged.certify().promote().await != ApplyOutcome::Resolved {
-                            return Ok(false);
-                        }
-                        assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
+                    if let Finalized::Staged(staged) = finalized
+                        && let Some(reason) = promote_receipt(&fx, staged, fail_promote).await?
+                    {
+                        return Ok(Some(reason));
                     }
                     // Commit advances the model (last-writer-wins).
                     model = ev_model.scratch;
                 }
                 Outcome::Abort => {
-                    if let Finalized::Staged(staged) = session.finalize().await? {
+                    let finalized =
+                        match checked_finalize(&fx, &session, event, ev_model.buffered).await? {
+                            Ok(finalized) => finalized,
+                            Err(reason) => return Ok(Some(reason)),
+                        };
+                    if let Finalized::Staged(staged) = finalized {
                         staged.rollback().await;
-                        // Same raw probe as the Commit arm: a rollback that
-                        // skipped its store call would be healed to identical
-                        // bytes by the loop-tail resolving reads and masked.
+                        // Same raw probe as `promote_receipt`'s healthy arm: a
+                        // rollback that skipped its store call would be healed
+                        // to identical bytes by the loop-tail resolving reads
+                        // and masked.
                         assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
                     }
                     // Post-commit ops roll back to their `prev`, which
@@ -885,12 +954,17 @@ async fn run(trace: Trace) -> Result<bool> {
                     model = ev_model.floor.resolve(model);
                 }
                 Outcome::Reset => {
+                    let finalized =
+                        match checked_finalize(&fx, &session, event, ev_model.buffered).await? {
+                            Ok(finalized) => finalized,
+                            Err(reason) => return Ok(Some(reason)),
+                        };
                     // Dropping the receipt leaves any provisional written by
                     // `finalize` standing, projecting its `prev` (the
                     // `commit()`-landed snapshot, or the unchanged committed
                     // base) — exactly the discarded-stage behavior `reset`
                     // pairs with.
-                    let _finalized = session.finalize().await?;
+                    drop(finalized);
                     session.reset();
                     model = ev_model.floor.resolve(model);
                 }
@@ -905,69 +979,33 @@ async fn run(trace: Trace) -> Result<bool> {
 
         // The shared dirty buffer is empty for the key — no per-event leak.
         if !fx.dirty.touched(&key).is_empty() {
-            return Ok(false);
+            return Ok(Some("the shared dirty buffer leaked past the event"));
         }
         // A fresh overlay read (the dirty short-circuit path) tracks the model:
         // a leaked dirty cell would surface here as a read of uncommitted state.
         if fx.overlay_value().await? != model {
-            return Ok(false);
+            return Ok(Some("the overlay read diverged from the model"));
         }
         // The committed projection still tracks the model.
         if fx.committed_value().await? != model {
-            return Ok(false);
+            return Ok(Some("the committed projection diverged from the model"));
         }
     }
-    Ok(true)
+    Ok(None)
 }
 
-/// The Value session lifecycle is sound over random mixed-outcome traces: the
-/// committed projection tracks the model event by event.
+/// The central settlement property: the Value session lifecycle is sound over
+/// random mixed-outcome traces — the module doc lists the clauses.
 #[test]
 fn prop_value_lifecycle_equivalence() {
     fn prop(trace: Trace) -> TestResult {
         match executor::block_on(run(trace)) {
-            Ok(true) => TestResult::passed(),
-            Ok(false) => TestResult::error("the committed projection diverged from the model"),
+            Ok(None) => TestResult::passed(),
+            Ok(Some(reason)) => TestResult::error(reason),
             Err(error) => TestResult::error(format!("trace errored: {error:#}")),
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
-}
-
-/// Drain-on-success: `finalize` consumes the event's dirty range as part of
-/// its success path, so the receipt's mint source is consumed — a second
-/// `finalize` finds an empty buffer and returns [`Finalized::Clean`], never a
-/// second receipt for the same stage.
-#[tokio::test]
-async fn second_finalize_after_success_returns_clean() -> Result<()> {
-    let fx = Fixture::new()?;
-    let (event, dedup_id) = message(1);
-    // The scope stays alive so its Drop clear cannot mask the finalize drain.
-    let scope = fx.session(event);
-    let session = scope.handle();
-
-    session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
-        .await?;
-    session.register_marker(dedup_id);
-    let Finalized::Staged(staged) = session.finalize().await? else {
-        bail!("the buffered write must mint a receipt");
-    };
-    assert!(
-        fx.dirty.touched(&fx.state_key.key).is_empty(),
-        "finalize drains the event's dirty range on success",
-    );
-
-    assert!(
-        matches!(session.finalize().await?, Finalized::Clean),
-        "the mint source is consumed — a second finalize returns Clean",
-    );
-
-    // The receipt still settles normally after the drain.
-    session.flush_marker().await?;
-    assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
-    assert_eq!(fx.committed_value().await?, Some(Bytes::from_static(b"v1")));
-    Ok(())
 }
 
 /// A collection failing mid-stage exits `finalize` with the buffer **whole**
@@ -978,44 +1016,20 @@ async fn second_finalize_after_success_returns_clean() -> Result<()> {
 /// empty buffer.
 #[tokio::test]
 async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
-    type FailingBackend = PartitionBackend<
-        ScriptedOracle,
-        MemoryDescriptorIdentityStore,
-        FailingCellStore<MemoryCellStore<ScriptedOracle>>,
-    >;
-
-    let cart = StateName::try_new("cart")?;
+    let fx = Fixture::with_collections(&["cart", "wishlist"])?;
+    let cart = fx.value_name.clone();
     let wishlist = StateName::try_new("wishlist")?;
-    let mut registry = CollectionDefRegistry::new(None);
-    for name in ["cart", "wishlist"] {
-        registry.register(&value_state::<JsonCodec>(name), CollectionDef::new(None))?;
-    }
-    let registry = Arc::new(registry);
-    let oracle = ScriptedOracle::default();
     // Poison wishlist's stage: `write_provisional` fails Transient while cart
     // (racing under buffer_unordered) may or may not have staged first.
-    let store = FailingCellStore::failing_write_provisional(
-        MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+    fx.set_poison(Some(Poison::WriteProvisional(
         wishlist.clone(),
         ErrorCategory::Transient,
-    );
-    let dirty = Arc::new(DirtyStore::new());
-    let state_key = StateKey::new(Uuid::from_u128(0xE0), Arc::from("key"));
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    )));
     let (event, dedup_id) = message(1);
-    let session: KeyedStateSession<FailingBackend, ()> = KeyedStateSession::new(SessionParts {
-        cell: store.clone(),
-        dirty: dirty.clone(),
-        oracle,
-        loader: (),
-        registry,
-        state_key: state_key.clone(),
-        event,
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
-        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    });
+    // The scope stays alive across the dirty probes below: its `Drop` would
+    // clear the very buffer the failed finalize must leave whole.
+    let scope = fx.session(event);
+    let session = scope.handle();
 
     session
         .set(StateType::Application, &cart, &value_cell(), b"c1")
@@ -1028,8 +1042,9 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
         session.finalize().await.is_err(),
         "the poisoned stage must fail the aggregate",
     );
-    let touched: Vec<StateName> = dirty
-        .touched(&state_key.key)
+    let touched: Vec<StateName> = fx
+        .dirty
+        .touched(&fx.state_key.key)
         .into_iter()
         .map(|((_, name), ..)| name)
         .collect();
@@ -1042,7 +1057,7 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
 
     // Heal the store: the retried finalize re-stages from the intact buffer
     // and the settle converges to both buffered values.
-    store.set_poison(None);
+    fx.set_poison(None);
     session.register_marker(dedup_id);
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the healed retry must re-stage from the intact buffer");
@@ -1050,9 +1065,9 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
     session.flush_marker().await?;
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
-        let id = CollectionId::new(state_key.clone(), StateType::Application, name.clone());
+        let id = CollectionId::new(fx.state_key.clone(), StateType::Application, name.clone());
         assert_eq!(
-            store
+            fx.cell_store()
                 .get(&id, &value_cell(), probe(u128::MAX))
                 .await?
                 .into_inner(),
@@ -1060,58 +1075,6 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
             "{name:?} must commit its buffered value on the healed retry",
         );
     }
-    Ok(())
-}
-
-/// A clears-only event still stages — durably: `clear_section` with no cell
-/// writes calls `write_provisional` with an empty write set under a
-/// clears-bearing marker, so the durable event marker stands after `finalize`
-/// (raw probe BEFORE any resolving read — a `get` would read-help-resolve the
-/// clears-bearing marker), the staged entry makes `finalize` return
-/// [`Finalized::Staged`] — the backstop-arming rule — and the receipt's
-/// `promote` resolves that entry (the receipt exists to consume).
-///
-/// An example because the [`Finalized::Staged`] backstop-arming signal
-/// and the [`ApplyOutcome::Resolved`] apply signal are protocol outcomes
-/// [`prop_value_lifecycle_equivalence`] cannot observe: that property asserts
-/// the committed value projection, which a clears-only event leaves empty
-/// whether or not the backstop armed, so only the finalize/apply outcomes and
-/// the standing event marker expose the staging.
-#[tokio::test]
-async fn clears_only_event_finalizes_staged() -> Result<()> {
-    let fx = Fixture::new()?;
-    let (event, _dedup_id) = message(1);
-    let session = fx.session(event).handle();
-
-    session
-        .clear_section(StateType::Application, &fx.value_name, Section::new(0))
-        .await?;
-    let Finalized::Staged(staged) = session.finalize().await? else {
-        bail!("a clears-only collection must stage so the backstop is armed");
-    };
-    let marker = fx
-        .cells
-        .standing_marker_of(&fx.value_id())
-        .ok_or_else(|| eyre!("a clears-only stage must land a durable event marker"))?;
-    assert_eq!(marker.event(), event, "the marker is this event's");
-    assert!(
-        marker.staged().is_empty(),
-        "a clears-only stage lists no staged cells"
-    );
-    assert_eq!(
-        marker
-            .clears()
-            .iter()
-            .map(SectionClear::section)
-            .collect::<Vec<_>>(),
-        [Section::new(0)],
-        "the marker carries the cleared section"
-    );
-    assert_eq!(
-        staged.certify().promote().await,
-        ApplyOutcome::Resolved,
-        "the staged entry exists to resolve"
-    );
     Ok(())
 }
 
