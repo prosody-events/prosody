@@ -871,15 +871,10 @@ where
                 Ok(acc)
             })
             .await?;
-        // Drain-on-success: the stage consumes the event's dirty range — one
-        // whole-key clear, strictly after the per-collection aggregate
-        // succeeded, never per collection. A collection failing after
-        // siblings staged durably must exit with the buffer whole (the `?`
-        // above) so the retried `finalize` re-stages idempotently. This
-        // consumes the receipt's mint source — a second `finalize` finds an
-        // empty buffer and returns `Clean` — and covers RU-only events too:
-        // their values were durably written above. Nothing past this point
-        // is fallible or `.await`s a store.
+        // Drain-on-success (invariant owned by the `finalize` trait doc): one
+        // whole-key clear, strictly after the per-collection aggregate — a
+        // mid-stage failure exits via the `?` above with the buffer whole.
+        // Nothing past this point is fallible or `.await`s a store.
         self.discard_dirty();
         if collections.is_empty() {
             return Ok(Finalized::Clean);

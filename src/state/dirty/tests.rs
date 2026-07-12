@@ -166,9 +166,13 @@ fn clear_section_keeps_sibling_section_ranges() -> Result<()> {
     };
     assert_eq!((*state_type, name), (StateType::Application, c.name()));
     assert_eq!(cleared.as_slice(), [Section::new(0)]);
+    let staged: Vec<u8> = cells
+        .iter()
+        .filter_map(|(key, _)| key.coordinate.as_bytes().first().copied())
+        .collect();
     assert_eq!(
-        cells.len(),
-        7,
+        staged,
+        [0, 1, 2, 4, 5, 7, 9],
         "the finalize work-list lost the sibling section's cells: {cells:?}"
     );
     Ok(())

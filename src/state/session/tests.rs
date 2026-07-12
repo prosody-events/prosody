@@ -23,6 +23,9 @@
 //! drain to its own collection. Four deterministic pins nail the `rollback()`
 //! contract, including that a terminated session's rollback is a `NoOp` so a
 //! stale clone cannot drain a later same-key event's buffer.
+//! Two further pins nail the drain-on-success contract: a successful
+//! `finalize` consumes the buffer — a second call returns `Clean` — and a
+//! mid-stage failure leaves the buffer whole for an idempotent retry.
 
 use super::sealed::{ApplyOutcome, StateLifecycle};
 use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};

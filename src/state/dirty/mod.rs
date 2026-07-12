@@ -334,8 +334,7 @@ mod tests;
 /// buffered, inline for the common handful of cells.
 fn remove_span<K, V, Q>(tree: &scc::TreeIndex<K, V>, range: RangeInclusive<Q>)
 where
-    K: Clone + Ord + 'static,
-    V: Clone + 'static,
+    K: Clone + Ord,
     Q: scc::Comparable<K>,
 {
     let guard = Guard::new();
