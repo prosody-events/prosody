@@ -11,7 +11,7 @@
 //! `is_message_committed(dedup_id)` delegates a read to a
 //! [`DeduplicationStore`]: row present ⇔ committed.
 //! [`CommitOracle::record_message`] writes that row via
-//! [`DeduplicationStore::insert`] — the boundary's marker-flush step,
+//! [`DeduplicationStore::insert`] — the boundary's marker-record step,
 //! strictly after the stage, so a present row always certifies a durable
 //! stage.
 //!

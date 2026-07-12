@@ -3,7 +3,7 @@
 //! [`CommitOracle`] owns both halves of the message commit relation — the
 //! one whose row presence the recovery reader interprets as "this event
 //! committed". [`CommitOracle::record_message`] writes that row at the
-//! durability boundary (the marker flush, strictly after the provisional
+//! durability boundary (the marker record, strictly after the provisional
 //! stage); [`CommitOracle::resolve`] reads it back during recovery, bridging
 //! the existing `CommitManager` bool API into an
 //! [`EventRef`]-shaped [`CommitDecision`] consumed by the cell store's
@@ -34,7 +34,7 @@ pub trait CommitOracle: Clone + Send + Sync + 'static {
     ///
     /// This is the write half of the message commit relation: a present
     /// row certifies that the event's staged state is durable. The
-    /// durability boundary calls it as the marker-flush step, strictly
+    /// durability boundary calls it as the marker-record step, strictly
     /// after the provisional-cell stage, so the invariant "marker present ⇒
     /// stage durable" holds structurally. The timer arm has no analog — a
     /// trigger's tag is written by its own commit machinery.

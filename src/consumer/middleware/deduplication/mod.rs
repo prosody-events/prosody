@@ -168,10 +168,11 @@ pub struct DeduplicationHandler<T, S: DeduplicationStore> {
 /// Computes the dedup UUID for a message.
 ///
 /// Length-prefixes each field before hashing so that adjacent fields cannot
-/// be confused — the prefix is load-bearing for canonical equality. Both
-/// the deduplication middleware and any other source of the dedup UUID
-/// (today, the commit oracle) must call this function with the same arguments
-/// to produce the same UUID.
+/// be confused — the prefix is load-bearing for canonical equality. Every
+/// deriver of a message's dedup UUID — the partition loop's per-message
+/// `EventRef` derivation and the deferred-reload override, both through
+/// [`dedup_uuid_for_message`] — must call this function with identical
+/// arguments to produce the same UUID.
 #[must_use]
 pub fn dedup_uuid(
     version: &str,

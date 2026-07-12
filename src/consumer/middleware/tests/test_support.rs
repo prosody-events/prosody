@@ -839,8 +839,8 @@ impl OutcomeSlot {
 // `KeyedStateSession` whose marker record routes through a recording oracle
 // so each seam's test can assert that contract directly.
 
-/// Oracle that records every recorded marker and always resolves Committed,
-/// so a test can read back exactly which markers `settle` certified.
+/// Oracle that logs every marker `settle` records and always resolves
+/// Committed, so a test can read back exactly which markers `settle` certified.
 #[derive(Clone)]
 pub struct RecordingOracle {
     recorded: Arc<Mutex<Vec<Uuid>>>,
@@ -855,7 +855,7 @@ impl RecordingOracle {
         }
     }
 
-    /// The shared log this oracle pushes every flushed marker into.
+    /// The shared log this oracle pushes every recorded marker into.
     #[must_use]
     pub fn recorded(&self) -> Arc<Mutex<Vec<Uuid>>> {
         self.recorded.clone()
@@ -898,7 +898,7 @@ pub type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Val
 /// What [`recording_session`] hands back: the session, its durable cell store
 /// (a clone sharing the durable `Arc`), the session's dirty store, and the
 /// shared log of every marker the oracle recorded — the surfaces the
-/// session-reset tests assert on.
+/// settlement-boundary marker tests assert on.
 pub type RecordingParts = (
     RecordingSession,
     MemoryCellStore<RecordingOracle>,

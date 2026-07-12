@@ -43,4 +43,7 @@ fn settlement_classification_table() {
     // rows stay Bypassed.
     let ok: Result<(), TableErr> = Ok(());
     assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
+    let inner_err: Result<(), TableErr> =
+        Err(SchedulerError::Handler(TestError(ErrorCategory::Permanent)));
+    assert_eq!(Probe::settlement(inner_err.as_ref()), Settlement::Bypassed);
 }

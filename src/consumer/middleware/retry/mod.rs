@@ -210,9 +210,10 @@ async fn wait_with_cancellation<C: EventContext>(
 /// per-attempt apply-hook split).
 ///
 /// - [`Resolution::Commit`] — the final attempt is final from the inner's POV:
-///   success, `Permanent`, or `Transient` after `max_retries`. The outer
-///   commits the marker and fires `after_commit` on the inner with this
-///   `Result<O, E>`.
+///   success, `Permanent`, or `Transient` after `max_retries`. The outer routes
+///   this through `settle`, which records a marker only for success or
+///   `Permanent` (a `Transient` exhaustion commits the offset with no marker)
+///   and fires `after_commit` on the inner with this `Result<O, E>`.
 /// - [`Resolution::Abort`] — the final attempt was cut short (shutdown
 ///   mid-loop, or a `Terminal` error) and this dispatch will be redelivered.
 ///   The marker must NOT advance, and the inner sees `after_abort(Err(error))`.

@@ -961,21 +961,7 @@ async fn prepare_pipeline_stack(
     Ok((stores, keyed_state, stack))
 }
 
-/// Builds the common middleware shared by every mode — the single place any
-/// common-middleware component is constructed.
-///
-/// This is the whole cross-mode set: telemetry, timeout, scheduler,
-/// cancellation, and **deduplication** (the mandatory commit oracle, here a
-/// duplicate filter + marker register — the marker is flushed later by the
-/// `settle` boundary, not in this stack). It runs outer→inner as
-/// `dedup → cancellation → scheduler → timeout → telemetry → handler`. Each
-/// mode layers only its *mode-specific* middleware (retry, monopolization,
-/// defer, failure-topic, log) OUTSIDE the returned block.
-///
-/// Because the deduplication middleware needs the per-partition dedup store,
-/// this is called INSIDE the storage `match` arm where the concrete
-/// `dedup_provider` is in hand.
-/// The concrete common-block composition [`build_common_middleware`] returns
+/// The concrete common-block composition `build_common_middleware` returns
 /// (innermost `telemetry` to outermost `dedup`). Named — not an opaque `impl
 /// HandlerMiddleware` — so the chains layered on top stay fully concrete and
 /// the crate-internal settlement classification of the composed handler
@@ -994,6 +980,21 @@ type CommonMiddleware<DP, P> = ComposedMiddleware<
     P,
 >;
 
+/// Builds the common middleware shared by every mode — the single place any
+/// common-middleware component is constructed.
+///
+/// This is the whole cross-mode set: telemetry, timeout, scheduler,
+/// cancellation, and **deduplication** (the mandatory commit oracle, here a
+/// stateless duplicate filter over `context.message_marker()`; the `settle`
+/// boundary records the marker directly, gated on the typed `Settlement`
+/// classification — not in this stack). It runs outer→inner as
+/// `dedup → cancellation → scheduler → timeout → telemetry → handler`. Each
+/// mode layers only its *mode-specific* middleware (retry, monopolization,
+/// defer, failure-topic, log) OUTSIDE the returned block.
+///
+/// Because the deduplication middleware needs the per-partition dedup store,
+/// this is called INSIDE the storage `match` arm where the concrete
+/// `dedup_provider` is in hand.
 fn build_common_middleware<DP, P>(
     config: &CommonConfiguration,
     consumer_config: &ConsumerConfiguration,

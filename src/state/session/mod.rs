@@ -286,7 +286,7 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
 ///
 /// The module is `pub(crate)`, so downstream crates can name [`CellSession`] in
 /// bounds but can neither implement it nor reach the lifecycle: staging,
-/// promoting, and resetting are framework-only moves.
+/// promoting, and discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
         CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Future, MarkerWrite,
@@ -367,7 +367,7 @@ pub(crate) mod sealed {
     }
 
     /// The linear settlement receipt for one event's staged cells. Consumed
-    /// exactly once: [`Self::rollback`] before any marker-flush attempt, or
+    /// exactly once: [`Self::rollback`] before any marker record attempt, or
     /// [`Self::certify`] → [`Promotable::promote`] after the commit.
     #[must_use]
     pub struct StagedState<S: CellStore> {
@@ -396,9 +396,9 @@ pub(crate) mod sealed {
             resolve_collections(&self.store, self.collections, false).await;
         }
 
-        /// Certifies the stage for promotion — entering the marker-flush
-        /// phase forfeits rollback. Before any flush attempt, rolling back to
-        /// the committed base is sound; after one it is not: a flush
+        /// Certifies the stage for promotion — entering the marker record
+        /// phase forfeits rollback. Before any record attempt, rolling back to
+        /// the committed base is sound; after one it is not: a record
         /// write-timeout is ambiguous — the marker may be durable — so a
         /// rollback could erase a committed write that redelivery then
         /// dedup-filters away. In that window the staged cells stay
@@ -464,7 +464,7 @@ pub(crate) mod sealed {
         /// `ReadUncommitted` collections write a resolved value — returning
         /// the staged work as the linear [`Finalized`] receipt the boundary
         /// consumes. Stages all collections before returning, so a stage
-        /// error returns before the textually-later marker flush; a staging
+        /// error returns before the textually-later marker record; a staging
         /// failure is a type-erased store error with no receipt minted.
         ///
         /// On success the event's dirty range is drained — the stage consumes
@@ -585,8 +585,9 @@ where
     /// cleared at each attempt/settle boundary.
     pub dirty: Arc<DirtyStore>,
 
-    /// Partition-lifetime commit oracle; the marker flush writes the message
-    /// commit row through it. The same instance is baked into `cell`.
+    /// Partition-lifetime commit oracle; the settle boundary records the
+    /// message commit row through it via `record_marker`. The same instance is
+    /// baked into `cell`.
     pub oracle: B::Oracle,
 
     /// Opaque per-session capability slot a [`CellResolver`] reads at resolve

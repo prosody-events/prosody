@@ -343,6 +343,7 @@ fn configuration_accepts_valid_failure_topic() {
         "Non-empty failure topic should pass validation"
     );
 }
+
 /// The routed swallow through the settle boundary: the inner attempt buffers
 /// a `cart` write and fails Transient; the DLQ route swallows that error into
 /// `Ok(Routed)` — classified `Bypassed`, so the offset commits while nothing
@@ -534,13 +535,20 @@ mod settlement_pins {
     /// The settlement classification table for the failure-topic wrapper:
     /// every Output and error variant, including the `DlqSendFailed` guard
     /// cells (inner-Permanent delegates; inner-Transient/Terminal bypass).
+    /// Delegation is proven against a `Bypassed`-classifying probe: the
+    /// `Inner(Ok)`, `Handler`, and Permanent-inner `DlqSendFailed` rows
+    /// delegate, so a wrapper hardcoding `Final` on them fails the probe.
     #[test]
     fn settlement_classification_table() -> color_eyre::Result<()> {
         use crate::codec::JsonCodecError;
+        use crate::consumer::middleware::tests::test_support::BypassedHandler;
 
         type Subject = FailureTopicHandler<StagingTransientHandler, JsonCodec>;
         type Out = FailureTopicOutput<(), StagingError>;
         type TableErr = FailureTopicError<StagingError, JsonCodecError>;
+        type Probe = FailureTopicHandler<BypassedHandler, JsonCodec>;
+        type ProbeOut = FailureTopicOutput<(), TestError>;
+        type ProbeErr = FailureTopicError<TestError, JsonCodecError>;
 
         fn dlq(inner: ErrorCategory) -> color_eyre::Result<TableErr> {
             Ok(FailureTopicError::DlqSendFailed {
@@ -588,6 +596,24 @@ mod settlement_pins {
         for (label, result, expected) in rows {
             assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
         }
+
+        // Delegation proof: over a Bypassed-classifying inner the delegating
+        // rows (`Inner(Ok)`, `Handler`, Permanent-inner `DlqSendFailed`) stay
+        // Bypassed.
+        let inner: Result<ProbeOut, ProbeErr> = Ok(FailureTopicOutput::Inner(()));
+        assert_eq!(Probe::settlement(inner.as_ref()), Settlement::Bypassed);
+        let handler: Result<ProbeOut, ProbeErr> = Err(FailureTopicError::Handler(TestError(
+            ErrorCategory::Permanent,
+        )));
+        assert_eq!(Probe::settlement(handler.as_ref()), Settlement::Bypassed);
+        let dlq_permanent: Result<ProbeOut, ProbeErr> = Err(FailureTopicError::DlqSendFailed {
+            inner: TestError(ErrorCategory::Permanent),
+            producer: permanent_producer()?,
+        });
+        assert_eq!(
+            Probe::settlement(dlq_permanent.as_ref()),
+            Settlement::Bypassed
+        );
         Ok(())
     }
 }

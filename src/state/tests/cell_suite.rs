@@ -163,8 +163,6 @@ pub(crate) struct ScriptedOracle {
     committed: Arc<scc::HashSet<Uuid, RandomState>>,
 }
 
-impl ScriptedOracle {}
-
 impl CommitOracle for ScriptedOracle {
     type Error = Infallible;
 
@@ -348,18 +346,18 @@ impl Arbitrary for FaultDepth {
 enum Outcome {
     /// Committed and promoted inline (the hot path).
     CleanCommitted,
-    /// Staged then rolled back inline before any commit-marker flush
+    /// Staged then rolled back inline before any commit-marker record
     /// (abandon).
     CleanRolledBack,
-    /// All cells staged, commit marker never flushed, crash → the generated
+    /// All cells staged, commit marker never recorded, crash → the generated
     /// recovery (rolls back).
     CrashAfterStage,
-    /// All cells staged, commit marker flushed, crash → the generated
+    /// All cells staged, commit marker recorded, crash → the generated
     /// recovery (promotes).
     CrashAfterMarker,
-    /// Only a prefix staged, commit marker never flushed, crash → recovery.
+    /// Only a prefix staged, commit marker never recorded, crash → recovery.
     CrashMidFanOut,
-    /// Commit marker flushed (committed), then the settle attempt fails under
+    /// Commit marker recorded (committed), then the settle attempt fails under
     /// a poison armed at the generated [`FaultDepth`]: the stage lingers over
     /// the **warm** in-process store — the committed-unapplied window (on a
     /// `Cached` instantiation, with warm coverage still holding the

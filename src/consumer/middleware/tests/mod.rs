@@ -411,10 +411,10 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
 }
 
 /// The settle boundary's single staged-rollback site: shutdown at the
-/// backstop arm — after a successful stage, before any marker-flush attempt —
+/// backstop arm — after a successful stage, before any marker record attempt —
 /// rolls the staged cells back to their committed base. `abandon` has no
 /// state access, and a rollback past `certify` does not compile
-/// (`Promotable` has no rollback), so rollback-after-a-marker-flush-attempt
+/// (`Promotable` has no rollback), so rollback-after-a-marker-record-attempt
 /// is unwritable rather than tested.
 mod staged_rollback {
     use super::*;
@@ -548,7 +548,7 @@ mod staged_rollback {
     /// stage failure is the one durability step the sequence skips rather than
     /// retries (a genuine data rejection cannot self-heal). The documented
     /// posture is commit-defensively: the offset still commits (no livelock on
-    /// an unstageable event), the marker flush is skipped (a present marker
+    /// an unstageable event), the marker record is skipped (a present marker
     /// must certify a durable stage — invariant: marker present ⇒ stage
     /// durable), and the backstop is armed defensively so the sweep resolves
     /// whatever partial stage may have landed.
@@ -628,7 +628,7 @@ mod staged_rollback {
         assert_eq!(aborted.load(Ordering::SeqCst), 0);
         assert!(
             recorded.lock().is_empty(),
-            "the marker must NOT flush over an uncertain stage",
+            "the marker must NOT record over an uncertain stage",
         );
         assert_eq!(
             context.count_scheduled(TimerType::StateRecovery),
@@ -651,7 +651,7 @@ mod staged_rollback {
     /// offset **iff** shutdown (leaving nothing provisional), and
     /// otherwise self-heals to a commit **no matter how many** failures —
     /// of **any** category — the arm hits first (the arm is must-succeed,
-    /// invariant 8) — then flushes the marker, commits, and promotes the
+    /// invariant 8) — then records the marker, commits, and promotes the
     /// cell. Generating the category is what exercises the retry-forever
     /// fold in `retry_step`: `Terminal` retries rather than abandons, and
     /// `Permanent` is retried by the arm's own loop past `retry_step`'s
@@ -729,7 +729,7 @@ mod staged_rollback {
 /// committed projection, where an own-event provisional cell answers its
 /// committed base `prev` — never the event's pre-settle overlay. One pin per
 /// ruled-on window: the arm-shutdown rollback's `after_abort` reads the
-/// restored committed base; the ambiguous marker-flush shutdown's
+/// restored committed base; the ambiguous marker-record shutdown's
 /// `after_abort` reads `prev` (staged cells deliberately left provisional);
 /// the `Incomplete`-promote `after_commit` reads the mixed per-cell view
 /// (promoted cells the new values, un-promoted cells `prev`).
@@ -911,8 +911,8 @@ mod hook_visibility {
     }
 
     /// Oracle whose every `record_message` flips shutdown on the stored
-    /// context and fails Transient, so the flush loop's next top sees
-    /// shutdown — the ambiguous marker-flush window (the marker MAY be
+    /// context and fails Transient, so the record loop's next top sees
+    /// shutdown — the ambiguous marker-record window (the marker MAY be
     /// durable, so nothing may roll back). `resolve` answers `NotCommitted`
     /// but is never consulted here: the hook's own-event read short-circuits
     /// to `prev` without an oracle read.
@@ -937,7 +937,7 @@ mod hook_visibility {
         async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             self.trip.request_shutdown();
-            Err(TestError(ErrorCategory::Transient, "flush"))
+            Err(TestError(ErrorCategory::Transient, "record"))
         }
 
         async fn resolve<'a>(
@@ -949,13 +949,13 @@ mod hook_visibility {
         }
     }
 
-    /// Window 2 — `after_abort` in the ambiguous marker-flush shutdown window
-    /// reads `prev`: a flush attempt was made, so the staged cells are
+    /// Window 2 — `after_abort` in the ambiguous marker-record shutdown window
+    /// reads `prev`: a record attempt was made, so the staged cells are
     /// deliberately left provisional (`certify` consumed the receipt — no
     /// rollback compiles), and the hook's own-event read short-circuits to
     /// the committed base without settling anything.
     #[tokio::test(start_paused = true)]
-    async fn ambiguous_flush_shutdown_after_abort_reads_prev() -> Result<()> {
+    async fn ambiguous_record_shutdown_after_abort_reads_prev() -> Result<()> {
         type TripBackend = PartitionBackend<
             FlushTripOracle,
             MemoryDescriptorIdentityStore,
@@ -1018,13 +1018,13 @@ mod hook_visibility {
         assert_eq!(
             aborted.load(Ordering::SeqCst),
             1,
-            "the ambiguous flush abandons"
+            "the ambiguous record abandons"
         );
         assert_eq!(committed.load(Ordering::SeqCst), 0);
         assert_eq!(
             oracle.attempts.load(Ordering::SeqCst),
             1,
-            "exactly one flush attempt preceded the shutdown — the ambiguity trigger",
+            "exactly one record attempt preceded the shutdown — the ambiguity trigger",
         );
         assert_eq!(
             handler.reads(),
@@ -1559,7 +1559,7 @@ mod marker_record_must_succeed {
     };
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
-    use color_eyre::eyre::Result;
+    use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
     use quickcheck::{QuickCheck, TestResult};
     use serde_json::json;
@@ -1724,7 +1724,7 @@ mod marker_record_must_succeed {
         // Stage a dirty write so "no stage" is a real claim, not vacuous.
         let handle = context
             .state(Registered::new(cart()))
-            .map_err(|e| color_eyre::eyre::eyre!("bind cart: {e}"))?;
+            .map_err(|e| eyre!("bind cart: {e}"))?;
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
@@ -1765,7 +1765,7 @@ mod marker_record_must_succeed {
         let context = MockEventContext::new().with_session(session);
         let handle = context
             .state(Registered::new(cart()))
-            .map_err(|e| color_eyre::eyre::eyre!("bind cart: {e}"))?;
+            .map_err(|e| eyre!("bind cart: {e}"))?;
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
@@ -1926,9 +1926,9 @@ mod marker_record_must_succeed {
 }
 
 /// Settlement classification tables for the wrappers without their own
-/// tests module: the scheduler's admission split, the pure pass-throughs
-/// (retry mid-stack, log, timeout, telemetry), `OptionHandler`'s per-branch
-/// delegation, and the `LeafHandler` chain terminator. Delegation is proven
+/// tests module: the pure pass-throughs (retry mid-stack, log, timeout,
+/// telemetry), `OptionHandler`'s per-branch delegation, and the `LeafHandler`
+/// chain terminator. Delegation is proven
 /// against [`BypassedHandler`], whose classification is `Bypassed` for every
 /// result — a wrapper hardcoding `Final` fails those rows.
 mod settlement_classification {

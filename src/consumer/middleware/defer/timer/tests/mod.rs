@@ -403,8 +403,8 @@ mod defer_swallow {
     use crate::consumer::middleware::defer::error::DeferError;
     use crate::consumer::middleware::defer::timer::handler::TimerDeferOutput;
     use crate::consumer::middleware::tests::test_support::{
-        MockEventContext, RecordingTimer, ScriptedHandler, StagingHook, StagingTransientHandler,
-        committed_value, recording_session,
+        BypassedHandler, MockEventContext, RecordingTimer, ScriptedHandler, StagingHook,
+        StagingTransientHandler, TestError, committed_value, recording_session,
     };
     use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
     use crate::error::ErrorCategory;
@@ -570,70 +570,68 @@ mod defer_swallow {
         Ok(())
     }
 
-    /// The settlement classification table for the timer-defer wrapper:
-    /// every Output and error variant, over a `Final` leaf so delegation is
-    /// observable against the `Bypassed` rows.
-    #[test]
-    fn settlement_classification_table() {
-        use crate::consumer::middleware::tests::test_support::TestError;
-        use crate::timers::datetime::CompactDateTimeError;
+    /// Store double whose `Error` is constructible (the memory store's is
+    /// `Infallible`), so the `DeferError::Store` row exists. `settlement()`
+    /// never runs a store method.
+    #[derive(Clone)]
+    struct TableStore;
 
-        /// Store double whose `Error` is constructible (the memory store's
-        /// is `Infallible`), so the `DeferError::Store` row exists.
-        /// `settlement()` never runs a store method.
-        #[derive(Clone)]
-        struct TableStore;
+    impl TimerDeferStore for TableStore {
+        type Error = TestError;
 
-        impl TimerDeferStore for TableStore {
-            type Error = TestError;
-
-            async fn defer_first_timer(&self, _trigger: &Trigger) -> Result<(), TestError> {
-                Ok(())
-            }
-
-            async fn get_next_deferred_timer(
-                &self,
-                _key: &Key,
-            ) -> Result<Option<(Trigger, u32)>, TestError> {
-                Ok(None)
-            }
-
-            async fn append_deferred_timer(&self, _trigger: &Trigger) -> Result<(), TestError> {
-                Ok(())
-            }
-
-            fn deferred_times(
-                &self,
-                _key: &Key,
-            ) -> impl Future<Output = Result<Vec<CompactDateTime>, TestError>> + Send + 'static
-            {
-                ready(Ok(Vec::new()))
-            }
-
-            async fn remove_deferred_timer(
-                &self,
-                _key: &Key,
-                _time: CompactDateTime,
-            ) -> Result<(), TestError> {
-                Ok(())
-            }
-
-            async fn set_retry_count(
-                &self,
-                _key: &Key,
-                _retry_count: u32,
-            ) -> Result<(), TestError> {
-                Ok(())
-            }
-
-            async fn delete_key(&self, _key: &Key) -> Result<(), TestError> {
-                Ok(())
-            }
+        async fn defer_first_timer(&self, _trigger: &Trigger) -> Result<(), TestError> {
+            Ok(())
         }
 
+        async fn get_next_deferred_timer(
+            &self,
+            _key: &Key,
+        ) -> Result<Option<(Trigger, u32)>, TestError> {
+            Ok(None)
+        }
+
+        async fn append_deferred_timer(&self, _trigger: &Trigger) -> Result<(), TestError> {
+            Ok(())
+        }
+
+        fn deferred_times(
+            &self,
+            _key: &Key,
+        ) -> impl Future<Output = Result<Vec<CompactDateTime>, TestError>> + Send + 'static
+        {
+            ready(Ok(Vec::new()))
+        }
+
+        async fn remove_deferred_timer(
+            &self,
+            _key: &Key,
+            _time: CompactDateTime,
+        ) -> Result<(), TestError> {
+            Ok(())
+        }
+
+        async fn set_retry_count(&self, _key: &Key, _retry_count: u32) -> Result<(), TestError> {
+            Ok(())
+        }
+
+        async fn delete_key(&self, _key: &Key) -> Result<(), TestError> {
+            Ok(())
+        }
+    }
+
+    type TableOut = TimerDeferOutput<(), TestError>;
+    type TableErr = DeferError<TestError, TestError>;
+
+    /// The settlement classification table for the timer-defer wrapper:
+    /// every Output and error variant, over a `Final` leaf so delegation is
+    /// observable against the `Bypassed` rows. The `Inner`/`Handler`
+    /// delegation is proven separately in [`settlement_table_delegates`].
+    #[test]
+    fn settlement_classification_table() {
+        use crate::timers::datetime::CompactDateTimeError;
+
         type Subject = TimerDeferHandler<ScriptedHandler, TableStore, AlwaysDefer>;
-        type Out = TimerDeferOutput<(), TestError>;
-        type TableErr = DeferError<TestError, TestError>;
+        type Out = TableOut;
 
         let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
             (
@@ -684,5 +682,20 @@ mod defer_swallow {
         for (label, result, expected) in rows {
             assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
         }
+    }
+
+    /// Delegation proof for the timer-defer wrapper: over a
+    /// `Bypassed`-classifying probe leaf, the delegating rows (`Inner`,
+    /// `Handler`) stay `Bypassed` — a wrapper hardcoding `Final` on them
+    /// fails this test.
+    #[test]
+    fn settlement_table_delegates() {
+        type Probe = TimerDeferHandler<BypassedHandler, TableStore, AlwaysDefer>;
+
+        let inner: Result<TableOut, TableErr> = Ok(TimerDeferOutput::Inner(()));
+        let handler: Result<TableOut, TableErr> =
+            Err(DeferError::Handler(TestError(ErrorCategory::Permanent)));
+        assert_eq!(Probe::settlement(inner.as_ref()), Settlement::Bypassed);
+        assert_eq!(Probe::settlement(handler.as_ref()), Settlement::Bypassed);
     }
 }

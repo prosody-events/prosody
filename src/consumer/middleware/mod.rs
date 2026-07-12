@@ -711,8 +711,8 @@ pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 /// defer swallow into `Ok(Deferred)`, a DLQ route into `Ok(Routed)`, a dedup
 /// skip into `Ok(None)`) classifies its own variants `Bypassed`, so nothing
 /// stages and no marker records for the swallowed attempt; there is no reset
-/// protocol to remember. The blanket impl therefore requires the
-/// classification alongside this marker trait.
+/// protocol to remember. The blanket impl below therefore requires both this
+/// trait and `SettlementHandler`.
 ///
 /// Per-invocation apply-hook correctness is preserved: one inner invocation
 /// pairs with exactly one `after_commit` / `after_abort` firing.

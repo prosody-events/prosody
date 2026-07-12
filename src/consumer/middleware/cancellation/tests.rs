@@ -401,4 +401,11 @@ fn settlement_classification_table() {
         ErrorCategory::Permanent,
     )));
     assert_eq!(Probe::settlement(inner_err.as_ref()), Settlement::Bypassed);
+    let shutdown_after_inner: Result<(), Err_> = Err(CancellationError::ShutdownAfterInner(
+        TestError(ErrorCategory::Permanent),
+    ));
+    assert_eq!(
+        Probe::settlement(shutdown_after_inner.as_ref()),
+        Settlement::Bypassed
+    );
 }

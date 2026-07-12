@@ -149,7 +149,7 @@ pub struct PartitionConfiguration<S, SP, P> {
 
     /// Deduplication hash version. Threaded into the per-message
     /// [`EventRef::Message`] dedup id so recovery resolves a message's
-    /// committed state by the exact id the deduplication writer produced.
+    /// committed state by the exact id the settle boundary records.
     pub version: Arc<str>,
 
     /// Trigger store provider — creates per-partition stores with independent
@@ -675,8 +675,8 @@ async fn process_event<T, S, M, P>(
             // Derive the dedup id for every message — even when no
             // descriptors are registered — because the EventRef must exist
             // before we know whether the handler touches state. The
-            // derivation matches the deduplication writer's so recovery
-            // resolves a message by the exact id that writer produced.
+            // derivation matches the marker the settle boundary records, so
+            // recovery resolves a message by the exact recorded id.
             let msg = message.message();
             let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
             // The scope owns the event's state lifetime; its `Drop` clears the

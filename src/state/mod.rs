@@ -168,7 +168,8 @@ pub trait StateBackend: Send + Sync + 'static {
     /// per-event dirty `Overlay`.
     type Cell: CellStore;
 
-    /// The shared commit oracle (the marker flush writes through it).
+    /// The shared commit oracle (the settle boundary records the marker
+    /// through it).
     fn oracle(&self) -> Self::Oracle;
 
     /// The shared descriptor-identity store.

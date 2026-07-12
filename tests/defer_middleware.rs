@@ -34,6 +34,7 @@ use prosody::JsonCodec;
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::middleware::deduplication::DEFAULT_IDEMPOTENCE_VERSION;
 use prosody::consumer::middleware::defer::message::store::CassandraMessageDeferStoreProvider;
 use prosody::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use prosody::consumer::middleware::defer::segment::CassandraSegmentStore;
@@ -310,7 +311,7 @@ impl DeferTestEnvironment {
                 message_provider,
                 failure_tracker,
                 loader,
-                "1",
+                DEFAULT_IDEMPOTENCE_VERSION,
                 &telemetry,
             )?;
 

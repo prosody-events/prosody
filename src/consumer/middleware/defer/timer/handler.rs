@@ -22,7 +22,8 @@
 //! The inner is invoked at most once per dispatch. [`TimerDeferOutput`]
 //! encodes the routing: `Inner` forwards the framework's chosen hook,
 //! `Deferred` always fires `after_abort` (the original timer's retry is
-//! coming even though our marker commits), and `NoInner` suppresses both.
+//! coming even though this dispatch's own commit still advances — `Bypassed`,
+//! no message marker records), and `NoInner` suppresses both.
 
 use super::context::TimerDeferContext;
 use super::store::{TimerDeferStore, TimerRetryCompletionResult};
@@ -186,7 +187,7 @@ where
         // Symmetric to after_commit. The only twist: Deferred(e) still
         // routes to after_abort(Err(e)) on the inner — the inner's prior
         // dispatch is being rolled back regardless of whether the outer
-        // commit/abort decision committed our defer marker.
+        // commit/abort decision advanced this dispatch's own commit.
         match result {
             Ok(TimerDeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;

@@ -474,4 +474,8 @@ fn settlement_classification_table() {
     // rows stay Bypassed.
     let ok: Result<(), Err_> = Ok(());
     assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
+    let inner_err: Result<(), Err_> = Err(MonopolizationError::Handler(TestError(
+        ErrorCategory::Permanent,
+    )));
+    assert_eq!(Probe::settlement(inner_err.as_ref()), Settlement::Bypassed);
 }

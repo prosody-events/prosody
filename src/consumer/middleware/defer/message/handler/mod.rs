@@ -23,7 +23,7 @@
 //! * `Inner` — inner ran; forward the framework's chosen hook.
 //! * `Deferred` — inner ran and returned a transient error that we captured for
 //!   retry. Both hooks route to `after_abort(Err(..))`: a retry is coming even
-//!   though the defer marker itself commits.
+//!   though the dispatch's offset itself commits.
 //! * `NoInner` — inner did not run (queue-append, orphan-timer, loader failure,
 //!   key-mismatch); suppress both hooks.
 

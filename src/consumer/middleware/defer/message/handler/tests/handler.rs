@@ -298,12 +298,12 @@ mod settlement_pins {
     use crate::consumer::middleware::providers::FallibleCloneProvider;
     use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
     use crate::consumer::middleware::tests::test_support::{
-        RecordingOracle, RecordingSession, RecordingTimer, committed_value,
+        RecordingOracle, RecordingSession, RecordingTimer, StagingError, committed_value,
         recording_session_with_loader,
     };
     use crate::consumer::middleware::{
-        ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandlerProvider,
-        HandlerMiddleware, Settlement, SettlementHandler,
+        ErrorCategory, FallibleEventHandler, FallibleHandlerProvider, HandlerMiddleware,
+        Settlement, SettlementHandler,
     };
     use crate::consumer::partition::offsets::OffsetTracker;
     use crate::loader::{MemoryLoader, MemoryLoaderError};
@@ -323,7 +323,6 @@ mod settlement_pins {
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use thiserror::Error;
     use tokio::sync::Semaphore;
     use uuid::Uuid;
 
@@ -341,17 +340,6 @@ mod settlement_pins {
     const GROUP: &str = "test";
     const VERSION: &str = "1";
     const KEY: &str = "user-1";
-
-    /// Error of a [`StagingLeaf`] attempt, carrying its classification.
-    #[derive(Debug, Error)]
-    #[error("staging leaf failed ({0:?})")]
-    struct LeafError(ErrorCategory);
-
-    impl ClassifyError for LeafError {
-        fn classify_error(&self) -> ErrorCategory {
-            self.0
-        }
-    }
 
     /// Leaf for the pins: on every `on_message` it buffers one `cart` write,
     /// records the message's offset, and returns the next scripted outcome
@@ -379,7 +367,7 @@ mod settlement_pins {
     }
 
     impl FallibleHandler for StagingLeaf {
-        type Error = LeafError;
+        type Error = StagingError;
         type Output = ();
         type Payload = Value;
 
@@ -395,16 +383,16 @@ mod settlement_pins {
             self.processed.lock().push(message.offset());
             let handle = context
                 .state(Registered::new(Self::collection()))
-                .map_err(|_| LeafError(ErrorCategory::Terminal))?;
+                .map_err(|_| StagingError(ErrorCategory::Terminal))?;
             handle
                 .set(json!({ "offset": message.offset() }))
                 .await
-                .map_err(|_| LeafError(ErrorCategory::Terminal))?;
+                .map_err(|_| StagingError(ErrorCategory::Terminal))?;
             let mut outcomes = self.outcomes.lock();
             if outcomes.is_empty() {
                 Ok(())
             } else {
-                Err(LeafError(outcomes.remove(0)))
+                Err(StagingError(outcomes.remove(0)))
             }
         }
 
@@ -714,7 +702,7 @@ mod settlement_pins {
             .defer_first_message(&Key::from(KEY), 0)
             .await?;
 
-        let (session, _cell_store, _dirty, recorded) = fx.session(timer_event())?;
+        let (session, cell_store, _dirty, recorded) = fx.session(timer_event())?;
         let scope = EventStateScope::new(session);
         let context = MockEventContext::new()
             .with_session(scope.handle())
@@ -728,6 +716,11 @@ mod settlement_pins {
             recorded.lock().clone(),
             vec![expected],
             "a permanently-failed reload records the reloaded message's id",
+        );
+        assert_eq!(
+            committed_value(&cell_store, fx.registry_key.clone(), "cart").await?,
+            None,
+            "permanent reload failure stages nothing",
         );
         assert_eq!(
             fx.defer_store.is_deferred(&Key::from(KEY)).await?,
@@ -799,16 +792,20 @@ mod settlement_pins {
     struct TableStore;
 
     impl MessageDeferStore for TableStore {
-        type Error = LeafError;
+        type Error = StagingError;
 
-        async fn defer_first_message(&self, _key: &Key, _offset: Offset) -> Result<(), LeafError> {
+        async fn defer_first_message(
+            &self,
+            _key: &Key,
+            _offset: Offset,
+        ) -> Result<(), StagingError> {
             Ok(())
         }
 
         async fn get_next_deferred_message(
             &self,
             _key: &Key,
-        ) -> Result<Option<(Offset, u32)>, LeafError> {
+        ) -> Result<Option<(Offset, u32)>, StagingError> {
             Ok(None)
         }
 
@@ -816,7 +813,7 @@ mod settlement_pins {
             &self,
             _key: &Key,
             _offset: Offset,
-        ) -> Result<(), LeafError> {
+        ) -> Result<(), StagingError> {
             Ok(())
         }
 
@@ -824,15 +821,15 @@ mod settlement_pins {
             &self,
             _key: &Key,
             _offset: Offset,
-        ) -> Result<(), LeafError> {
+        ) -> Result<(), StagingError> {
             Ok(())
         }
 
-        async fn set_retry_count(&self, _key: &Key, _retry_count: u32) -> Result<(), LeafError> {
+        async fn set_retry_count(&self, _key: &Key, _retry_count: u32) -> Result<(), StagingError> {
             Ok(())
         }
 
-        async fn delete_key(&self, _key: &Key) -> Result<(), LeafError> {
+        async fn delete_key(&self, _key: &Key) -> Result<(), StagingError> {
             Ok(())
         }
     }
@@ -852,8 +849,9 @@ mod settlement_pins {
             MemoryLoader<Value>,
             AlwaysDefer,
         >;
-        type Out = MessageDeferOutput<Option<()>, DeduplicationError<LeafError>>;
-        type TableErr = DeferError<LeafError, DeduplicationError<LeafError>, MemoryLoaderError>;
+        type Out = MessageDeferOutput<Option<()>, DeduplicationError<StagingError>>;
+        type TableErr =
+            DeferError<StagingError, DeduplicationError<StagingError>, MemoryLoaderError>;
 
         let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
             (
@@ -869,7 +867,7 @@ mod settlement_pins {
             (
                 "Deferred is Bypassed (parked for retry)",
                 Ok(MessageDeferOutput::Deferred(DeduplicationError::Inner(
-                    LeafError(ErrorCategory::Transient),
+                    StagingError(ErrorCategory::Transient),
                 ))),
                 Settlement::Bypassed,
             ),
@@ -880,26 +878,26 @@ mod settlement_pins {
             ),
             (
                 "Handler(Inner leaf error) delegates to Final",
-                Err(DeferError::Handler(DeduplicationError::Inner(LeafError(
-                    ErrorCategory::Permanent,
-                )))),
+                Err(DeferError::Handler(DeduplicationError::Inner(
+                    StagingError(ErrorCategory::Permanent),
+                ))),
                 Settlement::Final,
             ),
             (
                 "Handler(dedup Store) delegates to dedup's Bypassed",
                 Err(DeferError::Handler(DeduplicationError::Store(Box::new(
-                    LeafError(ErrorCategory::Transient),
+                    StagingError(ErrorCategory::Transient),
                 )))),
                 Settlement::Bypassed,
             ),
             (
                 "Store rescue failure is Bypassed",
-                Err(DeferError::Store(LeafError(ErrorCategory::Transient))),
+                Err(DeferError::Store(StagingError(ErrorCategory::Transient))),
                 Settlement::Bypassed,
             ),
             (
                 "Timer rescue failure is Bypassed",
-                Err(DeferError::Timer(Box::new(LeafError(
+                Err(DeferError::Timer(Box::new(StagingError(
                     ErrorCategory::Transient,
                 )))),
                 Settlement::Bypassed,

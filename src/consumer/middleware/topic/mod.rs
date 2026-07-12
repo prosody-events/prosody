@@ -437,9 +437,9 @@ where
             Ok(FailureTopicOutput::Routed(_)) => Settlement::Bypassed,
             // Inner ran and its error surfaced un-rescued.
             Err(FailureTopicError::Handler(error)) => T::settlement(Err(error)),
-            // Marker eligibility follows the INNER error (the register rule),
-            // guarded by its category, even though the retry-facing
-            // classification is the producer's:
+            // Marker eligibility follows the INNER error, guarded by its
+            // category, even though the retry-facing classification is the
+            // producer's:
             // - a Permanent inner would have certified on its own (it is final regardless of the
             //   DLQ), so delegate its settlement;
             // - a Transient inner never certifies — the message is neither handled nor in the DLQ,
