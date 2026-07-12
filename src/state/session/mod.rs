@@ -348,7 +348,7 @@ pub(crate) mod sealed {
 
     impl<S: CellStore> StagedState<S> {
         /// Delay between this stage and its `StateRecovery` sweep.
-        pub fn recovery_delay(&self) -> CompactDuration {
+        pub(crate) fn recovery_delay(&self) -> CompactDuration {
             self.recovery_delay
         }
 
@@ -358,7 +358,7 @@ pub(crate) mod sealed {
         /// and anything left provisional is the armed sweep's (or
         /// first-touch's) to resolve — there is no caller decision to feed,
         /// so no outcome is returned.
-        pub async fn rollback(self) {
+        pub(crate) async fn rollback(self) {
             resolve_collections(&self.store, self.collections, false).await;
         }
 
@@ -372,7 +372,7 @@ pub(crate) mod sealed {
         /// the oracle, which reads whether the marker landed. Consuming the
         /// receipt here makes the rule structural: a [`Promotable`] has no
         /// rollback.
-        pub fn certify(self) -> Promotable<S> {
+        pub(crate) fn certify(self) -> Promotable<S> {
             Promotable(self)
         }
     }
@@ -389,7 +389,7 @@ pub(crate) mod sealed {
         /// failures warn per collection and fold into
         /// [`ApplyOutcome::Incomplete`] (the backstop, always left armed,
         /// lets the sweep retry).
-        pub async fn promote(self) -> ApplyOutcome {
+        pub(crate) async fn promote(self) -> ApplyOutcome {
             let StagedState {
                 store, collections, ..
             } = self.0;

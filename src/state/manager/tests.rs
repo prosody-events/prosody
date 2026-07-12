@@ -719,6 +719,10 @@ async fn promote_is_best_effort_when_one_fails() -> Result<()> {
         ApplyOutcome::Incomplete,
         "a failed promote yields Incomplete so the boundary leaves the backstop armed",
     );
+    assert!(
+        staged_cell(&cell, &id_for(&key, "cart")?).await?.is_none(),
+        "promote commits the healthy cell — a skipped commit would leave it provisional",
+    );
     assert_eq!(
         committed(&cell, &id_for(&key, "cart")?).await?,
         Some(bytes(7)),

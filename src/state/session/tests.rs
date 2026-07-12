@@ -870,6 +870,10 @@ async fn run(trace: Trace) -> Result<bool> {
                 Outcome::Abort => {
                     if let Finalized::Staged(staged) = session.finalize().await? {
                         staged.rollback().await;
+                        // Same raw probe as the Commit arm: a rollback that
+                        // skipped its store call would be healed to identical
+                        // bytes by the loop-tail resolving reads and masked.
+                        assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
                     }
                     // Post-commit ops roll back to their `prev`, which
                     // finalize captured *after* the `commit()` landed — the
