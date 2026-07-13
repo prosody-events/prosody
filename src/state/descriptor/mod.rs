@@ -692,7 +692,8 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Whether this collection carries a TTL — a cheap, allocation-free
-    /// registry lookup the Map bound refresh consults per `set`.
+    /// registry lookup the Map keyset write consults per `set` so the keyset
+    /// cell co-expires with its entries (`KeysetPresence`).
     pub(in crate::state::descriptor) fn has_ttl(&self) -> bool {
         self.session.collection_has_ttl(self.state_type, &self.name)
     }
