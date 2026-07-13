@@ -31,12 +31,15 @@
 //! **resets the index space**: the erased bounds cell reads `[0, 0)`, so the
 //! next push writes index 0. Reuse is safe — every pre-clear row is erased by
 //! the clear, and a later write to a reused coordinate out-stamps any earlier
-//! tombstone (single writer, monotonic timestamps). Co-stamping makes the
-//! window move heal as a unit: a handler's entry mutation and the bounds move
-//! it buffers in one op stage in one batch with one write TS/TTL (see
-//! [`KeyedStateSession::finalize`](crate::state::session)) — and a
-//! mid-handler [`DequeHandle::commit`] drains them in one batch the same
-//! way.
+//! tombstone (single writer, monotonic timestamps). Co-stamping keeps the
+//! window move and its entry mutation together: they buffer as one op and stage
+//! under one settle marker with one write TS/TTL (see
+//! [`KeyedStateSession::finalize`](crate::state::session)), recoverable
+//! together whatever the batching — and a mid-handler [`DequeHandle::commit`]
+//! drains them resolved and marker-free: one atomic batch within the batch
+//! budget, but an over-budget commit can crash mid-split (the collection-grain
+//! over-budget residual on [`CellStore`](crate::state::store::CellStore),
+//! shared with the Map keyset).
 //!
 //! **Without a TTL the window is also dense**: every index in `[head, tail)`
 //! maps to a present entry cell, so `len` is exact and iteration yields exactly
@@ -525,8 +528,8 @@ where
     }
 
     /// Durably commits this deque's buffered ops mid-handler — entries and
-    /// the window bounds together, in one batch. At-least-once; see
-    /// [`CellSession::commit`] for the contract.
+    /// the window bounds together. At-least-once; see [`CellSession::commit`]
+    /// for the contract, including the over-budget batch split.
     ///
     /// # Errors
     ///
@@ -556,7 +559,7 @@ where
     }
 
     /// Buffers the bounds cell. Co-stamped with the entry mutation a single op
-    /// also buffers, so the window heals as a unit.
+    /// also buffers, so the move and its entry stage together (module docs).
     async fn write_bounds(
         &self,
         permit: &MutatePermit<'_>,

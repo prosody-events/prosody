@@ -223,10 +223,16 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// idempotence across the resume is the contract.
     ///
     /// Every currently-buffered op of the collection is written straight to
-    /// committed state ([`write_resolved`]) in one same-partition batch and
-    /// dropped from the dirty buffer, so multi-cell kinds commit data and
-    /// bookkeeping as a unit (a Map's entries and keyset, a Deque's
-    /// entries and window bounds). The guarantee is **at-least-once**: a
+    /// committed state ([`write_resolved`]) and dropped from the dirty buffer,
+    /// so multi-cell kinds commit data and bookkeeping together (a Map's
+    /// entries and keyset, a Deque's entries and window bounds). Within the
+    /// batch budget those cells ride one atomic same-partition batch; an
+    /// over-budget commit splits into the fewest fitting batches, and —
+    /// `write_resolved` being marker-free — a crash mid-split can leave a
+    /// torn committed write the store cannot reconstruct (the over-budget
+    /// residual on the collection-grain atomicity invariant, [`CellStore`]),
+    /// reconstructed only when the idempotent handler re-run re-issues the same
+    /// ops. The guarantee is **at-least-once**: a
     /// `commit()`-landed write is durable and visible immediately — never
     /// provisional, never listed in any event marker, never rolled back. Ops
     /// buffered *after* the commit ride the collection's normal stage→settle

@@ -57,7 +57,7 @@
 //! The keyset is an optimization cell, so a malformed or oversized stored frame
 //! **degrades** iteration to the full-section scan (with a warning) and is
 //! healed by the next `set` — it never errors upward. Membership is durable
-//! data co-staged with the entry writes in the same settle batch, so there is
+//! data co-staged with the entry writes under one settle marker, so there is
 //! no in-RAM structure to bound.
 //!
 //! # Invariant: on a TTL'd map the keyset outlives every entry
@@ -226,10 +226,16 @@ impl Codec for MapKeysetKey {
 /// rules hold it:
 ///
 /// * every `set` leaves a keyset cell present — writing one whenever the
-///   pre-write read is `Absent`/`Malformed` or the frame must change, staged in
-///   the **same atomic same-partition batch** as its entry write (at the settle
-///   boundary and at mid-handler [`commit`](MapHandle::commit) alike), and
-///   relying on the already-present cell otherwise;
+///   pre-write read is `Absent`/`Malformed` or the frame must change, staged
+///   with its entry write in one collection-grain store write, and relying on
+///   the already-present cell otherwise. At the settle boundary that write is
+///   provisional under one recovery marker, so it is recoverable whatever the
+///   batching; mid-handler [`commit`](MapHandle::commit) writes them resolved
+///   and marker-free — one atomic batch within the batch budget, but an
+///   over-budget commit can crash mid-split and strand an entry ahead of its
+///   keyset (the collection-grain over-budget residual on
+///   [`CellStore`](crate::state::store::CellStore), reconstructed only by the
+///   idempotent handler re-run, never by the store);
 /// * [`clear`](MapHandle::clear) erases both the entry section and the keyset;
 /// * on a TTL'd map every `set` refreshes the keyset (above), so it expires no
 ///   earlier than the newest entry.
@@ -680,8 +686,8 @@ where
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset
-    /// together, in one batch. At-least-once; see [`CellSession::commit`] for
-    /// the contract.
+    /// together. At-least-once; see [`CellSession::commit`] for the contract,
+    /// including the over-budget batch split.
     ///
     /// # Errors
     ///
