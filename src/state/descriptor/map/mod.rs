@@ -560,9 +560,7 @@ where
             return Ok(StreamPlan::Scan);
         };
         let limit = self.keyset.keyset_limit();
-        if coordinates.len() > limit
-            || tracked_frame_len(&coordinates).is_none_or(|len| len > KEYSET_BYTE_CEILING)
-        {
+        if is_oversized(&coordinates, limit) {
             warn!(
                 collection = self.entries.name().as_str(),
                 "map keyset frame is oversized for the registered limit; degrading to the bounds \
@@ -858,9 +856,7 @@ where
         ttl: bool,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
         // Oversized first — collapse even when `coordinate` is already listed.
-        if keys.len() > limit
-            || tracked_frame_len(&keys).is_none_or(|len| len > KEYSET_BYTE_CEILING)
-        {
+        if is_oversized(&keys, limit) {
             warn!(
                 collection = self.entries.name().as_str(),
                 "map keyset exceeded its bound; collapsing to Overflowed"
@@ -963,6 +959,14 @@ fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
             .checked_add(coordinate.as_bytes().len())?;
     }
     Some(total)
+}
+
+/// Whether a stored `Tracked` frame no longer fits the current bound (the
+/// registered limit or the byte ceiling). Shared by the read and write
+/// paths — `stream_plan` degrades on it and `update_tracked` collapses on
+/// it — so the two can never disagree about what "oversized" means.
+fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
+    keys.len() > limit || tracked_frame_len(keys).is_none_or(|len| len > KEYSET_BYTE_CEILING)
 }
 
 /// Decodes each stored coordinate to its logical key, returning `None` if any

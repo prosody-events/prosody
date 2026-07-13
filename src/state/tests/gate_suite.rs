@@ -19,7 +19,7 @@
 
 use super::super::cached::Cached;
 use super::super::descriptor::{
-    CellStateError, MapStateError, StateDescriptor, deque, deque_state, map_state, value_state,
+    CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
 };
 use super::super::manager::ArmedKeys;
 use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -345,7 +345,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         // Seed a valid, cold, non-TTL map: entries {0,1,2}, bounds [0,2], a
         // three-key Tracked keyset. Cold so the event's meta reads land on the
         // armed hold.
-        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let (min_cell, max_cell) = map::bound_cells();
         let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
         let entry =
             |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
@@ -356,19 +356,19 @@ fn gate_serializes_set_against_clear() -> Result<()> {
                     (min_cell.clone(), Some(bound(0))),
                     (max_cell.clone(), Some(bound(2))),
                     (
-                        super::super::descriptor::map::keyset_cell(),
+                        map::keyset_cell(),
                         Some(Bytes::from(tracked_frame(&[0, 1, 2]))),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&0)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&0)),
                         Some(entry(0)?),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&1)),
                         Some(entry(1)?),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&2)),
                         Some(entry(2)?),
                     ),
                 ],
@@ -434,11 +434,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
             .into_inner();
         let keyset = fx
             .counting
-            .get(
-                &id,
-                &super::super::descriptor::map::keyset_cell(),
-                probe(99),
-            )
+            .get(&id, &map::keyset_cell(), probe(99))
             .await?
             .into_inner();
         assert!(
@@ -525,7 +521,7 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
 
         // The bounds-ratchet twin: no live key lands outside the stored bounds.
         let id = fx.id("m")?;
-        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let (min_cell, max_cell) = map::bound_cells();
         let min = fx
             .counting
             .get(&id, &min_cell, probe(99))
@@ -547,11 +543,7 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
         // The keyset is the UNION {1, 9}, not a last-wins singleton.
         let keyset = fx
             .counting
-            .get(
-                &id,
-                &super::super::descriptor::map::keyset_cell(),
-                probe(99),
-            )
+            .get(&id, &map::keyset_cell(), probe(99))
             .await?
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
@@ -593,7 +585,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
 
         // Seed a two-key keyset (limit 3) beneath the cache, so event ops read
         // cold and land on the armed hold.
-        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let (min_cell, max_cell) = map::bound_cells();
         let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
         let entry =
             |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
@@ -604,15 +596,15 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
                     (min_cell, Some(bound(1))),
                     (max_cell, Some(bound(2))),
                     (
-                        super::super::descriptor::map::keyset_cell(),
+                        map::keyset_cell(),
                         Some(Bytes::from(tracked_frame(&[1, 2]))),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&1)),
                         Some(entry(1)?),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&2)),
                         Some(entry(2)?),
                     ),
                 ],
@@ -655,11 +647,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
         // The serial second set exceeds the limit → Overflowed.
         let keyset = fx
             .counting
-            .get(
-                &id,
-                &super::super::descriptor::map::keyset_cell(),
-                probe(99),
-            )
+            .get(&id, &map::keyset_cell(), probe(99))
             .await?
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
@@ -707,7 +695,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
         let cref = CollectionRef::new(id.clone(), None);
 
         // Seed {1: 10, 2: 20} with a two-key keyset beneath the cache (cold).
-        let (min_cell, max_cell) = super::super::descriptor::map::bound_cells();
+        let (min_cell, max_cell) = map::bound_cells();
         let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
         let entry =
             |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
@@ -718,15 +706,15 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
                     (min_cell, Some(bound(1))),
                     (max_cell, Some(bound(2))),
                     (
-                        super::super::descriptor::map::keyset_cell(),
+                        map::keyset_cell(),
                         Some(Bytes::from(tracked_frame(&[1, 2]))),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&1)),
                         Some(entry(10)?),
                     ),
                     (
-                        super::super::descriptor::map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        map::entry_cell_for(&I64KeyCodec::encode(&2)),
                         Some(entry(20)?),
                     ),
                 ],

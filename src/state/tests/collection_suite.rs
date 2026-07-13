@@ -1266,6 +1266,8 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
     let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
         bail!("the committed sets must have written a keyset cell");
     };
+    // Golden literal on purpose — independent of `tracked_frame`, so a helper
+    // bug and a codec bug can't drift together.
     assert_eq!(
         &bytes[..],
         [

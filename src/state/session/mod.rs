@@ -122,8 +122,8 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     fn is_terminated(&self) -> bool;
 
     /// Whether the collection named `(state_type, name)` carries a TTL — the
-    /// query the Map bound refresh consults to keep its bound cells' TTL
-    /// renewed on every `set`, so the bounds provably outlive every entry.
+    /// query the Map meta refresh consults to keep its `Meta` cells (bounds and
+    /// keyset) renewed on every `set`, so they provably outlive every entry.
     /// No default impl: a silent `false` would disable the refresh for a
     /// real session.
     fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool;

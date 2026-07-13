@@ -16,8 +16,9 @@ use thiserror::Error;
 pub(crate) const DEFAULT_KEYSET_LIMIT: usize = 128;
 
 /// Registration ceiling on the Map keyset bound: a larger limit is rejected at
-/// build ([`RegisterStateError::KeysetLimit`]) so a single map can never hold
-/// an unbounded keyset cell in RAM or on the wire.
+/// build ([`RegisterStateError::KeysetLimit`]), capping the point-get fan-out
+/// (and decode allocation) a single `stream` can issue — the byte ceiling
+/// separately bounds the frame's wire size.
 const MAX_KEYSET_LIMIT: usize = 4096;
 
 /// Persistence mode for a collection's state changes, chosen per collection
