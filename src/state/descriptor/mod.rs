@@ -958,11 +958,12 @@ where
     /// Desugared `-> impl Future + Send + 'a` (with the synchronous decode
     /// hoisted before the async block) so the `Send` bound is **stated**, not
     /// inferred: a `.map(|item| cooperative(...resolve_bytes...))` fan-out
-    /// requires the per-item futures `Send` for a higher-ranked lifetime, which
-    /// an `async fn`'s inferred `Send` is "not general enough" to satisfy
-    /// across a `tokio::spawn`. The explicit bound also removes the need
-    /// for the `manual_async_fn` shape a single-async-block `async fn`
-    /// would trip.
+    /// buffered under `.buffered(N)` requires the per-item futures `Send` for a
+    /// higher-ranked lifetime so the whole collection stream stays `Send` (it
+    /// is driven under `KeyManager`'s `buffer_unordered`), which an `async
+    /// fn`'s inferred `Send` is "not general enough" to satisfy. The
+    /// explicit bound also removes the need for the `manual_async_fn` shape
+    /// a single-async-block `async fn` would trip.
     ///
     /// # Errors
     ///

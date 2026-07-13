@@ -341,10 +341,11 @@ pub(crate) mod sealed {
     /// over: `commit()`'s snapshot→drain window dropping a concurrent `set`,
     /// and the map keyset read-modify-write under `join!`-ed sets.
     ///
-    /// **Each public op acquires the gate exactly once** (a stream's
-    /// acquisition is its init); nothing beneath a public wrapper
-    /// re-acquires — a tokio `Mutex` is not reentrant, so an internal
-    /// re-acquire is a deadlock the KV4 pins would surface as a hang.
+    /// **A stream acquires the gate at init and once per chunk**, each permit
+    /// dropped before the next; every other public op acquires it once for its
+    /// whole body. Nothing beneath a public wrapper re-acquires while holding —
+    /// a tokio `Mutex` is not reentrant, so an internal re-acquire is a
+    /// deadlock the KV4 pins would surface as a hang.
     ///
     /// **Streams hold the gate only per chunk (`StreamYieldFree`).** A
     /// point-get stream (a sub-threshold deque window, or a `Tracked` map

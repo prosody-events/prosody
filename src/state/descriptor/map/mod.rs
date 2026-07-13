@@ -112,7 +112,7 @@ const KEYSET_BYTE_CEILING: usize = 64 * 1024;
 /// Bounded and named, sized to overlap the durable round-trips of a cold keyset
 /// (a warm keyset's fjall hits gain nothing and lose nothing), not for
 /// throughput. Mirrors the deque window's [`WINDOW_CHUNK`](super::deque).
-const KEYSET_CHUNK: usize = 16;
+pub(crate) const KEYSET_CHUNK: usize = 16;
 
 /// Keyset frame tag for a [`Keyset::Tracked`] payload. Frozen wire byte, pinned
 /// by `map_keyset_cell_bytes_are_frozen`.
@@ -306,9 +306,9 @@ enum PriorKeyset {
     Malformed,
 }
 
-/// The arm [`MapHandle::stream`] takes: materialize the tracked keys' entries
-/// by point gets (in `dir` order), degrade to the full-section scan, or (an
-/// absent keyset ⇒ [`KeysetPresence`](Keyset) ⇒ no live entries) yield nothing.
+/// The arm [`MapHandle::stream`] takes: point-get the tracked keys' entries
+/// (in `dir` order), degrade to the full-section scan, or (an absent keyset ⇒
+/// [`KeysetPresence`](Keyset) ⇒ no live entries) yield nothing.
 enum StreamPlan<K> {
     /// Point-get each listed key (already reversed for a backward stream).
     Tracked(Vec<K>),
@@ -544,8 +544,8 @@ where
     /// means no live entries ([`KeysetPresence`](Keyset)), so the stream is
     /// [`Empty`](StreamPlan::Empty) with no entry reads (no scan); a `Tracked`
     /// keyset within the registered limit and byte ceiling whose every
-    /// coordinate decodes to a canonical key becomes the point-get
-    /// materialization (keys in `dir` order); anything else — `Overflowed`,
+    /// coordinate decodes to a canonical key becomes the chunked point-get
+    /// arm (keys in `dir` order); anything else — `Overflowed`,
     /// malformed, oversized, or a coordinate that fails to decode or
     /// re-encode — degrades to the full-section scan (with a warning on the
     /// degradations that are not simply overflowed). A keyset-read access

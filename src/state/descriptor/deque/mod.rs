@@ -96,7 +96,7 @@ pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
 /// Bounded and named, sized to overlap the durable round-trips of a cold window
 /// (a warm window's fjall hits gain nothing and lose nothing), not for
 /// throughput. Mirrors the map keyset's [`KEYSET_CHUNK`](super::map).
-const WINDOW_CHUNK: usize = 16;
+pub(crate) const WINDOW_CHUNK: usize = 16;
 
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so

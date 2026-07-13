@@ -1818,6 +1818,15 @@ impl Arbitrary for MapInterleave {
             backward: bool::arbitrary(g),
         }
     }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let backward = self.backward;
+        Box::new(
+            self.steps
+                .shrink()
+                .map(move |steps| Self { steps, backward }),
+        )
+    }
 }
 
 /// One step of a deque stream-interleave trace.
@@ -1875,6 +1884,15 @@ impl Arbitrary for DequeInterleave {
             backward: bool::arbitrary(g),
         }
     }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let backward = self.backward;
+        Box::new(
+            self.steps
+                .shrink()
+                .map(move |steps| Self { steps, backward }),
+        )
+    }
 }
 
 /// Runs a fallible handle op under the interleave hang-guard, tagging both the
@@ -1916,8 +1934,9 @@ fn check_map_yield(
     Ok(())
 }
 
-/// PIN 6 (map, `StreamYieldFree`): random `next()`/mutator interleavings on ONE
-/// live session against a live map stream never deadlock and never error, and
+/// The `StreamYieldFree` interleaving property (map): random `next()`/mutator
+/// interleavings on ONE live session against a live map stream never deadlock
+/// and never error, and
 /// every yielded entry is weakly consistent with the init snapshot. A forced
 /// first `Advance` locks the key-membership snapshot to the committed seed
 /// before any mutator runs, so a yielded key must be a seed key and its value
@@ -2027,7 +2046,7 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
     Ok(true)
 }
 
-/// PIN 6 (deque, `StreamYieldFree`): the structural twin of
+/// The `StreamYieldFree` interleaving property (deque): the structural twin of
 /// [`run_map_stream_interleave`]. A forced first `Advance` locks the **position
 /// window** snapshot to the committed seed; thereafter random push/pop/clear/
 /// commit/rollback mutators interleave with `next()`. No op deadlocks, no

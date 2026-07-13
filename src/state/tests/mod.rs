@@ -18,7 +18,7 @@ use self::collection_suite::{
 };
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
 use super::cell::ProvisionalWrite;
-use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
+use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map, map_state};
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
 use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -458,8 +458,35 @@ type CountingBackend = PartitionBackend<
     CountingCellStore<MemoryCellStore<ScriptedOracle>>,
 >;
 
-/// Mints a session over `counting` for one event. Dropped senders are fine —
-/// `watch::Receiver::borrow` keeps returning the last value.
+/// Mints a session over `counting` carrying `loader` for one event. Dropped
+/// senders are fine — `watch::Receiver::borrow` keeps returning the last value.
+fn session_with_loader<L>(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    oracle: &ScriptedOracle,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    armed: &ArmedKeys,
+    event: EventRef,
+    loader: L,
+) -> KeyedStateSession<CountingBackend, L> {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    KeyedStateSession::new(SessionParts::<CountingBackend, _> {
+        cell: counting.clone(),
+        dirty: Arc::default(),
+        oracle: oracle.clone(),
+        loader,
+        registry: registry.clone(),
+        state_key: state_key.clone(),
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: armed.clone(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    })
+}
+
+/// Mints a session over `counting` for one event with the default in-memory
+/// loader.
 fn counting_session(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     oracle: &ScriptedOracle,
@@ -468,20 +495,15 @@ fn counting_session(
     armed: &ArmedKeys,
     event: EventRef,
 ) -> KeyedStateSession<CountingBackend, MemoryLoader<Value>> {
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    KeyedStateSession::new(SessionParts::<CountingBackend, _> {
-        cell: counting.clone(),
-        dirty: Arc::default(),
-        oracle: oracle.clone(),
-        loader: MemoryLoader::new(),
-        registry: registry.clone(),
-        state_key: state_key.clone(),
+    session_with_loader(
+        counting,
+        oracle,
+        registry,
+        state_key,
+        armed,
         event,
-        recovery_delay: CompactDuration::new(30),
-        armed: armed.clone(),
-        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    })
+        MemoryLoader::new(),
+    )
 }
 
 /// Binds `map_state(name)` on `session` and fully drains its `stream(dir)`.
@@ -828,11 +850,6 @@ fn deque_stream_issues_no_scans() -> Result<()> {
     })
 }
 
-/// The chunk width both point-get streams hold the gate for and fetch
-/// concurrently in — mirrors `KEYSET_CHUNK`/`WINDOW_CHUNK` (16); the laziness
-/// bounds are stated in terms of it.
-const STREAM_CHUNK: usize = 16;
-
 /// A dense stream-laziness case: a collection of `n` entries drained
 /// `stream(..).take(k)`, with `n` on the deque's point-get arm (`≤ 128`) and
 /// far above `k`, so "fetch/resolve only the consumed prefix" is a strictly
@@ -846,7 +863,7 @@ struct StreamPrefix {
 impl Arbitrary for StreamPrefix {
     fn arbitrary(g: &mut Gen) -> Self {
         // 48..=127: dense, ≤ DEQUE_POINT_ITERATION_MAX (128) so the deque stays
-        // on the chunked point-get arm, and always > k + STREAM_CHUNK so the
+        // on the chunked point-get arm, and always > k + one chunk width (16) so the
         // "materialize everything" defect is observable.
         let n = 48 + usize::arbitrary(g) % 80;
         // 1..=12: well under one chunk width and far under n.
@@ -866,31 +883,18 @@ fn resolve_session(
     event: EventRef,
     loader: ResolveCounter,
 ) -> KeyedStateSession<CountingBackend, ResolveCounter> {
-    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    KeyedStateSession::new(SessionParts::<CountingBackend, _> {
-        cell: counting.clone(),
-        dirty: Arc::default(),
-        oracle: oracle.clone(),
-        loader,
-        registry: registry.clone(),
-        state_key: state_key.clone(),
-        event,
-        recovery_delay: CompactDuration::new(30),
-        armed: armed.clone(),
-        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-    })
+    session_with_loader(counting, oracle, registry, state_key, armed, event, loader)
 }
 
-/// PIN 5 (map): a `stream(dir).take(k)` over a **dense** `n`-entry `Tracked`
-/// map is genuinely incremental — it fetches at most one chunk beyond `k` (plus
-/// the single keyset read) and resolves at most `k + STREAM_CHUNK` values,
-/// never the whole `n`-entry collection. The counting store bounds fetches and
-/// the counting resolver bounds resolutions; both counters sit at the lowest
-/// layer, so nothing masks a materialization. FALSIFICATION: set `KEYSET_CHUNK`
-/// huge (one chunk = the whole map) → `take(k)` fetches and resolves all `n` →
-/// `lower_reads == n + 1` and `resolves == n`, both `> k + STREAM_CHUNK` for
-/// `n ≫ k` → red.
+/// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
+/// `n`-entry `Tracked` map is genuinely incremental — it fetches at most one
+/// chunk beyond `k` (plus the single keyset read) and resolves at most
+/// `k + KEYSET_CHUNK` values, never the whole `n`-entry collection. The
+/// counting store bounds fetches and the counting resolver bounds resolutions;
+/// both counters sit at the lowest layer, so nothing masks a materialization.
+/// FALSIFICATION: set `KEYSET_CHUNK` huge (one chunk = the whole map) →
+/// `take(k)` fetches and resolves all `n` → `lower_reads == n + 1` and
+/// `resolves == n`, both `> k + KEYSET_CHUNK` for `n ≫ k` → red.
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -971,23 +975,24 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.lower_reads() <= k + STREAM_CHUNK + 1,
+        counting.lower_reads() <= k + map::KEYSET_CHUNK + 1,
         "a lazy map take(k) fetches at most one chunk beyond k plus the keyset read (reads={}, \
          k={k}, n={n})",
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + STREAM_CHUNK,
+        resolves.resolves() <= k + map::KEYSET_CHUNK,
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
     Ok(())
 }
 
-/// PIN 5 (deque): the structural twin of [`run_map_stream_prefix_lazy`] over a
-/// dense `n`-entry window on the point-get arm — at most one chunk beyond `k`
-/// fetched (plus the single bounds read) and at most `k + STREAM_CHUNK`
-/// resolved. Same FALSIFICATION via a huge `WINDOW_CHUNK`.
+/// The stream-laziness property (deque): the structural twin of
+/// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
+/// point-get arm — at most one chunk beyond `k` fetched (plus the single bounds
+/// read) and at most `k + WINDOW_CHUNK` resolved. Same FALSIFICATION via a huge
+/// `WINDOW_CHUNK`.
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -1060,22 +1065,23 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.lower_reads() <= k + STREAM_CHUNK + 1,
+        counting.lower_reads() <= k + deque::WINDOW_CHUNK + 1,
         "a lazy deque take(k) fetches at most one chunk beyond k plus the bounds read (reads={}, \
          k={k}, n={n})",
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + STREAM_CHUNK,
+        resolves.resolves() <= k + deque::WINDOW_CHUNK,
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
     Ok(())
 }
 
-/// PIN 5: both collections' `stream(dir).take(k)` are genuinely incremental —
-/// the fetch/resolve budget tracks the consumed prefix, not the collection
-/// size. A `QuickCheck` property over dense `(n, k)` in both directions.
+/// The stream-laziness property: both collections' `stream(dir).take(k)` are
+/// genuinely incremental — the fetch/resolve budget tracks the consumed prefix,
+/// not the collection size. A `QuickCheck` property over dense `(n, k)` in both
+/// directions.
 #[test]
 fn stream_take_is_lazy() {
     fn property(input: StreamPrefix) -> Result<bool> {
@@ -1091,7 +1097,7 @@ fn stream_take_is_lazy() {
     QuickCheck::new().quickcheck(property as fn(StreamPrefix) -> Result<bool>);
 }
 
-/// PIN 6 (map): the `StreamYieldFree` interleaving property — random
+/// The `StreamYieldFree` interleaving property (map): random
 /// `next()`/mutator interleavings on one live session never deadlock or error
 /// and stay weakly consistent with the init snapshot. A fresh `current_thread`
 /// runtime with a time driver per iteration powers the hang-guard; no sleeps.
@@ -1107,8 +1113,7 @@ fn map_stream_interleave_is_yield_free() {
     QuickCheck::new().quickcheck(property as fn(MapInterleave) -> Result<bool>);
 }
 
-/// PIN 6 (deque): the `StreamYieldFree` interleaving property on the structural
-/// twin.
+/// The `StreamYieldFree` interleaving property (deque): the structural twin.
 #[test]
 fn deque_stream_interleave_is_yield_free() {
     fn property(input: DequeInterleave) -> Result<bool> {

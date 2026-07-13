@@ -965,9 +965,9 @@ fn gate_excludes_pop_between_deque_chunks() -> Result<()> {
         });
         timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
             .await
-            .map_err(|_| eyre!("the materialization never reached its hold"))?;
+            .map_err(|_| eyre!("the stream never reached its hold"))?;
 
-        // The racing pop+commit parks on the gate the materialization holds.
+        // The racing pop+commit parks on the gate the stream chunk holds.
         let pop_task = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -1101,7 +1101,7 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
         let dref = CollectionRef::new(id.clone(), None);
 
         // Seed a one-element window `[0, 1)` whose entry holds undecodable
-        // bytes, so the bounded materialization's point-get fails.
+        // bytes, so the chunk fetch's point-get fails.
         fx.counting
             .write_resolved(
                 &dref,
