@@ -1,7 +1,8 @@
 //! Ordered key→value map collection.
 //!
 //! A Map stores one cell per entry, keyed by an order-preserving encoding of
-//! the logical key, plus loose min/max bounds that anchor an ordered scan. The
+//! the logical key, plus one keyset cell tracking current membership so a small
+//! map's `stream` becomes point gets instead of a durable scan. The
 //! [`MapHandle`] composes the uniform `CellView` typed cell interface — there
 //! is no Map-specific store, session, or backend. Build a descriptor with
 //! [`map_state`], register it with the consumer, and bind the
@@ -12,80 +13,63 @@
 //!
 //! Two sections separate bookkeeping from data (`MapNs`):
 //!
-//! * `Meta` holds **three** cells: the two bounds, addressed by
-//!   `MapBound::Min`/`MapBound::Max`, each storing an extreme entry's *key*
-//!   through `KC` itself (a key codec is its own payload codec — the
-//!   byte-identity law on `OrderedKeyCodec`); plus the keyset at its own fixed
-//!   coordinate. A bound cell's payload bytes are `KC::encode(key)` — the very
-//!   bytes the entry cell is addressed by — so a bound reads back as a logical
-//!   `KC::Key`. The two bounds are stored separately (not one cell) so each
-//!   ratchets independently. An empty Map has no `Meta` cells.
+//! * `Meta` holds **one** cell: the keyset, at the fixed coordinate `[2]`.
+//!   Coordinates `[0]`/`[1]` are a deliberately retired gap (they once held two
+//!   min/max bound cells; re-using a retired coordinate would let a stale
+//!   artifact alias an old frame). An empty Map has no `Meta` cell.
 //! * `Entries` holds one cell per key, addressed by the key codec's
 //!   order-preserving coordinate and typed by the entries cell type
 //!   [`Keyed`]`<KC, V>`.
 //!
-//! # Invariant: the keyset is a loose superset, `Overflowed` is one-way
+//! # Invariant: the keyset tracks current membership, `Overflowed` is one-way
 //!
 //! The keyset cell tracks a map's membership so a small map's `stream` becomes
 //! enumerable point gets (all cached when warm) instead of a durable range
-//! scan. It is a **loose superset**: `set` adds the key (a read-modify-write of
-//! the cell, riding the same operation gate as the entry write), `remove` never
-//! subtracts (it stays the blind entry clear it always was), and iteration
-//! point-gets each listed key and **skips** the ones that read absent. So every
-//! staleness the keyset can exhibit is an over-report that costs at most one
-//! cached absent read — never a wrong or dropped answer.
+//! scan. It tracks **current** membership: `set` adds the key and `remove`
+//! subtracts it (each a read-modify-write of the cell, riding the same
+//! operation gate as the entry write). The only over-report is across TTL
+//! expiry (a present keyset may briefly outlive its entries) or the one-way
+//! `Overflowed`; iteration still point-gets each listed key and **skips** the
+//! ones that read absent, so a stale entry costs at most one cached absent
+//! read, never a wrong or dropped answer.
 //!
 //! A `Tracked` keyset holds at most the registered `keyset_limit` distinct
 //! keys, stored sorted by their order-preserving coordinate, so iteration is
-//! key order in both directions with no read-time sort. The first `set` past
-//! the limit (or past the module's encoded-byte ceiling) writes the one-way
-//! `Overflowed` sentinel — until `clear` or TTL death of the whole map — and
-//! iteration falls back to the bounds-anchored scan. The bound is the
-//! **distinct-key universe since `clear`**, not the live size: a
-//! rotating-identifier map overflows permanently and should not expect cached
-//! iteration.
+//! key order in both directions with no read-time sort. A `set` that would push
+//! a `Tracked` frame past the limit (or past the module's encoded-byte ceiling)
+//! writes the one-way `Overflowed` sentinel — until `clear` or TTL death of the
+//! whole map — and iteration falls back to the full-section (`Unbounded`-edged)
+//! scan. The bound is the **live distinct-key count**: because `remove`
+//! subtracts, a rotating map whose live size stays under the limit keeps cached
+//! iteration forever (and a `remove` that drops a `Tracked` frame back under
+//! the limit heals it — removal heals). A map that ever exceeds the limit in
+//! one incarnation overflows permanently (scan-rebuild re-entry from
+//! `Overflowed` is deliberately not implemented; it needs `clear` or TTL death
+//! to recover).
+//!
+//! Bounds deleted (the Part B ruling): the map once carried two min/max bound
+//! cells to anchor the fallback scan. They are gone — within an incarnation
+//! they fenced no tombstone the `Tracked` arm ever wades (that arm point-gets),
+//! and the accepted residual is the cross-incarnation `Overflowed` corner,
+//! whose fallback is a full-section scan that may cross a one-time tombstone
+//! wave (self-healing as those rows compact).
 //!
 //! The keyset is an optimization cell, so a malformed or oversized stored frame
-//! **degrades** iteration to the scan (with a warning) and is healed by the
-//! next `set` — it never errors upward; the bound cells keep their stricter
-//! `Permanent` posture. Membership is durable data co-staged with the entry
-//! writes in the same settle batch, so there is no in-RAM structure to bound.
+//! **degrades** iteration to the full-section scan (with a warning) and is
+//! healed by the next `set` — it never errors upward. Membership is durable
+//! data co-staged with the entry writes in the same settle batch, so there is
+//! no in-RAM structure to bound.
 //!
-//! # Invariant: min/max are a loose outward superset
+//! # Invariant: on a TTL'd map the keyset outlives every entry
 //!
-//! `set` ratchets the min/max bounds **outward only** and never reads the entry
-//! being written, so a blind last-writer-wins entry write is preserved and the
-//! bounds may name a key that was since removed — a *superset* of the live key
-//! range, never a subset. `stream` anchors **both** edges of its scan on the
-//! bounds — `[min, max]` ascending, mirrored descending — reading them
-//! concurrently, and relies on the store hiding cleared cells, so it yields
-//! exactly the live entries in key order regardless of stale bounds: a residue
-//! beyond the live range is never reached, and a live key can never sit outside
-//! its bounds, so bounding the scan to `[min, max]` drops no entry. When either
-//! bound is absent the map holds no live entries (see the TTL-refresh
-//! invariant), so no scan is issued at all. The bounds are therefore
-//! self-healing — never an exact count, by design (a count would force a
-//! read-before-write on every mutation). [`MapHandle::clear`] removes the
-//! bounds with the entries, so the absent-bounds ⇔ empty-map reading survives
-//! a cleared map.
-//!
-//! # Invariant: on a TTL'd map the bounds outlive every entry
-//!
-//! A bound cell carries the collection's TTL, but an entry `set` within the
-//! existing bounds would refresh only the entry's TTL — so, left alone, the
-//! bounds could expire while live entries remain. To prevent that skew, on a
-//! collection with a TTL every `set` rewrites *both* bound cells (with the
-//! ratcheted extremes), refreshing their TTL. So a bound cell always lives at
-//! least as long as the newest entry, and **absent bounds ⇔ no live entries**.
-//! A non-TTL'd map keeps the extend-only write — nothing expires, so the
-//! invariant holds vacuously.
-//!
-//! The keyset cell rides the identical rule: on a TTL'd map every `set`
-//! rewrites the keyset too — **including** the already-tracked and `Overflowed`
-//! no-write fast paths, which must not suppress the refresh — so the keyset
-//! outlives every entry. An absent keyset then means pre-keyset-or-expired, and
-//! iteration safely falls back to the bounds scan. A non-TTL'd map writes the
-//! keyset only on a content change.
+//! The keyset cell carries the collection's TTL, but an entry `set` of an
+//! already-tracked key would refresh only the entry's TTL — so, left alone, the
+//! keyset could expire while live entries remain. To prevent that skew, on a
+//! collection with a TTL every `set` rewrites the keyset — **including** the
+//! already-tracked and `Overflowed` no-write fast paths, which must not
+//! suppress the refresh — so the keyset always lives at least as long as the
+//! newest entry. A non-TTL'd map writes the keyset only on a content change;
+//! nothing expires, so the invariant holds vacuously.
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
@@ -111,7 +95,7 @@ use thiserror::Error;
 use tokio::task::coop::cooperative;
 use tracing::{Instrument, info_span, instrument, warn};
 
-/// The `Meta` section, holding the two bound cells and the keyset cell.
+/// The `Meta` section, holding the keyset cell.
 const META_SECTION: Section = Section::new(MapNs::Meta as i8);
 
 /// The `Entries` section, holding one cell per key.
@@ -150,7 +134,7 @@ const KEYSET_MAX_ENTRIES: usize = KEYSET_BYTE_CEILING / 4;
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MapNs {
-    /// Bookkeeping: the min/max bound cells.
+    /// Bookkeeping: the keyset cell.
     Meta = 0,
 
     /// Data: one cell per key.
@@ -175,77 +159,13 @@ impl TryFrom<i8> for MapNs {
     }
 }
 
-/// The two bound cells' logical address within the `Meta` section: the loose
-/// lower and upper bounds of the live key range. Its encoding (`Min`→`[0]`,
-/// `Max`→`[1]`) is a frozen durable contract, pinned by `map_layout_is_frozen`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum MapBound {
-    /// The loose lower bound of the live key range.
-    Min = 0,
-
-    /// The loose upper bound of the live key range.
-    Max = 1,
-}
-
-/// Address codec for the two [`MapBound`] cells. Module-fixed by the Map kind
-/// (the section byte already pins the meta cells), so its
-/// [`FORMAT_ID`](Codec::FORMAT_ID) never rides a collection's durable identity.
-/// The meta cells are only ever read at their two fixed addresses, so `decode`
-/// is a defensive round-trip, never a scan step.
-#[derive(Clone, Copy, Debug, Default)]
-struct MapBoundKey;
-
-impl OrderedKeyCodec for MapBoundKey {
-    type Key = MapBound;
-
-    fn encode(key: &MapBound) -> Coordinate {
-        // `from_static` — the two bound coordinates are compile-time constants,
-        // so the meta-op address builder allocates nothing (behavior pinned by
-        // `map_layout_is_frozen`).
-        Coordinate::from_bytes(Bytes::from_static(match key {
-            MapBound::Min => &[0],
-            MapBound::Max => &[1],
-        }))
-    }
-
-    fn decode(bytes: &[u8]) -> Result<MapBound, KeyCodecError> {
-        match bytes {
-            [0] => Ok(MapBound::Min),
-            [1] => Ok(MapBound::Max),
-            &[actual] => Err(KeyCodecError::BadDiscriminant { actual }),
-            _ => Err(KeyCodecError::BadLength {
-                expected: 1,
-                actual: bytes.len(),
-            }),
-        }
-    }
-}
-
-/// The payload half of `MapBoundKey` — delegates to `encode`/`decode`, so the
-/// byte-identity law on [`OrderedKeyCodec`] holds by construction. Only the
-/// *entries* key codec rides a bound cell's payload; this impl exists to
-/// satisfy the supertrait, not to store bounds by.
-impl Codec for MapBoundKey {
-    type Error = KeyCodecError;
-    type Payload = MapBound;
-
-    const FORMAT_ID: &'static str = "map-bound.v1";
-
-    fn deserialize(&mut self, buf: &mut [u8]) -> Result<MapBound, KeyCodecError> {
-        Self::decode(buf)
-    }
-
-    fn serialize(&mut self, payload: MapBound, buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
-        buf.extend_from_slice(Self::encode(&payload).as_bytes());
-        Ok(())
-    }
-}
-
 /// The keyset cell's logical address within the `Meta` section: a single fixed
-/// coordinate `[2]`, beside `MapBound::Min`=`[0]` and `MapBound::Max`=`[1]`.
-/// Its encoding is a frozen durable contract, pinned by `map_layout_is_frozen`.
-/// Module-fixed by the Map kind, so its [`FORMAT_ID`](Codec::FORMAT_ID) never
-/// rides a collection's durable identity.
+/// coordinate `[2]`. Coordinates `[0]`/`[1]` are a deliberately retired gap
+/// (they once held two min/max bound cells; re-using a retired coordinate would
+/// let a stale artifact alias an old frame as a keyset). Its encoding is a
+/// frozen durable contract, pinned by `map_layout_is_frozen`. Module-fixed by
+/// the Map kind, so its [`FORMAT_ID`](Codec::FORMAT_ID) never rides a
+/// collection's durable identity.
 #[derive(Clone, Copy, Debug, Default)]
 struct MapKeysetKey;
 
@@ -288,17 +208,36 @@ impl Codec for MapKeysetKey {
     }
 }
 
-/// A map's decoded keyset cell — the membership tracked since the last `clear`.
+/// A map's decoded keyset cell — its current tracked membership.
 ///
 /// `Tracked` lists at most the registered `keyset_limit` coordinates,
 /// **strictly ascending bytewise** (sorted and unique), bounded by the limit
 /// and the [`KEYSET_BYTE_CEILING`] at write time. `Overflowed` is the one-way
 /// sentinel: once a `set` past the bound writes it, iteration falls back to the
-/// durable bounds scan until `clear` (or TTL death of the whole map). See the
-/// module's loose-superset invariant.
+/// full-section (`Unbounded`-edged) scan until `clear` (or TTL death of the
+/// whole map). See the module's current-membership invariant.
+///
+/// # Invariant: `KeysetPresence`
+///
+/// A **live entry cell implies a present keyset cell** — equivalently, an
+/// absent keyset implies no live entries, so `stream` may return empty with
+/// zero entry reads (the [`MapHandle::stream`] `Absent → Empty` arm). Three
+/// rules hold it:
+///
+/// * every `set` co-stages a keyset write in the **same atomic same-partition
+///   batch** as its entry write — at the settle boundary and at mid-handler
+///   [`commit`](MapHandle::commit) alike;
+/// * [`clear`](MapHandle::clear) erases both the entry section and the keyset;
+/// * on a TTL'd map every `set` refreshes the keyset (above), so it expires no
+///   earlier than the newest entry.
+///
+/// The converse is **not** an invariant: `remove` may leave `Tracked([])`, TTL
+/// expiry may over-report, and `Overflowed` may outlive its last entry — a
+/// present keyset over an empty map is legal and merely does bounded extra work
+/// (one absent read per stale coordinate, or one empty-yield scan).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Keyset {
-    /// The distinct-key coordinates tracked since `clear`, strictly ascending.
+    /// The distinct-key coordinates currently tracked, strictly ascending.
     Tracked(Vec<Coordinate>),
 
     /// The map overflowed its keyset bound; membership is no longer tracked.
@@ -365,13 +304,17 @@ enum PriorKeyset {
 }
 
 /// The arm [`MapHandle::stream`] takes: materialize the tracked keys' entries
-/// by point gets (in `dir` order), or fall back to the bounds-anchored scan.
+/// by point gets (in `dir` order), degrade to the full-section scan, or (an
+/// absent keyset ⇒ [`KeysetPresence`](Keyset) ⇒ no live entries) yield nothing.
 enum StreamPlan<K> {
     /// Point-get each listed key (already reversed for a backward stream).
     Tracked(Vec<K>),
 
-    /// Degrade to the bounds scan.
+    /// Degrade to the full-section (`Unbounded`-edged) scan.
     Scan,
+
+    /// Absent keyset — no live entries, so no store touch at all.
+    Empty,
 }
 
 /// What [`MapHandle::stream`] yields once its under-gate init has finished and
@@ -382,10 +325,11 @@ enum StreamStart<K, V> {
     /// The bounded arm's materialized entries, yielded straight from memory.
     Buffered(Vec<(K, V)>),
 
-    /// The scan arm's live bounds — streamed per-item after the permit drops.
-    Scan { min: K, max: K },
+    /// The degrade arm — the full-section scan, streamed per-item after the
+    /// permit drops.
+    Scan,
 
-    /// Nothing to yield (an overflowed/absent keyset with an absent bound).
+    /// Nothing to yield (an absent keyset ⇒ no live entries).
     Empty,
 }
 
@@ -418,23 +362,20 @@ where
     fn handle<S: CellSession>(scope: CellScope<S>) -> MapHandle<S, KC, V> {
         MapHandle {
             entries: scope.typed(ENTRY_SECTION),
-            meta: scope.typed(META_SECTION),
             keyset: scope.typed(META_SECTION),
         }
     }
 }
 
 /// Typed, owned handle over a codec-backed ordered map — a thin composition
-/// over three typed `CellView`s: `entries` (the per-key data cells, typed
-/// [`Keyed`]`<KC, V>`), `meta` (the min/max bound cells, each storing an
-/// extreme entry's key), and `keyset` (the membership cell — see the module's
-/// loose-superset invariant). Every operation guards on session termination
+/// over two typed `CellView`s: `entries` (the per-key data cells, typed
+/// [`Keyed`]`<KC, V>`) and `keyset` (the membership cell — see the module's
+/// current-membership invariant). Every operation guards on session termination
 /// through the views. Cheap `Clone`.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct MapHandle<S, KC, V> {
     entries: CellView<S, Keyed<KC, V>>,
-    meta: CellView<S, Keyed<MapBoundKey, KC>>,
     keyset: CellView<S, Keyed<MapKeysetKey, MapKeysetCodec>>,
 }
 
@@ -477,12 +418,14 @@ where
     /// A `Tracked` keyset within its bound is the fast arm: iteration
     /// **materializes** the listed keys' entries by bounded concurrent point
     /// gets under one gate hold (the split-stream bounded contract), skipping
-    /// any that read absent (the loose-superset skip), so a warm small map
+    /// any that read absent (the current-membership skip), so a warm small map
     /// streams entirely from cache with zero durable scans. An `Overflowed`,
-    /// absent, malformed, oversized, or otherwise undecodable keyset degrades
-    /// to the bounds-anchored scan: bounded to `[min, max]`, so a stale bound
-    /// never drops a live entry, only ever costs an extra scanned-but-cleared
-    /// cell; both bounds absent ⇒ empty map ⇒ no scan.
+    /// malformed, oversized, or otherwise undecodable keyset degrades to a
+    /// **full-section** (`Unbounded`-edged) scan, which yields every live entry
+    /// (the store hides cleared cells) at the accepted degraded cost of walking
+    /// the whole section. An **absent** keyset means no live entries (the
+    /// current-membership invariant), so the stream yields nothing with
+    /// **zero** store touches.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
         // so each inner await is instrumented with a clone instead; the
@@ -544,16 +487,8 @@ where
                         // complex `Result`.
                         Ok::<_, MapStateError<CellCodecError<V>>>(StreamStart::Buffered(buffer))
                     }
-                    StreamPlan::Scan => {
-                        let (min, max) = tokio::try_join!(
-                            self.read_bound(&permit, MapBound::Min).instrument(span.clone()),
-                            self.read_bound(&permit, MapBound::Max).instrument(span.clone())
-                        )?;
-                        Ok(match (min, max) {
-                            (Some(min), Some(max)) => StreamStart::Scan { min, max },
-                            _ => StreamStart::Empty,
-                        })
-                    }
+                    StreamPlan::Scan => Ok(StreamStart::Scan),
+                    StreamPlan::Empty => Ok(StreamStart::Empty),
                 }
             }
             .await;
@@ -565,12 +500,16 @@ where
                     }
                 }
                 StreamStart::Empty => {}
-                StreamStart::Scan { min, max } => {
-                    let (start, end) = match dir {
-                        Direction::Forward => (ScanEdge::Included(&min), ScanEdge::Included(&max)),
-                        Direction::Backward => (ScanEdge::Included(&max), ScanEdge::Included(&min)),
-                    };
-                    let inner = self.entries.scan(start, dir, end, None);
+                StreamStart::Scan => {
+                    // The degrade fallback walks the whole entry section: no
+                    // keyset enumeration remains to fence it, so both edges are
+                    // `Unbounded`. `dir` still orders the walk.
+                    let inner = self.entries.scan(
+                        ScanEdge::<&KC::Key>::Unbounded,
+                        dir,
+                        ScanEdge::<&KC::Key>::Unbounded,
+                        None,
+                    );
                     futures::pin_mut!(inner);
                     while let Some(item) = inner.next().instrument(span.clone()).await {
                         yield item?;
@@ -580,32 +519,37 @@ where
         }
     }
 
-    /// Reads the keyset cell and decides the stream's arm: a `Tracked` keyset
+    /// Reads the keyset cell and decides the stream's arm: an **absent** keyset
+    /// means no live entries ([`KeysetPresence`](Keyset)), so the stream is
+    /// [`Empty`](StreamPlan::Empty) with no store touch; a `Tracked` keyset
     /// within the registered limit and byte ceiling whose every coordinate
     /// decodes to a canonical key becomes the point-get materialization (keys
-    /// in `dir` order); anything else — `Overflowed`, absent, malformed,
-    /// oversized, or a coordinate that fails to decode or re-encode — degrades
-    /// to the bounds scan (with a warning on the degradations that are not
-    /// simply absent/overflowed). A keyset-read access error propagates; it
-    /// never silently degrades.
+    /// in `dir` order); anything else — `Overflowed`, malformed, oversized, or
+    /// a coordinate that fails to decode or re-encode — degrades to the
+    /// full-section scan (with a warning on the degradations that are not
+    /// simply overflowed). A keyset-read access error propagates; it never
+    /// silently degrades.
     async fn stream_plan(
         &self,
         permit: &OpPermit<'_>,
         dir: Direction,
     ) -> Result<StreamPlan<KC::Key>, MapStateError<CellCodecError<V>>> {
-        // Absent/Overflowed fall to the scan with no warning; Malformed already
-        // warned in `read_keyset_state`.
-        let PriorKeyset::Decoded(Keyset::Tracked(coordinates)) =
-            self.read_keyset_state(permit).await?
-        else {
-            return Ok(StreamPlan::Scan);
+        let coordinates = match self.read_keyset_state(permit).await? {
+            // Absent ⇒ no live entries: yield nothing, issue no scan.
+            PriorKeyset::Absent => return Ok(StreamPlan::Empty),
+            // Overflowed falls to the scan with no warning; Malformed already
+            // warned in `read_keyset_state`.
+            PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
+                return Ok(StreamPlan::Scan);
+            }
+            PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
         };
         let limit = self.keyset.keyset_limit();
         if is_oversized(&coordinates, limit) {
             warn!(
                 collection = self.entries.name().as_str(),
-                "map keyset frame is oversized for the registered limit; degrading to the bounds \
-                 scan until the next set heals it"
+                "map keyset frame is oversized for the registered limit; degrading to the \
+                 full-section scan until the next set heals it"
             );
             return Ok(StreamPlan::Scan);
         }
@@ -613,7 +557,7 @@ where
             warn!(
                 collection = self.entries.name().as_str(),
                 "map keyset holds a coordinate that is not canonical for its key codec; degrading \
-                 to the bounds scan until the next set heals it"
+                 to the full-section scan until the next set heals it"
             );
             return Ok(StreamPlan::Scan);
         };
@@ -625,21 +569,9 @@ where
         Ok(StreamPlan::Tracked(keys))
     }
 
-    /// Reads a bound cell's stored extreme key (`None` when absent). The bound
-    /// stores the key through `KC` itself (byte-identity law), so it reads
-    /// back as a logical `KC::Key`.
-    async fn read_bound(
-        &self,
-        permit: &OpPermit<'_>,
-        bound: MapBound,
-    ) -> Result<Option<KC::Key>, MapStateError<CellCodecError<V>>> {
-        self.meta.get(permit, &bound).await.map_err(meta_err)
-    }
-
     /// Inserts or overwrites `key`'s value (a blind last-writer-wins write —
-    /// the entry is never read first), ratcheting the min/max bounds outward
-    /// and folding `key` into the keyset (see the module's loose-superset
-    /// invariant).
+    /// the entry is never read first) and folds `key` into the keyset (see the
+    /// module's current-membership invariant).
     ///
     /// # Errors
     ///
@@ -655,35 +587,28 @@ where
         &self,
         key: KC::Key,
         value: WriteOf<'_, V>,
-    ) -> Result<(), MapStateError<CellCodecError<V>>>
-    where
-        KC::Key: Clone,
-    {
+    ) -> Result<(), MapStateError<CellCodecError<V>>> {
         let permit = self
             .entries
             .mutate_permit()
             .await
             .map_err(CellStateError::Access)?;
-        // The three meta reads are independent point gets; read them
-        // concurrently *before* any write (own writes are visible to own
-        // reads, so reading bounds after the ratchet would misclassify every
-        // fresh map's first set). `&permit` (a `&MutatePermit`) deref-coerces
-        // to the `&OpPermit` the read helpers demand.
+        // Read the keyset *before* the entry write: own writes are visible to
+        // own reads, and the transition depends on the pre-set frame. `&permit`
+        // (a `&MutatePermit`) deref-coerces to the `&OpPermit` the read helper
+        // demands.
         let coordinate = KC::encode(&key);
-        let (min, max, prior) = tokio::try_join!(
-            self.read_bound(&permit, MapBound::Min),
-            self.read_bound(&permit, MapBound::Max),
-            self.read_keyset_state(&permit),
-        )?;
-        let bounds_present = min.is_some() || max.is_some();
+        let prior = self.read_keyset_state(&permit).await?;
         self.entries.set(&permit, &key, value).await?;
-        self.ratchet_bounds(&permit, key, min, max).await?;
-        self.update_keyset(&permit, coordinate, bounds_present, prior)
-            .await
+        self.update_keyset(&permit, coordinate, prior).await
     }
 
-    /// Removes `key` (a blind clear; the bounds are left untouched, so they
-    /// remain a loose superset).
+    /// Removes `key` and subtracts it from the keyset (see the module's
+    /// current-membership invariant): buffers the entry clear, then rewrites a
+    /// `Tracked` frame without the coordinate — which heals an oversized frame
+    /// back toward the bound. An `Overflowed` or absent keyset is unchanged
+    /// (membership is unknown / already empty); a malformed frame heals to
+    /// `Overflowed`, exactly as `set` does.
     ///
     /// # Errors
     ///
@@ -700,15 +625,18 @@ where
             .mutate_permit()
             .await
             .map_err(CellStateError::Access)?;
-        Ok(self.entries.clear(&permit, key).await?)
+        let coordinate = KC::encode(key);
+        let prior = self.read_keyset_state(&permit).await?;
+        self.entries.clear(&permit, key).await?;
+        self.subtract_keyset(&permit, &coordinate, prior).await
     }
 
-    /// Removes every entry, both bounds, and the keyset: within the event the
-    /// map reads empty from this program point (later `set`s repopulate it,
-    /// starting a fresh `Tracked` keyset); committed, exactly the repopulated
-    /// entries survive; aborted, the map is untouched. O(handler writes) — the
-    /// entry section rides the durable section clear; only the
-    /// fixed-cardinality bookkeeping cells take the per-cell path.
+    /// Removes every entry and the keyset: within the event the map reads empty
+    /// from this program point (later `set`s repopulate it, starting a fresh
+    /// `Tracked` keyset); committed, exactly the repopulated entries survive;
+    /// aborted, the map is untouched. O(handler writes) — the entry section
+    /// rides the durable section clear; only the fixed-address keyset cell
+    /// takes the per-cell path.
     ///
     /// # Errors
     ///
@@ -726,21 +654,13 @@ where
             .await
             .map_err(CellStateError::Access)?;
         self.entries.clear_all(&permit).await?;
-        self.meta
-            .clear(&permit, &MapBound::Min)
-            .await
-            .map_err(meta_err)?;
-        self.meta
-            .clear(&permit, &MapBound::Max)
-            .await
-            .map_err(meta_err)?;
         self.keyset.clear(&permit, &()).await.map_err(keyset_err)?;
         Ok(())
     }
 
-    /// Durably commits this map's buffered ops mid-handler — entries and
-    /// bound ratchets together, in one batch. At-least-once; see
-    /// [`CellSession::commit`] for the contract.
+    /// Durably commits this map's buffered ops mid-handler — entries and keyset
+    /// together, in one batch. At-least-once; see [`CellSession::commit`] for
+    /// the contract.
     ///
     /// # Errors
     ///
@@ -760,10 +680,10 @@ where
         Ok(self.entries.commit(&permit).await?)
     }
 
-    /// Discards this map's buffered uncommitted ops — entries and bound
-    /// ratchets together — reverting reads to the last
-    /// [`commit`](Self::commit), or the pre-event committed state if none.
-    /// Infallible; see [`CellSession::rollback`] for the contract.
+    /// Discards this map's buffered uncommitted ops — entries and keyset
+    /// together — reverting reads to the last [`commit`](Self::commit), or the
+    /// pre-event committed state if none. Infallible; see
+    /// [`CellSession::rollback`] for the contract.
     #[instrument(
         name = "map.rollback",
         skip_all,
@@ -771,72 +691,6 @@ where
     )]
     pub async fn rollback(&self) -> StoreOutcome {
         self.entries.rollback().await
-    }
-
-    /// Ratchets the min/max bounds outward to `key`, given the bounds already
-    /// read by the caller (`set` reads all three meta cells concurrently up
-    /// front), then writes the ratcheted extremes.
-    ///
-    /// On a **TTL'd** collection both bound cells are rewritten every `set`,
-    /// even when neither extreme moves: that unconditional rewrite refreshes
-    /// the bounds' TTL so they outlive every entry (the module's
-    /// TTL-refresh invariant). On a **non-TTL'd** collection only a bound
-    /// that `key` extends by [`Ord`] is written — nothing expires, so a
-    /// rewrite would be pure churn. Either way the conditional sets stay
-    /// sequential (cheap in-memory buffering, nothing to overlap): `key` is
-    /// cloned into the lower write and moved into the upper.
-    async fn ratchet_bounds(
-        &self,
-        permit: &MutatePermit<'_>,
-        key: KC::Key,
-        min: Option<KC::Key>,
-        max: Option<KC::Key>,
-    ) -> Result<(), MapStateError<CellCodecError<V>>>
-    where
-        KC::Key: Clone,
-    {
-        if self.meta.has_ttl() {
-            // Compute both ratcheted extremes before the moves: `new_min` may
-            // clone `key`, `new_max` consumes it.
-            let new_min = min.filter(|min| *min <= key).unwrap_or_else(|| key.clone());
-            let new_max = max.filter(|max| *max >= key).unwrap_or(key);
-            self.meta
-                .set(permit, &MapBound::Min, new_min)
-                .await
-                .map_err(meta_err)?;
-            self.meta
-                .set(permit, &MapBound::Max, new_max)
-                .await
-                .map_err(meta_err)?;
-            return Ok(());
-        }
-        let extend_min = min.is_none_or(|min| key < min);
-        let extend_max = max.is_none_or(|max| key > max);
-        match (extend_min, extend_max) {
-            (true, true) => {
-                // Both bounds extend: clone once for Min, move into Max.
-                self.meta
-                    .set(permit, &MapBound::Min, key.clone())
-                    .await
-                    .map_err(meta_err)?;
-                self.meta
-                    .set(permit, &MapBound::Max, key)
-                    .await
-                    .map_err(meta_err)?;
-            }
-            (true, false) => self
-                .meta
-                .set(permit, &MapBound::Min, key)
-                .await
-                .map_err(meta_err)?,
-            (false, true) => self
-                .meta
-                .set(permit, &MapBound::Max, key)
-                .await
-                .map_err(meta_err)?,
-            (false, false) => {}
-        }
-        Ok(())
     }
 
     /// Reads the keyset cell, folding a malformed frame into
@@ -853,8 +707,8 @@ where
             Err(CellStateError::Codec(_)) => {
                 warn!(
                     collection = self.entries.name().as_str(),
-                    "map keyset frame did not decode; degrading to the bounds scan until the next \
-                     set heals it"
+                    "map keyset frame did not decode; degrading to the full-section scan until \
+                     the next set heals it"
                 );
                 Ok(PriorKeyset::Malformed)
             }
@@ -862,9 +716,9 @@ where
         }
     }
 
-    /// Folds `coordinate` into the keyset given the pre-read prior state and
-    /// whether the bounds are present (the transition table for the module's
-    /// loose-superset invariant).
+    /// Folds `coordinate` into the keyset given the pre-read prior state (the
+    /// `set`-side transition table for the module's current-membership
+    /// invariant).
     ///
     /// The size check runs *before* the already-tracked fast path, so an
     /// oversized stored `Tracked` collapses to `Overflowed` even when
@@ -875,7 +729,6 @@ where
         &self,
         permit: &MutatePermit<'_>,
         coordinate: Coordinate,
-        bounds_present: bool,
         prior: PriorKeyset,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
         let limit = self.keyset.keyset_limit();
@@ -883,15 +736,14 @@ where
         match prior {
             // Malformed → heal to Overflowed (already warned at read).
             PriorKeyset::Malformed => self.write_keyset(permit, Keyset::Overflowed).await,
-            // Absent + bounds present → membership unknown, conservatively
-            // Overflowed. Absent + bounds absent → the empty map: a fresh
-            // singleton, itself subject to the limit/ceiling.
+            // Absent → the empty map: a fresh singleton, itself subject to the
+            // limit/ceiling.
             PriorKeyset::Absent => {
-                if bounds_present || !fits_fresh(&coordinate, limit) {
-                    self.write_keyset(permit, Keyset::Overflowed).await
-                } else {
+                if fits_fresh(&coordinate, limit) {
                     self.write_keyset(permit, Keyset::Tracked(vec![coordinate]))
                         .await
+                } else {
+                    self.write_keyset(permit, Keyset::Overflowed).await
                 }
             }
             // Overflowed is one-way: no write, except the TTL refresh.
@@ -906,6 +758,37 @@ where
                 self.update_tracked(permit, coordinate, keys, limit, ttl)
                     .await
             }
+        }
+    }
+
+    /// Subtracts `coordinate` from the keyset given the pre-read prior state
+    /// (the `remove`-side transition table for the module's current-membership
+    /// invariant). A `Tracked` frame containing the coordinate is rewritten
+    /// without it — unconditionally, so a `remove` that drops an oversized
+    /// frame back under the bound heals it (removal heals); the rewrite
+    /// only shrinks the frame, so the byte ceiling can never be exceeded by
+    /// it. A `Tracked` frame that does not contain the coordinate, an
+    /// `Overflowed` sentinel (membership unknown; one-way until `clear`),
+    /// and an absent keyset are all left untouched; a malformed frame heals
+    /// to `Overflowed`, exactly as `set` does.
+    async fn subtract_keyset(
+        &self,
+        permit: &MutatePermit<'_>,
+        coordinate: &Coordinate,
+        prior: PriorKeyset,
+    ) -> Result<(), MapStateError<CellCodecError<V>>> {
+        match prior {
+            PriorKeyset::Malformed => self.write_keyset(permit, Keyset::Overflowed).await,
+            PriorKeyset::Decoded(Keyset::Tracked(mut keys)) => {
+                match keys.binary_search(coordinate) {
+                    Ok(position) => {
+                        keys.remove(position);
+                        self.write_keyset(permit, Keyset::Tracked(keys)).await
+                    }
+                    Err(_) => Ok(()),
+                }
+            }
+            PriorKeyset::Absent | PriorKeyset::Decoded(Keyset::Overflowed) => Ok(()),
         }
     }
 
@@ -978,20 +861,6 @@ where
     V: CellType<Key = UnitKey>,
 {
     MapDescriptor::new(name)
-}
-
-/// Re-homes a meta-cell access error under the map's value-codec error
-/// parameter. The `meta` view's payload codec is the entries key codec `KC`,
-/// so a meta codec failure means a stored bound's key bytes no longer decode —
-/// a key-decode failure, folded under [`CellStateError::Key`].
-fn meta_err<E>(err: CellStateError<KeyCodecError>) -> MapStateError<E>
-where
-    E: Error + Send + Sync + 'static,
-{
-    match err {
-        CellStateError::Access(e) => CellStateError::Access(e).into(),
-        CellStateError::Codec(e) | CellStateError::Key(e) => CellStateError::Key(e).into(),
-    }
 }
 
 /// Re-homes a keyset-cell access error under the map's value-codec error
@@ -1139,13 +1008,13 @@ struct UnknownMapSection(i8);
 
 /// Error returned by [`MapHandle`] operations.
 ///
-/// The entry and bound cells go through the `CellView` interface, so their
-/// failures — access, value-codec, or a stored key that no longer decodes — are
-/// already a [`CellStateError`]. A corrupt keyset *frame* is the keyset codec's
-/// own error, kept separate because it never surfaces from a well-behaved
-/// handle: a malformed frame degrades reads to the scan (never errors upward)
-/// and the encoder's guards are bounded away by the registration cap. The arm
-/// exists to keep the keyset view's error mapping total. (Mirrors
+/// The entry cells go through the `CellView` interface, so their failures —
+/// access, value-codec, or a stored key that no longer decodes — are already a
+/// [`CellStateError`]. A corrupt keyset *frame* is the keyset codec's own
+/// error, kept separate because it never surfaces from a well-behaved handle: a
+/// malformed frame degrades reads to the scan (never errors upward) and the
+/// encoder's guards are bounded away by the registration cap. The arm exists to
+/// keep the keyset view's error mapping total. (Mirrors
 /// [`DequeStateError::MetaFrame`](super::deque::DequeStateError::MetaFrame).)
 #[derive(Debug, Error)]
 pub enum MapStateError<E>
@@ -1221,17 +1090,6 @@ pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
     }
 }
 
-/// Test-only: the `(Min, Max)` bound cells, so a test can read the stored
-/// bounds directly and assert the loose-superset containment invariant.
-#[cfg(test)]
-pub(crate) fn bound_cells() -> (CellKey, CellKey) {
-    let cell = |bound: MapBound| CellKey {
-        section: META_SECTION,
-        coordinate: MapBoundKey::encode(&bound),
-    };
-    (cell(MapBound::Min), cell(MapBound::Max))
-}
-
 /// Test-only: the keyset cell at its frozen address (`Meta` section,
 /// coordinate `[2]`), so a test can read the stored keyset frame directly.
 #[cfg(test)]
@@ -1243,12 +1101,14 @@ pub(crate) fn keyset_cell() -> CellKey {
 }
 
 impl<KC, V> Descriptor<MapKind<KC, V>> {
-    /// Sets the Map keyset bound: the number of distinct keys **since `clear`**
-    /// (not the live size) this map tracks before overflowing to the durable
-    /// bounds scan. Default `128`, validated `<= 4096` at registration; `0`
-    /// disables tracking (every map overflows on its first `set`). A
-    /// rotating-identifier map exhausts the bound permanently, so it should not
-    /// expect cached iteration.
+    /// Sets the Map keyset bound: the number of **live** distinct keys this map
+    /// tracks before overflowing to the full-section scan. Default `128`,
+    /// validated `<= 4096` at registration; `0` disables tracking (every map
+    /// overflows on its first `set`). Because `remove` subtracts, a rotating
+    /// map whose live size stays under the bound keeps cached iteration; a
+    /// map that ever exceeds the bound in one incarnation overflows
+    /// permanently (until `clear` or TTL death), so a monotonically growing
+    /// key universe should not expect cached iteration.
     ///
     /// Available on Map registrations only — a keyset bound on a Value or Deque
     /// is uncompilable, since this inherent method exists only at this type.

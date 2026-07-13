@@ -1,6 +1,6 @@
 //! Map section-freeze and frozen-byte goldens.
 //!
-//! The behavioral invariants (key ordering, the loose-superset bounds, clear,
+//! The behavioral invariants (key ordering, current-membership keyset, clear,
 //! crash atomicity) are proven by the memory-backed `run_map_trace` property
 //! in [`crate::state::tests`]. These pin the durable wire contracts: the
 //! section discriminants and the `Meta` cell addresses.
@@ -26,9 +26,11 @@ fn prop_map_section_round_trip() {
     QuickCheck::new().quickcheck(prop as fn(i8) -> TestResult);
 }
 
-/// The frozen discriminants and the two distinct `Meta` bound coordinates (a
-/// durable contract — the sections lower to `0`/`1` and the bounds encode to
-/// `[0]`/`[1]`).
+/// The frozen discriminants and the single `Meta` cell address (a durable
+/// contract — the sections lower to `0`/`1` and the keyset encodes to `[2]`).
+/// Coordinates `[0]`/`[1]` are deliberately retired (they once held two min/max
+/// bound cells; the keyset-only meta layout leaves the gap so a stale artifact
+/// cannot alias an old frame).
 #[test]
 fn map_layout_is_frozen() {
     assert_eq!(MapNs::Meta as i8, 0);
@@ -36,16 +38,8 @@ fn map_layout_is_frozen() {
     assert_eq!(i8::from(META_SECTION), 0);
     assert_eq!(i8::from(ENTRY_SECTION), 1);
 
-    let min = MapBoundKey::encode(&MapBound::Min);
-    let max = MapBoundKey::encode(&MapBound::Max);
     let keyset = MapKeysetKey::encode(&());
-    assert_eq!(min.as_bytes(), &[0]);
-    assert_eq!(max.as_bytes(), &[1]);
     assert_eq!(keyset.as_bytes(), &[2]);
-    // The three Meta cells must address distinct cells.
-    assert_ne!(min, max);
-    assert_ne!(min, keyset);
-    assert_ne!(max, keyset);
 }
 
 /// A short coordinate over a tiny null-prone alphabet, so the keyset frame's

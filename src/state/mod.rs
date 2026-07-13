@@ -52,11 +52,17 @@
 //! collection-owned `Meta` bookkeeping (as the deque window already is), never
 //! as a cell-layer feature.
 //!
-//! **TTL mass-expiry is transient and self-healing.** When a TTL'd section's
-//! cells expire, the first scans over it hit a one-time tombstone wave; because
-//! every scan carries concrete [`ScanEdge`] bounds pinned to the collection's
-//! live extent, the range collapses as those bounds themselves expire, so the
-//! wave self-heals and never needs operator action.
+//! **TTL mass-expiry is transient and self-healing.** On a TTL'd
+//! [`descriptor::map`] the keyset cell rides the same TTL-refresh rule as every
+//! entry (each `set` rewrites it), so it outlives the newest entry. When the
+//! map's cells expire the keyset expires with them, and the next `stream` reads
+//! it absent and yields nothing with **zero scans** — no tombstone wave at all
+//! on the fast path. A degraded (`Overflowed`) map instead falls back to a
+//! full-section ([`Unbounded`](ScanEdge::Unbounded)-edged) scan that *can* meet
+//! a one-time tombstone wave, which self-heals as those rows compact — the
+//! accepted degraded cost. A [`descriptor::deque`] scan keeps concrete
+//! [`ScanEdge`] bounds pinned to its live window, so its range collapses as
+//! those bounds expire.
 //!
 //! **Cross-assignment clock skew is a standard Cassandra assumption, not a new
 //! hazard.** Last-write-wins ordering *across* assignments — a new assignee's

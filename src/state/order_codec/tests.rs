@@ -112,9 +112,8 @@ fn deque_index_anchors_are_frozen() {
 }
 
 /// Frozen-bytes goldens for the other Map key codecs — durable wire contracts
-/// for the entry coordinate (and the bytes a Map
-/// `MapBound::Min`/`MapBound::Max` stores). `Utf8KeyCodec` is the raw UTF-8
-/// bytes; `U64KeyCodec` is plain big-endian (unsigned, so no sign flip — `0` is
+/// for the entry coordinate. `Utf8KeyCodec` is the raw UTF-8 bytes;
+/// `U64KeyCodec` is plain big-endian (unsigned, so no sign flip — `0` is
 /// all-zero, unlike the signed `i64` codec).
 #[test]
 fn map_key_coordinate_bytes_are_frozen() {

@@ -1734,16 +1734,34 @@ async fn seed_section_clear<S: CellStore>(
     Ok(())
 }
 
-/// A scan request over one sampled section with random anchor, direction,
-/// bound exclusivity, optional end and limit, and an optional early-stop
+/// One [`ScanReq`] edge kind: an inclusive/exclusive anchor, or `Unbounded`
+/// (open on that side). Sampled uniformly, so the scan property covers the full
+/// Direction × 3-start × 3-end space — exercising the exclusive-anchor
+/// statements, the two section-only `_all` statements, and the `past_end` skip.
+#[derive(Clone, Copy, Debug)]
+enum EdgeKind {
+    Included,
+    Excluded,
+    Unbounded,
+}
+
+impl Arbitrary for EdgeKind {
+    fn arbitrary(g: &mut Gen) -> Self {
+        *g.choose(&[Self::Included, Self::Excluded, Self::Unbounded])
+            .unwrap_or(&Self::Included)
+    }
+}
+
+/// A scan request over one sampled section with random anchor, direction, per-
+/// edge kind ([`EdgeKind`]), optional end and limit, and an optional early-stop
 /// prefix length.
 #[derive(Clone, Copy, Debug)]
 struct ScanReq {
     sect: u8,
     start: u8,
     forward: bool,
-    start_excl: bool,
-    end_excl: bool,
+    start_kind: EdgeKind,
+    end_kind: EdgeKind,
     end: u8,
     limit: Option<u8>,
     partial: Option<u8>,
@@ -1757,10 +1775,8 @@ impl Arbitrary for ScanReq {
             sect: section_idx(u8::arbitrary(g)),
             start: u8::arbitrary(g) % (CELLS + 1),
             forward: bool::arbitrary(g),
-            // Exclusive bounds exercise the exclusive-anchor statement
-            // variants and open `(p, q)` ranges.
-            start_excl: bool::arbitrary(g),
-            end_excl: bool::arbitrary(g),
+            start_kind: EdgeKind::arbitrary(g),
+            end_kind: EdgeKind::arbitrary(g),
             end: u8::arbitrary(g) % (CELLS + 1),
             // Includes 0 and values > the cell count.
             limit: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 4)),
@@ -1811,34 +1827,34 @@ fn scan_oracle(model: &CellModel, req: ScanReq) -> Vec<(u8, Bytes)> {
 /// endpoint.
 fn in_scan_range(req: ScanReq, c: u8) -> bool {
     // `start` is the low side forward, the high side backward; `end` inverts.
-    let on_start_side = match (req.forward, req.start_excl) {
-        (true, false) => c >= req.start,
-        (true, true) => c > req.start,
-        (false, false) => c <= req.start,
-        (false, true) => c < req.start,
+    // An `Unbounded` edge opens its side unconditionally.
+    let on_start_side = match (req.forward, req.start_kind) {
+        (_, EdgeKind::Unbounded) => true,
+        (true, EdgeKind::Included) => c >= req.start,
+        (true, EdgeKind::Excluded) => c > req.start,
+        (false, EdgeKind::Included) => c <= req.start,
+        (false, EdgeKind::Excluded) => c < req.start,
     };
-    let within_end = match (req.forward, req.end_excl) {
-        (true, false) => c <= req.end,
-        (true, true) => c < req.end,
-        (false, false) => c >= req.end,
-        (false, true) => c > req.end,
+    let within_end = match (req.forward, req.end_kind) {
+        (_, EdgeKind::Unbounded) => true,
+        (true, EdgeKind::Included) => c <= req.end,
+        (true, EdgeKind::Excluded) => c < req.end,
+        (false, EdgeKind::Included) => c >= req.end,
+        (false, EdgeKind::Excluded) => c > req.end,
     };
     on_start_side && within_end
 }
 
 /// Builds the [`Scan`] request from a [`ScanReq`] and owned anchor coordinates.
-/// `req.start_excl`/`req.end_excl` choose the edge exclusivity.
+/// `req.start_kind`/`req.end_kind` choose each edge (incl/excl/unbounded).
 fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: &'a Coordinate) -> Scan<'a> {
-    let start = if req.start_excl {
-        ScanEdge::Excluded(start)
-    } else {
-        ScanEdge::Included(start)
+    let edge = |kind, coordinate| match kind {
+        EdgeKind::Included => ScanEdge::Included(coordinate),
+        EdgeKind::Excluded => ScanEdge::Excluded(coordinate),
+        EdgeKind::Unbounded => ScanEdge::Unbounded,
     };
-    let end = if req.end_excl {
-        ScanEdge::Excluded(end)
-    } else {
-        ScanEdge::Included(end)
-    };
+    let start = edge(req.start_kind, start);
+    let end = edge(req.end_kind, end);
     Scan {
         section: SECTIONS[req.sect as usize % SECTIONS.len()],
         start,

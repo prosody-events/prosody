@@ -13,7 +13,7 @@ use self::cell_suite::{
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
     DequeHoles, DequeTrace, MapTrace, finalize_and_promote, run_deque_holes, run_deque_trace,
-    run_map_trace, run_map_ttl_bounds_trace,
+    run_map_keyset_exact_trace, run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
 use self::support::{CountingCellStore, fresh_collection};
 use super::cell::ProvisionalWrite;
@@ -181,11 +181,11 @@ fn prop_deque_collection_lifecycle_read_uncommitted() {
 /// Map collection soundness over the real session lifecycle: random
 /// set/remove/get/clear/mid-handler-commit traces with commit/abort/crash
 /// outcomes keep the handle's `get` and key-ordered `stream` in step with a
-/// `BTreeMap` oracle — the loose-superset bounds (cleared with the entries),
-/// crash atomicity, and the at-least-once `commit()` contract
-/// (`commit()`-landed ops survive abort/crash-rollback; post-commit ops roll
-/// back — so a commit-then-clear-then-abort trace restores the
-/// `commit()`-landed state).
+/// `BTreeMap` oracle — the current-membership keyset (cleared with the
+/// entries; `KeysetPresence`), crash atomicity, and the at-least-once
+/// `commit()` contract (`commit()`-landed ops survive abort/crash-rollback;
+/// post-commit ops roll back — so a commit-then-clear-then-abort trace restores
+/// the `commit()`-landed state).
 #[test]
 fn prop_map_collection_lifecycle() {
     fn property(trace: MapTrace) -> Result<bool> {
@@ -205,14 +205,27 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
 
-/// Map TTL bound-refresh: on a TTL'd map every `set` — including a re-set of a
-/// key already within the committed bounds — buffers both `MapBound` cells, so
-/// the bounds' TTL is refreshed and they outlive every entry (absent bounds ⇔
-/// no live entries). Staged-set composition, so no clock is needed.
+/// Keyset exactness: over an arbitrary committed trace on a non-overflowing
+/// map, the stored keyset decodes to exactly the live key set after every
+/// settled event — `set` adds, `remove` subtracts, `clear` erases. A loose
+/// superset (the pre-keyset design, or a `remove` that failed to subtract)
+/// would fail here.
 #[test]
-fn prop_map_ttl_bounds_refresh() {
+fn prop_map_keyset_exact() {
     fn property(trace: MapTrace) -> Result<bool> {
-        executor::block_on(run_map_ttl_bounds_trace(trace))
+        executor::block_on(run_map_keyset_exact_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Map TTL keyset-refresh: on a TTL'd map every `set` — including a re-set of
+/// an already-tracked key, and once overflowed — buffers the keyset cell, so
+/// its TTL is refreshed and it outlives every entry. Staged-set composition, so
+/// no clock is needed.
+#[test]
+fn prop_map_ttl_keyset_refresh() {
+    fn property(trace: MapTrace) -> Result<bool> {
+        executor::block_on(run_map_ttl_keyset_refresh_trace(trace))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
@@ -514,7 +527,7 @@ fn map_stream_issues_no_scans() -> Result<()> {
         ));
         let armed: ArmedKeys = Arc::default();
 
-        // Empty-map arm: no keyset ⇒ scan fallback ⇒ no bounds ⇒ no scan.
+        // Empty-map arm: absent keyset ⇒ Empty ⇒ no scan (KeysetPresence).
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(0),
         };
@@ -585,8 +598,8 @@ fn map_stream_issues_no_scans() -> Result<()> {
 
 /// The overflowed-map budget pin (the liveness proof for
 /// `map_stream_issues_no_scans`): a keyset-disabled map (`keyset_limit = 0`)
-/// overflows on its first set and streams through **exactly one** scan (plus
-/// the keyset and both bound gets).
+/// overflows on its first set and streams through **exactly one** full-section
+/// scan (plus the single keyset get — bounds are gone).
 #[test]
 fn map_overflowed_stream_issues_one_scan() -> Result<()> {
     executor::block_on(async {
@@ -643,8 +656,8 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
         );
         assert_eq!(
             counting.lower_reads(),
-            3,
-            "the keyset cell plus both bound cells"
+            1,
+            "the single keyset get — no bound reads"
         );
         Ok(())
     })

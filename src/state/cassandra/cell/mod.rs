@@ -514,17 +514,13 @@ where
         let section = i8::from(scan.section);
         let dir = scan.dir;
         let limit = scan.limit;
-        // The start edge goes into CQL (the comparator is chosen by selecting
-        // one of the per-edge prepared statements). The end edge is enforced
-        // in-code by `past_end`, so it needs no statement variant. Both edges
-        // are held as owned `Coordinate`s across the stream's awaits — O(1)
-        // refcount bumps (`Coordinate` is `Bytes`), never byte copies.
-        let statement = match (dir, &scan.start) {
-            (Direction::Forward, ScanEdge::Included(_)) => self.queries.scan_forward_incl.clone(),
-            (Direction::Forward, ScanEdge::Excluded(_)) => self.queries.scan_forward_excl.clone(),
-            (Direction::Backward, ScanEdge::Included(_)) => self.queries.scan_backward_incl.clone(),
-            (Direction::Backward, ScanEdge::Excluded(_)) => self.queries.scan_backward_excl.clone(),
-        };
+        // The start edge selects the prepared statement (the comparator cannot
+        // be bound), and — when bounded — supplies the anchor coordinate; an
+        // `Unbounded` start uses a section-only `_all` statement with no
+        // comparator. The end edge is enforced in-code by `past_end`, so it
+        // needs no statement variant. Both edges are held as owned
+        // `Coordinate`s across the stream's awaits — O(1) refcount bumps
+        // (`Coordinate` is `Bytes`), never byte copies.
         let start = scan.start.cloned();
         let end = scan.end.cloned();
         let collection_ref = self.resolver.collection_ref(collection);
@@ -538,15 +534,37 @@ where
                 .await
                 .map_err(flatten_resolve)?;
             let pk = Pk::of(collection);
-            // The start edge always binds its coordinate; the comparator was
-            // fixed by the statement selected above.
-            let pager = self
-                .cql()
-                .execute_iter(
-                    statement,
-                    (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section, start.coordinate().as_bytes()),
-                )
-                .await;
+            // The section-prefix bind values every scan statement shares.
+            let prefix = (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section);
+            let (seg, key, st, name, cell_kind, sect) = prefix;
+            // Statement selection and binding are one match: the bounded arms
+            // append the anchor coordinate (a 7-tuple), the `Unbounded` arms
+            // bind only the section prefix (a 6-tuple) — distinct Rust types,
+            // so the pager must open inside each arm.
+            let pager = match (dir, start.as_ref()) {
+                (Direction::Forward, ScanEdge::Included(c)) => {
+                    self.cql().execute_iter(self.queries.scan_forward_incl.clone(),
+                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                }
+                (Direction::Forward, ScanEdge::Excluded(c)) => {
+                    self.cql().execute_iter(self.queries.scan_forward_excl.clone(),
+                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                }
+                (Direction::Backward, ScanEdge::Included(c)) => {
+                    self.cql().execute_iter(self.queries.scan_backward_incl.clone(),
+                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                }
+                (Direction::Backward, ScanEdge::Excluded(c)) => {
+                    self.cql().execute_iter(self.queries.scan_backward_excl.clone(),
+                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                }
+                (Direction::Forward, ScanEdge::Unbounded) => {
+                    self.cql().execute_iter(self.queries.scan_forward_all.clone(), prefix).await
+                }
+                (Direction::Backward, ScanEdge::Unbounded) => {
+                    self.cql().execute_iter(self.queries.scan_backward_all.clone(), prefix).await
+                }
+            };
             let stream = pager
                 .map_err(CassandraStoreError::from)
                 .map_err(into_store_err::<O::Error>)?
@@ -1624,7 +1642,8 @@ fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreEr
 
 /// Whether `key` has walked past the in-code `end` edge for the scan
 /// direction. An `Excluded` edge also stops *on* the endpoint (the exclusive
-/// variant for exclusive scan anchors).
+/// variant for exclusive scan anchors); an `Unbounded` end never stops the
+/// walk (the section-only fallback).
 fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&Coordinate>) -> bool {
     let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
@@ -1632,6 +1651,7 @@ fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&Coordinate>) -> bool {
         (Direction::Forward, ScanEdge::Excluded(end)) => coordinate >= end.as_bytes(),
         (Direction::Backward, ScanEdge::Included(end)) => coordinate < end.as_bytes(),
         (Direction::Backward, ScanEdge::Excluded(end)) => coordinate <= end.as_bytes(),
+        (_, ScanEdge::Unbounded) => false,
     }
 }
 
@@ -1699,13 +1719,18 @@ cassandra_queries! {
     /// `ORDER BY` direction cannot be bound (forward/backward), and the
     /// **start-side comparator** cannot be bound either, so each direction
     /// carries two start variants — inclusive (`>=`/`<=`) and exclusive
-    /// (`>`/`<`, for exclusive anchors). Every scan binds a concrete
-    /// start coordinate ([`ScanEdge`] has no unbounded variant). The end bound
-    /// is enforced in code (`past_end`), so it needs no statement variant. The
-    /// `marker_*` statements maintain and point-read the one fixed-address
-    /// event-marker row that bounds recovery. The `gap_*` statements are the
-    /// section-clear range deletes (`gaps_unit`) — writes, never reads, so
-    /// no statement can scan a tombstone field. None use `ALLOW FILTERING`.
+    /// (`>`/`<`, for exclusive anchors). A start edge is therefore either a
+    /// bound coordinate (the four incl/excl statements) or
+    /// [`Unbounded`](ScanEdge::Unbounded) (the two section-only `_all`
+    /// statements, which carry no start comparator). The end bound is enforced
+    /// in code (`past_end`), so it needs no statement variant. The `marker_*`
+    /// statements maintain and point-read the one fixed-address event-marker row
+    /// that bounds recovery. The `gap_*` statements are the section-clear range
+    /// deletes (`gaps_unit`) — writes, never reads. Scan issuance is gated: the
+    /// four cell mutators each write exactly one row shape, so the only reader
+    /// that walks a whole section (and thus can meet a tombstone field) is an
+    /// `_all` scan, reached solely by the map's degraded full-section fallback —
+    /// the accepted degraded cost. None use `ALLOW FILTERING`.
     pub struct CellQueries {
         /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
@@ -1765,6 +1790,30 @@ cassandra_queries! {
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate < ? \
+             ORDER BY coordinate DESC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Section-only forward scan (an [`Unbounded`](ScanEdge::Unbounded)
+        /// start edge): no start comparator, walks the whole `kind=Cell` slice
+        /// of the section in ascending `coordinate` order.
+        scan_forward_all: (
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? \
+             ORDER BY coordinate ASC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Section-only backward scan (an [`Unbounded`](ScanEdge::Unbounded)
+        /// start edge): no start comparator, walks the whole `kind=Cell` slice
+        /// of the section in descending `coordinate` order.
+        scan_backward_all: (
+            "SELECT section, coordinate, data, prev_data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? \
              ORDER BY coordinate DESC",
             TABLE_KEYED_STATE_CELL
         ),

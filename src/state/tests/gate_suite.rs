@@ -321,20 +321,18 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
 }
 
 /// KV4 pin (c): a `set` racing `clear()`, proving the map's core invariant —
-/// **every live entry is covered by present bounds and a present keyset** —
+/// **every live entry is covered by a present keyset** (`KeysetPresence`) —
 /// survives the race. The teeth need a *non-empty* map: on an empty map both
-/// serial orders leave a valid loose-superset state, so the invariant can't be
-/// violated. Seeded cold with `{0,1,2}`, bounds `[0,2]`, keyset
-/// `Tracked{0,1,2}`, then `set(1)` (a key already in bounds and already
-/// tracked, so on a non-TTL map its bound-ratchet and keyset writes are both
-/// suppressed) parks at its cold Min read HOLDING the gate. `clear()` is polled
-/// exactly once: with the gate it parks (a single deterministic
-/// `Poll::Pending`, no scheduler heuristic) and runs only after the set
-/// completes — set-then-clear leaves the map empty. Red-proven by deleting the
-/// permit acquisition in `set` OR `clear`: the first poll runs `clear` to
-/// completion, then the resumed `set` writes ONLY the entry (its meta writes
-/// suppressed), stranding a live entry with absent bounds and keyset — the
-/// invariant the gate protects.
+/// serial orders leave a valid state, so the invariant can't be violated.
+/// Seeded cold with `{0,1,2}` and keyset `Tracked{0,1,2}`, then `set(1)` (a key
+/// already tracked, so on a non-TTL map its keyset write is suppressed) parks
+/// at its cold keyset read HOLDING the gate. `clear()` is polled exactly once:
+/// with the gate it parks (a single deterministic `Poll::Pending`, no scheduler
+/// heuristic) and runs only after the set completes — set-then-clear leaves the
+/// map empty. Red-proven by deleting the permit acquisition in `set` OR
+/// `clear`: the first poll runs `clear` to completion, then the resumed `set`
+/// writes ONLY the entry (its keyset write suppressed), stranding a live entry
+/// with an absent keyset — the invariant the gate protects.
 #[test]
 fn gate_serializes_set_against_clear() -> Result<()> {
     runtime()?.block_on(async {
@@ -342,19 +340,14 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         let id = fx.id("m")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        // Seed a valid, cold, non-TTL map: entries {0,1,2}, bounds [0,2], a
-        // three-key Tracked keyset. Cold so the event's meta reads land on the
-        // armed hold.
-        let (min_cell, max_cell) = map::bound_cells();
-        let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
+        // Seed a valid, cold, non-TTL map: entries {0,1,2} and a three-key
+        // Tracked keyset. Cold so the event's meta read lands on the armed hold.
         let entry =
             |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
         fx.counting
             .write_resolved(
                 &cref,
                 &[
-                    (min_cell.clone(), Some(bound(0))),
-                    (max_cell.clone(), Some(bound(2))),
                     (
                         map::keyset_cell(),
                         Some(Bytes::from(tracked_frame(&[0, 1, 2]))),
@@ -381,9 +374,9 @@ fn gate_serializes_set_against_clear() -> Result<()> {
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
 
-        // set(1) parks at its cold Min read (a held lower read) while HOLDING
-        // the gate. 1 is already in [0,2] and already tracked, so once it
-        // resumes its only write is the entry.
+        // set(1) parks at its cold keyset read (a held lower read) while HOLDING
+        // the gate. 1 is already tracked, so once it resumes its only write is
+        // the entry.
         fx.holds.get_for_cache().arm(1);
         let set_task = tokio::spawn({
             let handle = handle.clone();
@@ -414,60 +407,46 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         }
 
         // Settle, then probe the physical state: no live entry may survive with
-        // absent bounds or keyset. With the gate the outcome is set-then-clear
-        // (empty); the injected race strands entry 1 with cleared meta.
+        // an absent keyset. With the gate the outcome is set-then-clear (empty);
+        // the injected race strands entry 1 with a cleared keyset.
         finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
         let verify = fx.session(2);
         let fresh = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&verify)
             .map_err(|e| eyre!("bind: {e}"))?;
         let entry = fresh.get(&1).await.map_err(|e| eyre!("{e}"))?;
-        let min = fx
-            .counting
-            .get(&id, &min_cell, probe(99))
-            .await?
-            .into_inner();
-        let max = fx
-            .counting
-            .get(&id, &max_cell, probe(99))
-            .await?
-            .into_inner();
         let keyset = fx
             .counting
             .get(&id, &map::keyset_cell(), probe(99))
             .await?
             .into_inner();
         assert!(
-            entry.is_none() || (min.is_some() && max.is_some() && keyset.is_some()),
-            "a live entry must be covered by present bounds and keyset (entry={:?}, min={:?}, \
-             max={:?}, keyset={:?})",
+            entry.is_none() || keyset.is_some(),
+            "a live entry must be covered by a present keyset (entry={:?}, keyset={:?})",
             entry.is_some(),
-            min.is_some(),
-            max.is_some(),
             keyset.is_some(),
         );
         Ok(())
     })
 }
 
-/// The ratchet-lost-update pin (the pre-existing `ratchet_bounds`
-/// read-modify-write race the gate closes) and the set/set-from-empty keyset
-/// pin: two racing sets of the extremes serialize under the gate, so the final
-/// bounds hold BOTH extremes, the keyset is the UNION of both keys (not a
-/// last-wins singleton), and a stream yields both entries. Red-proven by
-/// deleting the permit acquisition: the parked set's stale reads overwrite the
-/// other's ratchet and keyset update, the bounds lose an extension and the
-/// keyset loses a key, and the loose-superset invariant breaks.
+/// The keyset read-modify-write race pin (the pre-existing lost-update the gate
+/// closes; the surviving same-shape race after the bound ratchet was deleted):
+/// two racing fresh-key sets serialize under the gate, so the keyset is the
+/// UNION of both keys (not a last-wins singleton) and a stream yields both
+/// entries. Red-proven by deleting the permit acquisition: the parked set's
+/// stale keyset read overwrites the other's update, the keyset loses a key, and
+/// the current-membership invariant breaks.
 #[test]
-fn gate_serializes_racing_ratchets() -> Result<()> {
+fn gate_serializes_racing_keyset_rmw() -> Result<()> {
     runtime()?.block_on(async {
-        let fx = GateFixture::new("gate_ratchet")?;
+        let fx = GateFixture::new("gate_keyset_rmw")?;
         let session = fx.session(1);
         let handle = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
 
-        // set(1) parks at its bound read while holding the gate; set(9) parks
+        // set(1) parks at its keyset read while holding the gate; set(9) parks
         // on the gate behind it.
         fx.holds.get_for_cache().arm(1);
         let first = tokio::spawn({
@@ -516,31 +495,11 @@ fn gate_serializes_racing_ratchets() -> Result<()> {
         assert_eq!(
             keys,
             vec![1, 9],
-            "serialized ratchets hold both extremes — no lost bound extension"
-        );
-
-        // The bounds-ratchet twin: no live key lands outside the stored bounds.
-        let id = fx.id("m")?;
-        let (min_cell, max_cell) = map::bound_cells();
-        let min = fx
-            .counting
-            .get(&id, &min_cell, probe(99))
-            .await?
-            .into_inner()
-            .ok_or_else(|| eyre!("missing Min bound"))?;
-        let max = fx
-            .counting
-            .get(&id, &max_cell, probe(99))
-            .await?
-            .into_inner()
-            .ok_or_else(|| eyre!("missing Max bound"))?;
-        assert!(
-            min[..] <= I64KeyCodec::encode(&1).as_bytes()[..]
-                && max[..] >= I64KeyCodec::encode(&9).as_bytes()[..],
-            "the stored bounds contain both keys — no live key outside them"
+            "serialized keyset updates track both keys — no lost membership"
         );
 
         // The keyset is the UNION {1, 9}, not a last-wins singleton.
+        let id = fx.id("m")?;
         let keyset = fx
             .counting
             .get(&id, &map::keyset_cell(), probe(99))
@@ -585,16 +544,12 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
 
         // Seed a two-key keyset (limit 3) beneath the cache, so event ops read
         // cold and land on the armed hold.
-        let (min_cell, max_cell) = map::bound_cells();
-        let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
         let entry =
             |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
         fx.counting
             .write_resolved(
                 &cref,
                 &[
-                    (min_cell, Some(bound(1))),
-                    (max_cell, Some(bound(2))),
                     (
                         map::keyset_cell(),
                         Some(Bytes::from(tracked_frame(&[1, 2]))),
@@ -680,6 +635,179 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
     })
 }
 
+/// Rotating map stays `Tracked` (the live-size bound): a map churned across
+/// more distinct keys than the limit — each event removing the oldest key
+/// before setting a new one, so live size never exceeds the limit — keeps a
+/// `Tracked` keyset forever, because `remove` subtracts. A fresh stream then
+/// takes the point-get arm and issues **zero** scans. Red-proven by making
+/// `remove`'s subtract a no-write: the keyset never shrinks, the fourth
+/// distinct key overflows, and the stream degrades to a full-section scan
+/// (`lower_scans() == 1`).
+#[test]
+fn map_keyset_rotating_stays_tracked() -> Result<()> {
+    /// Distinct keys churned — strictly greater than the limit (3), so a
+    /// keyset that never subtracts would overflow.
+    const STEPS: i64 = 6;
+
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_rotating")?;
+        let id = fx.id("ks")?;
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("ks");
+
+        // Each committed event removes the oldest key (once the window is full)
+        // then sets a new one, so live size stays ≤ 3 while total distinct = 6.
+        for step in 0..STEPS {
+            let event = Uuid::from_u128(u128::try_from(step)? + 1);
+            let session = fx.session(u128::try_from(step)? + 1);
+            let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+            if step >= 3 {
+                handle.remove(&(step - 3)).await.map_err(|e| eyre!("{e}"))?;
+            }
+            handle
+                .set(step, Value::from(step))
+                .await
+                .map_err(|e| eyre!("{e}"))?;
+            finalize_and_promote(&session, &fx.oracle, event, &fx.cells, &id).await?;
+        }
+
+        // A fresh stream over the live window {3,4,5} takes the Tracked arm.
+        fx.counting.reset();
+        let verify = fx.session(100);
+        let fresh = descriptor.bind(&verify).map_err(|e| eyre!("bind: {e}"))?;
+        let mut keys = Vec::new();
+        {
+            let stream = fresh.stream(Direction::Forward);
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;
+                keys.push(key);
+            }
+        }
+        assert_eq!(keys, vec![3, 4, 5], "the stream yields the live window");
+        assert_eq!(
+            fx.counting.lower_scans(),
+            0,
+            "a rotating map that never overflows streams by point gets, not a scan"
+        );
+        Ok(())
+    })
+}
+
+/// Removal heals an oversized frame (the remove-side twin of
+/// `map_keyset_oversized_frame_collapses_before_fast_path`): a stored oversized
+/// `Tracked` frame degrades the stream to a full-section scan, but once
+/// `remove` subtracts enough keys to bring the frame back under the limit, a
+/// fresh stream takes the point-get arm again. Red-proven by making
+/// `subtract_keyset` write `Overflowed` instead of the shrunk frame: removal
+/// never heals, so the post-remove stream still degrades (`lower_scans() ==
+/// 1`).
+#[test]
+fn map_keyset_removal_heals_oversized() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_heal_oversized")?;
+        let id = fx.id("ks")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("ks");
+        let entry =
+            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
+
+        // Seed a valid but oversized 5-key Tracked frame (limit 3) + entries.
+        let mut seed = vec![(
+            map::keyset_cell(),
+            Some(Bytes::from(tracked_frame(&[1, 2, 3, 4, 5]))),
+        )];
+        for k in 1..=5_i64 {
+            seed.push((
+                map::entry_cell_for(&I64KeyCodec::encode(&k)),
+                Some(entry(k)?),
+            ));
+        }
+        fx.counting.write_resolved(&cref, &seed, &[]).await?;
+
+        // The oversized frame degrades to a full-section scan.
+        fx.counting.reset();
+        {
+            let verify = fx.session(1);
+            let fresh = descriptor.bind(&verify).map_err(|e| eyre!("bind: {e}"))?;
+            let stream = fresh.stream(Direction::Forward);
+            futures::pin_mut!(stream);
+            while (stream.next().await).is_some() {}
+        }
+        assert_eq!(
+            fx.counting.lower_scans(),
+            1,
+            "an oversized keyset degrades to the full-section scan"
+        );
+
+        // A committed event removes keys 1 and 2, bringing the tracked set to
+        // {3,4,5} (≤ limit) — remove subtracts, rewriting a smaller Tracked.
+        let session = fx.session(2);
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        handle.remove(&1).await.map_err(|e| eyre!("{e}"))?;
+        handle.remove(&2).await.map_err(|e| eyre!("{e}"))?;
+        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(2), &fx.cells, &id).await?;
+
+        // The healed frame ({3,4,5}) takes the point-get arm — no scan.
+        fx.counting.reset();
+        let verify = fx.session(3);
+        let fresh = descriptor.bind(&verify).map_err(|e| eyre!("bind: {e}"))?;
+        let mut keys = Vec::new();
+        {
+            let stream = fresh.stream(Direction::Forward);
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;
+                keys.push(key);
+            }
+        }
+        assert_eq!(keys, vec![3, 4, 5], "the stream yields the remaining keys");
+        assert_eq!(
+            fx.counting.lower_scans(),
+            0,
+            "removal healed the frame back under the bound: the fast arm is restored"
+        );
+        Ok(())
+    })
+}
+
+/// An absent keyset streams nothing with zero entry reads (the `Absent → Empty`
+/// fast path resting on `KeysetPresence`): a truly empty collection yields
+/// nothing and issues no scan, and the only lower read is the single keyset get
+/// itself. Red-proven by changing `stream_plan`'s `Absent` arm to `Scan`: an
+/// empty map then issues a full-section scan (`lower_scans() == 1`).
+#[test]
+fn map_absent_keyset_streams_zero_reads() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_absent_keyset")?;
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("ks");
+        let session = fx.session(1);
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+        fx.counting.reset();
+        let mut yielded = 0usize;
+        {
+            let stream = handle.stream(Direction::Forward);
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                item.map_err(|e| eyre!("stream: {e}"))?;
+                yielded += 1;
+            }
+        }
+        assert_eq!(yielded, 0, "an absent keyset yields nothing");
+        assert_eq!(
+            fx.counting.lower_scans(),
+            0,
+            "Absent → Empty issues no scan"
+        );
+        assert_eq!(
+            fx.counting.lower_reads(),
+            1,
+            "the only lower read is the single keyset get; no entry point-gets"
+        );
+        Ok(())
+    })
+}
+
 /// The set-racing-stream pin (the split-stream bounded-arm materialization
 /// contract): the keyset stream materializes under one gate hold, so a racing
 /// `set` of a listed key cannot interleave — the drain yields EXACTLY the
@@ -695,16 +823,12 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
         let cref = CollectionRef::new(id.clone(), None);
 
         // Seed {1: 10, 2: 20} with a two-key keyset beneath the cache (cold).
-        let (min_cell, max_cell) = map::bound_cells();
-        let bound = |k: i64| Bytes::copy_from_slice(I64KeyCodec::encode(&k).as_bytes());
         let entry =
             |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
         fx.counting
             .write_resolved(
                 &cref,
                 &[
-                    (min_cell, Some(bound(1))),
-                    (max_cell, Some(bound(2))),
                     (
                         map::keyset_cell(),
                         Some(Bytes::from(tracked_frame(&[1, 2]))),

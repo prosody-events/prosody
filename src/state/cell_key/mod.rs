@@ -107,18 +107,25 @@ pub enum Direction {
     Backward,
 }
 
-/// One concrete edge of a [`Scan`]: an inclusive or exclusive endpoint at a
-/// known coordinate. There is deliberately **no unbounded variant** — every
-/// cell scan is pinned to a concrete start *and* end, so a scan can never walk
-/// past a collection's known-live extent into a tombstone field. Making the
-/// unbounded case unrepresentable is the type-level enforcement of that rule
-/// (the twin of the timer system's watermark bound).
+/// One edge of a [`Scan`]: an inclusive or exclusive endpoint at a known
+/// coordinate, or `Unbounded` — an open endpoint at no coordinate at all.
+///
+/// `Unbounded` is **direction-relative** like the other edges: as a `start` it
+/// opens the low side (forward) or high side (backward); as an `end` it opens
+/// the opposite side. It exists for the map's `Overflowed`/degraded fallback,
+/// where the keyset holds no complete key enumeration to fence the scan from,
+/// so iteration must walk the whole section. A scan with both edges `Unbounded`
+/// therefore walks an entire section — including, on a TTL'd or freshly-cleared
+/// section, a field of tombstones. That is the accepted degraded cost of the
+/// fallback, not a hazard: the fast (bounded-coordinate) arms of every
+/// collection stay pinned to their live extent, and only the map's degrade path
+/// ever constructs an `Unbounded` edge.
 ///
 /// The exclusive edge exists for callers that need an endpoint-exclusive
 /// range — e.g. resuming a scan just past the last coordinate seen. No
 /// production caller constructs it today; it is reached through the
 /// `Direction` × `ScanEdge` comparator dispatch in the Cassandra cell
-/// store, and property tests drive both variants.
+/// store, and property tests drive all three variants.
 ///
 /// Generic over the borrowed inner so the same type serves a [`Scan`]'s
 /// `ScanEdge<&Coordinate>` and the typed cell view's `ScanEdge<&Key>`.
@@ -129,14 +136,19 @@ pub enum ScanEdge<T> {
 
     /// The endpoint coordinate is excluded from the range.
     Excluded(T),
+
+    /// No endpoint on this side — the range is open (direction-relative).
+    Unbounded,
 }
 
 impl<T> ScanEdge<T> {
-    /// The endpoint coordinate, regardless of inclusivity.
+    /// The endpoint coordinate, or `None` for an [`Unbounded`](Self::Unbounded)
+    /// edge.
     #[must_use]
-    pub fn coordinate(&self) -> &T {
+    pub fn coordinate(&self) -> Option<&T> {
         match self {
-            Self::Included(t) | Self::Excluded(t) => t,
+            Self::Included(t) | Self::Excluded(t) => Some(t),
+            Self::Unbounded => None,
         }
     }
 
@@ -147,6 +159,7 @@ impl<T> ScanEdge<T> {
         match self {
             Self::Included(t) => ScanEdge::Included(t),
             Self::Excluded(t) => ScanEdge::Excluded(t),
+            Self::Unbounded => ScanEdge::Unbounded,
         }
     }
 
@@ -156,6 +169,7 @@ impl<T> ScanEdge<T> {
         match self {
             Self::Included(t) => ScanEdge::Included(f(t)),
             Self::Excluded(t) => ScanEdge::Excluded(f(t)),
+            Self::Unbounded => ScanEdge::Unbounded,
         }
     }
 }
@@ -167,6 +181,7 @@ impl<T: Clone> ScanEdge<&T> {
         match self {
             Self::Included(t) => ScanEdge::Included(t.clone()),
             Self::Excluded(t) => ScanEdge::Excluded(t.clone()),
+            Self::Unbounded => ScanEdge::Unbounded,
         }
     }
 }
@@ -176,6 +191,7 @@ impl<T> From<ScanEdge<T>> for Bound<T> {
         match edge {
             ScanEdge::Included(t) => Bound::Included(t),
             ScanEdge::Excluded(t) => Bound::Excluded(t),
+            ScanEdge::Unbounded => Bound::Unbounded,
         }
     }
 }
@@ -185,9 +201,9 @@ impl<T> From<ScanEdge<T>> for Bound<T> {
 /// `section` is required, so a cross-section scan cannot be constructed. The
 /// `start`/`end` [`ScanEdge`]s are **direction-relative**: forward walks from
 /// `start` (the low side) toward `end` (the high side); backward walks from
-/// `start` (the high side) toward `end` (the low side). Both edges are
-/// concrete — a `ScanEdge` has no unbounded variant — so a scan is always
-/// pinned to a known coordinate range.
+/// `start` (the high side) toward `end` (the low side). Either edge may be
+/// [`ScanEdge::Unbounded`] (open on that side), so a scan is still single-
+/// section but need not be pinned to a known coordinate range.
 #[derive(Clone, Copy)]
 pub struct Scan<'a> {
     /// The section whose cells the scan walks.
@@ -240,6 +256,7 @@ fn above_low(coordinate: &Coordinate, edge: ScanEdge<&Coordinate>) -> bool {
     match edge {
         ScanEdge::Included(lo) => coordinate >= lo,
         ScanEdge::Excluded(lo) => coordinate > lo,
+        ScanEdge::Unbounded => true,
     }
 }
 
@@ -248,6 +265,7 @@ fn below_high(coordinate: &Coordinate, edge: ScanEdge<&Coordinate>) -> bool {
     match edge {
         ScanEdge::Included(hi) => coordinate <= hi,
         ScanEdge::Excluded(hi) => coordinate < hi,
+        ScanEdge::Unbounded => true,
     }
 }
 
