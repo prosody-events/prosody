@@ -374,6 +374,21 @@ enum StreamPlan<K> {
     Scan,
 }
 
+/// What [`MapHandle::stream`] yields once its under-gate init has finished and
+/// the permit is released — computed while the gate is held, then handed out
+/// gate-free so an error is never yielded to user code under the gate (the
+/// split-stream contract on [`SessionGate`](crate::state::session)).
+enum StreamStart<K, V> {
+    /// The bounded arm's materialized entries, yielded straight from memory.
+    Buffered(Vec<(K, V)>),
+
+    /// The scan arm's live bounds — streamed per-item after the permit drops.
+    Scan { min: K, max: K },
+
+    /// Nothing to yield (an overflowed/absent keyset with an absent bound).
+    Empty,
+}
+
 /// One item [`MapHandle::stream`] yields: a decoded key paired with its
 /// resolved value, or the error that ended the stream.
 type MapStreamItem<KC, V> =
@@ -486,47 +501,67 @@ where
             // materialization (every listed entry, ≤ the keyset bound in
             // memory), released before the first yield; the scan arm drops the
             // permit after the bounds read and streams per-item live. Neither
-            // holds the gate across a yield to user code.
+            // holds the gate across a yield to user code — the fallible init
+            // runs inside an inner `async` block (which `try_stream!` leaves
+            // untransformed, so its `?` is an ordinary early return that drops
+            // the permit), so the error `?` at this level only fires after the
+            // permit has been released.
             let permit = self.entries.read_permit().instrument(span.clone()).await;
-            let plan = self.stream_plan(dir).instrument(span.clone()).await?;
-            match plan {
-                StreamPlan::Tracked(keys) => {
-                    // Concurrent ordered point gets: the gate hold above is the
-                    // safety argument, the per-cell reads commute across
-                    // distinct coordinates, and `buffered(KEYSET_PREFETCH)`
-                    // overlaps a cold keyset's durable round-trips in key order.
-                    let len = keys.len();
-                    let gets = stream::iter(keys)
-                        .map(|key| {
-                            cooperative(async move {
-                                let value = self.entries.get(&key).await?;
-                                Ok::<_, MapStateError<CellCodecError<V>>>(value.map(|v| (key, v)))
+            let init = async {
+                match self.stream_plan(dir).instrument(span.clone()).await? {
+                    StreamPlan::Tracked(keys) => {
+                        // Concurrent ordered point gets: the gate hold above is
+                        // the safety argument, the per-cell reads commute across
+                        // distinct coordinates, and `buffered(KEYSET_PREFETCH)`
+                        // overlaps a cold keyset's durable round-trips in key
+                        // order.
+                        let len = keys.len();
+                        let gets = stream::iter(keys)
+                            .map(|key| {
+                                cooperative(async move {
+                                    let value = self.entries.get(&key).await?;
+                                    Ok::<_, MapStateError<CellCodecError<V>>>(
+                                        value.map(|v| (key, v)),
+                                    )
+                                })
                             })
-                        })
-                        .buffered(KEYSET_PREFETCH);
-                    futures::pin_mut!(gets);
-                    let mut buffer: Vec<(KC::Key, ResolvedOf<V>)> = Vec::with_capacity(len);
-                    while let Some(item) = gets.next().instrument(span.clone()).await {
-                        // A `None` is a removed/expired key: skipped, never an
-                        // error (the loose-superset skip).
-                        if let Some(entry) = item? {
-                            buffer.push(entry);
+                            .buffered(KEYSET_PREFETCH);
+                        futures::pin_mut!(gets);
+                        let mut buffer: Vec<(KC::Key, ResolvedOf<V>)> = Vec::with_capacity(len);
+                        while let Some(item) = gets.next().instrument(span.clone()).await {
+                            // A `None` is a removed/expired key: skipped, never
+                            // an error (the loose-superset skip).
+                            if let Some(entry) = item? {
+                                buffer.push(entry);
+                            }
                         }
+                        // Pin the error type once (the value type infers from
+                        // this variant) so the outer `?` need not annotate a
+                        // complex `Result`.
+                        Ok::<_, MapStateError<CellCodecError<V>>>(StreamStart::Buffered(buffer))
                     }
-                    drop(permit);
+                    StreamPlan::Scan => {
+                        let (min, max) = tokio::try_join!(
+                            self.read_bound(MapBound::Min).instrument(span.clone()),
+                            self.read_bound(MapBound::Max).instrument(span.clone())
+                        )?;
+                        Ok(match (min, max) {
+                            (Some(min), Some(max)) => StreamStart::Scan { min, max },
+                            _ => StreamStart::Empty,
+                        })
+                    }
+                }
+            }
+            .await;
+            drop(permit);
+            match init? {
+                StreamStart::Buffered(buffer) => {
                     for entry in buffer {
                         yield entry;
                     }
                 }
-                StreamPlan::Scan => {
-                    let (min, max) = tokio::try_join!(
-                        self.read_bound(MapBound::Min).instrument(span.clone()),
-                        self.read_bound(MapBound::Max).instrument(span.clone())
-                    )?;
-                    drop(permit);
-                    let (Some(min), Some(max)) = (min, max) else {
-                        return;
-                    };
+                StreamStart::Empty => {}
+                StreamStart::Scan { min, max } => {
                     let (start, end) = match dir {
                         Direction::Forward => (ScanEdge::Included(&min), ScanEdge::Included(&max)),
                         Direction::Backward => (ScanEdge::Included(&max), ScanEdge::Included(&min)),

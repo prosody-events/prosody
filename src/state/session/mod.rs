@@ -349,9 +349,10 @@ pub(crate) mod sealed {
     /// no helper ever calls a public wrapper.
     ///
     /// **Streams have a split contract.** A *bounded* stream (a sub-threshold
-    /// deque window) materializes under one gate hold at init — membership and
-    /// every listed entry read, bounded memory — releases, then yields from the
-    /// buffer; the gate is never held across a yield to user code. A
+    /// deque window, or a `Tracked` map keyset within its bound) materializes
+    /// under one gate hold at init — membership and every listed entry read,
+    /// bounded memory — releases, then yields from the buffer; the gate is
+    /// never held across a yield to user code, error items included. A
     /// *scan-path* stream takes the gate only for its init metadata read
     /// and is per-item live thereafter. A cold bounded materialization is
     /// the accepted worst case: it holds the gate across up to N+1 durable

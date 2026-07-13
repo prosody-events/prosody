@@ -877,6 +877,136 @@ fn gate_excludes_commit_during_bounded_materialization() -> Result<()> {
     })
 }
 
+/// The error-yield gate-release pin (map): a `Tracked` map stream whose
+/// point-get hits an undecodable entry yields `Err` — and MUST release the
+/// session gate before that yield reaches user code. Otherwise a caller that
+/// catches the error and, with the stream still alive, issues another op on the
+/// same session deadlocks: the suspended generator holds the gate the next op
+/// waits on (the split-stream contract on `SessionGate` — the gate is never
+/// held across a yield to user code, error items included). Red without the
+/// fix: the `try_stream!` `?` yields the error while the init permit is still
+/// held (the generator suspends at the yield before the permit drops), so the
+/// follow-up `get` parks forever and the hang-guard trips.
+#[test]
+fn map_stream_error_yield_releases_the_gate() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_map_stream_error")?;
+        let id = fx.id("m")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Seed a one-key `Tracked` keyset whose entry cell holds undecodable
+        // bytes, so the stream's point-get fails and yields `Err`.
+        let key = 7_i64;
+        fx.counting
+            .write_resolved(
+                &cref,
+                &[
+                    (map::keyset_cell(), Some(Bytes::from(tracked_frame(&[key])))),
+                    (
+                        map::entry_cell_for(&I64KeyCodec::encode(&key)),
+                        Some(Bytes::from_static(b"\x00\x01\x02 not json")),
+                    ),
+                ],
+                &[],
+            )
+            .await?;
+
+        let session = fx.session(1);
+        let handle = map_state::<I64KeyCodec, JsonCodec>("m")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        let stream = handle.stream(Direction::Forward);
+        futures::pin_mut!(stream);
+        // The Tracked point-get hits the corrupt entry: the stream yields `Err`.
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
+        assert!(
+            first.is_err(),
+            "the corrupt entry must surface as an Err item"
+        );
+
+        // The stream is still alive (held in scope, not dropped). A follow-up op
+        // on the same session must not be starved by a gate the suspended stream
+        // holds: post-fix the permit was released before the Err yield, so this
+        // completes; pre-fix it parks forever and the guard trips.
+        let absent = timeout(HANG_GUARD, handle.get(&999))
+            .await
+            .map_err(|_| {
+                eyre!(
+                    "a session op after a stream Err hung: the stream held the gate across the \
+                     error yield"
+                )
+            })?
+            .map_err(|e| eyre!("probe get: {e}"))?;
+        assert!(absent.is_none(), "the probe key is absent");
+        Ok(())
+    })
+}
+
+/// The error-yield gate-release pin (deque twin of
+/// [`map_stream_error_yield_releases_the_gate`]): a bounded deque stream whose
+/// point-get hits an undecodable element yields `Err` and MUST release the gate
+/// before the yield. Same mechanism, same red, on the structural twin.
+#[test]
+fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_deque_stream_error")?;
+        let id = fx.id("d")?;
+        let dref = CollectionRef::new(id.clone(), None);
+
+        // Seed a one-element window `[0, 1)` whose entry holds undecodable
+        // bytes, so the bounded materialization's point-get fails.
+        fx.counting
+            .write_resolved(
+                &dref,
+                &[
+                    (
+                        deque::meta_cell(),
+                        Some(Bytes::from(deque::seed_frame(0, 1))),
+                    ),
+                    (
+                        deque::entry_cell_for(&I64KeyCodec::encode(&0)),
+                        Some(Bytes::from_static(b"\x00\x01\x02 not json")),
+                    ),
+                ],
+                &[],
+            )
+            .await?;
+
+        let session = fx.session(1);
+        let handle = deque_state::<JsonCodec>("d")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        let stream = handle.stream(Direction::Forward);
+        futures::pin_mut!(stream);
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
+        assert!(
+            first.is_err(),
+            "the corrupt element must surface as an Err item"
+        );
+
+        // The stream is still alive: a follow-up op must not be starved.
+        let empty = timeout(HANG_GUARD, handle.is_empty())
+            .await
+            .map_err(|_| {
+                eyre!(
+                    "a session op after a stream Err hung: the stream held the gate across the \
+                     error yield"
+                )
+            })?
+            .map_err(|e| eyre!("probe is_empty: {e}"))?;
+        assert!(!empty, "the seeded window is non-empty");
+        Ok(())
+    })
+}
+
 /// The cancel-safety pin (the futurelock posture's safe half): dropping a
 /// session-op future — while it HOLDS the gate, and while it is QUEUED on it —
 /// releases the gate, so the next op and the settle acquire both proceed. The

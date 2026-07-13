@@ -167,6 +167,26 @@ pub struct DequeHandle<S, T> {
     meta: CellView<S, MetaCodec>,
 }
 
+/// What [`DequeHandle::stream`] yields once its under-gate init has finished
+/// and the permit is released — computed while the gate is held, then handed
+/// out gate-free so an error is never yielded to user code under the gate (the
+/// split-stream contract on [`SessionGate`](crate::state::session)).
+enum StreamStart<V> {
+    /// The bounded arm's materialized elements, yielded straight from memory.
+    Buffered(Vec<V>),
+
+    /// The scan arm's live window — streamed per-item after the permit drops.
+    Scan {
+        /// The validated window `[head, tail)` to anchor the scan on.
+        window: Window,
+        /// The window length, passed as the scan's page hint.
+        len: usize,
+    },
+
+    /// The window is empty; nothing to yield.
+    Empty,
+}
+
 impl<S, T> DequeHandle<S, T>
 where
     S: CellSession,
@@ -266,14 +286,21 @@ where
             // materializes under ONE gate hold — bounds plus every listed
             // entry, ≤ DEQUE_POINT_ITERATION_MAX in memory — released before
             // the first yield; the scan arm drops the permit after the bounds
-            // read and streams per-item live.
+            // read and streams per-item live. Neither holds the gate across a
+            // yield to user code — the fallible init runs inside an inner
+            // `async` block (which `try_stream!` leaves untransformed, so its
+            // `?` is an ordinary early return that drops the permit), so the
+            // error `?` at this level only fires after the permit is released.
             let permit = self.entries.read_permit().instrument(span.clone()).await;
-            let window = self.bounds().instrument(span.clone()).await?;
-            let len = window.len()?;
-            if len == 0 {
-                return;
-            }
-            if len <= DEQUE_POINT_ITERATION_MAX {
+            let init = async {
+                let window = self.bounds().instrument(span.clone()).await?;
+                let len = window.len()?;
+                if len == 0 {
+                    return Ok(StreamStart::Empty);
+                }
+                if len > DEQUE_POINT_ITERATION_MAX {
+                    return Ok(StreamStart::Scan { window, len });
+                }
                 // Concurrent ordered point gets: the gate hold above is the
                 // safety argument (commit()/set cannot interleave with the
                 // materialization — the exclusion is the gate, not a serial
@@ -303,33 +330,47 @@ where
                         buffer.push(value);
                     }
                 }
-                drop(permit);
-                for value in buffer {
-                    yield value;
-                }
-                return;
+                // Pin the error type once (the value type infers from this
+                // variant) so the outer `?` need not annotate a complex
+                // `Result`.
+                Ok::<_, DequeStateError<CellCodecError<T>>>(StreamStart::Buffered(buffer))
             }
+            .await;
             drop(permit);
-            // Anchor both edges on the window: front `head` to back `tail − 1`
-            // (`len > 0` proves `tail − 1` does not underflow), mirrored
-            // backward.
-            let head = window.head;
-            let last = window
-                .tail
-                .checked_sub(1)
-                .ok_or(MetaDecodeError::IndexOverflow)?;
-            let (start, end) = match dir {
-                Direction::Forward => (ScanEdge::Included(&head), ScanEdge::Included(&last)),
-                Direction::Backward => (ScanEdge::Included(&last), ScanEdge::Included(&head)),
-            };
-            let inner = self.entries.scan(start, dir, end, Some(len));
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                // The scan yields the decoded index; the module's window
-                // invariant makes it redundant, so only the resolved element is
-                // exposed.
-                let (_, value) = item?;
-                yield value;
+            match init? {
+                StreamStart::Empty => {}
+                StreamStart::Buffered(buffer) => {
+                    for value in buffer {
+                        yield value;
+                    }
+                }
+                StreamStart::Scan { window, len } => {
+                    // Anchor both edges on the window: front `head` to back
+                    // `tail − 1` (`len > 0` proves `tail − 1` does not
+                    // underflow), mirrored backward.
+                    let head = window.head;
+                    let last = window
+                        .tail
+                        .checked_sub(1)
+                        .ok_or(MetaDecodeError::IndexOverflow)?;
+                    let (start, end) = match dir {
+                        Direction::Forward => {
+                            (ScanEdge::Included(&head), ScanEdge::Included(&last))
+                        }
+                        Direction::Backward => {
+                            (ScanEdge::Included(&last), ScanEdge::Included(&head))
+                        }
+                    };
+                    let inner = self.entries.scan(start, dir, end, Some(len));
+                    futures::pin_mut!(inner);
+                    while let Some(item) = inner.next().instrument(span.clone()).await {
+                        // The scan yields the decoded index; the module's window
+                        // invariant makes it redundant, so only the resolved
+                        // element is exposed.
+                        let (_, value) = item?;
+                        yield value;
+                    }
+                }
             }
         }
     }
