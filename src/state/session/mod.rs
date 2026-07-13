@@ -122,14 +122,14 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     fn is_terminated(&self) -> bool;
 
     /// Whether the collection named `(state_type, name)` carries a TTL — the
-    /// query the Map meta refresh consults to keep its `Meta` cells (bounds and
-    /// keyset) renewed on every `set`, so they provably outlive every entry.
+    /// query the Map meta refresh consults to keep its keyset `Meta` cell
+    /// renewed on every `set`, so it provably outlives every entry.
     /// No default impl: a silent `false` would disable the refresh for a
     /// real session.
     fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool;
 
-    /// The Map keyset bound for `(state_type, name)` — the distinct-key
-    /// universe a map tracks before overflowing to the durable bounds scan.
+    /// The Map keyset bound for `(state_type, name)` — the number of live
+    /// distinct keys a map tracks before overflowing to the full-section scan.
     /// Read per `set`/`stream` on a Map handle. No default impl: a wrong
     /// silent default would mis-size the keyset for a real session.
     fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize;
@@ -225,7 +225,7 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
     /// Every currently-buffered op of the collection is written straight to
     /// committed state ([`write_resolved`]) in one same-partition batch and
     /// dropped from the dirty buffer, so multi-cell kinds commit data and
-    /// bookkeeping as a unit (a Map's entries and bound ratchets, a Deque's
+    /// bookkeeping as a unit (a Map's entries and keyset, a Deque's
     /// entries and window bounds). The guarantee is **at-least-once**: a
     /// `commit()`-landed write is durable and visible immediately — never
     /// provisional, never listed in any event marker, never rolled back. Ops
@@ -339,7 +339,7 @@ pub(crate) mod sealed {
     /// serial order — which also closes two lost-update races the dirty
     /// store's old "no handler op is in flight" comment papered
     /// over: `commit()`'s snapshot→drain window dropping a concurrent `set`,
-    /// and the map bound-ratchet read-modify-write under `join!`-ed sets.
+    /// and the map keyset read-modify-write under `join!`-ed sets.
     ///
     /// **Each public op acquires the gate exactly once** (a stream's
     /// acquisition is its init); nothing beneath a public wrapper

@@ -25,7 +25,7 @@
 //! `abort_provisional`, which delegate to them) applies *all* its cells
 //! together, so no reader and no crash-recovery ever observes a torn subset
 //! (some cells written, others not), and on the Cassandra backend every cell
-//! shares one write timestamp and one TTL anchor (bounds and entries
+//! shares one write timestamp and one TTL anchor (keyset and entries
 //! co-expire).
 //!
 //! * **Cassandra** packs the cells into **one same-partition `UNLOGGED

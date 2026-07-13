@@ -10,8 +10,8 @@ use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
 use thiserror::Error;
 
-/// Default Map keyset bound — the distinct-key universe a map tracks before it
-/// overflows to the durable bounds scan. Applied to any collection not
+/// Default Map keyset bound — the number of live distinct keys a map tracks
+/// before it overflows to the full-section scan. Applied to any collection not
 /// overriding it and to names absent from the registry.
 pub(crate) const DEFAULT_KEYSET_LIMIT: usize = 128;
 
@@ -97,9 +97,10 @@ pub struct CollectionDef {
     /// `None` uses the always-on `recovery_delay` floor.
     pub recovery_within: Option<CompactDuration>,
 
-    /// Map keyset bound: the number of **distinct keys since `clear`** a map
-    /// tracks in its keyset cell before overflowing to the durable bounds scan
-    /// (not the live entry count). Meaningful for Map collections only; ignored
+    /// Map keyset bound: the number of **live** distinct keys a map tracks in
+    /// its keyset cell before overflowing to the full-section scan (`remove`
+    /// subtracts, so this is the current membership, not a running total).
+    /// Meaningful for Map collections only; ignored
     /// by Value and Deque. `0` disables tracking (every map overflows on its
     /// first `set`). Operational, never part of the frozen
     /// [`StructuralIdentity`] — changing it needs no migration. Validated
