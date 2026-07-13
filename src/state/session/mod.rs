@@ -502,8 +502,9 @@ pub(crate) mod sealed {
 
     impl OpPermit<'_> {
         /// Whether the settle boundary has closed the session — consulted by
-        /// [`CellSession::rollback`], whose infallible contract answers a
-        /// closed session with `NoOp` instead of an error.
+        /// [`CellSession::rollback`](super::CellSession::rollback), whose
+        /// infallible contract answers a closed session with `NoOp` instead of
+        /// an error.
         pub(crate) fn is_closed(&self) -> bool {
             matches!(*self.0, SessionPhase::Closed)
         }

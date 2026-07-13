@@ -10,7 +10,7 @@
 //! These impls are **serialize-only by design**, the same rationale as the
 //! [`EventRef`](crate::state::EventRef) UDT bridge in
 //! [`super::udt`]. Reads do *not* go through a matching `DeserializeValue`:
-//! the cell decoder ([`super::cell::decode`]) deserializes the raw integer and
+//! the cell decoder (`cell::decode`) deserializes the raw integer and
 //! validates it in a fallible post-step. A bad discriminator then classifies
 //! `Permanent` rather than becoming scylla's opaque `Terminal`
 //! `DeserializationError`, which would tear the partition down over one bad

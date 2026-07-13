@@ -487,7 +487,7 @@ impl CassandraTriggerStore {
         Ok(out)
     }
 
-    /// Atomic batch: DELETE target clustering row + DELETE state[type].
+    /// Atomic batch: DELETE target clustering row + DELETE `state[type]`.
     ///
     /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
     /// read shows zero non-target rows. Both statements target the same

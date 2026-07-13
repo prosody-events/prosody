@@ -159,7 +159,7 @@ const PER_STATEMENT_OVERHEAD: u64 = 512;
 ///
 /// Every authoritative cell stamps the version its bytes were written under;
 /// this build writes version 1 and rejects any other at decode
-/// ([`decode::validate_version`]). Per-key identity migration is future work —
+/// (`decode::validate_version`). Per-key identity migration is future work —
 /// the stamp is the dormant hook it would build on.
 const INITIAL_VERSION: i32 = 1;
 

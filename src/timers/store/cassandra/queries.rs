@@ -423,7 +423,7 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
-        /// BATCH: DELETE target clustering row + DELETE state[type].
+        /// BATCH: DELETE target clustering row + DELETE `state[type]`.
         /// Used by `delete_key_trigger`'s Overflow branch when the
         /// pre-delete read shows the target is the only row → Absent.
         /// Both statements target the same `(segment_id, key)` partition.

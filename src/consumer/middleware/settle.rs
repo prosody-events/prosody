@@ -110,7 +110,7 @@ enum StepOutcome<R> {
     /// construction, a shutdown abort — a transient or terminal store failure
     /// retries forever instead (see [`retry_step`]).
     ///
-    /// [`EventContext::is_shutdown`]: crate::consumer::event_context::EventContext::is_shutdown
+    /// [`EventContext::is_shutdown`]: crate::consumer::event_context::TerminationSignals::is_shutdown
     Abandon,
 }
 

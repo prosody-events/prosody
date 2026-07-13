@@ -5,7 +5,8 @@
 //! `20260522_create_keyed_state.cql`. It is the control-plane half of keyed
 //! state — decoupled from any kind's cell data so "which kind owns identity?"
 //! is un-askable. The steady-state read is a point-read; first-use registration
-//! is the one authorized keyed-state LWT (see [`Self::register_identity`]).
+//! is the one authorized keyed-state LWT (see
+//! [`DescriptorIdentityStore::register_identity`]).
 //!
 //! # Concurrency
 //!

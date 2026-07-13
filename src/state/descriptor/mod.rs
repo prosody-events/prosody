@@ -1044,7 +1044,7 @@ where
     /// and never touched again.
     ///
     /// Items may be prefetched and resolved up to
-    /// [`SHARD_FANOUT_CONCURRENCY`](crate::state::SHARD_FANOUT_CONCURRENCY)
+    /// [`SHARD_FANOUT_CONCURRENCY`]
     /// ahead of the consumer; the window is ordered (`buffered`, not
     /// `buffer_unordered`), so cells arrive in key order. The stream terminates
     /// at the first error.

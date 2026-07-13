@@ -98,7 +98,7 @@ static FUSE_BLOWN: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// epoch.
 ///
 /// A non-`dyn` seam: production reads the [`Wall`](Self::Wall) clock; a test
-/// can pin time with [`Fixed`](Self::Fixed) and advance the shared counter past
+/// can pin time with `Fixed` and advance the shared counter past
 /// a stamped expiry **without sleeping**, so the TTL-expiry property is
 /// deterministic. The cache stamps expiries with the same source it reads them
 /// against, so the two never disagree.
@@ -475,7 +475,7 @@ impl FjallCellCache {
     }
 
     /// Reads and decodes one cell's raw fjall frame: the shared prologue
-    /// behind [`get`](Self::get) and [`stored_expiry`](Self::stored_expiry),
+    /// behind [`get`](Self::get) and `stored_expiry`,
     /// which differ only in how they treat an expired stamp.
     async fn read_decoded(
         &self,

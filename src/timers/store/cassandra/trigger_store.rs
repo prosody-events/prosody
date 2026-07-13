@@ -6,8 +6,8 @@
 //! BATCH only when clustering rows actually need to change.
 //!
 //! **Locking contract.** State-mutating methods call `resolve_state` to obtain
-//! the per-`(key, timer_type)` [`CachedState`] mutex (see
-//! [`crate::timers::store::cassandra::state`]) and hold it from the state
+//! the per-`(key, timer_type)` [`CachedState`](super::state::CachedState) mutex
+//! (see [`crate::timers::store::cassandra::state`]) and hold it from the state
 //! check through the DB write — that is what makes the read-decide-write
 //! sequence linearisable against concurrent callers on the same
 //! `(key, timer_type)`. Read-only stream methods take the same lock briefly
