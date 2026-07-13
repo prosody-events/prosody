@@ -808,13 +808,18 @@ fn map_absent_keyset_streams_zero_reads() -> Result<()> {
     })
 }
 
-/// The set-racing-stream pin (the split-stream bounded-arm materialization
-/// contract): the keyset stream materializes under one gate hold, so a racing
-/// `set` of a listed key cannot interleave — the drain yields EXACTLY the
-/// init-materialized state (stronger than some-serial-order), and the set
-/// applies after. Red without the gate: the set completes while the stream is
-/// parked at its keyset read, the dirty overlay wins the entry read, and the
-/// stream yields the new value.
+/// The set-racing-stream pin (the chunked-stream contract): a mutator racing a
+/// live stream serializes against the CURRENT chunk fetch and lands **between
+/// chunks**, never mid-fetch. The stream snapshots key membership at its init
+/// keyset read, then releases the gate before fetching the entry chunk; a `set`
+/// parked on the gate during the init read therefore lands first (FIFO) and
+/// buffers `1→99` into the shared overlay, so the entry chunk — a fresh gate
+/// acquire — reads key 1 through the overlay = 99. Values are read live,
+/// chunk by chunk (the point-get arm's per-arm consistency contract); the
+/// interleaving property `run_map_stream_interleave` is the stronger successor
+/// (named in the commit). Red-proven by deleting the permit acquisition in
+/// `set` OR the stream's chunk fetch: without serialization the yield is
+/// nondeterministic and the stream can observe a torn state.
 #[test]
 fn gate_excludes_set_during_keyset_stream() -> Result<()> {
     runtime()?.block_on(async {
@@ -884,8 +889,9 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
             .map_err(|e| eyre!("stream: {e}"))?;
         assert_eq!(
             yielded,
-            vec![(1, Value::from(10_i64)), (2, Value::from(20_i64))],
-            "the stream yields the init-materialized state, not the racing set"
+            vec![(1, Value::from(99_i64)), (2, Value::from(20_i64))],
+            "the racing set landed between the init keyset read and the entry chunk fetch \
+             (chunk-scoped hold, not whole-stream): the chunk read key 1 through the overlay"
         );
         timeout(HANG_GUARD, set_task)
             .await
@@ -894,22 +900,29 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
         assert_eq!(
             handle.get(&1).await.map_err(|e| eyre!("{e}"))?,
             Some(Value::from(99_i64)),
-            "the set applied after the whole stream materialized"
+            "the set is durable in the overlay"
         );
         Ok(())
     })
 }
 
-/// Item 11's stream pin: the deque's bounded materialization holds the gate,
-/// so a racing `pop_back` + `commit()` cannot interleave — the stream yields
-/// the whole pre-commit window in order, and the commit applies after. The
-/// window is wider than the prefetch width, so without the gate the parked
-/// materialization's unlaunched tail reads WOULD observe the commit (the
-/// red). Also re-checks the counting pin's scan half: zero scans (the full
-/// `len + 1`-gets pin lives in `state::tests::deque_stream_issues_no_scans`).
+/// The pop-between-chunks pin (the chunked-stream contract, deque twin of
+/// `gate_excludes_set_during_keyset_stream`): a mutator racing a live stream
+/// lands **between chunks**, not mid-chunk. The window (20) spans two chunks
+/// (16 + 4). A `pop_back()` + `commit()` parked on the gate while the stream
+/// holds chunk 1's permit lands after chunk 1 releases (FIFO): it buffers a
+/// clear of index 19 into the shared overlay, so the stream's chunk 2
+/// (positions 16..19) reads index 19 through the overlay = absent and **skips**
+/// it (position identity, the per-arm consistency contract). The output is
+/// deterministic via the overlay clear + FIFO(pop before the chunk-2 acquire),
+/// independent of the durable commit's ordering — so this pin does NOT assert a
+/// commit-before-chunk-2 order. The interleaving property
+/// `run_deque_stream_interleave` is the stronger successor (named in the
+/// commit). Re-checks the point-get arm issues zero scans.
 #[test]
-fn gate_excludes_commit_during_bounded_materialization() -> Result<()> {
-    /// Wider than `WINDOW_PREFETCH` (16), under the scan threshold (128).
+fn gate_excludes_pop_between_deque_chunks() -> Result<()> {
+    /// Wider than `WINDOW_CHUNK` (16) so the window spans two chunks (16 + 4),
+    /// under the scan threshold (128).
     const LEN: usize = 20;
 
     runtime()?.block_on(async {
@@ -971,17 +984,18 @@ fn gate_excludes_commit_during_bounded_materialization() -> Result<()> {
             .await
             .map_err(|_| eyre!("stream hung"))??
             .map_err(|e| eyre!("stream: {e}"))?;
-        let want: Vec<Value> = (0..LEN)
+        let want: Vec<Value> = (0..LEN - 1)
             .map(|i| i64::try_from(i).map(Value::from))
             .collect::<Result<_, _>>()?;
         assert_eq!(
             yielded, want,
-            "the materialization yields the whole pre-commit window, in index order"
+            "the pop landed between chunk 1 and chunk 2; position 19 read absent through the \
+             overlay and was skipped (chunk-scoped hold)"
         );
         assert_eq!(
             fx.counting.lower_scans(),
             0,
-            "the bounded materialization issues no scans"
+            "the point-get arm issues no scans"
         );
         let popped = timeout(HANG_GUARD, pop_task)
             .await
@@ -990,27 +1004,30 @@ fn gate_excludes_commit_during_bounded_materialization() -> Result<()> {
         assert_eq!(
             popped,
             Some(Value::from(i64::try_from(LEN - 1)?)),
-            "the pop applied after the materialization"
+            "the pop removed the back element"
         );
         assert_eq!(
             handle.len().await.map_err(|e| eyre!("{e}"))?,
             LEN - 1,
-            "the commit landed after the stream's window"
+            "the commit made the pop durable"
         );
         Ok(())
     })
 }
 
-/// The error-yield gate-release pin (map): a `Tracked` map stream whose
-/// point-get hits an undecodable entry yields `Err` — and MUST release the
-/// session gate before that yield reaches user code. Otherwise a caller that
-/// catches the error and, with the stream still alive, issues another op on the
-/// same session deadlocks: the suspended generator holds the gate the next op
-/// waits on (the split-stream contract on `SessionGate` — the gate is never
-/// held across a yield to user code, error items included). Red without the
-/// fix: the `try_stream!` `?` yields the error while the init permit is still
-/// held (the generator suspends at the yield before the permit drops), so the
-/// follow-up `get` parks forever and the hang-guard trips.
+/// The error-yield gate-release pin (map): a `Tracked` map stream whose entry
+/// holds undecodable bytes yields `Err` — and MUST release the session gate
+/// before that yield reaches user code. Otherwise a caller that catches the
+/// error and, with the stream still alive, issues another op on the same
+/// session deadlocks: the suspended generator holds the gate the next op waits
+/// on (the chunked-stream contract on `SessionGate` — the gate is never held
+/// across a yield to user code, error items included). Mechanism under
+/// chunking: the corrupt bytes **fetch** fine under the chunk permit; the
+/// decode error fires in the gate-free **resolve** step, after `drop(permit)`,
+/// so the `try_stream!` `?` yields it gate-free. Red-proven by resolving under
+/// the gate (moving `drop(permit)` after the resolve+yield loop): the error
+/// yields with the gate held, the follow-up `get` parks forever, and the
+/// hang-guard trips.
 #[test]
 fn map_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1071,9 +1088,11 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 }
 
 /// The error-yield gate-release pin (deque twin of
-/// [`map_stream_error_yield_releases_the_gate`]): a bounded deque stream whose
-/// point-get hits an undecodable element yields `Err` and MUST release the gate
-/// before the yield. Same mechanism, same red, on the structural twin.
+/// [`map_stream_error_yield_releases_the_gate`]): a point-get deque stream
+/// whose element holds undecodable bytes yields `Err` and MUST release the gate
+/// before the yield. Same mechanism (corrupt bytes fetch fine under the chunk
+/// permit; the decode error fires in the gate-free resolve after
+/// `drop(permit)`), same red, on the structural twin.
 #[test]
 fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1195,6 +1214,106 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
             .map_err(|e| eyre!("get: {e}"))?;
 
         // The settle acquire proceeds (the drop-is-safe futurelock half).
+        let permit = timeout(HANG_GUARD, session.close_gate())
+            .await
+            .map_err(|_| eyre!("hang-guard: settle's close never acquired the gate"))?;
+        drop(permit);
+        Ok(())
+    })
+}
+
+/// The chunk-fetch cancellation pin (the stream cousin of
+/// [`dropped_session_op_releases_the_gate`]): a stream whose chunk fetch parks
+/// holding the gate is dropped — while it HOLDS the gate, and while a second op
+/// is QUEUED behind it — and the RAII permit is released, so the next op and
+/// settle's close acquire both proceed. Drop-releases-via-RAII is green by
+/// construction; the falsification that guards it is detaching the chunk fetch
+/// into a `tokio::spawn` (the design's forbidden detachment) so an abort of the
+/// stream task cannot cancel the fetch — then the gate stays held and the
+/// follow-up op's hang-guard trips.
+#[test]
+fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_stream_cancel")?;
+        // Seed a small deque window cold, valued by index.
+        let id = fx.id("d")?;
+        let dref = CollectionRef::new(id.clone(), None);
+        let mut seeded = vec![(
+            deque::meta_cell(),
+            Some(Bytes::from(deque::seed_frame(0, 3))),
+        )];
+        for i in 0..3_i64 {
+            seeded.push((
+                deque::entry_cell_for(&I64KeyCodec::encode(&i)),
+                Some(Bytes::from(serde_json::to_vec(&Value::from(i))?)),
+            ));
+        }
+        fx.counting.write_resolved(&dref, &seeded, &[]).await?;
+
+        let session = fx.session(1);
+        let handle = deque_state::<JsonCodec>("d")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        // Warm the bounds cell so the armed hold lands on the first ENTRY read —
+        // i.e. inside a chunk fetch, holding the gate.
+        assert_eq!(handle.len().await.map_err(|e| eyre!("{e}"))?, 3);
+
+        // Drop a HOLDING stream: its chunk fetch parks in the withheld entry
+        // read, gate held.
+        fx.holds.get_for_cache().arm(1);
+        let stream_task = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                let stream = handle.stream(Direction::Forward);
+                futures::pin_mut!(stream);
+                let _ = stream.next().await;
+            }
+        });
+        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+            .await
+            .map_err(|_| eyre!("the chunk fetch never reached its hold"))?;
+        stream_task.abort();
+        assert!(
+            stream_task.await.is_err(),
+            "the stream was dropped mid-chunk-fetch"
+        );
+
+        // The next op proceeds — the dropped generator released the gate.
+        timeout(HANG_GUARD, handle.is_empty())
+            .await
+            .map_err(|_| {
+                eyre!("hang-guard: the chunk fetch's permit was not released by the drop")
+            })?
+            .map_err(|e| eyre!("is_empty: {e}"))?;
+
+        // Drop a QUEUED next(): A (a chunk fetch) holds, a queued op B waits, B
+        // is dropped, A completes, and settle's close still proceeds.
+        fx.holds.get_for_cache().arm(1);
+        let holding = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                let stream = handle.stream(Direction::Forward);
+                futures::pin_mut!(stream);
+                stream.next().await.transpose()
+            }
+        });
+        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+            .await
+            .map_err(|_| eyre!("the second chunk fetch never reached its hold"))?;
+        let queued = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.len().await }
+        });
+        let_task_park().await;
+        queued.abort();
+        assert!(queued.await.is_err(), "the queued op was dropped");
+        fx.holds.get_for_cache().release();
+        timeout(HANG_GUARD, holding)
+            .await
+            .map_err(|_| eyre!("the holding stream hung"))??
+            .map_err(|e| eyre!("stream: {e}"))?;
+
+        // Settle's close acquire proceeds (the drop-is-safe half).
         let permit = timeout(HANG_GUARD, session.close_gate())
             .await
             .map_err(|_| eyre!("hang-guard: settle's close never acquired the gate"))?;

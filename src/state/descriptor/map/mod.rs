@@ -106,12 +106,13 @@ const ENTRY_SECTION: Section = Section::new(MapNs::Entries as i8);
 /// unbounded meta cell, so the byte size is capped independently of the count.
 const KEYSET_BYTE_CEILING: usize = 64 * 1024;
 
-/// Concurrency width of the Tracked stream's ordered point gets
-/// (`.buffered(KEYSET_PREFETCH)`): bounded and named, sized to overlap the
-/// durable round-trips of a cold keyset (a warm keyset's fjall hits gain
-/// nothing and lose nothing), not for throughput. Mirrors the deque window's
-/// prefetch.
-const KEYSET_PREFETCH: usize = 16;
+/// The Tracked stream's chunk width: the granularity of both the per-chunk
+/// gate hold (one read permit per chunk fetch, released before the chunk is
+/// resolved and yielded) and the fetch concurrency (`.buffered(KEYSET_CHUNK)`).
+/// Bounded and named, sized to overlap the durable round-trips of a cold keyset
+/// (a warm keyset's fjall hits gain nothing and lose nothing), not for
+/// throughput. Mirrors the deque window's [`WINDOW_CHUNK`](super::deque).
+const KEYSET_CHUNK: usize = 16;
 
 /// Keyset frame tag for a [`Keyset::Tracked`] payload. Frozen wire byte, pinned
 /// by `map_keyset_cell_bytes_are_frozen`.
@@ -320,22 +321,6 @@ enum StreamPlan<K> {
     Empty,
 }
 
-/// What [`MapHandle::stream`] yields once its under-gate init has finished and
-/// the permit is released — computed while the gate is held, then handed out
-/// gate-free so an error is never yielded to user code under the gate (the
-/// split-stream contract on [`SessionGate`](crate::state::session)).
-enum StreamStart<K, V> {
-    /// The bounded arm's materialized entries, yielded straight from memory.
-    Buffered(Vec<(K, V)>),
-
-    /// The degrade arm — the full-section scan, streamed per-item after the
-    /// permit drops.
-    Scan,
-
-    /// Nothing to yield (an absent keyset ⇒ no live entries).
-    Empty,
-}
-
 /// One item [`MapHandle::stream`] yields: a decoded key paired with its
 /// resolved value, or the error that ended the stream.
 type MapStreamItem<KC, V> =
@@ -418,23 +403,36 @@ where
     /// [`Direction::Forward`], descending for [`Direction::Backward`]. Each
     /// entry's value is resolved as it is yielded.
     ///
-    /// A `Tracked` keyset within its bound is the fast arm: iteration
-    /// **materializes** the listed keys' entries by bounded concurrent point
-    /// gets under one gate hold (the split-stream bounded contract), skipping
-    /// any that read absent (the current-membership skip), so a warm small map
-    /// streams entirely from cache with zero durable scans. An `Overflowed`,
-    /// malformed, oversized, or otherwise undecodable keyset degrades to a
-    /// **full-section** (`Unbounded`-edged) scan, which yields every live entry
-    /// (the store hides cleared cells) at the accepted degraded cost of walking
-    /// the whole section. An **absent** keyset means no live entries (the
-    /// current-membership invariant), so the stream yields nothing with
-    /// zero entry reads (no scan).
+    /// # Per-arm consistency (a paged read, not a snapshot)
+    ///
+    /// A `Tracked` keyset within its bound is the fast arm: **key membership is
+    /// snapshotted at init** (the one keyset read), then the listed keys are
+    /// point-got in gate-scoped chunks of `KEYSET_CHUNK`. Keys added after
+    /// init are not yielded; **values are read live, chunk by chunk** — a key
+    /// removed/cleared/expired after init reads absent (skipped, the
+    /// current-membership skip) and an overwritten key yields the newer value
+    /// when its chunk is fetched. So a warm small map streams entirely from
+    /// cache with zero durable scans. An `Overflowed`, malformed, oversized, or
+    /// otherwise undecodable keyset degrades to a **full-section**
+    /// (`Unbounded`-edged) scan: live pages (own dirty writes snapshotted at
+    /// init, the durable leg lazily), hides cleared cells, and can observe
+    /// entries the handler itself mid-handler-commits ahead of the cursor (it
+    /// terminates because a finite handler inserts finitely many coordinates
+    /// ahead — a visibility semantic, not a termination hazard). An **absent**
+    /// keyset means no live entries (the current-membership invariant), so the
+    /// stream yields nothing with zero entry reads (no scan).
+    ///
+    /// The gate is held only for the init keyset read and per chunk fetch
+    /// (≤ `KEYSET_CHUNK` point reads each), never across a yield to user code
+    /// (items and errors alike) and never across resolution — so a handler may
+    /// mutate this map between stream items without deadlock or error
+    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)).
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
         // so each inner await is instrumented with a clone instead; the
         // span's recorded time is the stream's own work. Unlike the sibling
         // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing scan ends with an OK-status span, and the
+        // the span — a failing chunk ends with an OK-status span, and the
         // yielded `Err` surfaces to the caller inside this span's scope.
         let span = info_span!(
             "map.stream",
@@ -442,71 +440,27 @@ where
             direction = ?dir,
         );
         try_stream! {
-            // The split stream contract (see `SessionGate`): the gate is held
-            // for the init keyset read and — on the bounded arm — the whole
-            // materialization (every listed entry, ≤ the keyset bound in
-            // memory), released before the first yield; the scan arm drops the
-            // permit after the keyset read and streams per-item live. Neither
-            // holds the gate across a yield to user code — the fallible init
-            // runs inside an inner `async` block (which `try_stream!` leaves
-            // untransformed, so its `?` is an ordinary early return that drops
-            // the permit), so the error `?` at this level only fires after the
-            // permit has been released.
-            let permit = self.entries.read_permit().instrument(span.clone()).await;
-            let init = async {
-                match self.stream_plan(&permit, dir).instrument(span.clone()).await? {
-                    StreamPlan::Tracked(keys) => {
-                        // Concurrent ordered point gets: the gate hold above is
-                        // the safety argument, the per-cell reads commute across
-                        // distinct coordinates, and `buffered(KEYSET_PREFETCH)`
-                        // overlaps a cold keyset's durable round-trips in key
-                        // order.
-                        let len = keys.len();
-                        // Reborrow the owned read permit as a `Copy` `&OpPermit`
-                        // outside the fan-out closure, so each per-key future
-                        // copies the reference rather than moving the permit.
-                        let permit = &permit;
-                        let gets = stream::iter(keys)
-                            .map(|key| {
-                                cooperative(async move {
-                                    let value = self.entries.get(permit, &key).await?;
-                                    Ok::<_, MapStateError<CellCodecError<V>>>(
-                                        value.map(|v| (key, v)),
-                                    )
-                                })
-                            })
-                            .buffered(KEYSET_PREFETCH);
-                        futures::pin_mut!(gets);
-                        let mut buffer: Vec<(KC::Key, ResolvedOf<V>)> = Vec::with_capacity(len);
-                        while let Some(item) = gets.next().instrument(span.clone()).await {
-                            // A `None` is a removed/expired key: skipped, never
-                            // an error (the current-membership skip).
-                            if let Some(entry) = item? {
-                                buffer.push(entry);
-                            }
-                        }
-                        // Pin the error type once (the value type infers from
-                        // this variant) so the outer `?` need not annotate a
-                        // complex `Result`.
-                        Ok::<_, MapStateError<CellCodecError<V>>>(StreamStart::Buffered(buffer))
-                    }
-                    StreamPlan::Scan => Ok(StreamStart::Scan),
-                    StreamPlan::Empty => Ok(StreamStart::Empty),
-                }
-            }
-            .await;
-            drop(permit);
-            match init? {
-                StreamStart::Buffered(buffer) => {
-                    for entry in buffer {
-                        yield entry;
-                    }
-                }
-                StreamStart::Empty => {}
-                StreamStart::Scan => {
-                    // The degrade fallback walks the whole entry section: no
-                    // keyset enumeration remains to fence it, so both edges are
-                    // `Unbounded`. `dir` still orders the walk.
+            // Init: read the keyset plan under one permit, released before any
+            // resolve or yield. The fallible read runs inside an inner `async`
+            // block (which `try_stream!` leaves untransformed, so its `?` is an
+            // ordinary early return that drops the permit), so the outer `?`
+            // fires only after the permit is dropped.
+            let plan = {
+                let permit = self.entries.read_permit().instrument(span.clone()).await;
+                let init = async { self.stream_plan(&permit, dir).await }
+                    .instrument(span.clone())
+                    .await;
+                drop(permit);
+                init?
+            };
+            match plan {
+                // Absent keyset ⇒ no live entries: yield nothing.
+                StreamPlan::Empty => {}
+                // The degrade fallback walks the whole entry section: no keyset
+                // enumeration remains to fence it, so both edges are
+                // `Unbounded`. `dir` still orders the walk; the scan drops the
+                // gate after its own init and pages live thereafter.
+                StreamPlan::Scan => {
                     let inner = self.entries.scan(
                         ScanEdge::<&KC::Key>::Unbounded,
                         dir,
@@ -516,6 +470,70 @@ where
                     futures::pin_mut!(inner);
                     while let Some(item) = inner.next().instrument(span.clone()).await {
                         yield item?;
+                    }
+                }
+                StreamPlan::Tracked(keys) => {
+                    let mut key_iter = keys.into_iter();
+                    // ONE upfront chunk scratch, reused via `drain` per chunk
+                    // (fixed bound, never regrown). A `Vec`, not a `SmallVec`:
+                    // the scratch lives across every yield in the stream future,
+                    // and an inline `SmallVec<[_; KEYSET_CHUNK]>` would bloat the
+                    // future toward clippy's `large_futures` bound — the same
+                    // reason `StagedCollection` keeps a `Vec`.
+                    let mut raw: Vec<(KC::Key, Bytes)> = Vec::with_capacity(KEYSET_CHUNK);
+                    while key_iter.len() > 0 {
+                        // Fetch the next chunk under its OWN permit, dropped
+                        // before any `?`/yield. `buffered` keeps key order and
+                        // overlaps a cold keyset's durable round-trips.
+                        {
+                            let permit = self.entries.read_permit().instrument(span.clone()).await;
+                            let fetched = async {
+                                // Reborrow as a `Copy` `&OpPermit` so each per-key
+                                // future copies the reference rather than moving
+                                // the permit.
+                                let permit = &permit;
+                                let gets = stream::iter(key_iter.by_ref().take(KEYSET_CHUNK))
+                                    .map(|key| {
+                                        cooperative(async move {
+                                            let bytes = self.entries.get_bytes(permit, &key).await?;
+                                            Ok::<_, MapStateError<CellCodecError<V>>>(
+                                                bytes.map(|b| (key, b)),
+                                            )
+                                        })
+                                    })
+                                    .buffered(KEYSET_CHUNK);
+                                futures::pin_mut!(gets);
+                                while let Some(item) = gets.next().instrument(span.clone()).await {
+                                    // A `None` is a removed/expired key: skipped,
+                                    // never an error (the current-membership skip).
+                                    if let Some(kb) = item? {
+                                        raw.push(kb);
+                                    }
+                                }
+                                Ok::<_, MapStateError<CellCodecError<V>>>(())
+                            }
+                            .await;
+                            drop(permit);
+                            fetched?;
+                        }
+                        // Resolve the chunk gate-free (resolution takes no
+                        // permit), yield in key order.
+                        {
+                            let resolves = stream::iter(raw.drain(..))
+                                .map(|(key, bytes)| {
+                                    cooperative(async move {
+                                        Ok::<_, MapStateError<CellCodecError<V>>>((
+                                            key,
+                                            self.entries.resolve_bytes(bytes).await?,
+                                        ))
+                                    })
+                                })
+                                .buffered(KEYSET_CHUNK);
+                            futures::pin_mut!(resolves);
+                            while let Some(item) = resolves.next().instrument(span.clone()).await {
+                                yield item?;
+                            }
+                        }
                     }
                 }
             }

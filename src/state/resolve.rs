@@ -143,14 +143,14 @@ where
 /// Resolves one raw cell to its visible committed value for a bottom store's
 /// **scan** — the read-only sibling of [`resolve_read`].
 ///
-/// A scan runs gate-free over a pager/snapshot view (the split-stream contract
-/// on [`SessionGate`](crate::state::session)), so it must NOT perform the
-/// durable write-back a point read does: a repair computed from that snapshot
-/// could delete or overwrite a newer same-handler `commit()` of the same cell
-/// (a later monotonic driver timestamp makes the stale write win — a lost
-/// durable write with no repair site). The foreign-provisional arm therefore
-/// consults the oracle and returns the resolved value — `data` (committed) or
-/// `prev` (not committed) — WITHOUT calling
+/// A scan runs gate-free over a pager/snapshot view (the chunked stream
+/// contract on [`SessionGate`](crate::state::session)), so it must NOT perform
+/// the durable write-back a point read does: a repair computed from that
+/// snapshot could delete or overwrite a newer same-handler `commit()` of the
+/// same cell (a later monotonic driver timestamp makes the stale write win — a
+/// lost durable write with no repair site). The foreign-provisional arm
+/// therefore consults the oracle and returns the resolved value — `data`
+/// (committed) or `prev` (not committed) — WITHOUT calling
 /// [`mark_resolved`](CellStore::mark_resolved) or
 /// [`write_resolved`](CellStore::write_resolved). The cell stays provisional,
 /// behaviorally identical to "the scan never repaired it"; the point read

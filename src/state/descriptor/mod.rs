@@ -721,7 +721,7 @@ impl<S: CellSession> CellScope<S> {
     /// design: a scan drives gate-free (the stream takes the gate only for its
     /// init metadata read; see
     /// [`SessionGate`](crate::state::session::sealed::SessionGate)'s
-    /// split-stream contract).
+    /// chunked stream contract).
     pub(in crate::state::descriptor) fn raw_scan<'a>(
         &'a self,
         scan: Scan<'a>,
@@ -890,16 +890,18 @@ where
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
-    /// Reads, decodes, and resolves the visible committed value at `key`.
+    /// Reads, decodes, and resolves the visible committed value at `key` — the
+    /// point-op surface, recomposing the witnessed [`Self::get_bytes`] fetch
+    /// with the gate-free [`Self::resolve_bytes`] decode+resolve.
     ///
     /// Written in the desugared `-> impl Future + Send` form for two reasons an
     /// `async fn` could not express:
     /// - the future holds the resolver's [`ContextOf`] GAT projection across
     ///   the resolve await, which rustc issue #100013 cannot infer `Send` for
     ///   through an `async fn`;
-    /// - the key is lowered to its coordinate *before* the async block, so only
-    ///   the owned [`CellKey`] — never the borrowed `&KeyOf<T>` — is captured
-    ///   into the future.
+    /// - the key is lowered to its coordinate *before* the async block (inside
+    ///   [`Self::get_bytes`]), so only the owned [`CellKey`] — never the
+    ///   borrowed `&KeyOf<T>` — is captured into the future.
     ///
     /// # Errors
     ///
@@ -912,16 +914,70 @@ where
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send + 'a
     {
-        let cell = self.cell(key);
+        let fetch = self.get_bytes(permit, key);
         async move {
-            let Some(bytes) = self.scope.raw_get(permit, &cell).await? else {
-                return Ok(None);
-            };
-            let stored = decode_cell::<T::Codec>(bytes).map_err(CellStateError::Codec)?;
+            match fetch.await? {
+                Some(bytes) => Ok(Some(self.resolve_bytes(bytes).await?)),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Reads one cell's visible committed RAW bytes (witnessed) — the gated
+    /// half of [`Self::get`]: the overlay check → `raw_get` → cache-fill
+    /// publish, with no decode. Streams call this per chunk under a per-chunk
+    /// permit and resolve the returned bytes gate-free via
+    /// [`Self::resolve_bytes`].
+    ///
+    /// Desugared `-> impl Future + Send` and lowering the key to its
+    /// [`CellKey`] *before* the async block, so only the owned coordinate — not
+    /// the borrowed `&KeyOf<T>` — crosses the `raw_get` await.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(crate) fn get_bytes<'a>(
+        &'a self,
+        permit: &'a OpPermit<'_>,
+        key: &KeyOf<T>,
+    ) -> impl Future<Output = Result<Option<Bytes>, CellStateError<CellCodecError<T>>>> + Send + 'a
+    {
+        let cell = self.cell(key);
+        async move { Ok(self.scope.raw_get(permit, &cell).await?) }
+    }
+
+    /// Decodes and resolves raw cell bytes into the exposed value — the
+    /// gate-free half of [`Self::get`]. Takes no permit: a resolver's only
+    /// session capability is `()` or `&Loader` ([`FromSession`]), never a cell
+    /// op, so resolution touches no cell state and needs no gate (the same
+    /// property [`Self::get`] has always relied on — it resolves *under* the
+    /// permit today, so a gate-re-entering resolver would already deadlock).
+    /// Streams resolve each chunk through this after dropping the fetch permit;
+    /// [`Self::scan`]'s per-item body shares it.
+    ///
+    /// Desugared `-> impl Future + Send + 'a` (with the synchronous decode
+    /// hoisted before the async block) so the `Send` bound is **stated**, not
+    /// inferred: a `.map(|item| cooperative(...resolve_bytes...))` fan-out
+    /// requires the per-item futures `Send` for a higher-ranked lifetime, which
+    /// an `async fn`'s inferred `Send` is "not general enough" to satisfy
+    /// across a `tokio::spawn`. The explicit bound also removes the need
+    /// for the `manual_async_fn` shape a single-async-block `async fn`
+    /// would trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns a codec error (Permanent) when the bytes do not decode, or a
+    /// resolution error from the resolver.
+    fn resolve_bytes<'a>(
+        &'a self,
+        bytes: Bytes,
+    ) -> impl Future<Output = Result<ResolvedOf<T>, CellStateError<CellCodecError<T>>>> + Send + 'a
+    {
+        let stored = decode_cell::<T::Codec>(bytes);
+        async move {
+            let stored = stored.map_err(CellStateError::Codec)?;
             let ctx = <ContextOf<'a, T> as FromSession<'a, S>>::from_session(self.scope.session());
-            Ok(Some(
-                <T::Resolver as CellResolver>::resolve(ctx, stored).await?,
-            ))
+            Ok(<T::Resolver as CellResolver>::resolve(ctx, stored).await?)
         }
     }
 
@@ -999,7 +1055,7 @@ where
     ) -> impl Stream<Item = ScanItem<T>> + Send + 'a {
         try_stream! {
             ensure_live(self.scope.session())?;
-            let session = self.scope.session();
+            let this = self;
             // Encode the direction-relative edges once, here — the owned
             // coordinates outlive the scan the generator drives to completion
             // below. (`Scan::start`/`end` follow `dir`; `Scan` itself derives
@@ -1015,7 +1071,8 @@ where
             };
             // `cooperative` inline in the producing closure (a `.map(cooperative)`
             // stage trips a higher-ranked-lifetime error on the non-`'static`
-            // per-item futures); `buffered` keeps key order.
+            // per-item futures); `buffered` keeps key order. Resolution shares
+            // `resolve_bytes` with the point-op `get` — one gate-free path.
             let inner = self
                 .scope
                 .raw_scan(scan)
@@ -1024,11 +1081,7 @@ where
                         let (cell, bytes) = item?;
                         let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
                             .map_err(CellStateError::Key)?;
-                        let stored =
-                            decode_cell::<T::Codec>(bytes).map_err(CellStateError::Codec)?;
-                        let ctx = <ContextOf<'a, T> as FromSession<'a, S>>::from_session(session);
-                        let resolved =
-                            <T::Resolver as CellResolver>::resolve(ctx, stored).await?;
+                        let resolved = this.resolve_bytes(bytes).await?;
                         Ok::<_, CellStateError<CellCodecError<T>>>((key, resolved))
                     })
                 })

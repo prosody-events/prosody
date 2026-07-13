@@ -59,10 +59,27 @@ use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Display;
+use std::future::Future;
+use std::iter::once;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
+use tokio::time::timeout;
 use uuid::Uuid;
+
+/// The interleave pins' hang-guard: the ONLY deadline in
+/// [`run_map_stream_interleave`] / [`run_deque_stream_interleave`], and never
+/// an assertion — a legal interleaving completes instantly, so this fires only
+/// when the stream holds the gate across a yield (the `StreamYieldFree`
+/// violation it guards against).
+const INTERLEAVE_HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// Seed size for the interleave pins — spans more than one point-get chunk
+/// (`> 16`) and stays under `DEQUE_POINT_ITERATION_MAX` (128), so both
+/// collections take the chunked point-get arm.
+const INTERLEAVE_SEED: usize = 20;
 
 /// The per-partition backend for the suites: a memory cell store and a scripted
 /// commit oracle, behind the standard [`PartitionBackend`] bundle.
@@ -1745,4 +1762,392 @@ fn read_event(index: usize) -> EventRef {
     EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX - index as u128),
     }
+}
+
+/// One step of a map stream-interleave trace: advance the live stream one item,
+/// or run a mutator on the same session between items.
+#[derive(Clone, Debug)]
+pub(crate) enum MapStreamStep {
+    /// Pull the next stream item.
+    Advance,
+    /// `set(key, val)`.
+    Set(i64, i64),
+    /// `remove(key)`.
+    Remove(i64),
+    /// `clear()`.
+    Clear,
+    /// Mid-handler `commit()`.
+    Commit,
+    /// Mid-handler `rollback()`.
+    Rollback,
+}
+
+impl Arbitrary for MapStreamStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // Keys 0..24 span the 20-key seed plus a few added-after-init keys;
+        // values 0..8 so re-sets collide. `Advance` is weighted heavily so the
+        // stream actually drains between mutations.
+        let key = i64::from(u8::arbitrary(g) % 24);
+        let val = i64::from(u8::arbitrary(g) % 8);
+        match g
+            .choose(&[0_u8, 0, 0, 1, 1, 2, 3, 4, 5])
+            .copied()
+            .unwrap_or(0)
+        {
+            1 => Self::Set(key, val),
+            2 => Self::Remove(key),
+            3 => Self::Commit,
+            4 => Self::Rollback,
+            5 => Self::Clear,
+            _ => Self::Advance,
+        }
+    }
+}
+
+/// A map stream-interleave trace plus the stream direction.
+#[derive(Clone, Debug)]
+pub(crate) struct MapInterleave {
+    steps: Vec<MapStreamStep>,
+    backward: bool,
+}
+
+impl Arbitrary for MapInterleave {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            steps: capped_vec(g, MAX_TRACE_OPS),
+            backward: bool::arbitrary(g),
+        }
+    }
+}
+
+/// One step of a deque stream-interleave trace.
+#[derive(Clone, Debug)]
+pub(crate) enum DequeStreamStep {
+    /// Pull the next stream item.
+    Advance,
+    /// `push_back(val)`.
+    PushBack(i64),
+    /// `push_front(val)`.
+    PushFront(i64),
+    /// `pop_back()`.
+    PopBack,
+    /// `pop_front()`.
+    PopFront,
+    /// `clear()`.
+    Clear,
+    /// Mid-handler `commit()`.
+    Commit,
+    /// Mid-handler `rollback()`.
+    Rollback,
+}
+
+impl Arbitrary for DequeStreamStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let val = i64::from(u8::arbitrary(g));
+        match g
+            .choose(&[0_u8, 0, 0, 1, 2, 3, 4, 5, 6, 7])
+            .copied()
+            .unwrap_or(0)
+        {
+            1 => Self::PushBack(val),
+            2 => Self::PushFront(val),
+            3 => Self::PopBack,
+            4 => Self::PopFront,
+            5 => Self::Commit,
+            6 => Self::Rollback,
+            7 => Self::Clear,
+            _ => Self::Advance,
+        }
+    }
+}
+
+/// A deque stream-interleave trace plus the stream direction.
+#[derive(Clone, Debug)]
+pub(crate) struct DequeInterleave {
+    steps: Vec<DequeStreamStep>,
+    backward: bool,
+}
+
+impl Arbitrary for DequeInterleave {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            steps: capped_vec(g, MAX_TRACE_OPS),
+            backward: bool::arbitrary(g),
+        }
+    }
+}
+
+/// Runs a fallible handle op under the interleave hang-guard, tagging both the
+/// timeout and the op error with `label` — the mutator boilerplate the
+/// interleave runners share.
+async fn guarded<T, E: Display>(label: &str, fut: impl Future<Output = Result<T, E>>) -> Result<T> {
+    timeout(INTERLEAVE_HANG_GUARD, fut)
+        .await
+        .map_err(|_| eyre!("{label} hung"))?
+        .map_err(|e| eyre!("{label}: {e}"))
+}
+
+/// Weak-consistency check for one yielded map entry: its key was in the init
+/// snapshot, is yielded at most once, and its value was held at that key at
+/// some point (the per-arm consistency contract — a paged live read, not a
+/// snapshot).
+fn check_map_yield(
+    key: i64,
+    value: &Value,
+    init_keys: &BTreeSet<i64>,
+    yielded: &mut BTreeSet<i64>,
+    ever_held: &BTreeMap<i64, BTreeSet<i64>>,
+) -> Result<()> {
+    if !init_keys.contains(&key) {
+        bail!("yielded key {key} was not in the init-snapshot membership");
+    }
+    if !yielded.insert(key) {
+        bail!("key {key} was yielded twice");
+    }
+    let value = value
+        .as_i64()
+        .ok_or_else(|| eyre!("non-integer value yielded for key {key}"))?;
+    if !ever_held
+        .get(&key)
+        .is_some_and(|held| held.contains(&value))
+    {
+        bail!("value {value} yielded for key {key} was never held there");
+    }
+    Ok(())
+}
+
+/// PIN 6 (map, `StreamYieldFree`): random `next()`/mutator interleavings on ONE
+/// live session against a live map stream never deadlock and never error, and
+/// every yielded entry is weakly consistent with the init snapshot. A forced
+/// first `Advance` locks the key-membership snapshot to the committed seed
+/// before any mutator runs, so a yielded key must be a seed key and its value
+/// one held there at some point (values are read live, chunk by chunk). Every
+/// op is bounded by [`INTERLEAVE_HANG_GUARD`] — the only deadline, never the
+/// assertion. FALSIFICATION: hold the chunk permit across the resolve+yield
+/// loop (move `drop(permit)` after it) → the first mutator after an `Advance`
+/// blocks on the gate the suspended generator holds → the hang-guard elapses →
+/// red.
+pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bool> {
+    let MapInterleave { steps, backward } = input;
+    let dir = if backward {
+        Direction::Backward
+    } else {
+        Direction::Forward
+    };
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("iv");
+    let (registry, collection_ref) = registry_and_ref(
+        &descriptor,
+        "iv",
+        &state_key,
+        CollectionDef {
+            // ≥ seed so the map stays Tracked (the chunked point-get arm).
+            keyset_limit: 4096,
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let id = collection_ref.id();
+    let armed: ArmedKeys = Arc::default();
+
+    // Seed a committed map of INTERLEAVE_SEED keys; `ever_held` records each.
+    let mut ever_held: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    let seed_event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let seed_session = make_session(&cells, &oracle, &registry, &state_key, &armed, seed_event);
+    let seed = descriptor
+        .bind(&seed_session)
+        .map_err(|e| eyre!("bind: {e}"))?;
+    for i in 0..INTERLEAVE_SEED {
+        let key = i64::try_from(i)?;
+        seed.set(key, Value::from(key)).await?;
+        ever_held.entry(key).or_default().insert(key);
+    }
+    finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, id).await?;
+    let init_keys: BTreeSet<i64> = (0..i64::try_from(INTERLEAVE_SEED)?).collect();
+
+    // A fresh live session; the stream and its racing mutators share it.
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let stream = handle.stream(dir);
+    futures::pin_mut!(stream);
+
+    let mut yielded: BTreeSet<i64> = BTreeSet::new();
+    // A forced first `Advance` locks the snapshot to the committed seed before
+    // any mutator, then the generated steps interleave freely.
+    for step in once(MapStreamStep::Advance).chain(steps) {
+        match step {
+            MapStreamStep::Advance => {
+                if let Some(item) = timeout(INTERLEAVE_HANG_GUARD, stream.next())
+                    .await
+                    .map_err(|_| eyre!("Advance hung: the stream held the gate across a yield"))?
+                {
+                    let (key, value) =
+                        item.map_err(|e| eyre!("stream yielded Err on a legal interleaving: {e}"))?;
+                    check_map_yield(key, &value, &init_keys, &mut yielded, &ever_held)?;
+                }
+            }
+            MapStreamStep::Set(key, val) => {
+                guarded("set", handle.set(key, Value::from(val))).await?;
+                ever_held.entry(key).or_default().insert(val);
+            }
+            MapStreamStep::Remove(key) => {
+                guarded("remove", handle.remove(&key)).await?;
+            }
+            MapStreamStep::Clear => {
+                guarded("clear", handle.clear()).await?;
+            }
+            MapStreamStep::Commit => {
+                guarded("commit", handle.commit()).await?;
+            }
+            MapStreamStep::Rollback => {
+                timeout(INTERLEAVE_HANG_GUARD, handle.rollback())
+                    .await
+                    .map_err(|_| eyre!("rollback hung"))?;
+            }
+        }
+    }
+    // Drain the remainder under the hang-guard.
+    while let Some(item) = timeout(INTERLEAVE_HANG_GUARD, stream.next())
+        .await
+        .map_err(|_| eyre!("drain hung"))?
+    {
+        let (key, value) = item.map_err(|e| eyre!("stream yielded Err on drain: {e}"))?;
+        check_map_yield(key, &value, &init_keys, &mut yielded, &ever_held)?;
+    }
+    Ok(true)
+}
+
+/// PIN 6 (deque, `StreamYieldFree`): the structural twin of
+/// [`run_map_stream_interleave`]. A forced first `Advance` locks the **position
+/// window** snapshot to the committed seed; thereafter random push/pop/clear/
+/// commit/rollback mutators interleave with `next()`. No op deadlocks, no
+/// `Advance` errors, the yielded count never exceeds the init window length,
+/// and every yielded value was pushed at some point (position identity — a
+/// popped position reads absent and is skipped). Same FALSIFICATION as the map
+/// twin.
+pub(crate) async fn run_deque_stream_interleave(input: DequeInterleave) -> Result<bool> {
+    let DequeInterleave { steps, backward } = input;
+    let dir = if backward {
+        Direction::Backward
+    } else {
+        Direction::Forward
+    };
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("iv");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "iv", &state_key, CollectionDef::new(None))?;
+    let id = collection_ref.id();
+    let armed: ArmedKeys = Arc::default();
+
+    // Seed a committed window of INTERLEAVE_SEED elements; `ever_pushed` records
+    // every value the deque ever held.
+    let mut ever_pushed: BTreeSet<i64> = BTreeSet::new();
+    let seed_event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let seed_session = make_session(&cells, &oracle, &registry, &state_key, &armed, seed_event);
+    let seed = descriptor
+        .bind(&seed_session)
+        .map_err(|e| eyre!("bind: {e}"))?;
+    for i in 0..INTERLEAVE_SEED {
+        let value = i64::try_from(i)?;
+        seed.push_back(Value::from(value)).await?;
+        ever_pushed.insert(value);
+    }
+    finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, id).await?;
+
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let stream = handle.stream(dir);
+    futures::pin_mut!(stream);
+
+    let mut yielded = 0_usize;
+
+    for step in once(DequeStreamStep::Advance).chain(steps) {
+        match step {
+            DequeStreamStep::Advance => {
+                if let Some(item) = timeout(INTERLEAVE_HANG_GUARD, stream.next())
+                    .await
+                    .map_err(|_| eyre!("Advance hung: the stream held the gate across a yield"))?
+                {
+                    let value =
+                        item.map_err(|e| eyre!("stream yielded Err on a legal interleaving: {e}"))?;
+                    check_deque_yield(&value, &ever_pushed, &mut yielded)?;
+                }
+            }
+            DequeStreamStep::PushBack(val) => {
+                guarded("push_back", handle.push_back(Value::from(val))).await?;
+                ever_pushed.insert(val);
+            }
+            DequeStreamStep::PushFront(val) => {
+                guarded("push_front", handle.push_front(Value::from(val))).await?;
+                ever_pushed.insert(val);
+            }
+            DequeStreamStep::PopBack => {
+                guarded("pop_back", handle.pop_back()).await?;
+            }
+            DequeStreamStep::PopFront => {
+                guarded("pop_front", handle.pop_front()).await?;
+            }
+            DequeStreamStep::Clear => {
+                guarded("clear", handle.clear()).await?;
+            }
+            DequeStreamStep::Commit => {
+                guarded("commit", handle.commit()).await?;
+            }
+            DequeStreamStep::Rollback => {
+                timeout(INTERLEAVE_HANG_GUARD, handle.rollback())
+                    .await
+                    .map_err(|_| eyre!("rollback hung"))?;
+            }
+        }
+    }
+    while let Some(item) = timeout(INTERLEAVE_HANG_GUARD, stream.next())
+        .await
+        .map_err(|_| eyre!("drain hung"))?
+    {
+        let value = item.map_err(|e| eyre!("stream yielded Err on drain: {e}"))?;
+        check_deque_yield(&value, &ever_pushed, &mut yielded)?;
+    }
+    Ok(true)
+}
+
+/// Weak-consistency check for one yielded deque element: the yielded count
+/// stays within the init window length and the value was pushed at some point
+/// (position identity — a popped position reads absent and is skipped).
+fn check_deque_yield(
+    value: &Value,
+    ever_pushed: &BTreeSet<i64>,
+    yielded: &mut usize,
+) -> Result<()> {
+    *yielded += 1;
+    if *yielded > INTERLEAVE_SEED {
+        bail!("yielded more items than the init window length");
+    }
+    let value = value
+        .as_i64()
+        .ok_or_else(|| eyre!("non-integer value yielded"))?;
+    if !ever_pushed.contains(&value) {
+        bail!("value {value} was never pushed");
+    }
+    Ok(())
 }

@@ -8,7 +8,7 @@ use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
-use crate::state::descriptor::StructuralIdentity;
+use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
@@ -26,9 +26,10 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
 use futures::stream::{self, Stream};
 use quickcheck::{Arbitrary, Gen};
+use serde_json::Value;
 use std::convert::Infallible;
 use std::fmt;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -454,6 +455,53 @@ where
             .abort_provisional
             .fetch_add(1, Ordering::Relaxed);
         self.inner.abort_provisional(collection, writes).await
+    }
+}
+
+/// A session loader carrying a resolve counter, so a stream-laziness test can
+/// bound how many values a stream materializes independently of the
+/// [`CountingCellStore`] fetch counters. Mirrors that store's owned-counter,
+/// read-by-reference shape — no process-global static, so parallel tests stay
+/// isolated.
+#[derive(Clone, Default)]
+pub(crate) struct ResolveCounter(Arc<AtomicUsize>);
+
+impl ResolveCounter {
+    /// Resolutions counted so far.
+    pub(crate) fn resolves(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A passthrough JSON [`CellResolver`] that bumps the session loader's resolve
+/// counter on every [`resolve`](CellResolver::resolve). Pair it as
+/// `WithResolver<JsonCodec, CountingResolver>` over a [`ResolveCounter`]
+/// session loader; a stream-laziness test then asserts a `take(k)` stream
+/// resolves only its consumed prefix (± one chunk), never the whole collection.
+pub(crate) struct CountingResolver;
+
+impl CellResolver for CountingResolver {
+    type Context<'s> = &'s ResolveCounter;
+    type Resolved = Value;
+    type Stored = Value;
+    type Write<'a> = Value;
+
+    const RESOLVER_ID: Option<&'static str> = Some("test-counting-resolver.v1");
+
+    fn resolve(
+        ctx: Self::Context<'_>,
+        stored: Value,
+    ) -> impl Future<Output = Result<Value, StateAccessError>> + Send {
+        ctx.bump();
+        ready(Ok(stored))
+    }
+
+    fn stored_from(write: Value) -> Value {
+        write
     }
 }
 

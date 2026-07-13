@@ -12,12 +12,13 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeHoles, DequeTrace, MapTrace, finalize_and_promote, run_deque_holes, run_deque_trace,
-    run_map_keyset_exact_trace, run_map_trace, run_map_ttl_keyset_refresh_trace,
+    DequeHoles, DequeInterleave, DequeTrace, MapInterleave, MapTrace, finalize_and_promote,
+    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_keyset_exact_trace,
+    run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
-use self::support::{CountingCellStore, fresh_collection};
+use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
 use super::cell::ProvisionalWrite;
-use super::descriptor::{StateDescriptor, deque, deque_state, map_state};
+use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
 use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -38,9 +39,10 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use futures::executor;
-use quickcheck::QuickCheck;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::runtime::Builder;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -824,4 +826,297 @@ fn deque_stream_issues_no_scans() -> Result<()> {
         );
         Ok(())
     })
+}
+
+/// The chunk width both point-get streams hold the gate for and fetch
+/// concurrently in — mirrors `KEYSET_CHUNK`/`WINDOW_CHUNK` (16); the laziness
+/// bounds are stated in terms of it.
+const STREAM_CHUNK: usize = 16;
+
+/// A dense stream-laziness case: a collection of `n` entries drained
+/// `stream(..).take(k)`, with `n` on the deque's point-get arm (`≤ 128`) and
+/// far above `k`, so "fetch/resolve only the consumed prefix" is a strictly
+/// stronger claim than "fetch everything".
+#[derive(Clone, Copy, Debug)]
+struct StreamPrefix {
+    n: usize,
+    k: usize,
+}
+
+impl Arbitrary for StreamPrefix {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // 48..=127: dense, ≤ DEQUE_POINT_ITERATION_MAX (128) so the deque stays
+        // on the chunked point-get arm, and always > k + STREAM_CHUNK so the
+        // "materialize everything" defect is observable.
+        let n = 48 + usize::arbitrary(g) % 80;
+        // 1..=12: well under one chunk width and far under n.
+        let k = 1 + usize::arbitrary(g) % 12;
+        Self { n, k }
+    }
+}
+
+/// Mints a session over `counting` carrying a [`ResolveCounter`] loader, so a
+/// stream-laziness pin can bound resolutions independently of fetches.
+fn resolve_session(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    oracle: &ScriptedOracle,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    armed: &ArmedKeys,
+    event: EventRef,
+    loader: ResolveCounter,
+) -> KeyedStateSession<CountingBackend, ResolveCounter> {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    KeyedStateSession::new(SessionParts::<CountingBackend, _> {
+        cell: counting.clone(),
+        dirty: Arc::default(),
+        oracle: oracle.clone(),
+        loader,
+        registry: registry.clone(),
+        state_key: state_key.clone(),
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: armed.clone(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+    })
+}
+
+/// PIN 5 (map): a `stream(dir).take(k)` over a **dense** `n`-entry `Tracked`
+/// map is genuinely incremental — it fetches at most one chunk beyond `k` (plus
+/// the single keyset read) and resolves at most `k + STREAM_CHUNK` values,
+/// never the whole `n`-entry collection. The counting store bounds fetches and
+/// the counting resolver bounds resolutions; both counters sit at the lowest
+/// layer, so nothing masks a materialization. FALSIFICATION: set `KEYSET_CHUNK`
+/// huge (one chunk = the whole map) → `take(k)` fetches and resolves all `n` →
+/// `lower_reads == n + 1` and `resolves == n`, both `> k + STREAM_CHUNK` for
+/// `n ≫ k` → red.
+async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("lz");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(
+        &descriptor,
+        CollectionDef {
+            // ≥ n so the map stays Tracked (the dense point-get arm).
+            keyset_limit: 4096,
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let registry = Arc::new(registry);
+    let counting = CountingCellStore::new(MemoryCellStore::new(
+        cells.clone(),
+        oracle.clone(),
+        registry.clone(),
+    ));
+    let armed: ArmedKeys = Arc::default();
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("lz")?,
+    );
+
+    // Seed a dense committed map of n entries (a blind `set` never resolves).
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = resolve_session(
+        &counting,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event,
+        ResolveCounter::default(),
+    );
+    let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    for i in 0..n {
+        let key = i64::try_from(i)?;
+        seed.set(key, Value::from(key))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+    }
+    finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+    // Fresh cold session, zeroed counters; drain only the k-prefix.
+    counting.reset();
+    let resolves = ResolveCounter::default();
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = resolve_session(
+        &counting,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event,
+        resolves.clone(),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let taken: Vec<_> = {
+        let stream = handle.stream(dir).take(k);
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.map_err(|e| eyre!("stream: {e}"))?);
+        }
+        out
+    };
+    assert_eq!(
+        taken.len(),
+        k.min(n),
+        "take(k) yields exactly k.min(n) entries"
+    );
+    assert!(
+        counting.lower_reads() <= k + STREAM_CHUNK + 1,
+        "a lazy map take(k) fetches at most one chunk beyond k plus the keyset read (reads={}, \
+         k={k}, n={n})",
+        counting.lower_reads()
+    );
+    assert!(
+        resolves.resolves() <= k + STREAM_CHUNK,
+        "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
+        resolves.resolves()
+    );
+    Ok(())
+}
+
+/// PIN 5 (deque): the structural twin of [`run_map_stream_prefix_lazy`] over a
+/// dense `n`-entry window on the point-get arm — at most one chunk beyond `k`
+/// fetched (plus the single bounds read) and at most `k + STREAM_CHUNK`
+/// resolved. Same FALSIFICATION via a huge `WINDOW_CHUNK`.
+async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<WithResolver<JsonCodec, CountingResolver>>("lz");
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(&descriptor, CollectionDef::new(None))?;
+    let registry = Arc::new(registry);
+    let counting = CountingCellStore::new(MemoryCellStore::new(
+        cells.clone(),
+        oracle.clone(),
+        registry.clone(),
+    ));
+    let armed: ArmedKeys = Arc::default();
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("lz")?,
+    );
+
+    // Seed a dense committed window of n entries (a blind `push_back` never
+    // resolves).
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = resolve_session(
+        &counting,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event,
+        ResolveCounter::default(),
+    );
+    let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    for i in 0..n {
+        seed.push_back(Value::from(i64::try_from(i)?))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+    }
+    finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+    counting.reset();
+    let resolves = ResolveCounter::default();
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = resolve_session(
+        &counting,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event,
+        resolves.clone(),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    let taken: Vec<_> = {
+        let stream = handle.stream(dir).take(k);
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.map_err(|e| eyre!("stream: {e}"))?);
+        }
+        out
+    };
+    assert_eq!(
+        taken.len(),
+        k.min(n),
+        "take(k) yields exactly k.min(n) elements"
+    );
+    assert!(
+        counting.lower_reads() <= k + STREAM_CHUNK + 1,
+        "a lazy deque take(k) fetches at most one chunk beyond k plus the bounds read (reads={}, \
+         k={k}, n={n})",
+        counting.lower_reads()
+    );
+    assert!(
+        resolves.resolves() <= k + STREAM_CHUNK,
+        "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
+        resolves.resolves()
+    );
+    Ok(())
+}
+
+/// PIN 5: both collections' `stream(dir).take(k)` are genuinely incremental —
+/// the fetch/resolve budget tracks the consumed prefix, not the collection
+/// size. A `QuickCheck` property over dense `(n, k)` in both directions.
+#[test]
+fn stream_take_is_lazy() {
+    fn property(input: StreamPrefix) -> Result<bool> {
+        let StreamPrefix { n, k } = input;
+        executor::block_on(async move {
+            for dir in [Direction::Forward, Direction::Backward] {
+                run_map_stream_prefix_lazy(n, k, dir).await?;
+                run_deque_stream_prefix_lazy(n, k, dir).await?;
+            }
+            Ok(true)
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(StreamPrefix) -> Result<bool>);
+}
+
+/// PIN 6 (map): the `StreamYieldFree` interleaving property — random
+/// `next()`/mutator interleavings on one live session never deadlock or error
+/// and stay weakly consistent with the init snapshot. A fresh `current_thread`
+/// runtime with a time driver per iteration powers the hang-guard; no sleeps.
+#[test]
+fn map_stream_interleave_is_yield_free() {
+    fn property(input: MapInterleave) -> Result<bool> {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| eyre!("runtime: {e}"))?
+            .block_on(run_map_stream_interleave(input))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapInterleave) -> Result<bool>);
+}
+
+/// PIN 6 (deque): the `StreamYieldFree` interleaving property on the structural
+/// twin.
+#[test]
+fn deque_stream_interleave_is_yield_free() {
+    fn property(input: DequeInterleave) -> Result<bool> {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| eyre!("runtime: {e}"))?
+            .block_on(run_deque_stream_interleave(input))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeInterleave) -> Result<bool>);
 }

@@ -62,6 +62,7 @@ use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::session::{CellSession, MutatePermit, OpPermit};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
+use bytes::Bytes;
 use educe::Educe;
 use futures::stream::{self, Stream, StreamExt};
 use std::error::Error;
@@ -86,14 +87,16 @@ const ENTRY_SECTION: Section = Section::new(DequeNs::Entries as i8);
 /// Iteration shape threshold: a window of at most this many entries streams
 /// by per-index point gets — each a cacheable committed point read — while a
 /// wider window pays one durable range scan instead of `len` point reads. A
-/// shape choice, not configuration.
+/// read-shape choice, not configuration.
 pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
 
-/// Concurrency width of the bounded materialization's ordered point gets
-/// (`.buffered(WINDOW_PREFETCH)`): bounded and named, sized to overlap the
-/// durable round-trips of a cold window (a warm window's fjall hits gain
-/// nothing and lose nothing), not for throughput.
-const WINDOW_PREFETCH: usize = 16;
+/// The point-get stream's chunk width: the granularity of both the per-chunk
+/// gate hold (one read permit per chunk fetch, released before the chunk is
+/// resolved and yielded) and the fetch concurrency (`.buffered(WINDOW_CHUNK)`).
+/// Bounded and named, sized to overlap the durable round-trips of a cold window
+/// (a warm window's fjall hits gain nothing and lose nothing), not for
+/// throughput. Mirrors the map keyset's [`KEYSET_CHUNK`](super::map).
+const WINDOW_CHUNK: usize = 16;
 
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so
@@ -167,26 +170,6 @@ pub struct DequeHandle<S, T> {
     meta: CellView<S, MetaCodec>,
 }
 
-/// What [`DequeHandle::stream`] yields once its under-gate init has finished
-/// and the permit is released — computed while the gate is held, then handed
-/// out gate-free so an error is never yielded to user code under the gate (the
-/// split-stream contract on [`SessionGate`](crate::state::session)).
-enum StreamStart<V> {
-    /// The bounded arm's materialized elements, yielded straight from memory.
-    Buffered(Vec<V>),
-
-    /// The scan arm's live window — streamed per-item after the permit drops.
-    Scan {
-        /// The validated window `[head, tail)` to anchor the scan on.
-        window: Window,
-        /// The window length, passed as the scan's page hint.
-        len: usize,
-    },
-
-    /// The window is empty; nothing to yield.
-    Empty,
-}
-
 impl<S, T> DequeHandle<S, T>
 where
     S: CellSession,
@@ -257,15 +240,31 @@ where
     /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
     /// element is resolved as it is yielded.
     ///
+    /// # Per-arm consistency (position identity, a paged read, not a snapshot)
+    ///
     /// Iteration point-reads each index in `[head, tail)` (see the module's
-    /// window invariant) and **skips** an absent index — a TTL-expired entry
-    /// resolves as skipped, never an error. Windows wider than
-    /// `DEQUE_POINT_ITERATION_MAX` entries fall back to one durable range scan
-    /// over the window: identical items in identical order, but a mid-stream
-    /// read failure may surface after a different-length yielded prefix (the
-    /// bounded arm materializes the window before yielding, so a read failure
-    /// surfaces before any item; the scan fallback may yield a prefix and then
-    /// fail at a page boundary).
+    /// window invariant) in gate-scoped chunks of `WINDOW_CHUNK`. The
+    /// **position window** `[head, tail)` is snapshotted at init — **position
+    /// identity, not element identity**: each position yields whatever the cell
+    /// holds when its chunk is fetched, so a pop observed before the fetch
+    /// reads absent and is **skipped** (the same skip a TTL hole already
+    /// requires, never an error), and a pop-then-push reusing the position
+    /// yields the new occupant. Windows wider than
+    /// `DEQUE_POINT_ITERATION_MAX` entries fall back to one durable range
+    /// scan over the window — identical items in identical order, live
+    /// pages, same skip-absent semantics.
+    ///
+    /// A bounded-arm read failure may surface **after** a yielded prefix (a
+    /// deliberate change: chunked point gets yield the prior chunks before a
+    /// later chunk's read fails, exactly as the scan arm has always yielded a
+    /// prefix before failing at a page boundary — the two arms' error contracts
+    /// converge).
+    ///
+    /// The gate is held only for the init bounds read and per chunk fetch
+    /// (≤ `WINDOW_CHUNK` point reads each), never across a yield to user code
+    /// (items and errors alike) and never across resolution — so a handler may
+    /// mutate this deque between stream items without deadlock or error
+    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)).
     pub fn stream(
         &self,
         dir: Direction,
@@ -274,7 +273,7 @@ where
         // so each inner await is instrumented with a clone instead; the
         // span's recorded time is the stream's own work. Unlike the sibling
         // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing stream ends with an OK-status span, and the
+        // the span — a failing chunk ends with an OK-status span, and the
         // yielded `Err` surfaces to the caller inside this span's scope.
         let span = info_span!(
             "deque.stream",
@@ -282,98 +281,116 @@ where
             direction = ?dir,
         );
         try_stream! {
-            // The split stream contract (see `SessionGate`): the bounded arm
-            // materializes under ONE gate hold — bounds plus every listed
-            // entry, ≤ DEQUE_POINT_ITERATION_MAX in memory — released before
-            // the first yield; the scan arm drops the permit after the bounds
-            // read and streams per-item live. Neither holds the gate across a
-            // yield to user code — the fallible init runs inside an inner
-            // `async` block (which `try_stream!` leaves untransformed, so its
-            // `?` is an ordinary early return that drops the permit), so the
-            // error `?` at this level only fires after the permit is released.
-            let permit = self.entries.read_permit().instrument(span.clone()).await;
-            let init = async {
-                let window = self.bounds(&permit).instrument(span.clone()).await?;
-                let len = window.len()?;
-                if len == 0 {
-                    return Ok(StreamStart::Empty);
+            // Init: read the window bounds under one permit, released before any
+            // resolve or yield. The fallible read runs inside an inner `async`
+            // block (which `try_stream!` leaves untransformed, so its `?` is an
+            // ordinary early return that drops the permit), so the outer `?`
+            // fires only after the permit is dropped.
+            let (window, len) = {
+                let permit = self.entries.read_permit().instrument(span.clone()).await;
+                let init = async {
+                    let window = self.bounds(&permit).await?;
+                    let len = window.len()?;
+                    Ok::<_, DequeStateError<CellCodecError<T>>>((window, len))
                 }
-                if len > DEQUE_POINT_ITERATION_MAX {
-                    return Ok(StreamStart::Scan { window, len });
+                .instrument(span.clone())
+                .await;
+                drop(permit);
+                init?
+            };
+            if len == 0 {
+                // Empty window: yield nothing.
+            } else if len > DEQUE_POINT_ITERATION_MAX {
+                // Wide window: one durable range scan, anchored on the window —
+                // front `head` to back `tail − 1` (`len > 0` proves `tail − 1`
+                // does not underflow), mirrored backward. The scan drops the
+                // gate after its own init and pages live thereafter.
+                let head = window.head;
+                let last = window
+                    .tail
+                    .checked_sub(1)
+                    .ok_or(MetaDecodeError::IndexOverflow)?;
+                let (start, end) = match dir {
+                    Direction::Forward => (ScanEdge::Included(&head), ScanEdge::Included(&last)),
+                    Direction::Backward => (ScanEdge::Included(&last), ScanEdge::Included(&head)),
+                };
+                let inner = self.entries.scan(start, dir, end, Some(len));
+                futures::pin_mut!(inner);
+                while let Some(item) = inner.next().instrument(span.clone()).await {
+                    // The scan yields the decoded index; the module's window
+                    // invariant makes it redundant, so only the resolved element
+                    // is exposed.
+                    let (_, value) = item?;
+                    yield value;
                 }
-                // Reborrow the owned read permit as a `Copy` `&OpPermit`
-                // outside the fan-out closure, so each per-index future copies
-                // the reference rather than moving the permit.
-                let permit = &permit;
-                // Concurrent ordered point gets: the gate hold above is the
-                // safety argument (commit()/set cannot interleave with the
-                // materialization — the exclusion is the gate, not a serial
-                // loop), the per-cell reads are write-free except the per-key
-                // cache fill and commute across distinct coordinates, and
-                // `buffered(WINDOW_PREFETCH)` overlaps the cold window's
-                // durable round-trips while yielding in index order.
-                let gets = stream::iter(0..len)
-                    .map(|i| {
-                        let position = match dir {
-                            Direction::Forward => i,
-                            Direction::Backward => len - 1 - i,
-                        };
-                        cooperative(async move {
-                            let index = window.absolute(position)?;
-                            Ok::<_, DequeStateError<CellCodecError<T>>>(
-                                self.entries.get(permit, &index).await?,
-                            )
-                        })
-                    })
-                    .buffered(WINDOW_PREFETCH);
-                futures::pin_mut!(gets);
-                let mut buffer: Vec<ResolvedOf<T>> = Vec::with_capacity(len);
-                while let Some(item) = gets.next().instrument(span.clone()).await {
-                    // A `None` is a TTL hole: skipped, never an error.
-                    if let Some(value) = item? {
-                        buffer.push(value);
-                    }
-                }
-                // Pin the error type once (the value type infers from this
-                // variant) so the outer `?` need not annotate a complex
-                // `Result`.
-                Ok::<_, DequeStateError<CellCodecError<T>>>(StreamStart::Buffered(buffer))
-            }
-            .await;
-            drop(permit);
-            match init? {
-                StreamStart::Empty => {}
-                StreamStart::Buffered(buffer) => {
-                    for value in buffer {
-                        yield value;
-                    }
-                }
-                StreamStart::Scan { window, len } => {
-                    // Anchor both edges on the window: front `head` to back
-                    // `tail − 1` (`len > 0` proves `tail − 1` does not
-                    // underflow), mirrored backward.
-                    let head = window.head;
-                    let last = window
-                        .tail
-                        .checked_sub(1)
-                        .ok_or(MetaDecodeError::IndexOverflow)?;
-                    let (start, end) = match dir {
-                        Direction::Forward => {
-                            (ScanEdge::Included(&head), ScanEdge::Included(&last))
+            } else {
+                // Point-get arm: fetch the window in gate-scoped chunks, each
+                // resolved and yielded gate-free. Positions are computed
+                // arithmetically from the snapshot window — no key list. ONE
+                // upfront chunk scratch, reused via `drain` per chunk (fixed
+                // bound, never regrown); a `Vec`, not a `SmallVec`, because it
+                // lives across every yield in the stream future and an inline
+                // `SmallVec` would bloat the future toward clippy's
+                // `large_futures` bound (as `StagedCollection` keeps a `Vec`).
+                let mut raw: Vec<Bytes> = Vec::with_capacity(WINDOW_CHUNK);
+                let mut next = 0usize;
+                while next < len {
+                    let chunk_end = (next + WINDOW_CHUNK).min(len);
+                    // Fetch the chunk under its OWN permit, dropped before any
+                    // `?`/yield. `buffered` keeps index order.
+                    {
+                        let permit = self.entries.read_permit().instrument(span.clone()).await;
+                        let fetched = async {
+                            // Reborrow as a `Copy` `&OpPermit` so each per-index
+                            // future copies the reference rather than moving it.
+                            let permit = &permit;
+                            let gets = stream::iter(next..chunk_end)
+                                .map(|i| {
+                                    let position = match dir {
+                                        Direction::Forward => i,
+                                        Direction::Backward => len - 1 - i,
+                                    };
+                                    cooperative(async move {
+                                        let index = window.absolute(position)?;
+                                        Ok::<_, DequeStateError<CellCodecError<T>>>(
+                                            self.entries.get_bytes(permit, &index).await?,
+                                        )
+                                    })
+                                })
+                                .buffered(WINDOW_CHUNK);
+                            futures::pin_mut!(gets);
+                            while let Some(item) = gets.next().instrument(span.clone()).await {
+                                // A `None` is a TTL hole or a popped position:
+                                // skipped, never an error.
+                                if let Some(bytes) = item? {
+                                    raw.push(bytes);
+                                }
+                            }
+                            Ok::<_, DequeStateError<CellCodecError<T>>>(())
                         }
-                        Direction::Backward => {
-                            (ScanEdge::Included(&last), ScanEdge::Included(&head))
-                        }
-                    };
-                    let inner = self.entries.scan(start, dir, end, Some(len));
-                    futures::pin_mut!(inner);
-                    while let Some(item) = inner.next().instrument(span.clone()).await {
-                        // The scan yields the decoded index; the module's window
-                        // invariant makes it redundant, so only the resolved
-                        // element is exposed.
-                        let (_, value) = item?;
-                        yield value;
+                        .await;
+                        drop(permit);
+                        fetched?;
                     }
+                    // Resolve the chunk gate-free (resolution takes no permit),
+                    // yield in index order.
+                    {
+                        let resolves = stream::iter(raw.drain(..))
+                            .map(|bytes| {
+                                cooperative(async move {
+                                    self.entries
+                                        .resolve_bytes(bytes)
+                                        .await
+                                        .map_err(DequeStateError::from)
+                                })
+                            })
+                            .buffered(WINDOW_CHUNK);
+                        futures::pin_mut!(resolves);
+                        while let Some(item) = resolves.next().instrument(span.clone()).await {
+                            yield item?;
+                        }
+                    }
+                    next = chunk_end;
                 }
             }
         }
