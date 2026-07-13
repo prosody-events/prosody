@@ -344,10 +344,7 @@ pub(crate) mod sealed {
     /// **Each public op acquires the gate exactly once** (a stream's
     /// acquisition is its init); nothing beneath a public wrapper
     /// re-acquires — a tokio `Mutex` is not reentrant, so an internal
-    /// re-acquire is a deadlock the KV4 pins would surface as a hang. The
-    /// factoring rule that enforces this: every descriptor operation is one
-    /// gated public wrapper over gate-free private helpers, and
-    /// no helper ever calls a public wrapper.
+    /// re-acquire is a deadlock the KV4 pins would surface as a hang.
     ///
     /// **Streams have a split contract.** A *bounded* stream (a sub-threshold
     /// deque window, or a `Tracked` map keyset within its bound) materializes
