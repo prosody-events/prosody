@@ -73,7 +73,7 @@
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
-    Descriptor, FromSession, Keyed, ResolvedOf, WriteOf,
+    Descriptor, FromSession, Keyed, ResolvedOf, STREAM_CHUNK, WriteOf,
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -86,9 +86,11 @@ use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use smallvec::SmallVec;
 use std::error::Error;
 use std::fmt::Display;
+use std::future::ready;
 use std::marker::PhantomData;
 use std::slice::from_ref;
 use thiserror::Error;
@@ -105,14 +107,6 @@ const ENTRY_SECTION: Section = Section::new(MapNs::Entries as i8);
 /// instead: `keyset_limit` keys of unbounded encoded length must not produce an
 /// unbounded meta cell, so the byte size is capped independently of the count.
 const KEYSET_BYTE_CEILING: usize = 64 * 1024;
-
-/// The Tracked stream's chunk width: the granularity of both the per-chunk
-/// gate hold (one read permit per chunk fetch, released before the chunk is
-/// resolved and yielded) and the fetch concurrency (`.buffered(KEYSET_CHUNK)`).
-/// Bounded and named, sized to overlap the durable round-trips of a cold keyset
-/// (a warm keyset's fjall hits gain nothing and lose nothing), not for
-/// throughput. Mirrors the deque window's [`WINDOW_CHUNK`](super::deque).
-pub(crate) const KEYSET_CHUNK: usize = 16;
 
 /// Keyset frame tag for a [`Keyset::Tracked`] payload. Frozen wire byte, pinned
 /// by `map_keyset_cell_bytes_are_frozen`.
@@ -413,7 +407,7 @@ where
     ///
     /// A `Tracked` keyset within its bound is the fast arm: **key membership is
     /// snapshotted at init** (the one keyset read), then the listed keys are
-    /// point-got in gate-scoped chunks of `KEYSET_CHUNK`. Keys added after
+    /// point-got in gate-scoped chunks of `STREAM_CHUNK`. Keys added after
     /// init are not yielded; **values are read live, chunk by chunk** — a key
     /// removed/cleared/expired after init reads absent (skipped, the
     /// current-membership skip) and an overwritten key yields the newer value
@@ -428,11 +422,15 @@ where
     /// keyset means no live entries (the current-membership invariant), so the
     /// stream yields nothing with zero entry reads (no scan).
     ///
-    /// The gate is held only for the init keyset read and per chunk fetch
-    /// (≤ `KEYSET_CHUNK` point reads each), never across a yield to user code
-    /// (items and errors alike) and never across resolution — so a handler may
-    /// mutate this map between stream items without deadlock or error
-    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)).
+    /// The gate is held only for the init keyset read and per chunk
+    /// (≤ `STREAM_CHUNK` point reads each): each chunk is fetched, decoded, and
+    /// resolved under one permit that dies with the chunk future's scope before
+    /// any of its items reach user code, so the gate is never held across a
+    /// yield (items and errors alike) — a handler may mutate this map between
+    /// stream items without deadlock (`StreamYieldFree`; see
+    /// [`SessionGate`](crate::state::session)). Errors are chunk-atomic: a
+    /// failing chunk yields none of its items (all its live entries, or only
+    /// its error).
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
         // so each inner await is instrumented with a clone instead; the
@@ -479,66 +477,43 @@ where
                     }
                 }
                 StreamPlan::Tracked(keys) => {
-                    let mut key_iter = keys.into_iter();
-                    // ONE upfront chunk scratch, reused via `drain` per chunk
-                    // (fixed bound, never regrown). A `Vec`, not a `SmallVec`:
-                    // the scratch lives across every yield in the stream future,
-                    // and an inline `SmallVec<[_; KEYSET_CHUNK]>` would bloat the
-                    // future toward clippy's `large_futures` bound — the same
-                    // reason `StagedCollection` keeps a `Vec`.
-                    let mut raw: Vec<(KC::Key, Bytes)> = Vec::with_capacity(KEYSET_CHUNK);
-                    while key_iter.len() > 0 {
-                        // Fetch the next chunk under its OWN permit, dropped
-                        // before any `?`/yield. `buffered` keeps key order and
-                        // overlaps a cold keyset's durable round-trips.
-                        {
-                            let permit = self.entries.read_permit().instrument(span.clone()).await;
-                            let fetched = async {
-                                // Reborrow as a `Copy` `&OpPermit` so each per-key
-                                // future copies the reference rather than moving
-                                // the permit.
-                                let permit = &permit;
-                                let gets = stream::iter(key_iter.by_ref().take(KEYSET_CHUNK))
-                                    .map(|key| {
-                                        cooperative(async move {
-                                            let bytes = self.entries.get_bytes(permit, &key).await?;
-                                            Ok::<_, MapStateError<CellCodecError<V>>>(
-                                                bytes.map(|b| (key, b)),
-                                            )
-                                        })
-                                    })
-                                    .buffered(KEYSET_CHUNK);
-                                futures::pin_mut!(gets);
-                                while let Some(item) = gets.next().instrument(span.clone()).await {
-                                    // A `None` is a removed/expired key: skipped,
-                                    // never an error (the current-membership skip).
-                                    if let Some(kb) = item? {
-                                        raw.push(kb);
-                                    }
-                                }
-                                Ok::<_, MapStateError<CellCodecError<V>>>(())
-                            }
-                            .await;
-                            drop(permit);
-                            fetched?;
+                    // Chunk source: the draining key iterator is the unfold
+                    // state, so owned keys move straight from the plan into
+                    // their chunk's `get` futures — no per-chunk key Vec.
+                    let chunks = stream::unfold(keys.into_iter(), |mut keys| async move {
+                        if keys.len() == 0 {
+                            return None;
                         }
-                        // Resolve the chunk gate-free (resolution takes no
-                        // permit), yield in key order.
-                        {
-                            let resolves = stream::iter(raw.drain(..))
-                                .map(|(key, bytes)| {
-                                    cooperative(async move {
-                                        Ok::<_, MapStateError<CellCodecError<V>>>((
-                                            key,
-                                            self.entries.resolve_bytes(bytes).await?,
-                                        ))
-                                    })
+                        // One read permit per chunk, dropped with this future's
+                        // scope — never held across a yield (StreamYieldFree).
+                        let permit = self.entries.read_permit().await;
+                        let permit = &permit;
+                        let chunk = stream::iter(keys.by_ref().take(STREAM_CHUNK))
+                            .map(|key| {
+                                cooperative(async move {
+                                    let value = self.entries.get(permit, &key).await?;
+                                    Ok::<_, MapStateError<CellCodecError<V>>>(
+                                        value.map(|value| (key, value)),
+                                    )
                                 })
-                                .buffered(KEYSET_CHUNK);
-                            futures::pin_mut!(resolves);
-                            while let Some(item) = resolves.next().instrument(span.clone()).await {
-                                yield item?;
-                            }
+                            })
+                            // `buffered` keeps key order and overlaps a cold
+                            // chunk's durable round-trips.
+                            .buffered(STREAM_CHUNK)
+                            // A `None` is a removed/expired key: skipped, never
+                            // an error (the current-membership skip).
+                            .try_filter_map(|entry| ready(Ok(entry)))
+                            // Short-circuits at the first ordered error,
+                            // cancelling the chunk's in-flight reads; collects
+                            // inline — no heap.
+                            .try_collect::<SmallVec<[_; STREAM_CHUNK]>>()
+                            .await;
+                        Some((chunk, keys))
+                    });
+                    futures::pin_mut!(chunks);
+                    while let Some(chunk) = chunks.next().instrument(span.clone()).await {
+                        for entry in chunk? {
+                            yield entry;
                         }
                     }
                 }

@@ -54,7 +54,7 @@
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
-    Descriptor, FromSession, Keyed, ResolvedOf, WriteOf,
+    Descriptor, FromSession, Keyed, ResolvedOf, STREAM_CHUNK, WriteOf,
 };
 use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -65,10 +65,11 @@ use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::session::{CellSession, MutatePermit, OpPermit};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
-use bytes::Bytes;
 use educe::Educe;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use smallvec::SmallVec;
 use std::error::Error;
+use std::future::ready;
 use std::marker::PhantomData;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
@@ -92,14 +93,6 @@ const ENTRY_SECTION: Section = Section::new(DequeNs::Entries as i8);
 /// wider window pays one durable range scan instead of `len` point reads. A
 /// read-shape choice, not configuration.
 pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
-
-/// The point-get stream's chunk width: the granularity of both the per-chunk
-/// gate hold (one read permit per chunk fetch, released before the chunk is
-/// resolved and yielded) and the fetch concurrency (`.buffered(WINDOW_CHUNK)`).
-/// Bounded and named, sized to overlap the durable round-trips of a cold window
-/// (a warm window's fjall hits gain nothing and lose nothing), not for
-/// throughput. Mirrors the map keyset's [`KEYSET_CHUNK`](super::map).
-pub(crate) const WINDOW_CHUNK: usize = 16;
 
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so
@@ -246,7 +239,7 @@ where
     /// # Per-arm consistency (position identity, a paged read, not a snapshot)
     ///
     /// Iteration point-reads each index in `[head, tail)` (see the module's
-    /// window invariant) in gate-scoped chunks of `WINDOW_CHUNK`. The
+    /// window invariant) in gate-scoped chunks of `STREAM_CHUNK`. The
     /// **position window** `[head, tail)` is snapshotted at init — **position
     /// identity, not element identity**: each position yields whatever the cell
     /// holds when its chunk is fetched, so a pop observed before the fetch
@@ -261,13 +254,16 @@ where
     /// deliberate change: chunked point gets yield the prior chunks before a
     /// later chunk's read fails, exactly as the scan arm has always yielded a
     /// prefix before failing at a page boundary — the two arms' error contracts
-    /// converge).
+    /// converge); within a chunk the error is atomic — a failing chunk yields
+    /// none of its items.
     ///
-    /// The gate is held only for the init bounds read and per chunk fetch
-    /// (≤ `WINDOW_CHUNK` point reads each), never across a yield to user code
-    /// (items and errors alike) and never across resolution — so a handler may
-    /// mutate this deque between stream items without deadlock or error
-    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)).
+    /// The gate is held only for the init bounds read and per chunk
+    /// (≤ `STREAM_CHUNK` point reads each): each chunk is fetched, decoded, and
+    /// resolved under one permit that dies with the chunk future's scope before
+    /// any of its items reach user code, so the gate is never held across a
+    /// yield (items and errors alike) — a handler may mutate this deque between
+    /// stream items without deadlock (`StreamYieldFree`; see
+    /// [`SessionGate`](crate::state::session)).
     pub fn stream(
         &self,
         dir: Direction,
@@ -328,72 +324,41 @@ where
                 }
             } else {
                 // Point-get arm: fetch the window in gate-scoped chunks, each
-                // resolved and yielded gate-free. Positions are computed
-                // arithmetically from the snapshot window — no key list. ONE
-                // upfront chunk scratch, reused via `drain` per chunk (fixed
-                // bound, never regrown); a `Vec`, not a `SmallVec`, because it
-                // lives across every yield in the stream future and an inline
-                // `SmallVec` would bloat the future toward clippy's
-                // `large_futures` bound (as `StagedCollection` keeps a `Vec`).
-                let mut raw: Vec<Bytes> = Vec::with_capacity(WINDOW_CHUNK);
-                let mut next = 0usize;
-                while next < len {
-                    let chunk_end = (next + WINDOW_CHUNK).min(len);
-                    // Fetch the chunk under its OWN permit, dropped before any
-                    // `?`/yield. `buffered` keeps index order.
-                    {
-                        let permit = self.entries.read_permit().instrument(span.clone()).await;
-                        let fetched = async {
-                            // Reborrow as a `Copy` `&OpPermit` so each per-index
-                            // future copies the reference rather than moving it.
-                            let permit = &permit;
-                            let gets = stream::iter(next..chunk_end)
-                                .map(|i| {
-                                    let position = match dir {
-                                        Direction::Forward => i,
-                                        Direction::Backward => len - 1 - i,
-                                    };
-                                    cooperative(async move {
-                                        let index = window.absolute(position)?;
-                                        Ok::<_, DequeStateError<CellCodecError<T>>>(
-                                            self.entries.get_bytes(permit, &index).await?,
-                                        )
-                                    })
-                                })
-                                .buffered(WINDOW_CHUNK);
-                            futures::pin_mut!(gets);
-                            while let Some(item) = gets.next().instrument(span.clone()).await {
-                                // A `None` is a TTL hole or a popped position:
-                                // skipped, never an error.
-                                if let Some(bytes) = item? {
-                                    raw.push(bytes);
-                                }
-                            }
-                            Ok::<_, DequeStateError<CellCodecError<T>>>(())
-                        }
-                        .await;
-                        drop(permit);
-                        fetched?;
+                // fetched + resolved under one permit that dies before any
+                // yield. Positions are computed arithmetically from the
+                // snapshot window — nothing is allocated to chunk.
+                let chunks = stream::unfold(0usize, |start| async move {
+                    if start >= len {
+                        return None;
                     }
-                    // Resolve the chunk gate-free (resolution takes no permit),
-                    // yield in index order.
-                    {
-                        let resolves = stream::iter(raw.drain(..))
-                            .map(|bytes| {
-                                cooperative(async move {
-                                    self.entries
-                                        .resolve_bytes(bytes)
-                                        .await
-                                        .map_err(DequeStateError::from)
-                                })
+                    let permit = self.entries.read_permit().await;
+                    let permit = &permit;
+                    let end = (start + STREAM_CHUNK).min(len);
+                    let chunk = stream::iter(start..end)
+                        .map(|i| {
+                            let position = match dir {
+                                Direction::Forward => i,
+                                Direction::Backward => len - 1 - i,
+                            };
+                            cooperative(async move {
+                                let index = window.absolute(position)?;
+                                Ok::<_, DequeStateError<CellCodecError<T>>>(
+                                    self.entries.get(permit, &index).await?,
+                                )
                             })
-                            .buffered(WINDOW_CHUNK);
-                        futures::pin_mut!(resolves);
-                        while let Some(item) = resolves.next().instrument(span.clone()).await {
-                            yield item?;
-                        }
+                        })
+                        .buffered(STREAM_CHUNK)
+                        // A `None` is a TTL hole or a popped position: skipped.
+                        .try_filter_map(|element| ready(Ok(element)))
+                        .try_collect::<SmallVec<[_; STREAM_CHUNK]>>()
+                        .await;
+                    Some((chunk, end))
+                });
+                futures::pin_mut!(chunks);
+                while let Some(chunk) = chunks.next().instrument(span.clone()).await {
+                    for element in chunk? {
+                        yield element;
                     }
-                    next = chunk_end;
                 }
             }
         }

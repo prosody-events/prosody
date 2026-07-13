@@ -18,7 +18,9 @@ use self::collection_suite::{
 };
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
 use super::cell::ProvisionalWrite;
-use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map, map_state};
+use super::descriptor::{
+    STREAM_CHUNK, StateDescriptor, WithResolver, deque, deque_state, map_state,
+};
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
 use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -889,14 +891,14 @@ fn resolve_session(
 /// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
 /// `n`-entry `Tracked` map is genuinely incremental — it fetches at most one
 /// chunk beyond `k` (plus the single keyset read) and resolves at most
-/// `k + KEYSET_CHUNK` values, never the whole `n`-entry collection. The
+/// `k + STREAM_CHUNK` values, never the whole `n`-entry collection. The
 /// counting store bounds fetches and the counting resolver bounds resolutions;
 /// both counters sit at the lowest layer, so nothing masks a materialization.
-/// FALSIFICATION: widen the per-chunk `key_iter.by_ref().take(KEYSET_CHUNK)`
+/// FALSIFICATION: widen the per-chunk `keys.by_ref().take(STREAM_CHUNK)`
 /// in `stream` to `.take(usize::MAX)` (drain every tracked key in one chunk) →
 /// `take(k)` fetches and resolves all `n` → `lower_reads == n + 1` and
-/// `resolves == n`, both `> k + KEYSET_CHUNK` for `n ≫ k` → red. (Inflating
-/// `KEYSET_CHUNK` itself cannot falsify: the assertion bound moves with it.)
+/// `resolves == n`, both `> k + STREAM_CHUNK` for `n ≫ k` → red. (Inflating
+/// `STREAM_CHUNK` itself cannot falsify: the assertion bound moves with it.)
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -977,13 +979,13 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.lower_reads() <= k + map::KEYSET_CHUNK + 1,
+        counting.lower_reads() <= k + STREAM_CHUNK + 1,
         "a lazy map take(k) fetches at most one chunk beyond k plus the keyset read (reads={}, \
          k={k}, n={n})",
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + map::KEYSET_CHUNK,
+        resolves.resolves() <= k + STREAM_CHUNK,
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -993,10 +995,10 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// The stream-laziness property (deque): the structural twin of
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
 /// point-get arm — at most one chunk beyond `k` fetched (plus the single bounds
-/// read) and at most `k + WINDOW_CHUNK` resolved. FALSIFICATION: collapse the
-/// chunk end `(next + WINDOW_CHUNK).min(len)` in `stream` to `len` (fetch the
-/// whole window in one chunk) → `lower_reads == n + 1` and `resolves == n`,
-/// both `> k + WINDOW_CHUNK` for `n ≫ k` → red. (Inflating `WINDOW_CHUNK`
+/// read) and at most `k + STREAM_CHUNK` resolved. FALSIFICATION: collapse the
+/// chunk end `(start + STREAM_CHUNK).min(len)` in the unfold to `len` (fetch
+/// the whole window in one chunk) → `lower_reads == n + 1` and `resolves == n`,
+/// both `> k + STREAM_CHUNK` for `n ≫ k` → red. (Inflating `STREAM_CHUNK`
 /// itself cannot falsify: the assertion bound moves with it.)
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -1070,13 +1072,13 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.lower_reads() <= k + deque::WINDOW_CHUNK + 1,
+        counting.lower_reads() <= k + STREAM_CHUNK + 1,
         "a lazy deque take(k) fetches at most one chunk beyond k plus the bounds read (reads={}, \
          k={k}, n={n})",
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + deque::WINDOW_CHUNK,
+        resolves.resolves() <= k + STREAM_CHUNK,
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );

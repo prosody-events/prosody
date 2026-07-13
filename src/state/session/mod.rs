@@ -358,19 +358,19 @@ pub(crate) mod sealed {
     /// keyset within its bound) takes the gate for its init metadata read
     /// (the map keyset cell / the deque window cell), releases it, then
     /// fetches the listed entries in gate-scoped chunks — one permit per
-    /// chunk, ≤ the chunk width in point reads each, released before the
-    /// chunk is resolved and before every yield. The permit is **never held
-    /// across a yield to user code (items and errors alike) and never
-    /// across resolution**; resolution is a pure read on every arm. A
-    /// *scan-path* stream takes the gate only for its init metadata read
-    /// and is per-item live thereafter — and its per-item resolution is a
+    /// chunk, ≤ the chunk width in point reads each. Each chunk is fetched,
+    /// decoded, and resolved under that one permit, which is dropped with the
+    /// chunk future's scope before any of the chunk's items reach user code, so
+    /// the permit is **never held across a yield to user code (items and errors
+    /// alike)**. A *scan-path* stream takes the gate only for its init metadata
+    /// read and is per-item live thereafter — and its per-item resolution is a
     /// pure **read** (a scan never writes a resolution back durably; the
     /// point-read / first-touch / recovery-sweep paths own repair),
     /// so a concurrent mid-stream `commit()` on a scanned cell is never
     /// clobbered. A mutator racing a live stream (`join!`, or a handler
     /// mutating its own collection between stream items) therefore waits at
-    /// most one chunk fetch — never a whole materialization — and settle's
-    /// closure acquire queues FIFO the same way.
+    /// most one chunk fetch+resolve — never a whole materialization — and
+    /// settle's closure acquire queues FIFO the same way.
     ///
     /// **The gate also closes the session lifecycle**: settle acquires it once
     /// via [`close`](Self::close) and marks the session `Closed`, holding

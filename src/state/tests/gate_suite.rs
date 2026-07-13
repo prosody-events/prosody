@@ -920,7 +920,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 /// commit). Re-checks the point-get arm issues zero scans.
 #[test]
 fn gate_excludes_pop_between_deque_chunks() -> Result<()> {
-    /// Wider than `WINDOW_CHUNK` (16) so the window spans two chunks (16 + 4),
+    /// Wider than `STREAM_CHUNK` (16) so the window spans two chunks (16 + 4),
     /// under the scan threshold (128).
     const LEN: usize = 20;
 
@@ -1021,12 +1021,18 @@ fn gate_excludes_pop_between_deque_chunks() -> Result<()> {
 /// session deadlocks: the suspended generator holds the gate the next op waits
 /// on (the chunked-stream contract on `SessionGate` — the gate is never held
 /// across a yield to user code, error items included). Mechanism under
-/// chunking: the corrupt bytes **fetch** fine under the chunk permit; the
-/// decode error fires in the gate-free **resolve** step, after `drop(permit)`,
-/// so the `try_stream!` `?` yields it gate-free. Red-proven by resolving under
-/// the gate (moving `drop(permit)` after the resolve+yield loop): the error
-/// yields with the gate held, the follow-up `get` parks forever, and the
-/// hang-guard trips.
+/// chunking: the corrupt bytes **fetch AND fail to decode under the chunk
+/// permit**; the permit still dies with the chunk future's scope before the
+/// forwarding loop's `chunk?` yields the `Err`, so the gate is released before
+/// the `Err` reaches user code.
+///
+/// This pin **also pins chunk-atomicity**: a valid lower-sorting entry (key 3)
+/// precedes the corrupt key (7) in the same chunk, so prefix-yield semantics
+/// would surface key 3's `Ok` first and fail `first.is_err()`. Two red
+/// recipes: (i) chunk-atomicity — make the chunk yield per-item instead of
+/// collecting; (ii) gate-release — hold the permit across the yield by
+/// returning it in the unfold state (`Some((chunk, permit, keys))`) so the
+/// follow-up `get` hangs.
 #[test]
 fn map_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1034,16 +1040,26 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
         let id = fx.id("m")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        // Seed a one-key `Tracked` keyset whose entry cell holds undecodable
-        // bytes, so the stream's point-get fails and yields `Err`.
-        let key = 7_i64;
+        // Seed a two-key `Tracked` keyset: a valid lower-sorting entry (3) ahead
+        // of the corrupt entry (7) in the same chunk, so a chunk-atomic error
+        // surfaces the corrupt key's `Err` first (prefix-yield would leak 3's
+        // `Ok`), and the corrupt bytes fail to decode under the chunk permit.
+        let valid = 3_i64;
+        let corrupt = 7_i64;
         fx.counting
             .write_resolved(
                 &cref,
                 &[
-                    (map::keyset_cell(), Some(Bytes::from(tracked_frame(&[key])))),
                     (
-                        map::entry_cell_for(&I64KeyCodec::encode(&key)),
+                        map::keyset_cell(),
+                        Some(Bytes::from(tracked_frame(&[valid, corrupt]))),
+                    ),
+                    (
+                        map::entry_cell_for(&I64KeyCodec::encode(&valid)),
+                        Some(Bytes::from_static(b"null")),
+                    ),
+                    (
+                        map::entry_cell_for(&I64KeyCodec::encode(&corrupt)),
                         Some(Bytes::from_static(b"\x00\x01\x02 not json")),
                     ),
                 ],
@@ -1058,14 +1074,16 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 
         let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
-        // The Tracked point-get hits the corrupt entry: the stream yields `Err`.
+        // Both keys land in one chunk; the chunk-atomic collect short-circuits
+        // at the corrupt key, so the FIRST yielded item is the `Err` — key 3's
+        // `Ok` is never surfaced.
         let first = stream
             .next()
             .await
             .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
         assert!(
             first.is_err(),
-            "the corrupt entry must surface as an Err item"
+            "the corrupt entry must surface as the first (chunk-atomic) Err item, not key 3's Ok"
         );
 
         // The stream is still alive (held in scope, not dropped). A follow-up op
@@ -1089,9 +1107,11 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 /// The error-yield gate-release pin (deque twin of
 /// [`map_stream_error_yield_releases_the_gate`]): a point-get deque stream
 /// whose element holds undecodable bytes yields `Err` and MUST release the gate
-/// before the yield. Same mechanism (corrupt bytes fetch fine under the chunk
-/// permit; the decode error fires in the gate-free resolve after
-/// `drop(permit)`), same red, on the structural twin.
+/// before the yield. Same mechanism (corrupt bytes fetch AND fail to decode
+/// under the chunk permit, which dies with the chunk future before `chunk?`
+/// yields the `Err`), and — with index 0 valid ahead of the corrupt index 1 in
+/// one chunk — it likewise pins chunk-atomicity: prefix-yield would surface
+/// index 0's `Ok` first. Same reds, on the structural twin.
 #[test]
 fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1099,18 +1119,24 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
         let id = fx.id("d")?;
         let dref = CollectionRef::new(id.clone(), None);
 
-        // Seed a one-element window `[0, 1)` whose entry holds undecodable
-        // bytes, so the chunk fetch's point-get fails.
+        // Seed a two-element window `[0, 2)`: index 0 valid, index 1 corrupt, so
+        // a chunk-atomic error surfaces index 1's `Err` first (prefix-yield
+        // would leak index 0's `Ok`), and the corrupt bytes fail to decode under
+        // the chunk permit.
         fx.counting
             .write_resolved(
                 &dref,
                 &[
                     (
                         deque::meta_cell(),
-                        Some(Bytes::from(deque::seed_frame(0, 1))),
+                        Some(Bytes::from(deque::seed_frame(0, 2))),
                     ),
                     (
                         deque::entry_cell_for(&I64KeyCodec::encode(&0)),
+                        Some(Bytes::from_static(b"null")),
+                    ),
+                    (
+                        deque::entry_cell_for(&I64KeyCodec::encode(&1)),
                         Some(Bytes::from_static(b"\x00\x01\x02 not json")),
                     ),
                 ],
@@ -1125,13 +1151,17 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
 
         let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
+        // Both indices land in one chunk; the chunk-atomic collect short-circuits
+        // at index 1, so the FIRST yielded item is the `Err` — index 0's `Ok` is
+        // never surfaced.
         let first = stream
             .next()
             .await
             .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
         assert!(
             first.is_err(),
-            "the corrupt element must surface as an Err item"
+            "the corrupt element must surface as the first (chunk-atomic) Err item, not index 0's \
+             Ok"
         );
 
         // The stream is still alive: a follow-up op must not be starved.

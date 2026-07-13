@@ -105,6 +105,28 @@ enum ValueNs {
 /// The section holding a Value collection's single [`UnitKey`]-addressed cell.
 const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 
+/// The point-get streams' chunk width: the granularity of both the per-chunk
+/// gate hold (one read permit per chunk, dropped with the chunk future's scope
+/// before any yield) and the fetch concurrency (`.buffered(STREAM_CHUNK)`).
+/// Bounded and named, sized to overlap the durable round-trips of a cold
+/// collection (a warm one's fjall hits gain nothing and lose nothing), not for
+/// throughput. Shared by [`MapHandle::stream`](map::MapHandle::stream) and
+/// [`DequeHandle::stream`](deque::DequeHandle::stream).
+///
+/// # Invariant: `STREAM_CHUNK > 0`
+///
+/// Both chunk sources rely on it to make progress: the map's
+/// `keys.by_ref().take(STREAM_CHUNK)` must drain ≥ 1 key per chunk, and the
+/// deque's `(start + STREAM_CHUNK).min(len)` must advance past `start`. At
+/// zero, `take(0)` never drains and `end == start` never advances, so each
+/// unfold source would produce empty chunks forever.
+pub(crate) const STREAM_CHUNK: usize = 16;
+
+const _: () = assert!(
+    STREAM_CHUNK > 0,
+    "STREAM_CHUNK must be positive or both unfold chunk sources stall on empty chunks"
+);
+
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
 /// handle exposes (`Resolved`/`Write`).
 ///
@@ -121,6 +143,11 @@ const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 /// payload denotes something the format doesn't imply (a reference, a
 /// pointer) belongs in a dedicated codec, the way the message cell's
 /// `"message-ref"` format is its own codec and its resolver merely fetches.
+///
+/// A resolver must never issue a session or collection operation: point gets
+/// and point-get stream chunks resolve while holding the session gate (a scan
+/// resolves gate-free, but the contract binds every resolver regardless of
+/// path), so a resolver that re-entered the non-reentrant gate would deadlock.
 pub trait CellResolver {
     /// The decoded cell type this resolver maps from — pinned to the codec's
     /// payload by [`CellType`].
@@ -892,17 +919,18 @@ where
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
     /// Reads, decodes, and resolves the visible committed value at `key` — the
-    /// point-op surface, recomposing the witnessed [`Self::get_bytes`] fetch
-    /// with the gate-free [`Self::resolve_bytes`] decode+resolve.
+    /// point-op read surface: the overlay check → `raw_get` → cache-fill under
+    /// the permit, then decode + resolve through [`Self::resolve_bytes`]. The
+    /// point-get streams compose this per chunk under one chunk permit.
     ///
     /// Written in the desugared `-> impl Future + Send` form for two reasons an
     /// `async fn` could not express:
     /// - the future holds the resolver's [`ContextOf`] GAT projection across
     ///   the resolve await, which rustc issue #100013 cannot infer `Send` for
     ///   through an `async fn`;
-    /// - the key is lowered to its coordinate *before* the async block (inside
-    ///   [`Self::get_bytes`]), so only the owned [`CellKey`] — never the
-    ///   borrowed `&KeyOf<T>` — is captured into the future.
+    /// - the key is lowered to its [`CellKey`] coordinate *before* the async
+    ///   block, so only the owned coordinate — never the borrowed `&KeyOf<T>` —
+    ///   is captured into the future.
     ///
     /// # Errors
     ///
@@ -915,46 +943,23 @@ where
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send + 'a
     {
-        let fetch = self.get_bytes(permit, key);
+        let cell = self.cell(key);
         async move {
-            match fetch.await? {
+            match self.scope.raw_get(permit, &cell).await? {
                 Some(bytes) => Ok(Some(self.resolve_bytes(bytes).await?)),
                 None => Ok(None),
             }
         }
     }
 
-    /// Reads one cell's visible committed RAW bytes (witnessed) — the gated
-    /// half of [`Self::get`]: the overlay check → `raw_get` → cache-fill
-    /// publish, with no decode. Streams call this per chunk under a per-chunk
-    /// permit and resolve the returned bytes gate-free via
-    /// [`Self::resolve_bytes`].
-    ///
-    /// Desugared `-> impl Future + Send` and lowering the key to its
-    /// [`CellKey`] *before* the async block, so only the owned coordinate — not
-    /// the borrowed `&KeyOf<T>` — crosses the `raw_get` await.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(crate) fn get_bytes<'a>(
-        &'a self,
-        permit: &'a OpPermit<'_>,
-        key: &KeyOf<T>,
-    ) -> impl Future<Output = Result<Option<Bytes>, CellStateError<CellCodecError<T>>>> + Send + 'a
-    {
-        let cell = self.cell(key);
-        async move { Ok(self.scope.raw_get(permit, &cell).await?) }
-    }
-
-    /// Decodes and resolves raw cell bytes into the exposed value — the
-    /// gate-free half of [`Self::get`]. Takes no permit: a resolver's only
+    /// Decodes and resolves raw cell bytes into the exposed value — the private
+    /// helper [`Self::get`] and [`Self::scan`] share. `get` decodes and
+    /// resolves under its point permit; `scan` resolves each yielded
+    /// `(CellKey, Bytes)` pair gate-free. Takes no permit: a resolver's only
     /// session capability is `()` or `&Loader` ([`FromSession`]), never a cell
-    /// op, so resolution touches no cell state and needs no gate (the same
-    /// property [`Self::get`] has always relied on — it resolves *under* the
-    /// permit today, so a gate-re-entering resolver would already deadlock).
-    /// Streams resolve each chunk through this after dropping the fetch permit;
-    /// [`Self::scan`]'s per-item body shares it.
+    /// op, so resolution touches no cell state and needs no gate (which is why
+    /// a resolver that re-entered the gate would deadlock — see
+    /// [`CellResolver`]).
     ///
     /// Desugared `-> impl Future + Send + 'a` (with the synchronous decode
     /// hoisted before the async block) so the `Send` bound is **stated**, not
@@ -1073,8 +1078,9 @@ where
             };
             // `cooperative` inline in the producing closure (a `.map(cooperative)`
             // stage trips a higher-ranked-lifetime error on the non-`'static`
-            // per-item futures); `buffered` keeps key order. Resolution shares
-            // `resolve_bytes` with the point-op `get` — one gate-free path.
+            // per-item futures); `buffered` keeps key order. Each item is
+            // decoded and resolved through the shared `resolve_bytes`; the scan
+            // runs gate-free (`raw_scan` is unwitnessed).
             let inner = self
                 .scope
                 .raw_scan(scan)
