@@ -4,7 +4,7 @@ error[E0624]: associated function `new` is private
 14 |       CellScope::new((), state_type, name)
    |                  ^^^ private associated function
    |
-  ::: src/state/descriptor/mod.rs
+  ::: src/state/descriptor/view.rs
    |
    | /     pub(in crate::state::descriptor) fn new(
    | |         session: S,
