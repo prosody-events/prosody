@@ -103,7 +103,8 @@ where
 }
 
 /// Resolves one raw cell to its visible committed value, for a bottom store's
-/// resolving `get`/`scan_cells`.
+/// resolving point read (`get`/`get_for_cache`) — the arm that MAY durably
+/// repair. The scan path uses the read-only sibling [`peek_read`] instead.
 ///
 /// A resolved cell is already committed; a provisional cell owned by `own` is
 /// the running handler's own write — provably uncommitted while the handler
@@ -135,6 +136,48 @@ where
         }
         Cell::Provisional(provisional) => {
             resolve_cell(store, oracle, collection, cell, provisional).await
+        }
+    }
+}
+
+/// Resolves one raw cell to its visible committed value for a bottom store's
+/// **scan** — the read-only sibling of [`resolve_read`].
+///
+/// A scan runs gate-free over a pager/snapshot view (the split-stream contract
+/// on [`SessionGate`](crate::state::session)), so it must NOT perform the
+/// durable write-back a point read does: a repair computed from that snapshot
+/// could delete or overwrite a newer same-handler `commit()` of the same cell
+/// (a later monotonic driver timestamp makes the stale write win — a lost
+/// durable write with no repair site). The foreign-provisional arm therefore
+/// consults the oracle and returns the resolved value — `data` (committed) or
+/// `prev` (not committed) — WITHOUT calling
+/// [`mark_resolved`](CellStore::mark_resolved) or
+/// [`write_resolved`](CellStore::write_resolved). The cell stays provisional,
+/// behaviorally identical to "the scan never repaired it"; the point read
+/// ([`resolve_read`]), first-touch, and the recovery sweep remain the repair
+/// paths. Fails only if the oracle read fails.
+pub(crate) async fn peek_read<O>(
+    oracle: &O,
+    collection: &CollectionRef,
+    own: EventRef,
+    raw: Cell,
+) -> Result<Committed, O::Error>
+where
+    O: CommitOracle,
+{
+    match raw {
+        Cell::Resolved(committed) => Ok(committed),
+        Cell::Provisional(provisional) if provisional.event() == own => {
+            Ok(Committed::new(provisional.into_prev()))
+        }
+        Cell::Provisional(provisional) => {
+            let decision = oracle
+                .resolve(collection.id().state_key(), provisional.event())
+                .await?;
+            Ok(match decision {
+                CommitDecision::Committed => Committed::new(provisional.into_data()),
+                CommitDecision::NotCommitted => Committed::new(provisional.into_prev()),
+            })
         }
     }
 }
@@ -375,9 +418,9 @@ where
     Ok(marker_ok && cells_ok)
 }
 
-/// Error raised by cell resolution: the bottom stores' resolving `get`/
-/// `scan_cells` (via `resolve_read`) and the recovery sweep
-/// (`sweep_provisional`).
+/// Error raised by cell resolution: the bottom stores' resolving reads (`get`/
+/// `get_for_cache` via `resolve_read`, `scan_cells` via the read-only
+/// `peek_read`) and the recovery sweep (`sweep_provisional`).
 ///
 /// It is the bottom `CellStore`s' associated `Error`: their currency is the
 /// resolved `Committed` cell, so a read can fail either in the raw store

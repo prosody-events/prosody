@@ -56,6 +56,14 @@
 //! nameable downstream (they ride public signatures), the scope's
 //! view-minting surface is not — the structure is authoring-ready and opening
 //! it later is purely additive visibility.
+//!
+//! [`StateDescriptor`] itself is **sealed** (by the crate-private
+//! `SealedDescriptor` supertrait): a downstream crate can register and bind the
+//! framework's descriptors but cannot add its own impl, so no custom descriptor
+//! can receive the raw, gate-free [`CellSession`] from `bind` and reach cells
+//! outside the KV4 session gate. This closes the one hole `CollectionSpec`'s
+//! Exposure note (on [`CollectionSpec`]) does not — that seals cell *reach* for
+//! kinds, this seals descriptor *authorship*.
 
 use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -337,6 +345,28 @@ pub trait DescriptorIdentity {
     fn structural_identity(&self) -> StructuralIdentity;
 }
 
+/// Seals [`StateDescriptor`]. The trait is crate-internal (declared `pub`
+/// inside a `pub(crate)` module so it caps at crate visibility yet reads as the
+/// supertrait of the `pub` [`StateDescriptor`] without the `private_bounds`
+/// lint), so only the framework's two descriptor carriers implement it —
+/// [`Descriptor<K>`] (with its public
+/// [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases) and the
+/// crate-internal lifecycle tunnel (`LifecycleAccess` in
+/// [`crate::state::session`]). A downstream crate can name [`StateDescriptor`]
+/// in bounds and call `bind`, but cannot add an impl — so it can never hand its
+/// own `bind` the raw, gate-free [`CellSession`] and reach cells outside the
+/// KV4 session gate.
+pub(crate) mod sealed {
+    use super::Descriptor;
+
+    /// The seal marker; see the module-level item's doc.
+    pub trait SealedDescriptor {}
+
+    impl<K> SealedDescriptor for Descriptor<K> {}
+}
+
+pub(crate) use sealed::SealedDescriptor;
+
 /// A typed view over one keyed-state collection, bindable to any
 /// [`CellSession`].
 ///
@@ -347,8 +377,12 @@ pub trait DescriptorIdentity {
 /// [`verify_state_registration`] and returns an owned, `Clone` handle that
 /// wraps the session's byte cells with the descriptor's typing.
 ///
+/// Sealed by the crate-private `SealedDescriptor` supertrait: the two impls are
+/// the framework's own [`Descriptor<K>`] and the lifecycle tunnel, so `bind`'s
+/// raw-session access stays framework-only (see the module's Exposure note).
+///
 /// [`verify_state_registration`]: CellSession::verify_state_registration
-pub trait StateDescriptor: DescriptorIdentity + Copy {
+pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
     /// [`CellSession`].
     type Handle<S: CellSession>;

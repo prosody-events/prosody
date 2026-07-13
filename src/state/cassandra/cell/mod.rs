@@ -103,7 +103,8 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, help_read_window, resolve_marker, resolve_read,
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, peek_read, resolve_marker,
+    resolve_read,
 };
 use crate::state::store::CellStore;
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
@@ -555,15 +556,17 @@ where
             pin_mut!(stream);
 
             let mut yielded = 0usize;
-            // Deliberately sequential, not an oversight: the common `resolve_read`
+            // Deliberately sequential, not an oversight: the common `peek_read`
             // is a free no-op (own-event provisional / already-resolved cells
-            // consult no oracle and write nothing), so steady-state scans gain
-            // nothing from fan-out; the only payoff is mid-recovery across many
-            // foreign provisional cells. And because `limit` counts *present*
-            // yields — knowable only post-resolve — a buffered pipeline would
-            // resolve up to N−1 foreign-provisional cells past the boundary, each
-            // a durable write-back: read-path write amplification we won't pay for
-            // a recovery-only win on a hot read path.
+            // consult no oracle), so steady-state scans gain nothing from
+            // fan-out; the only payoff is mid-recovery across many foreign
+            // provisional cells. And because `limit` counts *present* yields —
+            // knowable only post-resolve — a buffered pipeline would resolve up
+            // to N−1 foreign-provisional cells past the boundary, each an extra
+            // oracle read: a recovery-only win we won't pay for on a hot read
+            // path. `peek_read` is read-only — it never writes a resolution
+            // back durably (a scan write-back could clobber a newer `commit()`
+            // of the same cell), so this posture costs no write amplification.
             while let Some(row) = cooperative(stream.try_next())
                 .await
                 .map_err(CassandraStoreError::from)
@@ -580,10 +583,9 @@ where
                 if past_end(dir, &key, end.as_ref()) {
                     break;
                 }
-                let committed =
-                    resolve_read(self, self.resolver.oracle(), &collection_ref, &key, own, raw)
-                        .await
-                        .map_err(flatten_resolve)?;
+                let committed = peek_read(self.resolver.oracle(), &collection_ref, own, raw)
+                    .await
+                    .map_err(ResolveCellError::Oracle)?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (key, bytes);
                     yielded += 1;

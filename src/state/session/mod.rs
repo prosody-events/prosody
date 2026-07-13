@@ -59,7 +59,7 @@ use crate::state::access::StateAccessError;
 use crate::state::cell::ProvisionalWrite;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::{
-    DescriptorIdentity, Registered, StateDescriptor, StructuralIdentity,
+    DescriptorIdentity, Registered, SealedDescriptor, StateDescriptor, StructuralIdentity,
 };
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
@@ -354,8 +354,12 @@ pub(crate) mod sealed {
     /// bounded memory — releases, then yields from the buffer; the gate is
     /// never held across a yield to user code, error items included. A
     /// *scan-path* stream takes the gate only for its init metadata read
-    /// and is per-item live thereafter. A cold bounded materialization is
-    /// the accepted worst case: it holds the gate across up to N+1 durable
+    /// and is per-item live thereafter — and its per-item resolution is a pure
+    /// **read** (a scan never writes a resolution back durably; the
+    /// point-read / first-touch / recovery-sweep paths own repair), so a
+    /// concurrent mid-stream `commit()` on a scanned cell is never clobbered. A
+    /// cold bounded materialization is the accepted worst case: it holds the
+    /// gate across up to N+1 durable
     /// point reads, and `join!`-ed ops (and settle's closure acquire) queue
     /// FIFO behind it.
     ///
@@ -378,6 +382,16 @@ pub(crate) mod sealed {
     /// later op, including settlement — settle warns loudly past
     /// [`GATE_WARN_INTERVAL`] but **never** proceeds without the gate (settling
     /// around a still-executing op would snapshot a half-applied session).
+    ///
+    /// A second shape is equally forbidden: **detaching** a session clone into
+    /// a task that outlives the handler op that spawned it. Session handles are
+    /// `Clone + 'static`, but the gate only serializes ops *within* one event's
+    /// dispatch. Between retry attempts the gate is Open (closure happens only
+    /// at settle), so a spawned task's `set` landing after an attempt's
+    /// `discard_dirty` would join the NEXT attempt's transaction — a silent
+    /// leak no serial order explains. Keep every session op inside the handler
+    /// future that owns the event; the `SessionClosed` error fences detached
+    /// ops only AFTER settle, never at an attempt boundary.
     ///
     /// Perf posture: uncontended for any handler that does not `join!` its
     /// session ops — one uncontended tokio `Mutex` lock per op; the phase
@@ -1204,6 +1218,11 @@ where
         // permit (boundary paths), or the dispatch future completed and the
         // session gate's no-un-polled-ops contract holds (retry attempt
         // boundaries) — so no session op is in flight over this key's range.
+        // This is a handler-cooperation contract, NOT enforced here: a task
+        // that DETACHED a session clone (see `SessionGate`'s forbidden
+        // patterns) can `set` after this clear and, at an attempt boundary
+        // where the gate is Open, land its write in the next attempt's
+        // transaction. Keep session ops inside the owning handler future.
         self.inner
             .overlay
             .dirty()
@@ -1421,6 +1440,8 @@ impl DescriptorIdentity for LifecycleAccess {
         }
     }
 }
+
+impl SealedDescriptor for LifecycleAccess {}
 
 impl StateDescriptor for LifecycleAccess {
     type Handle<S: CellSession> = S;

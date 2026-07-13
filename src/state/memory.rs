@@ -9,7 +9,8 @@ use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, help_read_window, resolve_marker, resolve_read,
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, peek_read, resolve_marker,
+    resolve_read,
 };
 use super::store::{CellStore, route_abort, route_commit};
 use super::{CollectionId, CollectionRef, EventRef, StateType};
@@ -261,16 +262,10 @@ where
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let committed = cooperative(resolve_read(
-                    self,
-                    self.resolver.oracle(),
-                    &collection_ref,
-                    &cell,
-                    own,
-                    stored,
-                ))
-                .await
-                .map_err(flatten_resolve)?;
+                let committed =
+                    cooperative(peek_read(self.resolver.oracle(), &collection_ref, own, stored))
+                        .await
+                        .map_err(ResolveCellError::Oracle)?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (cell, bytes);
                     yielded += 1;

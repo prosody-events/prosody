@@ -24,11 +24,13 @@
 //!   durable rows and the oracle's committed set survive; a fresh store starts
 //!   with a cold in-process cache, exactly as after a restart. Nothing is ever
 //!   leaked or forgotten to fake a crash (the CLAUDE.md memory rule).
-//! * **`get`/`scan` resolve in the backend, so they MUTATE a provisional
-//!   cell.** Provisional state is therefore observed only through
-//!   `provisional_cells`; committed seeds for the overlay/scan suites are
-//!   written **resolved** (`write_resolved`, no event) so reads stay pure
-//!   dirty-over-committed.
+//! * **`get` resolves in the backend, so it MUTATES a provisional cell; a
+//!   `scan` resolves READ-ONLY** (no durable write-back — a scan runs gate-free
+//!   over a snapshot, so a repair computed from it could clobber a newer
+//!   `commit()`; point-read / first-touch / sweep own repair). Provisional
+//!   state is therefore observed only through `provisional_cells`; committed
+//!   seeds for the overlay/scan suites are written **resolved**
+//!   (`write_resolved`, no event) so reads stay pure dirty-over-committed.
 //! * **`prev` always comes from `store.get`**, never minted — the staged `prev`
 //!   is the resolved committed base, the same path `finalize` uses.
 

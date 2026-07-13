@@ -868,10 +868,12 @@ fn write_path_delete_recovers_within_budget() -> Result<()> {
 }
 
 /// Establish-then-publish over a faulted lower store: a failed lower
-/// `write_resolved` leaves the cache untouched, still serving the pre-write
-/// value with zero lower reads and zero phantom publishes — and when the
-/// failed write carries a section clear, the delete-first D4 degrades to a
-/// correct slow read, never a wrong one.
+/// `write_resolved` NEVER publishes the new value — it still serves the
+/// pre-write value, correct. But `write_resolved`'s pre-call deletes (the
+/// drop-safe delete of the written cells, and delete-first D4 for a section
+/// clear) run before the lower write, so a failed apply leaves the touched
+/// cells cold: the follow-up is a correct slow fall-through (one lower read),
+/// never a wrong warm hit and never a phantom publish.
 ///
 /// Example test by necessity: the crash/overlay properties observe values,
 /// not the serving layer — "which layer answered and how many lower reads it
@@ -910,8 +912,11 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         );
         assert_eq!(counting.lower_reads(), 0, "the arrange get is warm");
 
-        // A clears-free lower write fault: the write must surface Err and
-        // leave the cache untouched.
+        // A clears-free lower write fault: the write must surface Err. The
+        // drop-safe pre-call cell delete (F1) already evicted the entry, so the
+        // follow-up serves the PRE-write value via a cold fall-through (one
+        // lower read) — correct, never a warm stale hit, never a phantom
+        // publish of the new value — then re-warms.
         *handle.lock() = Some(Poison::WriteResolved(
             name.clone(),
             ErrorCategory::Transient,
@@ -932,10 +937,17 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         );
         assert_eq!(
             counting.lower_reads(),
-            0,
-            "cache untouched: still a warm fjall serve (a phantom publish would serve the new \
-             value; a spurious delete would cost a lower read)"
+            1,
+            "the drop-safe pre-call delete left the cell cold: one fall-through, never a phantom \
+             publish of the new value"
         );
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(20)).await?.get(),
+            Some(&bytes(1)),
+            "the fall-through re-warmed the pre-write value"
+        );
+        assert_eq!(counting.lower_reads(), 0, "the re-warmed get reads nothing");
 
         // A clears-bearing lower write fault: delete-first (D4) is the
         // contract, so the section delete DID run before the lower rejection —
@@ -970,6 +982,141 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
             "the fall-through re-warmed the coordinate"
         );
         assert_eq!(counting.lower_reads(), 0, "the re-warmed get reads nothing");
+        Ok(())
+    })
+}
+
+/// Drop-safety (F1): `write_resolved` is the one user-droppable write path
+/// (mid-handler `commit()` / `ReadUncommitted` finalize). If the future is
+/// dropped between the durable write landing and the re-warming publish, the
+/// written cell's OLD entry must NOT survive as a stale warm hit (KV1) — the
+/// pre-call delete leaves it cold, so the next read falls through to the
+/// durable NEW value. Reverting the pre-call delete freezes the stale `A` warm
+/// and reddens this pin (the get would serve `A` with zero lower reads).
+#[test]
+fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let holding = HoldingCellStore::new(counting.clone());
+        let holds = holding.holds();
+        let cached = Cached::new(test_db::cache("drop_write")?, holding);
+        let id = collection("drop-write")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Warm committed `A` = 1 through the cache (no charge armed, so the
+        // hold passes through).
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
+            .await?;
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(1)).await?.get(),
+            Some(&bytes(1)),
+            "A is warm"
+        );
+        assert_eq!(counting.lower_reads(), 0, "the arrange get is warm");
+
+        // Arm the next `write_resolved` to park AFTER its durable write lands,
+        // then spawn a write of `B` = 2 and drop it mid-flight — the pre-call
+        // delete has run and the durable write has landed, but the re-warming
+        // publish never will.
+        holds.write_resolved().arm(1);
+        let landed_before = holds.write_resolved().landed();
+        let task = tokio::spawn({
+            let cached = cached.clone();
+            let cref = cref.clone();
+            async move {
+                cached
+                    .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
+                    .await
+            }
+        });
+        holds.write_resolved().entered().await;
+        assert!(
+            holds.write_resolved().landed() > landed_before,
+            "the durable write landed before the drop"
+        );
+        task.abort();
+        assert!(task.await.is_err(), "the write future was dropped");
+
+        // The cell is COLD (pre-call delete), so the next get falls through to
+        // the durable NEW value `B` = 2 — never a warm stale `A`.
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            Some(&bytes(2)),
+            "a dropped write_resolved must not leave the stale pre-write value warm"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            1,
+            "the dropped write left the cell cold: exactly one fall-through"
+        );
+        Ok(())
+    })
+}
+
+/// Read-only scan (F2): a scan resolving a FOREIGN committed provisional cell
+/// must NOT issue the durable write-back a point read performs. The scan runs
+/// gate-free over a snapshot, so a write-back computed from it could clobber a
+/// newer same-handler `commit()` of the same cell with a later LWW timestamp —
+/// a lost durable write with no repair site. After the fix the scan leaves the
+/// cell provisional (first-touch / point-read / sweep still repair); reverting
+/// the scan arm to `resolve_read` durably resolves it (here: the committed
+/// clear deletes the row) and reddens this pin. Exercises the memory scan arm
+/// directly; the Cassandra twin swaps to the same `peek_read`.
+#[test]
+fn scan_resolution_is_read_only() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let lower = MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let id = collection("scan-readonly")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let foreign = probe(7);
+
+        // Seed a foreign committed provisional at x: a clear (data = None) over
+        // committed base `A` = 1, owned by `foreign`, which the oracle says
+        // committed. The point-read repair arm would `write_resolved(x, None)`,
+        // a durable delete; the scan must NOT.
+        let writes = [(
+            cell_at(4),
+            ProvisionalWrite::new(None, Committed::new(Some(bytes(1))), foreign),
+        )];
+        let marker = EventMarker::frozen(foreign, &writes, &[]);
+        lower
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+        oracle.record_message(Uuid::from_u128(7)).await?;
+        assert_eq!(
+            cells.provisional_coordinates(&id),
+            vec![cell_at(4)],
+            "the foreign committed provisional is seeded"
+        );
+
+        // Scan the section (a distinct own event). The cell resolves to its
+        // committed view — absent, since data = None — so the scan yields
+        // nothing, but must leave the durable cell provisional.
+        let seen = scan_forward(&lower, &id, 0, ScanEdge::Included(255), probe(99)).await?;
+        assert!(
+            seen.is_empty(),
+            "the committed clear resolves to absent, so the scan yields nothing"
+        );
+        assert_eq!(
+            cells.provisional_coordinates(&id),
+            vec![cell_at(4)],
+            "the scan must not durably resolve the foreign provisional (read-only): a scan \
+             write-back could clobber a newer commit of the same cell"
+        );
         Ok(())
     })
 }

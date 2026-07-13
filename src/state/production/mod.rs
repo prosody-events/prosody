@@ -219,8 +219,8 @@ where
 ///
 /// **Dedup half — provider minting is sound.** The marker *write* already
 /// goes through this oracle's own store ([`CommitOracle::record_message`] is
-/// the `settle` boundary's flush), so writer and recovery reader are one
-/// instance by construction. The dedup middleware's separate filter
+/// the `settle` boundary's marker record), so writer and recovery reader are
+/// one instance by construction. The dedup middleware's separate filter
 /// instance cannot diverge either: every store a
 /// [`DeduplicationStoreProvider`] creates shares its state — the Cassandra
 /// provider shares one session and one write-through marker cache across

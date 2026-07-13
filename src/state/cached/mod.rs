@@ -79,7 +79,11 @@
 //! leaves a stale entry reachable.
 //!
 //! Establish-then-publish, in one line: `lower.write` precedes every fjall
-//! publish; a failed lower write returns the error with the cache untouched.
+//! publish, so a failed lower write returns the error and **never publishes**
+//! the new value. It may still leave the touched cells cold: `write_resolved`'s
+//! pre-call deletes (delete-first D4 section clears, and the drop-safe delete
+//! of the written cells) run before the lower write, so a failed apply degrades
+//! to a correct slow fall-through, never a wrong warm hit.
 //!
 //! **The Incomplete trap.**
 //! [`commit_provisional`](CellStore::commit_provisional)
@@ -136,8 +140,9 @@
 //!
 //! The cache read path stays a hint: a fjall read error is logged and degrades
 //! that read to a durable one, and a failed fill publish degrades with **no**
-//! delete (the prior state was miss-or-expired, both of which already fall
-//! through) — correctness rests on the lower store, so
+//! delete (a Miss/Expired prior state already fell through; a live entry
+//! surviving a fjall read error equals what the next read resolves — see
+//! [`Cached::get`]) — correctness rests on the lower store, so
 //! [`Cached::Error`](CellStore::Error) is just the lower store's error.
 
 use super::SHARD_FANOUT_CONCURRENCY;
@@ -343,9 +348,15 @@ where
         let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
         // Best-effort fill publish — present or absent (negative caching),
         // stamped with the remaining-TTL co-expiry. Sound because of
-        // GetNeverReadsOwnStaged (module doc, KV2). A failure degrades with NO
-        // delete: the prior state was miss-or-expired, both already falling
-        // through.
+        // GetNeverReadsOwnStaged (module doc, KV2). A failed publish degrades
+        // with NO delete. On the Miss/Expired arms the prior state already
+        // fell through, so nothing stale survives. On the `Err(fjall read)`
+        // arm the prior state can be a live, unexpired entry that stays — safe
+        // because every schedule reaching here re-reads a value EQUAL to that
+        // surviving entry (the D5 pre-call transform installs the committed
+        // projection; per-key dispatch serializes whole events), so the entry
+        // is never stale on its own — a stale hit here would already be a KV1
+        // break from another site.
         let expiry = self.expiry_for(remaining);
         if let Err(error) = self.fjall.put(collection, cell, &committed, expiry).await {
             warn_skip("populate", &error);
@@ -582,8 +593,9 @@ where
         // exists for read-help to resolve), so delete-first is mandatory. A
         // failed or cancelled lower write then leaves the sections merely cold
         // (a slow read, never a wrong one). Whole-section is correct here —
-        // unlike the commit site — because `publish_written(data)` re-warms
-        // the written cells AFTER the lower call.
+        // unlike the commit site — because the written cells are deleted
+        // pre-call (drop-safety, below) and re-warmed by `publish_written(data)`
+        // AFTER the lower call.
         for clear in clears {
             retry_delete(&self.fjall, "clear section", || {
                 self.fjall
@@ -591,6 +603,25 @@ where
             })
             .await;
         }
+        // Drop-safety: `write_resolved` is the one user-droppable write path —
+        // mid-handler `commit()` / ReadUncommitted finalize run in a
+        // handler-owned future the `SessionGate` blesses dropping. The written
+        // cells' OLD entries go stale the instant the durable write lands, and
+        // the re-warming `publish_written` runs only AFTER the lower ack — so a
+        // drop (or a publish + D1 failure) in that window would leave them
+        // served verbatim forever (KV1). Delete the written cells' entries
+        // pre-call too, must-succeed: a drop then leaves them cold (a
+        // fall-through), never stale, and the success path re-warms them. A
+        // pre-call INSTALL would be wrong here — unlike the D5 transform the
+        // write's success is not yet fixed, so caching `data` early could cache
+        // a value that never lands. (Not a per-message hot path: this verb runs
+        // only on `commit()`/finalize, and the keys are one bounded batch off
+        // the `cells` param — the same key-clone shape D1 already uses.)
+        let cell_keys: Vec<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
+        retry_delete(&self.fjall, "resolved cells", || {
+            self.fjall.delete_batch(collection.id(), &cell_keys)
+        })
+        .await;
         // Pre-write anchor, establish-first — see `write_provisional`.
         let stamped_at = self.fjall.clock().now_ms();
         self.lower.write_resolved(collection, cells, clears).await?;
@@ -792,9 +823,16 @@ where
 /// sheds the 0–999 ms sub-second remainder that would otherwise
 /// deterministically overhang the row (rounding to *nearest* would round up
 /// half the time and still overhang by ≤500 ms). Flooring is the safe direction
-/// — an early fjall expiry falls through and self-heals. Any residual is
-/// cross-node clock skew, which no client-side arithmetic can remove; it too is
-/// absorbed by the self-healing fall-through.
+/// — an early fjall expiry falls through and self-heals. Two residuals remain,
+/// bounded and accepted. Cross-node clock skew (the coordinator's wall clock
+/// differs from this node's) no client-side arithmetic can remove; a *forward*
+/// skew or step only shortens the fjall life, so it too falls through and
+/// self-heals. A **backward** local clock step AFTER publication is the one
+/// direction the fall-through does not cover: the entry never reads as expired,
+/// so it stays a hit past the durable row's death for the size of the step,
+/// until the next write-through or D-site eviction heals it — bounded by the
+/// NTP step magnitude. A monotonic-clock floor would remove it; it is not
+/// applied here.
 fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
     match remaining {
         Some(remaining) => {
@@ -812,9 +850,14 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 /// posture for why every failure class (there is no Permanent escape hatch)
 /// lands in the same bounded place.
 ///
-/// A dropped settle future abandons the retry harmlessly: the drop coincides
-/// with assignment revocation (the workspace — and any stale entry — dies with
-/// it) or with an idempotent sweep re-run that re-attempts the repair.
+/// A dropped **boundary-owned** settle/sweep future abandons the retry
+/// harmlessly: the drop coincides with assignment revocation (the workspace —
+/// and any stale entry — dies with it) or with an idempotent sweep re-run that
+/// re-attempts the repair. The one **user-droppable** caller — mid-handler
+/// `commit()` / `ReadUncommitted` finalize via [`Cached::write_resolved`] — is
+/// not covered by that argument (nothing re-runs a marker-free direct write);
+/// it is made drop-safe instead by `write_resolved`'s pre-call delete of the
+/// written cells, so a drop leaves them cold rather than stale.
 async fn retry_delete<F, Fut>(fjall: &FjallCellCache, op: &str, mut delete: F)
 where
     F: FnMut() -> Fut,
