@@ -19,7 +19,8 @@
 
 use super::super::cached::Cached;
 use super::super::descriptor::{
-    CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
+    CellStateError, MapStateError, STREAM_CHUNK, StateDescriptor, deque, deque_state, map,
+    map_state, value_state,
 };
 use super::super::manager::ArmedKeys;
 use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -56,6 +57,16 @@ use uuid::Uuid;
 
 /// The hang-guard for acquisitions that must proceed — never the assertion.
 const HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// The `*_stream_error_yield_releases_the_gate` pins seed exactly two items and
+/// assert the first yielded item is the `Err` — chunk-atomicity, which requires
+/// both items to land in one point-get chunk. At `STREAM_CHUNK == 1` each key
+/// is its own chunk, the valid entry's `Ok` surfaces first, and the pins would
+/// go red on correct code; enforce the premise so breaking it is uncompilable.
+const _: () = assert!(
+    STREAM_CHUNK >= 2,
+    "the *_stream_error_yield pins need two items in one chunk to prove chunk-atomicity"
+);
 
 /// Yields until a just-spawned task has reached its park point (the gate
 /// acquire); 8 yields covers the deepest spawn → acquire chain, and the
@@ -920,9 +931,10 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 /// commit). Re-checks the point-get arm issues zero scans.
 #[test]
 fn gate_excludes_pop_between_deque_chunks() -> Result<()> {
-    /// Wider than `STREAM_CHUNK` (16) so the window spans two chunks (16 + 4),
-    /// under the scan threshold (128).
-    const LEN: usize = 20;
+    /// Wider than `STREAM_CHUNK` so the window spans two point-get chunks;
+    /// still under the scan threshold `DEQUE_POINT_ITERATION_MAX`, so the arm
+    /// stays on the point-get path.
+    const LEN: usize = STREAM_CHUNK + 4;
 
     runtime()?.block_on(async {
         let fx = GateFixture::new("gate_stream")?;
