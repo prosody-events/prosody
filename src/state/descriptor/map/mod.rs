@@ -97,7 +97,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
-use crate::state::session::CellSession;
+use crate::state::session::{CellSession, MutatePermit, OpPermit};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -466,8 +466,8 @@ where
         &self,
         key: &KC::Key,
     ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>> {
-        let _permit = self.entries.read_permit().await;
-        Ok(self.entries.get(key).await?)
+        let permit = self.entries.read_permit().await;
+        Ok(self.entries.get(&permit, key).await?)
     }
 
     /// Streams the live entries in key order — ascending for
@@ -508,7 +508,7 @@ where
             // permit has been released.
             let permit = self.entries.read_permit().instrument(span.clone()).await;
             let init = async {
-                match self.stream_plan(dir).instrument(span.clone()).await? {
+                match self.stream_plan(&permit, dir).instrument(span.clone()).await? {
                     StreamPlan::Tracked(keys) => {
                         // Concurrent ordered point gets: the gate hold above is
                         // the safety argument, the per-cell reads commute across
@@ -516,10 +516,14 @@ where
                         // overlaps a cold keyset's durable round-trips in key
                         // order.
                         let len = keys.len();
+                        // Reborrow the owned read permit as a `Copy` `&OpPermit`
+                        // outside the fan-out closure, so each per-key future
+                        // copies the reference rather than moving the permit.
+                        let permit = &permit;
                         let gets = stream::iter(keys)
                             .map(|key| {
                                 cooperative(async move {
-                                    let value = self.entries.get(&key).await?;
+                                    let value = self.entries.get(permit, &key).await?;
                                     Ok::<_, MapStateError<CellCodecError<V>>>(
                                         value.map(|v| (key, v)),
                                     )
@@ -542,8 +546,8 @@ where
                     }
                     StreamPlan::Scan => {
                         let (min, max) = tokio::try_join!(
-                            self.read_bound(MapBound::Min).instrument(span.clone()),
-                            self.read_bound(MapBound::Max).instrument(span.clone())
+                            self.read_bound(&permit, MapBound::Min).instrument(span.clone()),
+                            self.read_bound(&permit, MapBound::Max).instrument(span.clone())
                         )?;
                         Ok(match (min, max) {
                             (Some(min), Some(max)) => StreamStart::Scan { min, max },
@@ -586,11 +590,13 @@ where
     /// never silently degrades.
     async fn stream_plan(
         &self,
+        permit: &OpPermit<'_>,
         dir: Direction,
     ) -> Result<StreamPlan<KC::Key>, MapStateError<CellCodecError<V>>> {
         // Absent/Overflowed fall to the scan with no warning; Malformed already
         // warned in `read_keyset_state`.
-        let PriorKeyset::Decoded(Keyset::Tracked(coordinates)) = self.read_keyset_state().await?
+        let PriorKeyset::Decoded(Keyset::Tracked(coordinates)) =
+            self.read_keyset_state(permit).await?
         else {
             return Ok(StreamPlan::Scan);
         };
@@ -624,9 +630,10 @@ where
     /// back as a logical `KC::Key`.
     async fn read_bound(
         &self,
+        permit: &OpPermit<'_>,
         bound: MapBound,
     ) -> Result<Option<KC::Key>, MapStateError<CellCodecError<V>>> {
-        self.meta.get(&bound).await.map_err(meta_err)
+        self.meta.get(permit, &bound).await.map_err(meta_err)
     }
 
     /// Inserts or overwrites `key`'s value (a blind last-writer-wins write —
@@ -652,11 +659,7 @@ where
     where
         KC::Key: Clone,
     {
-        // ONE permit across the entry set, the bound ratchet, AND the keyset
-        // update: each is a read-modify-write over meta cells, so an
-        // interleaved sibling `set` could lose an extension or a keyset entry
-        // without the shared hold.
-        let _permit = self
+        let permit = self
             .entries
             .mutate_permit()
             .await
@@ -664,17 +667,19 @@ where
         // The three meta reads are independent point gets; read them
         // concurrently *before* any write (own writes are visible to own
         // reads, so reading bounds after the ratchet would misclassify every
-        // fresh map's first set).
+        // fresh map's first set). `&permit` (a `&MutatePermit`) deref-coerces
+        // to the `&OpPermit` the read helpers demand.
         let coordinate = KC::encode(&key);
         let (min, max, prior) = tokio::try_join!(
-            self.read_bound(MapBound::Min),
-            self.read_bound(MapBound::Max),
-            self.read_keyset_state(),
+            self.read_bound(&permit, MapBound::Min),
+            self.read_bound(&permit, MapBound::Max),
+            self.read_keyset_state(&permit),
         )?;
         let bounds_present = min.is_some() || max.is_some();
-        self.entries.set(&key, value).await?;
-        self.ratchet_bounds(key, min, max).await?;
-        self.update_keyset(coordinate, bounds_present, prior).await
+        self.entries.set(&permit, &key, value).await?;
+        self.ratchet_bounds(&permit, key, min, max).await?;
+        self.update_keyset(&permit, coordinate, bounds_present, prior)
+            .await
     }
 
     /// Removes `key` (a blind clear; the bounds are left untouched, so they
@@ -690,12 +695,12 @@ where
         err
     )]
     pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
-        let _permit = self
+        let permit = self
             .entries
             .mutate_permit()
             .await
             .map_err(CellStateError::Access)?;
-        Ok(self.entries.clear(key).await?)
+        Ok(self.entries.clear(&permit, key).await?)
     }
 
     /// Removes every entry, both bounds, and the keyset: within the event the
@@ -715,15 +720,21 @@ where
         err
     )]
     pub async fn clear(&self) -> Result<(), MapStateError<CellCodecError<V>>> {
-        let _permit = self
+        let permit = self
             .entries
             .mutate_permit()
             .await
             .map_err(CellStateError::Access)?;
-        self.entries.clear_all().await?;
-        self.meta.clear(&MapBound::Min).await.map_err(meta_err)?;
-        self.meta.clear(&MapBound::Max).await.map_err(meta_err)?;
-        self.keyset.clear(&()).await.map_err(keyset_err)?;
+        self.entries.clear_all(&permit).await?;
+        self.meta
+            .clear(&permit, &MapBound::Min)
+            .await
+            .map_err(meta_err)?;
+        self.meta
+            .clear(&permit, &MapBound::Max)
+            .await
+            .map_err(meta_err)?;
+        self.keyset.clear(&permit, &()).await.map_err(keyset_err)?;
         Ok(())
     }
 
@@ -741,12 +752,12 @@ where
         err
     )]
     pub async fn commit(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>> {
-        let _permit = self
+        let permit = self
             .entries
             .mutate_permit()
             .await
             .map_err(CellStateError::Access)?;
-        Ok(self.entries.commit().await?)
+        Ok(self.entries.commit(&permit).await?)
     }
 
     /// Discards this map's buffered uncommitted ops — entries and bound
@@ -776,6 +787,7 @@ where
     /// cloned into the lower write and moved into the upper.
     async fn ratchet_bounds(
         &self,
+        permit: &MutatePermit<'_>,
         key: KC::Key,
         min: Option<KC::Key>,
         max: Option<KC::Key>,
@@ -789,11 +801,11 @@ where
             let new_min = min.filter(|min| *min <= key).unwrap_or_else(|| key.clone());
             let new_max = max.filter(|max| *max >= key).unwrap_or(key);
             self.meta
-                .set(&MapBound::Min, new_min)
+                .set(permit, &MapBound::Min, new_min)
                 .await
                 .map_err(meta_err)?;
             self.meta
-                .set(&MapBound::Max, new_max)
+                .set(permit, &MapBound::Max, new_max)
                 .await
                 .map_err(meta_err)?;
             return Ok(());
@@ -804,13 +816,24 @@ where
             (true, true) => {
                 // Both bounds extend: clone once for Min, move into Max.
                 self.meta
-                    .set(&MapBound::Min, key.clone())
+                    .set(permit, &MapBound::Min, key.clone())
                     .await
                     .map_err(meta_err)?;
-                self.meta.set(&MapBound::Max, key).await.map_err(meta_err)?;
+                self.meta
+                    .set(permit, &MapBound::Max, key)
+                    .await
+                    .map_err(meta_err)?;
             }
-            (true, false) => self.meta.set(&MapBound::Min, key).await.map_err(meta_err)?,
-            (false, true) => self.meta.set(&MapBound::Max, key).await.map_err(meta_err)?,
+            (true, false) => self
+                .meta
+                .set(permit, &MapBound::Min, key)
+                .await
+                .map_err(meta_err)?,
+            (false, true) => self
+                .meta
+                .set(permit, &MapBound::Max, key)
+                .await
+                .map_err(meta_err)?,
             (false, false) => {}
         }
         Ok(())
@@ -820,8 +843,11 @@ where
     /// [`PriorKeyset::Malformed`] (with a warning) so the caller degrades
     /// rather than errors. An access error propagates; a key-decode error
     /// cannot arise (the cell is read at its one fixed coordinate).
-    async fn read_keyset_state(&self) -> Result<PriorKeyset, MapStateError<CellCodecError<V>>> {
-        match self.keyset.get(&()).await {
+    async fn read_keyset_state(
+        &self,
+        permit: &OpPermit<'_>,
+    ) -> Result<PriorKeyset, MapStateError<CellCodecError<V>>> {
+        match self.keyset.get(permit, &()).await {
             Ok(None) => Ok(PriorKeyset::Absent),
             Ok(Some(keyset)) => Ok(PriorKeyset::Decoded(keyset)),
             Err(CellStateError::Codec(_)) => {
@@ -838,7 +864,7 @@ where
 
     /// Folds `coordinate` into the keyset given the pre-read prior state and
     /// whether the bounds are present (the transition table for the module's
-    /// loose-superset invariant). Runs under the caller's `set` permit.
+    /// loose-superset invariant).
     ///
     /// The size check runs *before* the already-tracked fast path, so an
     /// oversized stored `Tracked` collapses to `Overflowed` even when
@@ -847,6 +873,7 @@ where
     /// cell, refreshing its TTL (the module's TTL-refresh invariant).
     async fn update_keyset(
         &self,
+        permit: &MutatePermit<'_>,
         coordinate: Coordinate,
         bounds_present: bool,
         prior: PriorKeyset,
@@ -855,27 +882,29 @@ where
         let ttl = self.keyset.has_ttl();
         match prior {
             // Malformed → heal to Overflowed (already warned at read).
-            PriorKeyset::Malformed => self.write_keyset(Keyset::Overflowed).await,
+            PriorKeyset::Malformed => self.write_keyset(permit, Keyset::Overflowed).await,
             // Absent + bounds present → membership unknown, conservatively
             // Overflowed. Absent + bounds absent → the empty map: a fresh
             // singleton, itself subject to the limit/ceiling.
             PriorKeyset::Absent => {
                 if bounds_present || !fits_fresh(&coordinate, limit) {
-                    self.write_keyset(Keyset::Overflowed).await
+                    self.write_keyset(permit, Keyset::Overflowed).await
                 } else {
-                    self.write_keyset(Keyset::Tracked(vec![coordinate])).await
+                    self.write_keyset(permit, Keyset::Tracked(vec![coordinate]))
+                        .await
                 }
             }
             // Overflowed is one-way: no write, except the TTL refresh.
             PriorKeyset::Decoded(Keyset::Overflowed) => {
                 if ttl {
-                    self.write_keyset(Keyset::Overflowed).await
+                    self.write_keyset(permit, Keyset::Overflowed).await
                 } else {
                     Ok(())
                 }
             }
             PriorKeyset::Decoded(Keyset::Tracked(keys)) => {
-                self.update_tracked(coordinate, keys, limit, ttl).await
+                self.update_tracked(permit, coordinate, keys, limit, ttl)
+                    .await
             }
         }
     }
@@ -885,6 +914,7 @@ where
     /// check.
     async fn update_tracked(
         &self,
+        permit: &MutatePermit<'_>,
         coordinate: Coordinate,
         keys: Vec<Coordinate>,
         limit: usize,
@@ -896,13 +926,13 @@ where
                 collection = self.entries.name().as_str(),
                 "map keyset exceeded its bound; collapsing to Overflowed"
             );
-            return self.write_keyset(Keyset::Overflowed).await;
+            return self.write_keyset(permit, Keyset::Overflowed).await;
         }
         match keys.binary_search(&coordinate) {
             // Already tracked: no content change — rewrite only to refresh TTL.
             Ok(_) => {
                 if ttl {
-                    self.write_keyset(Keyset::Tracked(keys)).await
+                    self.write_keyset(permit, Keyset::Tracked(keys)).await
                 } else {
                     Ok(())
                 }
@@ -914,20 +944,27 @@ where
                         .and_then(|len| len.checked_add(coordinate.as_bytes().len()))
                         .is_none_or(|len| len > KEYSET_BYTE_CEILING);
                 if would_exceed {
-                    return self.write_keyset(Keyset::Overflowed).await;
+                    return self.write_keyset(permit, Keyset::Overflowed).await;
                 }
                 let mut updated = Vec::with_capacity(keys.len() + 1);
                 updated.extend_from_slice(&keys[..position]);
                 updated.push(coordinate);
                 updated.extend_from_slice(&keys[position..]);
-                self.write_keyset(Keyset::Tracked(updated)).await
+                self.write_keyset(permit, Keyset::Tracked(updated)).await
             }
         }
     }
 
     /// Buffers a keyset-cell write, re-homing its error under the map's type.
-    async fn write_keyset(&self, keyset: Keyset) -> Result<(), MapStateError<CellCodecError<V>>> {
-        self.keyset.set(&(), keyset).await.map_err(keyset_err)
+    async fn write_keyset(
+        &self,
+        permit: &MutatePermit<'_>,
+        keyset: Keyset,
+    ) -> Result<(), MapStateError<CellCodecError<V>>> {
+        self.keyset
+            .set(permit, &(), keyset)
+            .await
+            .map_err(keyset_err)
     }
 }
 

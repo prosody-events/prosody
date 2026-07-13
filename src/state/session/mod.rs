@@ -79,7 +79,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex as SyncMutex;
-pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, SessionGate};
+pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
 use sealed::{StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
@@ -308,6 +308,7 @@ pub(crate) mod sealed {
     };
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
+    use std::ops::Deref;
     use std::sync::LazyLock;
     use tokio::sync::{Mutex as TokioMutex, MutexGuard};
     use tokio::time::timeout;
@@ -434,12 +435,12 @@ pub(crate) mod sealed {
         ///
         /// Returns [`StateAccessError::SessionClosed`] once the settle boundary
         /// has closed the session.
-        pub(crate) async fn mutate(&self) -> Result<OpPermit<'_>, StateAccessError> {
+        pub(crate) async fn mutate(&self) -> Result<MutatePermit<'_>, StateAccessError> {
             let guard = self.inner.lock().await;
             if matches!(*guard, SessionPhase::Closed) {
                 return Err(StateAccessError::SessionClosed);
             }
-            Ok(OpPermit(guard))
+            Ok(MutatePermit(OpPermit(guard)))
         }
 
         /// Closes the session for settlement: acquires the gate once, marks the
@@ -475,6 +476,20 @@ pub(crate) mod sealed {
     }
 
     /// A held [`SessionGate`] permit (RAII: dropping it releases the gate).
+    ///
+    /// Witnesses admission for a session **read**: the descriptor's cell-op
+    /// sinks demand `&OpPermit` so "forgot to acquire the gate" and "let the
+    /// acquire outlive the op" cannot compile. The settle boundary's closure
+    /// hold ([`SessionGate::close`]) is also this type — the name stays
+    /// `OpPermit` (not `ReadPermit`) because `close` returns one and a
+    /// mutator's [`MutatePermit`] derefs to it. The read-vs-mutate split
+    /// encodes the gate's closure check, **not** shared-vs-exclusive access:
+    /// both permits are exclusive holds (a session read is not pure — a
+    /// point-get miss does durable read-repair and publishes a cache fill,
+    /// which KV4's fill-vs-write-through exclusion assumes runs under full
+    /// mutual exclusion). [`SessionGate`] owns the conventional half of the
+    /// contract: one acquire per public op, no re-acquire beneath it, same
+    /// session.
     pub struct OpPermit<'a>(MutexGuard<'a, SessionPhase>);
 
     impl OpPermit<'_> {
@@ -483,6 +498,28 @@ pub(crate) mod sealed {
         /// closed session with `NoOp` instead of an error.
         pub(crate) fn is_closed(&self) -> bool {
             matches!(*self.0, SessionPhase::Closed)
+        }
+    }
+
+    /// A held gate permit that additionally witnesses a session **mutation**.
+    ///
+    /// Granted only through [`SessionGate::mutate`], whose closure check
+    /// confirms the session is still open to mutation — so the descriptor's
+    /// mutating sinks (`raw_set`/`raw_clear`/`clear_section`/`raw_commit`)
+    /// demand `&MutatePermit` and "acquired too weakly" (a read permit at a
+    /// write) does not compile. It [`Deref`]s to [`OpPermit`], so a mutator's
+    /// one permit also witnesses the reads inside its body — the read-under-
+    /// mutate grade subtyping is one-directional and deliberate: a read is
+    /// legal under a mutate hold, but the converse (mutate under a read
+    /// permit) is a type error. Uncontended unless a handler `join!`s its
+    /// session ops.
+    pub struct MutatePermit<'a>(OpPermit<'a>);
+
+    impl<'a> Deref for MutatePermit<'a> {
+        type Target = OpPermit<'a>;
+
+        fn deref(&self) -> &OpPermit<'a> {
+            &self.0
         }
     }
 

@@ -792,11 +792,18 @@ mod typed_cell_view {
         );
 
         let seed = scope.typed::<SeedCell>(CELL_SECTION);
+        // Acquire the mutate permit once for the whole seed phase (mirroring a
+        // production wrapper), then release it before the gate-free scan below.
+        let permit = seed
+            .mutate_permit()
+            .await
+            .map_err(|e| eyre!("seed permit: {e}"))?;
         for key in 0..n as i64 {
-            seed.set(&key, key)
+            seed.set(&permit, &key, key)
                 .await
                 .map_err(|e| eyre!("seed {key}: {e}"))?;
         }
+        drop(permit);
 
         let view = scope.typed::<GatedCell>(CELL_SECTION);
         let (lo, hi) = (i64::MIN, i64::MAX);
