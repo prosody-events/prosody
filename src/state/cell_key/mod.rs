@@ -142,16 +142,6 @@ pub enum ScanEdge<T> {
 }
 
 impl<T> ScanEdge<T> {
-    /// The endpoint coordinate, or `None` for an [`Unbounded`](Self::Unbounded)
-    /// edge.
-    #[must_use]
-    pub fn coordinate(&self) -> Option<&T> {
-        match self {
-            Self::Included(t) | Self::Excluded(t) => Some(t),
-            Self::Unbounded => None,
-        }
-    }
-
     /// Borrows the inner value, preserving inclusivity — the borrow half of the
     /// `as_ref().cloned()` pair, parallelling [`Bound::as_ref`].
     #[must_use]
