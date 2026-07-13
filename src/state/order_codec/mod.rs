@@ -18,8 +18,8 @@ use thiserror::Error;
 /// Every key codec is also a [`Codec`] over the same type — the supertrait
 /// equalities pin `Payload = Key` — under the **byte-identity law**:
 /// `serialize` writes exactly `encode`'s bytes and `deserialize` is `decode`.
-/// A key can therefore ride as a cell *payload* (a map bound cell stores the
-/// extreme entry's key) with no adapter, and [`Codec::FORMAT_ID`] is the one
+/// A key can therefore ride as a cell *payload* with no adapter, and
+/// [`Codec::FORMAT_ID`] is the one
 /// durable token a key encoding freezes into a collection's identity.
 ///
 /// The invariants every impl must satisfy (enforced by the per-codec
@@ -29,8 +29,8 @@ use thiserror::Error;
 /// - **Key round-trip:** `decode(encode(k).as_bytes()) == Ok(k)`.
 /// - **Byte round-trip:** for any `b` a codec itself produced,
 ///   `encode(&decode(b)?).as_bytes() == b`. This is what makes a typed scan
-///   durable-compatible: decoding a stored coordinate and re-encoding it (as a
-///   map bound cell does) reproduces the exact stored bytes.
+///   durable-compatible: decoding a stored coordinate and re-encoding it
+///   reproduces the exact stored bytes.
 /// - **Byte identity:** `serialize(k)` appends exactly `encode(k).as_bytes()`.
 ///   Held by construction when `serialize`/`deserialize` delegate to
 ///   `encode`/`decode`, as every impl here does.
@@ -38,8 +38,8 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     /// The logical key type, ordered to match its encoded byte order.
     ///
     /// `Send + Sync + 'static`, not merely `Ord`: a typed scan yields the
-    /// decoded key in a `Send` stream (so it must be `Send`), and a map bound
-    /// cell stores the key as a [`Codec`] payload (so it must be
+    /// decoded key in a `Send` stream (so it must be `Send`), and a key can
+    /// ride as a [`Codec`] payload (so it must be
     /// `Sync + 'static`). Every real key (`String`, `i64`, `u64`, `()`)
     /// already satisfies it.
     type Key: Ord + Send + Sync + 'static;

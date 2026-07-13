@@ -161,7 +161,7 @@ fn unit_key_round_trips_only_the_empty_coordinate() {
 
 /// Byte-identity law: every key codec is its own payload codec — `serialize`
 /// writes exactly `encode`'s bytes and `deserialize` agrees with `decode` —
-/// which is what lets a key ride as a cell payload (a map bound cell) with no
+/// which is what lets a key ride as a cell payload with no
 /// adapter. Held by construction today (the `Codec` impls delegate); this
 /// property guards against a future impl drifting the two byte forms apart.
 #[test]

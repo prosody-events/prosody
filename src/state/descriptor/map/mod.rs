@@ -224,9 +224,11 @@ impl Codec for MapKeysetKey {
 /// zero entry reads (the [`MapHandle::stream`] `Absent → Empty` arm). Three
 /// rules hold it:
 ///
-/// * every `set` co-stages a keyset write in the **same atomic same-partition
-///   batch** as its entry write — at the settle boundary and at mid-handler
-///   [`commit`](MapHandle::commit) alike;
+/// * every `set` leaves a keyset cell present — writing one whenever the
+///   pre-write read is `Absent`/`Malformed` or the frame must change, staged in
+///   the **same atomic same-partition batch** as its entry write (at the settle
+///   boundary and at mid-handler [`commit`](MapHandle::commit) alike), and
+///   relying on the already-present cell otherwise;
 /// * [`clear`](MapHandle::clear) erases both the entry section and the keyset;
 /// * on a TTL'd map every `set` refreshes the keyset (above), so it expires no
 ///   earlier than the newest entry.
@@ -313,7 +315,8 @@ enum StreamPlan<K> {
     /// Degrade to the full-section (`Unbounded`-edged) scan.
     Scan,
 
-    /// Absent keyset — no live entries, so no store touch at all.
+    /// Absent keyset — no live entries, so the stream reads no entries (no
+    /// scan).
     Empty,
 }
 
@@ -345,7 +348,7 @@ type MapStreamItem<KC, V> =
 /// via [`map_state`].
 pub type MapDescriptor<KC, V = JsonCodec> = Descriptor<MapKind<KC, V>>;
 
-/// The Map [`CollectionSpec`]: one cell per key plus the min/max bound cells;
+/// The Map [`CollectionSpec`]: one cell per key plus one keyset cell;
 /// the key codec is frozen into the identity.
 pub struct MapKind<KC, V>(PhantomData<fn() -> (KC, V)>);
 
@@ -425,7 +428,7 @@ where
     /// (the store hides cleared cells) at the accepted degraded cost of walking
     /// the whole section. An **absent** keyset means no live entries (the
     /// current-membership invariant), so the stream yields nothing with
-    /// **zero** store touches.
+    /// zero entry reads (no scan).
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_ {
         // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
         // so each inner await is instrumented with a clone instead; the
@@ -443,7 +446,7 @@ where
             // for the init keyset read and — on the bounded arm — the whole
             // materialization (every listed entry, ≤ the keyset bound in
             // memory), released before the first yield; the scan arm drops the
-            // permit after the bounds read and streams per-item live. Neither
+            // permit after the keyset read and streams per-item live. Neither
             // holds the gate across a yield to user code — the fallible init
             // runs inside an inner `async` block (which `try_stream!` leaves
             // untransformed, so its `?` is an ordinary early return that drops
@@ -477,7 +480,7 @@ where
                         let mut buffer: Vec<(KC::Key, ResolvedOf<V>)> = Vec::with_capacity(len);
                         while let Some(item) = gets.next().instrument(span.clone()).await {
                             // A `None` is a removed/expired key: skipped, never
-                            // an error (the loose-superset skip).
+                            // an error (the current-membership skip).
                             if let Some(entry) = item? {
                                 buffer.push(entry);
                             }
@@ -521,14 +524,14 @@ where
 
     /// Reads the keyset cell and decides the stream's arm: an **absent** keyset
     /// means no live entries ([`KeysetPresence`](Keyset)), so the stream is
-    /// [`Empty`](StreamPlan::Empty) with no store touch; a `Tracked` keyset
-    /// within the registered limit and byte ceiling whose every coordinate
-    /// decodes to a canonical key becomes the point-get materialization (keys
-    /// in `dir` order); anything else — `Overflowed`, malformed, oversized, or
-    /// a coordinate that fails to decode or re-encode — degrades to the
-    /// full-section scan (with a warning on the degradations that are not
-    /// simply overflowed). A keyset-read access error propagates; it never
-    /// silently degrades.
+    /// [`Empty`](StreamPlan::Empty) with no entry reads (no scan); a `Tracked`
+    /// keyset within the registered limit and byte ceiling whose every
+    /// coordinate decodes to a canonical key becomes the point-get
+    /// materialization (keys in `dir` order); anything else — `Overflowed`,
+    /// malformed, oversized, or a coordinate that fails to decode or
+    /// re-encode — degrades to the full-section scan (with a warning on the
+    /// degradations that are not simply overflowed). A keyset-read access
+    /// error propagates; it never silently degrades.
     async fn stream_plan(
         &self,
         permit: &OpPermit<'_>,

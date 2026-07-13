@@ -1901,7 +1901,8 @@ where
 /// Cassandra `ORDER BY ASC/DESC` + `coordinate` range the overlay merge
 /// delegates to and the limit/end the overlay strips before delegating — plus
 /// post-clear (gap-tombstoned) section states across the full Direction ×
-/// exclusivity × limit space. Every seed is committed (`write_resolved`), so
+/// edge-kind (inclusive/exclusive/unbounded) × limit space. Every seed is
+/// committed (`write_resolved`), so
 /// the oracle is committed-only.
 pub(crate) async fn run_bottom_scan_trace<S, P>(
     store: S,

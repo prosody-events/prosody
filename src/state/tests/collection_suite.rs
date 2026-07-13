@@ -8,10 +8,10 @@
 //! collection's observable state must equal a plain `VecDeque`/`BTreeMap` model
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
-//! caught. This single property proves dense-window / loose-bounds invariants,
+//! caught. This single property proves dense-window / exact-keyset invariants,
 //! key/positional ordering, containment, whole-collection `Clear` (in-event
 //! emptiness, survivor repopulation, abort exactness), and the
-//! bounds-and-entries-promote-together crash atomicity. The lifecycle
+//! keyset-and-entries-promote-together crash atomicity. The lifecycle
 //! properties run in **both** commit modes: `ReadCommitted` settles along the
 //! outcome, `ReadUncommitted` commits everything at `finalize` regardless of
 //! the outcome.
@@ -279,7 +279,7 @@ fn make_session(
 }
 
 /// [`make_session`] over a caller-owned dirty workspace, so a test can snapshot
-/// the per-event buffered cells (the Map TTL bound-refresh property inspects
+/// the per-event buffered cells (the Map TTL keyset-refresh property inspects
 /// what `finalize` will stage through it).
 fn make_session_with_dirty(
     cells: &MemoryCells,
