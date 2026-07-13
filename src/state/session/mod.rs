@@ -535,6 +535,11 @@ pub(crate) mod sealed {
     /// apply on the commit arm only (rollback needs no clear leg — the stage
     /// touched nothing destructive). A clears-only collection appears with an
     /// empty write set — the entry that arms the recovery backstop.
+    // `Vec`, not `SmallVec`, deliberately: an entry is ~140 bytes of `Bytes`
+    // handles and the receipt is held across the settle boundary's awaits, so
+    // inline storage bloats every such future past clippy's `large_futures`
+    // bound (measured +45 warnings); the `with_capacity` folds at the build
+    // sites already bound the allocation.
     pub struct StagedCollection {
         pub(super) collection: CollectionRef,
         pub(super) writes: Vec<(CellKey, ProvisionalWrite)>,
