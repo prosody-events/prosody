@@ -47,12 +47,12 @@
 //! `Overflowed` is deliberately not implemented; it needs `clear` or TTL death
 //! to recover).
 //!
-//! Bounds deleted (the Part B ruling): the map once carried two min/max bound
-//! cells to anchor the fallback scan. They are gone — within an incarnation
-//! they fenced no tombstone the `Tracked` arm ever wades (that arm point-gets),
-//! and the accepted residual is the cross-incarnation `Overflowed` corner,
-//! whose fallback is a full-section scan that may cross a one-time tombstone
-//! wave (self-healing as those rows compact).
+//! Bounds deleted (`KeysetPresence` makes them redundant): the map once carried
+//! two min/max bound cells to anchor the fallback scan. They are gone — within
+//! an incarnation they fenced no tombstone the `Tracked` arm ever wades (that
+//! arm point-gets), and the accepted residual is the cross-incarnation
+//! `Overflowed` corner, whose fallback is a full-section scan that may cross a
+//! one-time tombstone wave (self-healing as those rows compact).
 //!
 //! The keyset is an optimization cell, so a malformed or oversized stored frame
 //! **degrades** iteration to the full-section scan (with a warning) and is

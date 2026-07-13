@@ -431,12 +431,11 @@ fn gate_serializes_set_against_clear() -> Result<()> {
 }
 
 /// The keyset read-modify-write race pin (the pre-existing lost-update the gate
-/// closes; the surviving same-shape race after the bound ratchet was deleted):
-/// two racing fresh-key sets serialize under the gate, so the keyset is the
-/// UNION of both keys (not a last-wins singleton) and a stream yields both
-/// entries. Red-proven by deleting the permit acquisition: the parked set's
-/// stale keyset read overwrites the other's update, the keyset loses a key, and
-/// the current-membership invariant breaks.
+/// closes): two racing fresh-key sets serialize under the gate, so the keyset
+/// is the UNION of both keys (not a last-wins singleton) and a stream yields
+/// both entries. Red-proven by deleting the permit acquisition: the parked
+/// set's stale keyset read overwrites the other's update, the keyset loses a
+/// key, and the current-membership invariant breaks.
 #[test]
 fn gate_serializes_racing_keyset_rmw() -> Result<()> {
     runtime()?.block_on(async {

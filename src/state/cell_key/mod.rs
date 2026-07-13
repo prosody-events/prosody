@@ -26,7 +26,7 @@ use std::ops::Bound;
 /// [`Coordinate`]. **Opaque to the cell-store core**, which only stores it,
 /// sorts by it, and scopes single-section scans to it — it never interprets the
 /// meaning. Each collection owns the meaning of its sections (e.g. a Map's
-/// bound-bookkeeping section vs its entry section) and lowers its own section
+/// keyset (meta) section vs its entry section) and lowers its own section
 /// enum to the wire `i8` via the standard discriminator idiom
 /// (`Section::new(i8::from(my_section))`). The cell layer round-trips that `i8`
 /// without validating it, exactly as it treats [`Coordinate`] bytes — so an
