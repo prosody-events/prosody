@@ -892,9 +892,11 @@ fn resolve_session(
 /// `k + KEYSET_CHUNK` values, never the whole `n`-entry collection. The
 /// counting store bounds fetches and the counting resolver bounds resolutions;
 /// both counters sit at the lowest layer, so nothing masks a materialization.
-/// FALSIFICATION: set `KEYSET_CHUNK` huge (one chunk = the whole map) →
+/// FALSIFICATION: widen the per-chunk `key_iter.by_ref().take(KEYSET_CHUNK)`
+/// in `stream` to `.take(usize::MAX)` (drain every tracked key in one chunk) →
 /// `take(k)` fetches and resolves all `n` → `lower_reads == n + 1` and
-/// `resolves == n`, both `> k + KEYSET_CHUNK` for `n ≫ k` → red.
+/// `resolves == n`, both `> k + KEYSET_CHUNK` for `n ≫ k` → red. (Inflating
+/// `KEYSET_CHUNK` itself cannot falsify: the assertion bound moves with it.)
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -991,8 +993,11 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// The stream-laziness property (deque): the structural twin of
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
 /// point-get arm — at most one chunk beyond `k` fetched (plus the single bounds
-/// read) and at most `k + WINDOW_CHUNK` resolved. Same FALSIFICATION via a huge
-/// `WINDOW_CHUNK`.
+/// read) and at most `k + WINDOW_CHUNK` resolved. FALSIFICATION: collapse the
+/// chunk end `(next + WINDOW_CHUNK).min(len)` in `stream` to `len` (fetch the
+/// whole window in one chunk) → `lower_reads == n + 1` and `resolves == n`,
+/// both `> k + WINDOW_CHUNK` for `n ≫ k` → red. (Inflating `WINDOW_CHUNK`
+/// itself cannot falsify: the assertion bound moves with it.)
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
