@@ -723,12 +723,22 @@ mod unwind {
 
     /// Arm A/C — a handler (or final apply hook) panics with no attempt bump,
     /// so a handle leaked past it keeps a CURRENT pin. After the catch resumes
-    /// the panic: a leaked read errors `Terminated` (the catch terminated the
-    /// session), a leaked `commit()` errors `SessionClosed` (current pin, gate
-    /// Closed — Closed is checked before termination), and the dirty overlay is
-    /// empty (the gate-held catch discarded the handler's buffered set).
-    /// Falsify: remove `session.terminate()` from `guarded_dispatch` → the read
-    /// returns `Ok`; remove `session.discard_dirty()` → residue survives.
+    /// the panic: a leaked read errors `Terminated`, a leaked `commit()` errors
+    /// `SessionClosed` (current pin, gate Closed — Closed is checked before
+    /// termination), and the dirty overlay is empty.
+    ///
+    /// Falsify: drop the `close_gate()` acquire from the catch arm — the gate
+    /// stays Open, so the current-pin `commit()` falls through to the
+    /// termination check and errors `Terminated`, not `SessionClosed`. Closing
+    /// the gate under the panic is the catch's uniquely-pinned contribution
+    /// here. The read-`Terminated` and empty-overlay postconditions are *also*
+    /// produced by [`EventStateScope`]'s `Drop` re-running `terminate` +
+    /// `discard_dirty` (ungated) as the still-live scope unwinds, so deleting
+    /// those from the catch alone is masked — Drop's `terminate` is pinned by
+    /// [`dropped_dispatch_future_terminates_the_session`]. The catch's
+    /// gate-held discard uniquely defeats residue from a mutator admitted
+    /// *before* closure (the Arm D no-residue guarantee below), which the
+    /// ungated Drop cannot.
     #[tokio::test]
     #[expect(
         clippy::panic,

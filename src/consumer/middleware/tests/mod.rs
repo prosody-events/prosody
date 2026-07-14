@@ -2688,7 +2688,11 @@ mod settled_view {
     /// the termination watch. The stale-pin `Terminated`-not-`SessionClosed`
     /// half is pinned in
     /// `gate_suite::stale_mutator_on_closed_session_is_terminated_not_closed`.
-    /// Falsify by swapping the pin/closed order in `mutate_permit`.
+    /// Falsify by swapping the closed/termination order in `mutate_permit`: the
+    /// current-pin mutation then hits the termination check first and errors
+    /// `Terminated`. (Swapping pin/closed is inert here — the handle is
+    /// current-pin, so the pin check never fires; that ordering is the
+    /// stale-pin sibling's to pin, above.)
     #[tokio::test]
     async fn current_pin_hook_mutation_is_closed_even_under_shutdown() -> Result<()> {
         let (context, _cell_store, _floor_id, _pending_id) = two_collections().await?;
