@@ -779,9 +779,10 @@ async fn process_event<T, S, M, P>(
 }
 
 /// Runs one event's dispatch under a panic-unwind guard — the single catch
-/// site above every [`EventHandler`](crate::consumer::EventHandler) impl (the
-/// blanket durability-boundary impl *and* [`RetryHandler`], since retry is
-/// outermost and its own `on_message`/`on_timer` is `dispatch` here).
+/// site above every [`EventHandler`] impl (the
+/// blanket durability-boundary impl *and*
+/// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler), since
+/// retry is outermost and its own `on_message`/`on_timer` is `dispatch` here).
 ///
 /// On the normal path it tears the event down (`invalidate`), exactly as the
 /// two arms did before. On an unwind it runs the gate-held terminal

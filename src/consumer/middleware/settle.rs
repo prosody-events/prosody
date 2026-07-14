@@ -121,7 +121,7 @@ pub struct MarkerWrite(());
 /// clone can never re-pin itself back to life.
 ///
 /// Nominally `pub` — and re-exported publicly — because
-/// [`EventContext::redispatch`](crate::consumer::event_context::EventContext::redispatch)
+/// [`EventContext::redispatch`]
 /// names it in a public signature; its effective visibility stays
 /// crate-internal because no one outside this module can construct one.
 pub struct RepinProof(());

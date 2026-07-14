@@ -149,7 +149,7 @@ impl ClassifyError for ErasedStateError {
 }
 
 /// Erased single-value collection — the object-safe face of
-/// [`ValueHandle`](crate::state::descriptor::ValueHandle).
+/// [`ValueHandle`].
 #[async_trait]
 pub trait DynValueState<Item: Send + 'static>: Send + Sync {
     /// Reads the current value (`None` when absent/cleared).
@@ -170,7 +170,7 @@ pub trait DynValueState<Item: Send + 'static>: Send + Sync {
 }
 
 /// Erased ordered map — the object-safe face of
-/// [`MapHandle`](crate::state::descriptor::MapHandle), keys always `String`.
+/// [`MapHandle`], keys always `String`.
 #[async_trait]
 pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// Reads `key`'s value (`None` when absent).
@@ -197,7 +197,7 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
 }
 
 /// Erased deque — the object-safe face of
-/// [`DequeHandle`](crate::state::descriptor::DequeHandle).
+/// [`DequeHandle`].
 #[async_trait]
 pub trait DynDequeState<Item: Send + 'static>: Send + Sync {
     /// The number of live elements.
