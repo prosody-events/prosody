@@ -809,10 +809,13 @@ impl PipelineMiddlewareStack {
         // `consumer::middleware`'s `FallibleEventHandler` docs), which decides
         // commit-vs-bypass from the typed `Settlement` classification of the
         // final result. Two residual order facts remain: retry stays OUTERMOST
-        // so each attempt is a fresh dispatch isolated by `discard_dirty()`
-        // between attempts; and the dedup filter sits INSIDE message-defer so
-        // a deferred reload's duplicate check sees the reload identity
-        // override. `monopolization` is state-agnostic.
+        // so each attempt is a fresh dispatch, isolated by the `next_attempt`
+        // verb between attempts (its `reset` transition discards the failed
+        // attempt's dirty overlay and bumps the session's attempt epoch under
+        // one gate hold, fencing a leaked handle instead of letting it join the
+        // next attempt); and the dedup filter sits INSIDE message-defer so a
+        // deferred reload's duplicate check sees the reload identity override.
+        // `monopolization` is state-agnostic.
         let common_middleware = build_common_middleware::<DP, C::Payload>(
             &self.common_config,
             &self.consumer_config,
