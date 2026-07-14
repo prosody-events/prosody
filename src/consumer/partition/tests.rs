@@ -593,7 +593,7 @@ async fn test_partition_manager_timer_heartbeat_integration() {
     assert_eq!(watermark, Some(1), "Shutdown should drain the commit");
 }
 
-/// (l) abnormal-exit fencing through [`guarded_dispatch`] — the single
+/// Abnormal-exit fencing through [`guarded_dispatch`] — the single
 /// panic-unwind catch site, which `process_event` wraps every dispatch in
 /// (above `RetryHandler`'s own `EventHandler` impl). On an unwind the catch
 /// runs the gate-held terminal transition (close, discard, terminate — no epoch
@@ -931,7 +931,8 @@ mod unwind {
         async fn shutdown(self) {}
     }
 
-    /// (l) through the PRODUCTION entry — the same current-pin leak as
+    /// Abnormal-exit fencing through the PRODUCTION entry — the same
+    /// current-pin leak as
     /// [`handler_panic_current_pin_leaks_are_fenced_and_overlay_cleared`], but
     /// driven through `process_event` (which wraps every dispatch in
     /// [`guarded_dispatch`]) instead of calling `guarded_dispatch` directly, so
@@ -947,8 +948,9 @@ mod unwind {
     /// .invalidate();`. With no catch, only [`EventStateScope`]'s `Drop` runs
     /// during the unwind (terminate + discard, gate left OPEN), so the leaked
     /// `commit()` falls through to the termination check and errors
-    /// `Terminated`, not `SessionClosed`. This is the half of pin (l) the
-    /// direct-`guarded_dispatch` unit arms above cannot reach; the
+    /// `Terminated`, not `SessionClosed`. This is the half of the
+    /// abnormal-exit fencing the direct-`guarded_dispatch` unit arms above
+    /// cannot reach; the
     /// stale-pin-through-`RetryHandler` half lives in `retry::tests`.
     #[tokio::test]
     async fn process_event_wires_the_catch_for_a_panicking_handler() -> Result<()> {

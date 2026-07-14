@@ -2522,7 +2522,8 @@ mod settled_view {
         Ok(())
     }
 
-    /// (k)/(h) over the non-finalized arms: final Permanent, final Transient,
+    /// Non-finalized arms — no aborted-overlay residue and the apply-hook
+    /// contract, over final Permanent, final Transient,
     /// `Bypassed`, and the direct `abandon` (Terminal). Each fires its hook
     /// after the boundary discards the uncommitted overlay, so the hook sees
     /// `pending == None` (base, residue gone) and `floor == "floor"`
@@ -2556,7 +2557,8 @@ mod settled_view {
         Ok(())
     }
 
-    /// (j)/(k) the permanent finalize-**failure** arm: a Permanent stage
+    /// The permanent finalize-**failure** arm (settled-view cleanup plus the
+    /// commit-now floor): a Permanent stage
     /// failure hits `StepOutcome::Skip`, which commits defensively but is NOT a
     /// successful finalize — so `finalize` never drained the buffer and the
     /// boundary must discard it under the held permit before the hook. The hook
@@ -2640,7 +2642,7 @@ mod settled_view {
         Ok(())
     }
 
-    /// (e)/(h) teardown fence + graceful hook-window read: a current-pin handle
+    /// Teardown fence plus graceful hook-window read: a current-pin handle
     /// captured before settle reads committed data during the hook window (the
     /// gate is Closed, reads allowed — graceful completion), then errors
     /// `Terminated` once the session is torn down (`terminate`, the sync half
@@ -2682,7 +2684,7 @@ mod settled_view {
         }
     }
 
-    /// (n) current-pin precedence under shutdown: after settle closes the gate,
+    /// Current-pin precedence under shutdown: after settle closes the gate,
     /// a current-pin mutation errors `SessionClosed` even when the session is
     /// also terminated, because `mutate_permit` checks the closed gate before
     /// the termination watch. The stale-pin `Terminated`-not-`SessionClosed`

@@ -174,7 +174,7 @@ fn runtime() -> Result<Runtime> {
     Ok(Builder::new_current_thread().enable_all().build()?)
 }
 
-/// KV4 pin (a): a get-fill suspended across a `commit()` of the same cell.
+/// KV4 — a get-fill suspended across a `commit()` of the same cell.
 /// The harness FORCES the round-2 schedule — the fill's lower read completes
 /// (linearizing before the commit's durable write), its publish is withheld,
 /// the commit's write-through would land, then the fill resumes. With the
@@ -259,7 +259,7 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
     })
 }
 
-/// KV4 pin (b): a `set` racing `commit()`'s snapshot→drain window. The
+/// KV4 — a `set` racing `commit()`'s snapshot→drain window. The
 /// commit's lower write is withheld after it lands; the racing set parks on
 /// the gate, so its cell is buffered strictly after the drain and survives to
 /// the settle — nothing is lost. Red-proven by deleting the permit
@@ -333,7 +333,7 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
     })
 }
 
-/// KV4 pin (c): a `set` racing `clear()`, proving the map's core invariant —
+/// KV4 — a `set` racing `clear()`, proving the map's core invariant —
 /// **every live entry is covered by a present keyset** (`KeysetPresence`) —
 /// survives the race. The teeth need a *non-empty* map: on an empty map both
 /// serial orders leave a valid state, so the invariant can't be violated.

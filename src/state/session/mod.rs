@@ -425,7 +425,7 @@ pub(crate) mod sealed {
     /// the same; the fence is the backstop, not a license to detach.
     ///
     /// Perf posture: uncontended for any handler that does not `join!` its
-    /// session ops — one uncontended tokio `Mutex` lock per op; the phase
+    /// session ops — one uncontended tokio `Mutex` lock per op; the gate
     /// adds no other RAM structure.
     pub struct SessionGate {
         inner: TokioMutex<SessionPhase>,
@@ -1379,16 +1379,15 @@ where
     }
 
     fn discard_dirty(&self) {
-        // Sync and ungated (Drop paths cannot await). Precondition: by the
-        // time this runs, either the settle boundary held the closed gate
-        // permit (boundary paths), or the dispatch future completed and the
-        // session gate's no-un-polled-ops contract holds (retry attempt
-        // boundaries) — so no session op is in flight over this key's range.
-        // This is a handler-cooperation contract, NOT enforced here: a task
-        // that DETACHED a session clone (see `SessionGate`'s forbidden
-        // patterns) can `set` after this clear and, at an attempt boundary
-        // where the gate is Open, land its write in the next attempt's
-        // transaction. Keep session ops inside the owning handler future.
+        // Sync and ungated (Drop paths cannot await). Every caller either holds
+        // the gate — settle/unwind under the closed-gate permit, or `reset`
+        // under its read-permit, which waits out any in-flight session op
+        // before clearing — or is the ungated `EventStateScope::Drop` teardown,
+        // whose already-admitted-op residual is documented on that type. A
+        // clone detached past its attempt does not survive into the next
+        // attempt: `reset` bumps the epoch under the same hold (see
+        // `AttemptEpoch`), so the stale write errors `Terminated`. Keep session
+        // ops inside the owning handler future all the same.
         self.inner
             .overlay
             .dirty()
