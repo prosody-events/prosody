@@ -983,8 +983,13 @@ where
     /// (task cancellation), where no other teardown runs — so a handle leaked
     /// past its event finds `is_terminated() == true`. A monotonic
     /// `false → true` flag set through `&self`; `Relaxed` suffices because it
-    /// publishes no other state and a racing reader that observes `false`
-    /// re-polls and converges.
+    /// publishes no other state, so a reader that observes `true` relies on no
+    /// happens-before edge — it simply errors its op. On the paths that also
+    /// bump the attempt epoch or close the gate this flag is a redundant
+    /// backstop; the one path where it is the sole fence is task-cancellation
+    /// teardown, whose already-benign forward-leak boundary is owned by
+    /// [`EventStateScope`](crate::state::manager::EventStateScope)'s
+    /// `# Residual`.
     terminated: AtomicBool,
     /// The per-event session operation gate (KV4) — see [`SessionGate`].
     gate: SessionGate,
