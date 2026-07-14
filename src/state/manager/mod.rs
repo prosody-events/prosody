@@ -95,13 +95,17 @@ pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomSt
 /// `PartitionStateManager::session` mints exactly one of these per event. It
 /// is the single owner of the event's state lifetime: non-`Clone` and
 /// `#[must_use]`, so a mint site cannot drop it on the floor, and its `Drop`
-/// clears the event's buffered dirty cells on **every** exit path — success,
-/// error, abandon, or panic unwind. That makes "clear the buffer when the
-/// event ends" structural rather than a scattered manual call a new code path
-/// could forget. On the success path `finalize` has already drained the
-/// buffer (the sealed lifecycle's `discard_dirty` doc owns that invariant),
-/// so the Drop clear is a no-op there: the scope is the failure-path
-/// backstop.
+/// runs on **every** exit path — success, error, abandon, task cancellation,
+/// or panic unwind — where it both flips the session terminated (the sealed
+/// lifecycle's `terminate`) and clears the event's buffered dirty cells (its
+/// `discard_dirty`). That makes "the session
+/// outlives its event" unrepresentable: a handle leaked into a task that
+/// outlives this scope finds `is_terminated() == true` and its ops error, and
+/// "clear the buffer when the event ends" is structural rather than a
+/// scattered manual call a new code path could forget. On the success path
+/// `finalize` has already drained the buffer (the sealed lifecycle's
+/// `discard_dirty` doc owns that invariant), so the Drop clear is a no-op
+/// there: the scope is the failure-path backstop.
 ///
 /// The session itself stays a freely-cloned `Arc`-backed handle
 /// ([`CellSession`]): the
@@ -116,12 +120,18 @@ pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomSt
 ///
 /// # Residual (honest boundary)
 ///
-/// `#[must_use]` + non-`Clone` + `Drop` guarantee the clear on every exit from
-/// a held scope. They do **not** prevent a deliberate `let _ = session(...)`
-/// or moving a `'static` handle into a task that outlives the scope; either
-/// degrades to a one-event forward-leak of buffered cells (not corruption),
-/// guarded by `#[must_use]`, the `let _guard = …` convention, and the session
-/// lifecycle property test.
+/// Because `Drop` is sync it is **ungated**, so on the dropped-future path
+/// (task cancellation, where no panic-unwind catch runs) it cannot revoke an
+/// *already-admitted but parked* mutator: a detached `set` that acquired the
+/// gate and parked before writing, when the dispatch future is dropped, lands
+/// its write after this ungated `discard_dirty` — a one-event forward-leak of
+/// buffered cells (not corruption). It is benign because future-drop is
+/// partition teardown/rebalance: the shared dirty workspace dies with the
+/// partition and no next same-key event reads it. The panic path takes the
+/// gate-held catch in `partition::process_event`, which serializes after any
+/// admitted permit and so *does* give the admitted-mutator no-residue
+/// guarantee. The `terminate` flip still fences the detached task's
+/// *subsequent* ops on both paths.
 #[must_use]
 pub struct EventStateScope<S>(S)
 where
@@ -148,6 +158,14 @@ where
     S: CellSession,
 {
     fn drop(&mut self) {
+        // Flip termination first, then discard: a dispatch future dropped
+        // mid-flight (task cancellation) runs no other teardown, so this sync
+        // Drop is the sole fence for a handle the dropped future leaked into a
+        // detached task — its subsequent ops then error `Terminated`. Both are
+        // ungated and best-effort; the panic path uses the gate-held catch in
+        // `partition::process_event` for the admitted-mutator no-residue
+        // guarantee this ungated discard cannot give.
+        self.0.terminate();
         self.0.discard_dirty();
     }
 }

@@ -22,7 +22,9 @@ use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
-use crate::state::manager::{PartitionStateManager, PartitionStateProvider, SweepResolution};
+use crate::state::manager::{
+    EventStateScope, PartitionStateManager, PartitionStateProvider, SweepResolution,
+};
 use crate::state::session::{CellSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::telemetry::sender::TelemetrySender;
@@ -37,9 +39,10 @@ use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
-use futures::{Stream, StreamExt, pin_mut};
-use std::future::{Ready, ready};
+use futures::{FutureExt, Stream, StreamExt, pin_mut};
+use std::future::{Future, Ready, ready};
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -702,11 +705,14 @@ async fn process_event<T, S, M, P>(
             // `Span::current()` captures like `EventContext::schedule`) nest
             // under it ambiently.
             let receive_span = message.span();
-            handler
-                .on_message(context, message, DemandType::Normal)
-                .instrument(receive_span)
-                .await;
-            cloned_context.invalidate();
+            guarded_dispatch(
+                &scope,
+                cloned_context,
+                handler
+                    .on_message(context, message, DemandType::Normal)
+                    .instrument(receive_span),
+            )
+            .await;
         }
         UncommittedEvent::Timer(timer) => {
             if let Some(firing) = timer.fire().await {
@@ -759,12 +765,53 @@ async fn process_event<T, S, M, P>(
                 // Instrument with the dispatch span so handler-created spans
                 // nest under it ambiently (mirrors the message arm).
                 let dispatch_span = firing.trigger().span();
-                handler
-                    .on_timer(context, firing, DemandType::Normal)
-                    .instrument(dispatch_span)
-                    .await;
-                cloned_context.invalidate();
+                guarded_dispatch(
+                    &scope,
+                    cloned_context,
+                    handler
+                        .on_timer(context, firing, DemandType::Normal)
+                        .instrument(dispatch_span),
+                )
+                .await;
             }
+        }
+    }
+}
+
+/// Runs one event's dispatch under a panic-unwind guard — the single catch
+/// site above every [`EventHandler`](crate::consumer::EventHandler) impl (the
+/// blanket durability-boundary impl *and* [`RetryHandler`], since retry is
+/// outermost and its own `on_message`/`on_timer` is `dispatch` here).
+///
+/// On the normal path it tears the event down (`invalidate`), exactly as the
+/// two arms did before. On an unwind it runs the gate-held terminal
+/// transition on the scope's own session — acquire the closed-gate permit
+/// (which FIFO-serializes *after* any already-admitted mutator, so a detached
+/// op in flight lands fully before the discard), discard the uncommitted
+/// overlay, flip the session terminated, release — then resumes the unwind so
+/// a panic still kills the partition task. It writes **no** epoch: a leaked
+/// current-pin handle is fenced for reads by termination and for mutations
+/// (including `commit()`) by the closed gate, and a genuinely-stale clone stays
+/// fenced by its old pin.
+///
+/// `process_event` legitimately owns the scope, so reaching the sealed
+/// lifecycle through [`EventStateScope::handle`] here is not the tunnel the
+/// settlement/marker split restricts — no `context` accessor is used.
+async fn guarded_dispatch<S, C, F>(scope: &EventStateScope<S>, cloned: C, dispatch: F)
+where
+    S: CellSession,
+    C: EventContext,
+    F: Future<Output = ()>,
+{
+    match AssertUnwindSafe(dispatch).catch_unwind().await {
+        Ok(()) => cloned.invalidate(),
+        Err(panic) => {
+            let session = scope.handle();
+            let permit = session.close_gate().await;
+            session.discard_dirty();
+            session.terminate();
+            drop(permit);
+            resume_unwind(panic);
         }
     }
 }

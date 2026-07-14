@@ -13,7 +13,7 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
-use crate::state::session::sealed::StateLifecycle;
+use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::CellStore;
 use crate::state::{
@@ -219,13 +219,6 @@ where
         Ok(Finalized::Clean)
     }
 
-    fn set_reload_marker(&self, _marker: MessageMarker) {}
-
-    fn message_marker(&self) -> Option<MessageMarker> {
-        // Stateless: no event identity, so nothing filters or records.
-        None
-    }
-
     async fn record_marker(
         &self,
         _marker: MessageMarker,
@@ -235,6 +228,8 @@ where
     }
 
     fn discard_dirty(&self) {}
+
+    fn terminate(&self) {}
 
     fn attempt_current(&self) -> bool {
         // Inert: every op errors `Unavailable` before the pin is consulted.
@@ -256,6 +251,18 @@ where
     }
 
     async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
+}
+
+impl<P> MarkerIdentity for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    fn set_reload_marker(&self, _marker: MessageMarker) {}
+
+    fn message_marker(&self) -> Option<MessageMarker> {
+        // Stateless: no event identity, so nothing filters or records.
+        None
+    }
 }
 
 /// A [`CellStore`] decorator counting every durable mutation, shared by the

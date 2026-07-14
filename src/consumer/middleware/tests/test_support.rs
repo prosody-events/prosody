@@ -33,7 +33,9 @@ use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::session::{
+    CellSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
+};
 use crate::state::store::CellStore;
 use crate::state::tests::support::UnavailableState;
 use crate::state::{
@@ -449,6 +451,24 @@ where
         future::ready(Ok(self.durable_scheduled(timer_type)))
     }
 }
+
+/// Test-only convenience accessor to the full settlement session, standing in
+/// for the deleted crate-wide `lifecycle()`. Production enforcement holds — the
+/// settlement surface is reachable in shipping code only through settle's own
+/// private `SettlementAccess` — while tests that legitimately drive
+/// `finalize` / `get` / backstop accessors through the event's own session
+/// keep a one-call binder. The North Star is production leak-fencing; tests are
+/// allowed broad access.
+pub trait TestLifecycleAccess: EventContext {
+    /// Binds the event's session through [`LifecycleAccess`], returning it so
+    /// the test drives the sealed lifecycle. Fails only when the context is
+    /// terminated.
+    fn test_lifecycle(&self) -> Result<Self::State, StateAccessError> {
+        self.state(Registered::new(LifecycleAccess))
+    }
+}
+
+impl<C: EventContext> TestLifecycleAccess for C {}
 
 /// Test error carrying its classification. Display matches the per-file
 /// originals (`test error (Transient)`) so no assertion text changes.

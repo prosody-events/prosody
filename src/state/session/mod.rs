@@ -82,7 +82,7 @@ use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
-use sealed::{StagedCollection, StagedState, StateLifecycle};
+use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -109,7 +109,7 @@ mod tests;
 /// sealed `StateLifecycle` supertrait, which is what seals `CellSession`:
 /// downstream crates can name it in bounds (e.g. [`EventContext::State`]) but
 /// can neither implement it nor reach the lifecycle.
-pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
+pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
     /// [`CellResolver`](crate::state::descriptor::CellResolver)
@@ -735,30 +735,6 @@ pub(crate) mod sealed {
             &self,
         ) -> impl Future<Output = Result<Finalized<Self::Cell>, StateAccessError>> + Send;
 
-        /// Sets the deferred-reload identity override: the dedup id of the
-        /// message the current dispatch loaded from the defer queue, set at
-        /// exactly one site — the message-defer reload path, immediately
-        /// after the load succeeds and before the inner dispatch.
-        ///
-        /// **Last-wins and never cleared.** Last-wins is load-bearing: a
-        /// retry re-dispatch of the same defer timer after an ambiguous
-        /// durable queue advance loads the *next* queued message — a
-        /// different id — and the override must re-point at it (a set-once
-        /// cell would dispatch message B under message A's identity). Never
-        /// cleared is safe because every settle arm that consults
-        /// [`Self::message_marker`] implies the final attempt's inner ran,
-        /// which implies that attempt's reload performed the set — a stale
-        /// read is unreachable, not merely forbidden.
-        fn set_reload_marker(&self, marker: MessageMarker);
-
-        /// The message commit-marker identity for this event: a message
-        /// session's [`EventRef::Message`](crate::state::EventRef) dedup id;
-        /// on a timer session, the reload override; else `None` (a pure
-        /// timer, whose trigger commit is its dedup). A message session
-        /// never reads the override — the match arm structurally ignores it,
-        /// so a divergent override is unreadable rather than forbidden.
-        fn message_marker(&self) -> Option<MessageMarker>;
-
         /// Records `marker` through the commit oracle. Idempotent — the
         /// oracle write is a bare upsert — so the boundary retries failures
         /// freely. [`MarkerWrite`] is constructible only inside the
@@ -784,6 +760,19 @@ pub(crate) mod sealed {
         /// there; the receipt's promote/rollback read only receipt-owned
         /// data, never dirty.
         fn discard_dirty(&self);
+
+        /// Flips this session terminated, synchronously and idempotently — the
+        /// teardown half of
+        /// [`CellSession::is_terminated`](super::CellSession::is_terminated).
+        /// The [`EventStateScope`](crate::state::manager::EventStateScope)'s
+        /// `Drop` calls it on every dispatch exit (including a future dropped
+        /// mid-flight, where no gated teardown runs), and the panic-unwind
+        /// catch calls it under the held closed gate. After it, every op on any
+        /// clone of this session errors — reads/inits `Terminated`, and a
+        /// current-pin mutation past the closed gate `SessionClosed` (the gate
+        /// closes first in the catch). Writes no epoch: a genuinely-leaked
+        /// stale clone stays fenced by its old pin regardless.
+        fn terminate(&self);
 
         /// Whether this handle/session clone's pinned epoch still equals the
         /// live session epoch. `false` once a later attempt boundary
@@ -823,6 +812,39 @@ pub(crate) mod sealed {
         /// Records that a `StateRecovery` backstop firing at `fire` now stands
         /// for this session's key (overwriting any earlier standing fire).
         fn mark_backstop_armed(&self, fire: CompactDateTime) -> impl Future<Output = ()> + Send;
+    }
+
+    /// The message commit-marker identity surface — the sole home of
+    /// `set_reload_marker`/`message_marker` (they are deliberately **not** on
+    /// [`StateLifecycle`], so the settlement surface carries no marker
+    /// vocabulary). Exactly three audiences reach it, each through the narrow
+    /// [`MarkerHandle`](super::MarkerHandle) rather than a raw session: the
+    /// message-defer reload path *sets* the override, and the dedup filter and
+    /// the settle boundary *read* it.
+    pub trait MarkerIdentity {
+        /// Sets the deferred-reload identity override: the dedup id of the
+        /// message the current dispatch loaded from the defer queue, set at
+        /// exactly one site — the message-defer reload path, immediately
+        /// after the load succeeds and before the inner dispatch.
+        ///
+        /// **Last-wins and never cleared.** Last-wins is load-bearing: a
+        /// retry re-dispatch of the same defer timer after an ambiguous
+        /// durable queue advance loads the *next* queued message — a
+        /// different id — and the override must re-point at it (a set-once
+        /// cell would dispatch message B under message A's identity). Never
+        /// cleared is safe because every settle arm that consults
+        /// [`Self::message_marker`] implies the final attempt's inner ran,
+        /// which implies that attempt's reload performed the set — a stale
+        /// read is unreachable, not merely forbidden.
+        fn set_reload_marker(&self, marker: MessageMarker);
+
+        /// The message commit-marker identity for this event: a message
+        /// session's [`EventRef::Message`](crate::state::EventRef) dedup id;
+        /// on a timer session, the reload override; else `None` (a pure
+        /// timer, whose trigger commit is its dedup). A message session
+        /// never reads the override — the match arm structurally ignores it,
+        /// so a divergent override is unreadable rather than forbidden.
+        fn message_marker(&self) -> Option<MessageMarker>;
     }
 }
 
@@ -937,6 +959,16 @@ where
     /// identity only; the commit decision lives in the settle boundary's
     /// typed classification, never in this cell's occupancy.
     reload_marker: SyncMutex<Option<MessageMarker>>,
+    /// Session-owned termination flag, flipped synchronously by
+    /// [`StateLifecycle::terminate`](sealed::StateLifecycle::terminate). It is
+    /// the teardown half of [`is_terminated`](CellSession::is_terminated): the
+    /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
+    /// runs on every dispatch exit — including a future dropped mid-flight
+    /// (task cancellation), where no other teardown runs — so a handle leaked
+    /// past its event finds `is_terminated() == true`. Only the sender is kept;
+    /// `borrow()` reads and `send_replace(true)` sets it, both fine with zero
+    /// receivers.
+    terminated: watch::Sender<bool>,
     /// The per-event session operation gate (KV4) — see [`SessionGate`].
     gate: SessionGate,
     /// The shared live attempt epoch — the truth every clone of this session
@@ -1022,6 +1054,7 @@ where
                 armed,
                 termination,
                 reload_marker: SyncMutex::new(None),
+                terminated: watch::channel(false).0,
                 gate: SessionGate::new(),
                 epoch: RwLock::new(AttemptEpoch::INITIAL),
             }),
@@ -1067,7 +1100,7 @@ where
     }
 
     fn is_terminated(&self) -> bool {
-        self.inner.termination.is_terminated()
+        self.inner.termination.is_terminated() || *self.inner.terminated.borrow()
     }
 
     fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool {
@@ -1318,25 +1351,6 @@ where
         }))
     }
 
-    fn set_reload_marker(&self, marker: MessageMarker) {
-        // Override implies timer session: only the deferred-message reload
-        // sets it, and that reload always dispatches under a timer EventRef.
-        debug_assert!(
-            matches!(self.inner.event, EventRef::Timer(_)),
-            "the reload override is set only on timer sessions"
-        );
-        *self.inner.reload_marker.lock() = Some(marker);
-    }
-
-    fn message_marker(&self) -> Option<MessageMarker> {
-        match self.inner.event {
-            // The message's own id — the override is never read here, so a
-            // divergent override on a message session is unreadable.
-            EventRef::Message { dedup_id } => Some(MessageMarker::new(dedup_id)),
-            EventRef::Timer(_) => *self.inner.reload_marker.lock(),
-        }
-    }
-
     async fn record_marker(
         &self,
         marker: MessageMarker,
@@ -1364,6 +1378,10 @@ where
             .overlay
             .dirty()
             .clear_event(&self.inner.state_key.key);
+    }
+
+    fn terminate(&self) {
+        self.inner.terminated.send_replace(true);
     }
 
     fn attempt_current(&self) -> bool {
@@ -1404,6 +1422,30 @@ where
             .armed
             .upsert_async(self.inner.state_key.key.clone(), fire)
             .await;
+    }
+}
+
+impl<B, L> MarkerIdentity for KeyedStateSession<B, L>
+where
+    B: StateBackend,
+{
+    fn set_reload_marker(&self, marker: MessageMarker) {
+        // Override implies timer session: only the deferred-message reload
+        // sets it, and that reload always dispatches under a timer EventRef.
+        debug_assert!(
+            matches!(self.inner.event, EventRef::Timer(_)),
+            "the reload override is set only on timer sessions"
+        );
+        *self.inner.reload_marker.lock() = Some(marker);
+    }
+
+    fn message_marker(&self) -> Option<MessageMarker> {
+        match self.inner.event {
+            // The message's own id — the override is never read here, so a
+            // divergent override on a message session is unreadable.
+            EventRef::Message { dedup_id } => Some(MessageMarker::new(dedup_id)),
+            EventRef::Timer(_) => *self.inner.reload_marker.lock(),
+        }
     }
 }
 
@@ -1569,12 +1611,21 @@ where
         .await
 }
 
-/// Crate-private descriptor the framework uses to reach a session through the
-/// one public [`EventContext::state`] method — the sole state surface wrapper
-/// contexts forward. Binding it yields the session itself (`Handle<S> = S`), so
-/// the durability boundary calls the sealed [`StateLifecycle`] methods on the
-/// session directly; a second required context method would burden every
-/// wrapper and expose the raw session to handlers.
+/// Crate-private descriptor reaching a session through the one public
+/// [`EventContext::state`] method — the sole state surface wrapper contexts
+/// forward. Binding it yields the session itself (`Handle<S> = S`), so the
+/// settlement boundary drives the full sealed [`StateLifecycle`] on it.
+///
+/// This is the **settlement surface**: `close_gate` / `finalize` /
+/// `record_marker` / `discard_dirty` / `terminate` / the backstop accessors.
+/// It stays `pub(crate)` because the settle-module-private
+/// [`SettlementAccess`](crate::consumer::middleware::settle) extension must
+/// name it. Residual: no convenient crate-wide accessor exists (the old
+/// `LifecycleAccessExt` is gone), so reaching this surface outside settle
+/// requires writing `context.state(Registered::new(LifecycleAccess))` plus a
+/// `use sealed::StateLifecycle` by hand — a deliberate, greppable act rather
+/// than a one-call convenience. Dedup / defer-reload reach only the marker
+/// identity, through the narrow [`MarkerHandle`].
 ///
 /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
 #[derive(Clone, Copy, Debug)]
@@ -1620,17 +1671,84 @@ impl StateDescriptor for LifecycleAccess {
     }
 }
 
-/// Crate-private extension giving every [`EventContext`] one-call access to its
-/// per-event session through the public [`EventContext::state`] method. The
-/// returned session exposes the sealed [`StateLifecycle`] the durability
-/// boundary drives.
-pub(crate) trait LifecycleAccessExt: EventContext {
-    /// Binds the event's session through the lifecycle tunnel. Fails with
-    /// [`StateAccessError`] only when the context is terminated;
-    /// [`LifecycleAccess`] is otherwise registration-independent.
-    fn lifecycle(&self) -> Result<Self::State, StateAccessError> {
-        self.state(Registered::new(LifecycleAccess))
+/// The narrow marker-identity handle handed to the three
+/// [`MarkerIdentity`](sealed::MarkerIdentity) audiences (defer-reload set,
+/// dedup read, settle read). Wraps a session clone but exposes **only** the
+/// two marker methods — never the raw session, so it cannot reach the
+/// settlement surface. This is the tunnel-narrowing enforcement: dedup and
+/// defer-reload bind [`MarkerAccess`] and get one of these, so they cannot
+/// import `sealed::StateLifecycle` and call `close_gate` / `finalize`.
+pub(crate) struct MarkerHandle<S>(S);
+
+impl<S: MarkerIdentity> MarkerHandle<S> {
+    /// Sets the deferred-reload identity override — see
+    /// [`MarkerIdentity::set_reload_marker`](sealed::MarkerIdentity::set_reload_marker).
+    pub(crate) fn set_reload_marker(&self, marker: MessageMarker) {
+        self.0.set_reload_marker(marker);
+    }
+
+    /// The message commit-marker identity — see
+    /// [`MarkerIdentity::message_marker`](sealed::MarkerIdentity::message_marker).
+    pub(crate) fn message_marker(&self) -> Option<MessageMarker> {
+        self.0.message_marker()
     }
 }
 
-impl<C: EventContext> LifecycleAccessExt for C {}
+/// Crate-private descriptor binding a session's marker-identity surface,
+/// forwarded through the one public [`EventContext::state`] method exactly as
+/// [`LifecycleAccess`] is. Binding yields a [`MarkerHandle`], never the raw
+/// session, so the audience reaches only `set_reload_marker`/`message_marker`.
+///
+/// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarkerAccess;
+
+impl DescriptorIdentity for MarkerAccess {
+    /// Inert, exactly as [`LifecycleAccess`]: `MarkerAccess` is never
+    /// registered, so neither field is consulted — they satisfy the
+    /// [`StateDescriptor`] supertrait only.
+    fn name(&self) -> &'static str {
+        "\u{0}marker"
+    }
+
+    fn structural_identity(&self) -> StructuralIdentity {
+        StructuralIdentity {
+            kind: CollectionKindId::Value,
+            format_id: "\u{0}framework-marker",
+            resolver_id: None,
+            key_format_id: "\u{0}framework-marker",
+        }
+    }
+}
+
+impl SealedDescriptor for MarkerAccess {}
+
+impl StateDescriptor for MarkerAccess {
+    type Handle<S: CellSession> = MarkerHandle<S>;
+
+    /// Wraps the session in a [`MarkerHandle`], validating no registration —
+    /// the marker tunnel carries no typed collection.
+    fn bind<S: CellSession>(self, session: &S) -> Result<MarkerHandle<S>, StateAccessError> {
+        Ok(MarkerHandle(session.clone()))
+    }
+
+    /// No-op: the marker tunnel carries no operational settings.
+    fn with_collection_def(self, _def: CollectionDef) -> Self {
+        self
+    }
+}
+
+/// Crate-private extension giving the marker-identity audiences (defer-reload,
+/// dedup, and settle) one-call access to their event's [`MarkerHandle`]
+/// through the public [`EventContext::state`] method — the narrow replacement
+/// for the deleted crate-wide `lifecycle()` accessor.
+pub(crate) trait MarkerAccessExt: EventContext {
+    /// Binds the event's marker-identity handle. Fails with
+    /// [`StateAccessError`] only when the context is terminated;
+    /// [`MarkerAccess`] is otherwise registration-independent.
+    fn marker_identity(&self) -> Result<MarkerHandle<Self::State>, StateAccessError> {
+        self.state(Registered::new(MarkerAccess))
+    }
+}
+
+impl<C: EventContext> MarkerAccessExt for C {}

@@ -52,8 +52,7 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     Settlement, SettlementHandler,
 };
-use crate::state::session::LifecycleAccessExt;
-use crate::state::session::sealed::StateLifecycle;
+use crate::state::session::MarkerAccessExt;
 use crate::timers::Trigger;
 use crate::{EventIdentity, Partition, Topic};
 
@@ -280,9 +279,9 @@ where
         // A context with no marker source (stateless / invalidated session)
         // dispatches unfiltered.
         let marker = context
-            .lifecycle()
+            .marker_identity()
             .ok()
-            .and_then(|lifecycle| lifecycle.message_marker());
+            .and_then(|marker| marker.message_marker());
         if let Some(marker) = marker
             && self
                 .store

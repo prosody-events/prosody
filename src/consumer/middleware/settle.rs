@@ -30,8 +30,10 @@ use super::FallibleHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::event_context::EventContext;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
-use crate::state::session::{Finalized, LifecycleAccessExt, MessageMarker, OpPermit};
+use crate::state::access::StateAccessError;
+use crate::state::descriptor::Registered;
+use crate::state::session::sealed::{ApplyOutcome, MarkerIdentity, StateLifecycle};
+use crate::state::session::{Finalized, LifecycleAccess, MessageMarker, OpPermit};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -40,6 +42,24 @@ use crate::timers::duration::CompactDuration;
 /// that failed transiently. Mirrors the timer commit retry cadence
 /// ([`crate::timers::uncommitted`]) and the state-manager init loop.
 const DURABILITY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Settle-module-private access to the full settlement surface: binds the
+/// event's session through [`LifecycleAccess`] and returns it so the boundary
+/// drives the sealed [`StateLifecycle`] (`close_gate` / `finalize` /
+/// `record_marker` / `discard_dirty` / the backstop accessors). Private to
+/// this module — the crate-wide `lifecycle()` accessor is gone, so only settle
+/// reaches this surface conveniently; dedup / defer-reload get the narrow
+/// [`MarkerHandle`](crate::state::session::MarkerHandle) instead.
+trait SettlementAccess: EventContext {
+    /// Binds the event's session through the settlement tunnel. Fails only
+    /// when the context is terminated; [`LifecycleAccess`] is otherwise
+    /// registration-independent.
+    fn settle_lifecycle(&self) -> Result<Self::State, StateAccessError> {
+        self.state(Registered::new(LifecycleAccess))
+    }
+}
+
+impl<C: EventContext> SettlementAccess for C {}
 
 /// How the settlement boundary treats the stack's final result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,11 +73,12 @@ pub(crate) enum Settlement {
     /// commit of the same message) or the error belongs to a middleware
     /// layer, not the event (a rescue/admission failure where the marker
     /// must not certify anything). Nothing stages, no marker records; the
-    /// offset/trigger commits. The event scope's drop discards any dirty
-    /// residue, and skipping `finalize` is exact parity with finalizing an
-    /// empty buffer: an empty finalize yields [`Finalized::Clean`], and the
-    /// Clean arm never arms the recovery backstop (arming is
-    /// possession-driven, gated on `Finalized::Staged`).
+    /// offset/trigger commits. The boundary discards any uncommitted dirty
+    /// overlay under the held permit before the hook fires (the scope drop
+    /// stays the panic/drop backstop), and skipping `finalize` is exact parity
+    /// with finalizing an empty buffer: an empty finalize yields
+    /// [`Finalized::Clean`], and the Clean arm never arms the recovery backstop
+    /// (arming is possession-driven, gated on `Finalized::Staged`).
     Bypassed,
 }
 
@@ -134,7 +155,7 @@ impl<C: EventContext> NextAttempt for C {
     async fn next_attempt(self) -> Self {
         // A stateless / invalidated context has no lifecycle to reset; the
         // re-pin below is then a no-op rebuild. Mint site 1a (reset/bump).
-        if let Ok(session) = self.lifecycle() {
+        if let Ok(session) = self.settle_lifecycle() {
             session.reset(RepinProof(())).await;
         }
         // Mint site 1b (re-pin to the just-bumped epoch).
@@ -231,7 +252,7 @@ pub(crate) async fn settle<T, C, G>(
     // Reach the event's lifecycle handle. Every live context carries one —
     // `LifecycleAccess` binds unconditionally — so `None` means only an
     // invalidated context, which cannot stage anyway.
-    let lifecycle = context.lifecycle().ok();
+    let lifecycle = context.settle_lifecycle().ok();
 
     // Close the session operation gate and HOLD the permit across the whole
     // durability sequence: closure fences mutators (a detached op errors
@@ -251,6 +272,7 @@ pub(crate) async fn settle<T, C, G>(
         // yields `Finalized::Clean`, and Clean never arms the backstop.
         Settlement::Bypassed => {
             guard.commit().await;
+            discard_uncommitted(lifecycle.as_ref());
             drop(permit);
             fire_apply_hook(handler, context, true, result).await;
         }
@@ -265,6 +287,7 @@ pub(crate) async fn settle<T, C, G>(
                     record_marker_best_effort(&context, lifecycle, marker).await;
                 }
                 guard.commit().await;
+                discard_uncommitted(lifecycle.as_ref());
                 drop(permit);
                 fire_apply_hook(handler, context, true, result).await;
             }
@@ -273,6 +296,7 @@ pub(crate) async fn settle<T, C, G>(
             // (Terminal returned above.)
             Some(_) => {
                 guard.commit().await;
+                discard_uncommitted(lifecycle.as_ref());
                 drop(permit);
                 fire_apply_hook(handler, context, true, result).await;
             }
@@ -281,6 +305,28 @@ pub(crate) async fn settle<T, C, G>(
                 settle_committed(handler, context, guard, result, lifecycle.as_ref(), permit).await;
             }
         },
+    }
+}
+
+/// Discards this event's uncommitted dirty overlay, on every settle path that
+/// did **not** successfully finalize (final permanent/transient, Bypassed,
+/// permanent finalize-failure, finalize / marker-record shutdown, and the
+/// direct [`abandon`]). Defined by the *absence* of successful finalization,
+/// not an error-category list: a successful
+/// [`finalize`](StateLifecycle::finalize) drains the buffer as part of the
+/// stage, so the success path never reaches here.
+///
+/// Called under the still-held closed-gate permit, before the permit drops and
+/// the apply hooks fire, so an apply hook or a leaked hook-window read observes
+/// fully-settled committed truth with no aborted-attempt residue. The
+/// commit-now floor survives untouched: an explicit mid-handler `commit()`
+/// durably applies **and** drains its cells at commit time, so this clears only
+/// the remaining uncommitted ops. Staged provisional cells and the recovery
+/// backstop live in the durable store, not the dirty buffer, so this never
+/// touches them. A stateless / invalidated context (`None`) has no overlay.
+fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.discard_dirty();
     }
 }
 
@@ -352,6 +398,12 @@ async fn settle_committed<'a, T, C, G>(
                 // arm uses the plain floor.
                 let _ = arm_backstop(&context, lifecycle, lifecycle.recovery_floor()).await;
                 guard.commit().await;
+                // Not a successful finalize (`finalize`'s failure paths leave
+                // the buffer whole), so discard the uncommitted overlay under
+                // the still-held permit before the hook reads — the commit-now
+                // floor of an explicit mid-handler `commit()` survives (its
+                // cells were durably applied and drained at commit time).
+                discard_uncommitted(Some(lifecycle));
                 drop(permit);
                 fire_apply_hook(handler, context, true, result).await;
                 return;
@@ -360,8 +412,12 @@ async fn settle_committed<'a, T, C, G>(
                 // Shutdown before a receipt exists: nothing is recorded to
                 // roll back (finalize mints the receipt only on full success);
                 // redelivery re-runs from clean state, and recovery owns any
-                // partial durable stage. Drop the permit first: `abandon`
-                // performs its own idempotent gate close.
+                // partial durable stage. Discard the uncommitted overlay under
+                // the still-held permit (finalize did not drain it) before
+                // dropping — closes the drop→`abandon` reacquire gap where a
+                // leaked read could observe the residue in the open-gate
+                // window. `abandon` performs its own idempotent gate close.
+                discard_uncommitted(Some(lifecycle));
                 drop(permit);
                 abandon(handler, context, guard, result).await;
                 return;
@@ -427,6 +483,11 @@ async fn settle_committed<'a, T, C, G>(
                     // ambiguous, so the staged cells must not (and
                     // structurally cannot) roll back — see
                     // [`StagedState::certify`]; the armed sweep resolves them.
+                    // The buffer is already drained (finalize succeeded to
+                    // reach here), so this discard is a provable no-op included
+                    // only for a local, gap-free argument at the drop→`abandon`
+                    // reacquire.
+                    discard_uncommitted(Some(lifecycle));
                     drop(permit);
                     abandon(handler, context, guard, result).await;
                     return;
@@ -461,11 +522,14 @@ async fn settle_committed<'a, T, C, G>(
 /// reloadable) and fire `after_abort`. Reached on a terminal error or a
 /// shutdown mid-sequence.
 ///
-/// Touches no keyed state: staged cells (if any exist) stay provisional for
-/// redelivery, first-touch, or the armed sweep to resolve through the oracle
-/// — the one inline rollback lives at the arm-shutdown arm of
-/// `settle_committed`, where possession of the un-certified receipt proves it
-/// is sound.
+/// Never *promotes* keyed state: certified staged cells (if any exist) stay
+/// provisional for redelivery, first-touch, or the armed sweep to resolve
+/// through the oracle — the one inline rollback lives at the arm-shutdown arm
+/// of `settle_committed`, where possession of the un-certified receipt proves
+/// it is sound. It does discard the uncommitted dirty overlay under the held
+/// permit (abandon is never a successful finalize), so a leaked hook-window
+/// read observes committed truth, not aborted-attempt residue; the commit-now
+/// floor survives (its cells drained at `commit()` time).
 pub(crate) async fn abandon<T, C, G>(
     handler: &T,
     context: C,
@@ -480,12 +544,13 @@ pub(crate) async fn abandon<T, C, G>(
     // the fence must not depend on routing through `settle`. Idempotent: a
     // second close after `settle`'s own (its arms drop their permit before
     // delegating here) merely re-acquires and re-marks `Closed`.
-    let lifecycle = context.lifecycle().ok();
+    let lifecycle = context.settle_lifecycle().ok();
     let permit = match &lifecycle {
         Some(lifecycle) => Some(lifecycle.close_gate().await),
         None => None,
     };
     guard.abort().await;
+    discard_uncommitted(lifecycle.as_ref());
     drop(permit);
     fire_apply_hook(handler, context, false, result).await;
 }

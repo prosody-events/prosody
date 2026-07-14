@@ -42,8 +42,7 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
 use crate::loader::{KafkaLoader, MessageLoader};
-use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{LifecycleAccessExt, MessageMarker};
+use crate::state::session::{MarkerAccessExt, MessageMarker};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::TimerEventType;
 use crate::telemetry::partition::TelemetryPartitionSender;
@@ -855,8 +854,8 @@ where
         // session stages under the timer's EventRef. Last-wins by design: a
         // retry re-dispatch of this same timer after a durable queue advance
         // loads the next head and re-points the override at it.
-        if let Ok(lifecycle) = context.lifecycle() {
-            lifecycle.set_reload_marker(MessageMarker::new(dedup_uuid_for_message(
+        if let Ok(marker) = context.marker_identity() {
+            marker.set_reload_marker(MessageMarker::new(dedup_uuid_for_message(
                 DedupIdentity {
                     version: &self.dedup_version,
                     group_id: &self.source,

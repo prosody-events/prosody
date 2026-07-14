@@ -592,3 +592,262 @@ async fn test_partition_manager_timer_heartbeat_integration() {
     let watermark = partition_manager.shutdown().await;
     assert_eq!(watermark, Some(1), "Shutdown should drain the commit");
 }
+
+/// (l) abnormal-exit fencing through [`guarded_dispatch`] — the single
+/// panic-unwind catch site `process_event` wraps every dispatch in (above
+/// `RetryHandler`'s own `EventHandler` impl). On an unwind the catch runs the
+/// gate-held terminal transition (close, discard, terminate — no epoch write)
+/// then resumes; on a dropped dispatch future the scope's `Drop` flips
+/// termination. Either way a handle the dispatch leaked past its attempt is
+/// fenced on the op's next effect, with zero orchestration by any caller.
+mod unwind {
+    use super::*;
+    use crate::codec::{JsonCodec, JsonCodecError};
+    use crate::consumer::middleware::NextAttempt;
+    use crate::consumer::middleware::tests::test_support::MockEventContext;
+    use crate::state::access::StateAccessError;
+    use crate::state::descriptor::tests::TestSession;
+    use crate::state::descriptor::{CellStateError, Registered, ValueHandle, value_state};
+    use crate::state::dirty::DirtyStore;
+    use crate::state::manager::EventStateScope;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+    use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+    use crate::state::tests::cell_suite::value_cell;
+    use crate::state::{EventRef, StateKey, StateName, StateType};
+    use crate::timers::duration::CompactDuration;
+    use bytes::Bytes;
+    use color_eyre::eyre::{Result, bail, eyre};
+    use serde_json::{Value, json};
+    use tokio::sync::{oneshot, watch};
+    use uuid::Uuid;
+
+    const NAME: &str = "c";
+    type Ctx = MockEventContext<Value, TestSession>;
+    type Handle = ValueHandle<TestSession, JsonCodec>;
+
+    /// Shared durable + dirty state so the event session and a fresh observer
+    /// session read the same overlay — the residue probe.
+    struct Fixture {
+        cell: MemoryCellStore<FixedOracle>,
+        dirty: Arc<DirtyStore>,
+        state_key: StateKey,
+        registry: Arc<CollectionDefRegistry>,
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self> {
+            let mut registry = CollectionDefRegistry::default();
+            registry.register(&value_state::<JsonCodec>(NAME), CollectionDef::new(None))?;
+            let registry = Arc::new(registry);
+            let cell = MemoryCellStore::new(
+                MemoryCells::new(),
+                FixedOracle::committed(),
+                registry.clone(),
+            );
+            Ok(Self {
+                cell,
+                dirty: Arc::new(DirtyStore::new()),
+                state_key: StateKey::new(Uuid::from_u128(0xE), Arc::from("user-1")),
+                registry,
+            })
+        }
+
+        /// A fresh session (new event epoch) over the shared durable + dirty
+        /// state.
+        fn session(&self) -> TestSession {
+            let (_s, shutdown_rx) = watch::channel(ShutdownPhase::default());
+            let (_c, cancel_rx) = watch::channel(false);
+            KeyedStateSession::new(SessionParts {
+                cell: self.cell.clone(),
+                dirty: self.dirty.clone(),
+                oracle: FixedOracle::committed(),
+                loader: MemoryLoader::new(),
+                registry: self.registry.clone(),
+                state_key: self.state_key.clone(),
+                event: EventRef::Message {
+                    dedup_id: Uuid::new_v4(),
+                },
+                recovery_delay: CompactDuration::new(30),
+                armed: Arc::default(),
+                termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            })
+        }
+
+        /// The buffered dirty bytes of `NAME` observed through a fresh,
+        /// non-terminated session over the same overlay — the residue probe.
+        async fn residue(&self) -> Result<Option<Bytes>> {
+            self.session()
+                .get(
+                    StateType::Application,
+                    &StateName::try_new(NAME)?,
+                    &value_cell(),
+                )
+                .await
+                .map_err(|e| eyre!("residue read: {e}"))
+        }
+    }
+
+    fn handle(context: &Ctx) -> Result<Handle> {
+        context
+            .state(Registered::new(value_state::<JsonCodec>(NAME)))
+            .map_err(|e| eyre!("bind: {e}"))
+    }
+
+    fn tag(error: &CellStateError<JsonCodecError>) -> String {
+        match error {
+            CellStateError::Access(StateAccessError::SessionClosed) => "SessionClosed".into(),
+            CellStateError::Access(StateAccessError::Terminated) => "Terminated".into(),
+            other => format!("other: {other}"),
+        }
+    }
+
+    /// Runs `dispatch` through the production catch on a spawned task and
+    /// returns `Ok(())` once the resumed panic is observed at the join.
+    async fn expect_unwind<F>(
+        scope: EventStateScope<TestSession>,
+        cloned: Ctx,
+        dispatch: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let joined = spawn(async move {
+            guarded_dispatch(&scope, cloned, dispatch).await;
+        })
+        .await;
+        match joined {
+            Err(e) if e.is_panic() => Ok(()),
+            other => bail!("guarded_dispatch must resume the unwind, got {other:?}"),
+        }
+    }
+
+    /// Arm A/C — a handler (or final apply hook) panics with no attempt bump,
+    /// so a handle leaked past it keeps a CURRENT pin. After the catch resumes
+    /// the panic: a leaked read errors `Terminated` (the catch terminated the
+    /// session), a leaked `commit()` errors `SessionClosed` (current pin, gate
+    /// Closed — Closed is checked before termination), and the dirty overlay is
+    /// empty (the gate-held catch discarded the handler's buffered set).
+    /// Falsify: remove `session.terminate()` from `guarded_dispatch` → the read
+    /// returns `Ok`; remove `session.discard_dirty()` → residue survives.
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        reason = "the unwind pins drive a deliberate panic through the catch"
+    )]
+    async fn handler_panic_current_pin_leaks_are_fenced_and_overlay_cleared() -> Result<()> {
+        let fx = Fixture::new()?;
+        let session = fx.session();
+        let scope = EventStateScope::new(session.clone());
+        let context = MockEventContext::new().with_session(session);
+        // Leak a current-pin handle and buffer a write, both at attempt 1.
+        let leaked = handle(&context)?;
+        leaked.set(json!("leaked")).await?;
+
+        let cloned = context.clone();
+        expect_unwind(scope, cloned, async move {
+            let _hold = context;
+            panic!("handler boom");
+        })
+        .await?;
+
+        match leaked.get().await {
+            Err(CellStateError::Access(StateAccessError::Terminated)) => {}
+            other => bail!("leaked read must be Terminated, got {other:?}"),
+        }
+        match leaked.commit().await {
+            Err(e) if tag(&e) == "SessionClosed" => {}
+            other => bail!("current-pin leaked commit must be SessionClosed, got {other:?}"),
+        }
+        assert_eq!(
+            fx.residue().await?,
+            None,
+            "the catch discarded the handler's buffered overlay",
+        );
+        Ok(())
+    }
+
+    /// Arm B — an intermediate `after_abort` panics mid retry loop, AFTER a
+    /// `next_attempt` bump, so the leaked handle predates the bump and is
+    /// STALE. Its `commit()` then errors `Terminated` (the pin compare fires
+    /// before the closed-gate check), distinguishing it from the current-pin
+    /// arms. Falsify: swap the pin/closed order in `mutate_permit` → this flips
+    /// to `SessionClosed`.
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        reason = "the unwind pins drive a deliberate panic through the catch"
+    )]
+    async fn intermediate_bump_makes_leaked_commit_terminated() -> Result<()> {
+        let fx = Fixture::new()?;
+        let session = fx.session();
+        let scope = EventStateScope::new(session.clone());
+        let context = MockEventContext::new().with_session(session);
+        // Leak a handle at attempt 1 BEFORE the bump.
+        let leaked = handle(&context)?;
+
+        let cloned = context.clone();
+        expect_unwind(scope, cloned, async move {
+            // Advance the attempt boundary via the real verb — exactly what
+            // retry runs between attempts — then panic mid-loop.
+            let context = context.next_attempt().await;
+            let _hold = context;
+            panic!("intermediate after_abort boom");
+        })
+        .await?;
+
+        match leaked.commit().await {
+            Err(e) if tag(&e) == "Terminated" => Ok(()),
+            other => bail!("stale-pin leaked commit must be Terminated, got {other:?}"),
+        }
+    }
+
+    /// Arm E — the dispatch future is DROPPED mid-flight (task cancellation),
+    /// which no catch ever sees. The scope's `Drop` flips termination
+    /// synchronously, so a handle leaked past it errors `Terminated`. (No
+    /// no-residue claim: the ungated drop cannot revoke an already-admitted
+    /// parked mutator — the documented drop-path residual.) Falsify: remove
+    /// `terminate()` from `EventStateScope::Drop` → the leaked read returns
+    /// `Ok`.
+    #[tokio::test]
+    async fn dropped_dispatch_future_terminates_the_session() -> Result<()> {
+        let fx = Fixture::new()?;
+        let session = fx.session();
+        let context = MockEventContext::new().with_session(session.clone());
+        let leaked = handle(&context)?;
+
+        let (parked_tx, parked_rx) = oneshot::channel::<()>();
+        let (_never_tx, never_rx) = oneshot::channel::<()>();
+        // A dispatch future owning the scope that parks forever; aborting the
+        // task drops the future, running the scope's Drop.
+        let task = spawn(async move {
+            let scope = EventStateScope::new(session);
+            let cloned = context.clone();
+            guarded_dispatch(&scope, cloned, async move {
+                parked_tx.send(()).ok();
+                let _ = never_rx.await;
+            })
+            .await;
+        });
+        parked_rx
+            .await
+            .map_err(|_| eyre!("dispatch never parked"))?;
+        task.abort();
+        let _ = task.await;
+
+        match leaked.get().await {
+            Err(CellStateError::Access(StateAccessError::Terminated)) => Ok(()),
+            other => bail!("a dropped-future leak must error Terminated, got {other:?}"),
+        }
+    }
+
+    // Arm D (the paused-time admitted-mutator FIFO race — a detached `set`
+    // parked mid-op while the catch's `close_gate()` waits behind its permit)
+    // is not a unit-level pin: forcing the park *between* `mutate_permit` and
+    // the buffer write needs store instrumentation the memory backend does not
+    // expose. Its no-residue outcome is covered by
+    // `handler_panic_current_pin_leaks_are_fenced_and_overlay_cleared` (the
+    // catch discards the handler's buffered write); the FIFO ordering itself —
+    // `close_gate().await` strictly before the discard in `guarded_dispatch` —
+    // is a code invariant backed by the gate-serialization pins in
+    // `state::tests::gate_suite`.
+}
