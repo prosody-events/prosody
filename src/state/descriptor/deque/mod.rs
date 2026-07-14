@@ -54,7 +54,7 @@
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
-    Descriptor, FromSession, Keyed, ResolvedOf, STREAM_CHUNK, WriteOf,
+    Descriptor, FromSession, Keyed, ResolvedOf, WriteOf,
 };
 use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -66,13 +66,10 @@ use crate::state::session::{CellSession, MutatePermit, OpPermit};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
-use smallvec::SmallVec;
+use futures::stream::{Stream, StreamExt};
 use std::error::Error;
-use std::future::ready;
 use std::marker::PhantomData;
 use thiserror::Error;
-use tokio::task::coop::cooperative;
 use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
 /// The deque's head/tail meta codec: two big-endian `i64`s composed with no
@@ -238,16 +235,20 @@ where
     ///
     /// # Per-arm consistency (position identity, a paged read, not a snapshot)
     ///
-    /// Iteration point-reads each index in `[head, tail)` (see the module's
-    /// window invariant) in gate-scoped chunks of `STREAM_CHUNK`. The
+    /// Iteration maps each position in `[head, tail)` (see the module's window
+    /// invariant) to its absolute index and point-reads it through the scan
+    /// shell's coordinate source (`CellView::scan_at`), in gate-scoped chunks
+    /// of `STREAM_CHUNK`. The absolute indices are computed arithmetically from
+    /// the snapshot window with the extreme index validated once at plan time
+    /// (`absolute` is monotone, so the coordinate iterator is infallible). The
     /// **position window** `[head, tail)` is snapshotted at init — **position
     /// identity, not element identity**: each position yields whatever the cell
     /// holds when its chunk is fetched, so a pop observed before the fetch
     /// reads absent and is **skipped** (the same skip a TTL hole already
     /// requires, never an error), and a pop-then-push reusing the position
     /// yields the new occupant. Windows wider than
-    /// `DEQUE_POINT_ITERATION_MAX` entries fall back to one durable range
-    /// scan over the window — identical items in identical order, live
+    /// `DEQUE_POINT_ITERATION_MAX` entries fall back to the scan shell's range
+    /// source over the window — identical items in identical order, live
     /// pages, same skip-absent semantics.
     ///
     /// A bounded-arm read failure may surface **after** a yielded prefix (a
@@ -297,9 +298,7 @@ where
                 drop(permit);
                 init?
             };
-            if len == 0 {
-                // Empty window: yield nothing.
-            } else if len > DEQUE_POINT_ITERATION_MAX {
+            if len > DEQUE_POINT_ITERATION_MAX {
                 // Wide window: one durable range scan, anchored on the window —
                 // front `head` to back `tail − 1` (`len > 0` proves `tail − 1`
                 // does not underflow), mirrored backward. The scan drops the
@@ -323,42 +322,34 @@ where
                     yield value;
                 }
             } else {
-                // Point-get arm: fetch the window in gate-scoped chunks, each
-                // fetched + resolved under one permit that dies before any
-                // yield. Positions are computed arithmetically from the
-                // snapshot window — nothing is allocated to chunk.
-                let chunks = stream::unfold(0usize, |start| async move {
-                    if start >= len {
-                        return None;
-                    }
-                    let permit = self.entries.read_permit().await;
-                    let permit = &permit;
-                    let end = (start + STREAM_CHUNK).min(len);
-                    let chunk = stream::iter(start..end)
-                        .map(|i| {
-                            let position = match dir {
-                                Direction::Forward => i,
-                                Direction::Backward => len - 1 - i,
-                            };
-                            cooperative(async move {
-                                let index = window.absolute(position)?;
-                                Ok::<_, DequeStateError<CellCodecError<T>>>(
-                                    self.entries.get(permit, &index).await?,
-                                )
-                            })
-                        })
-                        .buffered(STREAM_CHUNK)
-                        // A `None` is a TTL hole or a popped position: skipped.
-                        .try_filter_map(|element| ready(Ok(element)))
-                        .try_collect::<SmallVec<[_; STREAM_CHUNK]>>()
-                        .await;
-                    Some((chunk, end))
+                // Point-get arm through the scan shell. Positions map to
+                // absolute indices arithmetically from the snapshot window:
+                // `absolute` is monotone in the position, so validating the
+                // extreme index ONCE proves every position in `[0, len)` is in
+                // range and the coordinate iterator is infallible. An empty
+                // window (`len == 0`) feeds an empty iterator, so it yields
+                // nothing but still passes the scan-shell fence on exhaustion.
+                let head = window.head;
+                if len > 0 {
+                    window.absolute(len - 1)?; // validate extreme; monotone ⇒ all valid
+                }
+                let coords = (0..len).map(move |i| {
+                    let position = match dir {
+                        Direction::Forward => i,
+                        Direction::Backward => len - 1 - i,
+                    };
+                    // Infallible: the extreme index validated above and
+                    // `absolute` is monotone, so this equals the checked path.
+                    head + position as i64
                 });
-                futures::pin_mut!(chunks);
-                while let Some(chunk) = chunks.next().instrument(span.clone()).await {
-                    for element in chunk? {
-                        yield element;
-                    }
+                let inner = self.entries.scan_at(coords);
+                futures::pin_mut!(inner);
+                while let Some(item) = inner.next().instrument(span.clone()).await {
+                    // The scan yields the decoded index; the module's window
+                    // invariant makes it redundant, so only the resolved element
+                    // is exposed.
+                    let (_, value) = item?;
+                    yield value;
                 }
             }
         }

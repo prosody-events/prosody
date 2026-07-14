@@ -398,19 +398,30 @@ pub(crate) mod sealed {
     /// [`GATE_WARN_INTERVAL`] but **never** proceeds without the gate (settling
     /// around a still-executing op would snapshot a half-applied session).
     ///
-    /// A second shape — **detaching** a session clone into a task that outlives
-    /// the handler op that spawned it — is fenced by the attempt epoch, not
-    /// just forbidden. Session handles are `Clone + 'static`, but the gate only
-    /// serializes ops *within* one event's dispatch. Between retry attempts the
-    /// gate is Open (closure happens only at settle), so a spawned task's `set`
-    /// landing after an attempt boundary would once have joined the NEXT
-    /// attempt's transaction. The attempt boundary
-    /// ([`StateLifecycle::reset`](super::StateLifecycle::reset)) now bumps the
-    /// session epoch under this gate, so a detached clone keeps its stale pin
-    /// and its ops error [`StateAccessError::Terminated`] — the leak is an
-    /// enforced error, not a convention. Keep every session op inside the
-    /// handler future that owns the event all the same; the fence is the
-    /// backstop, not a license to detach.
+    /// A second shape — **detaching** a session clone, handle, or scan stream
+    /// into a task, an un-awaited future, or a foreign promise that outlives
+    /// the handler attempt that spawned it — is an **enforced error on every
+    /// op**, not a convention. Session handles are `Clone + 'static`, but the
+    /// gate only serializes ops *within* one event's dispatch. Between retry
+    /// attempts the gate is Open (closure happens only at settle), so a leaked
+    /// clone's `set` landing after an attempt boundary would once have joined
+    /// the NEXT attempt's transaction. The attempt boundary
+    /// ([`StateLifecycle::reset`](super::StateLifecycle::reset)) bumps the
+    /// session epoch under this gate, and a detached clone keeps its stale pin,
+    /// so the leak errors [`StateAccessError::Terminated`] at the point its op
+    /// takes effect — uniformly across the whole surface:
+    ///
+    /// * **handle ops** (`get`/`set`/`clear`/…) — the pin compare in
+    ///   `ensure_live` / `mutate_permit`'s ordered admission;
+    /// * **apply-hook mutations** past the settle window — the closed gate and
+    ///   attempt teardown;
+    /// * **scans and streams** — the scan shell's per-emission fence
+    ///   (`CellView::fenced`), which runs `ensure_live` after every stream
+    ///   completion, so a leaked stream errors at its next emission and no
+    ///   buffered item crosses the boundary.
+    ///
+    /// Keep every session op inside the handler future that owns the event all
+    /// the same; the fence is the backstop, not a license to detach.
     ///
     /// Perf posture: uncontended for any handler that does not `join!` its
     /// session ops — one uncontended tokio `Mutex` lock per op; the phase

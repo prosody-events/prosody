@@ -8,7 +8,7 @@
 
 use super::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
-    ResolvedOf, WriteOf,
+    ResolvedOf, STREAM_CHUNK, WriteOf,
 };
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::StateAccessError;
@@ -18,8 +18,9 @@ use crate::state::session::{CellSession, MutatePermit, OpPermit};
 use crate::state::{SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::stream::{Stream, StreamExt};
-use std::future::Future;
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use smallvec::SmallVec;
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use tokio::task::coop::cooperative;
 
@@ -302,6 +303,58 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     pub(in crate::state::descriptor) async fn rollback(&self) -> StoreOutcome {
         self.scope.raw_rollback().await
     }
+
+    /// The scan shell's fence adapter — the shell's one uniform piece and the
+    /// SOLE home of a scan's per-emission attempt fence. Wraps a source's item
+    /// stream (the range source [`Self::scan`], the coordinate source
+    /// [`Self::scan_at`]) and runs [`ensure_live`] after EVERY `inner.next()`
+    /// completion — `Some`, `Err`, and the exhaustion `None` alike — BEFORE
+    /// matching it, so a scan leaked past its handler attempt (a spawned task,
+    /// an un-awaited future, a foreign promise) errors
+    /// [`StateAccessError::Terminated`] at its next emission and no buffered
+    /// item crosses the boundary. Empty sources still pass the fence on
+    /// exhaustion, so a leaked empty-plan stream errors rather than reporting a
+    /// clean end.
+    ///
+    /// # Invariant — no await, no buffering between the fence and the caller
+    ///
+    /// Every source buffer (a coordinate chunk's `SmallVec`, the range source's
+    /// `buffered` resolution window) sits BELOW this adapter; a collection adds
+    /// only synchronous per-item transforms above it (`map_err` into its
+    /// collection error, dropping the coordinate for a deque). The check is a
+    /// LINEARIZATION point, not a wall-clock wall: a completion whose
+    /// synchronous `ensure_live` passed linearized before any concurrent
+    /// attempt boundary. It holds no permit (the check is sync); a concurrent
+    /// reset — which needs the gate exclusively and, for the coordinate source,
+    /// queues behind the whole chunk's permit — is ordered relative to a
+    /// completion by whether its bump landed before that completion's check.
+    fn fenced<'a>(
+        &'a self,
+        inner: impl Stream<Item = ScanItem<T>> + Send + 'a,
+    ) -> impl Stream<Item = ScanItem<T>> + Send + 'a {
+        let session = self.scope.session();
+        // Heap-hold the source's state machine (the chunk unfold or the
+        // `buffered` resolution window): it is the large part, so boxing it
+        // keeps the fence adapter — and every collection stream that embeds it
+        // — a small future (large-future stack bloat, not a per-item cost).
+        // One bounded allocation per stream construction (a per-read entry
+        // point, never the steady-state per-item path); `Pin<Box<_>>` is
+        // `Unpin`, so no `pin_mut!`. The boxed type is the concrete source, not
+        // a `dyn Stream`.
+        let mut inner = Box::pin(inner);
+        try_stream! {
+            loop {
+                let item = inner.next().await;
+                // Pin compare + termination, BEFORE matching the completion —
+                // `Some`, `Err`, and the exhaustion `None` alike.
+                ensure_live(session)?;
+                match item {
+                    Some(item) => yield item?,
+                    None => break,
+                }
+            }
+        }
+    }
 }
 
 impl<S, T> CellView<S, T>
@@ -444,8 +497,89 @@ where
     /// [`SHARD_FANOUT_CONCURRENCY`]
     /// ahead of the consumer; the window is ordered (`buffered`, not
     /// `buffer_unordered`), so cells arrive in key order. The stream terminates
-    /// at the first error.
+    /// at the first error. This is the **range source** of the scan shell,
+    /// fenced per emission by [`Self::fenced`].
     pub(in crate::state::descriptor) fn scan<'a>(
+        &'a self,
+        start: ScanEdge<&'a KeyOf<T>>,
+        dir: Direction,
+        end: ScanEdge<&'a KeyOf<T>>,
+        limit: Option<usize>,
+    ) -> impl Stream<Item = ScanItem<T>> + Send + 'a {
+        self.fenced(self.range_source(start, dir, end, limit))
+    }
+
+    /// The coordinate source of the scan shell: resolves the cells addressed by
+    /// `coords` (a draining coordinate iterator) in INPUT ORDER, yielding
+    /// `(KeyOf<T>, ResolvedOf<T>)` and skipping absent cells uniformly (TTL
+    /// holes, popped positions, membership races). Point gets run
+    /// gate-witnessed in chunks of [`STREAM_CHUNK`]: one read permit per chunk,
+    /// ≤ `STREAM_CHUNK` reads + resolver lookups in flight (`buffered` overlaps
+    /// a cold chunk's durable round trips), collected into a
+    /// `SmallVec<[_; STREAM_CHUNK]>` with the permit released before the first
+    /// yield (`StreamYieldFree`). The permit spans the whole chunk, so an
+    /// attempt boundary (which needs the gate exclusively) serializes AFTER a
+    /// chunk and never tears it. Fenced per emission by [`Self::fenced`]; an
+    /// empty `coords` yields nothing but still passes the fence on exhaustion.
+    pub(in crate::state::descriptor) fn scan_at<'a, I>(
+        &'a self,
+        coords: I,
+    ) -> impl Stream<Item = ScanItem<T>> + Send + 'a
+    where
+        I: Iterator<Item = KeyOf<T>> + Send + 'a,
+    {
+        self.fenced(self.coordinate_source(coords))
+    }
+
+    /// The unfenced body of [`Self::scan_at`]. Split out so [`Self::fenced`]
+    /// wraps the same shape as the range source.
+    fn coordinate_source<'a, I>(&'a self, coords: I) -> impl Stream<Item = ScanItem<T>> + Send + 'a
+    where
+        I: Iterator<Item = KeyOf<T>> + Send + 'a,
+    {
+        try_stream! {
+            // Chunk source: the draining coordinate iterator is the unfold
+            // state, so owned coordinates move straight from the plan into
+            // their chunk's `get` futures — no per-chunk key Vec. `peek()` ends
+            // the unfold at drain (alloc-free; works for `iter::empty()`).
+            let chunks = stream::unfold(coords.peekable(), |mut coords| async move {
+                coords.peek()?; // exhausted ⇒ unfold ends
+                // One read permit per chunk, dropped with this future's scope —
+                // never held across a yield (StreamYieldFree).
+                let permit = self.read_permit().await;
+                let permit = &permit;
+                let chunk = stream::iter(coords.by_ref().take(STREAM_CHUNK))
+                    .map(|key| {
+                        cooperative(async move {
+                            let value = self.get(permit, &key).await?;
+                            Ok::<_, CellStateError<CellCodecError<T>>>(value.map(|v| (key, v)))
+                        })
+                    })
+                    // `buffered` keeps input order and overlaps a cold chunk's
+                    // durable round-trips.
+                    .buffered(STREAM_CHUNK)
+                    // A `None` is an absent cell: skipped, never an error.
+                    .try_filter_map(|entry| ready(Ok(entry)))
+                    // Short-circuits at the first ordered error, cancelling the
+                    // chunk's in-flight reads; collects inline — no heap.
+                    .try_collect::<SmallVec<[_; STREAM_CHUNK]>>()
+                    .await;
+                Some((chunk, coords))
+            });
+            futures::pin_mut!(chunks);
+            while let Some(chunk) = chunks.next().await {
+                for entry in chunk? {
+                    yield entry;
+                }
+            }
+        }
+    }
+
+    /// The range source of the scan shell — see [`Self::scan`], which wraps
+    /// this in [`Self::fenced`]. Drives the gate-free `raw_scan` through an
+    /// ordered `buffered` resolution window and terminates at the first
+    /// error.
+    fn range_source<'a>(
         &'a self,
         start: ScanEdge<&'a KeyOf<T>>,
         dir: Direction,

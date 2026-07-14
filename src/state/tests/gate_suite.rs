@@ -1741,6 +1741,123 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
     })
 }
 
+/// Whether a fenced map stream item is the `Terminated` access error.
+fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
+    matches!(
+        item,
+        MapStateError::Cell(CellStateError::Access(StateAccessError::Terminated))
+    )
+}
+
+/// Scan-shell fence, RANGE source: the map degrade arm streams through the
+/// gate-free range source, and an emission after an observed attempt bump
+/// errors `Terminated` — the per-emission `CellView::fenced` check catches it,
+/// not the source (which keeps producing). The first item crosses pre-bump; the
+/// range source holds no permit, so the `reset` between pulls bumps
+/// immediately. Red proven by dropping the `self.fenced(...)` wrapper in
+/// `CellView::scan` (return the raw `range_source`): the post-bump pull then
+/// yields a second `Ok` item.
+#[test]
+fn range_scan_stream_fences_after_bump() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_range_scan")?;
+        let cref = CollectionRef::new(fx.id("ks")?, None);
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("ks");
+        let entry =
+            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
+
+        // An oversized 4-key Tracked frame (limit 3) degrades the stream to the
+        // full-section range source; ≥ 2 entries so a second emission exists.
+        let mut seed = vec![(
+            map::keyset_cell(),
+            Some(Bytes::from(tracked_frame(&[1, 2, 3, 4]))),
+        )];
+        for k in 1..=4_i64 {
+            seed.push((
+                map::entry_cell_for(&I64KeyCodec::encode(&k)),
+                Some(entry(k)?),
+            ));
+        }
+        fx.counting.write_resolved(&cref, &seed, &[]).await?;
+
+        let session = fx.session(1);
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        let stream = handle.stream(Direction::Forward);
+        futures::pin_mut!(stream);
+
+        match stream.next().await {
+            Some(Ok(_)) => {}
+            other => bail!("the first range item must cross pre-bump, got {other:?}"),
+        }
+        // Attempt boundary: the range source holds no permit, so reset bumps now.
+        session.reset(RepinProof::for_test()).await;
+        match stream.next().await {
+            Some(Err(ref e)) if map_item_terminated(e) => {}
+            other => bail!("the post-bump range emission must be Terminated, got {other:?}"),
+        }
+        Ok(())
+    })
+}
+
+/// Scan-shell fence, COORDINATE source: the map tracked arm point-gets a chunk,
+/// collects it into a `SmallVec`, and releases the permit before the first
+/// yield; a buffered entry never crosses the fence after an observed bump. Both
+/// keys land in one chunk (`STREAM_CHUNK >= 2`), so the first entry's fence
+/// check passes pre-bump and the second's runs post-bump. Red proven by
+/// dropping the `self.fenced(...)` wrapper in `CellView::scan_at`: the buffered
+/// second entry then crosses as an `Ok`.
+#[test]
+fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_coord_scan")?;
+        let cref = CollectionRef::new(fx.id("m")?, None);
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("m");
+        let entry =
+            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
+
+        // Exactly two tracked keys: one chunk, both entries buffered together.
+        fx.counting
+            .write_resolved(
+                &cref,
+                &[
+                    (
+                        map::keyset_cell(),
+                        Some(Bytes::from(tracked_frame(&[1, 2]))),
+                    ),
+                    (
+                        map::entry_cell_for(&I64KeyCodec::encode(&1)),
+                        Some(entry(10)?),
+                    ),
+                    (
+                        map::entry_cell_for(&I64KeyCodec::encode(&2)),
+                        Some(entry(20)?),
+                    ),
+                ],
+                &[],
+            )
+            .await?;
+
+        let session = fx.session(1);
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        let stream = handle.stream(Direction::Forward);
+        futures::pin_mut!(stream);
+
+        // The chunk is fetched and the permit dropped before this first yield.
+        match stream.next().await {
+            Some(Ok((1, _))) => {}
+            other => bail!("the first buffered entry must cross pre-bump, got {other:?}"),
+        }
+        // Attempt boundary: the chunk permit is already dropped, so reset bumps.
+        session.reset(RepinProof::for_test()).await;
+        // The SECOND buffered entry's emission check runs post-bump.
+        match stream.next().await {
+            Some(Err(ref e)) if map_item_terminated(e) => {}
+            other => bail!("the buffered second entry must be fenced Terminated, got {other:?}"),
+        }
+        Ok(())
+    })
+}
+
 /// A stale-pinned mutation on an already-closed session classifies
 /// `Terminated`, never `SessionClosed` — `mutate_permit` checks the pin before
 /// the closed flag, so a dead-attempt op is fenced uniformly regardless of the

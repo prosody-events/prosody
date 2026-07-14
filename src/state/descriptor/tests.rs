@@ -649,6 +649,9 @@ mod scope_containment {
 /// desugared `-> impl Future + Send` form guarding rustc issue #100013).
 mod typed_cell_view {
     use super::*;
+    use crate::consumer::middleware::RepinProof;
+    use crate::state::session::sealed::StateLifecycle;
+    use std::iter;
     use tokio::runtime::Builder;
 
     /// The single section every gated-scan / terminate-at-error fixture seeds
@@ -1071,5 +1074,274 @@ mod typed_cell_view {
             true,
         );
         KeyedStateSession::new(parts)
+    }
+
+    // ======================================================================
+    // Scan-shell contract pins (below the collections): `CellView::scan_at`
+    // (the coordinate source) and `CellView::fenced` (the per-emission fence).
+    // ======================================================================
+
+    /// Builds a scope over a fresh, live test session and seeds `keys` as
+    /// [`SeedCell`]s (payload == key) under one mutate permit, dropped before
+    /// return. Returns the session clone (so a caller can drive its lifecycle,
+    /// e.g. `reset`) alongside the scope, whose own clone shares the epoch.
+    async fn seeded_scope(
+        name: &str,
+        keys: &[i64],
+    ) -> Result<(TestSession, CellScope<TestSession>)> {
+        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
+        let scope = CellScope::new(
+            session.clone(),
+            StateType::Application,
+            StateName::try_new(name)?,
+        );
+        let seed = scope.typed::<SeedCell>(CELL_SECTION);
+        let permit = seed
+            .mutate_permit()
+            .await
+            .map_err(|e| eyre!("seed permit: {e}"))?;
+        for &key in keys {
+            seed.set(&permit, &key, key)
+                .await
+                .map_err(|e| eyre!("seed {key}: {e}"))?;
+        }
+        drop(permit);
+        Ok((session, scope))
+    }
+
+    /// `scan_at` yields resolved cells in INPUT coordinate order, not sorted
+    /// order. Falsifiable: sorting the coordinates (or feeding a `BTreeSet`)
+    /// before chunking would yield `[0, 2, 5, 7]` instead of the input order.
+    #[tokio::test]
+    async fn scan_at_preserves_input_coordinate_order() -> Result<()> {
+        let (_session, scope) = seeded_scope("order", &[0, 2, 5, 7]).await?;
+        let view = scope.typed::<SeedCell>(CELL_SECTION);
+        let stream = view.scan_at([5, 0, 7, 2].into_iter());
+        futures::pin_mut!(stream);
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (key, value) = item.map_err(|e| eyre!("scan_at: {e}"))?;
+            if key != value {
+                return Err(eyre!("resolver desync: key {key} != {value}"));
+            }
+            keys.push(key);
+        }
+        assert_eq!(keys, vec![5, 0, 7, 2], "scan_at preserves input order");
+        Ok(())
+    }
+
+    /// `scan_at` skips absent cells uniformly (never errors on a hole) and
+    /// preserves the present ones in input order. Falsifiable: a pass-through
+    /// that surfaced `None` entries as items (or errored on absent) would add
+    /// extra items or an error.
+    #[tokio::test]
+    async fn scan_at_skips_absent_never_errors() -> Result<()> {
+        let (_session, scope) = seeded_scope("skip", &[0, 5]).await?;
+        let view = scope.typed::<SeedCell>(CELL_SECTION);
+        // 3 and 9 were never seeded.
+        let stream = view.scan_at([0, 3, 5, 9].into_iter());
+        futures::pin_mut!(stream);
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (key, _) = item.map_err(|e| eyre!("scan_at: {e}"))?;
+            keys.push(key);
+        }
+        assert_eq!(keys, vec![0, 5], "absent cells skipped, present preserved");
+        Ok(())
+    }
+
+    /// `scan_at` is chunk-atomic: the first decode error short-circuits its
+    /// chunk's `try_collect`, so NONE of the chunk's Ok items surface — unlike
+    /// the range source (`typed_scan_terminates_at_first_error`), which yields
+    /// the pre-error prefix incrementally. All three keys land in one chunk.
+    /// Falsifiable: a per-item `collect` that kept the Ok items before the
+    /// error would surface `[Ok, Err]`.
+    #[tokio::test]
+    async fn scan_at_chunk_is_error_atomic() -> Result<()> {
+        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
+        let name = StateName::try_new("chunk_err")?;
+        // Ascending keys within one chunk; the middle cell's bytes are not JSON.
+        for (key, bytes) in [
+            (-1_i64, b"1".as_slice()),
+            (0, b"not json".as_slice()),
+            (5, b"2".as_slice()),
+        ] {
+            let cell = CellKey {
+                section: CELL_SECTION,
+                coordinate: I64KeyCodec::encode(&key),
+            };
+            session
+                .set(StateType::Application, &name, &cell, bytes)
+                .await
+                .map_err(|e| eyre!("seed {key}: {e}"))?;
+        }
+        let scope = CellScope::new(session, StateType::Application, name);
+        let view = scope.typed::<Keyed<I64KeyCodec, JsonCodec>>(CELL_SECTION);
+        let stream = view.scan_at([-1_i64, 0, 5].into_iter());
+        futures::pin_mut!(stream);
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        match items.as_slice() {
+            [Err(CellStateError::Codec(_))] => Ok(()),
+            _ => Err(eyre!(
+                "expected exactly one codec error and NO Ok prefix (chunk-atomic); got {items:?}"
+            )),
+        }
+    }
+
+    /// The fence runs on the exhaustion `None`, not only on items: a source
+    /// whose epoch is bumped after its last item then yields `Terminated`,
+    /// never a clean end. Falsifiable: moving `ensure_live` inside
+    /// `fenced`'s `Some` arm (skipping it on `None`) makes the post-bump
+    /// pull return `None`.
+    #[tokio::test]
+    async fn scan_at_check_on_exhaustion_yields_terminated() -> Result<()> {
+        let (session, scope) = seeded_scope("exhaust", &[7]).await?;
+        let view = scope.typed::<SeedCell>(CELL_SECTION);
+        let stream = view.scan_at([7_i64].into_iter());
+        futures::pin_mut!(stream);
+        match stream.next().await {
+            Some(Ok((7, 7))) => {}
+            other => return Err(eyre!("first pull must be the seeded item, got {other:?}")),
+        }
+        // Bump the attempt epoch; the buffered chunk is already drained, so the
+        // next pull drives the source to exhaustion and the fence catches it.
+        session.reset(RepinProof::for_test()).await;
+        match stream.next().await {
+            Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
+            other => Err(eyre!(
+                "the post-bump exhaustion pull must be Terminated, got {other:?}"
+            )),
+        }
+    }
+
+    /// A leaked EMPTY-plan stream (routed through `scan_at` over an empty
+    /// iterator, as the collections' absent/empty arms now are) still passes
+    /// the fence on exhaustion: after a bump its first pull errors
+    /// `Terminated`, not clean end-of-collection. Falsifiable identically
+    /// to the exhaustion pin.
+    #[tokio::test]
+    async fn scan_at_empty_fences_on_exhaustion() -> Result<()> {
+        let (session, scope) = seeded_scope("empty", &[]).await?;
+        let view = scope.typed::<SeedCell>(CELL_SECTION);
+        session.reset(RepinProof::for_test()).await;
+        let stream = view.scan_at(iter::empty::<i64>());
+        futures::pin_mut!(stream);
+        match stream.next().await {
+            Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
+            other => Err(eyre!(
+                "a leaked empty-plan stream must fence Terminated on exhaustion, got {other:?}"
+            )),
+        }
+    }
+
+    /// `StreamYieldFree` at the shell: the per-chunk permit is dropped before
+    /// the first yield, so a mutator can acquire the gate BETWEEN stream
+    /// items without deadlock. Both cells sit in one chunk, so after item 0
+    /// the permit is already free. Falsifiable: hoisting `read_permit` out
+    /// of the unfold (holding it across yields) makes the between-items
+    /// mutate hang.
+    #[tokio::test]
+    async fn scan_at_permit_not_held_across_yield() -> Result<()> {
+        let (_session, scope) = seeded_scope("yield_free", &[0, 1]).await?;
+        let view = scope.typed::<SeedCell>(CELL_SECTION);
+        let stream = view.scan_at([0_i64, 1].into_iter());
+        futures::pin_mut!(stream);
+        // Pull item 0; its chunk's permit is dropped before it yields.
+        match stream.next().await {
+            Some(Ok((0, 0))) => {}
+            other => return Err(eyre!("first item unexpected: {other:?}")),
+        }
+        // A mutate permit must acquire immediately (no permit held across the
+        // yield) — the deadline is a hang-guard, never the assertion.
+        let permit = timeout(Duration::from_secs(30), view.mutate_permit())
+            .await
+            .map_err(|_| eyre!("mutate_permit hung: the chunk held the gate across a yield"))?
+            .map_err(|e| eyre!("mutate_permit: {e}"))?;
+        drop(permit);
+        // Draining the rest still works.
+        match stream.next().await {
+            Some(Ok((1, 1))) => Ok(()),
+            other => Err(eyre!("second item unexpected: {other:?}")),
+        }
+    }
+
+    /// `scan_at` keeps at most `STREAM_CHUNK` reads/resolutions in flight and
+    /// starts a second chunk only after the first drains: a chunk is bounded by
+    /// `buffered(STREAM_CHUNK)` over `by_ref().take(STREAM_CHUNK)`, and the
+    /// unfold awaits the chunk's `try_collect` before the next. Seeds
+    /// `STREAM_CHUNK + EXTRA` gated cells; when chunk 1 is fully parked,
+    /// exactly `STREAM_CHUNK` resolutions are in flight (chunk 2 has not
+    /// begun). Falsifiable: flattening all coordinates into one `buffered`
+    /// window (no chunking) would park all `STREAM_CHUNK + EXTRA` at once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_at_bounds_in_flight_reads_to_stream_chunk() -> Result<()> {
+        const EXTRA: usize = 4;
+        let n = STREAM_CHUNK + EXTRA;
+        let ladder = Arc::new(GateLadder::new(n));
+        let scope = CellScope::new(
+            gate_session(ladder.clone()),
+            StateType::Application,
+            StateName::try_new("chunk_bound")?,
+        );
+
+        // Seed n cells (payload == key) through the plain passthrough view.
+        let seed = scope.typed::<SeedCell>(CELL_SECTION);
+        let permit = seed
+            .mutate_permit()
+            .await
+            .map_err(|e| eyre!("seed permit: {e}"))?;
+        for key in 0..n as i64 {
+            seed.set(&permit, &key, key)
+                .await
+                .map_err(|e| eyre!("seed {key}: {e}"))?;
+        }
+        drop(permit);
+
+        let view = scope.typed::<GatedCell>(CELL_SECTION);
+        let coords: Vec<i64> = (0..n as i64).collect();
+        let collector = async {
+            let stream = view.scan_at(coords.into_iter());
+            futures::pin_mut!(stream);
+            let mut keys = Vec::new();
+            while let Some(item) = stream.next().await {
+                let (key, _) = item.map_err(|e| eyre!("scan_at: {e}"))?;
+                keys.push(key);
+            }
+            Ok::<Vec<i64>, color_eyre::Report>(keys)
+        };
+        // The releaser observes the in-flight ceiling: with the collector polled
+        // first, chunk 1's STREAM_CHUNK resolutions all park before chunk 2 can
+        // begin (its unfold step awaits chunk 1's try_collect). Then release
+        // every gate so the collector drains.
+        let releaser = async {
+            if ladder.parked() != STREAM_CHUNK {
+                bail!(
+                    "chunk 1 must park exactly STREAM_CHUNK ({STREAM_CHUNK}) resolutions before \
+                     chunk 2 begins; parked = {}",
+                    ladder.parked()
+                );
+            }
+            for idx in 0..n {
+                ladder.release(idx);
+            }
+            Ok(())
+        };
+        let (collected, outcome) = timeout(
+            Duration::from_secs(30),
+            Box::pin(async { tokio::join!(collector, releaser) }),
+        )
+        .await
+        .map_err(|_| eyre!("bounded scan hung"))?;
+        outcome?;
+        let keys = collected?;
+        assert_eq!(
+            keys,
+            (0..n as i64).collect::<Vec<_>>(),
+            "every seeded cell is yielded in input order across the two chunks"
+        );
+        Ok(())
     }
 }

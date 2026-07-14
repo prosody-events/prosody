@@ -73,7 +73,7 @@
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
-    Descriptor, FromSession, Keyed, ResolvedOf, STREAM_CHUNK, WriteOf,
+    Descriptor, FromSession, Keyed, ResolvedOf, WriteOf,
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -86,15 +86,12 @@ use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
-use smallvec::SmallVec;
+use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt::Display;
-use std::future::ready;
 use std::marker::PhantomData;
 use std::slice::from_ref;
 use thiserror::Error;
-use tokio::task::coop::cooperative;
 use tracing::{Instrument, info_span, instrument, warn};
 
 /// The `Meta` section, holding the keyset cell.
@@ -307,18 +304,16 @@ enum PriorKeyset {
 }
 
 /// The arm [`MapHandle::stream`] takes: point-get the tracked keys' entries
-/// (in `dir` order), degrade to the full-section scan, or (an absent keyset ⇒
-/// [`KeysetPresence`](Keyset) ⇒ no live entries) yield nothing.
+/// (in `dir` order), or degrade to the full-section scan. An absent keyset
+/// (⇒ [`KeysetPresence`](Keyset) ⇒ no live entries) arrives here as an empty
+/// [`Tracked`](StreamPlan::Tracked) list — zero coordinates, so zero point
+/// gets and no scan, and its exhaustion still passes the scan-shell fence.
 enum StreamPlan<K> {
     /// Point-get each listed key (already reversed for a backward stream).
     Tracked(Vec<K>),
 
     /// Degrade to the full-section (`Unbounded`-edged) scan.
     Scan,
-
-    /// Absent keyset — no live entries, so the stream reads no entries (no
-    /// scan).
-    Empty,
 }
 
 /// One item [`MapHandle::stream`] yields: a decoded key paired with its
@@ -458,8 +453,6 @@ where
                 init?
             };
             match plan {
-                // Absent keyset ⇒ no live entries: yield nothing.
-                StreamPlan::Empty => {}
                 // The degrade fallback walks the whole entry section: no keyset
                 // enumeration remains to fence it, so both edges are
                 // `Unbounded`. `dir` still orders the walk; the scan drops the
@@ -476,45 +469,16 @@ where
                         yield item?;
                     }
                 }
+                // Tracked keyset (possibly empty): point-get the listed keys
+                // through the scan shell's coordinate source. An absent keyset
+                // arrives here as an empty list, so its exhaustion is fenced
+                // too. Chunking, the per-chunk permit, and skip-absent all live
+                // in `CellView::scan_at`.
                 StreamPlan::Tracked(keys) => {
-                    // Chunk source: the draining key iterator is the unfold
-                    // state, so owned keys move straight from the plan into
-                    // their chunk's `get` futures — no per-chunk key Vec.
-                    let chunks = stream::unfold(keys.into_iter(), |mut keys| async move {
-                        if keys.len() == 0 {
-                            return None;
-                        }
-                        // One read permit per chunk, dropped with this future's
-                        // scope — never held across a yield (StreamYieldFree).
-                        let permit = self.entries.read_permit().await;
-                        let permit = &permit;
-                        let chunk = stream::iter(keys.by_ref().take(STREAM_CHUNK))
-                            .map(|key| {
-                                cooperative(async move {
-                                    let value = self.entries.get(permit, &key).await?;
-                                    Ok::<_, MapStateError<CellCodecError<V>>>(
-                                        value.map(|value| (key, value)),
-                                    )
-                                })
-                            })
-                            // `buffered` keeps key order and overlaps a cold
-                            // chunk's durable round-trips.
-                            .buffered(STREAM_CHUNK)
-                            // A `None` is a removed/expired key: skipped, never
-                            // an error (the current-membership skip).
-                            .try_filter_map(|entry| ready(Ok(entry)))
-                            // Short-circuits at the first ordered error,
-                            // cancelling the chunk's in-flight reads; collects
-                            // inline — no heap.
-                            .try_collect::<SmallVec<[_; STREAM_CHUNK]>>()
-                            .await;
-                        Some((chunk, keys))
-                    });
-                    futures::pin_mut!(chunks);
-                    while let Some(chunk) = chunks.next().instrument(span.clone()).await {
-                        for entry in chunk? {
-                            yield entry;
-                        }
+                    let inner = self.entries.scan_at(keys.into_iter());
+                    futures::pin_mut!(inner);
+                    while let Some(item) = inner.next().instrument(span.clone()).await {
+                        yield item?;
                     }
                 }
             }
@@ -522,23 +486,24 @@ where
     }
 
     /// Reads the keyset cell and decides the stream's arm: an **absent** keyset
-    /// means no live entries ([`KeysetPresence`](Keyset)), so the stream is
-    /// [`Empty`](StreamPlan::Empty) with no entry reads (no scan); a `Tracked`
-    /// keyset within the registered limit and byte ceiling whose every
-    /// coordinate decodes to a canonical key becomes the chunked point-get
-    /// arm (keys in `dir` order); anything else — `Overflowed`,
-    /// malformed, oversized, or a coordinate that fails to decode or
-    /// re-encode — degrades to the full-section scan (with a warning on the
-    /// degradations that are not simply overflowed). A keyset-read access
-    /// error propagates; it never silently degrades.
+    /// means no live entries ([`KeysetPresence`](Keyset)), so the stream takes
+    /// an empty [`Tracked`](StreamPlan::Tracked) list — zero coordinates, so
+    /// zero point gets and no scan; a `Tracked` keyset within the registered
+    /// limit and byte ceiling whose every coordinate decodes to a canonical
+    /// key becomes the chunked point-get arm (keys in `dir` order); anything
+    /// else — `Overflowed`, malformed, oversized, or a coordinate that fails to
+    /// decode or re-encode — degrades to the full-section scan (with a warning
+    /// on the degradations that are not simply overflowed). A keyset-read
+    /// access error propagates; it never silently degrades.
     async fn stream_plan(
         &self,
         permit: &OpPermit<'_>,
         dir: Direction,
     ) -> Result<StreamPlan<KC::Key>, MapStateError<CellCodecError<V>>> {
         let coordinates = match self.read_keyset_state(permit).await? {
-            // Absent ⇒ no live entries: yield nothing, issue no scan.
-            PriorKeyset::Absent => return Ok(StreamPlan::Empty),
+            // Absent ⇒ no live entries: an empty Tracked list — zero
+            // coordinates, so zero point gets and no scan.
+            PriorKeyset::Absent => return Ok(StreamPlan::Tracked(Vec::new())),
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
             PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
