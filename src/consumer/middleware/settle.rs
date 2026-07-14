@@ -353,7 +353,7 @@ async fn settle_committed<'a, T, C, G>(
                 let _ = arm_backstop(&context, lifecycle, lifecycle.recovery_floor()).await;
                 guard.commit().await;
                 drop(permit);
-                handler.after_commit(context, result).await;
+                fire_apply_hook(handler, context, true, result).await;
                 return;
             }
             StepOutcome::Abandon => {
@@ -452,9 +452,7 @@ async fn settle_committed<'a, T, C, G>(
     }
 
     // 6. After-commit hook (telemetry, dedup forwarding, ...). The permit
-    // drops first, so the hooks' post-settle state reads proceed. The stamp
-    // re-pins the hook view current so reads after a (possibly nested) retry
-    // succeed.
+    // drops first, so the hooks' post-settle state reads proceed.
     drop(permit);
     fire_apply_hook(handler, context, true, result).await;
 }

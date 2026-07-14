@@ -1427,8 +1427,7 @@ fn closed_session_fences_mutators_but_serves_hook_reads() -> Result<()> {
 // every cell op fails `Terminated` once a later attempt boundary (`reset`)
 // bumped it. These pins drive `reset`/`repin` directly through
 // `RepinProof::for_test()` at the typed layer — no retry loop — so each fence
-// rule is isolated. The per-pin falsification injection is recorded in the
-// phase report's FALSIFICATION TARGETS.
+// rule is isolated.
 
 /// Whether a fenced cell op returned the `Terminated` access error.
 fn is_terminated(err: &CellStateError<JsonCodecError>) -> bool {
@@ -1449,8 +1448,37 @@ async fn seed_committed_v(fx: &GateFixture, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Pin (a): a typed handle op after `reset()` errors `Terminated`, with zero
-/// store effect — the fenced `set` never reaches the committed cell.
+/// Settles `session`, then asserts a fresh event's read of `v` answers
+/// `expected` — the zero-store-effect verification every fence pin ends with.
+async fn settle_and_verify(
+    fx: &GateFixture,
+    session: &KeyedStateSession<GateBackend, MemoryLoader<Value>>,
+    expected: Option<Value>,
+    msg: &str,
+) -> Result<()> {
+    finalize_and_promote(
+        session,
+        &fx.oracle,
+        Uuid::from_u128(1),
+        &fx.cells,
+        &fx.id("v")?,
+    )
+    .await?;
+    let fresh = value_state::<JsonCodec>("v")
+        .bind(&fx.session(2))
+        .map_err(|e| eyre!("bind: {e}"))?;
+    assert_eq!(
+        fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
+        expected,
+        "{msg}"
+    );
+    Ok(())
+}
+
+/// A typed handle op after `reset()` errors `Terminated`, with zero store
+/// effect — the fenced `set` never reaches the committed cell. Red-proven by
+/// deleting the `!session.attempt_current()` pin compare in `ensure_live`: the
+/// stale-pinned `get`/`set` then answer live instead of `Terminated`.
 #[test]
 fn handle_op_after_reset_is_terminated() -> Result<()> {
     runtime()?.block_on(async {
@@ -1476,29 +1504,21 @@ fn handle_op_after_reset_is_terminated() -> Result<()> {
         // Zero store effect: settle the (now attempt-N+1) session — the fenced
         // set never buffered, so nothing stages — and a fresh event still reads
         // the seeded "A".
-        finalize_and_promote(
+        settle_and_verify(
+            &fx,
             &session,
-            &fx.oracle,
-            Uuid::from_u128(1),
-            &fx.cells,
-            &fx.id("v")?,
+            Some(Value::from("A")),
+            "the fenced set left the committed cell unchanged",
         )
         .await?;
-        let verify = fx.session(2);
-        let fresh = value_state::<JsonCodec>("v")
-            .bind(&verify)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        assert_eq!(
-            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
-            Some(Value::from("A")),
-            "the fenced set left the committed cell unchanged"
-        );
         Ok(())
     })
 }
 
-/// Pin (d): a leaked attempt-N session clone (and a clone of a clone) stays
-/// fenced after `reset()`, while a `repin`-ed clone is live.
+/// A leaked attempt-N session clone (and a clone of a clone) stays fenced after
+/// `reset()`, while a `repin`-ed clone is live. Red-proven by deleting the
+/// `!session.attempt_current()` pin compare in `ensure_live`: the leaked
+/// clones' reads then answer live instead of `Terminated`.
 #[test]
 fn leaked_clone_is_fenced_repin_is_live() -> Result<()> {
     runtime()?.block_on(async {
@@ -1544,9 +1564,11 @@ fn leaked_clone_is_fenced_repin_is_live() -> Result<()> {
     })
 }
 
-/// Pin (m): the epoch bump sticks even with NOTHING vended before the boundary
-/// — the first handle bound from a stale-pinned clone after `reset()` errors on
-/// its first op.
+/// The epoch bump sticks even with NOTHING vended before the boundary — the
+/// first handle bound from a stale-pinned clone after `reset()` errors on its
+/// first op. Red-proven by deleting the `!session.attempt_current()` pin
+/// compare in `ensure_live`: the first op then answers live instead of
+/// `Terminated`.
 #[test]
 fn reset_bump_sticks_with_nothing_vended() -> Result<()> {
     runtime()?.block_on(async {
@@ -1567,8 +1589,11 @@ fn reset_bump_sticks_with_nothing_vended() -> Result<()> {
     })
 }
 
-/// Pin (f): a stale `rollback()` (pinned N) after `reset()` returns `NoOp` and
-/// leaves attempt N+1's dirty buffer untouched.
+/// A stale `rollback()` (pinned N) after `reset()` returns `NoOp` and leaves
+/// attempt N+1's dirty buffer untouched. Red-proven by deleting the
+/// `!self.attempt_current()` pin term from the session `rollback`'s
+/// self-admission: the stale rollback then drains attempt N+1's live buffer and
+/// the fresh event reads `None`.
 #[test]
 fn stale_rollback_is_noop_and_spares_next_attempt() -> Result<()> {
     runtime()?.block_on(async {
@@ -1598,31 +1623,24 @@ fn stale_rollback_is_noop_and_spares_next_attempt() -> Result<()> {
         );
 
         // N+1 settles with the seeded value intact.
-        finalize_and_promote(
+        settle_and_verify(
+            &fx,
             &live,
-            &fx.oracle,
-            Uuid::from_u128(1),
-            &fx.cells,
-            &fx.id("v")?,
+            Some(Value::from("keep")),
+            "attempt N+1's dirty survived the stale rollback",
         )
         .await?;
-        let verify = fx.session(2);
-        let fresh = value_state::<JsonCodec>("v")
-            .bind(&verify)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        assert_eq!(
-            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
-            Some(Value::from("keep")),
-            "attempt N+1's dirty survived the stale rollback"
-        );
         Ok(())
     })
 }
 
-/// Pin (i): a stale queued write (pinned N) issued after the whole one-hold
-/// reset transition errors instead of buffering, and attempt N+1 settles with
-/// no residue of it — the `mutate_permit` pin fence, distinct from the (b)
-/// interleaving race.
+/// A stale queued write (pinned N) issued after the whole one-hold reset
+/// transition errors instead of buffering, and attempt N+1 settles with no
+/// residue of it — the `mutate_permit` pin fence, distinct from the queued-set
+/// interleaving race (`racing_set_never_joins_next_attempt`). Red-proven only
+/// by deleting BOTH `mutate_permit`'s pin check AND `ensure_live`'s pin
+/// compare: either alone leaves the other to fence this stale `set`, so both
+/// must go for the write to buffer and its residue to surface.
 #[test]
 fn stale_write_after_reset_errors_and_leaves_no_residue() -> Result<()> {
     runtime()?.block_on(async {
@@ -1640,33 +1658,25 @@ fn stale_write_after_reset_errors_and_leaves_no_residue() -> Result<()> {
         }
 
         // Settle N+1: nothing staged from the fenced write.
-        finalize_and_promote(
+        settle_and_verify(
+            &fx,
             &session,
-            &fx.oracle,
-            Uuid::from_u128(1),
-            &fx.cells,
-            &fx.id("v")?,
+            None,
+            "the fenced stale write left no committed residue",
         )
         .await?;
-        let verify = fx.session(2);
-        let fresh = value_state::<JsonCodec>("v")
-            .bind(&verify)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        assert_eq!(
-            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
-            None,
-            "the fenced stale write left no committed residue"
-        );
         Ok(())
     })
 }
 
-/// Pin (b): a `set` forced to queue on the gate behind the reset transition
-/// never joins attempt N+1's committed transaction (paused-time-free but
-/// deterministic via FIFO gate ordering). A parked fill holds the gate; reset
-/// queues first, the stale set second; releasing lets reset bump, then the
-/// set's admission pin check fences it — case (B) of the TOCTOU, the one the
-/// pin injection makes red.
+/// A `set` forced to queue on the gate behind the reset transition never joins
+/// attempt N+1's committed transaction (paused-time-free but deterministic via
+/// FIFO gate ordering). A parked fill holds the gate; reset queues first, the
+/// stale set second; releasing lets reset bump, then the set's admission pin
+/// check fences it — the interleaving case where the check-then-mint race is
+/// resolved by the held permit. Red-proven only by deleting BOTH
+/// `mutate_permit`'s pin check AND `ensure_live`'s pin compare: either alone
+/// still fences the racing set, so both must go for it to join attempt N+1.
 #[test]
 fn racing_set_never_joins_next_attempt() -> Result<()> {
     runtime()?.block_on(async {
@@ -1720,28 +1730,48 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
         }
 
         // N+1 settles with no trace of "B".
-        finalize_and_promote(
+        settle_and_verify(
+            &fx,
             &session,
-            &fx.oracle,
-            Uuid::from_u128(1),
-            &fx.cells,
-            &fx.id("v")?,
+            Some(Value::from("A")),
+            "the racing set never joined attempt N+1's transaction",
         )
         .await?;
-        let verify = fx.session(2);
-        let fresh = value_state::<JsonCodec>("v")
-            .bind(&verify)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        assert_eq!(
-            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
-            Some(Value::from("A")),
-            "the racing set never joined attempt N+1's transaction"
-        );
         Ok(())
     })
 }
 
-/// A conforming within-attempt op for pin (g)'s property.
+/// A stale-pinned mutation on an already-closed session classifies
+/// `Terminated`, never `SessionClosed` — `mutate_permit` checks the pin before
+/// the closed flag, so a dead-attempt op is fenced uniformly regardless of the
+/// close. Isolates the admission ORDER: `ensure_live` never runs when the
+/// permit errors `SessionClosed` first, so the order flip is observable only
+/// here. Red-proven by swapping the pin and closed checks in `mutate_permit`:
+/// the stale `set` then returns `SessionClosed`.
+#[test]
+fn stale_mutator_on_closed_session_is_terminated_not_closed() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_stale_closed")?;
+        let session = fx.session(1);
+        let handle = value_state::<JsonCodec>("v")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // Stale pin, then close the gate as the settle boundary would.
+        session.reset(RepinProof::for_test()).await;
+        drop(session.close_gate().await);
+
+        match handle.set(Value::from(8_i64)).await {
+            Err(ref e) if is_terminated(e) => {}
+            other => {
+                bail!("a stale mutator on a closed session must be Terminated, got {other:?}")
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A conforming within-attempt op for the conforming-handler property.
 #[derive(Clone, Debug)]
 enum ValueOp {
     Get,
@@ -1763,12 +1793,14 @@ impl Arbitrary for ValueOp {
     }
 }
 
-/// Pin (g): a conforming handler — every op issued within its own attempt,
-/// including a scan-then-rollback-then-rescan — NEVER observes the fence. The
-/// epoch is stable within one attempt, so the pin always matches; any op that
-/// errored `Terminated` would surface here as a failed property (the `?`
-/// propagates it). The subject is called for every generated op, so this is a
-/// real property, not a tautology.
+/// A conforming handler — every op issued within its own attempt, including a
+/// scan-then-rollback-then-rescan — NEVER observes the fence. The epoch is
+/// stable within one attempt, so the pin always matches; any op that errored
+/// `Terminated` would surface here as a failed property (the `?` propagates
+/// it). The subject is called for every generated op, so this is a real
+/// property, not a tautology. Red-proven by inverting `ensure_live`'s pin
+/// compare to `session.attempt_current()`: every conforming op then fences and
+/// the property's `?` fails.
 #[test]
 fn conforming_within_attempt_never_fenced() {
     fn property(ops: Vec<ValueOp>) -> Result<bool> {

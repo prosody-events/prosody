@@ -978,7 +978,8 @@ mod attempt_boundary {
         Ok(())
     }
 
-    // --- (j) hook-view arms: the settle stamp and the expired intermediate ---
+    // --- the settle-stamp hook-view arms: the final stamp and the expired
+    // intermediate ---
 
     /// Fails attempt 1 (`Normal`) Transient; on attempt 2 (`Failure`) stages
     /// `wishlist = {attempt:2}` and succeeds. Its `after_commit` re-reads
@@ -1075,10 +1076,11 @@ mod attempt_boundary {
         ))
     }
 
-    /// (j-final), simple: after one retry the final `after_commit` reads
-    /// attempt 2's `wishlist` — the post-settle read contract survives a
-    /// retry. (The final context is already current here, so this arm is the
-    /// green baseline; the stamp's load-bearing case is the nested arm.)
+    /// Final hook reads settled state — simple: after one retry the final
+    /// `after_commit` reads attempt 2's `wishlist` — the post-settle read
+    /// contract survives a retry. (The final context is already current here,
+    /// so this arm is the green baseline; the stamp's load-bearing case is
+    /// the nested arm.)
     #[tokio::test]
     async fn final_hook_reads_settled_state_after_retry() -> Result<()> {
         let read = Arc::new(Mutex::new(None));
@@ -1105,8 +1107,9 @@ mod attempt_boundary {
         Ok(())
     }
 
-    /// (j-final), nested: an inner retry bumps the epoch during the outer
-    /// attempt, leaving the outer's final context pinned stale; the settle
+    /// Final hook reads settled state — nested: an inner retry bumps the epoch
+    /// during the outer attempt, leaving the outer's final context pinned
+    /// stale; the settle
     /// stamp re-pins it current so `after_commit`'s read still sees the
     /// settled `wishlist`. Dropping the `redispatch` stamp in `fire_apply_hook`
     /// makes this read `Terminated` (the stale pin no longer matches the
@@ -1219,14 +1222,15 @@ mod attempt_boundary {
         }
     }
 
-    /// (j-intermediate): the between-attempts `after_abort` holds the EXPIRED
-    /// pre-verb context (pinned at the failed attempt, the epoch already
-    /// bumped), so both its `get()` and its `commit()` error `Terminated` and
-    /// its `commit()` has zero durable effect — a mid-loop commit of the failed
-    /// attempt's overlay is impossible. Covers the N≥3 case (attempts 1 and 2
-    /// fail, so two intermediate hooks fire). Passing the LIVE post-verb
-    /// context to the hook instead of the expired clone makes the reads
-    /// succeed (`Value`, not `Terminated`), failing this pin.
+    /// The intermediate hook is state-dead: the between-attempts `after_abort`
+    /// holds the EXPIRED pre-verb context (pinned at the failed attempt, the
+    /// epoch already bumped), so both its `get()` and its `commit()` error
+    /// `Terminated` and its `commit()` has zero durable effect — a mid-loop
+    /// commit of the failed attempt's overlay is impossible. With
+    /// `succeed_on = 3`, attempts 1 and 2 fail so two intermediate hooks fire,
+    /// exercising the repeated-hook shape. Passing the LIVE post-verb context
+    /// to the hook instead of the expired clone makes the reads succeed
+    /// (`Value`, not `Terminated`), failing this pin.
     #[tokio::test]
     async fn intermediate_hook_is_state_dead() -> Result<()> {
         let reads = Arc::new(Mutex::new(Vec::new()));
@@ -1248,7 +1252,7 @@ mod attempt_boundary {
         assert_eq!(
             reads.lock().clone(),
             vec![ReadObs::Terminated, ReadObs::Terminated],
-            "both intermediate after_abort reads are fenced (N>=3: two hooks fire)",
+            "both intermediate after_abort reads are fenced (two hooks fire)",
         );
         assert_eq!(
             commits.lock().clone(),

@@ -275,13 +275,15 @@ impl<T> RetryHandler<T> {
     ///   on the inner — the inner saw an invocation that returned, and per the
     ///   per-invocation apply-hook contract that attempt is non-final (another
     ///   invocation of the inner is coming), so `after_abort` is the matching
-    ///   hook.
+    ///   hook. That hook receives the EXPIRED pre-verb context (the epoch has
+    ///   already advanced), so its keyed-state ops error `Terminated` — a
+    ///   mid-loop commit of the failed attempt's overlay cannot land.
     /// - For the **final** attempt (the one whose outcome populates the
     ///   returned `Resolution`), this loop does not fire any apply hook on the
     ///   inner. The outer call site is responsible for that one.
     async fn run<C, E, O, F, Fut, A, AFut>(
         &self,
-        context: &C,
+        context: C,
         demand_type: DemandType,
         max_retries: Option<u32>,
         mut invoke: F,
@@ -300,7 +302,7 @@ impl<T> RetryHandler<T> {
         // boundaries. The returned view is the FINAL attempt's context (a fresh
         // re-pinned Arc for any retried event), which the outer settles on —
         // never the original the framework may invalidate.
-        let mut current = context.clone();
+        let mut current = context;
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
@@ -548,7 +550,7 @@ where
         let offset = message.offset();
         let (resolution, _final) = self
             .run(
-                &context,
+                context,
                 demand_type,
                 Some(self.max_retries),
                 |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
@@ -582,7 +584,7 @@ where
     {
         let (resolution, _final) = self
             .run(
-                &context,
+                context,
                 demand_type,
                 Some(self.max_retries),
                 |ctx, dt| self.handler.on_timer(ctx, timer.clone(), dt),
@@ -668,7 +670,7 @@ where
 
         let (resolution, final_ctx) = self
             .run(
-                &context,
+                context,
                 demand_type,
                 None,
                 |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
@@ -711,7 +713,7 @@ where
 
         let (resolution, final_ctx) = self
             .run(
-                &context,
+                context,
                 demand_type,
                 None,
                 |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),

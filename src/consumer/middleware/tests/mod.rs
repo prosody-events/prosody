@@ -428,7 +428,7 @@ mod staged_rollback {
     use crate::state::tests::cell_suite::value_cell;
     use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType};
     use bytes::Bytes;
-    use color_eyre::eyre::{Result, eyre};
+    use color_eyre::eyre::{Result, bail, eyre};
     use futures::StreamExt;
     use quickcheck::{QuickCheck, TestResult};
     use serde_json::json;
@@ -635,6 +635,159 @@ mod staged_rollback {
             1,
             "the backstop must be armed defensively for the sweep",
         );
+        Ok(())
+    }
+
+    /// Records whether its `after_commit` typed-handle read answered or hit the
+    /// stale-pin fence — the A1 witness that the permanent-`Skip` arm re-stamps
+    /// the hook context.
+    #[derive(Clone)]
+    struct SkipReadProbe {
+        read: Arc<Mutex<Option<Result<(), String>>>>,
+    }
+
+    impl FallibleHandler for SkipReadProbe {
+        type Error = TestError;
+        type Output = u64;
+        type Payload = serde_json::Value;
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage<Self::Payload>,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            Ok(0)
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            Ok(0)
+        }
+
+        async fn after_commit<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            let outcome = match context.state(Registered::new(cart())) {
+                Ok(handle) => handle.get().await.map(|_| ()).map_err(|e| e.to_string()),
+                Err(e) => Err(format!("bind: {e}")),
+            };
+            *self.read.lock() = Some(outcome);
+        }
+
+        async fn after_abort<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    impl SettlementHandler for SkipReadProbe {
+        fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+            Settlement::Final
+        }
+    }
+
+    /// The permanent-finalize-`Skip` arm must fire `after_commit` through
+    /// `fire_apply_hook`, not a direct call: a settle context left STALE by a
+    /// nested retry's epoch bump is re-stamped current before the hook reads.
+    /// Without the stamp the hook's typed read errors `Terminated` — the one
+    /// hook-fire site that used to bypass the stamp. Red-proven by reverting
+    /// the arm to `handler.after_commit(context, result)`: the read then
+    /// reports `Terminated`.
+    #[tokio::test]
+    async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
+        use crate::consumer::middleware::tests::test_support::RecordingOracle;
+        use crate::consumer::partition::ShutdownPhase;
+        use crate::state::PartitionBackend;
+        use crate::state::dirty::DirtyStore;
+        use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+        use crate::state::session::sealed::StateLifecycle;
+        use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
+        use crate::state::tests::cell_suite::FailingCellStore;
+        use crate::timers::duration::CompactDuration;
+        use tokio::sync::watch;
+
+        type SkipStore = FailingCellStore<MemoryCellStore<RecordingOracle>>;
+        type SkipBackend =
+            PartitionBackend<RecordingOracle, MemoryDescriptorIdentityStore, SkipStore>;
+
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&cart(), CollectionDef::new(None))?;
+        let registry = Arc::new(registry);
+        let oracle = RecordingOracle::new();
+        // Poison the STAGE path so `settle`'s own `finalize` hits Skip.
+        let cell_store = FailingCellStore::failing_write_provisional(
+            MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+            StateName::try_new("cart")?,
+            ErrorCategory::Permanent,
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let session: KeyedStateSession<SkipBackend, MemoryLoader<serde_json::Value>> =
+            KeyedStateSession::new(SessionParts {
+                cell: cell_store,
+                dirty: Arc::new(DirtyStore::new()),
+                oracle,
+                loader: MemoryLoader::new(),
+                registry,
+                state_key: StateKey::new(Uuid::from_u128(0x5C2), Arc::from("user-1")),
+                event: EventRef::Message {
+                    dedup_id: Uuid::new_v4(),
+                },
+                recovery_delay: CompactDuration::new(30),
+                armed: Arc::default(),
+                termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            });
+
+        // A nested retry's epoch bump: `reset` discards the (empty) dirty and
+        // bumps the shared epoch, leaving THIS clone pinned stale. Buffer the
+        // poisoned write through a live re-pinned clone (shared dirty overlay),
+        // so `finalize` stages it and hits the poison — while the settle still
+        // receives the stale clone.
+        session.reset(RepinProof::for_test()).await;
+        let live = session.repin(RepinProof::for_test());
+        let live_ctx = MockEventContext::new().with_session(live);
+        let live_handle = live_ctx
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind live: {e}"))?;
+        live_handle.set(json!({ "x": 1_i32 })).await?;
+
+        let context = MockEventContext::new().with_session(session);
+        let read = Arc::new(Mutex::new(None));
+        let handler = SkipReadProbe { read: read.clone() };
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        settle(&handler, context, guard, Ok(0)).await;
+
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            1,
+            "the permanent-skip arm still commits",
+        );
+        match read.lock().clone() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => bail!("the Skip-arm hook read was fenced: {e}"),
+            None => bail!("after_commit never fired"),
+        }
         Ok(())
     }
 
