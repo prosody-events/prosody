@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::marker::PhantomData;
 
@@ -215,6 +216,42 @@ pub struct JsonExtractor {
 /// writing JSON documents, and the codec is format-equal with
 /// [`JsonCodec`](crate::codec::JsonCodec).
 pub type JsonBinaryCodec = BinaryCodec<JsonExtractor, JsonFormat>;
+
+/// A [`BinaryExtractor`] that pulls no metadata and never parses.
+///
+/// The keyed-state value path never needs an event id or type, and it must
+/// not parse: a state cell can hold any JSON document — a scalar, an array,
+/// or an object — none of which an object-shaped metadata parse would accept.
+/// Extraction is infallible and always yields empty metadata.
+#[derive(Default)]
+pub struct NoopExtractor;
+
+impl BinaryExtractor for NoopExtractor {
+    type Error = Infallible;
+
+    fn extract<'a>(&mut self, _buf: &'a mut [u8]) -> Result<BinaryMetadata<'a>, Infallible> {
+        Ok(BinaryMetadata::default())
+    }
+
+    fn with_cached_local<R>(f: impl FnOnce(Self) -> (Self, R)) -> R {
+        // Zero-sized and stateless: no buffers to preserve across calls.
+        let (_extractor, result) = f(Self);
+        result
+    }
+}
+
+/// Verbatim JSON state codec for the C# binding's `BinaryPayload`: raw bytes
+/// in and out, never parsed by Rust. Composed from [`NoopExtractor`] and the
+/// declared [`JsonFormat`], so it is format-equal with
+/// [`JsonCodec`](crate::codec::JsonCodec) and [`JsonBinaryCodec`] — all speak
+/// `"json"`, so a collection stays identity-compatible across clients in one
+/// group.
+///
+/// Because the `"json"` [`Codec::FORMAT_ID`](crate::codec::Codec::FORMAT_ID)
+/// promises mutually decodable bytes, a binding writing through this codec
+/// must write valid JSON documents; the codec cannot enforce it (it never
+/// parses), so the byte-compatibility contract is the caller's.
+pub type JsonPassthroughStateCodec = BinaryCodec<NoopExtractor, JsonFormat>;
 
 #[derive(Deserialize)]
 struct JsonMetaView<'a> {

@@ -163,12 +163,12 @@ impl CollectionDefRegistry {
     /// Registers `descriptor`'s collection with operational settings `def`.
     ///
     /// The frozen [`StructuralIdentity`] is derived from the descriptor —
-    /// the single source of identity. Re-registering the same name with the
-    /// same identity is idempotent (the operational `def` is updated);
-    /// a different identity for the same name is rejected
-    /// ([`RegisterStateError::IdentityConflict`]). Also rejects an empty name
-    /// ([`RegisterStateError::Name`]) or a TTL over Cassandra's `USING TTL`
-    /// ceiling ([`RegisterStateError::Ttl`]).
+    /// the single source of identity. A name already present is rejected
+    /// loudly: [`RegisterStateError::IdentityConflict`] when the identity
+    /// differs, [`RegisterStateError::Duplicate`] when it matches (one
+    /// declaration per name per registry — never last-wins). Also rejects an
+    /// empty name ([`RegisterStateError::Name`]) or a TTL over Cassandra's
+    /// `USING TTL` ceiling ([`RegisterStateError::Ttl`]).
     ///
     /// Test-only: production builds the registry through `register_identity`
     /// (fed by the config's stored registrations); the typed descriptor form
@@ -215,17 +215,26 @@ impl CollectionDefRegistry {
             });
         }
         let namespace = self.defs.entry(state_type).or_default();
-        if let Some(existing) = namespace.get(&name)
-            && existing.identity != identity
-        {
-            return Err(RegisterStateError::IdentityConflict {
-                name,
-                registered: Box::new(existing.identity.clone()),
-                requested: Box::new(identity),
-            });
+        match namespace.get(&name) {
+            // A differing identity is the more serious mistake — keep the
+            // specific diagnostic.
+            Some(existing) if existing.identity != identity => {
+                Err(RegisterStateError::IdentityConflict {
+                    name,
+                    registered: Box::new(existing.identity.clone()),
+                    requested: Box::new(identity),
+                })
+            }
+            // A same-identity re-registration is a duplicate declaration:
+            // reject it loudly rather than silently last-wins overwriting the
+            // operational def. Consumers share the `Copy` `Registered` token
+            // instead of registering a name twice.
+            Some(_) => Err(RegisterStateError::Duplicate { name }),
+            None => {
+                namespace.insert(name, RegisteredCollection { identity, def });
+                Ok(())
+            }
         }
-        namespace.insert(name, RegisteredCollection { identity, def });
-        Ok(())
     }
 
     /// Looks up the registered collection for `(state_type, name)`, if any.
@@ -384,6 +393,16 @@ pub enum RegisterStateError {
 
         /// Identity the new registration asserted.
         requested: Box<StructuralIdentity>,
+    },
+
+    /// The name is already registered (with the same identity). One
+    /// declaration per name per registry — a duplicate is a configuration
+    /// error, rejected rather than silently overwriting the prior
+    /// operational settings.
+    #[error("state collection {name:?} is already registered")]
+    Duplicate {
+        /// The duplicated collection name.
+        name: StateName,
     },
 }
 

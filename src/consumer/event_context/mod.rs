@@ -12,13 +12,14 @@
 
 use crate::Key;
 use crate::codec::ErasedStateCodec;
-use crate::consumer::kafka_state::message_state;
+use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::loader::MessageLoader;
-use crate::state::descriptor::{Registered, StateDescriptor, value_state};
+use crate::state::descriptor::{Registered, StateDescriptor, deque_state, map_state, value_state};
+use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::session::CellSession;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
@@ -37,6 +38,14 @@ use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
 use tracing::{Instrument, Span, error, field::Empty, field::display};
+
+mod erased;
+
+pub use erased::{
+    BoxDequeState, BoxMapState, BoxStateCursor, BoxValueState, DynDequeState, DynMapState,
+    DynValueState, ErasedCategory, ErasedStateError, StateCursor,
+};
+use erased::{ErasedDeque, ErasedMap, ErasedValue};
 
 /// Marker trait for errors that can be returned from event context operations.
 ///
@@ -764,68 +773,75 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// partition shutdown).
     fn should_cancel(&self) -> bool;
 
-    // Keyed-state ops — the FFI seam the bindings wrap. They reuse the *same*
-    // typed `state(...)` path as the Rust API, recovering the codec from the
-    // payload via [`ErasedStateCodec`] (value cells) or `MessageRefCodec`
-    // (message refs); the blanket impl's `Self::Payload: ErasedStateCodec`
-    // bound is what restricts a boxed context to the FFI payloads. See
-    // [`ErasedStateCodec`] for the recovered-codec-matches-registration
-    // invariant; each op's `# Errors` notes the per-call failures.
+    // Keyed-state vend methods — the FFI seam the bindings wrap. Each mints a
+    // boxed erased handle ([`DynValueState`]/[`DynMapState`]/[`DynDequeState`])
+    // over the *same* typed `state(...)` path as the Rust API: the value
+    // families recover the cell codec from the payload via [`ErasedStateCodec`]
+    // (the blanket impl's `Self::Payload: ErasedStateCodec` bound restricts a
+    // boxed context to the FFI payloads); the message families resolve through
+    // the session's loader. Maps are always `String`-keyed ([`Utf8KeyCodec`]).
+    //
+    // Vending runs the access-time `verify_state_registration` check (an
+    // unregistered or identity-mismatched name is a Permanent error), then
+    // returns the bind-once handle. The attempt-epoch fence is inherited from
+    // the typed cell interface the handle wraps — the erased seam adds no
+    // fencing of its own. Errors carry a two-way `{Permanent, Transient}`
+    // category and never `Terminal` (see [`ErasedStateError`]).
 
-    /// Reads the named value collection's cell, decoded with the recovered
-    /// consumer codec.
+    /// Vends the erased handle for the named single-value collection.
     ///
     /// # Errors
     ///
     /// Returns a Permanent error for an unregistered or identity-mismatched
-    /// name, a codec error, or a store error.
-    async fn get_cell(&self, name: &str) -> Result<Option<Self::Payload>, BoxEventContextError>;
+    /// name.
+    fn value_state(&self, name: &str) -> Result<BoxValueState<Self::Payload>, ErasedStateError>;
 
-    /// Buffers a write of `value` to the named value collection's cell.
+    /// Vends the erased handle for the named `String`-keyed map collection.
     ///
     /// # Errors
     ///
-    /// Returns a Permanent error for an unregistered or identity-mismatched
-    /// name, a codec error, or a store error.
-    async fn set_cell(&self, name: &str, value: Self::Payload) -> Result<(), BoxEventContextError>;
+    /// See [`value_state`](Self::value_state).
+    fn map_state(&self, name: &str) -> Result<BoxMapState<Self::Payload>, ErasedStateError>;
 
-    /// Buffers a clear of the named value collection's cell.
+    /// Vends the erased handle for the named deque collection.
     ///
     /// # Errors
     ///
-    /// Returns a Permanent error for an unregistered or identity-mismatched
-    /// name, or a store error.
-    async fn clear_cell(&self, name: &str) -> Result<(), BoxEventContextError>;
+    /// See [`value_state`](Self::value_state).
+    fn deque_state(&self, name: &str) -> Result<BoxDequeState<Self::Payload>, ErasedStateError>;
 
-    /// Records `message` as the named Kafka-message collection's durable
-    /// reference (topic/partition/offset).
+    /// Vends the erased handle for the named single-value Kafka-message
+    /// collection — its item is the full [`ConsumerMessage`], resolved through
+    /// the consumer's loader.
     ///
     /// # Errors
     ///
-    /// Returns a Permanent error for an unregistered or identity-mismatched
-    /// name, or a store error.
-    async fn record_message(
+    /// See [`value_state`](Self::value_state).
+    fn message_value_state(
         &self,
         name: &str,
-        message: &ConsumerMessage<Self::Payload>,
-    ) -> Result<(), BoxEventContextError>;
+    ) -> Result<BoxValueState<ConsumerMessage<Self::Payload>>, ErasedStateError>;
 
-    /// Resolves the named Kafka-message collection's reference back to the
-    /// full message, loading through the consumer's message loader.
-    ///
-    /// Returns the same [`ConsumerMessage`] the typed
-    /// `MessageDescriptor::get` yields — topic, partition, offset, key,
-    /// timestamp, and payload — so a binding wraps it with the exact host
-    /// `Message` type it already builds in `on_message`.
+    /// Vends the erased handle for the named `String`-keyed map of Kafka
+    /// messages.
     ///
     /// # Errors
     ///
-    /// Returns a Permanent error for an unregistered or identity-mismatched
-    /// name, a loader miss, or a store error.
-    async fn get_message(
+    /// See [`value_state`](Self::value_state).
+    fn message_map_state(
         &self,
         name: &str,
-    ) -> Result<Option<ConsumerMessage<Self::Payload>>, BoxEventContextError>;
+    ) -> Result<BoxMapState<ConsumerMessage<Self::Payload>>, ErasedStateError>;
+
+    /// Vends the erased handle for the named deque of Kafka messages.
+    ///
+    /// # Errors
+    ///
+    /// See [`value_state`](Self::value_state).
+    fn message_deque_state(
+        &self,
+        name: &str,
+    ) -> Result<BoxDequeState<ConsumerMessage<Self::Payload>>, ErasedStateError>;
 }
 
 dyn_clone::clone_trait_object!(<P> DynEventContext<Payload = P>);
@@ -895,61 +911,69 @@ where
         EventContext::should_cancel(self)
     }
 
-    async fn get_cell(&self, name: &str) -> Result<Option<Self::Payload>, BoxEventContextError> {
-        let registered =
-            Registered::new(value_state::<<C::Payload as ErasedStateCodec>::Codec>(name));
-        self.state(registered)
-            .map_err(|e| Box::new(e) as BoxEventContextError)?
-            .get()
-            .await
-            .map_err(|e| Box::new(e) as BoxEventContextError)
+    fn value_state(&self, name: &str) -> Result<BoxValueState<Self::Payload>, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(value_state::<
+                <C::Payload as ErasedStateCodec>::Codec,
+            >(name)))
+            .map_err(|e| ErasedStateError::from_classified(&e))?;
+        Ok(Box::new(ErasedValue::new(handle)))
     }
 
-    async fn set_cell(&self, name: &str, value: Self::Payload) -> Result<(), BoxEventContextError> {
-        let registered =
-            Registered::new(value_state::<<C::Payload as ErasedStateCodec>::Codec>(name));
-        self.state(registered)
-            .map_err(|e| Box::new(e) as BoxEventContextError)?
-            .set(value)
-            .await
-            .map_err(|e| Box::new(e) as BoxEventContextError)
+    fn map_state(&self, name: &str) -> Result<BoxMapState<Self::Payload>, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(map_state::<
+                Utf8KeyCodec,
+                <C::Payload as ErasedStateCodec>::Codec,
+            >(name)))
+            .map_err(|e| ErasedStateError::from_classified(&e))?;
+        Ok(Box::new(ErasedMap::new(handle)))
     }
 
-    async fn clear_cell(&self, name: &str) -> Result<(), BoxEventContextError> {
-        let registered =
-            Registered::new(value_state::<<C::Payload as ErasedStateCodec>::Codec>(name));
-        self.state(registered)
-            .map_err(|e| Box::new(e) as BoxEventContextError)?
-            .clear()
-            .await
-            .map_err(|e| Box::new(e) as BoxEventContextError)
+    fn deque_state(&self, name: &str) -> Result<BoxDequeState<Self::Payload>, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(deque_state::<
+                <C::Payload as ErasedStateCodec>::Codec,
+            >(name)))
+            .map_err(|e| ErasedStateError::from_classified(&e))?;
+        Ok(Box::new(ErasedDeque::new(handle)))
     }
 
-    async fn record_message(
+    fn message_value_state(
         &self,
         name: &str,
-        message: &ConsumerMessage<Self::Payload>,
-    ) -> Result<(), BoxEventContextError> {
-        self.state(Registered::new(message_state::<
-            <C::State as CellSession>::Loader,
-        >(name)))
-            .map_err(|e| Box::new(e) as BoxEventContextError)?
-            .set(message)
-            .await
-            .map_err(|e| Box::new(e) as BoxEventContextError)
+    ) -> Result<BoxValueState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(message_state::<
+                <C::State as CellSession>::Loader,
+            >(name)))
+            .map_err(|e| ErasedStateError::from_classified(&e))?;
+        Ok(Box::new(ErasedValue::new(handle)))
     }
 
-    async fn get_message(
+    fn message_map_state(
         &self,
         name: &str,
-    ) -> Result<Option<ConsumerMessage<Self::Payload>>, BoxEventContextError> {
-        self.state(Registered::new(message_state::<
-            <C::State as CellSession>::Loader,
-        >(name)))
-            .map_err(|e| Box::new(e) as BoxEventContextError)?
-            .get()
-            .await
-            .map_err(|e| Box::new(e) as BoxEventContextError)
+    ) -> Result<BoxMapState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(message_map_state::<
+                Utf8KeyCodec,
+                <C::State as CellSession>::Loader,
+            >(name)))
+            .map_err(|e| ErasedStateError::from_classified(&e))?;
+        Ok(Box::new(ErasedMap::new(handle)))
+    }
+
+    fn message_deque_state(
+        &self,
+        name: &str,
+    ) -> Result<BoxDequeState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(message_deque_state::<
+                <C::State as CellSession>::Loader,
+            >(name)))
+            .map_err(|e| ErasedStateError::from_classified(&e))?;
+        Ok(Box::new(ErasedDeque::new(handle)))
     }
 }
 

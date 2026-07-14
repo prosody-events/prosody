@@ -9,7 +9,8 @@ mod serialize_buf;
 
 pub use binary::{
     BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryFormat, BinaryMetadata, BinaryPayload,
-    JsonBinaryCodec, JsonExtractError, JsonExtractor, JsonFormat,
+    JsonBinaryCodec, JsonExtractError, JsonExtractor, JsonFormat, JsonPassthroughStateCodec,
+    NoopExtractor,
 };
 pub use fixed::{FixedCodec, I64Codec, I64CodecError, PairCodecError};
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
@@ -96,8 +97,9 @@ pub trait Codec: Default + Send + Sync + 'static {
 ///
 /// The erased `DynEventContext` value ops carry no codec type parameter, so
 /// they recover one from the payload through this map. The reachable
-/// payloads are the FFI codecs' — `serde_json::Value` ([`JsonCodec`]) and
-/// [`BinaryPayload`] ([`JsonBinaryCodec`]).
+/// payloads are the FFI codecs' — `serde_json::Value` ([`JsonCodec`], for
+/// the js/py/rb bindings) and [`BinaryPayload`] ([`JsonPassthroughStateCodec`],
+/// for the C# binding, which hands Rust raw JSON bytes it never parses).
 ///
 /// # Invariant: the recovered codec must match the registration
 ///
@@ -105,18 +107,37 @@ pub trait Codec: Default + Send + Sync + 'static {
 /// `structural_identity`, which `verify_state_registration` checks at access:
 /// this map only *infers* a codec, that check *enforces* it. A consumer whose
 /// real codec differs self-rejects with a Permanent identity mismatch rather
-/// than misreading a cell.
+/// than misreading a cell. Every payload here maps to a `"json"`-format codec,
+/// so a value collection registered by any of the four clients is
+/// identity-compatible across all of them in one group.
 pub trait ErasedStateCodec: Send + Sync + 'static {
     /// The codec whose [`Codec::Payload`] is `Self`.
     type Codec: Codec<Payload = Self>;
+
+    /// Whether this payload is the JSON `null` "absent" sentinel — the value
+    /// the erased seam rejects on `set`/`push` (`clear`/`remove` express
+    /// deletion instead). `null` is not a storable cell value: a cell either
+    /// holds a value or is absent, and JSON `null` is the erased seam's way of
+    /// naming absent.
+    fn is_absent_sentinel(&self) -> bool;
 }
 
 impl ErasedStateCodec for serde_json::Value {
     type Codec = JsonCodec;
+
+    fn is_absent_sentinel(&self) -> bool {
+        matches!(self, serde_json::Value::Null)
+    }
 }
 
 impl ErasedStateCodec for BinaryPayload {
-    type Codec = JsonBinaryCodec;
+    type Codec = JsonPassthroughStateCodec;
+
+    fn is_absent_sentinel(&self) -> bool {
+        // No parse (the passthrough codec never parses): the seam only needs to
+        // recognize the literal `null` document, ASCII-whitespace-trimmed.
+        self.bytes.trim_ascii() == b"null"
+    }
 }
 
 #[cfg(test)]

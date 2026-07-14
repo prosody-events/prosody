@@ -20,7 +20,7 @@
 
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::codec::JsonCodecError;
-use prosody::consumer::event_context::{BoxEventContextError, EventContext, StateAccessError};
+use prosody::consumer::event_context::{ErasedStateError, EventContext, StateAccessError};
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
@@ -129,7 +129,8 @@ impl CartHandler {
 
         ctx.clone()
             .boxed()
-            .record_message(LAST_SEEN, &message)
+            .message_value_state(LAST_SEEN)?
+            .set(message)
             .await?;
 
         // The final message completes the cart; schedule the timer that
@@ -160,7 +161,8 @@ impl CartHandler {
         let last_seen = ctx
             .clone()
             .boxed()
-            .get_message(LAST_SEEN)
+            .message_value_state(LAST_SEEN)?
+            .get()
             .await?
             .map(|message| (message.offset(), message.payload().clone()));
 
@@ -228,7 +230,7 @@ enum CartHandlerError {
 
     /// A Kafka-message-cell access failure through the erased seam.
     #[error(transparent)]
-    Kafka(#[from] BoxEventContextError),
+    Kafka(#[from] ErasedStateError),
 
     /// The cart cell held something other than an array.
     #[error("unexpected cart cell: {0}")]

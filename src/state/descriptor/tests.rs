@@ -116,8 +116,26 @@ pub(crate) fn test_session_with_armed(
 
 /// The partition backend every test-session fixture in this module shares: the
 /// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
-type TestBackend =
+pub(crate) type TestBackend =
     PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+
+/// Builds a test session over an arbitrary loader payload — the generic twin of
+/// [`test_session`] (which pins the loader to `MemoryLoader<Value>`). The
+/// erased FFI-seam parity suites drive this for both `serde_json::Value` and
+/// `BinaryPayload` payloads.
+pub(crate) fn test_session_for<L>(
+    loader: L,
+    registry: CollectionDefRegistry,
+) -> KeyedStateSession<TestBackend, L> {
+    let (parts, _cell_store) = session_parts(
+        loader,
+        registry,
+        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+        Arc::default(),
+        false,
+    );
+    KeyedStateSession::new(parts)
+}
 
 /// Assembles the [`SessionParts`] shared by every test-session fixture — a
 /// fresh memory cell store over `registry`, the committed oracle, and the given
@@ -377,43 +395,44 @@ async fn bind_with_mismatched_kind_errors() -> Result<()> {
     Ok(())
 }
 
-/// Re-registering the same name with an *unchanged* identity is
-/// accepted and updates the operational settings — the second `CollectionDef`
-/// wins. Identity is frozen; TTL and commit mode are not.
+/// Re-registering the same name with an *unchanged* identity is rejected as a
+/// duplicate declaration — one declaration per name per registry, never
+/// last-wins. The first registration's operational settings stand; the second
+/// errors [`RegisterStateError::Duplicate`] (`Permanent`) rather than silently
+/// overwriting them.
 #[test]
-fn reregistration_updates_operational_settings() -> Result<()> {
+fn reregistration_is_rejected_as_duplicate() -> Result<()> {
     let name = StateName::try_new("cart")?;
     let initial_ttl = CompactDuration::new(60);
     let updated_ttl = CompactDuration::new(7_200);
 
     let mut registry = CollectionDefRegistry::new(None);
     registry.register(&cart(), CollectionDef::new(Some(initial_ttl)))?;
-    assert_eq!(
-        registry.ttl_for(StateType::Application, &name),
-        Some(initial_ttl)
-    );
-    assert_eq!(
-        registry.commit_mode_for(StateType::Application, &name),
-        CommitMode::ReadCommitted
-    );
 
-    // Same name, same identity, different operational settings.
-    registry.register(
+    // Same name, same identity, different operational settings — rejected.
+    let duplicate = registry.register(
         &cart(),
         CollectionDef {
             commit_mode: CommitMode::ReadUncommitted,
             ..CollectionDef::new(Some(updated_ttl))
         },
-    )?;
+    );
+    let Err(error) = duplicate else {
+        return Err(eyre!("a duplicate registration must be rejected"));
+    };
+    assert!(matches!(error, RegisterStateError::Duplicate { .. }));
+    assert_eq!(error.classify_error(), ErrorCategory::Permanent);
+
+    // The first registration's settings are untouched — no last-wins overwrite.
     assert_eq!(
         registry.ttl_for(StateType::Application, &name),
-        Some(updated_ttl),
-        "the re-registration's TTL must win"
+        Some(initial_ttl),
+        "the rejected re-registration must not have changed the TTL"
     );
     assert_eq!(
         registry.commit_mode_for(StateType::Application, &name),
-        CommitMode::ReadUncommitted,
-        "the re-registration's commit mode must win"
+        CommitMode::ReadCommitted,
+        "the rejected re-registration must not have changed the commit mode"
     );
     Ok(())
 }
@@ -439,10 +458,12 @@ fn empty_name_rejected_at_registration() {
 
 /// Descriptors are plain values: for any runtime name string, two
 /// descriptors built independently from equal strings are interchangeable —
-/// same (interned) name, same frozen identity — so registering the second
-/// is the idempotent re-registration path, never an `IdentityConflict`.
-/// This is the invariant that lets call sites build descriptors wherever
-/// they need them instead of sharing one declaration.
+/// same (interned) name, same frozen identity — so a call site can build a
+/// descriptor wherever it needs one instead of sharing one declaration. The
+/// registry holds one declaration per name, so registering the second is
+/// rejected loudly as a [`RegisterStateError::Duplicate`] (never last-wins);
+/// interchangeability is the identity/name equality, provable without a
+/// successful second register.
 #[test]
 fn prop_descriptors_from_equal_strings_are_interchangeable() {
     fn prop(name: String) -> TestResult {
@@ -455,12 +476,17 @@ fn prop_descriptors_from_equal_strings_are_interchangeable() {
             let b: ValueDescriptor = value_state(&name);
             let mut registry = CollectionDefRegistry::new(None);
             registry.register(&a, CollectionDef::new(None))?;
-            registry.register(&b, CollectionDef::new(None))?;
+            // A same-identity re-registration of the equal descriptor is a
+            // duplicate declaration — rejected, not silently overwritten.
+            let duplicate = registry.register(&b, CollectionDef::new(None));
+            if !matches!(duplicate, Err(RegisterStateError::Duplicate { .. })) {
+                return Ok(false);
+            }
             Ok(a.name() == b.name() && a.structural_identity() == b.structural_identity())
         })();
         finish_trace(
             result,
-            "equal strings must build interchangeable descriptors",
+            "equal strings must build interchangeable descriptors and reject a duplicate register",
             &input_dbg,
         )
     }
