@@ -108,8 +108,8 @@ pub trait Codec: Default + Send + Sync + 'static {
 /// this map only *infers* a codec, that check *enforces* it. A consumer whose
 /// real codec differs self-rejects with a Permanent identity mismatch rather
 /// than misreading a cell. Every payload here maps to a `"json"`-format codec,
-/// so a value collection registered by any of the four clients is
-/// identity-compatible across all of them in one group.
+/// so cross-client identity-compatibility holds by the [`JsonFormat`] /
+/// [`Codec::FORMAT_ID`] invariant.
 pub trait ErasedStateCodec: Send + Sync + 'static {
     /// The codec whose [`Codec::Payload`] is `Self`.
     type Codec: Codec<Payload = Self>;

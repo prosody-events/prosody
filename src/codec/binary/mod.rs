@@ -241,16 +241,13 @@ impl BinaryExtractor for NoopExtractor {
 }
 
 /// Verbatim JSON state codec for the C# binding's `BinaryPayload`: raw bytes
-/// in and out, never parsed by Rust. Composed from [`NoopExtractor`] and the
-/// declared [`JsonFormat`], so it is format-equal with
-/// [`JsonCodec`](crate::codec::JsonCodec) and [`JsonBinaryCodec`] — all speak
-/// `"json"`, so a collection stays identity-compatible across clients in one
-/// group.
+/// in and out, never parsed by Rust. Composed from [`NoopExtractor`] and
+/// [`JsonFormat`], which owns the `"json"` cross-client identity-compatibility
+/// invariant.
 ///
-/// Because the `"json"` [`Codec::FORMAT_ID`](crate::codec::Codec::FORMAT_ID)
-/// promises mutually decodable bytes, a binding writing through this codec
-/// must write valid JSON documents; the codec cannot enforce it (it never
-/// parses), so the byte-compatibility contract is the caller's.
+/// Because it never parses, the codec cannot enforce that the bytes are valid
+/// JSON: a binding writing through it must write JSON documents, or it breaks
+/// the mutually-decodable-bytes promise [`JsonFormat`] makes on its behalf.
 pub type JsonPassthroughStateCodec = BinaryCodec<NoopExtractor, JsonFormat>;
 
 #[derive(Deserialize)]

@@ -720,10 +720,12 @@ impl Error for BoxEventContextError {}
 ///
 /// Allows using `EventContext` trait objects where return types must be named.
 ///
-/// # Object Safety
+/// # Object safety
 ///
-/// Each method is turned into `async fn` or returns a `bool` for synchronous
-/// check.
+/// Every method resolves to an object-safe shape: the timer ops are `async fn`
+/// (boxed by `#[async_trait]`), `should_cancel` is a synchronous `bool`, and
+/// the six keyed-state vend methods are synchronous fallible `fn`s returning a
+/// boxed erased handle (`Result<Box<dyn Dyn*State>, ErasedStateError>`).
 #[async_trait]
 pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// The message payload type events on this context carry; mirrors

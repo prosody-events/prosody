@@ -10,11 +10,11 @@
 //! The handler stays generic over `C: EventContext` (no concrete context type
 //! named anywhere), which the typed `MessageDescriptor<L>` handle cannot do —
 //! its resolver names a concrete loader `L`, so it needs `C::State` pinned to
-//! that exact `L`, unknowable from `C: EventContext` alone. The erased
-//! Kafka-message ops (`record_message`/`get_message`) resolve through
-//! whatever loader `C::State` carries, bounded only by the `MessageLoader`
-//! trait, so this test exercises that loader-agnostic path for the
-//! Kafka-message cell instead.
+//! that exact `L`, unknowable from `C: EventContext` alone. The erased vend
+//! method `message_value_state(name)` returns a handle whose `.set()`/`.get()`
+//! resolve through whatever loader `C::State` carries, bounded only by the
+//! `MessageLoader` trait, so this test exercises that loader-agnostic path for
+//! the Kafka-message cell instead.
 
 #![recursion_limit = "256"]
 
@@ -69,8 +69,9 @@ fn last_seen() -> MessageDescriptor<KafkaLoader<JsonCodec>> {
 }
 
 /// The `last_seen` collection's registered name — the handler reaches it
-/// through the erased, loader-agnostic `record_message`/`get_message` ops
-/// rather than a typed [`Registered`] token (see the module doc).
+/// through the erased, loader-agnostic `message_value_state(name)` vend method
+/// (whose handle's `.set()`/`.get()` it calls) rather than a typed
+/// [`Registered`] token (see the module doc).
 const LAST_SEEN: &str = "last_seen";
 
 /// What the handler saw, streamed to the test for content assertions.

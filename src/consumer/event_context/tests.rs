@@ -10,12 +10,13 @@
 //! Because `<P as ErasedStateCodec>::Codec` *is* the codec the typed path uses,
 //! `erased == typed` is structural; the model catches any encode/decode
 //! corruption or name-resolution bug. Cursor laziness, the null-write
-//! rejection, the never-`Terminal` fold, and the unregistered/duplicate-name
-//! classifications are pinned alongside.
+//! rejection, the never-`Terminal` fold, and the unregistered-name
+//! classification are pinned alongside; duplicate-name is a registry-level pin
+//! in `state/descriptor/tests.rs`.
 
-use super::{DynEventContext, ErasedCategory, ErasedStateError, EventContext};
+use super::{DynEventContext, ErasedCategory, ErasedStateError, EventContext, StateCursor};
 use crate::codec::{BinaryPayload, ErasedStateCodec, JsonCodec};
-use crate::consumer::kafka_state::message_state;
+use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
@@ -141,6 +142,17 @@ where
     Ok(MockEventContext::<P>::new().with_session(session))
 }
 
+/// Drains a scan cursor fully into a `Vec`, surfacing any scan error. Shared by
+/// the map and deque parity runners, whose scan checks differ only in how they
+/// compare the drained entries against the model.
+async fn drain_cursor<T>(cursor: &StateCursor<T>) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    while let Some(item) = cursor.next().await.map_err(|e| eyre!("scan: {e}"))? {
+        items.push(item);
+    }
+    Ok(items)
+}
+
 /// Compares two optional payloads observationally.
 fn opt_same<P: ParityPayload>(a: Option<&P>, b: Option<&P>) -> bool {
     match (a, b) {
@@ -158,14 +170,18 @@ enum ValueOp {
     Get,
     Set,
     Clear,
+    Commit,
+    Rollback,
 }
 
 impl Arbitrary for ValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 3 {
+        match u8::arbitrary(g) % 5 {
             0 => ValueOp::Get,
             1 => ValueOp::Set,
-            _ => ValueOp::Clear,
+            2 => ValueOp::Clear,
+            3 => ValueOp::Commit,
+            _ => ValueOp::Rollback,
         }
     }
 
@@ -195,10 +211,14 @@ impl Arbitrary for ValueTrace {
     }
 }
 
-/// Drives a value trace through the erased handle and an `Option<P>` model,
-/// asserting `erased == typed == model` after every op. `set` values come from
-/// a fresh generator per op (seeded off the op index) so the property covers
-/// varied payloads without threading them through the trace.
+/// Drives a value trace through the erased handle and a `(floor, visible)`
+/// model, asserting `erased == typed == visible` after every op. `floor` is the
+/// last durably committed value; `visible` is the read-your-writes value.
+/// `set`/`clear` move only `visible`; `commit` promotes `visible` to `floor`;
+/// `rollback` reverts `visible` to `floor`. Commit/rollback are issued through
+/// the **erased** handle only — the typed handle shares the same overlay, so
+/// calling its commit would mask a no-op erased commit. `set` values come from
+/// a fresh generator per op so the property covers varied payloads.
 fn run_value_parity<P>(ops: &[ValueOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
@@ -208,7 +228,8 @@ where
         let handle = ctx
             .value_state(VALUE_NAME)
             .map_err(|e| eyre!("vend value: {e}"))?;
-        let mut model: Option<P> = None;
+        let mut floor: Option<P> = None;
+        let mut visible: Option<P> = None;
         let mut sampler = Gen::new(8);
         for op in ops {
             match op {
@@ -219,14 +240,25 @@ where
                         .set(value.clone())
                         .await
                         .map_err(|e| eyre!("erased set: {e}"))?;
-                    model = Some(value);
+                    visible = Some(value);
                 }
                 ValueOp::Clear => {
                     handle
                         .clear()
                         .await
                         .map_err(|e| eyre!("erased clear: {e}"))?;
-                    model = None;
+                    visible = None;
+                }
+                ValueOp::Commit => {
+                    handle
+                        .commit()
+                        .await
+                        .map_err(|e| eyre!("erased commit: {e}"))?;
+                    floor = visible.clone();
+                }
+                ValueOp::Rollback => {
+                    handle.rollback().await;
+                    visible = floor.clone();
                 }
             }
             let erased = handle.get().await.map_err(|e| eyre!("erased get: {e}"))?;
@@ -239,7 +271,7 @@ where
                 .await
                 .map_err(|e| eyre!("typed get: {e}"))?;
             if !opt_same::<P>(erased.as_ref(), typed.as_ref())
-                || !opt_same::<P>(erased.as_ref(), model.as_ref())
+                || !opt_same::<P>(erased.as_ref(), visible.as_ref())
             {
                 return Ok(false);
             }
@@ -285,6 +317,8 @@ enum MapOp {
     Remove(usize),
     Clear,
     Scan,
+    Commit,
+    Rollback,
 }
 
 impl MapOp {
@@ -295,12 +329,14 @@ impl MapOp {
 
 impl Arbitrary for MapOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 5 {
+        match u8::arbitrary(g) % 7 {
             0 => MapOp::Get(usize::arbitrary(g)),
             1 => MapOp::Set(usize::arbitrary(g)),
             2 => MapOp::Remove(usize::arbitrary(g)),
             3 => MapOp::Clear,
-            _ => MapOp::Scan,
+            4 => MapOp::Scan,
+            5 => MapOp::Commit,
+            _ => MapOp::Rollback,
         }
     }
 
@@ -330,17 +366,25 @@ impl Arbitrary for MapTrace {
     }
 }
 
-/// Drives a map trace through the erased handle and a `BTreeMap` model,
-/// asserting after every op that each pooled key reads equal and a full
-/// forward scan yields exactly the model's key-ordered entries.
+/// Drives a map trace through the erased handle and a `(floor, visible)`
+/// `BTreeMap` model, asserting after every op that each pooled key reads equal
+/// and a full forward scan yields exactly `visible`'s key-ordered entries.
+/// `visible` is the read-your-writes map; `floor` is the last committed
+/// snapshot. `commit` promotes `visible` to `floor`; `rollback` reverts
+/// `visible` to `floor`. Both are issued through the **erased** handle only —
+/// the typed handle shares the overlay, so calling its commit would mask a
+/// no-op erased commit.
 fn run_map_parity<P>(ops: &[MapOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
     executor::block_on(async {
         let ctx = parity_context::<P>()?;
-        let handle = ctx.map_state(MAP_NAME).map_err(|e| eyre!("vend map: {e}"))?;
-        let mut model: BTreeMap<String, P> = BTreeMap::new();
+        let handle = ctx
+            .map_state(MAP_NAME)
+            .map_err(|e| eyre!("vend map: {e}"))?;
+        let mut floor: BTreeMap<String, P> = BTreeMap::new();
+        let mut visible: BTreeMap<String, P> = BTreeMap::new();
         let mut sampler = Gen::new(8);
         for op in ops {
             match op {
@@ -353,7 +397,7 @@ where
                         .get(key.clone())
                         .await
                         .map_err(|e| eyre!("erased map get: {e}"))?;
-                    if !opt_same::<P>(erased.as_ref(), model.get(&key)) {
+                    if !opt_same::<P>(erased.as_ref(), visible.get(&key)) {
                         return Ok(false);
                     }
                 }
@@ -364,7 +408,7 @@ where
                         .set(key.clone(), value.clone())
                         .await
                         .map_err(|e| eyre!("erased map set: {e}"))?;
-                    model.insert(key, value);
+                    visible.insert(key, value);
                 }
                 MapOp::Remove(i) => {
                     let key = MapOp::key(*i);
@@ -372,14 +416,25 @@ where
                         .remove(key.clone())
                         .await
                         .map_err(|e| eyre!("erased map remove: {e}"))?;
-                    model.remove(&key);
+                    visible.remove(&key);
                 }
                 MapOp::Clear => {
                     handle
                         .clear()
                         .await
                         .map_err(|e| eyre!("erased map clear: {e}"))?;
-                    model.clear();
+                    visible.clear();
+                }
+                MapOp::Commit => {
+                    handle
+                        .commit()
+                        .await
+                        .map_err(|e| eyre!("erased map commit: {e}"))?;
+                    floor = visible.clone();
+                }
+                MapOp::Rollback => {
+                    handle.rollback().await;
+                    visible = floor.clone();
                 }
             }
             for key in KEYS {
@@ -387,18 +442,16 @@ where
                     .get((*key).to_owned())
                     .await
                     .map_err(|e| eyre!("erased map get: {e}"))?;
-                if !opt_same::<P>(erased.as_ref(), model.get(*key)) {
+                if !opt_same::<P>(erased.as_ref(), visible.get(*key)) {
                     return Ok(false);
                 }
             }
-            // A forward scan must yield exactly the model's key-ordered entries.
-            let cursor = handle.scan(Direction::Forward);
-            let mut scanned: Vec<(String, P)> = Vec::new();
-            while let Some(entry) = cursor.next().await.map_err(|e| eyre!("map scan: {e}"))? {
-                scanned.push(entry);
-            }
-            let expected: Vec<(String, P)> =
-                model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            // A forward scan must yield exactly the visible key-ordered entries.
+            let scanned = drain_cursor(&handle.scan(Direction::Forward)).await?;
+            let expected: Vec<(String, P)> = visible
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             if scanned.len() != expected.len()
                 || scanned
                     .iter()
@@ -449,17 +502,21 @@ enum DequeOp {
     PopBack,
     Clear,
     Scan,
+    Commit,
+    Rollback,
 }
 
 impl Arbitrary for DequeOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 8 {
             0 => DequeOp::PushBack,
             1 => DequeOp::PushFront,
             2 => DequeOp::PopFront,
             3 => DequeOp::PopBack,
             4 => DequeOp::Clear,
-            _ => DequeOp::Scan,
+            5 => DequeOp::Scan,
+            6 => DequeOp::Commit,
+            _ => DequeOp::Rollback,
         }
     }
 
@@ -489,9 +546,13 @@ impl Arbitrary for DequeTrace {
     }
 }
 
-/// Drives a deque trace through the erased handle and a `VecDeque` model,
-/// asserting `len`, every positional `get`, and a full forward scan agree
-/// after every op.
+/// Drives a deque trace through the erased handle and a `(floor, visible)`
+/// `VecDeque` model, asserting `len`, every positional `get`, and a full
+/// forward scan agree with `visible` after every op. `visible` is the
+/// read-your-writes deque; `floor` is the last committed snapshot. `commit`
+/// promotes `visible` to `floor`; `rollback` reverts `visible` to `floor`. Both
+/// are issued through the **erased** handle only — the typed handle shares the
+/// overlay, so calling its commit would mask a no-op erased commit.
 fn run_deque_parity<P>(ops: &[DequeOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
@@ -501,7 +562,8 @@ where
         let handle = ctx
             .deque_state(DEQUE_NAME)
             .map_err(|e| eyre!("vend deque: {e}"))?;
-        let mut model: VecDeque<P> = VecDeque::new();
+        let mut floor: VecDeque<P> = VecDeque::new();
+        let mut visible: VecDeque<P> = VecDeque::new();
         let mut sampler = Gen::new(8);
         for op in ops {
             match op {
@@ -512,7 +574,7 @@ where
                         .push_back(value.clone())
                         .await
                         .map_err(|e| eyre!("erased push_back: {e}"))?;
-                    model.push_back(value);
+                    visible.push_back(value);
                 }
                 DequeOp::PushFront => {
                     let value = P::arbitrary_value(&mut sampler);
@@ -520,14 +582,14 @@ where
                         .push_front(value.clone())
                         .await
                         .map_err(|e| eyre!("erased push_front: {e}"))?;
-                    model.push_front(value);
+                    visible.push_front(value);
                 }
                 DequeOp::PopFront => {
                     let erased = handle
                         .pop_front()
                         .await
                         .map_err(|e| eyre!("pop_front: {e}"))?;
-                    let expected = model.pop_front();
+                    let expected = visible.pop_front();
                     if !opt_same::<P>(erased.as_ref(), expected.as_ref()) {
                         return Ok(false);
                     }
@@ -537,7 +599,7 @@ where
                         .pop_back()
                         .await
                         .map_err(|e| eyre!("pop_back: {e}"))?;
-                    let expected = model.pop_back();
+                    let expected = visible.pop_back();
                     if !opt_same::<P>(erased.as_ref(), expected.as_ref()) {
                         return Ok(false);
                     }
@@ -547,37 +609,44 @@ where
                         .clear()
                         .await
                         .map_err(|e| eyre!("erased deque clear: {e}"))?;
-                    model.clear();
+                    visible.clear();
+                }
+                DequeOp::Commit => {
+                    handle
+                        .commit()
+                        .await
+                        .map_err(|e| eyre!("erased deque commit: {e}"))?;
+                    floor = visible.clone();
+                }
+                DequeOp::Rollback => {
+                    handle.rollback().await;
+                    visible = floor.clone();
                 }
             }
             let len = handle.len().await.map_err(|e| eyre!("deque len: {e}"))?;
-            if len != model.len()
+            if len != visible.len()
                 || handle
                     .is_empty()
                     .await
                     .map_err(|e| eyre!("is_empty: {e}"))?
-                    != model.is_empty()
+                    != visible.is_empty()
             {
                 return Ok(false);
             }
-            for index in 0..model.len() {
+            for index in 0..visible.len() {
                 let erased = handle
                     .get(index)
                     .await
                     .map_err(|e| eyre!("deque get: {e}"))?;
-                if !opt_same::<P>(erased.as_ref(), model.get(index)) {
+                if !opt_same::<P>(erased.as_ref(), visible.get(index)) {
                     return Ok(false);
                 }
             }
-            let cursor = handle.scan(Direction::Forward);
-            let mut scanned: Vec<P> = Vec::new();
-            while let Some(item) = cursor.next().await.map_err(|e| eyre!("deque scan: {e}"))? {
-                scanned.push(item);
-            }
-            if scanned.len() != model.len()
+            let scanned = drain_cursor(&handle.scan(Direction::Forward)).await?;
+            if scanned.len() != visible.len()
                 || scanned
                     .iter()
-                    .zip(model.iter())
+                    .zip(visible.iter())
                     .any(|(a, b)| !P::same(a, b))
             {
                 return Ok(false);
@@ -668,6 +737,114 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
     Ok(())
 }
 
+/// The erased Kafka-message *map* seam drives a distinct impl from the value
+/// seam — the borrowed-write `ErasedWrite for MessageCell` lowering a
+/// `handle.set(key, &message)` — so it is pinned separately. `set(key,
+/// message)` records the message by key; `.get(key)` resolves it back through
+/// the loader, matching the typed `message_map_state` path.
+#[tokio::test]
+async fn erased_kafka_map_set_then_get_matches_typed() -> Result<()> {
+    let topic = Topic::from("orders.v1");
+    let (partition, offset) = (3_i32, 42_i64);
+    let key: Key = Arc::from("user-1");
+    let payload = json!({ "order": 7_i32 });
+
+    let loader = MemoryLoader::<Value>::new();
+    loader.store_message(topic, partition, offset, key.clone(), payload.clone());
+
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(
+        &message_map_state::<Utf8KeyCodec, MemoryLoader<Value>>("seen_by_key"),
+        CollectionDef::new(None),
+    )?;
+    let session = test_session(loader, registry);
+    let ctx = MockEventContext::<Value>::new().with_session(session);
+
+    let message = ConsumerMessage::for_testing(topic, partition, offset, key, payload.clone())?;
+
+    ctx.message_map_state("seen_by_key")
+        .map_err(|e| eyre!("vend message map: {e}"))?
+        .set("k".to_owned(), message)
+        .await
+        .map_err(|e| eyre!("erased map set: {e}"))?;
+    let erased = ctx
+        .message_map_state("seen_by_key")
+        .map_err(|e| eyre!("vend message map: {e}"))?
+        .get("k".to_owned())
+        .await
+        .map_err(|e| eyre!("erased map get: {e}"))?
+        .ok_or_else(|| eyre!("erased map get resolved nothing"))?;
+    assert_eq!(erased.offset(), offset);
+    assert_eq!(*erased.payload(), payload);
+
+    let typed = ctx
+        .state(Registered::new(message_map_state::<
+            Utf8KeyCodec,
+            MemoryLoader<Value>,
+        >("seen_by_key")))
+        .map_err(|e| eyre!("typed map bind: {e}"))?
+        .get(&"k".to_owned())
+        .await
+        .map_err(|e| eyre!("typed map get: {e}"))?
+        .ok_or_else(|| eyre!("typed map get resolved nothing"))?;
+    assert_eq!(typed.offset(), erased.offset());
+    assert_eq!(*typed.payload(), *erased.payload());
+    Ok(())
+}
+
+/// The erased Kafka-message *deque* seam drives the same borrowed-write impl
+/// via `handle.push_back(&message)`, distinct from the value seam. `push_back`
+/// appends the message; `.get(0)` resolves it back through the loader, matching
+/// the typed `message_deque_state` path.
+#[tokio::test]
+async fn erased_kafka_deque_push_then_get_matches_typed() -> Result<()> {
+    let topic = Topic::from("orders.v1");
+    let (partition, offset) = (3_i32, 42_i64);
+    let key: Key = Arc::from("user-1");
+    let payload = json!({ "order": 7_i32 });
+
+    let loader = MemoryLoader::<Value>::new();
+    loader.store_message(topic, partition, offset, key.clone(), payload.clone());
+
+    let mut registry = CollectionDefRegistry::new(None);
+    registry.register(
+        &message_deque_state::<MemoryLoader<Value>>("seen_log"),
+        CollectionDef::new(None),
+    )?;
+    let session = test_session(loader, registry);
+    let ctx = MockEventContext::<Value>::new().with_session(session);
+
+    let message = ConsumerMessage::for_testing(topic, partition, offset, key, payload.clone())?;
+
+    ctx.message_deque_state("seen_log")
+        .map_err(|e| eyre!("vend message deque: {e}"))?
+        .push_back(message)
+        .await
+        .map_err(|e| eyre!("erased push_back: {e}"))?;
+    let erased = ctx
+        .message_deque_state("seen_log")
+        .map_err(|e| eyre!("vend message deque: {e}"))?
+        .get(0)
+        .await
+        .map_err(|e| eyre!("erased deque get: {e}"))?
+        .ok_or_else(|| eyre!("erased deque get resolved nothing"))?;
+    assert_eq!(erased.offset(), offset);
+    assert_eq!(*erased.payload(), payload);
+
+    let typed = ctx
+        .state(Registered::new(message_deque_state::<MemoryLoader<Value>>(
+            "seen_log",
+        )))
+        .map_err(|e| eyre!("typed deque bind: {e}"))?
+        .get(0)
+        .await
+        .map_err(|e| eyre!("typed deque get: {e}"))?
+        .ok_or_else(|| eyre!("typed deque get resolved nothing"))?;
+    assert_eq!(typed.offset(), erased.offset());
+    assert_eq!(*typed.payload(), *erased.payload());
+    Ok(())
+}
+
 // --- Object safety / cloneability -------------------------------------------
 
 /// The erased seam is the FFI deliverable, so `Box<dyn DynEventContext<Payload
@@ -743,7 +920,9 @@ where
         return Err(eyre!("a rejected null set must leave the cell untouched"));
     }
 
-    let map = ctx.map_state(MAP_NAME).map_err(|e| eyre!("vend map: {e}"))?;
+    let map = ctx
+        .map_state(MAP_NAME)
+        .map_err(|e| eyre!("vend map: {e}"))?;
     let Err(error) = map.set("k".to_owned(), P::null_value()).await else {
         return Err(eyre!("null map set must be rejected"));
     };
@@ -842,8 +1021,9 @@ type CountingBackend = PartitionBackend<FixedOracle, MemoryDescriptorIdentitySto
 type CountingContext =
     MockEventContext<Value, KeyedStateSession<CountingBackend, MemoryLoader<Value>>>;
 
-/// Builds a counting-store-backed context (map `MAP_NAME` registered), returning
-/// the context and a clone of the counting store to read its `get` counter.
+/// Builds a counting-store-backed context (map `MAP_NAME` registered),
+/// returning the context and a clone of the counting store to read its `get`
+/// counter.
 fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, CountingStore) {
     let registry = Arc::new(registry);
     let counting = CountingCellStore::new(MemoryCellStore::new(
@@ -887,7 +1067,9 @@ async fn map_cursor_is_lazy() -> Result<()> {
     )?;
     let (ctx, counting) = counting_context(registry);
 
-    let map = ctx.map_state(MAP_NAME).map_err(|e| eyre!("vend map: {e}"))?;
+    let map = ctx
+        .map_state(MAP_NAME)
+        .map_err(|e| eyre!("vend map: {e}"))?;
     for i in 0..entries {
         map.set(format!("k{i:04}"), json!(i))
             .await
