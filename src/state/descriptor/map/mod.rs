@@ -213,8 +213,8 @@ impl Codec for MapKeysetKey {
 ///
 /// A **live entry cell implies a present keyset cell** — equivalently, an
 /// absent keyset implies no live entries, so `stream` may return empty with
-/// zero entry reads (the [`MapHandle::stream`] `Absent → Empty` arm). Three
-/// rules hold it:
+/// zero entry reads (an empty [`Tracked`](StreamPlan::Tracked) list — zero
+/// coordinates, so no point gets and no scan). Three rules hold it:
 ///
 /// * every `set` leaves a keyset cell present — writing one whenever the
 ///   pre-write read is `Absent`/`Malformed` or the frame must change, staged

@@ -311,8 +311,9 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// completion — `Some`, `Err`, and the exhaustion `None` alike — BEFORE
     /// matching it, so a scan leaked past its handler attempt (a spawned task,
     /// an un-awaited future, a foreign promise) errors
-    /// [`StateAccessError::Terminated`] at its next emission and no buffered
-    /// item crosses the boundary. Empty sources still pass the fence on
+    /// [`StateAccessError::Terminated`] at its next emission; the source's own
+    /// buffer sits below the fence, so no item whose emission check follows the
+    /// bump crosses. Empty sources still pass the fence on
     /// exhaustion, so a leaked empty-plan stream errors rather than reporting a
     /// clean end.
     ///

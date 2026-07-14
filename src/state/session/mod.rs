@@ -408,8 +408,9 @@ pub(crate) mod sealed {
     /// the NEXT attempt's transaction. The attempt boundary
     /// ([`StateLifecycle::reset`](super::StateLifecycle::reset)) bumps the
     /// session epoch under this gate, and a detached clone keeps its stale pin,
-    /// so the leak errors [`StateAccessError::Terminated`] at the point its op
-    /// takes effect — uniformly across the whole surface:
+    /// so the leak errors at the point its op takes effect — uniformly across
+    /// the whole surface (`Terminated` on a crossed attempt boundary,
+    /// `SessionClosed` in the post-settle hook window):
     ///
     /// * **handle ops** (`get`/`set`/`clear`/…) — the pin compare in
     ///   `ensure_live` / `mutate_permit`'s ordered admission;
