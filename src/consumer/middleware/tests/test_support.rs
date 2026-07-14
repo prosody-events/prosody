@@ -19,7 +19,9 @@ use uuid::Uuid;
 use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
-use crate::consumer::middleware::{DemandType, FallibleHandler, Settlement, SettlementHandler};
+use crate::consumer::middleware::{
+    DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
+};
 use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -339,6 +341,25 @@ where
         DESC: StateDescriptor,
     {
         registered.descriptor().bind(&self.session)
+    }
+
+    fn redispatch(&self, proof: RepinProof) -> Self {
+        // Field-wise rebuild (mirrors `with_session`) re-pinning the session:
+        // a `recording_session`-backed mock re-pins the real
+        // `KeyedStateSession`; the default `UnavailableState` re-pin is a clone.
+        Self {
+            shutdown_tx: self.shutdown_tx.clone(),
+            shutdown_rx: self.shutdown_rx.clone(),
+            cancel_tx: self.cancel_tx.clone(),
+            cancel_rx: self.cancel_rx.clone(),
+            timer_operations: self.timer_operations.clone(),
+            durable_timers: self.durable_timers.clone(),
+            timer_fail_count: self.timer_fail_count.clone(),
+            timer_fail_category: self.timer_fail_category,
+            shutdown_on_timer_read: self.shutdown_on_timer_read,
+            session: self.session.repin(proof),
+            _payload: PhantomData,
+        }
     }
 
     fn should_cancel(&self) -> bool {

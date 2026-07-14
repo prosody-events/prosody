@@ -48,12 +48,14 @@
 //!    commit oracle. After the offset/trigger commit the boundary consumes the
 //!    receipt: `certify().promote()` promotes the staged cells; on an
 //!    arm-shutdown abort `rollback()` restores their committed bases.
-//! 4. At attempt boundaries, retry calls `discard_dirty` so the next attempt
-//!    starts from a clean buffer; the identity override persists by design (it
-//!    is identity, not decision).
+//! 4. At attempt boundaries the retry loop runs the `next_attempt` verb, whose
+//!    `reset` transition discards this event's dirty buffer (under the gate)
+//!    and bumps the attempt epoch, so the next attempt starts clean and any
+//!    handle leaked from the failed attempt is fenced; the identity override
+//!    persists by design (it is identity, not decision).
 
 use crate::consumer::event_context::EventContext;
-use crate::consumer::middleware::MarkerWrite;
+use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::access::StateAccessError;
 use crate::state::cell::ProvisionalWrite;
@@ -78,7 +80,7 @@ use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
-use parking_lot::Mutex as SyncMutex;
+use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
 use sealed::{StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
@@ -310,7 +312,8 @@ pub trait CellSession: StateLifecycle + Clone + Send + Sync + 'static {
 pub(crate) mod sealed {
     use super::{
         CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
-        MarkerWrite, ProvisionalWrite, SectionClear, StateAccessError, Uuid, resolve_collections,
+        MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError, Uuid,
+        resolve_collections,
     };
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
@@ -392,15 +395,19 @@ pub(crate) mod sealed {
     /// [`GATE_WARN_INTERVAL`] but **never** proceeds without the gate (settling
     /// around a still-executing op would snapshot a half-applied session).
     ///
-    /// A second shape is equally forbidden: **detaching** a session clone into
-    /// a task that outlives the handler op that spawned it. Session handles are
-    /// `Clone + 'static`, but the gate only serializes ops *within* one event's
-    /// dispatch. Between retry attempts the gate is Open (closure happens only
-    /// at settle), so a spawned task's `set` landing after an attempt's
-    /// `discard_dirty` would join the NEXT attempt's transaction — a silent
-    /// leak no serial order explains. Keep every session op inside the handler
-    /// future that owns the event; the `SessionClosed` error fences detached
-    /// ops only AFTER settle, never at an attempt boundary.
+    /// A second shape — **detaching** a session clone into a task that outlives
+    /// the handler op that spawned it — is fenced by the attempt epoch, not
+    /// just forbidden. Session handles are `Clone + 'static`, but the gate only
+    /// serializes ops *within* one event's dispatch. Between retry attempts the
+    /// gate is Open (closure happens only at settle), so a spawned task's `set`
+    /// landing after an attempt boundary would once have joined the NEXT
+    /// attempt's transaction. The attempt boundary
+    /// ([`StateLifecycle::reset`](super::StateLifecycle::reset)) now bumps the
+    /// session epoch under this gate, so a detached clone keeps its stale pin
+    /// and its ops error [`StateAccessError::Terminated`] — the leak is an
+    /// enforced error, not a convention. Keep every session op inside the
+    /// handler future that owns the event all the same; the fence is the
+    /// backstop, not a license to detach.
     ///
     /// Perf posture: uncontended for any handler that does not `join!` its
     /// session ops — one uncontended tokio `Mutex` lock per op; the phase
@@ -432,23 +439,6 @@ pub(crate) mod sealed {
         /// observe fully-settled state.
         pub(crate) async fn read(&self) -> OpPermit<'_> {
             OpPermit(self.inner.lock().await)
-        }
-
-        /// Acquires the gate for a mutator, re-checking closure **after** the
-        /// acquire (not just before waiting): an op parked behind the closing
-        /// settle errors [`StateAccessError::SessionClosed`] instead of
-        /// mutating a session the boundary already snapshotted.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`StateAccessError::SessionClosed`] once the settle boundary
-        /// has closed the session.
-        pub(crate) async fn mutate(&self) -> Result<MutatePermit<'_>, StateAccessError> {
-            let guard = self.inner.lock().await;
-            if matches!(*guard, SessionPhase::Closed) {
-                return Err(StateAccessError::SessionClosed);
-            }
-            Ok(MutatePermit(OpPermit(guard)))
         }
 
         /// Closes the session for settlement: acquires the gate once, marks the
@@ -512,10 +502,12 @@ pub(crate) mod sealed {
 
     /// A held gate permit that additionally witnesses a session **mutation**.
     ///
-    /// Granted only through [`SessionGate::mutate`], whose closure check
-    /// confirms the session is still open to mutation — so the descriptor's
+    /// Minted only through [`Self::witness`], from a held read permit once the
+    /// caller has sequenced the mutator admission order (pin → closed →
+    /// termination — see
+    /// [`CellView::mutate_permit`](crate::state::descriptor)). The descriptor's
     /// mutating sinks (`raw_set`/`raw_clear`/`clear_section`/`raw_commit`)
-    /// demand `&MutatePermit` and "acquired too weakly" (a read permit at a
+    /// demand `&MutatePermit`, so "acquired too weakly" (a read permit at a
     /// write) does not compile. It [`Deref`]s to [`OpPermit`], so a mutator's
     /// one permit also witnesses the reads inside its body — the read-under-
     /// mutate grade subtyping is one-directional and deliberate: a read is
@@ -523,6 +515,17 @@ pub(crate) mod sealed {
     /// permit) is a type error. Uncontended unless a handler `join!`s its
     /// session ops.
     pub struct MutatePermit<'a>(OpPermit<'a>);
+
+    impl<'a> MutatePermit<'a> {
+        /// Wraps a held read permit as a mutation witness. The caller
+        /// (`CellView::mutate_permit`) has already sequenced the
+        /// pin/closed/termination admission checks under this same permit, so
+        /// possessing a `MutatePermit` proves the session admitted the
+        /// mutation.
+        pub(in crate::state) fn witness(permit: OpPermit<'a>) -> Self {
+            Self(permit)
+        }
+    }
 
     impl<'a> Deref for MutatePermit<'a> {
         type Target = OpPermit<'a>;
@@ -766,10 +769,11 @@ pub(crate) mod sealed {
             proof: MarkerWrite,
         ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Discards just this event's buffered dirty cells — retry's
-        /// attempt-boundary isolation, and the failure-path backstop that
-        /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
-        /// runs on every exit path (error, abandon, panic unwind).
+        /// Discards just this event's buffered dirty cells — the isolation step
+        /// of the attempt-boundary [`Self::reset`] transition (which then bumps
+        /// the epoch under the same gate hold), and the failure-path backstop
+        /// that [`EventStateScope`](crate::state::manager::EventStateScope)'s
+        /// `Drop` runs on every exit path (error, abandon, panic unwind).
         ///
         /// The dirty workspace is partition-lifetime (manager-owned, shared by
         /// every session clone), so it must be cleared explicitly per event.
@@ -780,6 +784,26 @@ pub(crate) mod sealed {
         /// there; the receipt's promote/rollback read only receipt-owned
         /// data, never dirty.
         fn discard_dirty(&self);
+
+        /// Whether this handle/session clone's pinned epoch still equals the
+        /// live session epoch. `false` once a later attempt boundary
+        /// ([`Self::reset`]) bumped it — the pin half of `ensure_live`, the
+        /// mutator admission order, and `rollback`'s `NoOp` guard.
+        fn attempt_current(&self) -> bool;
+
+        /// The attempt-boundary transition: acquire the gate, discard this
+        /// attempt's dirty overlay, and bump the epoch — all under **one** gate
+        /// hold, so a stale queued write cannot land between the clear and the
+        /// bump and survive into the next attempt. This is the epoch's ONLY
+        /// bump site. Gated by [`RepinProof`] so a lone bump (a partial reset
+        /// with no matching re-pin) is unwritable outside the two mint sites.
+        fn reset(&self, proof: RepinProof) -> impl Future<Output = ()> + Send;
+
+        /// A session clone re-pinned to the CURRENT epoch — the crate-internal
+        /// re-pin constructor. [`RepinProof`]-gated so only the two mint sites
+        /// (the `next_attempt` verb and the settle final-hook stamp) can
+        /// produce a live attempt-N+1 (or stamped-final) view.
+        fn repin(&self, proof: RepinProof) -> Self;
 
         /// The always-on `recovery_delay` floor (a plain config read). The
         /// per-event tightened delay lives on the receipt
@@ -870,6 +894,30 @@ where
     pub termination: TerminationWatch,
 }
 
+/// The per-event attempt epoch. Bumped once per retry attempt boundary
+/// ([`StateLifecycle::reset`](sealed::StateLifecycle::reset)); a
+/// handle/stream/session clone pins the epoch that was live when it was minted,
+/// and every cell op fails once its pin no longer equals the session's live
+/// epoch (`ensure_live`, mutator admission, `rollback`). This is what turns a
+/// handle leaked past its handler attempt into an enforced `Terminated` error
+/// rather than a silent write into the next attempt's transaction.
+///
+/// Wrapping is deliberate: 2^64 attempt boundaries is unreachable in any
+/// process lifetime, and wrapping keeps the retry-forever design panic-free (a
+/// checked add would be a reachable panic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttemptEpoch(u64);
+
+impl AttemptEpoch {
+    /// The epoch a freshly-minted session pins (attempt 1).
+    const INITIAL: Self = Self(0);
+
+    /// The next epoch — see the wrapping rationale on the type.
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
 struct SessionInner<B, L>
 where
     B: StateBackend,
@@ -891,6 +939,12 @@ where
     reload_marker: SyncMutex<Option<MessageMarker>>,
     /// The per-event session operation gate (KV4) — see [`SessionGate`].
     gate: SessionGate,
+    /// The shared live attempt epoch — the truth every clone of this session
+    /// compares its pin against (see [`AttemptEpoch`]). Behind an `RwLock` so
+    /// the store-visibility window a bare atomic exposes cannot let a racing
+    /// emission read a pre-bump value; the guard is a leaf, dropped inside the
+    /// one-line accessors and never held across an `.await`.
+    epoch: RwLock<AttemptEpoch>,
 }
 
 /// The real per-event session over a partition's cell store.
@@ -904,6 +958,12 @@ where
     B: StateBackend,
 {
     inner: Arc<SessionInner<B, L>>,
+    /// This clone's pinned attempt epoch, copied verbatim by [`Clone`] and
+    /// living OUTSIDE the shared `inner` so a leaked clone (or a clone of a
+    /// clone) keeps its stale pin and can never re-pin itself. Only the
+    /// crate-internal [`StateLifecycle::repin`](sealed::StateLifecycle::repin)
+    /// mints a clone re-pinned to the live epoch.
+    pinned: AttemptEpoch,
 }
 
 impl<B, L> Clone for KeyedStateSession<B, L>
@@ -913,6 +973,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            pinned: self.pinned,
         }
     }
 }
@@ -962,13 +1023,35 @@ where
                 termination,
                 reload_marker: SyncMutex::new(None),
                 gate: SessionGate::new(),
+                epoch: RwLock::new(AttemptEpoch::INITIAL),
             }),
+            // A freshly-minted session is attempt 1: `pinned == *epoch.read()`.
+            pinned: AttemptEpoch::INITIAL,
         }
     }
 
     /// The collection id for `(state_type, name)` under this session's key.
     fn id_for(&self, state_type: StateType, name: &StateName) -> CollectionId {
         CollectionId::new(self.inner.state_key.clone(), state_type, name.clone())
+    }
+
+    /// The session's live attempt epoch. A one-line copy-out: the leaf
+    /// `RwLock` read guard is dropped before returning, so it is never held
+    /// across an `.await`.
+    fn current_epoch(&self) -> AttemptEpoch {
+        *self.inner.epoch.read()
+    }
+
+    /// Bumps the live attempt epoch to the next value. The **only** epoch
+    /// writer, with exactly one call site: inside
+    /// [`StateLifecycle::reset`](sealed::StateLifecycle::reset), under the
+    /// held gate permit. Lock ordering is always gate → epoch (the gate is an
+    /// async tokio mutex, this is a `parking_lot` leaf), so there is no
+    /// sync lock-order cycle; the write guard is dropped before returning and
+    /// never crosses an `.await`.
+    fn bump_epoch(&self) {
+        let mut epoch = self.inner.epoch.write();
+        *epoch = epoch.next();
     }
 }
 
@@ -1129,13 +1212,16 @@ where
         // settle boundary already snapshotted it) discards nothing, expressed
         // as a NoOp because the signature cannot surface `SessionClosed`.
         let permit = self.inner.gate.read().await;
-        // A terminated session must not mutate the shared per-partition dirty
-        // store either. Every other cell op refuses a terminated session
-        // through the descriptor's `ensure_live`; rollback expresses the same
-        // containment as a NoOp. Without this, a stale clone of a cancelled or
-        // shutting-down event (a handle moved into a spawned task) could drain
-        // a later same-key event's live buffer: a silent lost write.
-        if permit.is_closed() || self.is_terminated() {
+        // Self-admission INSIDE the held gate: rollback expresses every other
+        // cell op's admission checks as a `NoOp` (its infallible signature
+        // cannot surface an error). A stale pin (this clone outlived its
+        // attempt — the epoch was bumped) drains nothing, so it cannot touch
+        // the next attempt's live buffer; a closed session (the settle boundary
+        // already snapshotted it) and a terminated one (shutdown/cancel) do the
+        // same. Without the pin check a stale clone of a retried event moved
+        // into a spawned task could drain the next attempt's buffer: a silent
+        // lost write.
+        if !self.attempt_current() || permit.is_closed() || self.is_terminated() {
             return StoreOutcome::NoOp;
         }
         let id = self.id_for(state_type, name);
@@ -1278,6 +1364,28 @@ where
             .overlay
             .dirty()
             .clear_event(&self.inner.state_key.key);
+    }
+
+    fn attempt_current(&self) -> bool {
+        self.pinned == self.current_epoch()
+    }
+
+    async fn reset(&self, _proof: RepinProof) {
+        // ONE gate hold spanning discard-then-bump. Separate steps would let a
+        // stale queued write acquire the gate after the clear, buffer under the
+        // old epoch, and survive into attempt N+1. Holding the gate here also
+        // waits out any in-flight session op (the no-un-polled-op contract
+        // still applies), so the discard sees a quiescent dirty range.
+        let _permit = self.inner.gate.read().await;
+        self.discard_dirty();
+        self.bump_epoch();
+    }
+
+    fn repin(&self, _proof: RepinProof) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            pinned: self.current_epoch(),
+        }
     }
 
     fn recovery_floor(&self) -> CompactDuration {

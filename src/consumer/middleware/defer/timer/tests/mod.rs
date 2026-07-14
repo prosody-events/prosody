@@ -7,13 +7,13 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::tests::test_support::{HandlerOutcome, OutcomeError, OutcomeSlot};
+use crate::consumer::middleware::{FallibleHandler, RepinProof};
 use crate::otel::SpanRelation;
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::tests::support::UnavailableState;
@@ -120,6 +120,11 @@ impl EventContext for MockContext {
         DESC: StateDescriptor,
     {
         registered.descriptor().bind(&UnavailableState::new())
+    }
+
+    fn redispatch(&self, _proof: RepinProof) -> Self {
+        // Leaf mock over stateless keyed state: nothing to re-pin.
+        self.clone()
     }
 
     fn should_cancel(&self) -> bool {

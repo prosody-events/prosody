@@ -9,6 +9,7 @@ use crate::Key;
 use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::event_context::StateAccessError;
+use crate::consumer::middleware::RepinProof;
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::tests::support::UnavailableState;
 use crate::timers::TimerType;
@@ -229,6 +230,11 @@ impl EventContext for KeyedCapturingContext {
         DESC: StateDescriptor,
     {
         registered.descriptor().bind(&UnavailableState::new())
+    }
+
+    fn redispatch(&self, _proof: RepinProof) -> Self {
+        // Leaf mock over stateless keyed state: nothing to re-pin.
+        self.clone()
     }
 
     fn should_cancel(&self) -> bool {

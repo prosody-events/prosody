@@ -73,11 +73,9 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
-    Settlement, SettlementHandler, abandon, settle,
+    NextAttempt, Settlement, SettlementHandler, abandon, settle,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
-use crate::state::session::LifecycleAccessExt;
-use crate::state::session::sealed::StateLifecycle;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Offset, Partition, Topic};
@@ -289,15 +287,20 @@ impl<T> RetryHandler<T> {
         mut invoke: F,
         mut apply_abort: A,
         log: impl Fn(LogReason<'_, E>),
-    ) -> Resolution<O, E>
+    ) -> (Resolution<O, E>, C)
     where
         C: EventContext,
         E: ClassifyError,
-        F: FnMut(DemandType) -> Fut,
+        F: FnMut(C, DemandType) -> Fut,
         Fut: Future<Output = Result<O, E>>,
-        A: FnMut(E) -> AFut,
+        A: FnMut(C, E) -> AFut,
         AFut: Future<Output = ()>,
     {
+        // `run` owns the current dispatch view and drives it across attempt
+        // boundaries. The returned view is the FINAL attempt's context (a fresh
+        // re-pinned Arc for any retried event), which the outer settles on —
+        // never the original the framework may invalidate.
+        let mut current = context.clone();
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
@@ -307,8 +310,8 @@ impl<T> RetryHandler<T> {
             } else {
                 DemandType::Failure
             };
-            let error = match invoke(demand).await {
-                Ok(output) => return Resolution::Commit(Ok(output)),
+            let error = match invoke(current.clone(), demand).await {
+                Ok(output) => return (Resolution::Commit(Ok(output)), current),
                 Err(error) => error,
             };
 
@@ -316,8 +319,8 @@ impl<T> RetryHandler<T> {
             // Shutdown returns Abort *without* firing apply_abort here — the
             // outer layer will fire the inner's after_abort exactly once for
             // this final attempt.
-            if context.is_shutdown() {
-                return Resolution::Abort(error);
+            if current.is_shutdown() {
+                return (Resolution::Abort(error), current);
             }
 
             match error.classify_error() {
@@ -328,7 +331,7 @@ impl<T> RetryHandler<T> {
                             error: &error,
                         });
                         // Final attempt: outer layer fires the apply hook.
-                        return Resolution::Commit(Err(error));
+                        return (Resolution::Commit(Err(error)), current);
                     }
                     let sleep_time = self.sleep_time(attempt);
                     log(LogReason::Retrying {
@@ -341,43 +344,41 @@ impl<T> RetryHandler<T> {
                     // becomes the final attempt of the session and the
                     // outer's after_abort is the only apply-hook firing —
                     // we must not double-fire here.
-                    if wait_with_cancellation(context, sleep_time).await
+                    if wait_with_cancellation(&current, sleep_time).await
                         == RetryWaitResult::Shutdown
                     {
-                        return Resolution::Abort(error);
+                        return (Resolution::Abort(error), current);
                     }
-                    // We will retry: this attempt was a non-final dispatch
-                    // from the inner's POV. Per the per-invocation apply-hook
-                    // invariant, fire `inner.after_abort(Err(error))` before
-                    // the next invocation of the inner. Whether the sleep
-                    // returned `Completed` or `Cancelled` (message
-                    // cancellation, treated as transient), we are committing
-                    // to another attempt on the next loop iteration.
-                    apply_abort(error).await;
-
-                    // Attempt boundary: discard the failed attempt's dirty
-                    // ops so they never leak into the next attempt's
-                    // transaction. Attempt isolation only — the reload
-                    // identity override persists by design (it is identity,
-                    // not decision, and each re-dispatch would recompute the
-                    // same value or overwrite it last-wins).
-                    if let Ok(lifecycle) = context.lifecycle() {
-                        lifecycle.discard_dirty();
-                    }
+                    // Attempt boundary, verb-then-hook ordering: clone the stale
+                    // view, run `next_attempt` (which discards this attempt's
+                    // dirty overlay + bumps the epoch under the gate, then
+                    // returns the re-pinned N+1 view), THEN fire the
+                    // intermediate `after_abort` with the now-EXPIRED clone.
+                    // The expired clone is pinned at attempt N while the epoch
+                    // is now N+1, so it is state-dead by construction: a
+                    // mid-loop `commit()` of the failed attempt's overlay from
+                    // that hook errors `Terminated` rather than landing. Per
+                    // the per-invocation apply-hook contract this attempt was
+                    // non-final, so `after_abort` is the matching hook (message
+                    // cancellation is treated as transient — we retry either
+                    // way).
+                    let expired = current.clone();
+                    current = current.next_attempt().await;
+                    apply_abort(expired, error).await;
                 }
                 ErrorCategory::Permanent => {
                     log(LogReason::Permanent {
                         attempt,
                         error: &error,
                     });
-                    return Resolution::Commit(Err(error));
+                    return (Resolution::Commit(Err(error)), current);
                 }
                 ErrorCategory::Terminal => {
                     log(LogReason::Terminal {
                         attempt,
                         error: &error,
                     });
-                    return Resolution::Abort(error);
+                    return (Resolution::Abort(error), current);
                 }
             }
         }
@@ -545,16 +546,13 @@ where
         let partition = message.partition();
         let key = message.key();
         let offset = message.offset();
-        let resolution = self
+        let (resolution, _final) = self
             .run(
                 &context,
                 demand_type,
                 Some(self.max_retries),
-                |dt| {
-                    self.handler
-                        .on_message(context.clone(), message.clone(), dt)
-                },
-                |error| self.handler.after_abort(context.clone(), Err(error)),
+                |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
+                |ctx, error| self.handler.after_abort(ctx, Err(error)),
                 |reason| {
                     log_message_failure(
                         topic.as_ref(),
@@ -582,13 +580,13 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        let resolution = self
+        let (resolution, _final) = self
             .run(
                 &context,
                 demand_type,
                 Some(self.max_retries),
-                |dt| self.handler.on_timer(context.clone(), timer.clone(), dt),
-                |error| self.handler.after_abort(context.clone(), Err(error)),
+                |ctx, dt| self.handler.on_timer(ctx, timer.clone(), dt),
+                |ctx, error| self.handler.after_abort(ctx, Err(error)),
                 |reason| log_timer_failure(&reason, ""),
             )
             .await;
@@ -668,16 +666,13 @@ where
         let offset = message.offset();
         let (message, uncommitted_offset) = message.into_inner();
 
-        let resolution = self
+        let (resolution, final_ctx) = self
             .run(
                 &context,
                 demand_type,
                 None,
-                |dt| {
-                    self.handler
-                        .on_message(context.clone(), message.clone(), dt)
-                },
-                |error| self.handler.after_abort(context.clone(), Err(error)),
+                |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
+                |ctx, error| self.handler.after_abort(ctx, Err(error)),
                 |reason| {
                     log_message_failure(
                         topic.as_ref(),
@@ -691,12 +686,18 @@ where
             )
             .await;
 
+        // Settle on the FINAL dispatch context (a fresh re-pinned Arc for a
+        // retried event), not the original `context`: a leaked attempt-1 clone
+        // could have invalidated the original's shared Arc, which would strand
+        // the real attempt's dirty overlay at settle.
         match resolution {
-            Resolution::Commit(result) => settle(self, context, uncommitted_offset, result).await,
+            Resolution::Commit(result) => {
+                settle(self, final_ctx, uncommitted_offset, result).await;
+            }
             Resolution::Abort(error) => {
                 // Terminal abort: nothing staged (the receipt never minted),
                 // and abandon touches no state.
-                abandon(self, context, uncommitted_offset, Err(error)).await;
+                abandon(self, final_ctx, uncommitted_offset, Err(error)).await;
             }
         }
     }
@@ -708,23 +709,24 @@ where
     {
         let (trigger, uncommitted) = timer.into_inner();
 
-        let resolution = self
+        let (resolution, final_ctx) = self
             .run(
                 &context,
                 demand_type,
                 None,
-                |dt| self.handler.on_timer(context.clone(), trigger.clone(), dt),
-                |error| self.handler.after_abort(context.clone(), Err(error)),
+                |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
+                |ctx, error| self.handler.after_abort(ctx, Err(error)),
                 |reason| log_timer_failure(&reason, "; discarding timer"),
             )
             .await;
 
+        // Settle on the FINAL dispatch context — see the message arm above.
         match resolution {
-            Resolution::Commit(result) => settle(self, context, uncommitted, result).await,
+            Resolution::Commit(result) => settle(self, final_ctx, uncommitted, result).await,
             Resolution::Abort(error) => {
                 // Terminal abort: nothing staged (the receipt never minted),
                 // and abandon touches no state.
-                abandon(self, context, uncommitted, Err(error)).await;
+                abandon(self, final_ctx, uncommitted, Err(error)).await;
             }
         }
     }

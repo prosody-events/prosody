@@ -31,12 +31,13 @@ use super::super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::super::store::CellStore;
 use super::super::{
     CollectionId, CollectionRef, Direction, PartitionBackend, StateAccessError, StateKey,
-    StateName, StateType,
+    StateName, StateType, StoreOutcome,
 };
 use super::cell_suite::{ScriptedOracle, value_cell};
 use super::collection_suite::finalize_and_promote;
 use super::support::{CountingCellStore, HoldingCellStore, Holds, probe};
 use crate::codec::{JsonCodec, JsonCodecError};
+use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 
@@ -45,6 +46,7 @@ use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Report, Result, bail, eyre};
 use futures::StreamExt;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::sync::Arc;
 use std::task::Poll;
@@ -1403,7 +1405,7 @@ fn closed_session_fences_mutators_but_serves_hook_reads() -> Result<()> {
         // rollback answers NoOp (its infallible containment posture).
         assert_eq!(
             handle.rollback().await,
-            super::super::StoreOutcome::NoOp,
+            StoreOutcome::NoOp,
             "rollback on a closed session discards nothing"
         );
         // A read still answers — the apply hooks read state through it.
@@ -1414,4 +1416,418 @@ fn closed_session_fences_mutators_but_serves_hook_reads() -> Result<()> {
         );
         Ok(())
     })
+}
+
+// ==========================================================================
+// Attempt-epoch fence pins
+// ==========================================================================
+//
+// The mechanics of the per-event attempt epoch (`AttemptEpoch`): a handle,
+// stream, or session clone pins the epoch that was live when it was minted, and
+// every cell op fails `Terminated` once a later attempt boundary (`reset`)
+// bumped it. These pins drive `reset`/`repin` directly through
+// `RepinProof::for_test()` at the typed layer — no retry loop — so each fence
+// rule is isolated. The per-pin falsification injection is recorded in the
+// phase report's FALSIFICATION TARGETS.
+
+/// Whether a fenced cell op returned the `Terminated` access error.
+fn is_terminated(err: &CellStateError<JsonCodecError>) -> bool {
+    matches!(err, CellStateError::Access(StateAccessError::Terminated))
+}
+
+/// Seeds `value` as the committed base of collection `v` beneath the cache, so
+/// a later cold `get` fills through the lower store.
+async fn seed_committed_v(fx: &GateFixture, value: &Value) -> Result<()> {
+    let cref = CollectionRef::new(fx.id("v")?, None);
+    fx.counting
+        .write_resolved(
+            &cref,
+            &[(value_cell(), Some(Bytes::from(serde_json::to_vec(value)?)))],
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Pin (a): a typed handle op after `reset()` errors `Terminated`, with zero
+/// store effect — the fenced `set` never reaches the committed cell.
+#[test]
+fn handle_op_after_reset_is_terminated() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_reset_op")?;
+        seed_committed_v(&fx, &Value::from("A")).await?;
+        let session = fx.session(1);
+        let handle = value_state::<JsonCodec>("v")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // Attempt boundary: discard + bump. `handle` keeps the stale pin.
+        session.reset(RepinProof::for_test()).await;
+
+        match handle.get().await {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("get after reset must be Terminated, got {other:?}"),
+        }
+        match handle.set(Value::from("B")).await {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("set after reset must be Terminated, got {other:?}"),
+        }
+
+        // Zero store effect: settle the (now attempt-N+1) session — the fenced
+        // set never buffered, so nothing stages — and a fresh event still reads
+        // the seeded "A".
+        finalize_and_promote(
+            &session,
+            &fx.oracle,
+            Uuid::from_u128(1),
+            &fx.cells,
+            &fx.id("v")?,
+        )
+        .await?;
+        let verify = fx.session(2);
+        let fresh = value_state::<JsonCodec>("v")
+            .bind(&verify)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert_eq!(
+            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
+            Some(Value::from("A")),
+            "the fenced set left the committed cell unchanged"
+        );
+        Ok(())
+    })
+}
+
+/// Pin (d): a leaked attempt-N session clone (and a clone of a clone) stays
+/// fenced after `reset()`, while a `repin`-ed clone is live.
+#[test]
+fn leaked_clone_is_fenced_repin_is_live() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_leaked_clone")?;
+        let session = fx.session(1);
+        session.reset(RepinProof::for_test()).await; // epoch N -> N+1
+
+        // A leaked attempt-N clone vends a previously-unbound collection; its
+        // first op errors.
+        let leaked = session.clone();
+        let leaked_handle = value_state::<JsonCodec>("v")
+            .bind(&leaked)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        match leaked_handle.get().await {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("a leaked attempt-N clone op must be Terminated, got {other:?}"),
+        }
+
+        // A clone of a clone carries the same stale pin.
+        let leaked2 = session.clone().clone();
+        let handle2 = value_state::<JsonCodec>("v")
+            .bind(&leaked2)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        match handle2.get().await {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("a clone-of-a-clone op must be Terminated, got {other:?}"),
+        }
+
+        // A `repin`-ed clone is pinned to the live epoch and reads normally.
+        let live = session.repin(RepinProof::for_test());
+        let live_handle = value_state::<JsonCodec>("v")
+            .bind(&live)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert_eq!(
+            live_handle
+                .get()
+                .await
+                .map_err(|e| eyre!("live get: {e}"))?,
+            None,
+            "the live attempt reads normally"
+        );
+        Ok(())
+    })
+}
+
+/// Pin (m): the epoch bump sticks even with NOTHING vended before the boundary
+/// — the first handle bound from a stale-pinned clone after `reset()` errors on
+/// its first op.
+#[test]
+fn reset_bump_sticks_with_nothing_vended() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_bump_sticks")?;
+        let session = fx.session(1);
+        // No handle/stream vended before the boundary.
+        session.reset(RepinProof::for_test()).await;
+        // The FIRST handle, bound from a stale-pinned clone, errors on first op.
+        let stale = session.clone();
+        let handle = value_state::<JsonCodec>("v")
+            .bind(&stale)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        match handle.get().await {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("first op after a vend-free bump must be Terminated, got {other:?}"),
+        }
+        Ok(())
+    })
+}
+
+/// Pin (f): a stale `rollback()` (pinned N) after `reset()` returns `NoOp` and
+/// leaves attempt N+1's dirty buffer untouched.
+#[test]
+fn stale_rollback_is_noop_and_spares_next_attempt() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_stale_rollback")?;
+        let session = fx.session(1);
+        let stale = value_state::<JsonCodec>("v")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // Attempt boundary, then seed N+1's dirty through a live (repin-ed)
+        // handle over the SAME collection.
+        session.reset(RepinProof::for_test()).await;
+        let live = session.repin(RepinProof::for_test());
+        let live_handle = value_state::<JsonCodec>("v")
+            .bind(&live)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        live_handle
+            .set(Value::from("keep"))
+            .await
+            .map_err(|e| eyre!("set: {e}"))?;
+
+        // Without the pin check the stale rollback would drain the live buffer.
+        assert_eq!(
+            stale.rollback().await,
+            StoreOutcome::NoOp,
+            "a stale rollback discards nothing"
+        );
+
+        // N+1 settles with the seeded value intact.
+        finalize_and_promote(
+            &live,
+            &fx.oracle,
+            Uuid::from_u128(1),
+            &fx.cells,
+            &fx.id("v")?,
+        )
+        .await?;
+        let verify = fx.session(2);
+        let fresh = value_state::<JsonCodec>("v")
+            .bind(&verify)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert_eq!(
+            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
+            Some(Value::from("keep")),
+            "attempt N+1's dirty survived the stale rollback"
+        );
+        Ok(())
+    })
+}
+
+/// Pin (i): a stale queued write (pinned N) issued after the whole one-hold
+/// reset transition errors instead of buffering, and attempt N+1 settles with
+/// no residue of it — the `mutate_permit` pin fence, distinct from the (b)
+/// interleaving race.
+#[test]
+fn stale_write_after_reset_errors_and_leaves_no_residue() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_stale_write")?;
+        let session = fx.session(1);
+        let stale = value_state::<JsonCodec>("v")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        session.reset(RepinProof::for_test()).await; // discard + bump, one hold
+
+        match stale.set(Value::from("leak")).await {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("a stale write after reset must be Terminated, got {other:?}"),
+        }
+
+        // Settle N+1: nothing staged from the fenced write.
+        finalize_and_promote(
+            &session,
+            &fx.oracle,
+            Uuid::from_u128(1),
+            &fx.cells,
+            &fx.id("v")?,
+        )
+        .await?;
+        let verify = fx.session(2);
+        let fresh = value_state::<JsonCodec>("v")
+            .bind(&verify)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert_eq!(
+            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
+            None,
+            "the fenced stale write left no committed residue"
+        );
+        Ok(())
+    })
+}
+
+/// Pin (b): a `set` forced to queue on the gate behind the reset transition
+/// never joins attempt N+1's committed transaction (paused-time-free but
+/// deterministic via FIFO gate ordering). A parked fill holds the gate; reset
+/// queues first, the stale set second; releasing lets reset bump, then the
+/// set's admission pin check fences it — case (B) of the TOCTOU, the one the
+/// pin injection makes red.
+#[test]
+fn racing_set_never_joins_next_attempt() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_race_set")?;
+        // A committed base so the gate-holding get triggers a cold fill.
+        seed_committed_v(&fx, &Value::from("A")).await?;
+        let session = fx.session(1);
+        let stale = value_state::<JsonCodec>("v")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // Park a fill holding the gate (epoch still N, so its own `ensure_live`
+        // admitted it before the bump).
+        fx.holds.get_for_cache().arm(1);
+        let get_task = tokio::spawn({
+            let stale = stale.clone();
+            async move { stale.get().await }
+        });
+        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+            .await
+            .map_err(|_| eyre!("the fill never parked on the gate"))?;
+
+        // Reset queues on the gate FIRST (behind the parked fill).
+        let reset_task = tokio::spawn({
+            let session = session.clone();
+            async move { session.reset(RepinProof::for_test()).await }
+        });
+        let_task_park().await;
+        // The stale set queues on the gate SECOND (behind reset).
+        let set_task = tokio::spawn({
+            let stale = stale.clone();
+            async move { stale.set(Value::from("B")).await }
+        });
+        let_task_park().await;
+
+        // Release the fill: reset acquires (discard+bump), then the set.
+        fx.holds.get_for_cache().release();
+        timeout(HANG_GUARD, get_task)
+            .await
+            .map_err(|_| eyre!("get hung"))??
+            .map_err(|e| eyre!("get: {e}"))?;
+        timeout(HANG_GUARD, reset_task)
+            .await
+            .map_err(|_| eyre!("reset hung"))??;
+        let set_result = timeout(HANG_GUARD, set_task)
+            .await
+            .map_err(|_| eyre!("set hung"))??;
+        match set_result {
+            Err(ref e) if is_terminated(e) => {}
+            other => bail!("the set that lost the gate to reset must be Terminated, got {other:?}"),
+        }
+
+        // N+1 settles with no trace of "B".
+        finalize_and_promote(
+            &session,
+            &fx.oracle,
+            Uuid::from_u128(1),
+            &fx.cells,
+            &fx.id("v")?,
+        )
+        .await?;
+        let verify = fx.session(2);
+        let fresh = value_state::<JsonCodec>("v")
+            .bind(&verify)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert_eq!(
+            fresh.get().await.map_err(|e| eyre!("verify: {e}"))?,
+            Some(Value::from("A")),
+            "the racing set never joined attempt N+1's transaction"
+        );
+        Ok(())
+    })
+}
+
+/// A conforming within-attempt op for pin (g)'s property.
+#[derive(Clone, Debug)]
+enum ValueOp {
+    Get,
+    Set(i64),
+    Clear,
+    Commit,
+    Rollback,
+}
+
+impl Arbitrary for ValueOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 5 {
+            0 => ValueOp::Get,
+            1 => ValueOp::Set(i64::from(u8::arbitrary(g))),
+            2 => ValueOp::Clear,
+            3 => ValueOp::Commit,
+            _ => ValueOp::Rollback,
+        }
+    }
+}
+
+/// Pin (g): a conforming handler — every op issued within its own attempt,
+/// including a scan-then-rollback-then-rescan — NEVER observes the fence. The
+/// epoch is stable within one attempt, so the pin always matches; any op that
+/// errored `Terminated` would surface here as a failed property (the `?`
+/// propagates it). The subject is called for every generated op, so this is a
+/// real property, not a tautology.
+#[test]
+fn conforming_within_attempt_never_fenced() {
+    fn property(ops: Vec<ValueOp>) -> Result<bool> {
+        runtime()?.block_on(async {
+            let fx = GateFixture::new("fence_conforming")?;
+            let session = fx.session(1);
+            let value = value_state::<JsonCodec>("v")
+                .bind(&session)
+                .map_err(|e| eyre!("bind v: {e}"))?;
+            for op in ops {
+                match op {
+                    ValueOp::Get => {
+                        value.get().await.map_err(|e| eyre!("get: {e}"))?;
+                    }
+                    ValueOp::Set(n) => {
+                        value
+                            .set(Value::from(n))
+                            .await
+                            .map_err(|e| eyre!("set: {e}"))?;
+                    }
+                    ValueOp::Clear => {
+                        value.clear().await.map_err(|e| eyre!("clear: {e}"))?;
+                    }
+                    ValueOp::Commit => {
+                        value.commit().await.map_err(|e| eyre!("commit: {e}"))?;
+                    }
+                    ValueOp::Rollback => {
+                        // Infallible; within an attempt it is Applied/NoOp,
+                        // never fenced.
+                        let _ = value.rollback().await;
+                    }
+                }
+            }
+            // scan → rollback → rescan on a map, same attempt.
+            let map = map_state::<I64KeyCodec, JsonCodec>("m")
+                .bind(&session)
+                .map_err(|e| eyre!("bind m: {e}"))?;
+            for k in 0..3_i64 {
+                map.set(k, Value::from(k))
+                    .await
+                    .map_err(|e| eyre!("map set: {e}"))?;
+            }
+            {
+                let stream = map.stream(Direction::Forward);
+                futures::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    item.map_err(|e| eyre!("scan: {e}"))?;
+                }
+            }
+            let _ = map.rollback().await;
+            {
+                let stream = map.stream(Direction::Forward);
+                futures::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    item.map_err(|e| eyre!("rescan: {e}"))?;
+                }
+            }
+            Ok(true)
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<ValueOp>) -> Result<bool>);
 }

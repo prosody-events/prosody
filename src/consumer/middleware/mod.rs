@@ -183,7 +183,11 @@ pub mod topic;
 
 // Re-export providers for backwards compatibility and convenience
 pub use providers::{CloneProvider, FallibleCloneProvider, LeafHandler};
-pub(crate) use settle::{MarkerWrite, Settlement, SettlementHandler, abandon, settle};
+pub(crate) use settle::{MarkerWrite, NextAttempt, Settlement, SettlementHandler, abandon, settle};
+// `RepinProof` is named by the public `EventContext::redispatch` signature, so
+// it must be publicly reachable — its constructor stays module-private, so the
+// re-export exposes only an unconstructable token (the `MarkerWrite` idiom).
+pub use settle::RepinProof;
 
 /// Provides fallible handlers for processing messages from specific partitions.
 ///

@@ -91,6 +91,57 @@ pub(crate) trait SettlementHandler: FallibleHandler {
 /// straight-line [`settle_committed`].
 pub struct MarkerWrite(());
 
+/// The attempt-boundary re-pin privilege. Opaque (the `MarkerWrite` idiom):
+/// its tuple field is private to this module, so `RepinProof(())` is
+/// constructible only here — the two production mint sites are the
+/// `next_attempt` verb and the `fire_apply_hook` settle stamp.
+/// A partial reset (a lone epoch bump with no matching re-pin, or a re-pin with
+/// no reset) is therefore unwritable anywhere else, and a leaked stale context
+/// clone can never re-pin itself back to life.
+///
+/// Nominally `pub` — and re-exported publicly — because
+/// [`EventContext::redispatch`](crate::consumer::event_context::EventContext::redispatch)
+/// names it in a public signature; its effective visibility stays
+/// crate-internal because no one outside this module can construct one.
+pub struct RepinProof(());
+
+impl RepinProof {
+    /// Mints a proof for in-crate typed-layer tests that drive
+    /// `reset`/`repin`/`redispatch` directly (the production mint sites are the
+    /// two above). Test-only, so the privilege stays unforgeable in shipping
+    /// code.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
+}
+
+/// The single middleware-facing attempt-boundary verb. Consumes the stale
+/// dispatch context, runs the gate-held [`reset`](crate::state::session)
+/// transition (discard the dirty overlay + bump the epoch, one gate hold), and
+/// returns the re-pinned attempt-N+1 dispatch context. This is the epoch's ONLY
+/// bump site.
+///
+/// The re-pin runs strictly after the reset, so a partial reset is
+/// unrepresentable, and the cancellation flag is deliberately NOT cleared here
+/// — outer cancellers own the sticky flag.
+pub(crate) trait NextAttempt: EventContext {
+    /// Advances this dispatch to its next attempt: reset then re-pin.
+    fn next_attempt(self) -> impl Future<Output = Self> + Send;
+}
+
+impl<C: EventContext> NextAttempt for C {
+    async fn next_attempt(self) -> Self {
+        // A stateless / invalidated context has no lifecycle to reset; the
+        // re-pin below is then a no-op rebuild. Mint site 1a (reset/bump).
+        if let Ok(session) = self.lifecycle() {
+            session.reset(RepinProof(())).await;
+        }
+        // Mint site 1b (re-pin to the just-bumped epoch).
+        self.redispatch(RepinProof(()))
+    }
+}
+
 /// Outcome of one durability step driven by [`retry_step`].
 enum StepOutcome<R> {
     /// The step succeeded, carrying its result.
@@ -201,7 +252,7 @@ pub(crate) async fn settle<T, C, G>(
         Settlement::Bypassed => {
             guard.commit().await;
             drop(permit);
-            handler.after_commit(context, result).await;
+            fire_apply_hook(handler, context, true, result).await;
         }
         Settlement::Final => match category {
             // A failed-but-final message: record its marker best-effort (no
@@ -215,7 +266,7 @@ pub(crate) async fn settle<T, C, G>(
                 }
                 guard.commit().await;
                 drop(permit);
-                handler.after_commit(context, result).await;
+                fire_apply_hook(handler, context, true, result).await;
             }
             // Transient final (no retry layer below took it): no marker —
             // the event is not handled — just commit and fire the hook.
@@ -223,7 +274,7 @@ pub(crate) async fn settle<T, C, G>(
             Some(_) => {
                 guard.commit().await;
                 drop(permit);
-                handler.after_commit(context, result).await;
+                fire_apply_hook(handler, context, true, result).await;
             }
             // Success: run the full durability sequence.
             None => {
@@ -279,7 +330,7 @@ async fn settle_committed<'a, T, C, G>(
         // Invalidated / stateless context: just commit and fire the hook.
         guard.commit().await;
         drop(permit);
-        handler.after_commit(context, result).await;
+        fire_apply_hook(handler, context, true, result).await;
         return;
     };
 
@@ -344,7 +395,7 @@ async fn settle_committed<'a, T, C, G>(
                     guard.abort().await;
                     staged.rollback().await;
                     drop(permit);
-                    handler.after_abort(context, result).await;
+                    fire_apply_hook(handler, context, false, result).await;
                     return;
                 }
             }
@@ -401,9 +452,11 @@ async fn settle_committed<'a, T, C, G>(
     }
 
     // 6. After-commit hook (telemetry, dedup forwarding, ...). The permit
-    // drops first, so the hooks' post-settle state reads proceed.
+    // drops first, so the hooks' post-settle state reads proceed. The stamp
+    // re-pins the hook view current so reads after a (possibly nested) retry
+    // succeed.
     drop(permit);
-    handler.after_commit(context, result).await;
+    fire_apply_hook(handler, context, true, result).await;
 }
 
 /// Abandons the event: abort the marker (offset → redelivery, timer →
@@ -436,7 +489,34 @@ pub(crate) async fn abandon<T, C, G>(
     };
     guard.abort().await;
     drop(permit);
-    handler.after_abort(context, result).await;
+    fire_apply_hook(handler, context, false, result).await;
+}
+
+/// The single site both apply hooks fire through. Stamps the hook's context
+/// view **current** — one bump-free re-pin (the second [`RepinProof`] mint
+/// site) — before invoking, so a final hook's reads see settled state
+/// regardless of how many attempts ran or how deeply retry was nested. Inner
+/// resets advance the shared epoch during the outer attempt, leaving the
+/// boundary-owned final context pinned at a stale epoch; threading that context
+/// through unchanged would fail every hook read `Terminated`. The stamp writes
+/// **no** epoch — settlement has closed the gate and no further attempt can
+/// begin, so re-pinning to the live epoch only re-enables the boundary's own
+/// context, never a genuinely-leaked stale clone (which keeps its old pin).
+async fn fire_apply_hook<T, C>(
+    handler: &T,
+    context: C,
+    commit: bool,
+    result: Result<T::Output, T::Error>,
+) where
+    T: FallibleHandler,
+    C: EventContext<Payload = T::Payload>,
+{
+    let stamped = context.redispatch(RepinProof(()));
+    if commit {
+        handler.after_commit(stamped, result).await;
+    } else {
+        handler.after_abort(stamped, result).await;
+    }
 }
 
 /// Arms the per-key `StateRecovery` backstop as an arm-if-sooner singleton.

@@ -3,7 +3,7 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
-use crate::consumer::middleware::MarkerWrite;
+use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
@@ -235,6 +235,17 @@ where
     }
 
     fn discard_dirty(&self) {}
+
+    fn attempt_current(&self) -> bool {
+        // Inert: every op errors `Unavailable` before the pin is consulted.
+        true
+    }
+
+    async fn reset(&self, _proof: RepinProof) {}
+
+    fn repin(&self, _proof: RepinProof) -> Self {
+        self.clone()
+    }
 
     fn recovery_floor(&self) -> CompactDuration {
         CompactDuration::MIN

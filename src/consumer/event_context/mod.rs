@@ -14,6 +14,7 @@ use crate::Key;
 use crate::codec::ErasedStateCodec;
 use crate::consumer::kafka_state::message_state;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::loader::MessageLoader;
@@ -206,6 +207,21 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     ) -> Result<DESC::Handle<Self::State>, StateAccessError>
     where
         DESC: StateDescriptor;
+
+    /// Rebuilds this context re-pinned to the session's CURRENT attempt epoch —
+    /// the crate-internal re-pin primitive wrapper contexts forward (like
+    /// [`state`](Self::state)). Gated by [`RepinProof`], so only the
+    /// `next_attempt` verb and the settle final-hook stamp (the two mint sites)
+    /// produce a live attempt-N+1 (or stamped-final) view; a leaked stale clone
+    /// can never re-pin itself.
+    ///
+    /// The leaf rebuilds into a **fresh** inner cell, so a leaked clone of the
+    /// prior context keeps its stale pin (and stays fenced). An invalidated
+    /// context (its inner already stored `None`) stays invalidated — re-pin
+    /// must never resurrect it. Wrapper contexts forward to their inner,
+    /// recursively, so the fence reaches the whole stack.
+    #[must_use]
+    fn redispatch(&self, proof: RepinProof) -> Self;
 
     /// Return a boxed, type-erased event context for the FFI seam.
     ///
@@ -431,6 +447,30 @@ where
             return Err(StateAccessError::Terminated);
         };
         registered.descriptor().bind(&inner.session)
+    }
+
+    fn redispatch(&self, proof: RepinProof) -> Self {
+        let guard = self.inner.load();
+        let Some(inner) = guard.as_ref() else {
+            // Invalidated context: nothing to re-pin, and re-pin must never
+            // resurrect it — return an equally-invalidated (stateless) clone.
+            return self.clone();
+        };
+        // A FRESH outer `Arc<ArcSwapOption<Inner>>`: leaked clones of the prior
+        // context share the OLD Arc (old session, old pin) and stay fenced,
+        // while the re-pinned session shares the SAME `SessionInner`
+        // (dirty/gate/oracle/epoch) — only its `pinned` epoch differs.
+        let repinned = Inner {
+            key: inner.key.clone(),
+            shutdown_rx: inner.shutdown_rx.clone(),
+            message_cancel_tx: inner.message_cancel_tx.clone(),
+            message_cancel_rx: inner.message_cancel_rx.clone(),
+            timers: inner.timers.clone(),
+            session: inner.session.repin(proof),
+        };
+        Self {
+            inner: Arc::new(ArcSwapOption::new(Some(Arc::new(repinned)))),
+        }
     }
 
     fn should_cancel(&self) -> bool {

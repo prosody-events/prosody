@@ -224,14 +224,39 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
         self.scope.session().gate().read().await
     }
 
-    /// Acquires the session operation gate for a mutator, erroring
-    /// [`StateAccessError::SessionClosed`] once the settle boundary closed the
-    /// session. The returned [`MutatePermit`] is the witness the view's
-    /// mutating sinks demand.
+    /// Acquires the session operation gate for a mutator, then applies the one
+    /// total admission order under the held permit before minting the witness:
+    ///
+    /// 1. **pin** — a stale attempt (this handle outlived its dispatch; the
+    ///    epoch was bumped) errors [`StateAccessError::Terminated`], so a
+    ///    dead-attempt mutation is fenced uniformly.
+    /// 2. **closed** — the settle boundary already closed the session, so an
+    ///    own-event mutation past the settle window errors
+    ///    [`StateAccessError::SessionClosed`] deterministically (pin-first
+    ///    means a *current*-pin hook mutation classifies `SessionClosed`, not
+    ///    `Terminated`, even under shutdown/cancellation).
+    /// 3. **termination** — shutdown or cancellation errors
+    ///    [`StateAccessError::Terminated`].
+    ///
+    /// The permit is held across all three checks and the bump needs the gate
+    /// exclusively, so the pin is stable between the check and the mint. The
+    /// returned [`MutatePermit`] is the witness the view's mutating sinks
+    /// demand.
     pub(in crate::state::descriptor) async fn mutate_permit(
         &self,
     ) -> Result<MutatePermit<'_>, StateAccessError> {
-        self.scope.session().gate().mutate().await
+        let session = self.scope.session();
+        let permit = session.gate().read().await;
+        if !session.attempt_current() {
+            return Err(StateAccessError::Terminated);
+        }
+        if permit.is_closed() {
+            return Err(StateAccessError::SessionClosed);
+        }
+        if session.is_terminated() {
+            return Err(StateAccessError::Terminated);
+        }
+        Ok(MutatePermit::witness(permit))
     }
 
     /// The full cell address for `key` in this view's section — the sole place
@@ -501,14 +526,22 @@ fn encode_edge<K: OrderedKeyCodec>(edge: ScanEdge<&K::Key>) -> ScanEdge<Coordina
     edge.map(K::encode)
 }
 
-/// Guards every cell operation: a session whose partition is shutting
-/// down or whose event is cancelled refuses state access with
-/// [`StateAccessError::Terminated`].
+/// Guards every cell operation: a session whose partition is shutting down,
+/// whose event is cancelled, or whose pinned attempt epoch no longer matches
+/// the live one (a handle/stream leaked past its dispatch attempt) refuses
+/// state access with [`StateAccessError::Terminated`].
+///
+/// Covers `raw_get`/`raw_set`/`raw_clear`/`clear_section`/`raw_commit` and the
+/// `scan` init. For reads and scans the pin-vs-termination order is immaterial
+/// — both map to `Terminated`. Permit-covered mutators re-run this under the
+/// held gate (harmless: the permit blocks the bump, so the pin is stable),
+/// having already sequenced the ordered admission in
+/// [`CellView::mutate_permit`].
 fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
 where
     S: CellSession,
 {
-    if session.is_terminated() {
+    if session.is_terminated() || !session.attempt_current() {
         return Err(StateAccessError::Terminated);
     }
     Ok(())

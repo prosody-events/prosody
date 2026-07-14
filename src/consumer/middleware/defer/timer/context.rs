@@ -18,6 +18,7 @@
 use crate::Key;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
+use crate::consumer::middleware::RepinProof;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -135,6 +136,16 @@ where
         DESC: StateDescriptor,
     {
         self.inner.state(registered)
+    }
+
+    fn redispatch(&self, proof: RepinProof) -> Self {
+        // Forward the re-pin to the inner context (compiler-enforced, like
+        // `state`); the store/key are cheap clones this wrapper owns.
+        Self {
+            inner: self.inner.redispatch(proof),
+            store: self.store.clone(),
+            key: self.key.clone(),
+        }
     }
 
     fn should_cancel(&self) -> bool {

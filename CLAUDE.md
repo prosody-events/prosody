@@ -413,7 +413,10 @@ it. The anchors code comments cite by name:
 
 Two residual order facts govern middleware placement:
   - `retry` stays OUTERMOST so each attempt is a fresh dispatch, isolated by
-    `discard_dirty()` between attempts.
+    the `next_attempt` verb between attempts: its `reset` transition discards
+    the failed attempt's dirty overlay and bumps the session's attempt epoch
+    under one gate hold, so a handle leaked past its attempt is fenced
+    (`Terminated`) instead of joining the next attempt's transaction.
   - The dedup filter sits INSIDE message-defer so a deferred reload's
     duplicate check sees the reload identity override. `dedup` is a stateless
     duplicate **filter** over the boundary-readable message marker; the settle

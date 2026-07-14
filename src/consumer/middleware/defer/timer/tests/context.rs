@@ -7,6 +7,7 @@ use super::*;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::event_context::TerminationSignals;
+use crate::consumer::middleware::RepinProof;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
@@ -105,6 +106,16 @@ impl EventContext for KeyedMockContext {
         DESC: StateDescriptor,
     {
         registered.descriptor().bind(&UnavailableState::new())
+    }
+
+    fn redispatch(&self, proof: RepinProof) -> Self {
+        // Forward to the inner mock (compiler-enforced, like `state`); the
+        // key/timer capture are cheap clones this wrapper owns.
+        Self {
+            inner: self.inner.redispatch(proof),
+            key: self.key.clone(),
+            active_timers: self.active_timers.clone(),
+        }
     }
 
     fn should_cancel(&self) -> bool {

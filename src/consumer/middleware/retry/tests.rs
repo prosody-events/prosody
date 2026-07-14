@@ -752,28 +752,77 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
 }
 
 // =========================================================================
-// Between-attempt dirty discard over a real keyed-state session
+// Attempt-boundary fencing over a real keyed-state session
 // =========================================================================
 //
-// The load-bearing `lifecycle.discard_dirty()` in the retry loop discards a
-// failed attempt's buffered dirty ops before the next attempt runs, so a
-// later successful attempt stages only its own writes — and the settle
-// boundary records the event's marker (read from the session's `EventRef`)
-// exactly once, for the final attempt. Every other retry test drives the
-// inert `UnavailableState` session (whose `finalize` is always `Clean`), so
-// this is the one test that exercises the attempt boundary over a **real**
-// session end to end through `settle`.
+// The retry loop's attempt boundary runs the `next_attempt` verb, whose
+// `reset` transition discards the failed attempt's buffered dirty ops (under
+// the session gate) and bumps the attempt epoch before the next attempt runs.
+// Two things follow, both pinned here over a **real** session end to end
+// through `settle` (every other retry test drives the inert `UnavailableState`
+// session, whose `finalize` is always `Clean`):
+//
+//  * a later successful attempt stages only its own writes, and the boundary
+//    records the event's marker exactly once, for the final attempt (the
+//    isolation the discard once owned, now the reset's);
+//  * the epoch fence: a hook that reads state after a (possibly nested) retry
+//    sees the settled state via the settle stamp, while the intermediate
+//    `after_abort` fired between attempts holds the EXPIRED pre-verb context
+//    and its state ops error `Terminated`.
 
-mod discard_between_attempts {
+mod attempt_boundary {
     use super::*;
-    use crate::codec::JsonCodec;
-    use crate::consumer::middleware::tests::test_support::{committed_value, recording_session};
+    use crate::codec::{JsonCodec, JsonCodecError};
+    use crate::consumer::event_context::StateAccessError;
+    use crate::consumer::middleware::tests::test_support::{
+        RecordingOracle, RecordingSession, committed_value, recording_session,
+    };
     use crate::consumer::middleware::{Settlement, SettlementHandler};
-    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
+    use crate::state::descriptor::{CellStateError, Registered, ValueDescriptor, value_state};
+    use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::{EventRef, StateKey};
+    use crate::state::{EventRef, StateKey, StoreOutcome};
+    use parking_lot::Mutex;
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// What a keyed-state read observed inside an apply hook.
+    #[derive(Debug, Clone, PartialEq)]
+    enum ReadObs {
+        /// The read succeeded, carrying the visible value.
+        Value(Option<Value>),
+        /// The read was fenced (`StateAccessError::Terminated`).
+        Terminated,
+        /// Any other error (fails the assertions that expect the two above).
+        Other(String),
+    }
+
+    /// What a mid-handler `commit()` observed inside an apply hook.
+    #[derive(Debug, Clone, PartialEq)]
+    enum CommitObs {
+        /// The commit ran, carrying its outcome.
+        Outcome(StoreOutcome),
+        /// The commit was fenced (`StateAccessError::Terminated`).
+        Terminated,
+        /// Any other error.
+        Other(String),
+    }
+
+    fn classify_read(r: Result<Option<Value>, CellStateError<JsonCodecError>>) -> ReadObs {
+        match r {
+            Ok(value) => ReadObs::Value(value),
+            Err(CellStateError::Access(StateAccessError::Terminated)) => ReadObs::Terminated,
+            Err(other) => ReadObs::Other(format!("{other}")),
+        }
+    }
+
+    fn classify_commit(r: Result<StoreOutcome, CellStateError<JsonCodecError>>) -> CommitObs {
+        match r {
+            Ok(outcome) => CommitObs::Outcome(outcome),
+            Err(CellStateError::Access(StateAccessError::Terminated)) => CommitObs::Terminated,
+            Err(other) => CommitObs::Other(format!("{other}")),
+        }
+    }
 
     /// The message's dedup id on the session `EventRef` — the one marker the
     /// boundary may record, once, for the final attempt.
@@ -857,20 +906,19 @@ mod discard_between_attempts {
     }
 
     /// Retry over a real session: attempt 1 stages `cart` then fails
-    /// Transient; the loop's `after_abort` + `lifecycle.discard_dirty()`
-    /// discards it; attempt 2 stages `wishlist` and succeeds; `settle` then
+    /// Transient; the `next_attempt` verb's `reset` discards it (and bumps the
+    /// epoch); attempt 2 stages `wishlist` and succeeds; `settle` then
     /// certifies only attempt 2's work and records the event's marker
     /// **exactly once** (a retried event yields one marker — the final
     /// attempt's). The committed state must show `wishlist` present and
     /// `cart` **absent**.
     ///
-    /// Deleting the between-attempt `discard_dirty()` fails this: attempt
-    /// 1's `cart` write would survive in the dirty overlay, `finalize` would
-    /// stage it alongside `wishlist`, and the read-back would find `cart`
-    /// committed to attempt 1's value — precisely the leak the discard
-    /// exists to prevent.
+    /// Removing the reset's discard fails this: attempt 1's `cart` write would
+    /// survive in the dirty overlay, `finalize` would stage it alongside
+    /// `wishlist`, and the read-back would find `cart` committed to attempt 1's
+    /// value — precisely the leak the reset exists to prevent.
     #[tokio::test]
-    async fn retry_discards_dirty_between_attempts_and_records_one_marker() -> Result<()> {
+    async fn retry_isolates_dirty_between_attempts_and_records_one_marker() -> Result<()> {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&cart(), CollectionDef::new(None))?;
         registry.register(&wishlist(), CollectionDef::new(None))?;
@@ -927,6 +975,293 @@ mod discard_between_attempts {
             Some(0),
             "the offset commits after the successful retry",
         );
+        Ok(())
+    }
+
+    // --- (j) hook-view arms: the settle stamp and the expired intermediate ---
+
+    /// Fails attempt 1 (`Normal`) Transient; on attempt 2 (`Failure`) stages
+    /// `wishlist = {attempt:2}` and succeeds. Its `after_commit` re-reads
+    /// `wishlist` through the (stamped) hook context and records the outcome.
+    #[derive(Clone)]
+    struct FinalHookReadHandler {
+        read: Arc<Mutex<Option<ReadObs>>>,
+    }
+
+    impl FallibleHandler for FinalHookReadHandler {
+        type Error = TestError;
+        type Output = ();
+        type Payload = Value;
+
+        async fn on_message<C>(
+            &self,
+            context: C,
+            _message: ConsumerMessage<Self::Payload>,
+            demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            match demand_type {
+                DemandType::Normal => Err(TestError(ErrorCategory::Transient)),
+                DemandType::Failure => {
+                    let handle = context
+                        .state(Registered::new(wishlist()))
+                        .map_err(|_| TestError(ErrorCategory::Terminal))?;
+                    handle
+                        .set(json!({ "attempt": 2_i32 }))
+                        .await
+                        .map_err(|_| TestError(ErrorCategory::Terminal))?;
+                    Ok(())
+                }
+            }
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            Ok(())
+        }
+
+        async fn after_commit<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            let obs = match context.state(Registered::new(wishlist())) {
+                Ok(handle) => classify_read(handle.get().await),
+                Err(e) => ReadObs::Other(format!("bind: {e}")),
+            };
+            *self.read.lock() = Some(obs);
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    impl SettlementHandler for FinalHookReadHandler {
+        fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+            Settlement::Final
+        }
+    }
+
+    /// Builds the recording-session fixture and mock context the hook-view
+    /// pins share; returns the pieces they assert on.
+    fn hook_fixture(
+        handler_registry: impl FnOnce(&mut CollectionDefRegistry) -> Result<()>,
+    ) -> Result<(
+        MockEventContext<Value, RecordingSession>,
+        MemoryCellStore<RecordingOracle>,
+        StateKey,
+    )> {
+        let mut registry = CollectionDefRegistry::default();
+        handler_registry(&mut registry)?;
+        let state_key = StateKey::new(Uuid::from_u128(0xF00), Arc::from("user-1"));
+        let (session, cell_store, _dirty, _recorded) = recording_session(
+            registry,
+            state_key.clone(),
+            EventRef::Message {
+                dedup_id: MSG_DEDUP_ID,
+            },
+        );
+        Ok((
+            MockEventContext::new().with_session(session),
+            cell_store,
+            state_key,
+        ))
+    }
+
+    /// (j-final), simple: after one retry the final `after_commit` reads
+    /// attempt 2's `wishlist` — the post-settle read contract survives a
+    /// retry. (The final context is already current here, so this arm is the
+    /// green baseline; the stamp's load-bearing case is the nested arm.)
+    #[tokio::test]
+    async fn final_hook_reads_settled_state_after_retry() -> Result<()> {
+        let read = Arc::new(Mutex::new(None));
+        let handler = FinalHookReadHandler { read: read.clone() };
+        let retry_handler = create_retry_handler(handler, 10);
+        let (context, cell_store, state_key) =
+            hook_fixture(|r| Ok(r.register(&wishlist(), CollectionDef::new(None))?))?;
+
+        let tracker = create_offset_tracker();
+        let uncommitted = create_test_message()?.into_uncommitted(tracker.take(0).await?);
+        EventHandler::on_message(&retry_handler, context, uncommitted, DemandType::Normal).await;
+
+        assert_eq!(
+            read.lock().clone(),
+            Some(ReadObs::Value(Some(json!({ "attempt": 2_i32 })))),
+            "the final after_commit reads attempt 2's committed wishlist",
+        );
+        assert_eq!(
+            committed_value(&cell_store, state_key, "wishlist").await?,
+            Some(json!({ "attempt": 2_i32 })),
+            "wishlist committed",
+        );
+        let _ = tracker.shutdown().await;
+        Ok(())
+    }
+
+    /// (j-final), nested: an inner retry bumps the epoch during the outer
+    /// attempt, leaving the outer's final context pinned stale; the settle
+    /// stamp re-pins it current so `after_commit`'s read still sees the
+    /// settled `wishlist`. Dropping the `redispatch` stamp in `fire_apply_hook`
+    /// makes this read `Terminated` (the stale pin no longer matches the
+    /// inner-bumped epoch).
+    #[tokio::test]
+    async fn final_hook_reads_settled_state_under_nested_retry() -> Result<()> {
+        let read = Arc::new(Mutex::new(None));
+        let handler = FinalHookReadHandler { read: read.clone() };
+        // Inner retry (FallibleHandler) drives the attempts and bumps the
+        // shared epoch; the outer retry (EventHandler) settles on its own
+        // attempt-1 context, now stale relative to the inner's bumps.
+        let nested = create_retry_handler(create_retry_handler(handler, 10), 10);
+        let (context, cell_store, state_key) =
+            hook_fixture(|r| Ok(r.register(&wishlist(), CollectionDef::new(None))?))?;
+
+        let tracker = create_offset_tracker();
+        let uncommitted = create_test_message()?.into_uncommitted(tracker.take(0).await?);
+        EventHandler::on_message(&nested, context, uncommitted, DemandType::Normal).await;
+
+        assert_eq!(
+            read.lock().clone(),
+            Some(ReadObs::Value(Some(json!({ "attempt": 2_i32 })))),
+            "the stamp re-pins the final hook current, so its read sees the settled wishlist \
+             despite the inner retry's epoch bump",
+        );
+        assert_eq!(
+            committed_value(&cell_store, state_key, "wishlist").await?,
+            Some(json!({ "attempt": 2_i32 })),
+            "wishlist committed",
+        );
+        let _ = tracker.shutdown().await;
+        Ok(())
+    }
+
+    /// Fails attempts until `succeed_on`, staging `cart = {attempt:n}` each
+    /// attempt; its intermediate `after_abort` (fired between attempts with the
+    /// EXPIRED pre-verb context) tries to read and `commit()` `cart`, recording
+    /// both observations.
+    #[derive(Clone)]
+    struct IntermediateHookHandler {
+        calls: Arc<AtomicUsize>,
+        succeed_on: usize,
+        reads: Arc<Mutex<Vec<ReadObs>>>,
+        commits: Arc<Mutex<Vec<CommitObs>>>,
+    }
+
+    impl FallibleHandler for IntermediateHookHandler {
+        type Error = TestError;
+        type Output = ();
+        type Payload = Value;
+
+        async fn on_message<C>(
+            &self,
+            context: C,
+            _message: ConsumerMessage<Self::Payload>,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let handle = context
+                .state(Registered::new(cart()))
+                .map_err(|_| TestError(ErrorCategory::Terminal))?;
+            handle
+                .set(json!({ "attempt": n as i32 }))
+                .await
+                .map_err(|_| TestError(ErrorCategory::Terminal))?;
+            if n >= self.succeed_on {
+                Ok(())
+            } else {
+                Err(TestError(ErrorCategory::Transient))
+            }
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            Ok(())
+        }
+
+        async fn after_abort<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            let read = match context.state(Registered::new(cart())) {
+                Ok(handle) => classify_read(handle.get().await),
+                Err(e) => ReadObs::Other(format!("bind: {e}")),
+            };
+            self.reads.lock().push(read);
+            let commit = match context.state(Registered::new(cart())) {
+                Ok(handle) => classify_commit(handle.commit().await),
+                Err(e) => CommitObs::Other(format!("bind: {e}")),
+            };
+            self.commits.lock().push(commit);
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    impl SettlementHandler for IntermediateHookHandler {
+        fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+            Settlement::Final
+        }
+    }
+
+    /// (j-intermediate): the between-attempts `after_abort` holds the EXPIRED
+    /// pre-verb context (pinned at the failed attempt, the epoch already
+    /// bumped), so both its `get()` and its `commit()` error `Terminated` and
+    /// its `commit()` has zero durable effect — a mid-loop commit of the failed
+    /// attempt's overlay is impossible. Covers the N≥3 case (attempts 1 and 2
+    /// fail, so two intermediate hooks fire). Passing the LIVE post-verb
+    /// context to the hook instead of the expired clone makes the reads
+    /// succeed (`Value`, not `Terminated`), failing this pin.
+    #[tokio::test]
+    async fn intermediate_hook_is_state_dead() -> Result<()> {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let handler = IntermediateHookHandler {
+            calls: Arc::new(AtomicUsize::new(0)),
+            succeed_on: 3,
+            reads: reads.clone(),
+            commits: commits.clone(),
+        };
+        let retry_handler = create_retry_handler(handler, 10);
+        let (context, cell_store, state_key) =
+            hook_fixture(|r| Ok(r.register(&cart(), CollectionDef::new(None))?))?;
+
+        let tracker = create_offset_tracker();
+        let uncommitted = create_test_message()?.into_uncommitted(tracker.take(0).await?);
+        EventHandler::on_message(&retry_handler, context, uncommitted, DemandType::Normal).await;
+
+        assert_eq!(
+            reads.lock().clone(),
+            vec![ReadObs::Terminated, ReadObs::Terminated],
+            "both intermediate after_abort reads are fenced (N>=3: two hooks fire)",
+        );
+        assert_eq!(
+            commits.lock().clone(),
+            vec![CommitObs::Terminated, CommitObs::Terminated],
+            "both intermediate after_abort commits are fenced",
+        );
+        assert_eq!(
+            committed_value(&cell_store, state_key, "cart").await?,
+            Some(json!({ "attempt": 3_i32 })),
+            "only the successful attempt 3's cart commits; the fenced intermediate commits added \
+             nothing durable",
+        );
+        let _ = tracker.shutdown().await;
         Ok(())
     }
 }

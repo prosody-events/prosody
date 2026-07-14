@@ -124,6 +124,7 @@ pub use crate::consumer::kafka_state::{
 pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
 pub use crate::consumer::middleware::FallibleHandler;
+pub use crate::consumer::middleware::RepinProof;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration,
