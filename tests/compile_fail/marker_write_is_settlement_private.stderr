@@ -7,7 +7,7 @@ error[E0603]: struct `MarkerWrite` is private
 note: the struct `MarkerWrite` is defined here
  --> src/consumer/middleware/mod.rs
   |
-  | pub(crate) use settle::{MarkerWrite, Settlement, SettlementHandler, abandon, settle};
+  | pub(crate) use settle::{MarkerWrite, NextAttempt, Settlement, SettlementHandler, abandon, settle};
   |                         ^^^^^^^^^^^
 help: import `MarkerWrite` directly
   |
