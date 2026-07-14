@@ -399,10 +399,8 @@ async fn settle_committed<'a, T, C, G>(
                 let _ = arm_backstop(&context, lifecycle, lifecycle.recovery_floor()).await;
                 guard.commit().await;
                 // Not a successful finalize (`finalize`'s failure paths leave
-                // the buffer whole), so discard the uncommitted overlay under
-                // the still-held permit before the hook reads — the commit-now
-                // floor of an explicit mid-handler `commit()` survives (its
-                // cells were durably applied and drained at commit time).
+                // the buffer whole); `discard_uncommitted` owns the
+                // permit-held / commit-now-floor contract.
                 discard_uncommitted(Some(lifecycle));
                 drop(permit);
                 fire_apply_hook(handler, context, true, result).await;

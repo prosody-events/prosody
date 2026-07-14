@@ -161,10 +161,9 @@ where
         // Flip termination first, then discard: a dispatch future dropped
         // mid-flight (task cancellation) runs no other teardown, so this sync
         // Drop is the sole fence for a handle the dropped future leaked into a
-        // detached task — its subsequent ops then error `Terminated`. Both are
-        // ungated and best-effort; the panic path uses the gate-held catch in
-        // `partition::process_event` for the admitted-mutator no-residue
-        // guarantee this ungated discard cannot give.
+        // detached task — its subsequent ops then error `Terminated`. The
+        // ungated-vs-panic-path residue boundary is documented once on the
+        // type (`# Residual`).
         self.0.terminate();
         self.0.discard_dirty();
     }

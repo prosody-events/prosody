@@ -15,7 +15,7 @@
 //!
 //! # The session / lifecycle split
 //!
-//! The session surface is two traits:
+//! The session surface is the handler surface plus two sealed supertraits:
 //!
 //! - [`CellSession`] — the read/buffer/mutate surface handlers reach through
 //!   collection handles: `get`/`scan` + the buffering mutators
@@ -24,10 +24,12 @@
 //!   `loader`/`is_terminated`/`verify_state_registration`.
 //!   [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
-//!   (`finalize`/marker identity — settling moved onto the receipt `finalize`
-//!   returns), a `pub(crate)` supertrait of [`CellSession`] that seals it:
-//!   downstream crates can name `CellSession` in bounds but can neither
-//!   implement it nor reach the lifecycle.
+//!   (`finalize` and the attempt/teardown verbs — settling moved onto the
+//!   receipt `finalize` returns) — and `sealed::MarkerIdentity` — the
+//!   boundary-readable message-marker identity. Both are `pub(crate)`
+//!   supertraits of [`CellSession`] that seal it: downstream crates can name
+//!   `CellSession` in bounds but can neither implement it nor reach either
+//!   surface.
 //!
 //! # Lifecycle
 //!
@@ -105,10 +107,11 @@ mod tests;
 /// success), a handle's reads fall through to the lower store: the apply
 /// hooks observe the per-cell committed projection (an own-event provisional
 /// cell reads as its committed base `prev`), not the event's pre-settle
-/// overlay. The framework reaches the manager-driven lifecycle through the
-/// sealed `StateLifecycle` supertrait, which is what seals `CellSession`:
-/// downstream crates can name it in bounds (e.g. [`EventContext::State`]) but
-/// can neither implement it nor reach the lifecycle.
+/// overlay. The framework reaches the manager-driven lifecycle and the
+/// message-marker identity through the sealed `StateLifecycle` and
+/// `MarkerIdentity` supertraits, which seal `CellSession`: downstream crates
+/// can name it in bounds (e.g. [`EventContext::State`]) but can neither
+/// implement it nor reach either surface.
 pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + 'static {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
@@ -1698,6 +1701,10 @@ impl<S: MarkerIdentity> MarkerHandle<S> {
 /// forwarded through the one public [`EventContext::state`] method exactly as
 /// [`LifecycleAccess`] is. Binding yields a [`MarkerHandle`], never the raw
 /// session, so the audience reaches only `set_reload_marker`/`message_marker`.
+///
+/// Deliberately a full sibling of `LifecycleAccess` rather than a shared
+/// generic descriptor — the two distinct bound `Handle` types are the tunnel
+/// split itself.
 ///
 /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
 #[derive(Clone, Copy, Debug)]

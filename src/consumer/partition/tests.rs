@@ -594,10 +594,10 @@ async fn test_partition_manager_timer_heartbeat_integration() {
 }
 
 /// (l) abnormal-exit fencing through [`guarded_dispatch`] — the single
-/// panic-unwind catch site `process_event` wraps every dispatch in (above
-/// `RetryHandler`'s own `EventHandler` impl). On an unwind the catch runs the
-/// gate-held terminal transition (close, discard, terminate — no epoch write)
-/// then resumes; on a dropped dispatch future the scope's `Drop` flips
+/// panic-unwind catch site, which `process_event` wraps every dispatch in
+/// (above `RetryHandler`'s own `EventHandler` impl). On an unwind the catch
+/// runs the gate-held terminal transition (close, discard, terminate — no epoch
+/// write) then resumes; on a dropped dispatch future the scope's `Drop` flips
 /// termination. Either way a handle the dispatch leaked past its attempt is
 /// fenced on the op's next effect, with zero orchestration by any caller.
 mod unwind {
@@ -617,8 +617,10 @@ mod unwind {
     use crate::timers::duration::CompactDuration;
     use bytes::Bytes;
     use color_eyre::eyre::{Result, bail, eyre};
+    use parking_lot::Mutex as SyncMutex;
     use serde_json::{Value, json};
     use tokio::sync::{oneshot, watch};
+    use tokio::time::timeout;
     use uuid::Uuid;
 
     const NAME: &str = "c";
@@ -848,6 +850,160 @@ mod unwind {
             Err(CellStateError::Access(StateAccessError::Terminated)) => Ok(()),
             other => bail!("a dropped-future leak must error Terminated, got {other:?}"),
         }
+    }
+
+    /// A handler that leaks a bound keyed-state handle into a detached task,
+    /// then panics — the same current-pin leak as
+    /// [`handler_panic_current_pin_leaks_are_fenced_and_overlay_cleared`], but
+    /// exercised through the production `process_event` wiring rather than a
+    /// direct [`guarded_dispatch`] call. The leaked task parks until the test
+    /// releases it (strictly after the catch has run), then reports its
+    /// `commit()` error tag.
+    struct PanicLeakHandler {
+        /// Fires with the in-attempt `set` outcome the instant before the
+        /// panic, so the test knows the message was dispatched (ruling out a
+        /// `Draining` drop race) and the leaked handle was admitted while the
+        /// attempt was live.
+        reached: SyncMutex<Option<oneshot::Sender<Result<(), String>>>>,
+        /// Releases the leaked task's `commit()` — the test sends this only
+        /// after `shutdown()` has joined the panicked partition task.
+        go: SyncMutex<Option<oneshot::Receiver<()>>>,
+        /// Reports the leaked `commit()`'s error tag back to the test.
+        tag: SyncMutex<Option<oneshot::Sender<String>>>,
+    }
+
+    impl EventHandler for PanicLeakHandler {
+        type Payload = Value;
+
+        #[expect(
+            clippy::panic,
+            reason = "the unwind pin drives a deliberate panic through the catch"
+        )]
+        fn on_message<C>(
+            &self,
+            context: C,
+            _message: UncommittedMessage<Value>,
+            _demand_type: DemandType,
+        ) -> impl Future<Output = ()> + Send
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            let reached = self.reached.lock().take();
+            let go = self.go.lock().take();
+            let tag_tx = self.tag.lock().take();
+            async move {
+                let (Some(reached), Some(go), Some(tag_tx)) = (reached, go, tag_tx) else {
+                    return;
+                };
+                let handle = match context.state(Registered::new(value_state::<JsonCodec>(NAME))) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        reached.send(Err(format!("bind: {e}"))).ok();
+                        return;
+                    }
+                };
+                let set_outcome = handle.set(json!("leaked")).await.map_err(|e| tag(&e));
+                // Leak the CURRENT-pin handle into a detached task that outlives
+                // the attempt; it commits only once the test releases `go`,
+                // which it does strictly after the catch has closed the gate.
+                spawn(async move {
+                    if go.await.is_err() {
+                        return;
+                    }
+                    let outcome = match handle.commit().await {
+                        Ok(_) => "Ok".to_owned(),
+                        Err(e) => tag(&e),
+                    };
+                    tag_tx.send(outcome).ok();
+                });
+                reached.send(set_outcome).ok();
+                panic!("handler boom");
+            }
+        }
+
+        async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
+        where
+            C: EventContext<Payload = Self::Payload>,
+            U: UncommittedTimer,
+        {
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    /// (l) through the PRODUCTION entry — the same current-pin leak as
+    /// [`handler_panic_current_pin_leaks_are_fenced_and_overlay_cleared`], but
+    /// driven through `process_event` (which wraps every dispatch in
+    /// [`guarded_dispatch`]) instead of calling `guarded_dispatch` directly, so
+    /// the zero-orchestration production wiring is what fences the leak. A
+    /// handler leaks a live-attempt handle into a detached task and panics;
+    /// after `shutdown()` joins the panicked partition task — which completes
+    /// only once the catch has run `close_gate` → `resume_unwind` — the leaked
+    /// `commit()` errors `SessionClosed`: current pin, closed gate, no epoch
+    /// bump.
+    ///
+    /// Falsify: revert the message-arm `guarded_dispatch(&scope,
+    /// cloned_context, …)` in `process_event` to `…await; cloned_context
+    /// .invalidate();`. With no catch, only [`EventStateScope`]'s `Drop` runs
+    /// during the unwind (terminate + discard, gate left OPEN), so the leaked
+    /// `commit()` falls through to the termination check and errors
+    /// `Terminated`, not `SessionClosed`. This is the half of pin (l) the
+    /// direct-`guarded_dispatch` unit arms above cannot reach; the
+    /// stale-pin-through-`RetryHandler` half lives in `retry::tests`.
+    #[tokio::test]
+    async fn process_event_wires_the_catch_for_a_panicking_handler() -> Result<()> {
+        init_test_logging();
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (go_tx, go_rx) = oneshot::channel();
+        let (tag_tx, tag_rx) = oneshot::channel();
+        let handler = PanicLeakHandler {
+            reached: SyncMutex::new(Some(reached_tx)),
+            go: SyncMutex::new(Some(go_rx)),
+            tag: SyncMutex::new(Some(tag_tx)),
+        };
+
+        let mut registry = CollectionDefRegistry::new(None);
+        registry
+            .register(&value_state::<JsonCodec>(NAME), CollectionDef::new(None))
+            .map_err(|e| eyre!("register: {e}"))?;
+        let mut config = default_config();
+        config.state_provider = memory_state_provider(registry);
+        let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
+
+        partition_manager
+            .try_send(create_test_message(0, "key"))
+            .map_err(|_| eyre!("message send rejected"))?;
+
+        // The handler ran and buffered a set on the live attempt and is about
+        // to panic; awaiting this before shutting down rules out any `Draining`
+        // message-drop race. The deadline is only a hang-guard.
+        let set_outcome = timeout(Duration::from_secs(5), reached_rx)
+            .await
+            .map_err(|_| eyre!("handler never reached the leak point"))?
+            .map_err(|_| eyre!("reached sender dropped"))?;
+        if let Err(t) = set_outcome {
+            bail!("in-attempt set must succeed, got {t}");
+        }
+
+        // Joins the panicked partition task: `guarded_dispatch`'s catch (close
+        // gate, discard, terminate, resume) has fully run once shutdown returns.
+        partition_manager.shutdown().await;
+
+        // Release the leaked handle's commit, now strictly after the catch.
+        if go_tx.send(()).is_err() {
+            bail!("leaked task dropped its release channel before committing");
+        }
+        let tag = timeout(Duration::from_secs(5), tag_rx)
+            .await
+            .map_err(|_| eyre!("leaked commit never reported"))?
+            .map_err(|_| eyre!("tag sender dropped"))?;
+        if tag != "SessionClosed" {
+            bail!(
+                "leaked current-pin commit through the production catch must be SessionClosed, \
+                 got {tag}"
+            );
+        }
+        Ok(())
     }
 
     // Arm D (the paused-time admitted-mutator FIFO race — a detached `set`
