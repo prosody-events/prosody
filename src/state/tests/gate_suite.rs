@@ -355,8 +355,6 @@ fn gate_serializes_set_against_clear() -> Result<()> {
 
         // Seed a valid, cold, non-TTL map: entries {0,1,2} and a three-key
         // Tracked keyset. Cold so the event's meta read lands on the armed hold.
-        let entry =
-            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
         fx.counting
             .write_resolved(
                 &cref,
@@ -367,15 +365,15 @@ fn gate_serializes_set_against_clear() -> Result<()> {
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&0)),
-                        Some(entry(0)?),
+                        Some(json_entry(0)?),
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&1)),
-                        Some(entry(1)?),
+                        Some(json_entry(1)?),
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&2)),
-                        Some(entry(2)?),
+                        Some(json_entry(2)?),
                     ),
                 ],
                 &[],
@@ -541,6 +539,11 @@ fn tracked_frame(keys: &[i64]) -> Vec<u8> {
     frame
 }
 
+/// A JSON-encoded map entry payload for the seed writes.
+fn json_entry(v: i64) -> Result<Bytes> {
+    Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?))
+}
+
 /// The set/set-nearly-full keyset pin: two racing sets on a map already at
 /// `limit - 1` keys serialize under the gate, so the second observes the
 /// first's insert and overflows — the raw keyset is the `Overflowed` sentinel
@@ -556,8 +559,6 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
 
         // Seed a two-key keyset (limit 3) beneath the cache, so event ops read
         // cold and land on the armed hold.
-        let entry =
-            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
         fx.counting
             .write_resolved(
                 &cref,
@@ -568,11 +569,11 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&1)),
-                        Some(entry(1)?),
+                        Some(json_entry(1)?),
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&2)),
-                        Some(entry(2)?),
+                        Some(json_entry(2)?),
                     ),
                 ],
                 &[],
@@ -720,8 +721,6 @@ fn map_keyset_removal_heals_oversized() -> Result<()> {
         let id = fx.id("ks")?;
         let cref = CollectionRef::new(id.clone(), None);
         let descriptor = map_state::<I64KeyCodec, JsonCodec>("ks");
-        let entry =
-            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
 
         // Seed a valid but oversized 5-key Tracked frame (limit 3) + entries.
         let mut seed = vec![(
@@ -731,7 +730,7 @@ fn map_keyset_removal_heals_oversized() -> Result<()> {
         for k in 1..=5_i64 {
             seed.push((
                 map::entry_cell_for(&I64KeyCodec::encode(&k)),
-                Some(entry(k)?),
+                Some(json_entry(k)?),
             ));
         }
         fx.counting.write_resolved(&cref, &seed, &[]).await?;
@@ -840,8 +839,6 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
         let cref = CollectionRef::new(id.clone(), None);
 
         // Seed {1: 10, 2: 20} with a two-key keyset beneath the cache (cold).
-        let entry =
-            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
         fx.counting
             .write_resolved(
                 &cref,
@@ -852,11 +849,11 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&1)),
-                        Some(entry(10)?),
+                        Some(json_entry(10)?),
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&2)),
-                        Some(entry(20)?),
+                        Some(json_entry(20)?),
                     ),
                 ],
                 &[],
@@ -1763,8 +1760,6 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
         let fx = GateFixture::new("fence_range_scan")?;
         let cref = CollectionRef::new(fx.id("ks")?, None);
         let descriptor = map_state::<I64KeyCodec, JsonCodec>("ks");
-        let entry =
-            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
 
         // An oversized 4-key Tracked frame (limit 3) degrades the stream to the
         // full-section range source; ≥ 2 entries so a second emission exists.
@@ -1775,7 +1770,7 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
         for k in 1..=4_i64 {
             seed.push((
                 map::entry_cell_for(&I64KeyCodec::encode(&k)),
-                Some(entry(k)?),
+                Some(json_entry(k)?),
             ));
         }
         fx.counting.write_resolved(&cref, &seed, &[]).await?;
@@ -1812,8 +1807,6 @@ fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {
         let fx = GateFixture::new("fence_coord_scan")?;
         let cref = CollectionRef::new(fx.id("m")?, None);
         let descriptor = map_state::<I64KeyCodec, JsonCodec>("m");
-        let entry =
-            |v: i64| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&Value::from(v))?)) };
 
         // Exactly two tracked keys: one chunk, both entries buffered together.
         fx.counting
@@ -1826,11 +1819,11 @@ fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&1)),
-                        Some(entry(10)?),
+                        Some(json_entry(10)?),
                     ),
                     (
                         map::entry_cell_for(&I64KeyCodec::encode(&2)),
-                        Some(entry(20)?),
+                        Some(json_entry(20)?),
                     ),
                 ],
                 &[],

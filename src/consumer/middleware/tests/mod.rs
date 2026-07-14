@@ -639,7 +639,7 @@ mod staged_rollback {
     }
 
     /// Records whether its `after_commit` typed-handle read answered or hit the
-    /// stale-pin fence — the A1 witness that the permanent-`Skip` arm re-stamps
+    /// stale-pin fence — witnessing that the permanent-`Skip` arm re-stamps
     /// the hook context.
     #[derive(Clone)]
     struct SkipReadProbe {

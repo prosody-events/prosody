@@ -88,6 +88,7 @@ use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
@@ -406,7 +407,7 @@ pub(crate) mod sealed {
     /// attempts the gate is Open (closure happens only at settle), so a leaked
     /// clone's `set` landing after an attempt boundary would once have joined
     /// the NEXT attempt's transaction. The attempt boundary
-    /// ([`StateLifecycle::reset`](super::StateLifecycle::reset)) bumps the
+    /// ([`StateLifecycle::reset`]) bumps the
     /// session epoch under this gate, and a detached clone keeps its stale pin,
     /// so the leak errors at the point its op takes effect — uniformly across
     /// the whole surface (`Terminated` on a crossed attempt boundary,
@@ -556,10 +557,10 @@ pub(crate) mod sealed {
     /// `Uuid` at the oracle-write signature.
     ///
     /// Two sources feed it, one accessor reads it
-    /// ([`StateLifecycle::message_marker`]): a message session's own
+    /// ([`MarkerIdentity::message_marker`]): a message session's own
     /// [`EventRef::Message`](crate::state::EventRef) dedup id, or the
     /// deferred-reload identity override
-    /// ([`StateLifecycle::set_reload_marker`]) on a timer session.
+    /// ([`MarkerIdentity::set_reload_marker`]) on a timer session.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MessageMarker(Uuid);
 
@@ -769,11 +770,11 @@ pub(crate) mod sealed {
         /// The dirty workspace is partition-lifetime (manager-owned, shared by
         /// every session clone), so it must be cleared explicitly per event.
         /// The reload identity override is deliberately **not** cleared here
-        /// (never cleared at all — see [`Self::set_reload_marker`]). On the
-        /// success path [`Self::finalize`] has already drained the buffer
-        /// (the stage consumes it), making the scope-drop clear a no-op
-        /// there; the receipt's promote/rollback read only receipt-owned
-        /// data, never dirty.
+        /// (never cleared at all — see [`MarkerIdentity::set_reload_marker`]).
+        /// On the success path [`Self::finalize`] has already drained
+        /// the buffer (the stage consumes it), making the scope-drop
+        /// clear a no-op there; the receipt's promote/rollback read
+        /// only receipt-owned data, never dirty.
         fn discard_dirty(&self);
 
         /// Flips this session terminated, synchronously and idempotently — the
@@ -932,7 +933,7 @@ where
 }
 
 /// The per-event attempt epoch. Bumped once per retry attempt boundary
-/// ([`StateLifecycle::reset`](sealed::StateLifecycle::reset)); a
+/// ([`StateLifecycle::reset`]); a
 /// handle/stream/session clone pins the epoch that was live when it was minted,
 /// and every cell op fails once its pin no longer equals the session's live
 /// epoch (`ensure_live`, mutator admission, `rollback`). This is what turns a
@@ -970,20 +971,21 @@ where
     termination: TerminationWatch,
     /// The deferred-reload identity override: the dedup id of the message
     /// the current dispatch loaded, on a timer session. Last-wins and never
-    /// cleared — see [`sealed::StateLifecycle::set_reload_marker`]. Carries
+    /// cleared — see [`sealed::MarkerIdentity::set_reload_marker`]. Carries
     /// identity only; the commit decision lives in the settle boundary's
     /// typed classification, never in this cell's occupancy.
     reload_marker: SyncMutex<Option<MessageMarker>>,
     /// Session-owned termination flag, flipped synchronously by
-    /// [`StateLifecycle::terminate`](sealed::StateLifecycle::terminate). It is
+    /// [`StateLifecycle::terminate`]. It is
     /// the teardown half of [`is_terminated`](CellSession::is_terminated): the
     /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
     /// runs on every dispatch exit — including a future dropped mid-flight
     /// (task cancellation), where no other teardown runs — so a handle leaked
-    /// past its event finds `is_terminated() == true`. Only the sender is kept;
-    /// `borrow()` reads and `send_replace(true)` sets it, both fine with zero
-    /// receivers.
-    terminated: watch::Sender<bool>,
+    /// past its event finds `is_terminated() == true`. A monotonic
+    /// `false → true` flag set through `&self`; `Relaxed` suffices because it
+    /// publishes no other state and a racing reader that observes `false`
+    /// re-polls and converges.
+    terminated: AtomicBool,
     /// The per-event session operation gate (KV4) — see [`SessionGate`].
     gate: SessionGate,
     /// The shared live attempt epoch — the truth every clone of this session
@@ -1008,7 +1010,7 @@ where
     /// This clone's pinned attempt epoch, copied verbatim by [`Clone`] and
     /// living OUTSIDE the shared `inner` so a leaked clone (or a clone of a
     /// clone) keeps its stale pin and can never re-pin itself. Only the
-    /// crate-internal [`StateLifecycle::repin`](sealed::StateLifecycle::repin)
+    /// crate-internal [`StateLifecycle::repin`]
     /// mints a clone re-pinned to the live epoch.
     pinned: AttemptEpoch,
 }
@@ -1069,7 +1071,7 @@ where
                 armed,
                 termination,
                 reload_marker: SyncMutex::new(None),
-                terminated: watch::channel(false).0,
+                terminated: AtomicBool::new(false),
                 gate: SessionGate::new(),
                 epoch: RwLock::new(AttemptEpoch::INITIAL),
             }),
@@ -1092,7 +1094,7 @@ where
 
     /// Bumps the live attempt epoch to the next value. The **only** epoch
     /// writer, with exactly one call site: inside
-    /// [`StateLifecycle::reset`](sealed::StateLifecycle::reset), under the
+    /// [`StateLifecycle::reset`], under the
     /// held gate permit. Lock ordering is always gate → epoch (the gate is an
     /// async tokio mutex, this is a `parking_lot` leaf), so there is no
     /// sync lock-order cycle; the write guard is dropped before returning and
@@ -1115,7 +1117,7 @@ where
     }
 
     fn is_terminated(&self) -> bool {
-        self.inner.termination.is_terminated() || *self.inner.terminated.borrow()
+        self.inner.termination.is_terminated() || self.inner.terminated.load(Ordering::Relaxed)
     }
 
     fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool {
@@ -1395,7 +1397,7 @@ where
     }
 
     fn terminate(&self) {
-        self.inner.terminated.send_replace(true);
+        self.inner.terminated.store(true, Ordering::Relaxed);
     }
 
     fn attempt_current(&self) -> bool {
@@ -1686,7 +1688,7 @@ impl StateDescriptor for LifecycleAccess {
 }
 
 /// The narrow marker-identity handle handed to the three
-/// [`MarkerIdentity`](sealed::MarkerIdentity) audiences (defer-reload set,
+/// [`MarkerIdentity`] audiences (defer-reload set,
 /// dedup read, settle read). Wraps a session clone but exposes **only** the
 /// two marker methods — never the raw session, so it cannot reach the
 /// settlement surface. This is the tunnel-narrowing enforcement: dedup and
@@ -1696,13 +1698,13 @@ pub(crate) struct MarkerHandle<S>(S);
 
 impl<S: MarkerIdentity> MarkerHandle<S> {
     /// Sets the deferred-reload identity override — see
-    /// [`MarkerIdentity::set_reload_marker`](sealed::MarkerIdentity::set_reload_marker).
+    /// [`MarkerIdentity::set_reload_marker`].
     pub(crate) fn set_reload_marker(&self, marker: MessageMarker) {
         self.0.set_reload_marker(marker);
     }
 
     /// The message commit-marker identity — see
-    /// [`MarkerIdentity::message_marker`](sealed::MarkerIdentity::message_marker).
+    /// [`MarkerIdentity::message_marker`].
     pub(crate) fn message_marker(&self) -> Option<MessageMarker> {
         self.0.message_marker()
     }
