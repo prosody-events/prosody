@@ -942,10 +942,9 @@ mod unwind {
     /// [`EventStateScope`]'s `Drop` runs during the unwind (terminate +
     /// discard, gate left OPEN), so the leaked `commit()` falls through to the
     /// termination check and errors `Terminated`, not `SessionClosed`. This is
-    /// the half of the
-    /// abnormal-exit fencing the direct-`guarded_dispatch` unit arms above
-    /// cannot reach; the
-    /// stale-pin-through-`RetryHandler` half lives in `retry::tests`.
+    /// the half of the abnormal-exit fencing the direct-`guarded_dispatch` unit
+    /// arms above cannot reach; the stale-pin-through-`RetryHandler` half lives
+    /// in `retry::tests`.
     #[tokio::test]
     async fn process_event_wires_the_catch_for_a_panicking_handler() -> Result<()> {
         init_test_logging();

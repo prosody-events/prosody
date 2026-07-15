@@ -784,7 +784,7 @@ async fn process_event<T, S, M, P>(
 /// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler), since
 /// retry is outermost and its own `on_message`/`on_timer` is `dispatch` here).
 ///
-/// On the normal path the Ok arm is a no-op: the event's teardown
+/// On the normal path this returns without action: the event's teardown
 /// (`invalidate`) is hoisted to the two `process_event` call sites, run after
 /// this returns. On an unwind it runs the gate-held terminal
 /// transition on the scope's own session — acquire the closed-gate permit
@@ -804,16 +804,13 @@ where
     S: CellSession,
     F: Future<Output = ()>,
 {
-    match AssertUnwindSafe(dispatch).catch_unwind().await {
-        Ok(()) => {}
-        Err(panic) => {
-            let session = scope.handle();
-            let permit = session.close_gate().await;
-            session.discard_dirty();
-            session.terminate();
-            drop(permit);
-            resume_unwind(panic);
-        }
+    if let Err(panic) = AssertUnwindSafe(dispatch).catch_unwind().await {
+        let session = scope.handle();
+        let permit = session.close_gate().await;
+        session.discard_dirty();
+        session.terminate();
+        drop(permit);
+        resume_unwind(panic);
     }
 }
 
