@@ -15,7 +15,7 @@ use thiserror::Error;
 /// Stores duration as seconds in a [`u32`], supporting 0 to [`u32::MAX`]
 /// seconds (~136 years). Enables efficient arithmetic with minimal memory
 /// footprint for timer systems.
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd, serde::Serialize)]
 pub struct CompactDuration {
     seconds: u32,
 }

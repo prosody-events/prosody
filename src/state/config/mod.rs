@@ -4,15 +4,24 @@ use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
-use crate::util::from_env_with_fallback;
+use crate::util::{
+    from_duration_env_with_fallback, from_env_with_fallback, from_option_duration_env,
+};
 use derive_builder::Builder;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 /// Environment variable for the local fjall workspace directory.
 const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
+
+/// Environment variable for the fallback TTL of unregistered state rows.
+const DEFAULT_TTL_ENV: &str = "PROSODY_KEYED_STATE_DEFAULT_TTL";
+
+/// Environment variable for the `StateRecovery` backstop delay.
+const RECOVERY_DELAY_ENV: &str = "PROSODY_KEYED_STATE_RECOVERY_DELAY";
 
 /// Default delay between staging a cell and the `StateRecovery` sweep.
 const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
@@ -61,7 +70,14 @@ pub struct KeyedStateConfiguration {
     /// Registered collections never inherit this value: their TTL is
     /// exactly the `Option` passed to [`CollectionDef::new`], where `None`
     /// is an explicit choice of indefinite retention.
-    #[builder(default)]
+    ///
+    /// Environment variable: `PROSODY_KEYED_STATE_DEFAULT_TTL`. Accepts a
+    /// duration (e.g. `7d`) at second granularity, or `none` (the default) for
+    /// indefinite retention. A duration must be at least one second: zero would
+    /// mean "never expire", which is what `none` already expresses, so it is
+    /// rejected to keep the two ways of saying "keep forever" from diverging.
+    #[builder(default = "default_ttl_from_env()?")]
+    #[validate(custom(function = "validate_default_ttl"))]
     pub default_ttl: Option<CompactDuration>,
 
     /// Delay between staging a provisional cell and the `StateRecovery`
@@ -69,7 +85,14 @@ pub struct KeyedStateConfiguration {
     /// did not. Every registered collection's TTL must strictly exceed this
     /// (checked at consumer build) so a provisional cell cannot expire before
     /// the sweep reaches it.
-    #[builder(default = "CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)")]
+    ///
+    /// Environment variable: `PROSODY_KEYED_STATE_RECOVERY_DELAY`. Accepts a
+    /// duration at second granularity and defaults to 30 seconds. Must be at
+    /// least one second: a zero delay would schedule the sweep to run
+    /// immediately, leaving no window for the fast post-commit path to resolve
+    /// the cell first.
+    #[builder(default = "recovery_delay_from_env()?")]
+    #[validate(custom(function = "validate_recovery_delay"))]
     pub recovery_delay: CompactDuration,
 
     #[builder(setter(skip), default)]
@@ -81,8 +104,9 @@ impl Default for KeyedStateConfiguration {
         Self {
             cache_dir: from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())
                 .unwrap_or_else(|_| default_cache_dir()),
-            default_ttl: None,
-            recovery_delay: CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS),
+            default_ttl: default_ttl_from_env().unwrap_or(None),
+            recovery_delay: recovery_delay_from_env()
+                .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
             registrations: Vec::new(),
         }
     }
@@ -167,9 +191,50 @@ fn default_cache_dir() -> PathBuf {
         .join(Uuid::new_v4().simple().to_string())
 }
 
+/// Reads [`RECOVERY_DELAY_ENV`] as a duration, falling back to
+/// [`DEFAULT_RECOVERY_DELAY_SECS`] seconds when unset. Sub-second values round
+/// to the nearest second per [`CompactDuration`]'s `Duration` conversion.
+fn recovery_delay_from_env() -> Result<CompactDuration, String> {
+    let fallback = Duration::from_secs(u64::from(DEFAULT_RECOVERY_DELAY_SECS));
+    let duration = from_duration_env_with_fallback(RECOVERY_DELAY_ENV, fallback)?;
+    CompactDuration::try_from(duration).map_err(|error| error.to_string())
+}
+
+/// Reads [`DEFAULT_TTL_ENV`] as a duration, yielding `None` when unset or set
+/// to `none`. Sub-second values round to the nearest second per
+/// [`CompactDuration`]'s `Duration` conversion.
+fn default_ttl_from_env() -> Result<Option<CompactDuration>, String> {
+    from_option_duration_env(DEFAULT_TTL_ENV)?
+        .map(CompactDuration::try_from)
+        .transpose()
+        .map_err(|error| error.to_string())
+}
+
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
     if cache_dir.as_os_str().is_empty() {
         return Err(ValidationError::new("cache_dir_empty"));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the validator derive invokes custom functions by reference"
+)]
+fn validate_recovery_delay(recovery_delay: &CompactDuration) -> Result<(), ValidationError> {
+    if recovery_delay.seconds() == 0 {
+        return Err(ValidationError::new("recovery_delay_zero"));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the validator derive invokes custom functions by reference"
+)]
+fn validate_default_ttl(default_ttl: &CompactDuration) -> Result<(), ValidationError> {
+    if default_ttl.seconds() == 0 {
+        return Err(ValidationError::new("default_ttl_zero"));
     }
     Ok(())
 }

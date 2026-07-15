@@ -30,6 +30,43 @@ fn empty_cache_dir_is_rejected() -> Result<()> {
     Ok(())
 }
 
+/// A zero `recovery_delay` is rejected: a zero delay would fire the sweep
+/// immediately, leaving no window for the fast post-commit path.
+#[test]
+fn zero_recovery_delay_is_rejected() -> Result<()> {
+    let config = KeyedStateConfiguration::builder()
+        .recovery_delay(CompactDuration::new(0))
+        .build()?;
+    assert!(
+        config.validate().is_err(),
+        "a zero recovery_delay must fail validation"
+    );
+    Ok(())
+}
+
+/// A zero `default_ttl` is rejected — it duplicates the `None` (keep-forever)
+/// opt-out — while `None` and any positive duration validate cleanly.
+#[test]
+fn zero_default_ttl_is_rejected_but_none_and_positive_pass() -> Result<()> {
+    let zero = KeyedStateConfiguration::builder()
+        .default_ttl(Some(CompactDuration::new(0)))
+        .build()?;
+    assert!(
+        zero.validate().is_err(),
+        "a zero default_ttl must fail validation"
+    );
+
+    let none = KeyedStateConfiguration::builder()
+        .default_ttl(None)
+        .build()?;
+    let positive = KeyedStateConfiguration::builder()
+        .default_ttl(Some(CompactDuration::new(1)))
+        .build()?;
+    assert!(none.validate().is_ok(), "indefinite retention is allowed");
+    assert!(positive.validate().is_ok(), "a positive TTL is allowed");
+    Ok(())
+}
+
 /// Indefinite retention (`None`) is always allowed — the TTL ceiling
 /// guards only oversized `Some` values, never the opt-out.
 #[test]
