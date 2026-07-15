@@ -145,12 +145,12 @@
 
 use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::cell_key::{CellKey, Scan};
+use super::cell_key::{CellKey, Scan, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
-use super::store::CellStore;
+use super::store::{CacheBatch, CellStore, CommittedBatch, CoordinateBatch};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -360,6 +360,66 @@ where
             warn_skip("populate", &error);
         }
         Ok(committed)
+    }
+
+    async fn get_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<CommittedBatch, Self::Error> {
+        // Fuse snapshot ONCE at entry. Blown: pure passthrough — no D3 (its only
+        // purpose is fjall-entry repair), no publish. Admitted: the whole verb
+        // runs admitted even if the fuse blows mid-call — no second fuse check
+        // below (the snapshot-once admission contract).
+        if self.fjall.fuse_blown() {
+            return self.lower.get_many(collection, section, batch, own).await;
+        }
+        // Probe: ONE blocking hop, exhaustive.
+        match self.fjall.get_batch(collection, section, batch).await {
+            // Every position is a hit (Present value or Absent tag), the current
+            // committed projection (KV1): serve verbatim, zero lower reads, no D3.
+            Ok(Some(hits)) => return Ok(hits),
+            // Any miss/expired (KV2): fall through and refetch the WHOLE batch.
+            Ok(None) => {}
+            // A fjall probe failure degrades this read to a durable one.
+            Err(error) => warn_skip("read batch", &error),
+        }
+        // All-hits-or-refetch: any non-hit discards every sampled value and
+        // re-reads the whole batch from durable truth AFTER the read-window guard.
+        self.delete_read_window(collection, own).await?;
+        // Anchor the co-expiry on a clock read taken BEFORE the durable read
+        // (see the module's TTL co-expiry doc): a wide batch resolution can only
+        // stamp entries EARLY, never past their durable row death.
+        let stamped_at = self.fjall.clock().now_ms();
+        // On Err: publish NOTHING (a negative/Absent entry is published only from
+        // a fully successful batch).
+        let filled: CacheBatch = self
+            .lower
+            .get_many_for_cache(collection, section, batch, own)
+            .await?;
+        // Publish every cell (present AND absent), one atomic batch, NO delete on
+        // failure (the read-fill no-delete degrade — distinct from the mutator D1
+        // delete-on-failure). Each `CellKey` is built inline — no scratch buffer.
+        let projected =
+            batch
+                .iter()
+                .zip(filled.iter())
+                .map(|(coordinate, (committed, remaining))| {
+                    (
+                        CellKey {
+                            section,
+                            coordinate: coordinate.clone(),
+                        },
+                        committed.clone(),
+                        expiry_at(stamped_at, *remaining),
+                    )
+                });
+        if let Err(error) = self.fjall.put_batch(collection, projected).await {
+            warn_skip("populate batch", &error);
+        }
+        Ok(filled.into_iter().map(|(committed, _)| committed).collect())
     }
 
     fn scan_cells<'a>(

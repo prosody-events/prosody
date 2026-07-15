@@ -47,6 +47,7 @@ use super::super::store::{CELL_BATCH, CellStore, CoordinateBatch};
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 use super::support::CountingCellStore;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
@@ -2278,6 +2279,12 @@ pub(crate) enum Poison {
     /// one named collection — the establish-then-publish pin's lower-write
     /// fault (a failed lower write must leave the cache untouched).
     WriteResolved(StateName, ErrorCategory),
+    /// Read-fill path: `get_for_cache` fails for the chosen single-byte
+    /// coordinates, each with its mapped category — so the default
+    /// `get_many_for_cache` loops it and one poisoned position fails the whole
+    /// batch after earlier positions succeeded (the read-fill error arm: a
+    /// failed lower batch publishes nothing).
+    GetForCache(BTreeMap<u8, ErrorCategory>),
 }
 
 /// A runtime-armable poison slot shared by a [`FailingCellStore`], its
@@ -2329,6 +2336,13 @@ impl<S> FailingCellStore<S> {
         Self::armed(inner, Poison::WriteProvisional(poison, category))
     }
 
+    /// Wraps `inner`, poisoning `get_for_cache` for each single-byte coordinate
+    /// in `cells` with its mapped category — the read-fill path (a batch fill
+    /// that errors on one position after earlier ones succeeded).
+    pub(crate) fn failing_get_for_cache(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
+        Self::armed(inner, Poison::GetForCache(cells))
+    }
+
     /// Wraps `inner` around a shared runtime `poison` slot — the trace
     /// runner's constructor, re-wrapping each crash-rebuilt store around one
     /// handle.
@@ -2355,7 +2369,10 @@ impl<S> FailingCellStore<S> {
             Some(Poison::Cells(targets)) => cells
                 .iter()
                 .find_map(|c| targets.get(&coord_of(c)).copied()),
-            Some(Poison::WriteProvisional(..) | Poison::WriteResolved(..)) | None => None,
+            Some(
+                Poison::WriteProvisional(..) | Poison::WriteResolved(..) | Poison::GetForCache(..),
+            )
+            | None => None,
         }
     }
 
@@ -2366,9 +2383,13 @@ impl<S> FailingCellStore<S> {
             Some(Poison::WriteProvisional(name, category)) => {
                 (*collection.id().name() == *name).then_some(*category)
             }
-            Some(Poison::Collection(..) | Poison::Cells(..) | Poison::WriteResolved(..)) | None => {
-                None
-            }
+            Some(
+                Poison::Collection(..)
+                | Poison::Cells(..)
+                | Poison::WriteResolved(..)
+                | Poison::GetForCache(..),
+            )
+            | None => None,
         }
     }
 
@@ -2379,7 +2400,28 @@ impl<S> FailingCellStore<S> {
             Some(Poison::WriteResolved(name, category)) => {
                 (*collection.id().name() == *name).then_some(*category)
             }
-            Some(Poison::Collection(..) | Poison::Cells(..) | Poison::WriteProvisional(..))
+            Some(
+                Poison::Collection(..)
+                | Poison::Cells(..)
+                | Poison::WriteProvisional(..)
+                | Poison::GetForCache(..),
+            )
+            | None => None,
+        }
+    }
+
+    /// The category to inject when `get_for_cache` reads `cell`, or `None` —
+    /// the read-fill fault the default `get_many_for_cache` loop surfaces
+    /// per coordinate.
+    fn injected_read(&self, cell: &CellKey) -> Option<ErrorCategory> {
+        match &*self.poison.lock() {
+            Some(Poison::GetForCache(targets)) => targets.get(&coord_of(cell)).copied(),
+            Some(
+                Poison::Collection(..)
+                | Poison::Cells(..)
+                | Poison::WriteProvisional(..)
+                | Poison::WriteResolved(..),
+            )
             | None => None,
         }
     }
@@ -2428,6 +2470,24 @@ where
     ) -> Result<Committed, Self::Error> {
         self.inner
             .get(collection, cell, own)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
+    async fn get_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+        own: EventRef,
+    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
+        // The default `get_many_for_cache` loops this per coordinate in
+        // first-occurrence order, so a poisoned position fails the whole batch
+        // only after earlier positions have already succeeded.
+        if let Some(category) = self.injected_read(cell) {
+            return Err(FailCellError::Poison(category));
+        }
+        self.inner
+            .get_for_cache(collection, cell, own)
             .await
             .map_err(FailCellError::Inner)
     }

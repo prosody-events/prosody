@@ -27,7 +27,7 @@ use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::resolve::sweep_provisional;
-use super::super::store::CellStore;
+use super::super::store::{CellStore, CoordinateBatch};
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
     FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle, SECTION,
@@ -41,7 +41,7 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::slice;
 use std::sync::Arc;
@@ -256,6 +256,15 @@ where
         out.push((key.coordinate.as_bytes().to_vec(), value));
     }
     Ok(out)
+}
+
+/// The single [`CoordinateBatch`] over `coords` — every test's read list is
+/// `≤ CELL_BATCH`, so `chunks` yields exactly one batch. All coordinates are
+/// addressed at [`SECTION`], matching [`cell_at`].
+fn batch_of(coords: impl IntoIterator<Item = u8>) -> Result<CoordinateBatch> {
+    CoordinateBatch::chunks(coords.into_iter().map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("a non-empty coordinate list must yield one batch"))
 }
 
 /// Warm survival within an assignment: a `Cached` rebuilt over the **same**
@@ -2790,4 +2799,502 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
         })
     }
     QuickCheck::new().quickcheck(property as fn(TtlMutTrace) -> Result<bool>);
+}
+
+// ─────────────────────────── batch reads (get_many) ────────────────────────
+
+/// A memory lower store wrapped in the batch pins' read counter.
+type CountingLower = CountingCellStore<MemoryCellStore<ScriptedOracle>>;
+
+/// Builds a `Cached` over a [`CountingLower`] on the shared fjall database,
+/// returning the cache handle, the counting handle, and the collection — the
+/// batch pins' shared arrange.
+fn counting_cached(name: &str) -> Result<(Cached<CountingLower>, CountingLower, CollectionId)> {
+    let counting = CountingCellStore::new(MemoryCellStore::new(
+        MemoryCells::new(),
+        ScriptedOracle::default(),
+        Arc::new(CollectionDefRegistry::default()),
+    ));
+    let cached = Cached::new(test_db::cache(name)?, counting.clone());
+    let id = collection(name)?;
+    Ok((cached, counting, id))
+}
+
+/// T-a all-hits: a `CELL_BATCH`-wide chunk whose every coordinate is warm
+/// serves from fjall in one blocking hop with ZERO lower reads of any kind.
+///
+/// Dropping the `Ok(Some) => return` arm (always refetch) reddens this:
+/// `batch_cache_reads()` would climb to 1.
+#[test]
+fn batch_get_all_hits_reads_nothing() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let (cached, counting, id) = counting_cached("batch-all-hits")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        // Warm 16 coordinates through the write-through path.
+        let warm: Vec<(CellKey, Option<Bytes>)> =
+            (0u8..16).map(|c| (cell_at(c), Some(bytes(c)))).collect();
+        cached.write_resolved(&cref, &warm, &[]).await?;
+
+        counting.reset();
+        let out = cached
+            .get_many(&id, SECTION, &batch_of(0u8..16)?, probe(1))
+            .await?;
+        assert_eq!(out.len(), 16, "every position answered");
+        for c in 0u8..16 {
+            assert_eq!(
+                out[c as usize],
+                Committed::new(Some(bytes(c))),
+                "warm coordinate {c} serves its value from fjall"
+            );
+        }
+        assert_eq!(counting.lower_reads(), 0, "all-hits reads no point durable");
+        assert_eq!(
+            counting.batch_reads(),
+            0,
+            "all-hits issues no lower get_many"
+        );
+        assert_eq!(
+            counting.batch_cache_reads(),
+            0,
+            "all-hits issues no lower cache-fill batch"
+        );
+        Ok(())
+    })
+}
+
+/// T-a any-miss: one cold coordinate in an otherwise-warm chunk forces EXACTLY
+/// ONE lower cache-fill batch read (never the non-TTL `get_many`), and the
+/// served values are durable truth.
+///
+/// Routing the miss arm to `lower.get_many` (dropping the fill's TTL) reddens
+/// this: `batch_reads()==1, batch_cache_reads()==0`.
+#[test]
+fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let (cached, counting, id) = counting_cached("batch-any-miss")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        // Warm coordinates 0..15; leave 15 cold (and durably absent).
+        let warm: Vec<(CellKey, Option<Bytes>)> =
+            (0u8..15).map(|c| (cell_at(c), Some(bytes(c)))).collect();
+        cached.write_resolved(&cref, &warm, &[]).await?;
+
+        counting.reset();
+        let out = cached
+            .get_many(&id, SECTION, &batch_of(0u8..16)?, probe(1))
+            .await?;
+        assert_eq!(out.len(), 16, "every position answered");
+        for c in 0u8..15 {
+            assert_eq!(
+                out[c as usize],
+                Committed::new(Some(bytes(c))),
+                "coordinate {c} serves durable truth"
+            );
+        }
+        assert_eq!(
+            out[15],
+            Committed::new(None),
+            "the cold coordinate is absent"
+        );
+        assert_eq!(
+            counting.batch_cache_reads(),
+            1,
+            "any-miss refetches the whole batch via one cache-fill read"
+        );
+        assert_eq!(
+            counting.batch_reads(),
+            0,
+            "the miss arm never uses lower get_many"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "the fill loops the inner store, not this get"
+        );
+        Ok(())
+    })
+}
+
+/// T-d admitted posture: a batch admitted at entry (fuse intact) completes
+/// against fjall even when the fuse BLOWS mid-verb. A cold coordinate under a
+/// standing foreign clears marker reaches D3; with every must-succeed delete
+/// forced to fail, the D3 delete exhausts its budget and blows the fuse — yet
+/// the fill still publishes (neither `get_many_for_cache` nor `put_batch` is
+/// fuse-gated once admitted).
+///
+/// A second mid-verb `fuse_blown()` guard before the publish reddens this: the
+/// fill would be skipped and `stored_expiry` would be `None`.
+#[test]
+fn batch_get_admitted_completes_against_fjall_after_fuse_blow() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let fjall = test_db::cache("batch-admitted")?;
+        let cached = Cached::new(fjall.clone(), counting.clone());
+        let id = collection("batch-admitted")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // Stand a FOREIGN committed clears-only marker over the section (empty
+        // survivors) so a fall-through read triggers the D3 delete.
+        let foreign = probe(7);
+        let clear = SectionClear::frozen_resolved(SECTION, &[]);
+        let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear));
+        cached.write_provisional(&cref, &[], Some(&marker)).await?;
+        oracle.record_message(Uuid::from_u128(7)).await?;
+
+        // Every must-succeed delete now fails: the D3 delete exhausts its budget
+        // and blows the fuse mid-verb.
+        fjall.fail_deletes().store(u64::MAX, Ordering::Relaxed);
+        counting.reset();
+        let _ = cached
+            .get_many(&id, SECTION, &batch_of([0])?, probe(99))
+            .await?;
+
+        // The injection fired: the fuse is blown.
+        assert!(
+            fjall.fuse_blown(),
+            "the exhausted D3 delete must have blown the fuse mid-verb"
+        );
+        // Yet the admitted verb still published the fill to fjall.
+        assert!(
+            fjall.stored_expiry(&id, &cell_at(0)).await?.is_some(),
+            "an admitted batch completes its publish despite the mid-verb blow"
+        );
+        Ok(())
+    })
+}
+
+/// T-e all-hits-or-refetch rationale: on a mixed `(Hit, Miss)` batch the
+/// sampled hit is DISCARDED and never served — the refetch re-reads durable
+/// truth after the D3 guard. A standing foreign clears marker makes the sampled
+/// hit's durable truth ABSENT, so a mixed-merge that served the sampled
+/// `Some(V)` would be observably wrong.
+///
+/// Serving the probe's sampled hit for A on a mixed batch reddens this: A would
+/// come back `Some(V)` instead of the post-clear `None`.
+#[test]
+fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(test_db::cache("batch-discard")?, counting.clone());
+        let id = collection("batch-discard")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // (1) A = V, warm + durable.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(42)))], &[])
+            .await?;
+        // (2)+(3) A standing FOREIGN committed clears-only marker over the
+        // section (A is not a survivor), leaving A warm but its durable truth
+        // resolving to absent.
+        let foreign = probe(7);
+        let clear = SectionClear::frozen_resolved(SECTION, &[]);
+        let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear));
+        cached.write_provisional(&cref, &[], Some(&marker)).await?;
+        oracle.record_message(Uuid::from_u128(7)).await?;
+
+        // Batch [A (Hit), B (Miss)]: the miss forces a refetch that discards the
+        // sampled A=Some(42) and re-reads post-clear truth — A is absent.
+        let out = cached
+            .get_many(&id, SECTION, &batch_of([0, 1])?, probe(99))
+            .await?;
+        assert_eq!(out.len(), 2, "every position answered");
+        assert_eq!(
+            out[0].get(),
+            None,
+            "the sampled hit is discarded; A serves post-clear absence, never the stale Some(V)"
+        );
+        assert_eq!(out[1].get(), None, "B is absent");
+        Ok(())
+    })
+}
+
+/// T-f hidden-live-entry / no-delete degrade: a probe error over a live warm
+/// entry forces a refetch, and a FAILED fill publish must delete NOTHING — the
+/// hidden live entry stays warm (equal to what the refetch resolved). A
+/// SINGLETON batch makes the injected read error the sole refetch trigger.
+///
+/// Making the failed publish delete the batch cells reddens this: A goes cold
+/// and the healed point get pays one lower read instead of zero.
+#[test]
+fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let fjall = test_db::cache("batch-hidden")?;
+        let cached = Cached::new(fjall.clone(), counting.clone());
+        let id = collection("batch-hidden")?;
+        let cref = CollectionRef::new(id.clone(), None);
+
+        // A = V, warm + durable.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(9)))], &[])
+            .await?;
+        counting.reset();
+        // Probe errors (over the live A entry) AND the publish fails.
+        fjall.fail_reads().store(true, Ordering::Relaxed);
+        fjall.fail_puts().store(true, Ordering::Relaxed);
+        let out = cached
+            .get_many(&id, SECTION, &batch_of([0])?, probe(1))
+            .await?;
+        assert_eq!(out.len(), 1, "the single position answered");
+        assert_eq!(
+            out[0].get(),
+            Some(&bytes(9)),
+            "the refetch resolved the durable value"
+        );
+        assert_eq!(
+            counting.batch_cache_reads(),
+            1,
+            "the probe error fired: a refetch happened (an unfired fault would be an all-hit)"
+        );
+
+        // Heal both faults. The hidden live entry (V) survived untouched, so the
+        // next point get is a warm hit with zero lower reads.
+        fjall.fail_reads().store(false, Ordering::Relaxed);
+        fjall.fail_puts().store(false, Ordering::Relaxed);
+        counting.reset();
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            Some(&bytes(9)),
+            "the failed publish deleted nothing: A stayed warm"
+        );
+        assert_eq!(counting.lower_reads(), 0, "A was warm — no fall-through");
+        Ok(())
+    })
+}
+
+/// T-g expired-probe refetch: `get_batch` must classify a floor-expired entry
+/// as not-a-hit so the batch refetches durable truth, never serving the stale
+/// value. Pins `get_batch`'s own classification (distinct from
+/// `expired_entry_reads_as_miss`, which pins the point `FjallCellCache::get`).
+///
+/// Classifying Expired as a hit reddens this: the batch would serve the stale
+/// V1 instead of the fresh durable V2.
+#[test]
+fn batch_get_treats_expired_probe_as_refetch() -> Result<()> {
+    const T0: u64 = 1_000;
+    const NOW_EXPIRED: u64 = 7_000;
+
+    TEST_RUNTIME.block_on(async {
+        let now = Arc::new(AtomicU64::new(T0));
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(
+            test_db::cache_with_clock("batch-expired", Clock::Fixed(now.clone()))?,
+            counting.clone(),
+        );
+        let id = collection("batch-expired")?;
+        // A 5-second TTL: the fjall entry is stamped floor(T0)+5s = 6_000.
+        let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(5)));
+
+        // Warm A = V1 through the cache; it now holds a stamped fjall entry.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
+            .await?;
+        // Advance past the floor expiry and rewrite durable A = V2 WITHOUT the
+        // cache, so fjall holds the stale (expired) V1 while durable holds V2.
+        now.store(NOW_EXPIRED, Ordering::Relaxed);
+        counting
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
+            .await?;
+
+        let out = cached
+            .get_many(&id, SECTION, &batch_of([0])?, probe(2))
+            .await?;
+        assert_eq!(
+            out[0].get(),
+            Some(&bytes(2)),
+            "the expired probe refetches durable truth (V2), never the stale V1"
+        );
+        Ok(())
+    })
+}
+
+/// T-h negative caching: an Absent entry is published only from a fully
+/// successful batch. The positive arm proves absence IS cached (one durable
+/// read for two reads); the erroring arm proves a batch that errors mid-fill
+/// publishes NOTHING (A, read successfully before B errored, is not cached).
+///
+/// Filtering absent positions out of the publish reddens the positive arm (the
+/// second read misses). A mixed-merge that publishes per-position as results
+/// arrive would red the erroring arm (A cached before B errored).
+#[test]
+fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        // ---- Positive arm: absence is cached from a successful batch. -------
+        let (cached, counting, id) = counting_cached("batch-neg-ok")?;
+        counting.reset();
+        let out = cached
+            .get_many(&id, SECTION, &batch_of([0])?, probe(1))
+            .await?;
+        assert_eq!(out[0].get(), None, "the never-written cell is absent");
+        assert_eq!(
+            counting.batch_cache_reads(),
+            1,
+            "the first batch paid one cache-fill read"
+        );
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            None,
+            "the second read serves the cached Absent tag"
+        );
+        assert_eq!(
+            counting.lower_reads(),
+            0,
+            "absence was cached: the point get reads nothing"
+        );
+
+        // ---- Erroring arm: a mid-fill error publishes nothing. --------------
+        let counting_b = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            ScriptedOracle::default(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let failing = FailingCellStore::failing_get_for_cache(
+            counting_b.clone(),
+            BTreeMap::from([(1u8, ErrorCategory::Transient)]),
+        );
+        let cached_b = Cached::new(test_db::cache("batch-neg-err")?, failing.clone());
+        let id_b = collection("batch-neg-err")?;
+
+        // A (coord 0) is absent; B (coord 1) is poisoned. The default fill loops
+        // get_for_cache, reads A, then errors on B — so put_batch never runs.
+        let err = cached_b
+            .get_many(&id_b, SECTION, &batch_of([0, 1])?, probe(3))
+            .await;
+        assert!(
+            err.is_err(),
+            "a poisoned fill position fails the whole batch"
+        );
+
+        // Disarm and reset: if A had been cached by the errored batch its point
+        // get would read nothing; it was NOT, so it refetches once.
+        failing.set_poison(None);
+        counting_b.reset();
+        assert_eq!(
+            cached_b.get(&id_b, &cell_at(0), probe(4)).await?.get(),
+            None,
+            "A resolves absent on the healed read"
+        );
+        assert_eq!(
+            counting_b.lower_reads(),
+            1,
+            "the errored batch cached nothing: A is refetched once"
+        );
+        Ok(())
+    })
+}
+
+/// T-c co-anchor property: for any within-second start offset and any delay ≥
+/// 1s on the lower response, the expiry a batch fill stamps equals `floor(T0) +
+/// remaining(T0)` and never overhangs the durable row death — even though the
+/// clock advances while the fill's response is parked. The stamp is anchored
+/// BEFORE the lower read, so a slow resolution can only stamp early.
+///
+/// Moving the anchor to AFTER `get_many_for_cache` reddens this: for a delay
+/// crossing a second, `floor(T0 + delay) + remaining > death`.
+#[test]
+fn prop_batch_fill_expiry_never_overhangs() {
+    #[derive(Clone, Copy, Debug)]
+    struct Timing {
+        t0_offset: u16,
+        delay_ms: u16,
+    }
+
+    impl Arbitrary for Timing {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                t0_offset: u16::arbitrary(g),
+                // ≥ one full second so the delay can cross a floor boundary.
+                delay_ms: 1_000 + (u16::arbitrary(g) % 11_000),
+            }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            let base = *self;
+            Box::new(
+                self.t0_offset
+                    .shrink()
+                    .map(move |t0_offset| Timing { t0_offset, ..base }),
+            )
+        }
+    }
+
+    fn property(timing: Timing) -> Result<bool> {
+        TEST_RUNTIME.block_on(async move {
+            const START: u64 = 1_000;
+            // A far, second-aligned death so `remaining` is always positive.
+            const DEATH: u64 = 10_000_000;
+            let t0 = START + u64::from(timing.t0_offset);
+            let delay = u64::from(timing.delay_ms);
+            let now = Arc::new(AtomicU64::new(t0));
+            let clock = Clock::Fixed(now.clone());
+            let lower = HoldingCellStore::new(TtlAwareCellStore::new(
+                CountingCellStore::new(MemoryCellStore::new(
+                    MemoryCells::new(),
+                    ScriptedOracle::default(),
+                    Arc::new(CollectionDefRegistry::default()),
+                )),
+                clock.clone(),
+                DEATH,
+            ));
+            let holds = lower.holds();
+            let cached = Cached::new(
+                test_db::cache_with_clock("batch-anchor", clock)?,
+                lower.clone(),
+            );
+            let id = collection("batch-anchor")?;
+            let cref = CollectionRef::new(id.clone(), None);
+
+            // A present, durable, and COLD (written through the lower store, so
+            // the cache probes a miss and refetches).
+            lower
+                .write_resolved(&cref, &[(cell_at(7), Some(bytes(7)))], &[])
+                .await?;
+
+            // Spawn a singleton batch fill; park its lower response.
+            holds.get_for_cache().arm(1);
+            let task = tokio::spawn({
+                let cached = cached.clone();
+                let id = id.clone();
+                async move {
+                    let batch = batch_of([7])?;
+                    cached
+                        .get_many(&id, SECTION, &batch, probe(1))
+                        .await
+                        .map_err(|error| eyre!("{error:?}"))
+                }
+            });
+            holds.get_for_cache().entered().await;
+            // Advance the clock while the fill's response is parked, then resume.
+            now.store(t0 + delay, Ordering::Relaxed);
+            holds.get_for_cache().release();
+            task.await??;
+
+            // The remaining computed at T0, floored to Cassandra's second grain.
+            let remaining_ms = ((DEATH - t0) / 1_000) * 1_000;
+            let want = (t0 - t0 % 1_000) + remaining_ms;
+            let got = cached.stored_expiry(&id, &cell_at(7)).await?;
+            Ok(got == Some(want) && got.is_some_and(|e| e != 0 && e <= DEATH))
+        })
+    }
+
+    QuickCheck::new().quickcheck(property as fn(Timing) -> Result<bool>);
 }

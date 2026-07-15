@@ -15,7 +15,7 @@ use crate::state::oracle::CommitOracle;
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
-use crate::state::store::CellStore;
+use crate::state::store::{CacheBatch, CellStore, CommittedBatch, CoordinateBatch};
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
     StoreOutcome,
@@ -283,6 +283,8 @@ struct OpCounts {
     abort_provisional: AtomicUsize,
     standing_marker: AtomicUsize,
     get: AtomicUsize,
+    get_many: AtomicUsize,
+    get_many_for_cache: AtomicUsize,
     scan_cells: AtomicUsize,
     provisional_cells: AtomicUsize,
     provisional_cell_at: AtomicUsize,
@@ -321,6 +323,18 @@ impl<S> CountingCellStore<S> {
         self.counts.get.load(Ordering::Relaxed)
     }
 
+    /// `get_many` batch reads issued to the lower store — zero on an all-hit
+    /// `Cached::get_many` chunk.
+    pub(crate) fn batch_reads(&self) -> usize {
+        self.counts.get_many.load(Ordering::Relaxed)
+    }
+
+    /// `get_many_for_cache` (cache-fill) batch reads issued to the lower store
+    /// — exactly one per `Cached::get_many` miss arm.
+    pub(crate) fn batch_cache_reads(&self) -> usize {
+        self.counts.get_many_for_cache.load(Ordering::Relaxed)
+    }
+
     /// Range scans issued to the lower store — exactly one per `Cached`
     /// scan (KV3: scans bypass the cache), so budget pins can assert a path
     /// issued no scans at all.
@@ -349,6 +363,8 @@ impl<S> CountingCellStore<S> {
         self.counts.abort_provisional.store(0, Ordering::Relaxed);
         self.counts.standing_marker.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
+        self.counts.get_many.store(0, Ordering::Relaxed);
+        self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
@@ -369,6 +385,34 @@ where
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
         self.counts.get.fetch_add(1, Ordering::Relaxed);
         self.inner.get(collection, cell, own)
+    }
+
+    fn get_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
+        // One increment per batch read *request*; delegating to the inner store
+        // keeps its own per-coordinate `get` reads off this wrapper's `get`
+        // counter, so a miss arm shows `batch_cache_reads()==1, lower_reads()==0`.
+        self.counts.get_many.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_many(collection, section, batch, own)
+    }
+
+    fn get_many_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
+        self.counts
+            .get_many_for_cache
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .get_many_for_cache(collection, section, batch, own)
     }
 
     fn scan_cells<'a>(

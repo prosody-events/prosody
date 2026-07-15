@@ -58,6 +58,7 @@ use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Section};
+use crate::state::store::{CELL_BATCH, CommittedBatch, CoordinateBatch};
 use ahash::RandomState;
 use bytes::Bytes;
 use educe::Educe;
@@ -187,6 +188,19 @@ pub struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_deletes: Arc<AtomicU64>,
+    /// Test-only fault seam: when set, [`get_batch`](Self::get_batch)'s
+    /// blocking probe returns an engine error for the whole hop, so a test
+    /// can force the batch probe to error over a live entry (the read-fill
+    /// no-delete degrade).
+    #[cfg(test)]
+    #[educe(Debug(ignore))]
+    fail_reads: Arc<AtomicBool>,
+    /// Test-only: counts blocking hops [`get_batch`](Self::get_batch) launches.
+    /// Bumped INSIDE its `spawn_blocking` closure (the seam, not the method
+    /// boundary), so an accidental per-key probe loop would count `>1`.
+    #[cfg(test)]
+    #[educe(Debug(ignore))]
+    blocking_probes: Arc<AtomicU64>,
 }
 
 /// Backing for a [`FjallCellCache`]: either a bare cache handle plus its
@@ -310,6 +324,10 @@ impl FjallCellCache {
             fail_index_record: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_deletes: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_reads: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            blocking_probes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -374,6 +392,23 @@ impl FjallCellCache {
     #[must_use]
     pub fn fail_deletes(&self) -> Arc<AtomicU64> {
         self.fail_deletes.clone()
+    }
+
+    /// Test handle on the [`get_batch`](Self::get_batch) fault seam: the shared
+    /// flag a test sets to force the batch probe's whole blocking hop to error
+    /// (then unsets to heal).
+    #[cfg(test)]
+    #[must_use]
+    pub fn fail_reads(&self) -> Arc<AtomicBool> {
+        self.fail_reads.clone()
+    }
+
+    /// Test-only: blocking hops [`get_batch`](Self::get_batch) has launched —
+    /// exactly one per batch probe, however many keys it carries.
+    #[cfg(test)]
+    #[must_use]
+    pub fn probe_hops(&self) -> u64 {
+        self.blocking_probes.load(Ordering::Relaxed)
     }
 
     /// Consumes one charge of the delete-side fault seam, returning the
@@ -450,6 +485,80 @@ impl FjallCellCache {
         })
     }
 
+    /// Batch twin of [`get`](Self::get): probes every coordinate of one
+    /// `(collection, section)` batch in a SINGLE [`spawn_blocking`] hop — never
+    /// one per cell, so a warm chunk costs one blocking-pool round-trip, not
+    /// one per position.
+    ///
+    /// `Ok(Some(values))` iff EVERY position is an unexpired hit (a `Present`
+    /// value or an authoritative `Absent` tag), index-aligned to `batch`.
+    /// `Ok(None)` if any position is a miss (no entry) or floor-expired — the
+    /// caller then refetches the whole batch from durable truth. `Err` on a
+    /// join failure, a per-key engine error, or a decode failure — the caller
+    /// degrades that read to a durable one, exactly as the point path does on a
+    /// fjall read error.
+    ///
+    /// The closure reads all keys before returning (no short-circuit at the
+    /// first miss) so the whole batch costs one hop; classification then
+    /// samples the clock ONCE and may short-circuit `Ok(None)` at the first
+    /// non-hit.
+    pub(crate) async fn get_batch(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
+        // Encode every key up front (bounded, sized once): the steady state
+        // stays inline and the owned keys move into the blocking closure.
+        let keys: SmallVec<[SmallVec<[u8; 32]>; CELL_BATCH]> = batch
+            .iter()
+            .map(|coordinate| {
+                codec::cell_key(
+                    collection,
+                    &CellKey {
+                        section,
+                        coordinate: coordinate.clone(),
+                    },
+                )
+            })
+            .collect();
+        let handle = self.inner.handle().clone();
+        #[cfg(test)]
+        let (fail_reads, probes) = (self.fail_reads.clone(), self.blocking_probes.clone());
+        // ONE blocking hop reads every key exhaustively; a per-key engine error
+        // (or the injected fault) fails the whole hop, mirroring how `read_cell`
+        // surfaces one via `??`.
+        let raws = spawn_blocking(
+            move || -> Result<SmallVec<[Option<Slice>; CELL_BATCH]>, FjallCellCacheError> {
+                #[cfg(test)]
+                probes.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if fail_reads.load(Ordering::Relaxed) {
+                    return Err(FjallCellCacheError::Injected);
+                }
+                let mut out: SmallVec<[Option<Slice>; CELL_BATCH]> = SmallVec::new();
+                for key in &keys {
+                    out.push(handle.get(key.as_slice())?);
+                }
+                Ok(out)
+            },
+        )
+        .await??;
+        // One clock sample classifies every position; decode failures propagate.
+        let now = self.clock.now_ms();
+        let mut hits: CommittedBatch = SmallVec::new();
+        for raw in raws {
+            let (expiry, read) = codec::decode_cell(raw.as_deref())?;
+            match read {
+                Read::Unknown => return Ok(None),
+                _ if expired(expiry, now) => return Ok(None),
+                Read::Present(payload) => hits.push(Committed::new(Some(payload))),
+                Read::Absent => hits.push(Committed::new(None)),
+            }
+        }
+        Ok(Some(hits))
+    }
+
     /// The absolute expiry (millis; `0` = never) stamped on the cell's current
     /// fjall entry, or `None` when no entry exists. Unlike `get`,
     /// it does **not** treat a passed stamp as a miss: the caller is about to
@@ -520,9 +629,16 @@ impl FjallCellCache {
     /// cache update is never torn (mirroring the same-partition `UNLOGGED
     /// BATCH` the Cassandra side uses). This collapses the per-cell settle
     /// writes from N blocking thread-hops to one. The single-cell write-through
-    /// paths keep [`put`](Self::put). On a batch commit failure, the caller
-    /// deletes every written cell's entry (D1 — see
-    /// [`Cached`](crate::state::cached::Cached)'s module doc).
+    /// paths keep [`put`](Self::put).
+    ///
+    /// On a commit failure the caller's posture depends on the write's
+    /// provenance: a settle write-through (via
+    /// [`publish_written`](crate::state::cached::Cached)) deletes the written
+    /// cells' entries (D1 — the durable value moved, so a stale entry would
+    /// serve the pre-write value verbatim), while a read-fill (via
+    /// [`get_many`](crate::state::cached::Cached)) degrades with NO delete — a
+    /// miss/expired/error prior state left nothing stale, and a live entry
+    /// hidden by a read error equals what the next read resolves.
     pub(crate) async fn put_batch(
         &self,
         collection: &CollectionId,
@@ -536,7 +652,7 @@ impl FjallCellCache {
         // caller's iterator) so the blocking closure only touches fjall; the
         // owned key/frame pairs move into it. Building `framed` directly from the
         // projected iterator avoids an intermediate collect on the settle path.
-        let framed: Vec<(SmallVec<[u8; 32]>, Bytes)> = cells
+        let framed: SmallVec<[(SmallVec<[u8; 32]>, Bytes); CELL_BATCH]> = cells
             .into_iter()
             .map(|(cell, value, expiry)| {
                 (

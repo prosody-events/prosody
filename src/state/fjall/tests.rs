@@ -10,10 +10,11 @@
 
 use super::codec::cell_key;
 use super::test_db;
-use super::{CacheRead, FjallCellCache, FjallClient, FjallClientError};
+use super::{CacheRead, Clock, FjallCellCache, FjallClient, FjallClientError};
 use crate::Topic;
 use crate::state::cell::Committed;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::store::{CELL_BATCH, CoordinateBatch};
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::tests::support::fresh_collection;
 use crate::test_util::TEST_RUNTIME;
@@ -22,6 +23,24 @@ use color_eyre::eyre::{Report, Result, eyre};
 use fjall::{Database, KeyspaceCreateOptions};
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The section-0 cell at coordinate byte `b`.
+fn batch_cell(b: u8) -> CellKey {
+    CellKey {
+        section: Section::new(0),
+        coordinate: Coordinate::from_bytes(vec![b]),
+    }
+}
+
+/// The single [`CoordinateBatch`] over `coords` (each ≤ `CELL_BATCH` in these
+/// tests, so `chunks` yields exactly one batch).
+fn batch_of(coords: impl IntoIterator<Item = u8>) -> Result<CoordinateBatch> {
+    CoordinateBatch::chunks(coords.into_iter().map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("a non-empty coordinate list must yield one batch"))
+}
 
 /// Read-path uniqueness invariant over the fjall cache: a present cell read
 /// back from the decode path is uniquely owned, across random non-empty
@@ -132,6 +151,115 @@ fn expired_entry_reads_as_miss() -> Result<()> {
         assert!(
             matches!(cache.get(&c, &cell).await?, CacheRead::Hit(_)),
             "a never-expiry entry must always hit"
+        );
+        Ok::<_, Report>(())
+    })?;
+    Ok(())
+}
+
+/// Single-hop probe: a full `CELL_BATCH`-wide `get_batch` over 16 warm cells
+/// launches EXACTLY ONE blocking closure and returns every value present.
+///
+/// The `probe_hops` counter is bumped INSIDE `get_batch`'s `spawn_blocking`
+/// closure (the seam, not the method boundary), so a rewrite that loops
+/// `read_cell` per key runs 16 closures and reddens `probe_hops() == 1` — a
+/// method-boundary counter would false-pass that per-key loop.
+#[test]
+fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
+    let cache = test_db::cache("get_batch_hop")?;
+    let c = fresh_collection("one-hop")?;
+    let present = Committed::new(Some(Bytes::from_static(b"v")));
+
+    TEST_RUNTIME.block_on(async {
+        for b in 0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX) {
+            cache.put(&c, &batch_cell(b), &present, 0).await?;
+        }
+        let batch = batch_of(0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX))?;
+        let hits = cache
+            .get_batch(&c, Section::new(0), &batch)
+            .await?
+            .ok_or_else(|| eyre!("every warm position must hit"))?;
+        assert_eq!(hits.len(), CELL_BATCH, "every position answered");
+        assert!(
+            hits.iter()
+                .all(|h| h.get() == Some(&Bytes::from_static(b"v"))),
+            "every warm position serves its present value"
+        );
+        assert_eq!(
+            cache.probe_hops(),
+            1,
+            "the whole batch cost exactly one blocking hop"
+        );
+        Ok::<_, Report>(())
+    })?;
+    Ok(())
+}
+
+/// `get_batch` classification: an all-hit batch is `Ok(Some)`; a missing
+/// coordinate or a floor-expired entry is `Ok(None)` (refetch); an injected
+/// read fault or a corrupt frame is `Err` (degrade). Fixed clock, no sleep.
+///
+/// Classifying `Read::Unknown` as a hit reddens the miss case; dropping the
+/// `expired` guard reddens the expiry case — a stale serve either way.
+#[test]
+fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
+    let now = Arc::new(AtomicU64::new(1_000));
+    let cache = test_db::cache_with_clock("get_batch_classify", Clock::Fixed(now.clone()))?;
+    let c = fresh_collection("classify")?;
+    let present = Committed::new(Some(Bytes::from_static(b"v")));
+
+    TEST_RUNTIME.block_on(async {
+        // (1) Two present coordinates: an all-hit batch.
+        cache.put(&c, &batch_cell(0), &present, 0).await?;
+        cache.put(&c, &batch_cell(1), &present, 0).await?;
+        assert!(
+            matches!(
+                cache.get_batch(&c, Section::new(0), &batch_of([0, 1])?).await?,
+                Some(hits) if hits.len() == 2
+            ),
+            "an all-present batch classifies as Some"
+        );
+
+        // (2) A coordinate that was never put: the batch misses.
+        assert!(
+            cache
+                .get_batch(&c, Section::new(0), &batch_of([0, 2])?)
+                .await?
+                .is_none(),
+            "an unwritten coordinate makes the batch a miss"
+        );
+
+        // (3) A floor-expired entry (stamped at 500, clock at 1_000): refetch.
+        cache.put(&c, &batch_cell(3), &present, 500).await?;
+        assert!(
+            cache
+                .get_batch(&c, Section::new(0), &batch_of([0, 3])?)
+                .await?
+                .is_none(),
+            "a floor-expired entry makes the batch a miss, never a stale hit"
+        );
+
+        // (4) The injected read fault errors the whole hop.
+        cache.fail_reads().store(true, Ordering::Relaxed);
+        assert!(
+            cache
+                .get_batch(&c, Section::new(0), &batch_of([0, 1])?)
+                .await
+                .is_err(),
+            "an engine read fault degrades the batch to Err"
+        );
+        cache.fail_reads().store(false, Ordering::Relaxed);
+
+        // (5) A corrupt frame at a position fails the decode.
+        cache
+            .seed_raw_cell(&c, &batch_cell(4), Bytes::from_static(b"\x05corrupt"))
+            .await?;
+        assert!(
+            cache
+                .get_batch(&c, Section::new(0), &batch_of([0, 4])?)
+                .await
+                .is_err(),
+            "a corrupt frame degrades the batch to Err"
         );
         Ok::<_, Report>(())
     })?;
