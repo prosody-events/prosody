@@ -490,8 +490,8 @@ async fn rollback_on_a_terminated_session_is_noop() -> Result<()> {
     let stale = scope1.handle();
 
     // Event 1 completes: its context is invalidated (cancel latched, exactly
-    // what `EventContext::invalidate` does after every dispatch) and its scope
-    // drops, clearing event 1's dirty range.
+    // what `PartitionEventContext::invalidate` does after every dispatch) and its
+    // scope drops, clearing event 1's dirty range.
     cancel_tx.send(true)?;
     assert!(stale.is_terminated());
     drop(scope1);

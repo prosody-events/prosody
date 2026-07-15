@@ -173,10 +173,6 @@ impl EventContext for KeyedMockContext {
         self.inner.clear_scheduled(timer_type)
     }
 
-    fn invalidate(self) {
-        self.inner.invalidate();
-    }
-
     fn scheduled(
         &self,
         timer_type: TimerType,

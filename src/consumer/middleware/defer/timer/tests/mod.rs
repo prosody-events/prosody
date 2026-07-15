@@ -186,10 +186,6 @@ impl EventContext for MockContext {
         // No-op for testing
     }
 
-    fn invalidate(self) {
-        // No-op for testing
-    }
-
     fn scheduled(
         &self,
         _timer_type: TimerType,

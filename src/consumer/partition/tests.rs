@@ -705,16 +705,12 @@ mod unwind {
 
     /// Runs `dispatch` through the production catch on a spawned task and
     /// returns `Ok(())` once the resumed panic is observed at the join.
-    async fn expect_unwind<F>(
-        scope: EventStateScope<TestSession>,
-        cloned: Ctx,
-        dispatch: F,
-    ) -> Result<()>
+    async fn expect_unwind<F>(scope: EventStateScope<TestSession>, dispatch: F) -> Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let joined = spawn(async move {
-            guarded_dispatch(&scope, cloned, dispatch).await;
+            guarded_dispatch(&scope, dispatch).await;
         })
         .await;
         match joined {
@@ -755,8 +751,7 @@ mod unwind {
         let leaked = handle(&context)?;
         leaked.set(json!("leaked")).await?;
 
-        let cloned = context.clone();
-        expect_unwind(scope, cloned, async move {
+        expect_unwind(scope, async move {
             let _hold = context;
             panic!("handler boom");
         })
@@ -797,8 +792,7 @@ mod unwind {
         // Leak a handle at attempt 1 BEFORE the bump.
         let leaked = handle(&context)?;
 
-        let cloned = context.clone();
-        expect_unwind(scope, cloned, async move {
+        expect_unwind(scope, async move {
             // Advance the attempt boundary via the real verb — exactly what
             // retry runs between attempts — then panic mid-loop.
             let context = context.next_attempt().await;
@@ -833,8 +827,7 @@ mod unwind {
         // task drops the future, running the scope's Drop.
         let task = spawn(async move {
             let scope = EventStateScope::new(session);
-            let cloned = context.clone();
-            guarded_dispatch(&scope, cloned, async move {
+            guarded_dispatch(&scope, async move {
                 parked_tx.send(()).ok();
                 let _ = never_rx.await;
             })
@@ -943,12 +936,13 @@ mod unwind {
     /// `commit()` errors `SessionClosed`: current pin, closed gate, no epoch
     /// bump.
     ///
-    /// Falsify: revert the message-arm `guarded_dispatch(&scope,
-    /// cloned_context, …)` in `process_event` to `…await; cloned_context
-    /// .invalidate();`. With no catch, only [`EventStateScope`]'s `Drop` runs
-    /// during the unwind (terminate + discard, gate left OPEN), so the leaked
-    /// `commit()` falls through to the termination check and errors
-    /// `Terminated`, not `SessionClosed`. This is the half of the
+    /// Falsify: in `process_event`'s message arm, replace
+    /// `guarded_dispatch(&scope, …).await` with `….await` (keeping the trailing
+    /// `cloned_context.invalidate();`). With no catch, only
+    /// [`EventStateScope`]'s `Drop` runs during the unwind (terminate +
+    /// discard, gate left OPEN), so the leaked `commit()` falls through to the
+    /// termination check and errors `Terminated`, not `SessionClosed`. This is
+    /// the half of the
     /// abnormal-exit fencing the direct-`guarded_dispatch` unit arms above
     /// cannot reach; the
     /// stale-pin-through-`RetryHandler` half lives in `retry::tests`.

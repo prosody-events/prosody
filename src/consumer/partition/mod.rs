@@ -13,7 +13,7 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
-use crate::consumer::event_context::{EventContext, PartitionEventContext};
+use crate::consumer::event_context::PartitionEventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::partition::keyed::KeyManager;
@@ -707,12 +707,12 @@ async fn process_event<T, S, M, P>(
             let receive_span = message.span();
             guarded_dispatch(
                 &scope,
-                cloned_context,
                 handler
                     .on_message(context, message, DemandType::Normal)
                     .instrument(receive_span),
             )
             .await;
+            cloned_context.invalidate();
         }
         UncommittedEvent::Timer(timer) => {
             if let Some(firing) = timer.fire().await {
@@ -767,12 +767,12 @@ async fn process_event<T, S, M, P>(
                 let dispatch_span = firing.trigger().span();
                 guarded_dispatch(
                     &scope,
-                    cloned_context,
                     handler
                         .on_timer(context, firing, DemandType::Normal)
                         .instrument(dispatch_span),
                 )
                 .await;
+                cloned_context.invalidate();
             }
         }
     }
@@ -784,8 +784,9 @@ async fn process_event<T, S, M, P>(
 /// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler), since
 /// retry is outermost and its own `on_message`/`on_timer` is `dispatch` here).
 ///
-/// On the normal path it tears the event down (`invalidate`), exactly as the
-/// two arms did before. On an unwind it runs the gate-held terminal
+/// On the normal path the Ok arm is a no-op: the event's teardown
+/// (`invalidate`) is hoisted to the two `process_event` call sites, run after
+/// this returns. On an unwind it runs the gate-held terminal
 /// transition on the scope's own session — acquire the closed-gate permit
 /// (which FIFO-serializes *after* any already-admitted mutator, so a detached
 /// op in flight lands fully before the discard), discard the uncommitted
@@ -798,14 +799,13 @@ async fn process_event<T, S, M, P>(
 /// `process_event` legitimately owns the scope, so reaching the sealed
 /// lifecycle through [`EventStateScope::handle`] here is not the tunnel the
 /// settlement/marker split restricts — no `context` accessor is used.
-async fn guarded_dispatch<S, C, F>(scope: &EventStateScope<S>, cloned: C, dispatch: F)
+async fn guarded_dispatch<S, F>(scope: &EventStateScope<S>, dispatch: F)
 where
     S: CellSession,
-    C: EventContext,
     F: Future<Output = ()>,
 {
     match AssertUnwindSafe(dispatch).catch_unwind().await {
-        Ok(()) => cloned.invalidate(),
+        Ok(()) => {}
         Err(panic) => {
             let session = scope.handle();
             let permit = session.close_gate().await;

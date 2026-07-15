@@ -316,10 +316,6 @@ where
         }
     }
 
-    fn invalidate(self) {
-        self.inner.invalidate();
-    }
-
     fn scheduled(
         &self,
         timer_type: TimerType,

@@ -437,10 +437,6 @@ where
         future::ready(Ok(()))
     }
 
-    fn invalidate(self) {
-        self.cancel();
-    }
-
     fn scheduled(
         &self,
         timer_type: TimerType,

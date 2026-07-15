@@ -155,17 +155,6 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Invalidate this context to prevent further usage after message
-    /// processing.
-    ///
-    /// Contexts can be cloned during processing, but must be invalidated after
-    /// message completion to prevent race conditions in key-based processing
-    /// and data corruption when partition ownership changes. This ensures all
-    /// associated resources (such as tracing spans) are properly cleaned up
-    /// and the context cannot be used from language bindings where the Rust
-    /// compiler cannot enforce lifecycle constraints.
-    fn invalidate(self);
-
     /// List all scheduled execution times for timers on this key of the
     /// specified type.
     ///
@@ -433,6 +422,36 @@ where
         }
         result
     }
+
+    /// Framework-owned end-of-event teardown of **this** context cell.
+    ///
+    /// Latches cancellation, then stores `None` into this cell's inner slot:
+    /// every clone that shares this inner cell flips stateless (bind refuses
+    /// with `Terminated`, timer ops with `InvalidContext`), and the cell's
+    /// strong ref to `Inner` drops so its resources (tracing spans, watch
+    /// channels, session handle) free once the last clone drops.
+    ///
+    /// It is **not** event-wide. [`redispatch`](EventContext::redispatch) mints
+    /// a fresh inner cell per attempt, so this only tears down the partition's
+    /// original cell; attempt-N cells (and the contexts a final apply hook
+    /// mints) stay live until their own last clone drops. The cancellation
+    /// *signal* is shared event-wide but resettable via
+    /// [`uncancel`](EventContext::uncancel), so it is not an enduring fence.
+    /// Cross-attempt / post-event fencing for keyed-state ops is owned by the
+    /// session (epoch pin, gate, termination), not by this method.
+    ///
+    /// Crate-internal: the partition loop is the sole caller, once per event
+    /// after dispatch returns. Keeping it off the public [`EventContext`] trait
+    /// makes the mid-dispatch lost-write misuse (a handler invalidating its own
+    /// context, then returning `Ok` so settle commits the offset without
+    /// draining the dirty overlay) uncompilable for user code.
+    pub(in crate::consumer) fn invalidate(self)
+    where
+        S: CellSession<Loader: MessageLoader>,
+    {
+        self.cancel();
+        self.inner.store(None);
+    }
 }
 
 impl<T, S> EventContext for PartitionEventContext<T, S>
@@ -608,18 +627,6 @@ where
             inner.timers.unschedule_all(&inner.key, timer_type).await
         })
         .await
-    }
-
-    fn invalidate(self) {
-        // Signal cancellation to notify processors waiting on futures from `on_cancel`
-        // to abort ongoing operations.
-        self.cancel();
-
-        // Clear the inner state to prevent any further operations on this context.
-        // This ensures resource cleanup (spans, channels) and prevents usage after
-        // message processing completes, which could cause race conditions or
-        // corruption if partition ownership has transferred.
-        self.inner.store(None);
     }
 
     fn scheduled(

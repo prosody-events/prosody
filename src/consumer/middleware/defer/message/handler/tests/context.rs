@@ -300,10 +300,6 @@ impl EventContext for KeyedCapturingContext {
         // No-op for tests
     }
 
-    fn invalidate(self) {
-        // No-op for tests
-    }
-
     fn scheduled(
         &self,
         _timer_type: TimerType,

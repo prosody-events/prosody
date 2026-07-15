@@ -17,7 +17,6 @@ use prosody::{
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
-use tokio::task::yield_now;
 use tracing::info;
 
 mod common;
@@ -118,13 +117,17 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
 
     info!("Received cloned context, handler should have completed and invalidated context");
 
-    // Yield to allow any cleanup/invalidation to complete
-    yield_now().await;
+    // Join the partition task before probing: `env.shutdown()` drives the
+    // consumer down and joins its task, so the hoisted `invalidate()` at the
+    // end of the message arm has provably run. This also satisfies the rdkafka
+    // teardown rule (shut down before propagating any failure); no early `?`
+    // sits between the message send and here.
+    env.shutdown().await;
 
     // Now try to use the cloned context - this should fail with InvalidContext
     let future_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
 
-    let outcome = match cloned_context
+    match cloned_context
         .schedule(future_time, TimerType::Application)
         .await
     {
@@ -142,13 +145,5 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
                 Err(eyre!("Expected InvalidContext error, got: {error}"))
             }
         }
-    };
-
-    // Shut down before propagating any failure - a live consumer's rdkafka
-    // threads hang the process if the topic and group are never torn down.
-    env.shutdown().await;
-    outcome?;
-
-    info!("Test completed successfully");
-    Ok(())
+    }
 }
