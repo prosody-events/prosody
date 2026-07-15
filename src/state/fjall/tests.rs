@@ -14,9 +14,9 @@ use super::{CacheRead, Clock, FjallCellCache, FjallClient, FjallClientError};
 use crate::Topic;
 use crate::state::cell::Committed;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::store::{CELL_BATCH, CoordinateBatch};
-use crate::state::tests::cell_suite::value_cell;
-use crate::state::tests::support::fresh_collection;
+use crate::state::store::CELL_BATCH;
+use crate::state::tests::cell_suite::{bytes, value_cell};
+use crate::state::tests::support::{batch_of, fresh_collection};
 use crate::test_util::TEST_RUNTIME;
 use bytes::Bytes;
 use color_eyre::eyre::{Report, Result, eyre};
@@ -32,14 +32,6 @@ fn batch_cell(b: u8) -> CellKey {
         section: Section::new(0),
         coordinate: Coordinate::from_bytes(vec![b]),
     }
-}
-
-/// The single [`CoordinateBatch`] over `coords` (each ≤ `CELL_BATCH` in these
-/// tests, so `chunks` yields exactly one batch).
-fn batch_of(coords: impl IntoIterator<Item = u8>) -> Result<CoordinateBatch> {
-    CoordinateBatch::chunks(coords.into_iter().map(|b| Coordinate::from_bytes(vec![b])))
-        .next()
-        .ok_or_else(|| eyre!("a non-empty coordinate list must yield one batch"))
 }
 
 /// Read-path uniqueness invariant over the fjall cache: a present cell read
@@ -120,11 +112,6 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
 /// with a deterministic [`Clock::Fixed`], no sleep.
 #[test]
 fn expired_entry_reads_as_miss() -> Result<()> {
-    use super::Clock;
-    use color_eyre::eyre::Report;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     let now = Arc::new(AtomicU64::new(1_000));
     let cache = test_db::cache_with_clock("ttl_value", Clock::Fixed(now.clone()))?;
     let c = fresh_collection("ttl")?;
@@ -168,11 +155,15 @@ fn expired_entry_reads_as_miss() -> Result<()> {
 fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
     let cache = test_db::cache("get_batch_hop")?;
     let c = fresh_collection("one-hop")?;
-    let present = Committed::new(Some(Bytes::from_static(b"v")));
 
     TEST_RUNTIME.block_on(async {
+        // Each coordinate holds a DISTINCT payload (its own byte), so a
+        // scattered/reversed result reddens the index-aligned asserts below —
+        // identical payloads would false-pass a reorder bug.
         for b in 0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX) {
-            cache.put(&c, &batch_cell(b), &present, 0).await?;
+            cache
+                .put(&c, &batch_cell(b), &Committed::new(Some(bytes(b))), 0)
+                .await?;
         }
         let batch = batch_of(0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX))?;
         let hits = cache
@@ -180,11 +171,14 @@ fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
             .await?
             .ok_or_else(|| eyre!("every warm position must hit"))?;
         assert_eq!(hits.len(), CELL_BATCH, "every position answered");
-        assert!(
-            hits.iter()
-                .all(|h| h.get() == Some(&Bytes::from_static(b"v"))),
-            "every warm position serves its present value"
-        );
+        for (i, hit) in hits.iter().enumerate() {
+            let want = bytes(u8::try_from(i).unwrap_or(u8::MAX));
+            assert_eq!(
+                hit.get(),
+                Some(&want),
+                "position {i} serves its own coordinate's value, index-aligned"
+            );
+        }
         assert_eq!(
             cache.probe_hops(),
             1,
@@ -209,16 +203,21 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
     let present = Committed::new(Some(Bytes::from_static(b"v")));
 
     TEST_RUNTIME.block_on(async {
-        // (1) Two present coordinates: an all-hit batch.
-        cache.put(&c, &batch_cell(0), &present, 0).await?;
-        cache.put(&c, &batch_cell(1), &present, 0).await?;
-        assert!(
-            matches!(
-                cache.get_batch(&c, Section::new(0), &batch_of([0, 1])?).await?,
-                Some(hits) if hits.len() == 2
-            ),
-            "an all-present batch classifies as Some"
-        );
+        // (1) Two present coordinates with DISTINCT payloads: an all-hit batch,
+        // each position index-aligned to its own coordinate's value.
+        cache
+            .put(&c, &batch_cell(0), &Committed::new(Some(bytes(0))), 0)
+            .await?;
+        cache
+            .put(&c, &batch_cell(1), &Committed::new(Some(bytes(1))), 0)
+            .await?;
+        let hits = cache
+            .get_batch(&c, Section::new(0), &batch_of([0, 1])?)
+            .await?
+            .ok_or_else(|| eyre!("an all-present batch classifies as Some"))?;
+        assert_eq!(hits.len(), 2, "both positions answered");
+        assert_eq!(hits[0].get(), Some(&bytes(0)), "position 0 serves coord 0");
+        assert_eq!(hits[1].get(), Some(&bytes(1)), "position 1 serves coord 1");
 
         // (2) A coordinate that was never put: the batch misses.
         assert!(

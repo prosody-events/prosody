@@ -477,12 +477,7 @@ impl FjallCellCache {
         cell: &CellKey,
     ) -> Result<CacheRead, FjallCellCacheError> {
         let (expiry, read) = self.read_decoded(collection, cell).await?;
-        Ok(match read {
-            Read::Unknown => CacheRead::Miss,
-            _ if expired(expiry, self.clock.now_ms()) => CacheRead::Expired,
-            Read::Present(payload) => CacheRead::Hit(Committed::new(Some(payload))),
-            Read::Absent => CacheRead::Hit(Committed::new(None)),
-        })
+        Ok(classify(expiry, read, self.clock.now_ms()))
     }
 
     /// Batch twin of [`get`](Self::get): probes every coordinate of one
@@ -549,11 +544,9 @@ impl FjallCellCache {
         let mut hits: CommittedBatch = SmallVec::new();
         for raw in raws {
             let (expiry, read) = codec::decode_cell(raw.as_deref())?;
-            match read {
-                Read::Unknown => return Ok(None),
-                _ if expired(expiry, now) => return Ok(None),
-                Read::Present(payload) => hits.push(Committed::new(Some(payload))),
-                Read::Absent => hits.push(Committed::new(None)),
+            match classify(expiry, read, now) {
+                CacheRead::Hit(committed) => hits.push(committed),
+                CacheRead::Miss | CacheRead::Expired => return Ok(None),
             }
         }
         Ok(Some(hits))
@@ -1133,6 +1126,24 @@ async fn write_index_empty(
 /// Whether an absolute `expiry` (millis; `0` = never) has passed at `now`.
 fn expired(expiry: u64, now: u64) -> bool {
     expiry != codec::NEVER_EXPIRES && now >= expiry
+}
+
+/// Classifies a decoded cell frame `(expiry, read)` sampled at `now` into a
+/// [`CacheRead`]: a [`Miss`](CacheRead::Miss) when no entry exists, an
+/// [`Expired`](CacheRead::Expired) when the stamped expiry has passed, else a
+/// [`Hit`](CacheRead::Hit) on the present value or authoritative absent tag.
+///
+/// The single classifier shared by the point [`get`](FjallCellCache::get) and
+/// the batch [`get_batch`](FjallCellCache::get_batch) probe, so the stale-serve
+/// rules (a `Read::Unknown` is a miss; a passed expiry is never a hit) cannot
+/// drift between the two paths.
+fn classify(expiry: u64, read: Read<Bytes>, now: u64) -> CacheRead {
+    match read {
+        Read::Unknown => CacheRead::Miss,
+        _ if expired(expiry, now) => CacheRead::Expired,
+        Read::Present(payload) => CacheRead::Hit(Committed::new(Some(payload))),
+        Read::Absent => CacheRead::Hit(Committed::new(None)),
+    }
 }
 
 /// Reads the absolute stage expiry stamped on the cell at `key` back from the

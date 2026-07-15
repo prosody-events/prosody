@@ -27,13 +27,15 @@ use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::resolve::sweep_provisional;
-use super::super::store::{CellStore, CoordinateBatch};
+use super::super::store::CellStore;
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
     FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle, SECTION,
     ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
 };
-use super::support::{CountingCellStore, HoldingCellStore, fresh_collection as collection, probe};
+use super::support::{
+    CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
+};
 use crate::error::ErrorCategory;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
@@ -256,15 +258,6 @@ where
         out.push((key.coordinate.as_bytes().to_vec(), value));
     }
     Ok(out)
-}
-
-/// The single [`CoordinateBatch`] over `coords` — every test's read list is
-/// `≤ CELL_BATCH`, so `chunks` yields exactly one batch. All coordinates are
-/// addressed at [`SECTION`], matching [`cell_at`].
-fn batch_of(coords: impl IntoIterator<Item = u8>) -> Result<CoordinateBatch> {
-    CoordinateBatch::chunks(coords.into_iter().map(|b| Coordinate::from_bytes(vec![b])))
-        .next()
-        .ok_or_else(|| eyre!("a non-empty coordinate list must yield one batch"))
 }
 
 /// Warm survival within an assignment: a `Cached` rebuilt over the **same**
@@ -2949,7 +2942,7 @@ fn batch_get_admitted_completes_against_fjall_after_fuse_blow() -> Result<()> {
         // and blows the fuse mid-verb.
         fjall.fail_deletes().store(u64::MAX, Ordering::Relaxed);
         counting.reset();
-        let _ = cached
+        cached
             .get_many(&id, SECTION, &batch_of([0])?, probe(99))
             .await?;
 
@@ -3123,6 +3116,117 @@ fn batch_get_treats_expired_probe_as_refetch() -> Result<()> {
             Some(&bytes(2)),
             "the expired probe refetches durable truth (V2), never the stale V1"
         );
+        Ok(())
+    })
+}
+
+/// Expiry-boundary degrade pin: a warm entry that expires WHILE a degraded
+/// batch's delayed lower read is in flight, whose fill publish then FAILS
+/// (no-delete degrade), must never be served on a later read — the surviving
+/// stale entry re-classifies as expired and refetches durable truth again.
+///
+/// Parameterized over both refetch triggers the plan names:
+/// * a sampled Hit discarded because a second COLD position misses the probe;
+/// * an error-probe over the live entry (an injected fjall read fault).
+///
+/// The failed publish leaves the (now-expired) warm V1 on disk. Classifying
+/// Expired as a hit, or a degrade path that re-stamps the surviving entry with
+/// a fresh live expiry, would serve the stale V1 on the healed point read →
+/// red. (Distinct from `batch_get_treats_expired_probe_as_refetch`, which
+/// advances the clock BEFORE the call with a succeeding publish; here the entry
+/// crosses its floor expiry DURING a parked read and the publish fails.)
+#[test]
+fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
+    /// One case: `coords` is the batch (target is coord 0); `error_probe` arms
+    /// a fjall read fault so the whole probe errors instead of a cold miss.
+    async fn degrade_case(name: &str, coords: &[u8], error_probe: bool) -> Result<()> {
+        const T0: u64 = 1_000;
+        const AFTER_EXPIRY: u64 = 7_000; // past floor(T0)+5s = 6_000
+        const TTL_SECS: u32 = 5;
+
+        let now = Arc::new(AtomicU64::new(T0));
+        let clock = Clock::Fixed(now.clone());
+        let lower = HoldingCellStore::new(CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            ScriptedOracle::default(),
+            Arc::new(CollectionDefRegistry::default()),
+        )));
+        let holds = lower.holds();
+        let fjall = test_db::cache_with_clock(name, clock)?;
+        let cached = Cached::new(fjall.clone(), lower.clone());
+        let id = collection(name)?;
+        let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(TTL_SECS)));
+
+        // Warm the target (coord 0) = V1 through the cache: fjall now holds a
+        // live entry stamped floor(T0)+5s = 6_000; durable is also V1.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
+            .await?;
+        // Rewrite durable truth to V2 through the lower store ONLY, so a refetch
+        // resolves V2 while fjall still holds the stale warm V1.
+        lower
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
+            .await?;
+
+        // The fill's publish fails (no-delete degrade); optionally the probe
+        // errors instead of taking a cold-miss refetch.
+        fjall.fail_puts().store(true, Ordering::Relaxed);
+        if error_probe {
+            fjall.fail_reads().store(true, Ordering::Relaxed);
+        }
+
+        // Park the refetch's fill after the target's durable read lands, advance
+        // the clock past the entry's floor expiry while parked, then resume: the
+        // warm entry expires DURING the delayed lower read.
+        holds.get_for_cache().arm(1);
+        let batch = batch_of(coords.iter().copied())?;
+        let task = tokio::spawn({
+            let cached = cached.clone();
+            let id = id.clone();
+            async move {
+                cached
+                    .get_many(&id, SECTION, &batch, probe(99))
+                    .await
+                    .map_err(|error| eyre!("{error:?}"))
+            }
+        });
+        holds.get_for_cache().entered().await;
+        now.store(AFTER_EXPIRY, Ordering::Relaxed);
+        holds.get_for_cache().release();
+        let out = task.await??;
+        assert_eq!(
+            out[0].get(),
+            Some(&bytes(2)),
+            "the degraded refetch serves durable V2, never the stale warm V1"
+        );
+
+        // Heal the faults, then assert BEFORE any further write that the failed
+        // publish neither deleted nor re-stamped the surviving entry: it is
+        // still V1's original floor stamp (6_000), independent of its payload.
+        // A degrade that re-stamped it live, or deleted it, reddens here.
+        fjall.fail_puts().store(false, Ordering::Relaxed);
+        fjall.fail_reads().store(false, Ordering::Relaxed);
+        assert_eq!(
+            fjall.stored_expiry(&id, &cell_at(0)).await?,
+            Some(6_000),
+            "the failed publish left the stale entry's original stamp untouched"
+        );
+
+        // The surviving (now-expired) V1 entry must NOT be served: the point
+        // read re-classifies it Expired and refetches V2.
+        assert_eq!(
+            cached.get(&id, &cell_at(0), probe(100)).await?.get(),
+            Some(&bytes(2)),
+            "the surviving expired entry is never served; the point read refetches V2"
+        );
+        Ok(())
+    }
+
+    TEST_RUNTIME.block_on(async {
+        // (i) sampled Hit at coord 0 discarded because cold coord 1 misses.
+        degrade_case("batch-degrade-hit", &[0, 1], false).await?;
+        // (ii) an injected read fault errors the probe over the live entry.
+        degrade_case("batch-degrade-err", &[0], true).await?;
         Ok(())
     })
 }

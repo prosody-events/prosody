@@ -133,8 +133,11 @@
 //!   the cell's entry — the promote does not re-stamp the durable TTL, so
 //!   `data` keeps the death set at stage time; a fresh `now + ttl` would
 //!   overhang it by the whole stage→commit gap.
-//! * A fill reads the cell's *remaining* TTL from the lower store
-//!   (`CellStore::get_for_cache`) and stamps `floor(now) + remaining`.
+//! * A fill reads the cell's *remaining* TTL from the lower store and stamps
+//!   `floor(now) + remaining`: the point fill (`CellStore::get_for_cache`)
+//!   reads the clock AFTER the lower read, while the batch fill
+//!   (`CellStore::get_many_for_cache`) anchors its clock read BEFORE the
+//!   durable read, so a wide resolution can only stamp entries early.
 //!
 //! The cache read path stays a hint: a fjall read error is logged and degrades
 //! that read to a durable one, and a failed fill publish degrades with **no**

@@ -23,7 +23,7 @@ use crate::state::{
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, bail, eyre};
 use futures::stream::{self, Stream};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
@@ -924,6 +924,15 @@ pub(crate) fn arb_coordinate(g: &mut Gen) -> Coordinate {
         .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
         .collect();
     Coordinate::from_bytes(bytes)
+}
+
+/// The single [`CoordinateBatch`] over `coords`. Every batch test's read list
+/// is `≤ CELL_BATCH`, so `chunks` yields exactly one batch; each coordinate is
+/// one byte at [`Section`]-0 (matching `cell_at`/`batch_cell`).
+pub(crate) fn batch_of(coords: impl IntoIterator<Item = u8>) -> Result<CoordinateBatch> {
+    CoordinateBatch::chunks(coords.into_iter().map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("a non-empty coordinate list must yield one batch"))
 }
 
 /// A message event with the deterministic dedup id `Uuid::from_u128(n)`.
