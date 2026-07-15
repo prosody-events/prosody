@@ -1,6 +1,6 @@
 //! Write-through fjall K/V cache over the durable lower store.
 //!
-//! [`Cached`] fronts a lower [`CellStore`] (the durable
+//! [`Cached`] fronts a lower `CellStore` (the durable
 //! [`CassandraStore`](crate::state::cassandra::CassandraStore)) with a
 //! [`FjallCellCache`] of committed cell projections. The performance contract
 //! fits one sentence: **point reads are cached, scans are durable.** As the
@@ -31,11 +31,11 @@
 //!   event already staged (staging is at `finalize`/settle, which resolves via
 //!   `commit_provisional`/`abort_provisional`, never `get`), so the lower read
 //!   is always a settled committed projection.
-//! - **KV3 — scans bypass the cache.** [`scan_cells`](CellStore::scan_cells)
-//!   never reads or writes fjall; its only cache interaction is the pre-scan
-//!   read-window invalidation (D3). There is no way to serve a range from the
-//!   cache, so there is no completeness fact to maintain. A scan's cost is
-//!   always exactly one lower-store scan.
+//! - **KV3 — scans bypass the cache.** `scan_cells` never reads or writes
+//!   fjall; its only cache interaction is the pre-scan read-window invalidation
+//!   (D3). There is no way to serve a range from the cache, so there is no
+//!   completeness fact to maintain. A scan's cost is always exactly one
+//!   lower-store scan.
 //! - **KV4 — a read-back fill can never overwrite a newer write-through.**
 //!   Enforced, not argued, by three legs: per-key event dispatch serializes
 //!   whole events on a key; the per-event **session operation gate**
@@ -69,10 +69,10 @@
 //! | # | Site | Deleted / rewritten | Ordering |
 //! |---|---|---|---|
 //! | D1 | Failed fjall publish after a successful lower write | the written cells' entries | after the lower ack — the durable value moved |
-//! | D2 | Raw [`mark_resolved`](CellStore::mark_resolved) promote (the value is not carried) | the promoted cells' entries | **before** the lower call — deleting early costs a fall-through; deleting after leaves a promoted-but-cached `prev` on a mid-way cancel, a window the sweep never repairs |
+//! | D2 | Raw `mark_resolved` promote (the value is not carried) | the promoted cells' entries | **before** the lower call — deleting early costs a fall-through; deleting after leaves a promoted-but-cached `prev` on a mid-way cancel, a window the sweep never repairs |
 //! | D3 | Foreign standing marker resolved beneath the cache (fall-through read, `scan_cells`, or the stage boundary) | the marker's staged coordinates **and** cleared sections | before the lower call, verdict-blind; rides the lower store's marker memo |
 //! | D4 | Committed section clears | the cleared sections' entries — at the commit site, **excluding** the staged coordinates the D5 transform just installed | before the lower call — delete-first leaves the sections merely cold on a failed/cancelled lower write |
-//! | D5 | The **settle transform** ([`commit_provisional`](CellStore::commit_provisional) only) | staged entries rewritten `prev → data` at their stage-anchored expiry, atomically, **before** the lower promote; a failed transform falls back to must-succeed deletion of the same entries | the verdict is already fixed when the verb runs, so `data` *is* the committed projection — installing it pre-call is correct even if the promote fails or the future is dropped, and the staged cells stay **warm** through the settle |
+//! | D5 | The **settle transform** (`commit_provisional` only) | staged entries rewritten `prev → data` at their stage-anchored expiry, atomically, **before** the lower promote; a failed transform falls back to must-succeed deletion of the same entries | the verdict is already fixed when the verb runs, so `data` *is* the committed projection — installing it pre-call is correct even if the promote fails or the future is dropped, and the staged cells stay **warm** through the settle |
 //!
 //! "Must-succeed" means: the delete either lands (bounded retries) or blows
 //! the cache fuse — it never fails upward, never stalls settlement, and never
@@ -86,8 +86,8 @@
 //! to a correct slow fall-through, never a wrong warm hit.
 //!
 //! **The Incomplete trap.**
-//! [`commit_provisional`](CellStore::commit_provisional)
-//! / [`abort_provisional`](CellStore::abort_provisional) return the **lower**
+//! `commit_provisional`
+//! / `abort_provisional` return the **lower**
 //! `Result` verbatim and never fold a fjall failure into it — else a transient
 //! fjall failure would fold into
 //! [`ApplyOutcome::Incomplete`](crate::state::session) and arm `StateRecovery`
@@ -112,8 +112,8 @@
 //!    falls through to the lower resolving read, so an undeleted stale entry is
 //!    unreachable and KV1 holds vacuously.
 //! 2. **The warm provisional index and its seeded latch** — bypassed wholesale:
-//!    [`provisional_cells`](CellStore::provisional_cells) delegates the lower
-//!    stream verbatim (no seed check, no recording, no latch).
+//!    `provisional_cells` delegates the lower stream verbatim (no seed check,
+//!    no recording, no latch).
 //! 3. **[`MarkerPresence`](crate::state::fjall)** — fused for uniformity; its
 //!    own contract is over-report-safe.
 //!
@@ -126,24 +126,22 @@
 //! anchors a clock read and floors it to Cassandra's whole-second TTL
 //! resolution (see `expiry_at`), each with its own anchor:
 //!
-//! * A direct write ([`write_resolved`](CellStore::write_resolved) /
-//!   [`write_provisional`](CellStore::write_provisional) /
-//!   [`abort_provisional`](CellStore::abort_provisional)) anchors on a clock
-//!   read taken **before** the lower write and stamps `floor(stamped_at) + ttl`
-//!   ([`CollectionRef::ttl`]).
+//! * A direct write (`write_resolved` / `write_provisional` /
+//!   `abort_provisional`) anchors on a clock read taken **before** the lower
+//!   write and stamps `floor(stamped_at) + ttl` ([`CollectionRef::ttl`]).
 //! * The settle transform (D5) **reuses** the stage-anchored expiry already on
 //!   the cell's entry — the promote does not re-stamp the durable TTL, so
 //!   `data` keeps the death set at stage time; a fresh `now + ttl` would
 //!   overhang it by the whole stage→commit gap.
 //! * A fill reads the cell's *remaining* TTL from the lower store
-//!   ([`CellStore::get_for_cache`]) and stamps `floor(now) + remaining`.
+//!   (`CellStore::get_for_cache`) and stamps `floor(now) + remaining`.
 //!
 //! The cache read path stays a hint: a fjall read error is logged and degrades
 //! that read to a durable one, and a failed fill publish degrades with **no**
 //! delete (a Miss/Expired prior state already fell through; a live entry
 //! surviving a fjall read error equals what the next read resolves — see
-//! [`Cached::get`]) — correctness rests on the lower store, so
-//! [`Cached::Error`](CellStore::Error) is just the lower store's error.
+//! `Cached::get`) — correctness rests on the lower store, so
+//! `Cached::Error` is just the lower store's error.
 
 use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
@@ -176,7 +174,7 @@ const DELETE_RETRY_DELAY: Duration = Duration::ZERO;
 /// assignment its cache); the fuse handles the sick disk.
 pub(crate) const DELETE_RETRY_BUDGET: usize = 5;
 
-/// A write-through fjall K/V cache over a lower committed [`CellStore`].
+/// A write-through fjall K/V cache over a lower committed `CellStore`.
 ///
 /// A cheap `Arc`-backed handle, cloned with the stack per event; the fjall
 /// workspace (and its shared cache fuse) is per-assignment — cold at a fresh

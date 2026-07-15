@@ -47,7 +47,7 @@
 //! degenerates to one statement.
 
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::cell_key::{CellKey, Scan};
+use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
@@ -55,8 +55,84 @@ use crate::error::ClassifyError;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use futures::Stream;
+use smallvec::SmallVec;
 use std::error::Error;
 use std::future::Future;
+use std::iter::from_fn;
+use std::slice;
+
+/// The maximum number of coordinates a batch read carries in one hop — one
+/// Cassandra `IN` query, or one fjall blocking-pool round-trip. It owns the
+/// batch bound: [`CoordinateBatch`] is unrepresentable above it, and
+/// [`STREAM_CHUNK`](super::descriptor::STREAM_CHUNK) aliases it so the
+/// point-get stream chunk width and the batch-read width are one number.
+///
+/// Sized to overlap the durable round-trips of a cold collection window without
+/// pessimizing a warm one; every internal per-chunk buffer is a
+/// `SmallVec<[_; CELL_BATCH]>`, so the steady state stays on the stack.
+pub(crate) const CELL_BATCH: usize = 16;
+
+const _: () = assert!(
+    CELL_BATCH > 0,
+    "CELL_BATCH must be positive or both stream-unfold chunk sources stall on empty chunks"
+);
+
+/// A non-empty, bounded (`1..=CELL_BATCH`) run of coordinates for one batch
+/// read.
+///
+/// The bound is **unrepresentable if violated**: the sole constructor is
+/// [`Self::chunks`], which splits an arbitrary coordinate sequence into maximal
+/// `CELL_BATCH`-sized batches in input order and yields no empty batch. There
+/// is no public field, no raw constructor, no `FromIterator`, and no mutable
+/// accessor, so no caller can build an over-long or empty batch. Observers are
+/// read-only ([`Self::len`], [`Self::iter`], [`Self::as_slice`]).
+///
+/// Duplicates and unknown (no-row) coordinates are allowed; the read contract
+/// on [`CellStore::get_many`] states how each position is answered.
+///
+/// Nominally `pub` inside the `pub(crate)` [`store`](self) module (the
+/// module-capping precedent): the trait methods that take it are nominally
+/// `pub`, so the type must be too, but the module cap keeps it crate-internal.
+pub struct CoordinateBatch(SmallVec<[Coordinate; CELL_BATCH]>);
+
+impl CoordinateBatch {
+    /// Splits `coords` into maximal `1..=CELL_BATCH` batches in input order.
+    /// Empty input yields no batches; concatenating the yielded batches
+    /// reproduces the input exactly.
+    pub fn chunks<I: IntoIterator<Item = Coordinate>>(
+        coords: I,
+    ) -> impl Iterator<Item = CoordinateBatch> {
+        let mut it = coords.into_iter();
+        from_fn(move || {
+            let batch: SmallVec<[Coordinate; CELL_BATCH]> = it.by_ref().take(CELL_BATCH).collect();
+            (!batch.is_empty()).then_some(CoordinateBatch(batch))
+        })
+    }
+
+    /// The number of coordinates in the batch (`1..=CELL_BATCH`).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The batch's coordinates, in input order.
+    pub fn as_slice(&self) -> &[Coordinate] {
+        &self.0
+    }
+
+    /// Iterates the batch's coordinates, in input order.
+    pub fn iter(&self) -> slice::Iter<'_, Coordinate> {
+        self.0.iter()
+    }
+}
+
+/// The index-aligned result of a committed batch read: `result[i]` answers the
+/// batch's coordinate `i` (see [`CellStore::get_many`]).
+pub type CommittedBatch = SmallVec<[Committed; CELL_BATCH]>;
+
+/// The index-aligned result of a cache-fill batch read: each position's
+/// committed value plus the durable cell's remaining TTL (see
+/// [`CellStore::get_many_for_cache`]).
+pub type CacheBatch = SmallVec<[(Committed, Option<CompactDuration>); CELL_BATCH]>;
 
 /// Uniform durable storage for the cells of one collection partition.
 ///
@@ -147,6 +223,112 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
     {
         async move { Ok((self.get(collection, cell, own).await?, None)) }
+    }
+
+    /// Batch twin of [`Self::get`]: resolves one section's coordinates in one
+    /// backend hop, answering each input position by index (`result[i]` answers
+    /// `batch[i]`; a missing row is `Committed(None)`).
+    ///
+    /// # Read contract (the observation rules)
+    ///
+    /// This is **not** naive point-sequence equivalence — it is the weaker,
+    /// backend-uniform contract every implementation upholds:
+    ///
+    /// * **Alignment** — the result has exactly `batch.len()` entries and every
+    ///   position is answered.
+    /// * **Dedup + co-observation** — a repeated coordinate is read once; all
+    ///   its positions answer identically.
+    /// * **First-occurrence ordering** — unique coordinates are resolved in the
+    ///   order of their first appearance in `batch`, so among the **per-row
+    ///   semantic failures** (a corrupt row shape, an oracle consult) the one
+    ///   surfaced is the earliest input position's. A backend may additionally
+    ///   fail the batch as a whole *before* any row resolves (the Cassandra
+    ///   override's `IN` query, its standing-marker read, or the read-window
+    ///   re-issue); such a whole-collection failure carries **no** input
+    ///   position, exactly as the point [`Self::get`] surfaces the same failure
+    ///   with no cell attribution.
+    ///
+    /// The default reads each unique coordinate through [`Self::get`] in
+    /// first-occurrence order and scatters the answer to every duplicate
+    /// position; a failing coordinate fails the whole batch at its earliest
+    /// occurrence (the memory default has no whole-collection phase). The
+    /// Cassandra backend overrides it with one `IN` query. Every internal
+    /// scratch buffer is a `SmallVec<[_; CELL_BATCH]>`, so the per-chunk path
+    /// allocates nothing on the stack's common case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on the first per-row failure [`Self::get`] would
+    /// (at the earliest input position) or a whole-collection read failure (no
+    /// position).
+    fn get_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
+        async move {
+            let (uniques, plan) = dedupe(batch);
+            let mut answers: CommittedBatch = SmallVec::new();
+            for &coordinate in &uniques {
+                let cell = CellKey {
+                    section,
+                    coordinate: Coordinate::clone(coordinate),
+                };
+                answers.push(self.get(collection, &cell, own).await?);
+            }
+            let out: CommittedBatch = plan.iter().map(|&i| answers[i].clone()).collect();
+            debug_assert_eq!(
+                out.len(),
+                batch.len(),
+                "batch read must answer every input position"
+            );
+            Ok(out)
+        }
+    }
+
+    /// Cache-fill batch twin of [`Self::get_for_cache`]: the batch read plus
+    /// each position's remaining TTL, for the
+    /// [`Cached`](super::cached::Cached) write-through cache to mirror.
+    /// Same read contract and index alignment as [`Self::get_many`].
+    ///
+    /// The default reads each unique coordinate through [`Self::get_for_cache`]
+    /// (**not** [`Self::get_many`] with `None` TTLs — that would silently drop
+    /// a backend's TTL metadata, the `commit_provisional`-wrapper bug
+    /// class) in first-occurrence order and scatters the `(value, ttl)`
+    /// pair to every duplicate position. Only the Cassandra store overrides
+    /// it, sharing one prepared statement with [`Self::get_many`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on the first failure [`Self::get_for_cache`]
+    /// would, at the earliest input position.
+    fn get_many_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
+        async move {
+            let (uniques, plan) = dedupe(batch);
+            let mut answers: CacheBatch = SmallVec::new();
+            for &coordinate in &uniques {
+                let cell = CellKey {
+                    section,
+                    coordinate: Coordinate::clone(coordinate),
+                };
+                answers.push(self.get_for_cache(collection, &cell, own).await?);
+            }
+            let out: CacheBatch = plan.iter().map(|&i| answers[i].clone()).collect();
+            debug_assert_eq!(
+                out.len(),
+                batch.len(),
+                "batch read must answer every input position"
+            );
+            Ok(out)
+        }
     }
 
     /// Streams the whole partition's provisional cells (all sections) for the
@@ -336,6 +518,35 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+}
+
+/// Splits a [`CoordinateBatch`] into its unique coordinates (in
+/// first-occurrence order) and a per-position plan mapping each input index to
+/// its unique index.
+///
+/// The batch-read contract's dedup + first-occurrence-ordering leg, shared by
+/// the [`CellStore::get_many`]/[`CellStore::get_many_for_cache`] defaults and
+/// the Cassandra override so all three agree on which coordinate answers which
+/// position. Both buffers are `SmallVec<[_; CELL_BATCH]>`, so a batch never
+/// spills to the heap. The `uniques` borrow from `batch`.
+pub(crate) fn dedupe(
+    batch: &CoordinateBatch,
+) -> (
+    SmallVec<[&Coordinate; CELL_BATCH]>,
+    SmallVec<[usize; CELL_BATCH]>,
+) {
+    let mut uniques: SmallVec<[&Coordinate; CELL_BATCH]> = SmallVec::new();
+    let mut plan: SmallVec<[usize; CELL_BATCH]> = SmallVec::new();
+    for coordinate in batch.iter() {
+        let idx = if let Some(i) = uniques.iter().position(|u| *u == coordinate) {
+            i
+        } else {
+            uniques.push(coordinate);
+            uniques.len() - 1
+        };
+        plan.push(idx);
+    }
+    (uniques, plan)
 }
 
 /// Routes a committed settle to the primitive verbs: present-data cells promote

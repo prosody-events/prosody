@@ -38,7 +38,7 @@
 //! together whatever the batching — and a mid-handler [`DequeHandle::commit`]
 //! drains them resolved and marker-free: one atomic batch within the batch
 //! budget, but an over-budget commit can crash mid-split (the collection-grain
-//! over-budget residual on [`CellStore`](crate::state::store::CellStore),
+//! over-budget residual on `CellStore`,
 //! shared with the Map keyset).
 //!
 //! **Without a TTL the window is also dense**: every index in `[head, tail)`

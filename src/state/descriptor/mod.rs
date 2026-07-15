@@ -74,6 +74,7 @@ use crate::state::cell_key::Section;
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::CollectionDef;
 use crate::state::session::CellSession;
+use crate::state::store::CELL_BATCH;
 use crate::state::{CollectionKindId, CommitMode, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
 use educe::Educe;
@@ -107,24 +108,16 @@ const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 /// The point-get streams' chunk width: the granularity of both the per-chunk
 /// gate hold (one read permit per chunk, dropped with the chunk future's scope
 /// before any yield) and the fetch concurrency (`.buffered(STREAM_CHUNK)`).
-/// Bounded and named, sized to overlap the durable round-trips of a cold
-/// collection (a warm one's fjall hits gain nothing and lose nothing), not for
-/// throughput. Shared by [`MapHandle::stream`](map::MapHandle::stream) and
+/// Shared by [`MapHandle::stream`](map::MapHandle::stream) and
 /// [`DequeHandle::stream`](deque::DequeHandle::stream).
 ///
-/// # Invariant: `STREAM_CHUNK > 0`
-///
-/// Both chunk sources rely on it to make progress: the map's
-/// `keys.by_ref().take(STREAM_CHUNK)` must drain ≥ 1 key per chunk, and the
-/// deque's `(start + STREAM_CHUNK).min(len)` must advance past `start`. At
-/// zero, `take(0)` never drains and `end == start` never advances, so each
-/// unfold source would produce empty chunks forever.
-pub(crate) const STREAM_CHUNK: usize = 16;
-
-const _: () = assert!(
-    STREAM_CHUNK > 0,
-    "STREAM_CHUNK must be positive or both unfold chunk sources stall on empty chunks"
-);
+/// An alias of [`CELL_BATCH`](crate::state::store::CELL_BATCH) — the point-get
+/// stream chunk width and the store batch-read width are one number, and the
+/// `> 0` invariant both chunk sources rely on (the map's
+/// `keys.by_ref().take(STREAM_CHUNK)` must drain ≥ 1 key per chunk; the deque's
+/// `(start + STREAM_CHUNK).min(len)` must advance past `start`) is enforced
+/// once on `CELL_BATCH`.
+pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
 /// handle exposes (`Resolved`/`Write`).

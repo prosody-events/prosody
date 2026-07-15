@@ -5,7 +5,7 @@
 //! [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider)),
 //! then mints one [`KeyedStateSession`] per event from it. The manager owns the
 //! partition-lifetime parts — the uniform cell store
-//! ([`StateBackend::Cell`]), the commit oracle, the shared dirty workspace, and
+//! (`StateBackend::Cell`), the commit oracle, the shared dirty workspace, and
 //! the message loader — while each session gets `Arc`-clones and wraps the cell
 //! store in its own per-event `Overlay`. The
 //! recovery sweep resolves provisional cells through the *same* cell store and
@@ -244,7 +244,7 @@ pub enum SweepResolution {
 /// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider).
 ///
 /// `T` is the partition's trigger-store handle, threaded through to
-/// [`StateBackendFactory::for_partition`] (which owns the handle-passing
+/// `StateBackendFactory::for_partition` (which owns the handle-passing
 /// rationale).
 ///
 /// Like [`PartitionStateManager`], kept as a trait for type-parameter
@@ -301,7 +301,7 @@ where
 /// The real per-partition state manager: owns the partition-lifetime cell
 /// store, oracle, dirty workspace, and loader; mints per-event
 /// [`KeyedStateSession`]s sharing them. Parameterized by the one
-/// [`StateBackend`] bundle `B` and the loader `L`.
+/// `StateBackend` bundle `B` and the loader `L`.
 pub struct StateManager<B, L>
 where
     B: StateBackend,
@@ -473,7 +473,7 @@ where
 }
 
 /// Process-wide [`PartitionStateProvider`] over a
-/// [`StateBackendFactory`]: acquisition mints the partition's backend and
+/// `StateBackendFactory`: acquisition mints the partition's backend and
 /// eagerly validates descriptor identities.
 #[derive(Clone)]
 pub struct StateManagerProvider<F, L> {

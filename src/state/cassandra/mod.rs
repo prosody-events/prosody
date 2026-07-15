@@ -1,7 +1,7 @@
 //! Cassandra-backed durable keyed-state stores.
 //!
 //! [`CassandraStore`] implements
-//! [`CellStore`](crate::state::store::CellStore) over the
+//! `CellStore` over the
 //! `keyed_state_cell` table, and [`CassandraDescriptorIdentityStore`]
 //! implements
 //! [`DescriptorIdentityStore`](crate::state::descriptor_identity::DescriptorIdentityStore)

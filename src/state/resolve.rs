@@ -3,10 +3,10 @@
 //! `resolve_cell` is the one place a provisional cell becomes committed:
 //! consult the commit oracle for the cell's owning event, then resolve it one
 //! of three ways — *promote* present data in place
-//! ([`CellStore::mark_resolved`], the commit arm for a `Set`), **delete** the
-//! row for a committed clear ([`CellStore::write_resolved`]`(None)`, the
+//! (`CellStore::mark_resolved`, the commit arm for a `Set`), **delete** the
+//! row for a committed clear (`CellStore::write_resolved``(None)`, the
 //! row-absence invariant), or write the committed base back as resolved
-//! ([`CellStore::write_resolved`], the rollback arm). Eager promotion after
+//! (`CellStore::write_resolved`, the rollback arm). Eager promotion after
 //! commit, the quiescence sweep, and first-touch all funnel through here, so "a
 //! provisional cell is resolved only via the oracle" (the oracle-always
 //! invariant) holds by construction.

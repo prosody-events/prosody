@@ -3,7 +3,7 @@
 //! [`FjallCellCache`] stores one tagged cell per [`CellKey`] in a fjall
 //! keyspace: the committed-cell K/V store
 //! [`Cached`](crate::state::cached::Cached) serves point hits from. It does
-//! **not** implement [`CellStore`](crate::state::store::CellStore): it is a
+//! **not** implement `CellStore`: it is a
 //! concrete *partial* upper (it can only answer what it has mirrored), so a
 //! bare cache view can never be mistaken for a complete store — a miss asserts
 //! nothing and always falls through (KV2, owned by `Cached`).

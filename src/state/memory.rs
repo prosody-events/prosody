@@ -98,7 +98,7 @@ impl MemoryCells {
     }
 }
 
-/// In-memory, uniform [`CellStore`] — the in-memory (and mock-mode) backend.
+/// In-memory, uniform `CellStore` — the in-memory (and mock-mode) backend.
 ///
 /// The provisional-cell durable backend keyed by `(CollectionId, CellKey)`:
 /// each cell is either resolved or provisional. Resolution of in-flight

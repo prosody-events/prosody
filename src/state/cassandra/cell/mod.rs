@@ -96,7 +96,7 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{BatchRow, BatchUnit};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::event_ref::EventRef;
 use crate::state::fjall::MarkerPresence;
 use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
@@ -106,13 +106,15 @@ use crate::state::resolve::{
     ResolveCellError, Resolver, flatten_resolve, help_read_window, peek_read, resolve_marker,
     resolve_read,
 };
-use crate::state::store::CellStore;
+use crate::state::store::{
+    CELL_BATCH, CacheBatch, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+};
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{CellTtlRow, KeyedCellRow, RawCellRow};
+use decode::{CellTtlRow, KeyedCellRow, KeyedCellTtlRow, RawCellRow, split_keyed_cell_ttl};
 use encoding::encode_payload;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
 use scylla::client::session::Session;
@@ -220,10 +222,8 @@ pub type CellStoreError<OracleErr> = ResolveCellError<CassandraCellStoreError, O
 
 /// The session + prepared statements a [`CassandraStore`] is built from, shared
 /// across partitions. The per-partition oracle and registry are supplied at
-/// [`CassandraStateBackendFactory::for_partition`] time, so the resolving cell
+/// `CassandraStateBackendFactory::for_partition` time, so the resolving cell
 /// store cannot be pre-built — this holds the partition-independent parts.
-///
-/// [`CassandraStateBackendFactory::for_partition`]: crate::state::production::CassandraStateBackendFactory
 #[derive(Clone)]
 pub struct CassandraCellResources {
     pub(crate) session: CassandraSession,
@@ -371,7 +371,7 @@ impl<O> CassandraStore<O> {
                     pk.name,
                     CellKind::Cell,
                     i8::from(cell.section),
-                    cell.coordinate.as_bytes(),
+                    &cell.coordinate,
                 ),
             )
             .await
@@ -381,6 +381,56 @@ impl<O> CassandraStore<O> {
             .maybe_first_row::<R>()
             .map_err(CassandraStoreError::from)?;
         Ok(row)
+    }
+
+    /// Reads a section's `uniques` coordinates in one `IN` query, returning the
+    /// matching rows **un-decoded**, each re-keyed to its clustering
+    /// `coordinate`. Absent coordinates simply do not appear (the reader treats
+    /// them as `Committed(None)`). Semantic decode is deliberately deferred to
+    /// the caller's first-occurrence resolve loop
+    /// ([`get_many_for_cache`](CellStore::get_many_for_cache)) — decoding here
+    /// would surface a corrupt row in clustering order, violating the batch
+    /// read's earliest-input-position error rule.
+    ///
+    /// `uniques` is caller-deduped ([`dedupe`]) and non-empty by
+    /// [`CoordinateBatch`] construction, so the `IN` list has no repeats and is
+    /// never empty; bounded by `CELL_BATCH`, so the result never spills the
+    /// stack buffer.
+    async fn batch_read(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        uniques: &[&Coordinate],
+    ) -> Result<SmallVec<[(Coordinate, CellTtlRow); CELL_BATCH]>, CassandraCellStoreError> {
+        let pk = Pk::of(id);
+        let result = self
+            .cql()
+            .execute_unpaged(
+                &self.queries.read_cells_batch,
+                (
+                    pk.segment_id,
+                    pk.key,
+                    pk.state_type,
+                    pk.name,
+                    CellKind::Cell,
+                    i8::from(section),
+                    uniques,
+                ),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?;
+        let mut out: SmallVec<[(Coordinate, CellTtlRow); CELL_BATCH]> = SmallVec::new();
+        for row in result
+            .rows::<KeyedCellTtlRow>()
+            .map_err(CassandraStoreError::from)?
+        {
+            out.push(split_keyed_cell_ttl(
+                row.map_err(CassandraStoreError::from)?,
+            ));
+        }
+        Ok(out)
     }
 
     /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
@@ -544,19 +594,19 @@ where
             let pager = match (dir, start.as_ref()) {
                 (Direction::Forward, ScanEdge::Included(c)) => {
                     self.cql().execute_iter(self.queries.scan_forward_incl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                        (seg, key, st, name, cell_kind, sect, c)).await
                 }
                 (Direction::Forward, ScanEdge::Excluded(c)) => {
                     self.cql().execute_iter(self.queries.scan_forward_excl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                        (seg, key, st, name, cell_kind, sect, c)).await
                 }
                 (Direction::Backward, ScanEdge::Included(c)) => {
                     self.cql().execute_iter(self.queries.scan_backward_incl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                        (seg, key, st, name, cell_kind, sect, c)).await
                 }
                 (Direction::Backward, ScanEdge::Excluded(c)) => {
                     self.cql().execute_iter(self.queries.scan_backward_excl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c.as_bytes())).await
+                        (seg, key, st, name, cell_kind, sect, c)).await
                 }
                 (Direction::Forward, ScanEdge::Unbounded) => {
                     self.cql().execute_iter(self.queries.scan_forward_all.clone(), prefix).await
@@ -684,6 +734,98 @@ where
         .await
         .map_err(flatten_resolve)?;
         Ok((committed, ttl_seconds_to_duration(ttl)))
+    }
+
+    async fn get_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<CommittedBatch, Self::Error> {
+        // Mirrors `get` → `get_for_cache`: the committed value is the batch
+        // cache-fill read minus its co-expiry TTLs.
+        Ok(self
+            .get_many_for_cache(collection, section, batch, own)
+            .await?
+            .into_iter()
+            .map(|(committed, _)| committed)
+            .collect())
+    }
+
+    async fn get_many_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<CacheBatch, Self::Error> {
+        let collection_ref = self.resolver.collection_ref(collection);
+        let (uniques, plan) = dedupe(batch);
+        // The committed-unapplied read window, exactly as the point read
+        // (`get_for_cache`): consult the standing marker — memo-backed, so no
+        // durable read after the one seed read — CONCURRENTLY with the batch
+        // query. If the marker was resolved (foreign + clears), the pre-help
+        // rows may hold now-erased values, so the whole `IN` query is re-issued
+        // once.
+        let (rows, standing) = futures::join!(
+            self.batch_read(collection, section, &uniques),
+            self.standing_marker(collection),
+        );
+        let mut rows = rows.map_err(ResolveCellError::Store)?;
+        if help_read_window(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            standing?.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?
+        {
+            rows = self
+                .batch_read(collection, section, &uniques)
+                .await
+                .map_err(ResolveCellError::Store)?;
+        }
+        // Resolve the unique coordinates SEQUENTIALLY in first-occurrence input
+        // order — matching the sequential point-get oracle, so backend parity is
+        // provable. Semantic decode is deferred to here (not `batch_read`), so a
+        // corrupt row surfaces at its earliest input position, never in the
+        // clustering order the `IN` query returns. A coordinate with no row
+        // resolves as `Committed(None)`. `rows` is bounded by `CELL_BATCH`, so
+        // the linear scan is all-stack and O(CELL_BATCH²) at worst.
+        let mut answers: CacheBatch = SmallVec::new();
+        for &coordinate in &uniques {
+            let cell = CellKey {
+                section,
+                coordinate: Coordinate::clone(coordinate),
+            };
+            let (raw, ttl) = match rows.iter().find(|(found, _)| found == coordinate) {
+                Some((_, row)) => {
+                    decode::try_decode_cell_ttl(row.clone()).map_err(ResolveCellError::Store)?
+                }
+                None => (Cell::Resolved(Committed::new(None)), None),
+            };
+            let committed = resolve_read(
+                self,
+                self.resolver.oracle(),
+                &collection_ref,
+                &cell,
+                own,
+                raw,
+            )
+            .await
+            .map_err(flatten_resolve)?;
+            answers.push((committed, ttl_seconds_to_duration(ttl)));
+        }
+        let out: CacheBatch = plan.iter().map(|&i| answers[i].clone()).collect();
+        debug_assert_eq!(
+            out.len(),
+            batch.len(),
+            "batch read must answer every input position"
+        );
+        Ok(out)
     }
 
     fn scan_cells<'a>(
@@ -1751,6 +1893,23 @@ cassandra_queries! {
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Batch twin of [`read_cell_ttl`](Self::read_cell_ttl): one section's
+        /// cells for a bounded (`1..=CELL_BATCH`) coordinate list, plus each
+        /// blob's remaining TTL. `IN` returns matching clustering rows in
+        /// coordinate order (not input order) and omits absent coordinates, so
+        /// the reader carries the `coordinate` column to re-key each row to its
+        /// input position and treats a missing coordinate as an absent row.
+        /// One same-partition, single-shard query — never a cross-partition
+        /// `IN` (the partition key is fully bound).
+        read_cells_batch: (
+            "SELECT coordinate, data, prev_data, encoding, version, event, \
+             TTL(data), TTL(prev_data) \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate IN ?",
             TABLE_KEYED_STATE_CELL
         ),
 

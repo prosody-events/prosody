@@ -86,6 +86,38 @@ pub(super) type CellTtlRow = (
     Option<i32>, // TTL(prev_data) in whole seconds
 );
 
+/// Eight-column shape produced by the batch cache-fill `SELECT coordinate,
+/// data, prev_data, encoding, version, event, TTL(data), TTL(prev_data)` — a
+/// [`CellTtlRow`] prefixed with the clustering `coordinate`. Used by the batch
+/// read (`get_many`/`get_many_for_cache`), where `IN` returns rows in
+/// clustering order, so the coordinate is carried to re-key each row back to
+/// its input position.
+pub(super) type KeyedCellTtlRow = (
+    Vec<u8>, // coordinate
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+    Option<i32>,
+    Option<i32>,
+);
+
+/// Splits a batch row's clustering `coordinate` off its [`CellTtlRow`] body,
+/// **without** decoding. Infallible (the coordinate is opaque bytes); semantic
+/// decode is deferred to [`try_decode_cell_ttl`] so a corrupt row surfaces in
+/// input-resolution order, not in clustering order (the batch read's
+/// first-occurrence error-ordering rule).
+pub(super) fn split_keyed_cell_ttl(row: KeyedCellTtlRow) -> (Coordinate, CellTtlRow) {
+    let (coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
+    (
+        Coordinate::from_bytes(coordinate),
+        (
+            data, prev_data, encoding, version, event, ttl_data, ttl_prev,
+        ),
+    )
+}
+
 /// Four-column shape produced by the `marker_read` point read of the
 /// fixed-address event-marker row: the frozen payload blob, its shared
 /// `encoding`/`version`, and the staging event.

@@ -413,7 +413,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// **Contract: the answer must reflect every write performed through
     /// this store and its clones.** The keyed-state commit oracle holds a
     /// clone of the partition's writing store (handle passing — see
-    /// [`StateBackendFactory::for_partition`](crate::state::StateBackendFactory::for_partition)),
+    /// `StateBackendFactory::for_partition`),
     /// so a per-instance cache is fine as long as clones share it; a stale
     /// answer flips a recovery decision (rolling back a committed write, or
     /// promoting an abandoned one).

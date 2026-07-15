@@ -229,14 +229,14 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
     /// idempotence across the resume is the contract.
     ///
     /// Every currently-buffered op of the collection is written straight to
-    /// committed state ([`write_resolved`]) and dropped from the dirty buffer,
+    /// committed state (`write_resolved`) and dropped from the dirty buffer,
     /// so multi-cell kinds commit data and bookkeeping together (a Map's
     /// entries and keyset, a Deque's entries and window bounds). Within the
     /// batch budget those cells ride one atomic same-partition batch; an
     /// over-budget commit splits into the fewest fitting batches, and —
     /// `write_resolved` being marker-free — a crash mid-split can leave a
     /// torn committed write the store cannot reconstruct (the over-budget
-    /// residual on the collection-grain atomicity invariant, [`CellStore`]),
+    /// residual on the collection-grain atomicity invariant, `CellStore`),
     /// reconstructed only when the idempotent handler re-run re-issues the same
     /// ops. The guarantee is **at-least-once**: a
     /// `commit()`-landed write is durable and visible immediately — never
@@ -265,8 +265,6 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
     /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
     /// [`StateAccessError::Store`] when the underlying store fails (the
     /// buffer is left intact, so the ops still ride the normal commit path).
-    ///
-    /// [`write_resolved`]: crate::state::store::CellStore::write_resolved
     fn commit(
         &self,
         state_type: StateType,
@@ -1005,7 +1003,7 @@ where
 ///
 /// One session is minted per event by the partition's state manager; clones
 /// share the per-event dirty overlay and reload-marker override plus the
-/// cross-event singletons. `B` is the per-partition [`StateBackend`] bundle;
+/// cross-event singletons. `B` is the per-partition `StateBackend` bundle;
 /// `L` is the message loader.
 pub struct KeyedStateSession<B, L>
 where

@@ -43,13 +43,13 @@ use super::super::memory::MemoryCells;
 use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
 use super::super::resolve::{resolve_cell, resolve_marker, sweep_provisional};
-use super::super::store::CellStore;
+use super::super::store::{CELL_BATCH, CellStore, CoordinateBatch};
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 use super::support::CountingCellStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
 use bytes::Bytes;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2552,6 +2552,286 @@ where
             .await
             .map_err(FailCellError::Inner)
     }
+}
+
+// ─────────────────────────── batch-read parity ─────────────────────────────
+
+/// One seeded cell's committed state for the batch-read parity generator.
+#[derive(Clone, Copy, Debug)]
+enum BatchCellState {
+    /// A committed-present resolved cell (`write_resolved(Some)`).
+    Present(u8),
+    /// A committed-absent cell — no row (the parity oracle answers
+    /// `Committed(None)`).
+    Absent,
+    /// A cell staged provisional by the one trace event, resolved on read
+    /// through the oracle per the trace's verdict.
+    Provisional(u8),
+}
+
+impl Arbitrary for BatchCellState {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 3 {
+            0 => Self::Present(u8::arbitrary(g)),
+            1 => Self::Absent,
+            _ => Self::Provisional(u8::arbitrary(g)),
+        }
+    }
+}
+
+/// Generated input for the batch-read parity property: a small cell population
+/// over the [`SECTIONS`] pool (collisions dedupe last-writer-wins), the single
+/// staging event's verdict, and a read list in ONE sampled section whose
+/// coordinate bytes deliberately include duplicates and coordinates absent from
+/// the population.
+#[derive(Clone, Debug)]
+pub(crate) struct BatchReadTrace {
+    /// `(section idx, coord byte, state)`; later writers win per coordinate.
+    population: Vec<(u8, u8, BatchCellState)>,
+    /// The staging event's oracle verdict (`true` ⇒ its provisional cells
+    /// resolve to their staged data, `false` ⇒ to their `prev`).
+    event_committed: bool,
+    /// The section the read list scans.
+    read_section: u8,
+    /// The coordinate bytes to batch-read, in order (duplicates + unknowns
+    /// included).
+    reads: Vec<u8>,
+}
+
+impl Arbitrary for BatchReadTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // Read lists up to ~3× CELL_BATCH so multi-chunk fan-out is exercised.
+        let reads: Vec<u8> = capped_vec::<u8>(g, CELL_BATCH * 3)
+            .into_iter()
+            .map(|b| b % CELLS)
+            .collect();
+        Self {
+            population: capped_vec(g, MAX_TRACE_OPS),
+            event_committed: bool::arbitrary(g),
+            read_section: section_idx(u8::arbitrary(g)),
+            reads,
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let base = self.clone();
+        let by_pop = {
+            let base = base.clone();
+            base.population
+                .shrink()
+                .map(move |population| BatchReadTrace {
+                    population,
+                    ..base.clone()
+                })
+        };
+        let by_reads = base.reads.shrink().map(move |reads| BatchReadTrace {
+            reads,
+            ..base.clone()
+        });
+        Box::new(by_pop.chain(by_reads))
+    }
+}
+
+/// Seeds one collection from a batch population: committed-present cells as one
+/// `write_resolved`, then the staging event's provisional cells as one
+/// `write_provisional` (each `prev` read from the store, never minted). Absent
+/// cells write nothing (row-absence). The two collections a parity run compares
+/// call this with identical arguments.
+async fn seed_batch<S: CellStore>(
+    store: &S,
+    collection: &CollectionRef,
+    resolved: &[(CellKey, Option<Bytes>)],
+    provisional: &[(CellKey, u8)],
+    event: EventRef,
+) -> Result<()> {
+    if !resolved.is_empty() {
+        store.write_resolved(collection, resolved, &[]).await?;
+    }
+    if !provisional.is_empty() {
+        let mut writes = Vec::with_capacity(provisional.len());
+        for (cell, data) in provisional {
+            let prev = store.get(collection.id(), cell, event).await?;
+            writes.push((
+                cell.clone(),
+                ProvisionalWrite::new(Some(bytes(*data)), prev, event),
+            ));
+        }
+        let marker = EventMarker::frozen(event, &writes, &[]);
+        store
+            .write_provisional(collection, &writes, Some(&marker))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Backend-generic batch-read parity: `get_many` over one collection answers
+/// each position exactly as the sequential point `get` oracle over an
+/// identically-seeded sibling collection does — proving the batch read (dedup,
+/// scatter, first-occurrence resolution, the Cassandra `IN` override) upholds
+/// the observation rules across duplicates, unknowns, absence, and provisional
+/// resolution.
+///
+/// Two DISTINCT collections are required because `get`/`get_many` resolve
+/// in place: a single collection would let the oracle loop pre-resolve every
+/// cell before `get_many` ran, so `get_many` would never exercise its own
+/// resolution. Distinct `StateKey`s isolate the row sets on both backends.
+pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
+    store: S,
+    oracle: ScriptedOracle,
+    trace: BatchReadTrace,
+) -> Result<bool> {
+    // Collapse the population last-writer-wins into one final state per cell.
+    let mut final_state: BTreeMap<(u8, u8), BatchCellState> = BTreeMap::new();
+    for (s, c, state) in trace.population {
+        final_state.insert((section_idx(s), c % CELLS), state);
+    }
+    let mut resolved: Vec<(CellKey, Option<Bytes>)> = Vec::new();
+    let mut provisional: Vec<(CellKey, u8)> = Vec::new();
+    for (&(s, c), state) in &final_state {
+        match *state {
+            BatchCellState::Present(v) => resolved.push((cell_in(s, c), Some(bytes(v)))),
+            BatchCellState::Absent => {}
+            BatchCellState::Provisional(v) => provisional.push((cell_in(s, c), v)),
+        }
+    }
+
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(0x5EED),
+    };
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(0x0B5E_0B5E),
+    };
+    if trace.event_committed {
+        oracle.record_message(Uuid::from_u128(0x5EED)).await?;
+    }
+
+    // Fresh, distinct segments per invocation: the two collections isolate on
+    // both backends (per-key row isolation on the shared Cassandra keyspace,
+    // TESTING.md) and never collide across quickcheck iterations.
+    let mk = || -> Result<CollectionRef> {
+        Ok(CollectionRef::new(
+            CollectionId::new(
+                StateKey::new(Uuid::new_v4(), Arc::from("key")),
+                StateType::Application,
+                StateName::try_new("entries")?,
+            ),
+            None,
+        ))
+    };
+    let expected_coll = mk()?;
+    let batch_coll = mk()?;
+    seed_batch(&store, &expected_coll, &resolved, &provisional, event).await?;
+    seed_batch(&store, &batch_coll, &resolved, &provisional, event).await?;
+
+    let section = SECTIONS[trace.read_section as usize % SECTIONS.len()];
+    let mut expected: Vec<Committed> = Vec::with_capacity(trace.reads.len());
+    for &b in &trace.reads {
+        expected.push(
+            store
+                .get(expected_coll.id(), &cell_in(trace.read_section, b), own)
+                .await?,
+        );
+    }
+    let coords = trace.reads.iter().map(|&b| Coordinate::from_bytes(vec![b]));
+    let mut got: Vec<Committed> = Vec::with_capacity(trace.reads.len());
+    for batch in CoordinateBatch::chunks(coords) {
+        got.extend(
+            store
+                .get_many(batch_coll.id(), section, &batch, own)
+                .await?,
+        );
+    }
+    Ok(got.len() == trace.reads.len() && got == expected)
+}
+
+/// Deterministic within-batch duplicate co-observation + scatter-alignment pin:
+/// two present cells with distinct values, read as `[k, m, k]` in one batch —
+/// both `k` positions must answer identically and equal the point `get`, and
+/// the `m` position must carry its own value (a mis-built scatter plan mapping
+/// a duplicate to the wrong unique reddens this).
+pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -> Result<()> {
+    let id = CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("key")),
+        StateType::Application,
+        StateName::try_new("entries")?,
+    );
+    let collection = CollectionRef::new(id.clone(), None);
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(7),
+    };
+    store
+        .write_resolved(
+            &collection,
+            &[
+                (cell_in(0, 5), Some(bytes(42))),
+                (cell_in(0, 9), Some(bytes(99))),
+            ],
+            &[],
+        )
+        .await?;
+    let coords = [5u8, 9, 5].map(|b| Coordinate::from_bytes(vec![b]));
+    let batch = CoordinateBatch::chunks(coords)
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    let got = store.get_many(&id, SECTIONS[0], &batch, own).await?;
+    assert_eq!(got.len(), 3, "every position answered");
+    assert_eq!(got[0], got[2], "duplicate coordinate co-observes one value");
+    assert_eq!(
+        got[0],
+        Committed::new(Some(bytes(42))),
+        "coordinate 5 carries its own value"
+    );
+    assert_eq!(
+        got[1],
+        Committed::new(Some(bytes(99))),
+        "coordinate 9 carries its own value"
+    );
+    Ok(())
+}
+
+/// Deterministic alignment pin: a read list spanning two chunks that mixes
+/// present, absent, and duplicate coordinates — the concatenated `get_many`
+/// output has exactly the input length and each position matches the point
+/// `get` (a dropped no-row position reddens both the length check and the
+/// per-position compare).
+pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
+    let id = CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("key")),
+        StateType::Application,
+        StateName::try_new("entries")?,
+    );
+    let collection = CollectionRef::new(id.clone(), None);
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(11),
+    };
+    store
+        .write_resolved(
+            &collection,
+            &[
+                (cell_in(0, 2), Some(bytes(20))),
+                (cell_in(0, 7), Some(bytes(70))),
+                (cell_in(0, 10), Some(bytes(100))),
+            ],
+            &[],
+        )
+        .await?;
+    // 20 positions across two chunks: present (2,7,10), absent (0,1,3..), and
+    // duplicates (2, 7 repeated).
+    let read_bytes: Vec<u8> = vec![
+        2, 7, 10, 0, 1, 2, 3, 4, 7, 5, 6, 8, 10, 2, 11, 7, 0, 10, 2, 1,
+    ];
+    let mut expected: Vec<Committed> = Vec::with_capacity(read_bytes.len());
+    for &b in &read_bytes {
+        expected.push(store.get(&id, &cell_in(0, b), own).await?);
+    }
+    let coords = read_bytes.iter().map(|&b| Coordinate::from_bytes(vec![b]));
+    let mut got: Vec<Committed> = Vec::new();
+    for batch in CoordinateBatch::chunks(coords) {
+        got.extend(store.get_many(&id, SECTIONS[0], &batch, own).await?);
+    }
+    assert_eq!(got.len(), read_bytes.len(), "every input position answered");
+    assert_eq!(got, expected, "each position matches the point-get oracle");
+    Ok(())
 }
 
 #[cfg(test)]

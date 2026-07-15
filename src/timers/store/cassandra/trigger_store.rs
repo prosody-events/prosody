@@ -966,16 +966,12 @@ impl TriggerOperations for CassandraTriggerStore {
     /// This is sound because the partition's single writer is the only
     /// mutator of this instance's `state_cache`, and the keyed-state commit
     /// oracle consults through a **clone of this instance** (handle passing
-    /// at partition acquisition — see
-    /// [`StateBackendFactory::for_partition`]), so writer and oracle share
-    /// one cache; per-key serialization orders every consult against the
-    /// mutations it must observe. On `Overflow`, the clustering row's tag
-    /// column is read under the per-key mutex so a concurrent
-    /// promote/demote cannot interleave between the state check and the row
-    /// read.
-    ///
-    /// [`StateBackendFactory::for_partition`]:
-    ///     crate::state::StateBackendFactory::for_partition
+    /// at partition acquisition — see `StateBackendFactory::for_partition`), so
+    /// writer and oracle share one cache; per-key serialization orders every
+    /// consult against the mutations it must observe. On `Overflow`, the
+    /// clustering row's tag column is read under the per-key mutex so a
+    /// concurrent promote/demote cannot interleave between the state check and
+    /// the row read.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_tag(
         &self,

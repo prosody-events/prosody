@@ -15,10 +15,18 @@
 //! `Permanent` rather than becoming scylla's opaque `Terminal`
 //! `DeserializationError`, which would tear the partition down over one bad
 //! row.
+//!
+//! [`Coordinate`] is not a discriminator but a `blob` — it shares this module
+//! only for the same **serialize-only** posture: its impl delegates to its byte
+//! blob so a `CellKey`'s coordinate binds directly (as a single bind and inside
+//! an `IN` list of blobs), while reads keep deserializing the raw `Vec<u8>` and
+//! rebuilding the coordinate infallibly. It is the single conversion surface —
+//! no `as_iN`/`from_iN` inherent methods exist on [`Coordinate`].
 
 use crate::state::StateType;
 use crate::state::cassandra::cell::CellKind;
 use crate::state::cassandra::cell::Encoding;
+use crate::state::cell_key::Coordinate;
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
@@ -50,5 +58,15 @@ impl SerializeValue for Encoding {
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
         i16::from(*self).serialize(typ, writer)
+    }
+}
+
+impl SerializeValue for Coordinate {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        self.as_bytes().serialize(typ, writer)
     }
 }

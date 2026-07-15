@@ -6,8 +6,9 @@ pub(crate) mod identity_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    ApplyTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace, PoisonHandle,
-    ScanTrace, ScriptedOracle, Trace, run_apply_idempotence, run_bottom_scan_trace,
+    ApplyTrace, BatchReadTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace,
+    PoisonHandle, ScanTrace, ScriptedOracle, Trace, run_apply_idempotence, run_batch_alignment,
+    run_batch_duplicate_co_observation, run_batch_read_parity_trace, run_bottom_scan_trace,
     run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
@@ -28,10 +29,10 @@ use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
-use super::store::CellStore;
+use super::store::{CELL_BATCH, CellStore, CoordinateBatch, dedupe};
 use super::{
-    CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
-    StateName, StateType,
+    CollectionId, CollectionRef, CommitMode, Coordinate, Direction, EventRef, PartitionBackend,
+    StateKey, StateName, StateType,
 };
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -153,6 +154,119 @@ fn prop_memory_bottom_scan() {
         executor::block_on(run_bottom_scan_trace(store, trace, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
+}
+
+/// `CoordinateBatch::chunks` reassembles to its input exactly, and every
+/// yielded batch is non-empty and `≤ CELL_BATCH` with only the last possibly
+/// short — the batch-bound invariant the store verb relies on.
+#[test]
+fn prop_chunk_reassembly() {
+    fn property(coords: Vec<u8>) -> bool {
+        let input: Vec<Coordinate> = coords
+            .into_iter()
+            .map(|b| Coordinate::from_bytes(vec![b]))
+            .collect();
+        let batches: Vec<CoordinateBatch> = CoordinateBatch::chunks(input.clone()).collect();
+        let mut flat: Vec<Coordinate> = Vec::new();
+        for batch in &batches {
+            if batch.len() == 0 || batch.len() > CELL_BATCH {
+                return false;
+            }
+            flat.extend(batch.as_slice().iter().cloned());
+        }
+        // All but the last batch are exactly CELL_BATCH.
+        let full_prefix = batches
+            .split_last()
+            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH));
+        flat == input && full_prefix && (input.is_empty() == batches.is_empty())
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>) -> bool);
+}
+
+/// `dedupe` keeps unique coordinates in first-occurrence order and maps every
+/// input position to its unique's index — the dedup + first-occurrence leg the
+/// batch verbs and the Cassandra `IN` override share (a value-only test cannot
+/// observe client-side dedup, so it is pinned directly here).
+#[test]
+fn dedupe_uniques_and_plan() -> Result<()> {
+    let bytes_in = [5u8, 9, 5, 2, 9, 5];
+    let batch = CoordinateBatch::chunks(bytes_in.iter().map(|&b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    let (uniques, plan) = dedupe(&batch);
+    let unique_bytes: Vec<u8> = uniques.iter().map(|c| c.as_bytes()[0]).collect();
+    assert_eq!(
+        unique_bytes,
+        vec![5, 9, 2],
+        "first-occurrence order, deduped"
+    );
+    assert_eq!(
+        plan.as_slice(),
+        &[0, 1, 0, 2, 1, 0],
+        "each position maps to its unique"
+    );
+    Ok(())
+}
+
+/// Batch-read parity over the memory cell store: `get_many` answers each
+/// position exactly as the sequential point-`get` oracle, across duplicates,
+/// unknowns, absence, and provisional resolution.
+#[test]
+fn prop_memory_batch_read_parity() {
+    fn property(trace: BatchReadTrace) -> Result<bool> {
+        let oracle = ScriptedOracle::default();
+        let store = memory_store(MemoryCells::new(), oracle.clone());
+        executor::block_on(run_batch_read_parity_trace(store, oracle, trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
+}
+
+/// Within-batch duplicate co-observation + scatter alignment over the memory
+/// store (deterministic).
+#[test]
+fn memory_batch_duplicate_co_observation() -> Result<()> {
+    let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
+    executor::block_on(run_batch_duplicate_co_observation(store))
+}
+
+/// Every input position is answered over two chunks (deterministic alignment).
+#[test]
+fn memory_batch_alignment() -> Result<()> {
+    let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
+    executor::block_on(run_batch_alignment(store))
+}
+
+/// A store overriding only `get_for_cache` (returning a TTL) inherits the
+/// default `get_many_for_cache`, which must carry that TTL metadata through for
+/// every position — the guard against defaulting the cache-fill batch to
+/// `get_many` + `None` TTLs (the `commit_provisional`-wrapper bug class).
+#[test]
+fn forwarding_default_preserves_ttl() -> Result<()> {
+    use self::support::TtlStub;
+
+    let ttl = CompactDuration::new(3_600);
+    let store = TtlStub::new(bytes(7), Some(ttl));
+    let id = CollectionId::new(
+        StateKey::new(Uuid::new_v4(), Arc::from("key")),
+        StateType::Application,
+        StateName::try_new("entries")?,
+    );
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(3),
+    };
+    let batch = CoordinateBatch::chunks([0u8, 1].map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    let got = executor::block_on(store.get_many_for_cache(&id, SECTIONS[0], &batch, own))?;
+    assert_eq!(got.len(), 2, "every position answered");
+    for (_, remaining) in &got {
+        assert_eq!(
+            *remaining,
+            Some(ttl),
+            "the inherited default carries the TTL through"
+        );
+    }
+    Ok(())
 }
 
 /// Deque collection soundness over the real session lifecycle: random

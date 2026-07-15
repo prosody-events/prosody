@@ -25,11 +25,13 @@ use crate::state::fjall::{MarkerPresence, test_db};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
+use crate::state::store::CoordinateBatch;
 use crate::state::tests::cell_suite::{
-    ApplyTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle, ProbedMarker,
-    ScanTrace, ScriptedOracle, ShapeProbe, Trace, probed_parts, run_apply_idempotence,
-    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
-    value_cell,
+    ApplyTrace, BatchReadTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle,
+    ProbedMarker, SECTIONS, ScanTrace, ScriptedOracle, ShapeProbe, Trace, bytes, cell_in,
+    probed_parts, run_apply_idempotence, run_batch_alignment, run_batch_duplicate_co_observation,
+    run_batch_read_parity_trace, run_bottom_scan_trace, run_crash_equivalence_trace,
+    run_overlay_trace, run_overwrite_trace, value_cell,
 };
 use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
@@ -1681,4 +1683,200 @@ fn fits_one_batch_decides_on_both_budgets() {
     assert!(!fits_one_batch([1, 1, 1].into_iter(), 100, 2));
     // Empty always fits.
     assert!(fits_one_batch(iter::empty(), 0, 0));
+}
+
+/// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
+/// override answers each position exactly as the sequential point-`get` oracle
+/// over an identically-seeded sibling collection — across duplicates, unknowns,
+/// absence, and provisional resolution. Runs directly on the bare store so the
+/// override (dedup, scatter, first-occurrence resolution) is exercised, not the
+/// `Cached` default.
+#[test]
+fn prop_cassandra_batch_read_parity() {
+    async fn run(trace: BatchReadTrace) -> Result<bool> {
+        let fx = fixture().await?;
+        let oracle = ScriptedOracle::default();
+        let store = fx.bottom_store(oracle.clone());
+        run_batch_read_parity_trace(store, oracle, trace).await
+    }
+
+    init_test_logging();
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(BatchReadTrace) -> TestResult,
+        );
+}
+
+/// Within-batch duplicate co-observation + scatter alignment over the live
+/// store.
+#[tokio::test]
+async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    run_batch_duplicate_co_observation(fx.bottom_store(ScriptedOracle::default())).await
+}
+
+/// Every input position answered over two chunks on the live store.
+#[tokio::test]
+async fn cassandra_batch_alignment() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    run_batch_alignment(fx.bottom_store(ScriptedOracle::default())).await
+}
+
+/// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
+/// whose clustering order (A `0x01` < B `0xFE`) is the reverse of the read list
+/// `[B, A]`. `get_many` decodes the uniques in first-occurrence input order, so
+/// it must surface B's `BlobWithoutEncoding` — not A's `PrevWithoutEvent`,
+/// which the `IN` query returns first in clustering order. The corruptions are
+/// seeded by raw CQL (unreachable through the store verbs), and the sequential
+/// point `get`s confirm the two rows are distinguishable.
+#[tokio::test]
+async fn first_error_is_first_input_position() -> Result<()> {
+    use super::CellCorruptReason;
+    use super::encoding::{Encoding, encode_payload};
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::resolve::ResolveCellError;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("resolve-order")?;
+    let id = c.id();
+    let own = event(9);
+    let cell_a = cell_in(0, 0x01);
+    let cell_b = cell_in(0, 0xFE);
+
+    // A (`0x01`, low): `prev_data` present with a valid frame, `event` NULL ⇒
+    // PrevWithoutEvent. B (`0xFE`, high): `data` present, `encoding` NULL ⇒
+    // BlobWithoutEncoding.
+    let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
+    let insert_a = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate, prev_data, encoding, version) VALUES (?, ?, ?, ?, 0, 0, ?, ?, \
+         4, 1)"
+    );
+    let insert_b = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate, data) VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
+    );
+    let session = fx.cassandra.session();
+    session
+        .query_unpaged(
+            insert_a,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                cell_a.coordinate.as_bytes(),
+                prev_blob.as_ref(),
+            ),
+        )
+        .await?;
+    session
+        .query_unpaged(
+            insert_b,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                cell_b.coordinate.as_bytes(),
+                bytes(0xBB).as_ref(),
+            ),
+        )
+        .await?;
+
+    // The two rows are distinguishable through the sequential oracle.
+    assert!(
+        matches!(
+            store.get(id, &cell_a, own).await,
+            Err(ResolveCellError::Store(
+                CassandraCellStoreError::CorruptCell(CellCorruptReason::PrevWithoutEvent)
+            ))
+        ),
+        "A alone decodes as PrevWithoutEvent"
+    );
+    assert!(
+        matches!(
+            store.get(id, &cell_b, own).await,
+            Err(ResolveCellError::Store(
+                CassandraCellStoreError::CorruptCell(CellCorruptReason::BlobWithoutEncoding)
+            ))
+        ),
+        "B alone decodes as BlobWithoutEncoding"
+    );
+
+    // Read list `[B, A]`: first-occurrence resolution must surface B's error.
+    let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    match store.get_many(id, SECTIONS[0], &batch, own).await {
+        Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => {
+            assert_eq!(
+                reason,
+                CellCorruptReason::BlobWithoutEncoding,
+                "the earliest input position (B) determines the surfaced error"
+            );
+        }
+        other => return Err(eyre!("expected B's BlobWithoutEncoding, got {other:?}")),
+    }
+    Ok(())
+}
+
+/// Marker-window re-read pin: committed rows `[1, 2, 3]` with a standing
+/// FOREIGN event marker carrying a section clear whose only survivor is `2` (so
+/// `1` and `3` are cleared). Reading the batch with a foreign `own` must
+/// resolve the clears-bearing marker (`help_read_window`), apply the gap
+/// deletes, re-issue the `IN` query, and return post-clear truth: `1 → None`,
+/// `2 → present`, `3 → None`. Skipping the re-read would serve the stale
+/// pre-clear rows for `1` and `3`.
+#[tokio::test]
+async fn batch_returns_post_clear_truth() -> Result<()> {
+    use crate::state::oracle::CommitOracle;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let oracle = ScriptedOracle::default();
+    let store = fx.bottom_store(oracle.clone());
+    let c = collection("clears-window")?;
+    let id = c.id();
+
+    store
+        .write_resolved(
+            &c,
+            &[
+                (cell_in(0, 1), Some(bytes(1))),
+                (cell_in(0, 2), Some(bytes(2))),
+                (cell_in(0, 3), Some(bytes(3))),
+            ],
+            &[],
+        )
+        .await?;
+
+    // A foreign committed event whose marker clears section 0 down to survivor 2.
+    let foreign = event(0xF0);
+    let survivors = [(cell_in(0, 2), Some(bytes(2)))];
+    let clear = SectionClear::frozen_resolved(SECTIONS[0], &survivors);
+    let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear));
+    store.write_provisional(&c, &[], Some(&marker)).await?;
+    oracle.record_message(Uuid::from_u128(0xF0)).await?;
+
+    let batch = CoordinateBatch::chunks([1u8, 2, 3].map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    let got = store.get_many(id, SECTIONS[0], &batch, event(7)).await?;
+    assert_eq!(
+        got.as_slice(),
+        &[
+            Committed::new(None),
+            Committed::new(Some(bytes(2))),
+            Committed::new(None),
+        ],
+        "the cleared coordinates read absent and the survivor reads present"
+    );
+    Ok(())
 }
