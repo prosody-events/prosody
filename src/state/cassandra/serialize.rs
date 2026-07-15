@@ -1,4 +1,5 @@
-//! Write-only scylla `SerializeValue` impls for keyed-state discriminators.
+//! Write-only scylla `SerializeValue` impls for keyed-state discriminators and
+//! the coordinate blob.
 //!
 //! Each persisted discriminator binds directly into a `SerializeRow` tuple
 //! through its own `SerializeValue` impl, rather than being hand-converted to

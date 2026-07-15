@@ -801,9 +801,10 @@ where
                 section,
                 coordinate: Coordinate::clone(coordinate),
             };
-            let (raw, ttl) = match rows.iter().find(|(found, _)| found == coordinate) {
-                Some((_, row)) => {
-                    decode::try_decode_cell_ttl(row.clone()).map_err(ResolveCellError::Store)?
+            let (raw, ttl) = match rows.iter().position(|(found, _)| found == coordinate) {
+                Some(pos) => {
+                    let (_, row) = rows.swap_remove(pos);
+                    decode::try_decode_cell_ttl(row).map_err(ResolveCellError::Store)?
                 }
                 None => (Cell::Resolved(Committed::new(None)), None),
             };

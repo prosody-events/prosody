@@ -113,10 +113,9 @@ const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 ///
 /// An alias of [`CELL_BATCH`](crate::state::store::CELL_BATCH) — the point-get
 /// stream chunk width and the store batch-read width are one number, and the
-/// `> 0` invariant both chunk sources rely on (the map's
-/// `keys.by_ref().take(STREAM_CHUNK)` must drain ≥ 1 key per chunk; the deque's
-/// `(start + STREAM_CHUNK).min(len)` must advance past `start`) is enforced
-/// once on `CELL_BATCH`.
+/// `> 0` invariant the shared `CellView::scan_at` chunk source relies on
+/// (`coords.by_ref().take(STREAM_CHUNK)` must take ≥ 1 coordinate per chunk) is
+/// enforced once on `CELL_BATCH`.
 pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
