@@ -1104,7 +1104,8 @@ mod typed_cell_view {
 
     // ======================================================================
     // Scan-shell contract pins (below the collections): `CellView::scan_at`
-    // (the coordinate source) and `CellView::fenced` (the per-emission fence).
+    // (the coordinate source), `CellView::fenced` (the per-emission fence),
+    // and `CellView::get_many` (the batch point-read).
     // ======================================================================
 
     /// Builds a scope over a fresh, live test session and seeds `keys` as
@@ -1373,7 +1374,7 @@ mod typed_cell_view {
     }
 
     /// `CellView::get_many` fans its typed resolves out across the WHOLE call,
-    /// not per store sub-batch (ruling 7): a `RESOLVE_FANOUT`-key call (which
+    /// not per store sub-batch: a `RESOLVE_FANOUT`-key call (which
     /// spans two `CELL_BATCH` store sub-batches) parks ALL its resolves before
     /// any is released, so its resolve cost is one loader window, not the
     /// number of sub-batches. Falsifiable: nesting the resolve inside the

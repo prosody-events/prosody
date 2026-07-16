@@ -383,7 +383,7 @@ where
     /// Reads, decodes, and resolves the visible committed value at `key` — the
     /// point-op read surface: the overlay check → `raw_get` → cache-fill under
     /// the permit, then decode + resolve through [`Self::resolve_bytes`]. The
-    /// point-get streams compose this per chunk under one chunk permit.
+    /// point-op handles compose this under a single read permit.
     ///
     /// Written in the desugared `-> impl Future + Send` form for two reasons an
     /// `async fn` could not express:

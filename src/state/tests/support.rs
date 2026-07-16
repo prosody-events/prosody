@@ -405,9 +405,10 @@ where
         batch: &'a CoordinateBatch,
         own: EventRef,
     ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
-        // One increment per batch read *request*; delegating to the inner store
-        // keeps its own per-coordinate `get` reads off this wrapper's `get`
-        // counter, so a miss arm shows `batch_cache_reads()==1, lower_reads()==0`.
+        // One increment of the `batch_reads()` counter per batch read
+        // *request*; delegating to the inner store keeps its own per-coordinate
+        // `get` reads off this wrapper's `get` counter, so they never inflate
+        // `lower_reads()`.
         self.counts.get_many.fetch_add(1, Ordering::Relaxed);
         self.inner.get_many(collection, section, batch, own)
     }

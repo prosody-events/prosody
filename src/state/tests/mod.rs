@@ -1217,7 +1217,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         counting.batch_reads()
     );
     assert!(
-        counting.lower_reads() <= 2,
+        counting.lower_reads() <= 1,
         "entries flow through the batch verb, not point get; only the keyset meta read remains a \
          point read (lower_reads={})",
         counting.lower_reads()
@@ -1317,7 +1317,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         counting.batch_reads()
     );
     assert!(
-        counting.lower_reads() <= 2,
+        counting.lower_reads() <= 1,
         "entries flow through the batch verb, not point get; only the bounds meta read remains a \
          point read (lower_reads={})",
         counting.lower_reads()

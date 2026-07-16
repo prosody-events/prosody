@@ -9,6 +9,9 @@
 //! - `get` short-circuits the dirty leg: a buffered `Set` returns those bytes,
 //!   a `Cleared` returns known-absence, an untouched cell falls through to
 //!   `lower.get`.
+//! - `get_many` applies that same dirty short-circuit per position across a
+//!   [`CoordinateBatch`], then reads only the untouched positions through one
+//!   `lower.get_many` sub-batch and scatters the answers back into alignment.
 //! - `scan_cells` lazily merges the dirty leg against `lower.scan_cells` in
 //!   `coordinate` order — **dirty wins on a key tie**, a dirty `Cleared`
 //!   **hides** the lower cell, an untouched cell falls through.
@@ -18,7 +21,7 @@
 //!   snapshot filtered to the range.
 //!
 //! The overlay deliberately does **not** implement [`CellStore`]: it exposes
-//! only the two transactional reads, so cache-fill and promote paths cannot
+//! only the transactional reads, so cache-fill and promote paths cannot
 //! route through it — a `Cached<Overlay<…>>` composition or a cache fill of
 //! this handler's uncommitted dirty value is uncompilable, and durable writes
 //! go through [`Overlay::lower`] by construction.

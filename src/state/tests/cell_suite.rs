@@ -1639,9 +1639,9 @@ where
                 .chain(iter::once(Coordinate::from_bytes(vec![0])));
             // `CELLS + 1` (= 13) ≤ `CELL_BATCH`, so `chunks` yields one batch;
             // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
-            let Some(batch) = CoordinateBatch::chunks(coords).next() else {
-                continue;
-            };
+            let batch = CoordinateBatch::chunks(coords)
+                .next()
+                .ok_or_else(|| eyre!("chunks() must yield one batch for CELLS+1 <= CELL_BATCH"))?;
             let got = overlay
                 .get_many(&id, SECTIONS[s as usize], &batch, own)
                 .await?;
