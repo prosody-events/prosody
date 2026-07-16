@@ -15,7 +15,7 @@ use crate::state::oracle::CommitOracle;
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
-use crate::state::store::{CacheBatch, CellStore, CommittedBatch, CoordinateBatch};
+use crate::state::store::{CELL_BATCH, CacheBatch, CellStore, CommittedBatch, CoordinateBatch};
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
     StoreOutcome,
@@ -27,6 +27,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use futures::stream::{self, Stream};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
+use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};
@@ -146,6 +147,16 @@ where
         _name: &StateName,
         _cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
+    async fn get_many(
+        &self,
+        _state_type: StateType,
+        _name: &StateName,
+        _section: Section,
+        _batch: &CoordinateBatch,
+    ) -> Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 

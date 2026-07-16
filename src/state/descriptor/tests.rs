@@ -21,8 +21,8 @@ use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::{
-    CommitMode, EventRef, PartitionBackend, SHARD_FANOUT_CONCURRENCY, StateKey, StateName,
-    StateType,
+    CommitMode, EventRef, PartitionBackend, RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateKey,
+    StateName, StateType,
 };
 use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
 use crate::timers::duration::CompactDuration;
@@ -1294,14 +1294,15 @@ mod typed_cell_view {
         }
     }
 
-    /// `scan_at` keeps at most `STREAM_CHUNK` reads/resolutions in flight and
-    /// starts a second chunk only after the first drains: a chunk is bounded by
-    /// `buffered(STREAM_CHUNK)` over `by_ref().take(STREAM_CHUNK)`, and the
-    /// unfold awaits the chunk's `try_collect` before the next. Seeds
+    /// `scan_at` keeps at most `STREAM_CHUNK` resolutions in flight and starts
+    /// a second chunk only after the first drains: each chunk is read by
+    /// ONE `get_many` over `by_ref().take(STREAM_CHUNK)` keys, and the
+    /// unfold awaits that chunk's fetch + resolve before the next. Seeds
     /// `STREAM_CHUNK + EXTRA` gated cells; when chunk 1 is fully parked,
     /// exactly `STREAM_CHUNK` resolutions are in flight (chunk 2 has not
-    /// begun). Falsifiable: flattening all coordinates into one `buffered`
-    /// window (no chunking) would park all `STREAM_CHUNK + EXTRA` at once.
+    /// begun, because `RESOLVE_FANOUT ≥ STREAM_CHUNK` parks chunk 1's whole
+    /// width). Falsifiable: flattening all coordinates into one chunk would
+    /// park all `STREAM_CHUNK + EXTRA` at once.
     #[tokio::test(flavor = "current_thread")]
     async fn scan_at_bounds_in_flight_reads_to_stream_chunk() -> Result<()> {
         const EXTRA: usize = 4;
@@ -1368,6 +1369,78 @@ mod typed_cell_view {
             (0..n as i64).collect::<Vec<_>>(),
             "every seeded cell is yielded in input order across the two chunks"
         );
+        Ok(())
+    }
+
+    /// `CellView::get_many` fans its typed resolves out across the WHOLE call,
+    /// not per store sub-batch (ruling 7): a `RESOLVE_FANOUT`-key call (which
+    /// spans two `CELL_BATCH` store sub-batches) parks ALL its resolves before
+    /// any is released, so its resolve cost is one loader window, not the
+    /// number of sub-batches. Falsifiable: nesting the resolve inside the
+    /// Phase-1 per-sub-batch loop would let only the first sub-batch's `≤
+    /// CELL_BATCH` resolutions park (`< RESOLVE_FANOUT`), so the releaser
+    /// `bail!`s (or the join hangs → 30s timeout) → red.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_many_resolves_whole_call_concurrently() -> Result<()> {
+        let n = RESOLVE_FANOUT; // > CELL_BATCH ⇒ ≥ 2 store sub-batches
+        let ladder = Arc::new(GateLadder::new(n));
+        let scope = CellScope::new(
+            gate_session(ladder.clone()),
+            StateType::Application,
+            StateName::try_new("resolve_fanout")?,
+        );
+        // Seed all n as dirty Sets in the SAME session (payload == key) so
+        // Phase 1 answers from the overlay — the pin isolates resolve scheduling.
+        let seed = scope.typed::<SeedCell>(CELL_SECTION);
+        let permit = seed
+            .mutate_permit()
+            .await
+            .map_err(|e| eyre!("seed permit: {e}"))?;
+        for key in 0..n as i64 {
+            seed.set(&permit, &key, key)
+                .await
+                .map_err(|e| eyre!("seed {key}: {e}"))?;
+        }
+        drop(permit);
+
+        let view = scope.typed::<GatedCell>(CELL_SECTION);
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let collector = async {
+            let read = view.read_permit().await;
+            let out = view
+                .get_many(&read, &keys)
+                .await
+                .map_err(|e| eyre!("get_many: {e}"))?;
+            Ok::<_, color_eyre::Report>(out)
+        };
+        // The releaser observes the whole-call ceiling: with the collector
+        // polled first, ALL n resolves park (both sub-batches read, then the one
+        // buffered(RESOLVE_FANOUT) window resolves the whole call) before any
+        // release. A nested-per-sub-batch defect never reaches n here.
+        let releaser = async {
+            if ladder.parked() != n {
+                bail!(
+                    "all {n} resolves must be in flight before release; parked = {}",
+                    ladder.parked()
+                );
+            }
+            for idx in 0..n {
+                ladder.release(idx);
+            }
+            Ok(())
+        };
+        let (collected, outcome) = timeout(
+            Duration::from_secs(30),
+            Box::pin(async { tokio::join!(collector, releaser) }),
+        )
+        .await
+        .map_err(|_| eyre!("resolve fan-out hung"))?;
+        outcome?;
+        let out = collected?;
+        assert_eq!(out.len(), n, "aligned output");
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(*v, Some(i as i64), "position {i} resolved in order");
+        }
         Ok(())
     }
 }

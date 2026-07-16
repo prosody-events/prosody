@@ -56,6 +56,7 @@ use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
+use std::iter;
 use std::slice;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -1627,8 +1628,89 @@ where
                 }
             }
         }
+
+        // Batch leg: the same section's cells read through `get_many` (plus a
+        // duplicate of coord 0) answer each position exactly as the point-`get`
+        // oracle, and the two coord-0 positions co-observe. This runs the
+        // overlay's split-and-scatter against the same model, after every op.
+        for s in 0..SECTIONS.len() as u8 {
+            let coords = (0..CELLS)
+                .map(|c| Coordinate::from_bytes(vec![c]))
+                .chain(iter::once(Coordinate::from_bytes(vec![0])));
+            // `CELLS + 1` (= 13) ≤ `CELL_BATCH`, so `chunks` yields one batch;
+            // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
+            let Some(batch) = CoordinateBatch::chunks(coords).next() else {
+                continue;
+            };
+            let got = overlay
+                .get_many(&id, SECTIONS[s as usize], &batch, own)
+                .await?;
+            if got.len() != CELLS as usize + 1 {
+                return Ok(false);
+            }
+            for c in 0..CELLS {
+                if got[c as usize].clone().into_inner() != model.visible(s, c) {
+                    return Ok(false);
+                }
+            }
+            // The duplicate coord-0 position co-observes the coord-0 answer.
+            if got[CELLS as usize] != got[0] {
+                return Ok(false);
+            }
+        }
     }
     Ok(true)
+}
+
+/// Deterministic precedence pin for [`Overlay::get_many`]: a dirty `Set` inside
+/// a standing dirty section-clear answers its bytes (the `Set` arm is checked
+/// BEFORE the section-clear), and a dirty-answered position never reaches the
+/// lower batch. Read `[5, 5]` so the duplicate co-observation is pinned too.
+///
+/// Memory-only (the `batch_reads() == 0` claim needs the counting store); the
+/// backend-generic parity leg in [`run_overlay_trace`] covers the split itself
+/// on both backends.
+pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
+    counting: CountingCellStore<S>,
+) -> Result<()> {
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let id = CollectionId::new(
+        state_key,
+        StateType::Application,
+        StateName::try_new("entries")?,
+    );
+    let collection_ref = CollectionRef::new(id.clone(), None);
+    let own = EventRef::Message {
+        dedup_id: Uuid::from_u128(3),
+    };
+    let overlay = Overlay::new(Arc::new(DirtyStore::new()), counting.clone());
+    // Committed base under the section.
+    overlay
+        .lower()
+        .write_resolved(&collection_ref, &[(cell_in(0, 5), Some(bytes(42)))], &[])
+        .await?;
+    counting.reset();
+    // A standing dirty section-clear, then a dirty `Set` repopulating coord 5.
+    overlay.dirty().clear_section(&id, SECTIONS[0]);
+    overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
+    let coords = [5u8, 5].map(|b| Coordinate::from_bytes(vec![b]));
+    let batch = CoordinateBatch::chunks(coords)
+        .next()
+        .ok_or_else(|| eyre!("two coordinates must yield one batch"))?;
+    let got = overlay.get_many(&id, SECTIONS[0], &batch, own).await?;
+    assert_eq!(got.len(), 2, "every input position is answered");
+    assert_eq!(
+        got[0].clone().into_inner(),
+        Some(bytes(7)),
+        "a dirty Set beats a standing section-clear"
+    );
+    assert_eq!(got[0], got[1], "the duplicate position co-observes the Set");
+    assert_eq!(
+        counting.batch_reads(),
+        0,
+        "dirty-answered positions never reach the lower batch"
+    );
+    Ok(())
 }
 
 // ─────────────────────────── scan merge

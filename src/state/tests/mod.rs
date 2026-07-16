@@ -9,7 +9,8 @@ use self::cell_suite::{
     ApplyTrace, BatchReadTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace,
     PoisonHandle, ScanTrace, ScriptedOracle, Trace, run_apply_idempotence, run_batch_alignment,
     run_batch_duplicate_co_observation, run_batch_read_parity_trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    run_crash_equivalence_trace, run_overlay_precedence_pin, run_overlay_trace,
+    run_overwrite_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
@@ -234,6 +235,112 @@ fn memory_batch_duplicate_co_observation() -> Result<()> {
 fn memory_batch_alignment() -> Result<()> {
     let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
     executor::block_on(run_batch_alignment(store))
+}
+
+/// A dirty `Set` inside a standing dirty section-clear answers its bytes
+/// through `Overlay::get_many` (precedence + duplicate co-observation), and the
+/// dirty-answered positions never reach the lower batch.
+#[test]
+fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
+    let counting =
+        CountingCellStore::new(memory_store(MemoryCells::new(), ScriptedOracle::default()));
+    executor::block_on(run_overlay_precedence_pin(counting))
+}
+
+/// A cold, dense `CELL_BATCH`-entry `Tracked` map streamed to exhaustion issues
+/// exactly ONE lower batch read for its entries — a full-width scan chunk is
+/// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
+/// stays a point read.
+/// FALSIFICATION: revert `coordinate_source` to the per-key point-`get` loop →
+/// `batch_reads == 0` and `lower_reads == CELL_BATCH` (+ keyset) → both asserts
+/// red. Counters are read after the full drain, so nothing masks them.
+#[test]
+fn map_cold_chunk_is_one_batch_read() -> Result<()> {
+    executor::block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let descriptor =
+            map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("chunk1");
+        let mut registry = CollectionDefRegistry::new(None);
+        registry.register(
+            &descriptor,
+            CollectionDef {
+                keyset_limit: 4096,
+                ..CollectionDef::new(None)
+            },
+        )?;
+        let registry = Arc::new(registry);
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            registry.clone(),
+        ));
+        let armed: ArmedKeys = Arc::default();
+        let id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("chunk1")?,
+        );
+
+        // Seed a dense committed map of exactly one full chunk.
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let session = resolve_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            ResolveCounter::default(),
+        );
+        let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        for i in 0..CELL_BATCH as i64 {
+            seed.set(i, Value::from(i))
+                .await
+                .map_err(|e| eyre!("{e}"))?;
+        }
+        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+        // Fresh cold session, zeroed counters; drain the WHOLE stream.
+        counting.reset();
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(2),
+        };
+        let session = resolve_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            ResolveCounter::default(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        let drained: Vec<_> = {
+            let stream = handle.stream(Direction::Forward);
+            futures::pin_mut!(stream);
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                out.push(item.map_err(|e| eyre!("stream: {e}"))?);
+            }
+            out
+        };
+        assert_eq!(drained.len(), CELL_BATCH, "all entries drained");
+        assert_eq!(
+            counting.batch_reads(),
+            1,
+            "a cold full-width chunk is ONE lower batch read"
+        );
+        assert!(
+            counting.lower_reads() <= 1,
+            "only the keyset meta read is a point read (lower_reads={})",
+            counting.lower_reads()
+        );
+        Ok(())
+    })
 }
 
 /// A store overriding only `get_for_cache` (returning a TTL) inherits the
@@ -644,10 +751,10 @@ async fn drain_map_stream(
 
 /// The Map keyset budget pins for the point-get arms (parity of
 /// `deque_stream_issues_no_scans`): a never-written map yields nothing and
-/// issues zero scans, and a small committed map streams as pure point gets —
-/// zero scans and exactly `len + 1` gets (the keyset cell plus one per entry,
-/// no bound reads), in both directions. The liveness of these zeros is proved
-/// by `map_overflowed_stream_issues_one_scan`.
+/// issues zero scans, and a small committed map streams through the batch verb
+/// — zero scans, one keyset point-get, and one batch read for the entries, in
+/// both directions. The liveness of these zeros is proved by
+/// `map_overflowed_stream_issues_one_scan`.
 #[test]
 fn map_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
@@ -728,8 +835,13 @@ fn map_stream_issues_no_scans() -> Result<()> {
             );
             assert_eq!(
                 counting.lower_reads(),
-                4,
-                "the keyset cell plus three entry gets — no bound reads"
+                1,
+                "the keyset cell — entries flow through the batch verb, not point get"
+            );
+            assert_eq!(
+                counting.batch_reads(),
+                1,
+                "the three entries ride one lower batch read"
             );
         }
         Ok(())
@@ -853,13 +965,13 @@ async fn seed_wide_deque(
     Ok(())
 }
 
-/// Sub-threshold deque iteration is pure point reads: streaming a small
-/// committed deque issues **zero** lower-store scans and exactly `len + 1`
-/// lower gets (`len` entries plus the bounds cell), in both directions. The
-/// companion wide-window assertions prove the counters are live and pin the
-/// fallback: a directly-seeded window wider than
-/// [`deque::DEQUE_POINT_ITERATION_MAX`] streams every entry in order through
-/// exactly one lower scan (plus the one bounds get).
+/// Sub-threshold deque iteration streams through the batch verb: a small
+/// committed deque issues **zero** lower-store scans, one bounds point-get, and
+/// one batch read for the entries, in both directions. The companion
+/// wide-window assertions prove the counters are live and pin the fallback: a
+/// directly-seeded window wider than [`deque::DEQUE_POINT_ITERATION_MAX`]
+/// streams every entry in order through exactly one lower scan (plus the one
+/// bounds get).
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
@@ -924,8 +1036,13 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             );
             assert_eq!(
                 counting.lower_reads(),
-                expected.len() + 1,
-                "exactly len entry gets plus the bounds get"
+                1,
+                "the bounds cell — entries flow through the batch verb, not point get"
+            );
+            assert_eq!(
+                counting.batch_reads(),
+                1,
+                "the window's entries ride one lower batch read"
             );
         }
 
@@ -1003,16 +1120,18 @@ fn resolve_session(
 }
 
 /// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
-/// `n`-entry `Tracked` map is genuinely incremental — it fetches at most one
-/// chunk beyond `k` (plus the single keyset read) and resolves at most
-/// `k + STREAM_CHUNK` values, never the whole `n`-entry collection. The
-/// counting store bounds fetches and the counting resolver bounds resolutions;
-/// both counters sit at the lowest layer, so nothing masks a materialization.
-/// FALSIFICATION: widen the per-chunk `keys.by_ref().take(STREAM_CHUNK)`
-/// in `stream` to `.take(usize::MAX)` (drain every tracked key in one chunk) →
-/// `take(k)` fetches and resolves all `n` → `lower_reads == n + 1` and
-/// `resolves == n`, both `> k + STREAM_CHUNK` for `n ≫ k` → red. (Inflating
-/// `STREAM_CHUNK` itself cannot falsify: the assertion bound moves with it.)
+/// `n`-entry `Tracked` map is genuinely incremental — it issues at most one
+/// batch read beyond `k` (entries flow through the batch verb; only the keyset
+/// meta cell is a point read) and resolves at most `k + STREAM_CHUNK` values,
+/// never the whole `n`-entry collection. The counting store bounds fetches and
+/// the counting resolver bounds resolutions; both counters sit at the lowest
+/// layer, so nothing masks a materialization.
+/// FALSIFICATION: widen `coords.by_ref().take(STREAM_CHUNK)` in
+/// `coordinate_source` to `.take(usize::MAX)` (drain every tracked key in one
+/// chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
+/// n.div_ceil(16)` and `resolves == n`, both over their bounds for `n ≫ k` →
+/// red. (Inflating `STREAM_CHUNK` itself cannot falsify: the assertion bound
+/// moves with it.)
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -1093,9 +1212,14 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.lower_reads() <= k + STREAM_CHUNK + 1,
-        "a lazy map take(k) fetches at most one chunk beyond k plus the keyset read (reads={}, \
-         k={k}, n={n})",
+        counting.batch_reads() <= k.div_ceil(STREAM_CHUNK) + 1,
+        "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
+        counting.batch_reads()
+    );
+    assert!(
+        counting.lower_reads() <= 2,
+        "entries flow through the batch verb, not point get; only the keyset meta read remains a \
+         point read (lower_reads={})",
         counting.lower_reads()
     );
     assert!(
@@ -1108,12 +1232,14 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 
 /// The stream-laziness property (deque): the structural twin of
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
-/// point-get arm — at most one chunk beyond `k` fetched (plus the single bounds
-/// read) and at most `k + STREAM_CHUNK` resolved. FALSIFICATION: collapse the
-/// chunk end `(start + STREAM_CHUNK).min(len)` in the unfold to `len` (fetch
-/// the whole window in one chunk) → `lower_reads == n + 1` and `resolves == n`,
-/// both `> k + STREAM_CHUNK` for `n ≫ k` → red. (Inflating `STREAM_CHUNK`
-/// itself cannot falsify: the assertion bound moves with it.)
+/// point-get arm — at most one batch read beyond `k` (entries flow through the
+/// batch verb; only the bounds meta cell is a point read) and at most
+/// `k + STREAM_CHUNK` resolved. FALSIFICATION: widen
+/// `coords.by_ref().take(STREAM_CHUNK)` in `coordinate_source` to
+/// `.take(usize::MAX)` (fetch the whole window in one chunk) →
+/// `batch_reads == n.div_ceil(16)` and `resolves == n`, both over their bounds
+/// for `n ≫ k` → red. (Inflating `STREAM_CHUNK` itself cannot falsify: the
+/// assertion bound moves with it.)
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -1186,9 +1312,14 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.lower_reads() <= k + STREAM_CHUNK + 1,
-        "a lazy deque take(k) fetches at most one chunk beyond k plus the bounds read (reads={}, \
-         k={k}, n={n})",
+        counting.batch_reads() <= k.div_ceil(STREAM_CHUNK) + 1,
+        "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
+        counting.batch_reads()
+    );
+    assert!(
+        counting.lower_reads() <= 2,
+        "entries flow through the batch verb, not point get; only the bounds meta read remains a \
+         point read (lower_reads={})",
         counting.lower_reads()
     );
     assert!(

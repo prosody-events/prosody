@@ -35,14 +35,15 @@
 //! is not the collect-then-merge the design forbids for large backing ranges.
 
 use super::cell::Committed;
-use super::cell_key::{CellKey, Coordinate, Direction, Scan};
+use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::event_ref::EventRef;
 use super::identity::CollectionId;
-use super::store::CellStore;
+use super::store::{CELL_BATCH, CellStore, CommittedBatch, CoordinateBatch};
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -105,6 +106,72 @@ where
             }
             None => self.lower.get(collection, cell, own).await,
         }
+    }
+
+    /// Batch twin of [`Self::get`]: classifies each position exactly as `get`
+    /// (a dirty `Set` answers its bytes — checked FIRST, so a `Set` inside a
+    /// dirty-cleared section still answers its bytes; a dirty `Cleared` or a
+    /// standing section-clear answers absence; else untouched), sends ONLY the
+    /// untouched positions down as ONE re-batched lower `get_many` (a subset of
+    /// a batch is `≤ CELL_BATCH`, so exactly one lower call, or zero when every
+    /// position is dirty-answered), and scatters the answers back
+    /// index-aligned.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the lower store's error on the untouched batch read (the
+    /// dirty leg itself is infallible).
+    pub async fn get_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<CommittedBatch, L::Error> {
+        let section_cleared = self.dirty.section_cleared(collection, section);
+        let mut answers: SmallVec<[Option<Committed>; CELL_BATCH]> = smallvec![None; batch.len()];
+        let mut untouched: SmallVec<[Coordinate; CELL_BATCH]> = SmallVec::new();
+        let mut untouched_pos: SmallVec<[usize; CELL_BATCH]> = SmallVec::new();
+        for (i, coordinate) in batch.iter().enumerate() {
+            let cell = CellKey {
+                section,
+                coordinate: Coordinate::clone(coordinate),
+            };
+            match self.dirty.lookup(collection, &cell) {
+                Some(DirtyVal::Set(bytes)) => answers[i] = Some(Committed::new(Some(bytes))),
+                Some(DirtyVal::Cleared) => answers[i] = Some(Committed::new(None)),
+                // A standing dirty clear marker answers known-absence for any
+                // untouched cell of the section (a repopulating `set` would
+                // have matched the `Set` arm above).
+                None if section_cleared => answers[i] = Some(Committed::new(None)),
+                None => {
+                    untouched.push(Coordinate::clone(coordinate));
+                    untouched_pos.push(i);
+                }
+            }
+        }
+        // `untouched.len() ≤ batch.len() ≤ CELL_BATCH`, so this yields zero or
+        // one lower batch; `untouched_pos` aligns 1:1 with its answers.
+        for lower_batch in CoordinateBatch::chunks(untouched) {
+            let lower = self
+                .lower
+                .get_many(collection, section, &lower_batch, own)
+                .await?;
+            for (committed, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
+                answers[pos] = Some(committed);
+            }
+        }
+        // Every position is filled (dirty-answered or lower-scattered), so
+        // `flatten` drops nothing; a short lower result — a lower-store
+        // alignment violation, the same bug the store layer's own `get_many`
+        // default guards — would leave a hole the debug assert catches.
+        let out: CommittedBatch = answers.into_iter().flatten().collect();
+        debug_assert_eq!(
+            out.len(),
+            batch.len(),
+            "batch read must answer every input position"
+        );
+        Ok(out)
     }
 
     /// Scans a range through the overlay, lazily merging the dirty leg

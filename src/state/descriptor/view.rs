@@ -15,12 +15,13 @@ use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::session::{CellSession, MutatePermit, OpPermit};
-use crate::state::{SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
+use crate::state::store::{CELL_BATCH, CoordinateBatch};
+use crate::state::{RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use smallvec::SmallVec;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::marker::PhantomData;
 use tokio::task::coop::cooperative;
 
@@ -111,6 +112,21 @@ impl<S: CellSession> CellScope<S> {
     ) -> Result<Option<Bytes>, StateAccessError> {
         ensure_live(&self.session)?;
         self.session.get(self.state_type, &self.name, cell).await
+    }
+
+    /// Batch twin of [`Self::raw_get`]: reads `section`'s `batch` in one lower
+    /// hop, aligned. Demands the same `OpPermit` witness and runs the same
+    /// `ensure_live` guard as [`Self::raw_get`].
+    async fn raw_get_many(
+        &self,
+        _permit: &OpPermit<'_>,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError> {
+        ensure_live(&self.session)?;
+        self.session
+            .get_many(self.state_type, &self.name, section, batch)
+            .await
     }
 
     /// Scans this collection's cells in `coordinate` order. Unwitnessed by
@@ -398,6 +414,73 @@ where
         }
     }
 
+    /// Reads, decodes, and resolves the visible committed values for `keys` as
+    /// one aligned batch (`result[i]` answers `keys[i]`; duplicate keys are
+    /// answered per position under the observation rules; absent → `None`).
+    /// Owns the chunking and takes the read permit, exactly as [`Self::get`]
+    /// does. The scan coordinate source composes it per chunk under one chunk
+    /// permit.
+    ///
+    /// Runs in two decoupled phases. PHASE 1 — the sub-batched store reads (the
+    /// cheap part; carries marker-help + cache-fill writes beneath the cache,
+    /// whose cross-sub-batch concurrency safety is asserted nowhere): lower
+    /// each key to its coordinate via [`Self::cell`] in input order, split
+    /// via [`CoordinateBatch::chunks`], and read the sub-batches
+    /// SEQUENTIALLY. PHASE 2 — the typed resolves (the expensive part: a
+    /// loader read from Kafka; a pure read, no cache write, no marker
+    /// help): fan out across the WHOLE call through an ordered
+    /// [`buffered`](StreamExt::buffered) window of [`RESOLVE_FANOUT`], so a
+    /// batch's resolves overlap rather than serialize per sub-batch.
+    /// `buffered` preserves input order for the aligned output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session, a codec error (Permanent) when
+    /// a cell's bytes do not decode, or a resolution error from the resolver.
+    pub(in crate::state::descriptor) async fn get_many(
+        &self,
+        permit: &OpPermit<'_>,
+        keys: &[KeyOf<T>],
+    ) -> Result<SmallVec<[Option<ResolvedOf<T>>; CELL_BATCH]>, CellStateError<CellCodecError<T>>>
+    {
+        // PHASE 1: sequential store reads → aligned committed bytes. The
+        // per-chunk coordinate buffer stays inline (`≤ CELL_BATCH`); only the
+        // owned coordinates cross the store await, never a borrow of `self`.
+        let mut bytes: SmallVec<[Option<Bytes>; CELL_BATCH]> = SmallVec::with_capacity(keys.len());
+        for key_chunk in keys.chunks(CELL_BATCH) {
+            let coords: SmallVec<[Coordinate; CELL_BATCH]> =
+                key_chunk.iter().map(|k| self.cell(k).coordinate).collect();
+            for batch in CoordinateBatch::chunks(coords) {
+                bytes.extend(
+                    self.scope
+                        .raw_get_many(permit, self.section, &batch)
+                        .await?,
+                );
+            }
+        }
+        debug_assert_eq!(
+            bytes.len(),
+            keys.len(),
+            "batch read answers every input position"
+        );
+        // PHASE 2: whole-call concurrent typed resolve, input-ordered.
+        let resolved: SmallVec<[Option<ResolvedOf<T>>; CELL_BATCH]> = stream::iter(bytes)
+            .map(|slot| {
+                cooperative(async move {
+                    match slot {
+                        Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
+                            self.resolve_bytes(raw).await?,
+                        )),
+                        None => Ok(None),
+                    }
+                })
+            })
+            .buffered(RESOLVE_FANOUT)
+            .try_collect()
+            .await?;
+        Ok(resolved)
+    }
+
     /// Decodes and resolves raw cell bytes into the exposed value — the private
     /// helper [`Self::get`] and [`Self::scan`] share. `get` decodes and
     /// resolves under its point permit; `scan` resolves each yielded
@@ -513,15 +596,16 @@ where
     /// The coordinate source of the scan shell: resolves the cells addressed by
     /// `coords` (a draining coordinate iterator) in INPUT ORDER, yielding
     /// `(KeyOf<T>, ResolvedOf<T>)` and skipping absent cells uniformly (TTL
-    /// holes, popped positions, membership races). Point gets run
-    /// gate-witnessed in chunks of [`STREAM_CHUNK`]: one read permit per chunk,
-    /// ≤ `STREAM_CHUNK` reads + resolver lookups in flight (`buffered` overlaps
-    /// a cold chunk's durable round trips), collected into a
-    /// `SmallVec<[_; STREAM_CHUNK]>` with the permit released before the first
-    /// yield (`StreamYieldFree`). The permit spans the whole chunk, so an
-    /// attempt boundary (which needs the gate exclusively) serializes AFTER a
-    /// chunk and never tears it. Fenced per emission by [`Self::fenced`]; an
-    /// empty `coords` yields nothing but still passes the fence on exhaustion.
+    /// holes, popped positions, membership races). Each `≤ STREAM_CHUNK` chunk
+    /// is read gate-witnessed by ONE [`Self::get_many`] call — one read permit
+    /// per chunk, one lower batch read on any miss (a chunk is one
+    /// [`CoordinateBatch`] since `STREAM_CHUNK == CELL_BATCH`) — with the
+    /// permit released before the first yield (`StreamYieldFree`). The
+    /// permit spans the whole chunk's fetch and resolve, so an attempt
+    /// boundary (which needs the gate exclusively) serializes AFTER a chunk
+    /// and never tears it. Fenced per emission by [`Self::fenced`]; an
+    /// empty `coords` yields nothing but still passes the fence on
+    /// exhaustion.
     pub(in crate::state::descriptor) fn scan_at<'a, I>(
         &'a self,
         coords: I,
@@ -540,31 +624,25 @@ where
     {
         try_stream! {
             // Chunk source: the draining coordinate iterator is the unfold
-            // state, so owned coordinates move straight from the plan into
-            // their chunk's `get` futures — no per-chunk key Vec. `peek()` ends
-            // the unfold at drain (alloc-free; works for `iter::empty()`).
+            // state. `peek()` ends the unfold at drain (alloc-free; works for
+            // `iter::empty()`).
             let chunks = stream::unfold(coords.peekable(), |mut coords| async move {
                 coords.peek()?; // exhausted ⇒ unfold ends
                 // One read permit per chunk, dropped with this future's scope —
-                // never held across a yield (StreamYieldFree).
+                // never held across a yield (StreamYieldFree). It spans the
+                // whole batch fetch + resolve.
                 let permit = self.read_permit().await;
-                let permit = &permit;
-                let chunk = stream::iter(coords.by_ref().take(STREAM_CHUNK))
-                    .map(|key| {
-                        cooperative(async move {
-                            let value = self.get(permit, &key).await?;
-                            Ok::<_, CellStateError<CellCodecError<T>>>(value.map(|v| (key, v)))
-                        })
-                    })
-                    // `buffered` keeps input order and overlaps a cold chunk's
-                    // durable round-trips.
-                    .buffered(STREAM_CHUNK)
+                // Collect the chunk's ≤ STREAM_CHUNK keys, then ONE batch
+                // fetch + resolve; `get_many` keeps `vals` aligned to `keys`.
+                let keys: SmallVec<[KeyOf<T>; STREAM_CHUNK]> =
+                    coords.by_ref().take(STREAM_CHUNK).collect();
+                let chunk = self.get_many(&permit, &keys).await.map(|vals| {
                     // A `None` is an absent cell: skipped, never an error.
-                    .try_filter_map(|entry| ready(Ok(entry)))
-                    // Short-circuits at the first ordered error, cancelling the
-                    // chunk's in-flight reads; collects inline — no heap.
-                    .try_collect::<SmallVec<[_; STREAM_CHUNK]>>()
-                    .await;
+                    keys.into_iter()
+                        .zip(vals)
+                        .filter_map(|(key, value)| value.map(|v| (key, v)))
+                        .collect::<SmallVec<[_; STREAM_CHUNK]>>()
+                });
                 Some((chunk, coords))
             });
             futures::pin_mut!(chunks);

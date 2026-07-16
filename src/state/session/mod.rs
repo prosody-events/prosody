@@ -60,7 +60,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::access::StateAccessError;
-use crate::state::cell::ProvisionalWrite;
+use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, SealedDescriptor, StateDescriptor, StructuralIdentity,
@@ -72,7 +72,7 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::store::CellStore;
+use crate::state::store::{CELL_BATCH, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -85,6 +85,7 @@ use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
 use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
+use smallvec::SmallVec;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -170,6 +171,24 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
         name: &StateName,
         cell: &CellKey,
     ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
+
+    /// Batch twin of [`Self::get`]: reads one `section`'s coordinates in one
+    /// backend hop, aligned index-wise (`result[i]` answers `batch[i]`;
+    /// duplicate coordinates co-observe; absent → `None`). The section is
+    /// explicit alongside the batch — the point `get` carries it inside the
+    /// [`CellKey`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
+    /// [`StateAccessError::Store`] when the underlying store fails.
+    fn get_many(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> impl Future<Output = Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError>> + Send;
 
     /// The single-section, start-anchored, bidirectional range primitive: a
     /// lazy stream of the visible committed cells in `coordinate` byte order.
@@ -1163,6 +1182,23 @@ where
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_inner())
+    }
+
+    async fn get_many(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError> {
+        let id = self.id_for(state_type, name);
+        let committed = self
+            .inner
+            .overlay
+            .get_many(&id, section, batch, self.inner.event)
+            .await
+            .map_err(|e| StateAccessError::store(&e))?;
+        Ok(committed.into_iter().map(Committed::into_inner).collect())
     }
 
     fn scan<'a>(
