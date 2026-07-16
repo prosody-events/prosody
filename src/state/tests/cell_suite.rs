@@ -45,12 +45,12 @@ use super::super::overlay::Overlay;
 use super::super::resolve::{resolve_cell, resolve_marker, sweep_provisional};
 use super::super::store::{CELL_BATCH, CellStore, CoordinateBatch};
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
-use super::support::CountingCellStore;
+use super::support::{CountingCellStore, batch_of};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::Result;
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1634,14 +1634,9 @@ where
         // oracle, and the two coord-0 positions co-observe. This runs the
         // overlay's split-and-scatter against the same model, after every op.
         for s in 0..SECTIONS.len() as u8 {
-            let coords = (0..CELLS)
-                .map(|c| Coordinate::from_bytes(vec![c]))
-                .chain(iter::once(Coordinate::from_bytes(vec![0])));
             // `CELLS + 1` (= 13) ≤ `CELL_BATCH`, so `chunks` yields one batch;
             // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
-            let batch = CoordinateBatch::chunks(coords)
-                .next()
-                .ok_or_else(|| eyre!("chunks() must yield one batch for CELLS+1 <= CELL_BATCH"))?;
+            let batch = batch_of((0..CELLS).chain(iter::once(0)))?;
             let got = overlay
                 .get_many(&id, SECTIONS[s as usize], &batch, own)
                 .await?;
@@ -1693,10 +1688,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     // A standing dirty section-clear, then a dirty `Set` repopulating coord 5.
     overlay.dirty().clear_section(&id, SECTIONS[0]);
     overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
-    let coords = [5u8, 5].map(|b| Coordinate::from_bytes(vec![b]));
-    let batch = CoordinateBatch::chunks(coords)
-        .next()
-        .ok_or_else(|| eyre!("two coordinates must yield one batch"))?;
+    let batch = batch_of([5, 5])?;
     let got = overlay.get_many(&id, SECTIONS[0], &batch, own).await?;
     assert_eq!(got.len(), 2, "every input position is answered");
     assert_eq!(
@@ -2911,10 +2903,7 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
             &[],
         )
         .await?;
-    let coords = [5u8, 9, 5].map(|b| Coordinate::from_bytes(vec![b]));
-    let batch = CoordinateBatch::chunks(coords)
-        .next()
-        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    let batch = batch_of([5, 9, 5])?;
     let got = store.get_many(&id, SECTIONS[0], &batch, own).await?;
     assert_eq!(got.len(), 3, "every position answered");
     assert_eq!(got[0], got[2], "duplicate coordinate co-observes one value");
