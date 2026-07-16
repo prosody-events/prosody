@@ -4,11 +4,12 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
+use crate::timers::scheduler::TimerSchedulerError;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::test_support::{
-    create_test_trigger, setup_timer_manager, test_segment, test_semaphores,
+    create_test_trigger, setup_timer_manager, setup_timer_manager_at, test_segment, test_semaphores,
 };
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use color_eyre::eyre::{Result, eyre};
@@ -325,6 +326,73 @@ async fn test_timer_type_unschedule_isolation() -> Result<()> {
             .is_err()
     );
 
+    Ok(())
+}
+
+// =========================================================================
+// Shutdown Lifecycle Tests
+// =========================================================================
+
+/// The scheduler actor must keep serving commands through `Draining` so
+/// in-flight handlers can arm their recovery backstop as they settle.
+/// Seeding the phase before the actor spawns removes the send-then-observe
+/// race: the actor is already in the drain window on its first iteration.
+#[tokio::test]
+async fn clear_and_schedule_succeeds_while_draining() -> Result<()> {
+    let (_stream, manager, _shutdown_tx) = setup_timer_manager_at(ShutdownPhase::Draining).await?;
+
+    let key = Key::from("drain-backstop");
+    let time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
+    let request = TimerRequest::new(key.clone(), time, TimerType::StateRecovery, Span::current());
+
+    manager.clear_and_schedule(request).await?;
+
+    // The op did not merely return `Ok`; the actor persisted the trigger.
+    assert_eq!(
+        count_scheduled(&manager, &key, TimerType::StateRecovery).await?,
+        1,
+        "timer scheduled during Draining must be persisted, not silently dropped"
+    );
+    Ok(())
+}
+
+/// The actor serves commands through `Draining` but exits at `Cancelling`:
+/// once `Cancelling` is visible, its command channel closes and every
+/// subsequent scheduler-reaching op surfaces `Scheduler(Shutdown)`. The
+/// retained top-of-loop gate bounds the transition race to at most one
+/// command completing after `Cancelling`, so the poll loop terminates.
+#[tokio::test]
+async fn actor_exits_at_cancelling() -> Result<()> {
+    let (_stream, manager, shutdown_tx) = setup_timer_manager_at(ShutdownPhase::Draining).await?;
+
+    let key = Key::from("cancel-exit");
+    let time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
+
+    // Alive through Draining: a command succeeds.
+    manager
+        .clear_and_schedule(TimerRequest::new(
+            key.clone(),
+            time,
+            TimerType::Application,
+            Span::current(),
+        ))
+        .await?;
+
+    // Advancing to Cancelling must terminate the actor. Poll an idempotent
+    // scheduler-reaching op until it observes the closed channel; the await
+    // itself synchronizes with the actor (a nextest timeout is the sole
+    // hang-guard, per TESTING.md — never the assertion).
+    shutdown_tx.send(ShutdownPhase::Cancelling)?;
+    loop {
+        match manager
+            .unschedule(&Key::from("never-scheduled"), time, TimerType::Application)
+            .await
+        {
+            Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown)) => break,
+            Ok(()) => task::yield_now().await,
+            Err(e) => return Err(eyre!("unexpected error awaiting actor exit: {e:#}")),
+        }
+    }
     Ok(())
 }
 

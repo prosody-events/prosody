@@ -95,9 +95,10 @@ where
     ///
     /// The actor owns the trigger queue, slab metadata writes, slab loads,
     /// and slab cleanup. `store` must be `Clone` so the manager can keep its
-    /// own handle for trigger-row writes; the actor exits when `shutdown_rx`
-    /// reaches `Draining`. Returns the receiver end of the expired-trigger
-    /// channel along with the scheduler handle.
+    /// own handle for trigger-row writes; the actor serves commands through
+    /// `Draining` (so settling handlers can still schedule) and exits at
+    /// `shutdown_rx >= Cancelling`. Returns the receiver end of the
+    /// expired-trigger channel along with the scheduler handle.
     pub fn new<T>(
         store: T,
         segment: Segment,

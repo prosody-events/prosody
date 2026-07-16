@@ -106,8 +106,9 @@ where
     /// 2. An in-memory scheduler and its command processing task.
     /// 3. A background scheduler actor for preloading upcoming timers.
     ///
-    /// `shutdown_rx` signals partition shutdown; the scheduler actor exits at
-    /// `>= ShutdownPhase::Draining`. `semaphores` bounds in-flight timer
+    /// `shutdown_rx` signals partition shutdown; the scheduler actor serves
+    /// commands through `Draining` and exits at `>= ShutdownPhase::Cancelling`.
+    /// `semaphores` bounds in-flight timer
     /// events per type (see module docs). Returns a [`Stream`] of
     /// [`PendingTimer<T>`] alongside the [`TimerManager<T>`] used to
     /// schedule and manage timers.

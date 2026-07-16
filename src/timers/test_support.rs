@@ -61,15 +61,31 @@ pub(crate) fn create_test_trigger(
 /// Sets up a timer manager over an in-memory store.
 ///
 /// Returns `(stream, manager, shutdown_tx)`. The caller holds
-/// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
+/// `shutdown_tx` and can send `ShutdownPhase::Cancelling` to stop the
 /// background scheduler actor.
 pub(crate) async fn setup_timer_manager() -> Result<(
     impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
+    setup_timer_manager_at(ShutdownPhase::default()).await
+}
+
+/// Like [`setup_timer_manager`] but seeds the shutdown watch channel at
+/// `initial` before the scheduler actor spawns.
+///
+/// Seeding the phase up front is what makes drain-window tests
+/// deterministic: the actor observes `initial` on its very first loop
+/// iteration, with no send-then-observe race against the first command.
+pub(crate) async fn setup_timer_manager_at(
+    initial: ShutdownPhase,
+) -> Result<(
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    watch::Sender<ShutdownPhase>,
+)> {
     let store = memory_store(test_segment("test-segment", 300_u32));
-    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (shutdown_tx, shutdown_rx) = watch::channel(initial);
     let telemetry = Telemetry::new();
 
     let config = TimerManagerConfig {
