@@ -333,6 +333,15 @@ impl<S> CountingCellStore<S> {
         self.counts.get.load(Ordering::Relaxed)
     }
 
+    /// Visible point reads — the query-count-vocabulary view of the `get`
+    /// counter, the read [`CellStore::get_many`] batches away. Same atomic as
+    /// [`Self::lower_reads`], which frames it as cache fall-through; this name
+    /// is the one the read-committed staging query-count pins assert against
+    /// (one visible point read per untouched dirty cell).
+    pub(crate) fn visible_point_reads(&self) -> usize {
+        self.counts.get.load(Ordering::Relaxed)
+    }
+
     /// `get_many` batch reads issued to the lower store — zero on an all-hit
     /// `Cached::get_many` chunk.
     pub(crate) fn batch_reads(&self) -> usize {
@@ -362,6 +371,16 @@ impl<S> CountingCellStore<S> {
     /// Warm-sweep point reads — one per `provisional_cell_at`, the reads a warm
     /// (seeded) sweep issues (bounded by #provisional).
     pub(crate) fn warm_point_reads(&self) -> usize {
+        self.counts.provisional_cell_at.load(Ordering::Relaxed)
+    }
+
+    /// Raw (un-oracle-resolved) provisional point reads — the query-count view
+    /// of the `provisional_cell_at` counter. Same atomic as
+    /// [`Self::warm_point_reads`], which frames it as the warm recovery sweep's
+    /// per-coordinate read; this name is the one the marker-reconstruction
+    /// query-count pins assert against (one raw point read per listed
+    /// coordinate).
+    pub(crate) fn raw_point_reads(&self) -> usize {
         self.counts.provisional_cell_at.load(Ordering::Relaxed)
     }
 
@@ -974,4 +993,55 @@ pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionI
         bail!("settlement left an event marker standing");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::registry::CollectionDefRegistry;
+
+    /// Each per-query-kind read accessor counts exactly its own store call:
+    /// a `get` bumps only `visible_point_reads`, a `get_many` bumps only
+    /// `batch_reads` (its inner per-coordinate gets stay off the wrapper's
+    /// `get` counter), and a `provisional_cell_at` bumps only
+    /// `raw_point_reads`.
+    #[tokio::test]
+    async fn counters_increment_once_per_store_call() -> Result<()> {
+        let store = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            FixedOracle::committed(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let id = fresh_collection("counter-probe")?;
+        let cell = CellKey {
+            section: Section::new(0),
+            coordinate: Coordinate::from_bytes(vec![0]),
+        };
+        let own = probe(1);
+
+        // Visible point read.
+        store.reset();
+        store.get(&id, &cell, own).await?;
+        assert_eq!(store.visible_point_reads(), 1);
+        assert_eq!(store.batch_reads(), 0);
+        assert_eq!(store.raw_point_reads(), 0);
+
+        // Visible batch read — must NOT inflate visible_point_reads (the inner
+        // store's per-coordinate gets never reach this wrapper's get counter).
+        store.reset();
+        let batch = batch_of([0])?;
+        store.get_many(&id, Section::new(0), &batch, own).await?;
+        assert_eq!(store.batch_reads(), 1);
+        assert_eq!(store.visible_point_reads(), 0);
+        assert_eq!(store.raw_point_reads(), 0);
+
+        // Raw provisional point read.
+        store.reset();
+        store.provisional_cell_at(&id, &cell).await?;
+        assert_eq!(store.raw_point_reads(), 1);
+        assert_eq!(store.visible_point_reads(), 0);
+        assert_eq!(store.batch_reads(), 0);
+
+        Ok(())
+    }
 }
