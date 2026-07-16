@@ -579,8 +579,8 @@ where
 /// Sweeps every registered collection on `(segment, key)`, resolving any
 /// provisional cell through the oracle. The swept set comes from `registry` —
 /// the in-process authoritative declared set; a collection whose descriptor was
-/// removed is dormant, not swept (an accepted non-concern). TTLs come from
-/// `registry`, falling back to the middleware-wide default.
+/// removed is dormant, not swept (an accepted non-concern). Each collection's
+/// TTL comes from `registry`.
 ///
 /// A never-touched name streams no provisional cell and resolves trivially. A
 /// per-cell Permanent failure is logged and skipped inside

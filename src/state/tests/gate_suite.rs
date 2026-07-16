@@ -104,7 +104,7 @@ impl GateFixture {
     fn new(name: &str) -> Result<Self> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(&value_state::<JsonCodec>("v"), CollectionDef::new(None))?;
         registry.register(
             &map_state::<I64KeyCodec, JsonCodec>("m"),

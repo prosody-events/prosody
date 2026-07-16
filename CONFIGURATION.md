@@ -76,7 +76,6 @@ reloads and keyed-state message resolution.
 | Environment Variable                 | Description                                        | Default                  |
 |--------------------------------------|----------------------------------------------------|--------------------------|
 | `PROSODY_FJALL_CACHE_DIR`            | Local fjall workspace (the committed-value cache). Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
-| `PROSODY_KEYED_STATE_DEFAULT_TTL`    | How long to keep state left behind by a collection you have since stopped registering. `none` keeps it forever; a duration (e.g. `7d`) expires it. Durations are second-granularity and must be at least `1s`. | `none` (kept forever) |
 | `PROSODY_KEYED_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
 
 ## Deduplication (All Modes)

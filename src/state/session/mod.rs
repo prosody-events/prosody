@@ -931,7 +931,7 @@ where
     /// [`CellResolver`]: crate::state::descriptor::CellResolver
     pub loader: L,
 
-    /// Registered collection definitions and middleware-wide defaults.
+    /// Registered collection definitions.
     pub(crate) registry: Arc<CollectionDefRegistry>,
 
     /// Segment-qualified key this session's collections live under.

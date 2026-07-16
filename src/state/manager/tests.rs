@@ -82,7 +82,7 @@ fn registry_with_cart() -> Result<Arc<CollectionDefRegistry>> {
 fn registry_with_cart_within(
     within: Option<CompactDuration>,
 ) -> Result<Arc<CollectionDefRegistry>> {
-    let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &cart(),
         CollectionDef {
@@ -97,7 +97,7 @@ fn registry_with_cart_within(
 /// `ReadCommitted` (`cart`, `wishlist`) that stage provisional cells and one
 /// `ReadUncommitted` (`last_seen`) that writes resolved at finalize.
 fn registry_with_mixed() -> Result<Arc<CollectionDefRegistry>> {
-    let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
     registry.register(&wishlist(), CollectionDef::new(None))?;
     registry.register(

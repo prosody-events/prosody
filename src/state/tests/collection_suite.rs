@@ -334,7 +334,7 @@ fn registry_and_ref<D>(
 where
     D: StateDescriptor,
 {
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(descriptor, def)?;
     let collection_ref = CollectionRef::new(
         CollectionId::new(
@@ -657,7 +657,7 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &descriptor,
         CollectionDef {
@@ -1786,7 +1786,7 @@ fn map_keyset_subtracts_on_remove() -> Result<()> {
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&descriptor, CollectionDef::new(None))?;
     let registry = Arc::new(registry);
     let id = CollectionId::new(

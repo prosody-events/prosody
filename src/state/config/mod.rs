@@ -4,9 +4,7 @@ use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
-use crate::util::{
-    from_duration_env_with_fallback, from_env_with_fallback, from_option_duration_env,
-};
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use derive_builder::Builder;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -16,9 +14,6 @@ use validator::{Validate, ValidationError};
 
 /// Environment variable for the local fjall workspace directory.
 const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
-
-/// Environment variable for the fallback TTL of unregistered state rows.
-const DEFAULT_TTL_ENV: &str = "PROSODY_KEYED_STATE_DEFAULT_TTL";
 
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_KEYED_STATE_RECOVERY_DELAY";
@@ -62,24 +57,6 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_cache_dir"))]
     pub cache_dir: PathBuf,
 
-    /// Fallback TTL for state rows whose collection is **not** in the
-    /// registry — recovery-sweep leftovers whose descriptor was since
-    /// removed from the application. `None` means indefinite retention for
-    /// such rows.
-    ///
-    /// Registered collections never inherit this value: their TTL is
-    /// exactly the `Option` passed to [`CollectionDef::new`], where `None`
-    /// is an explicit choice of indefinite retention.
-    ///
-    /// Environment variable: `PROSODY_KEYED_STATE_DEFAULT_TTL`. Accepts a
-    /// duration (e.g. `7d`) at second granularity, or `none` (the default) for
-    /// indefinite retention. A duration must be at least one second: zero would
-    /// mean "never expire", which is what `none` already expresses, so it is
-    /// rejected to keep the two ways of saying "keep forever" from diverging.
-    #[builder(default = "default_ttl_from_env()?")]
-    #[validate(custom(function = "validate_default_ttl"))]
-    pub default_ttl: Option<CompactDuration>,
-
     /// Delay between staging a provisional cell and the `StateRecovery`
     /// backstop sweep that resolves any cell the eager post-commit promote
     /// did not. Every registered collection's TTL must strictly exceed this
@@ -104,7 +81,6 @@ impl Default for KeyedStateConfiguration {
         Self {
             cache_dir: from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())
                 .unwrap_or_else(|_| default_cache_dir()),
-            default_ttl: default_ttl_from_env().unwrap_or(None),
             recovery_delay: recovery_delay_from_env()
                 .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
             registrations: Vec::new(),
@@ -148,8 +124,7 @@ impl KeyedStateConfiguration {
         !self.registrations.is_empty()
     }
 
-    /// Builds the collection registry from the registrations and
-    /// `default_ttl`.
+    /// Builds the collection registry from the registrations.
     ///
     /// Each registration's TTL is checked against `recovery_delay` here, the
     /// one boundary that knows both: a provisional cell carries the
@@ -162,7 +137,7 @@ impl KeyedStateConfiguration {
     /// over Cassandra's `USING TTL` ceiling, a TTL at or below
     /// `recovery_delay`, or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
-        let mut registry = CollectionDefRegistry::new(self.default_ttl);
+        let mut registry = CollectionDefRegistry::default();
         for (state_type, name, identity, def) in &self.registrations {
             if let Some(ttl) = def.ttl
                 && ttl.seconds() <= self.recovery_delay.seconds()
@@ -200,16 +175,6 @@ fn recovery_delay_from_env() -> Result<CompactDuration, String> {
     CompactDuration::try_from(duration).map_err(|error| error.to_string())
 }
 
-/// Reads [`DEFAULT_TTL_ENV`] as a duration, yielding `None` when unset or set
-/// to `none`. Sub-second values round to the nearest second per
-/// [`CompactDuration`]'s `Duration` conversion.
-fn default_ttl_from_env() -> Result<Option<CompactDuration>, String> {
-    from_option_duration_env(DEFAULT_TTL_ENV)?
-        .map(CompactDuration::try_from)
-        .transpose()
-        .map_err(|error| error.to_string())
-}
-
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
     if cache_dir.as_os_str().is_empty() {
         return Err(ValidationError::new("cache_dir_empty"));
@@ -224,17 +189,6 @@ fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
 fn validate_recovery_delay(recovery_delay: &CompactDuration) -> Result<(), ValidationError> {
     if recovery_delay.seconds() == 0 {
         return Err(ValidationError::new("recovery_delay_zero"));
-    }
-    Ok(())
-}
-
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "the validator derive invokes custom functions by reference"
-)]
-fn validate_default_ttl(default_ttl: &CompactDuration) -> Result<(), ValidationError> {
-    if default_ttl.seconds() == 0 {
-        return Err(ValidationError::new("default_ttl_zero"));
     }
     Ok(())
 }

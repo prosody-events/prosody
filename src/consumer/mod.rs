@@ -916,7 +916,6 @@ async fn build_shared_state(
         consumer_config.mock,
         dedup_config.ttl,
         dedup_config.cache_capacity,
-        keyed_state_config.default_ttl,
         consumer_config.timer_spans,
     )
     .await?;
@@ -1280,7 +1279,6 @@ where
             consumer_config.mock,
             Duration::default(),
             NonZeroUsize::MIN,
-            keyed_state_config.default_ttl,
             consumer_config.timer_spans,
         )
         .await?;

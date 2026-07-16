@@ -263,7 +263,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor =
             map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("chunk1");
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(
             &descriptor,
             CollectionDef {
@@ -775,7 +775,7 @@ fn map_stream_issues_no_scans() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(
             &map_state::<I64KeyCodec, JsonCodec>("mp"),
             CollectionDef::new(None),
@@ -872,7 +872,7 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(
             &map_state::<I64KeyCodec, JsonCodec>("mp-of"),
             CollectionDef {
@@ -992,7 +992,7 @@ fn deque_stream_issues_no_scans() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(&deque_state::<JsonCodec>("dq"), CollectionDef::new(None))?;
         registry.register(
             &deque_state::<JsonCodec>("dq-wide"),
@@ -1151,7 +1151,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("lz");
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &descriptor,
         CollectionDef {
@@ -1259,7 +1259,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<WithResolver<JsonCodec, CountingResolver>>("lz");
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&descriptor, CollectionDef::new(None))?;
     let registry = Arc::new(registry);
     let counting = CountingCellStore::new(MemoryCellStore::new(

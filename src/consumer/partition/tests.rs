@@ -76,7 +76,7 @@ fn default_config()
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_provider: InMemoryTriggerStoreProvider::new(),
-        state_provider: memory_state_provider(CollectionDefRegistry::new(None)),
+        state_provider: memory_state_provider(CollectionDefRegistry::default()),
         timer_slab_size: CompactDuration::new(30),
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),
@@ -957,7 +957,7 @@ mod unwind {
             tag: SyncMutex::new(Some(tag_tx)),
         };
 
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry
             .register(&value_state::<JsonCodec>(NAME), CollectionDef::new(None))
             .map_err(|e| eyre!("register: {e}"))?;

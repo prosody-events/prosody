@@ -69,7 +69,7 @@ pub(crate) fn bind_registered<DESC>(
 where
     DESC: StateDescriptor,
 {
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&descriptor, CollectionDef::new(None))?;
     let session = test_session(loader, registry);
     descriptor
@@ -314,7 +314,7 @@ fn state_unavailable_without_keyed_state() -> Result<()> {
 /// registration.
 #[tokio::test]
 async fn state_with_unregistered_descriptor_errors() -> Result<()> {
-    let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
+    let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
     let Err(error) = cart().bind(&session) else {
         return Err(eyre!("unregistered bind must fail"));
     };
@@ -331,7 +331,7 @@ async fn state_with_unregistered_descriptor_errors() -> Result<()> {
 #[tokio::test]
 async fn bind_with_mismatched_identity_errors() -> Result<()> {
     let recoded: ValueDescriptor<CartCodec> = value_state("cart");
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
     let session = test_session(MemoryLoader::new(), registry);
 
@@ -349,7 +349,7 @@ async fn bind_with_mismatched_identity_errors() -> Result<()> {
 /// Map, then a Deque, over a name registered as a Value).
 #[test]
 fn conflicting_registration_is_rejected() -> Result<()> {
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
 
     // Same kind, different codec id.
@@ -381,7 +381,7 @@ fn conflicting_registration_is_rejected() -> Result<()> {
 #[tokio::test]
 async fn bind_with_mismatched_kind_errors() -> Result<()> {
     let map: MapDescriptor<Utf8KeyCodec> = map_state("cart");
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&map, CollectionDef::new(None))?;
     let session = test_session(MemoryLoader::new(), registry);
 
@@ -406,7 +406,7 @@ fn reregistration_is_rejected_as_duplicate() -> Result<()> {
     let initial_ttl = CompactDuration::new(60);
     let updated_ttl = CompactDuration::new(7_200);
 
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(Some(initial_ttl)))?;
 
     // Same name, same identity, different operational settings — rejected.
@@ -450,7 +450,7 @@ fn keyset_limit_threads_into_the_collection_def() {
 /// fallible boundary backing the infallible `value_state`.
 #[test]
 fn empty_name_rejected_at_registration() {
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     let empty: ValueDescriptor = value_state("");
     let result = registry.register(&empty, CollectionDef::new(None));
     assert!(matches!(result, Err(RegisterStateError::Name(_))));
@@ -474,7 +474,7 @@ fn prop_descriptors_from_equal_strings_are_interchangeable() {
         let result = (move || -> Result<bool> {
             let a: ValueDescriptor = value_state(&name);
             let b: ValueDescriptor = value_state(&name);
-            let mut registry = CollectionDefRegistry::new(None);
+            let mut registry = CollectionDefRegistry::default();
             registry.register(&a, CollectionDef::new(None))?;
             // A same-identity re-registration of the equal descriptor is a
             // duplicate declaration — rejected, not silently overwritten.
@@ -615,7 +615,7 @@ mod scope_containment {
 
     /// A registry with sibling collections of every kind registered.
     fn registry_with_siblings() -> Result<CollectionDefRegistry> {
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(&cart(), CollectionDef::new(None))?;
         registry.register(&wishlist(), CollectionDef::new(None))?;
         registry.register(&counts(), CollectionDef::new(None))?;
@@ -802,7 +802,7 @@ mod typed_cell_view {
     fn gate_session(ladder: Arc<GateLadder>) -> GateSession {
         let (parts, _) = session_parts(
             GateLoader(ladder),
-            CollectionDefRegistry::new(None),
+            CollectionDefRegistry::default(),
             StateKey::new(Uuid::new_v4(), Arc::from("gate")),
             Arc::default(),
             false,
@@ -943,7 +943,7 @@ mod typed_cell_view {
     /// yield the low and high cells and no error.
     #[tokio::test]
     async fn typed_scan_terminates_at_first_error() -> Result<()> {
-        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
+        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
         let name = StateName::try_new("scan_err")?;
         // Ascending keys; the middle cell's bytes are not valid JSON.
         for (key, bytes) in [
@@ -998,7 +998,7 @@ mod typed_cell_view {
         let value = value_state::<JsonCodec>("term_value");
         let map = map_state::<Utf8KeyCodec, JsonCodec>("term_map");
         let deque = deque_state::<JsonCodec>("term_deque");
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         registry.register(&value, CollectionDef::new(None))?;
         registry.register(&map, CollectionDef::new(None))?;
         registry.register(&deque, CollectionDef::new(None))?;
@@ -1050,7 +1050,7 @@ mod typed_cell_view {
         assert_send(handle.get());
 
         let scope = CellScope::new(
-            test_session(loader, CollectionDefRegistry::new(None)),
+            test_session(loader, CollectionDefRegistry::default()),
             StateType::Application,
             StateName::try_new("send_scan")?,
         );
@@ -1116,7 +1116,7 @@ mod typed_cell_view {
         name: &str,
         keys: &[i64],
     ) -> Result<(TestSession, CellScope<TestSession>)> {
-        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
+        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
         let scope = CellScope::new(
             session.clone(),
             StateType::Application,
@@ -1185,7 +1185,7 @@ mod typed_cell_view {
     /// error would surface `[Ok, Err]`.
     #[tokio::test]
     async fn scan_at_chunk_is_error_atomic() -> Result<()> {
-        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::new(None));
+        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
         let name = StateName::try_new("chunk_err")?;
         // Ascending keys within one chunk; the middle cell's bytes are not JSON.
         for (key, bytes) in [

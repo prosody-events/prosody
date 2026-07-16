@@ -124,7 +124,7 @@ impl Fixture {
         let value_name = names
             .first()
             .ok_or_else(|| eyre!("with_collections needs at least one collection"))?;
-        let mut registry = CollectionDefRegistry::new(None);
+        let mut registry = CollectionDefRegistry::default();
         for name in names {
             registry.register(&value_state::<JsonCodec>(name), CollectionDef::new(None))?;
         }
@@ -262,7 +262,7 @@ async fn staged_fire_delay(
     bounds: &[Option<u32>],
     floor_secs: u32,
 ) -> Result<Option<CompactDuration>> {
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     let mut names = Vec::with_capacity(bounds.len());
     for (i, within) in bounds.iter().enumerate() {
         let name = format!("c{i}");

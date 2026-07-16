@@ -1,4 +1,4 @@
-//! Per-collection definitions and the registry of middleware defaults.
+//! Per-collection definitions and the collection registry.
 
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -52,7 +52,7 @@ pub enum CommitMode {
     ReadUncommitted,
 }
 
-/// Operational per-collection settings that override middleware defaults.
+/// Operational per-collection settings.
 ///
 /// Carries the collection's TTL, [`CommitMode`], and recovery-convergence
 /// bound. `ttl` is `None` for
@@ -131,35 +131,18 @@ pub(crate) struct RegisteredCollection {
     pub(crate) def: CollectionDef,
 }
 
-/// Registry of registered collections plus middleware-wide defaults for
-/// TTL / commit-mode lookups on names that are not registered.
+/// Registry of registered collections keyed by `(state_type, name)`.
 ///
-/// Keyed by `(state_type, name)`: a collection's name is unique only *within*
-/// its [`StateType`] namespace, so the same name under two state types is two
-/// distinct entries and never an identity conflict. See [`Self::collections`]
-/// for what the recovery sweep enumerates.
-#[derive(Clone, Debug)]
+/// A collection's name is unique only *within* its [`StateType`] namespace, so
+/// the same name under two state types is two distinct entries and never an
+/// identity conflict. See [`Self::collections`] for what the recovery sweep
+/// enumerates.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct CollectionDefRegistry {
     defs: HashMap<StateType, HashMap<StateName, RegisteredCollection>>,
-    default_ttl: Option<CompactDuration>,
-}
-
-impl Default for CollectionDefRegistry {
-    fn default() -> Self {
-        Self::new(None)
-    }
 }
 
 impl CollectionDefRegistry {
-    /// Creates a registry with the supplied middleware-wide default TTL.
-    #[must_use]
-    pub(crate) fn new(default_ttl: Option<CompactDuration>) -> Self {
-        Self {
-            defs: HashMap::new(),
-            default_ttl,
-        }
-    }
-
     /// Registers `descriptor`'s collection with operational settings `def`.
     ///
     /// The frozen [`StructuralIdentity`] is derived from the descriptor —
@@ -268,8 +251,8 @@ impl CollectionDefRegistry {
         })
     }
 
-    /// Returns the TTL bound to `(state_type, name)`, falling back to the
-    /// middleware-wide default.
+    /// Returns the TTL registered for `(state_type, name)`; an unregistered
+    /// name yields `None`.
     #[must_use]
     pub(crate) fn ttl_for(
         &self,
@@ -277,7 +260,7 @@ impl CollectionDefRegistry {
         name: &StateName,
     ) -> Option<CompactDuration> {
         self.lookup_collection(state_type, name)
-            .map_or(self.default_ttl, |c| c.def.ttl)
+            .and_then(|c| c.def.ttl)
     }
 
     /// Returns the Map keyset bound for `(state_type, name)`, falling back to

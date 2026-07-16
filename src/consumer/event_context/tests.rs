@@ -125,7 +125,7 @@ fn parity_context<P>() -> Result<MockEventContext<P, ParitySession<P>>>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &value_state::<<P as ErasedStateCodec>::Codec>(VALUE_NAME),
         CollectionDef::new(None),
@@ -698,7 +698,7 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
     let loader = MemoryLoader::<Value>::new();
     loader.store_message(topic, partition, offset, key.clone(), payload.clone());
 
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &message_state::<MemoryLoader<Value>>("last_seen"),
         CollectionDef::new(None),
@@ -752,7 +752,7 @@ async fn erased_kafka_map_set_then_get_matches_typed() -> Result<()> {
     let loader = MemoryLoader::<Value>::new();
     loader.store_message(topic, partition, offset, key.clone(), payload.clone());
 
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &message_map_state::<Utf8KeyCodec, MemoryLoader<Value>>("seen_by_key"),
         CollectionDef::new(None),
@@ -806,7 +806,7 @@ async fn erased_kafka_deque_push_then_get_matches_typed() -> Result<()> {
     let loader = MemoryLoader::<Value>::new();
     loader.store_message(topic, partition, offset, key.clone(), payload.clone());
 
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &message_deque_state::<MemoryLoader<Value>>("seen_log"),
         CollectionDef::new(None),
@@ -1060,7 +1060,7 @@ fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, Counti
 async fn map_cursor_is_lazy() -> Result<()> {
     // Seed enough entries that a full drain far exceeds one chunk.
     let entries = STREAM_CHUNK * 3;
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &map_state::<Utf8KeyCodec, JsonCodec>(MAP_NAME),
         CollectionDef::new(None),
@@ -1112,7 +1112,7 @@ fn erased_registration_options_thread_through() -> Result<()> {
     use crate::state::{StateName, StateType};
 
     let ttl = CompactDuration::new(3_600);
-    let mut registry = CollectionDefRegistry::new(None);
+    let mut registry = CollectionDefRegistry::default();
     registry.register(
         &value_state::<JsonCodec>("v").ttl(ttl).read_uncommitted(),
         // The config layer derives the def from the descriptor's fluent

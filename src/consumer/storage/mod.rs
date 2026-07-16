@@ -24,7 +24,6 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CellQueries, IdentityQueries,
 };
-use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::num::NonZeroUsize;
@@ -101,7 +100,6 @@ impl StorePair {
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
     ///     NonZeroUsize::new(8192).ok_or("cache capacity must be nonzero")?,
-    ///     None,
     ///     SpanRelation::FollowsFrom,
     /// )
     /// .await?;
@@ -113,13 +111,11 @@ impl StorePair {
         mock: bool,
         dedup_ttl: Duration,
         dedup_cache_capacity: NonZeroUsize,
-        keyed_state_ttl: Option<CompactDuration>,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
         // Pure config validation first: fail fast before any Cassandra IO
         // (memory mode validates too, deliberately).
         let dedup_ttl_secs = dedup_ttl_seconds(dedup_ttl)?;
-        validate_keyed_state_ttl(keyed_state_ttl)?;
 
         let cass_config = match (mock, config) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
@@ -190,11 +186,9 @@ impl StorePair {
 }
 
 /// Converts a deduplication TTL to Cassandra's `i32` seconds representation,
-/// rejecting anything past the `USING TTL` ceiling.
-///
-/// Mirrors [`validate_keyed_state_ttl`]: an over-ceiling TTL would make every
-/// dedup-marker write fail at the coordinator, so we fail fast at store
-/// creation instead.
+/// rejecting anything past the `USING TTL` ceiling — an over-ceiling TTL would
+/// make every dedup-marker write fail at the coordinator, so we fail fast at
+/// store creation instead.
 fn dedup_ttl_seconds(ttl: Duration) -> Result<i32, StoreCreationError> {
     let seconds: i32 = ttl
         .as_secs()
@@ -204,22 +198,6 @@ fn dedup_ttl_seconds(ttl: Duration) -> Result<i32, StoreCreationError> {
         return Err(StoreCreationError::DeduplicationTtl(ttl.as_secs()));
     }
     Ok(seconds)
-}
-
-/// Rejects a keyed-state default TTL that exceeds Cassandra's `USING TTL`
-/// ceiling before it can reach a write.
-///
-/// Mirrors the dedup and timer-retention checks: an over-ceiling TTL would
-/// make every keyed-state write fail at the coordinator, so we fail fast at
-/// store creation instead. `None` (indefinite retention) is always allowed.
-fn validate_keyed_state_ttl(ttl: Option<CompactDuration>) -> Result<(), StoreCreationError> {
-    if let Some(ttl) = ttl {
-        let seconds = ttl.seconds();
-        if i64::from(seconds) > MAX_CASSANDRA_TTL_SECS {
-            return Err(StoreCreationError::KeyedStateTtl(u64::from(seconds)));
-        }
-    }
-    Ok(())
 }
 
 /// Errors that can occur during store pair creation.
@@ -242,10 +220,6 @@ pub enum StoreCreationError {
     /// Deduplication TTL exceeds Cassandra's maximum.
     #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
     DeduplicationTtl(u64),
-
-    /// Keyed-state default TTL exceeds Cassandra's maximum.
-    #[error("keyed-state default TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
-    KeyedStateTtl(u64),
 }
 
 impl From<CassandraTriggerStoreError> for StoreCreationError {
