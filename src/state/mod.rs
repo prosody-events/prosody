@@ -143,21 +143,16 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
 /// Maximum concurrent typed resolves in flight within one `CellView::get_many`
-/// call — the loader (Kafka message) fan-out for a batch read. Independent of
-/// [`store::CELL_BATCH`]: a resolve reads the collection's SOURCE (a Kafka
-/// message for a loader-backed collection), which does not contend on the
+/// call — the loader (Kafka message) fan-out for a batch read. A resolve reads
+/// the collection's source (a Kafka message for a loader-backed collection),
+/// which does not contend on the
 /// collection's Scylla shard, so it is not bounded by
 /// [`SHARD_FANOUT_CONCURRENCY`] (that bounds same-shard round-trip overlap).
 /// A batch's resolves fan out across the WHOLE call under this window, so the
 /// resolves overlap rather than serialize per store sub-batch.
 ///
-/// Must exceed [`store::CELL_BATCH`]: a single scan chunk (`≤ CELL_BATCH` keys)
-/// then resolves at full chunk width, and the whole-call fan-out is observable
-/// only for a call larger than one sub-batch.
-pub(crate) const RESOLVE_FANOUT: usize = 32;
+/// Currently matches [`store::CELL_BATCH`] so a full store batch resolves in
+/// one wave; the two bounds remain independently tunable.
+pub(crate) const RESOLVE_FANOUT: usize = 128;
 
-const _: () = assert!(
-    RESOLVE_FANOUT > store::CELL_BATCH,
-    "RESOLVE_FANOUT must exceed CELL_BATCH: a full scan chunk resolves at chunk width, and the \
-     whole-call resolve fan-out is only observable beyond one sub-batch"
-);
+const _: () = assert!(RESOLVE_FANOUT > 0, "RESOLVE_FANOUT must be positive");

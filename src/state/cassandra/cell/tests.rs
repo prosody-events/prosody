@@ -1697,7 +1697,7 @@ fn prop_cassandra_batch_read_parity() {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
         let store = fx.bottom_store(oracle.clone());
-        run_batch_read_parity_trace(store, oracle, trace).await
+        Box::pin(run_batch_read_parity_trace(store, oracle, trace)).await
     }
 
     init_test_logging();
@@ -1714,7 +1714,10 @@ fn prop_cassandra_batch_read_parity() {
 async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    run_batch_duplicate_co_observation(fx.bottom_store(ScriptedOracle::default())).await
+    Box::pin(run_batch_duplicate_co_observation(
+        fx.bottom_store(ScriptedOracle::default()),
+    ))
+    .await
 }
 
 /// Every input position answered over two chunks on the live store.
@@ -1722,7 +1725,10 @@ async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
 async fn cassandra_batch_alignment() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    run_batch_alignment(fx.bottom_store(ScriptedOracle::default())).await
+    Box::pin(run_batch_alignment(
+        fx.bottom_store(ScriptedOracle::default()),
+    ))
+    .await
 }
 
 /// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
@@ -1814,7 +1820,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    match store.get_many(id, SECTIONS[0], &batch, own).await {
+    match Box::pin(store.get_many(id, SECTIONS[0], &batch, own)).await {
         Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => {
             assert_eq!(
                 reason,
@@ -1868,7 +1874,7 @@ async fn batch_returns_post_clear_truth() -> Result<()> {
     let batch = CoordinateBatch::chunks([1u8, 2, 3].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let got = store.get_many(id, SECTIONS[0], &batch, event(7)).await?;
+    let got = Box::pin(store.get_many(id, SECTIONS[0], &batch, event(7))).await?;
     assert_eq!(
         got.as_slice(),
         &[

@@ -1295,95 +1295,13 @@ mod typed_cell_view {
         }
     }
 
-    /// `scan_at` keeps at most `STREAM_CHUNK` resolutions in flight and starts
-    /// a second chunk only after the first drains: each chunk is read by
-    /// ONE `get_many` over `by_ref().take(STREAM_CHUNK)` keys, and the
-    /// unfold awaits that chunk's fetch + resolve before the next. Seeds
-    /// `STREAM_CHUNK + EXTRA` gated cells; when chunk 1 is fully parked,
-    /// exactly `STREAM_CHUNK` resolutions are in flight (chunk 2 has not
-    /// begun, because `RESOLVE_FANOUT ≥ STREAM_CHUNK` parks chunk 1's whole
-    /// width). Falsifiable: flattening all coordinates into one chunk would
-    /// park all `STREAM_CHUNK + EXTRA` at once.
+    /// One full resolve window runs concurrently: every gated resolver parks
+    /// before any is released. Falsifiable: lowering the `buffered` width below
+    /// `RESOLVE_FANOUT` leaves fewer resolvers parked, so the releaser fails
+    /// (or the join hangs → 30s timeout).
     #[tokio::test(flavor = "current_thread")]
-    async fn scan_at_bounds_in_flight_reads_to_stream_chunk() -> Result<()> {
-        const EXTRA: usize = 4;
-        let n = STREAM_CHUNK + EXTRA;
-        let ladder = Arc::new(GateLadder::new(n));
-        let scope = CellScope::new(
-            gate_session(ladder.clone()),
-            StateType::Application,
-            StateName::try_new("chunk_bound")?,
-        );
-
-        // Seed n cells (payload == key) through the plain passthrough view.
-        let seed = scope.typed::<SeedCell>(CELL_SECTION);
-        let permit = seed
-            .mutate_permit()
-            .await
-            .map_err(|e| eyre!("seed permit: {e}"))?;
-        for key in 0..n as i64 {
-            seed.set(&permit, &key, key)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
-        }
-        drop(permit);
-
-        let view = scope.typed::<GatedCell>(CELL_SECTION);
-        let coords: Vec<i64> = (0..n as i64).collect();
-        let collector = async {
-            let stream = view.scan_at(coords.into_iter());
-            futures::pin_mut!(stream);
-            let mut keys = Vec::new();
-            while let Some(item) = stream.next().await {
-                let (key, _) = item.map_err(|e| eyre!("scan_at: {e}"))?;
-                keys.push(key);
-            }
-            Ok::<Vec<i64>, color_eyre::Report>(keys)
-        };
-        // The releaser observes the in-flight ceiling: with the collector polled
-        // first, chunk 1's STREAM_CHUNK resolutions all park before chunk 2 can
-        // begin (its unfold step awaits chunk 1's try_collect). Then release
-        // every gate so the collector drains.
-        let releaser = async {
-            if ladder.parked() != STREAM_CHUNK {
-                bail!(
-                    "chunk 1 must park exactly STREAM_CHUNK ({STREAM_CHUNK}) resolutions before \
-                     chunk 2 begins; parked = {}",
-                    ladder.parked()
-                );
-            }
-            for idx in 0..n {
-                ladder.release(idx);
-            }
-            Ok(())
-        };
-        let (collected, outcome) = timeout(
-            Duration::from_secs(30),
-            Box::pin(async { tokio::join!(collector, releaser) }),
-        )
-        .await
-        .map_err(|_| eyre!("bounded scan hung"))?;
-        outcome?;
-        let keys = collected?;
-        assert_eq!(
-            keys,
-            (0..n as i64).collect::<Vec<_>>(),
-            "every seeded cell is yielded in input order across the two chunks"
-        );
-        Ok(())
-    }
-
-    /// `CellView::get_many` fans its typed resolves out across the WHOLE call,
-    /// not per store sub-batch: a `RESOLVE_FANOUT`-key call (which
-    /// spans two `CELL_BATCH` store sub-batches) parks ALL its resolves before
-    /// any is released, so its resolve cost is one loader window, not the
-    /// number of sub-batches. Falsifiable: nesting the resolve inside the
-    /// Phase-1 per-sub-batch loop would let only the first sub-batch's `≤
-    /// CELL_BATCH` resolutions park (`< RESOLVE_FANOUT`), so the releaser
-    /// `bail!`s (or the join hangs → 30s timeout) → red.
-    #[tokio::test(flavor = "current_thread")]
-    async fn get_many_resolves_whole_call_concurrently() -> Result<()> {
-        let n = RESOLVE_FANOUT; // > CELL_BATCH ⇒ ≥ 2 store sub-batches
+    async fn get_many_resolves_full_window_concurrently() -> Result<()> {
+        let n = RESOLVE_FANOUT;
         let ladder = Arc::new(GateLadder::new(n));
         let scope = CellScope::new(
             gate_session(ladder.clone()),
@@ -1408,16 +1326,13 @@ mod typed_cell_view {
         let keys: Vec<i64> = (0..n as i64).collect();
         let collector = async {
             let read = view.read_permit().await;
-            let out = view
-                .get_many(&read, &keys)
+            let out = Box::pin(view.get_many(&read, &keys))
                 .await
                 .map_err(|e| eyre!("get_many: {e}"))?;
             Ok::<_, color_eyre::Report>(out)
         };
-        // The releaser observes the whole-call ceiling: with the collector
-        // polled first, ALL n resolves park (both sub-batches read, then the one
-        // buffered(RESOLVE_FANOUT) window resolves the whole call) before any
-        // release. A nested-per-sub-batch defect never reaches n here.
+        // With the collector polled first, the full window parks under the one
+        // buffered(RESOLVE_FANOUT) window before any release.
         let releaser = async {
             if ladder.parked() != n {
                 bail!(

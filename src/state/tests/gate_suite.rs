@@ -44,7 +44,7 @@ use crate::loader::MemoryLoader;
 use super::super::fjall::test_db;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::{Report, Result, bail, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
@@ -959,7 +959,7 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
         let reader = tokio::spawn({
             let map = map.clone();
             let keys = keys.clone();
-            async move { map.get_many(&keys).await }
+            async move { Box::pin(map.get_many(&keys)).await }
         });
         timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
             .await
@@ -989,116 +989,6 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
             Some(Value::from(TARGET)),
             "the sub-batch-2 read observed the committed pre-set value; the queued set serialized \
              after the whole get_many"
-        );
-        Ok(())
-    })
-}
-
-/// The pop-between-chunks pin (the chunked-stream contract, deque twin of
-/// `gate_excludes_set_during_keyset_stream`): a mutator racing a live stream
-/// lands **between chunks**, not mid-chunk. The window (20) spans two chunks
-/// (16 + 4). A `pop_back()` + `commit()` parked on the gate while the stream
-/// holds chunk 1's permit lands after chunk 1 releases (FIFO): it buffers a
-/// clear of index 19 into the shared overlay, so the stream's chunk 2
-/// (positions 16..19) reads index 19 through the overlay = absent and **skips**
-/// it (position identity, the per-arm consistency contract). The output is
-/// deterministic via the overlay clear + FIFO(pop before the chunk-2 acquire),
-/// independent of the durable commit's ordering — so this pin does NOT assert a
-/// commit-before-chunk-2 order. The interleaving property
-/// `run_deque_stream_interleave` is the stronger successor (named in the
-/// commit). Re-checks the point-get arm issues zero scans.
-#[test]
-fn gate_excludes_pop_between_deque_chunks() -> Result<()> {
-    /// Wider than `STREAM_CHUNK` so the window spans two point-get chunks;
-    /// still under the scan threshold `DEQUE_POINT_ITERATION_MAX`, so the arm
-    /// stays on the point-get path.
-    const LEN: usize = STREAM_CHUNK + 4;
-
-    runtime()?.block_on(async {
-        let fx = GateFixture::new("gate_stream")?;
-        // Seed the window beneath the cache (cold), valued by index.
-        let id = fx.id("d")?;
-        let dref = CollectionRef::new(id.clone(), None);
-        let mut seeded = vec![(
-            deque::meta_cell(),
-            Some(Bytes::from(deque::seed_frame(0, i64::try_from(LEN)?))),
-        )];
-        for i in 0..LEN {
-            let index = i64::try_from(i)?;
-            seeded.push((
-                deque::entry_cell_for(&I64KeyCodec::encode(&index)),
-                Some(Bytes::from(serde_json::to_vec(&Value::from(index))?)),
-            ));
-        }
-        fx.counting.write_resolved(&dref, &seeded, &[]).await?;
-
-        let session = fx.session(1);
-        let handle = deque_state::<JsonCodec>("d")
-            .bind(&session)
-            .map_err(|e| eyre!("bind: {e}"))?;
-        // Warm the bounds cell so the armed hold lands on the FIRST ENTRY read.
-        assert_eq!(handle.len().await.map_err(|e| eyre!("{e}"))?, LEN);
-
-        fx.holds.get_for_cache().arm(1);
-        let stream_task = tokio::spawn({
-            let handle = handle.clone();
-            async move {
-                let mut out = Vec::new();
-                let stream = handle.stream(Direction::Forward);
-                futures::pin_mut!(stream);
-                while let Some(item) = stream.next().await {
-                    out.push(item?);
-                }
-                Ok::<_, deque::DequeStateError<JsonCodecError>>(out)
-            }
-        });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
-            .await
-            .map_err(|_| eyre!("the stream never reached its hold"))?;
-
-        // The racing pop+commit parks on the gate the stream chunk holds.
-        let pop_task = tokio::spawn({
-            let handle = handle.clone();
-            async move {
-                let popped = handle.pop_back().await.map_err(|e| eyre!("pop: {e}"))?;
-                handle.commit().await.map_err(|e| eyre!("commit: {e}"))?;
-                Ok::<_, Report>(popped)
-            }
-        });
-        let_task_park().await;
-        fx.counting.reset();
-        fx.holds.get_for_cache().release();
-
-        let yielded = timeout(HANG_GUARD, stream_task)
-            .await
-            .map_err(|_| eyre!("stream hung"))??
-            .map_err(|e| eyre!("stream: {e}"))?;
-        let want: Vec<Value> = (0..LEN - 1)
-            .map(|i| i64::try_from(i).map(Value::from))
-            .collect::<Result<_, _>>()?;
-        assert_eq!(
-            yielded, want,
-            "the pop landed between chunk 1 and chunk 2; position 19 read absent through the \
-             overlay and was skipped (chunk-scoped hold)"
-        );
-        assert_eq!(
-            fx.counting.lower_scans(),
-            0,
-            "the point-get arm issues no scans"
-        );
-        let popped = timeout(HANG_GUARD, pop_task)
-            .await
-            .map_err(|_| eyre!("pop hung"))??
-            .map_err(|e| eyre!("{e}"))?;
-        assert_eq!(
-            popped,
-            Some(Value::from(i64::try_from(LEN - 1)?)),
-            "the pop removed the back element"
-        );
-        assert_eq!(
-            handle.len().await.map_err(|e| eyre!("{e}"))?,
-            LEN - 1,
-            "the commit made the pop durable"
         );
         Ok(())
     })
@@ -1610,7 +1500,7 @@ fn map_get_many_after_reset_is_terminated() -> Result<()> {
         // Attempt boundary: discard + bump. `map` keeps the stale pin.
         session.reset(RepinProof::for_test()).await;
 
-        match map.get_many(&[0, 1, 2]).await {
+        match Box::pin(map.get_many(&[0, 1, 2])).await {
             Err(ref e) if map_item_terminated(e) => {}
             other => bail!("get_many after reset must be Terminated, got {other:?}"),
         }

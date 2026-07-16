@@ -67,10 +67,10 @@ use std::slice;
 /// [`STREAM_CHUNK`](super::descriptor::STREAM_CHUNK) aliases it so the
 /// point-get stream chunk width and the batch-read width are one number.
 ///
-/// Sized to overlap the durable round-trips of a cold collection window without
-/// pessimizing a warm one; every internal per-chunk buffer is a
-/// `SmallVec<[_; CELL_BATCH]>`, so the steady state stays on the stack.
-pub(crate) const CELL_BATCH: usize = 16;
+/// Sized to amortize durable round-trips without widening one Cassandra
+/// response past the measured latency elbow; every internal per-chunk buffer is
+/// a `SmallVec<[_; CELL_BATCH]>`, so the steady state stays on the stack.
+pub(crate) const CELL_BATCH: usize = 128;
 
 const _: () = assert!(
     CELL_BATCH > 0,

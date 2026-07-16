@@ -67,6 +67,7 @@ use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
 use smallvec::SmallVec;
 use std::collections::HashSet;
+use std::future::Future;
 use std::ops::Bound;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -987,20 +988,22 @@ impl FjallCellCache {
     /// [`commit_batch`](Self::commit_batch) (which reads stage expiries inside
     /// its own closure) and the hopping
     /// [`delete_section`](Self::delete_section).
-    async fn run_batch(
+    fn run_batch(
         &self,
         handle: Keyspace,
         capacity: usize,
         fill: impl FnOnce(&mut OwnedWriteBatch, &Keyspace) -> fjall::Result<()> + Send + 'static,
-    ) -> Result<(), FjallCellCacheError> {
+    ) -> impl Future<Output = Result<(), FjallCellCacheError>> + Send {
         let database = self.inner.database().clone();
-        spawn_blocking(move || {
+        let task = spawn_blocking(move || {
             let mut batch = OwnedWriteBatch::with_capacity(database, capacity);
             fill(&mut batch, &handle)?;
             batch.commit()
-        })
-        .await??;
-        Ok(())
+        });
+        async move {
+            task.await??;
+            Ok(())
+        }
     }
 }
 

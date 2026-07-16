@@ -885,12 +885,12 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
         };
         let session1 = make_session(&cells, &oracle, &registry, &state_key, &armed, ev1);
         let handle1 = descriptor.bind(&session1).map_err(|e| eyre!("bind: {e}"))?;
-        batch = handle1.get_many(&input.queries).await?;
+        batch = Box::pin(handle1.get_many(&input.queries)).await?;
         for q in &input.queries {
             point.push(handle1.get(q).await?);
         }
     } else {
-        batch = handle0.get_many(&input.queries).await?;
+        batch = Box::pin(handle0.get_many(&input.queries)).await?;
         for q in &input.queries {
             point.push(handle0.get(q).await?);
         }
