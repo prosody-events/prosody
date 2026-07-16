@@ -42,7 +42,7 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::event_ref::EventRef;
 use super::identity::CollectionId;
-use super::store::{CELL_BATCH, CellStore, CommittedBatch, CoordinateBatch};
+use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch};
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -132,9 +132,9 @@ where
         own: EventRef,
     ) -> Result<CommittedBatch, L::Error> {
         let section_cleared = self.dirty.section_cleared(collection, section);
-        let mut answers: SmallVec<[Option<Committed>; CELL_BATCH]> = smallvec![None; batch.len()];
-        let mut untouched: SmallVec<[Coordinate; CELL_BATCH]> = SmallVec::new();
-        let mut untouched_pos: SmallVec<[usize; CELL_BATCH]> = SmallVec::new();
+        let mut answers: CellBuffer<Option<Committed>> = smallvec![None; batch.len()];
+        let mut untouched: CellBuffer<Coordinate> = SmallVec::new();
+        let mut untouched_pos: CellBuffer<usize> = SmallVec::new();
         for (i, coordinate) in batch.iter().enumerate() {
             let cell = CellKey {
                 section,

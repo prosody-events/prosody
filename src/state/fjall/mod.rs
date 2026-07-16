@@ -58,7 +58,7 @@ use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Section};
-use crate::state::store::{CELL_BATCH, CommittedBatch, CoordinateBatch};
+use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch};
 use ahash::RandomState;
 use bytes::Bytes;
 use educe::Educe;
@@ -504,9 +504,9 @@ impl FjallCellCache {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
-        // Encode every key up front (bounded, sized once): the steady state
-        // stays inline and the owned keys move into the blocking closure.
-        let keys: SmallVec<[SmallVec<[u8; 32]>; CELL_BATCH]> = batch
+        // Encode every key up front (bounded, sized once): small requests stay
+        // inline and the owned keys move into the blocking closure.
+        let keys: CellBuffer<SmallVec<[u8; 32]>> = batch
             .iter()
             .map(|coordinate| {
                 codec::cell_key(
@@ -525,14 +525,14 @@ impl FjallCellCache {
         // (or the injected fault) fails the whole hop, mirroring how `read_cell`
         // surfaces one via `??`.
         let raws = spawn_blocking(
-            move || -> Result<SmallVec<[Option<Slice>; CELL_BATCH]>, FjallCellCacheError> {
+            move || -> Result<CellBuffer<Option<Slice>>, FjallCellCacheError> {
                 #[cfg(test)]
                 probes.fetch_add(1, Ordering::Relaxed);
                 #[cfg(test)]
                 if fail_reads.load(Ordering::Relaxed) {
                     return Err(FjallCellCacheError::Injected);
                 }
-                let mut out: SmallVec<[Option<Slice>; CELL_BATCH]> = SmallVec::new();
+                let mut out = SmallVec::with_capacity(keys.len());
                 for key in &keys {
                     out.push(handle.get(key.as_slice())?);
                 }
@@ -646,7 +646,7 @@ impl FjallCellCache {
         // caller's iterator) so the blocking closure only touches fjall; the
         // owned key/frame pairs move into it. Building `framed` directly from the
         // projected iterator avoids an intermediate collect on the settle path.
-        let framed: SmallVec<[(SmallVec<[u8; 32]>, Bytes); CELL_BATCH]> = cells
+        let framed: CellBuffer<(SmallVec<[u8; 32]>, Bytes)> = cells
             .into_iter()
             .map(|(cell, value, expiry)| {
                 (
@@ -707,7 +707,8 @@ impl FjallCellCache {
         }
         // Owned closure inputs, bounded and sized once: the cell key plus the
         // committed `data` to rewrite at its read-back stage expiry.
-        let mut inputs: Vec<(SmallVec<[u8; 32]>, Option<Bytes>)> = Vec::with_capacity(writes.len());
+        let mut inputs: CellBuffer<(SmallVec<[u8; 32]>, Option<Bytes>)> =
+            SmallVec::with_capacity(writes.len());
         for (cell, write) in writes {
             inputs.push((codec::cell_key(collection, cell), write.data().cloned()));
         }
@@ -742,7 +743,7 @@ impl FjallCellCache {
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         self.injected_delete_failure()?;
-        let mut keys: Vec<SmallVec<[u8; 32]>> = Vec::with_capacity(cells.len());
+        let mut keys: CellBuffer<SmallVec<[u8; 32]>> = SmallVec::with_capacity(cells.len());
         for cell in cells {
             keys.push(codec::cell_key(collection, cell));
         }

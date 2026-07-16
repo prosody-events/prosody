@@ -31,10 +31,10 @@ use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
-use super::store::{CELL_BATCH, CellStore, CoordinateBatch, dedupe};
+use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
-    CollectionId, CollectionRef, CommitMode, Coordinate, Direction, EventRef, PartitionBackend,
-    StateKey, StateName, StateType,
+    CELLS_INLINE, CollectionId, CollectionRef, CommitMode, Coordinate, Direction, EventRef,
+    PartitionBackend, StateKey, StateName, StateType,
 };
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -183,6 +183,21 @@ fn prop_chunk_reassembly() {
         flat == input && full_prefix && (input.is_empty() == batches.is_empty())
     }
     QuickCheck::new().quickcheck(property as fn(Vec<u8>) -> bool);
+}
+
+/// Keyed-state buffers keep small operations inline but spill well before a
+/// full store batch can become part of an async future's stack footprint.
+#[test]
+fn cell_buffers_spill_before_full_batch() {
+    let small: CellBuffer<usize> = (0..CELLS_INLINE).collect();
+    assert!(!small.spilled(), "the common small case stays inline");
+
+    let full: CellBuffer<usize> = (0..CELL_BATCH).collect();
+    assert_eq!(full.len(), CELL_BATCH);
+    assert!(
+        full.spilled(),
+        "a full batch must not remain inline in an async state machine"
+    );
 }
 
 /// `dedupe` keeps unique coordinates in first-occurrence order and maps every

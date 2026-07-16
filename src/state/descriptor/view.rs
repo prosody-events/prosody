@@ -15,7 +15,7 @@ use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::session::{CellSession, MutatePermit, OpPermit};
-use crate::state::store::{CELL_BATCH, CoordinateBatch};
+use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
 use crate::state::{RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -122,7 +122,7 @@ impl<S: CellSession> CellScope<S> {
         _permit: &OpPermit<'_>,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         ensure_live(&self.session)?;
         self.session
             .get_many(self.state_type, &self.name, section, batch)
@@ -335,7 +335,7 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     ///
     /// # Invariant — no await, no buffering between the fence and the caller
     ///
-    /// Every source buffer (a coordinate chunk's `SmallVec`, the range source's
+    /// Every source buffer (a coordinate chunk's buffer, the range source's
     /// `buffered` resolution window) sits BELOW this adapter; a collection adds
     /// only synchronous per-item transforms above it (`map_err` into its
     /// collection error, dropping the coordinate for a deque). The check is a
@@ -441,14 +441,13 @@ where
         &self,
         permit: &OpPermit<'_>,
         keys: &[KeyOf<T>],
-    ) -> Result<SmallVec<[Option<ResolvedOf<T>>; CELL_BATCH]>, CellStateError<CellCodecError<T>>>
-    {
+    ) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>> {
         // PHASE 1: sequential store reads → aligned committed bytes. The
         // per-chunk coordinate buffer stays inline (`≤ CELL_BATCH`); only the
         // owned coordinates cross the store await, never a borrow of `self`.
-        let mut bytes: SmallVec<[Option<Bytes>; CELL_BATCH]> = SmallVec::with_capacity(keys.len());
+        let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(keys.len());
         for key_chunk in keys.chunks(CELL_BATCH) {
-            let coords: SmallVec<[Coordinate; CELL_BATCH]> =
+            let coords: CellBuffer<Coordinate> =
                 key_chunk.iter().map(|k| self.cell(k).coordinate).collect();
             for batch in CoordinateBatch::chunks(coords) {
                 bytes.extend(
@@ -464,7 +463,7 @@ where
             "batch read answers every input position"
         );
         // PHASE 2: whole-call concurrent typed resolve, input-ordered.
-        let resolved: SmallVec<[Option<ResolvedOf<T>>; CELL_BATCH]> = stream::iter(bytes)
+        let resolved: CellBuffer<Option<ResolvedOf<T>>> = stream::iter(bytes)
             .map(|slot| {
                 cooperative(async move {
                     match slot {
@@ -634,14 +633,14 @@ where
                 let permit = self.read_permit().await;
                 // Collect the chunk's ≤ STREAM_CHUNK keys, then ONE batch
                 // fetch + resolve; `get_many` keeps `vals` aligned to `keys`.
-                let keys: SmallVec<[KeyOf<T>; STREAM_CHUNK]> =
+                let keys: CellBuffer<KeyOf<T>> =
                     coords.by_ref().take(STREAM_CHUNK).collect();
                 let chunk = self.get_many(&permit, &keys).await.map(|vals| {
                     // A `None` is an absent cell: skipped, never an error.
                     keys.into_iter()
                         .zip(vals)
                         .filter_map(|(key, value)| value.map(|v| (key, v)))
-                        .collect::<SmallVec<[_; STREAM_CHUNK]>>()
+                        .collect::<CellBuffer<_>>()
                 });
                 Some((chunk, coords))
             });

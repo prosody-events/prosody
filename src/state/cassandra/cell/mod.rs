@@ -107,7 +107,7 @@ use crate::state::resolve::{
     resolve_read,
 };
 use crate::state::store::{
-    CELL_BATCH, CacheBatch, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
@@ -401,7 +401,7 @@ impl<O> CassandraStore<O> {
         id: &CollectionId,
         section: Section,
         uniques: &[&Coordinate],
-    ) -> Result<SmallVec<[(Coordinate, CellTtlRow); CELL_BATCH]>, CassandraCellStoreError> {
+    ) -> Result<CellBuffer<(Coordinate, CellTtlRow)>, CassandraCellStoreError> {
         let pk = Pk::of(id);
         let result = self
             .cql()
@@ -421,7 +421,7 @@ impl<O> CassandraStore<O> {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?;
-        let mut out: SmallVec<[(Coordinate, CellTtlRow); CELL_BATCH]> = SmallVec::new();
+        let mut out: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::new();
         for row in result
             .rows::<KeyedCellTtlRow>()
             .map_err(CassandraStoreError::from)?

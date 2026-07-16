@@ -46,6 +46,7 @@
 //! Value is single-cell, so every slice is size-1 and the Cassandra batch
 //! degenerates to one statement.
 
+use super::CELLS_INLINE;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
@@ -68,8 +69,8 @@ use std::slice;
 /// point-get stream chunk width and the batch-read width are one number.
 ///
 /// Sized to amortize durable round-trips without widening one Cassandra
-/// response past the measured latency elbow; every internal per-chunk buffer is
-/// a `SmallVec<[_; CELL_BATCH]>`, so the steady state stays on the stack.
+/// response past the measured latency elbow. Buffers use the small keyed-state
+/// inline capacity and spill before a full batch inflates an async future.
 pub(crate) const CELL_BATCH: usize = 128;
 
 const _: () = assert!(
@@ -93,7 +94,7 @@ const _: () = assert!(
 /// Nominally `pub` inside the `pub(crate)` [`store`](self) module (the
 /// module-capping precedent): the trait methods that take it are nominally
 /// `pub`, so the type must be too, but the module cap keeps it crate-internal.
-pub struct CoordinateBatch(SmallVec<[Coordinate; CELL_BATCH]>);
+pub struct CoordinateBatch(CellBuffer<Coordinate>);
 
 impl CoordinateBatch {
     /// Splits `coords` into maximal `1..=CELL_BATCH` batches in input order.
@@ -104,7 +105,7 @@ impl CoordinateBatch {
     ) -> impl Iterator<Item = CoordinateBatch> {
         let mut it = coords.into_iter();
         from_fn(move || {
-            let batch: SmallVec<[Coordinate; CELL_BATCH]> = it.by_ref().take(CELL_BATCH).collect();
+            let batch: CellBuffer<Coordinate> = it.by_ref().take(CELL_BATCH).collect();
             (!batch.is_empty()).then_some(CoordinateBatch(batch))
         })
     }
@@ -125,14 +126,18 @@ impl CoordinateBatch {
     }
 }
 
+/// A keyed-state work buffer: small operations stay inline and larger batches
+/// spill rather than embedding [`CELL_BATCH`] entries in async state machines.
+pub type CellBuffer<T> = SmallVec<[T; CELLS_INLINE]>;
+
 /// The index-aligned result of a committed batch read: `result[i]` answers the
 /// batch's coordinate `i` (see [`CellStore::get_many`]).
-pub type CommittedBatch = SmallVec<[Committed; CELL_BATCH]>;
+pub type CommittedBatch = CellBuffer<Committed>;
 
 /// The index-aligned result of a cache-fill batch read: each position's
 /// committed value plus the durable cell's remaining TTL (see
 /// [`CellStore::get_many_for_cache`]).
-pub type CacheBatch = SmallVec<[(Committed, Option<CompactDuration>); CELL_BATCH]>;
+pub type CacheBatch = CellBuffer<(Committed, Option<CompactDuration>)>;
 
 /// Uniform durable storage for the cells of one collection partition.
 ///
@@ -253,8 +258,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// position; a failing coordinate fails the whole batch at its earliest
     /// occurrence (the memory default has no whole-collection phase). The
     /// Cassandra backend overrides it with one `IN` query. Every internal
-    /// scratch buffer is a `SmallVec<[_; CELL_BATCH]>`, so the per-chunk path
-    /// allocates nothing on the stack's common case.
+    /// scratch buffers use [`CellBuffer`], so small calls stay inline while a
+    /// full batch spills rather than inflating this future.
     ///
     /// # Errors
     ///
@@ -527,16 +532,11 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 /// The batch-read contract's dedup + first-occurrence-ordering leg, shared by
 /// the [`CellStore::get_many`]/[`CellStore::get_many_for_cache`] defaults and
 /// the Cassandra override so all three agree on which coordinate answers which
-/// position. Both buffers are `SmallVec<[_; CELL_BATCH]>`, so a batch never
-/// spills to the heap. The `uniques` borrow from `batch`.
-pub(crate) fn dedupe(
-    batch: &CoordinateBatch,
-) -> (
-    SmallVec<[&Coordinate; CELL_BATCH]>,
-    SmallVec<[usize; CELL_BATCH]>,
-) {
-    let mut uniques: SmallVec<[&Coordinate; CELL_BATCH]> = SmallVec::new();
-    let mut plan: SmallVec<[usize; CELL_BATCH]> = SmallVec::new();
+/// position. Both buffers use [`CellBuffer`], so small calls stay inline. The
+/// `uniques` borrow from `batch`.
+pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellBuffer<usize>) {
+    let mut uniques: CellBuffer<&Coordinate> = SmallVec::new();
+    let mut plan: CellBuffer<usize> = SmallVec::new();
     for coordinate in batch.iter() {
         let idx = if let Some(i) = uniques.iter().position(|u| *u == coordinate) {
             i
@@ -575,8 +575,8 @@ pub(crate) async fn route_commit<S>(
 where
     S: CellStore,
 {
-    let mut keeps: Vec<CellKey> = Vec::with_capacity(writes.len());
-    let mut clears: Vec<(CellKey, Option<Bytes>)> = Vec::with_capacity(writes.len());
+    let mut keeps: CellBuffer<CellKey> = SmallVec::with_capacity(writes.len());
+    let mut clears: CellBuffer<(CellKey, Option<Bytes>)> = SmallVec::with_capacity(writes.len());
     for (cell, write) in writes {
         if write.data().is_some() {
             keeps.push(cell.clone());
@@ -609,7 +609,7 @@ pub(crate) async fn route_abort<S>(
 where
     S: CellStore,
 {
-    let cells: Vec<(CellKey, Option<Bytes>)> = writes
+    let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
         .iter()
         .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
         .collect();

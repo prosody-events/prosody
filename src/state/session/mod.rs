@@ -72,7 +72,7 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::store::{CELL_BATCH, CellStore, CoordinateBatch};
+use crate::state::store::{CellBuffer, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -85,7 +85,6 @@ use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
 use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
-use smallvec::SmallVec;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -188,7 +187,7 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
         name: &StateName,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError>> + Send;
+    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> + Send;
 
     /// The single-section, start-anchored, bidirectional range primitive: a
     /// lazy stream of the visible committed cells in `coordinate` byte order.
@@ -1191,7 +1190,7 @@ where
         name: &StateName,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<SmallVec<[Option<Bytes>; CELL_BATCH]>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         let id = self.id_for(state_type, name);
         let committed = self
             .inner

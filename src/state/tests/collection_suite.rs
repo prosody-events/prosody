@@ -853,7 +853,7 @@ impl Arbitrary for MapGetManyInput {
 /// boundary. No TTL is in play and the JSON identity resolver is deterministic,
 /// so the observation rules collapse to exact point-parity and this isolates
 /// the batch plumbing (coordinate lowering, dedupe/scatter, sub-batch
-/// concatenation, ordered `buffered` resolve, `SmallVec → Vec` alignment).
+/// concatenation, and ordered `buffered` resolution).
 /// Proven over both the dirty-overlay arm (uncommitted) and the committed arm.
 pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Result<bool> {
     let oracle = ScriptedOracle::default();

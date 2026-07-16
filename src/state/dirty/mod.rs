@@ -35,6 +35,7 @@
 //!
 //! [`Overlay`]: crate::state::overlay::Overlay
 
+use super::CELLS_INLINE;
 use super::cell_key::{CellKey, Section};
 use super::identity::{CollectionId, StateName, StateType};
 use crate::Key;
@@ -43,10 +44,6 @@ use scc::Guard;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::ops::RangeInclusive;
-
-/// Inline capacity of one collection's snapshotted cell set; small
-/// Maps/Deques and every Value stay inline.
-const CELLS_INLINE: usize = 8;
 
 /// Inline capacity of one event's touched-collection work-list; an event
 /// touches a handful of collections.

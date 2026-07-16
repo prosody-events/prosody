@@ -155,4 +155,12 @@ pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 /// one wave; the two bounds remain independently tunable.
 pub(crate) const RESOLVE_FANOUT: usize = 128;
 
+/// Inline capacity for keyed-state buffers whose cardinality is commonly small.
+/// Larger buffers spill to the heap instead of inflating nested async futures.
+pub(crate) const CELLS_INLINE: usize = 8;
+
 const _: () = assert!(RESOLVE_FANOUT > 0, "RESOLVE_FANOUT must be positive");
+const _: () = assert!(
+    CELLS_INLINE > 0 && CELLS_INLINE <= 8,
+    "keyed-state inline buffers must stay small"
+);

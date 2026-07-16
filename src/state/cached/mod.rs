@@ -153,7 +153,7 @@ use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
-use super::store::{CacheBatch, CellStore, CommittedBatch, CoordinateBatch};
+use super::store::{CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -275,7 +275,7 @@ impl<L> Cached<L> {
         if let Err(error) = self.fjall.put_batch(collection.id(), projected).await {
             warn_skip("publish", &error);
             // D1 repair: rebuild the delete keys from the `cells` param.
-            let keys: Vec<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
+            let keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "publish repair", || {
                 self.fjall.delete_batch(collection.id(), &keys)
             })
@@ -678,7 +678,7 @@ where
         // a value that never lands. (Not a per-message hot path: this verb runs
         // only on `commit()`/finalize, and the keys are one bounded batch off
         // the `cells` param — the same key-clone shape D1 already uses.)
-        let cell_keys: Vec<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
+        let cell_keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
         retry_delete(&self.fjall, "resolved cells", || {
             self.fjall.delete_batch(collection.id(), &cell_keys)
         })
@@ -770,7 +770,7 @@ where
         // the dominant read-modify-write workload.
         if let Err(error) = self.fjall.commit_batch(collection.id(), writes).await {
             warn_skip("commit transform", &error);
-            let cells: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
+            let cells: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "commit transform fallback", || {
                 self.fjall.delete_batch(collection.id(), &cells)
             })
@@ -786,7 +786,7 @@ where
         // whose expiries the transform reads. Order: transform → scoped D4 →
         // lower promote.
         if !clears.is_empty() {
-            let staged: Vec<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
+            let staged: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
             for clear in clears {
                 retry_delete(&self.fjall, "commit clear section", || {
                     self.fjall
@@ -826,7 +826,7 @@ where
         if self.fjall.fuse_blown() {
             return self.lower.abort_provisional(collection, writes).await;
         }
-        let cells: Vec<(CellKey, Option<Bytes>)> = writes
+        let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
             .iter()
             .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
             .collect();

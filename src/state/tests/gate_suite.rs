@@ -1791,7 +1791,7 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
 }
 
 /// Scan-shell fence, COORDINATE source: the map tracked arm point-gets a chunk,
-/// collects it into a `SmallVec`, and releases the permit before the first
+/// collects it into a bounded buffer, and releases the permit before the first
 /// yield; a buffered entry never crosses the fence after an observed bump. Both
 /// keys land in one chunk (`STREAM_CHUNK >= 2`), so the first entry's fence
 /// check passes pre-bump and the second's runs post-bump. Red proven by
