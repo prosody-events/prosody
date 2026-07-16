@@ -254,7 +254,7 @@ fn frozen_warm_index_bytes() -> Result<()> {
     let coord = index_coord_key(&id, &cell);
     let mut expected = prefix.to_vec();
     expected.extend_from_slice(&[0x00, 0x07, 0xAB, 0xCD]);
-    assert_eq!(coord, expected, "coord key layout");
+    assert_eq!(coord.as_slice(), expected.as_slice(), "coord key layout");
     assert_eq!(coord_cell_key(&coord), cell, "coord key round-trips");
 
     // seeded key: [hash][Seeded=0x01].
@@ -273,4 +273,52 @@ fn frozen_warm_index_bytes() -> Result<()> {
         "presence key layout"
     );
     Ok(())
+}
+
+/// The provisional-index coord key is byte-for-byte `[hash][Coord=0x00]
+/// [section][coordinate]` over random identities, sections, and coordinates,
+/// round-trips back to its `CellKey`, and stays inline exactly when its encoded
+/// length fits the 32-byte `SmallVec` buffer (only a long Map coordinate
+/// spills). Byte parity is the ordering proof: fjall range order is a pure
+/// function of these bytes.
+#[test]
+fn prop_index_coord_key_bytes_spill_and_round_trip() {
+    fn prop(fields: PrefixFields, section: i8, coord: Vec<u8>) -> TestResult {
+        let id = match id_from(fields) {
+            Ok(id) => id,
+            Err(e) => return TestResult::error(format!("invalid identity: {e}")),
+        };
+        let mut expected = collection_prefix(&id).to_vec();
+        expected.push(0x00); // IndexKind::Coord discriminant
+        expected.push(section.cast_unsigned());
+        expected.extend_from_slice(&coord);
+
+        let cell = CellKey {
+            section: Section::new(section),
+            coordinate: Coordinate::from_bytes(coord),
+        };
+        let key = index_coord_key(&id, &cell);
+
+        if key.as_slice() != expected.as_slice() {
+            return TestResult::error(format!(
+                "bytes diverged: got {:?}, want {:?}",
+                key.as_slice(),
+                expected.as_slice()
+            ));
+        }
+        let expect_spill = expected.len() > 32;
+        if key.spilled() != expect_spill {
+            return TestResult::error(format!(
+                "spill mismatch: len {} spilled {} want {}",
+                expected.len(),
+                key.spilled(),
+                expect_spill
+            ));
+        }
+        if coord_cell_key(&key) != cell {
+            return TestResult::error("coord key did not round-trip".to_owned());
+        }
+        TestResult::from_bool(true)
+    }
+    QuickCheck::new().quickcheck(prop as fn(PrefixFields, i8, Vec<u8>) -> TestResult);
 }

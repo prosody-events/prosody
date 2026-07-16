@@ -176,10 +176,15 @@ fn index_family_head(id: &CollectionId, kind: IndexKind) -> [u8; COLLECTION_PREF
 
 /// The warm-index key for a provisional coordinate:
 /// `[hash][Coord][section][coordinate]`. Presence ⟺ the cell is provisional.
+///
+/// Built per settle-time index write — the same steady-state cardinality as
+/// [`cell_key`] — so it rides the same `SmallVec` inline buffer: Value (18 B),
+/// Deque (26 B), and short-key Map entries stay on the stack; only a long Map
+/// coordinate spills to the heap (its coordinate is genuinely unbounded).
 #[must_use]
-pub(super) fn index_coord_key(id: &CollectionId, cell: &CellKey) -> Vec<u8> {
+pub(super) fn index_coord_key(id: &CollectionId, cell: &CellKey) -> SmallVec<[u8; 32]> {
     let coordinate = cell.coordinate.as_bytes();
-    let mut key = Vec::with_capacity(COLLECTION_PREFIX_LEN + 2 + coordinate.len());
+    let mut key = SmallVec::with_capacity(COLLECTION_PREFIX_LEN + 2 + coordinate.len());
     key.extend_from_slice(&collection_prefix(id));
     key.push(IndexKind::Coord.into());
     key.push(i8::from(cell.section).cast_unsigned());

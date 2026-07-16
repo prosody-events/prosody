@@ -1083,8 +1083,8 @@ fn encode_frame(payload: Option<&Bytes>, expiry: u64) -> Bytes {
 fn index_keys<'a>(
     collection: &CollectionId,
     cells: impl ExactSizeIterator<Item = &'a CellKey>,
-) -> Vec<Vec<u8>> {
-    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(cells.len());
+) -> Vec<SmallVec<[u8; 32]>> {
+    let mut keys: Vec<SmallVec<[u8; 32]>> = Vec::with_capacity(cells.len());
     for cell in cells {
         keys.push(codec::index_coord_key(collection, cell));
     }
@@ -1092,7 +1092,7 @@ fn index_keys<'a>(
 }
 
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
-/// blocking hop. Generic over the key so a variable-length `Vec<u8>` cell key
+/// blocking hop. Generic over the key so a variable-length `SmallVec` cell key
 /// and a fixed-size `[u8; N]` index key both read without a bridging copy.
 async fn read_cell(
     cache: &Keyspace,
