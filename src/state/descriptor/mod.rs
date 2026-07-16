@@ -107,8 +107,10 @@ const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 
 /// The point-get streams' chunk width: the granularity of both the per-chunk
 /// gate hold (one read permit per chunk, dropped with the chunk future's scope
-/// before any yield) and the fetch concurrency (`.buffered(STREAM_CHUNK)`).
-/// Shared by [`MapHandle::stream`](map::MapHandle::stream) and
+/// before any yield) and the batch read — each chunk's cells are fetched by
+/// ONE `CellView::get_many` call (one Cassandra query / one fjall hop), whose
+/// typed resolves then fan out under `RESOLVE_FANOUT`. Shared by
+/// [`MapHandle::stream`](map::MapHandle::stream) and
 /// [`DequeHandle::stream`](deque::DequeHandle::stream).
 ///
 /// An alias of [`CELL_BATCH`](crate::state::store::CELL_BATCH) — the point-get

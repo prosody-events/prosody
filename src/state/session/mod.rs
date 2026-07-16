@@ -382,8 +382,9 @@ pub(crate) mod sealed {
     /// keyset within its bound) takes the gate for its init metadata read
     /// (the map keyset cell / the deque window cell), releases it, then
     /// fetches the listed entries in gate-scoped chunks — one permit per
-    /// chunk, ≤ the chunk width in point reads each. Each chunk is fetched,
-    /// decoded, and resolved under that one permit, which is dropped with the
+    /// chunk, ONE batch read each (only the init metadata read stays a point
+    /// read). Each chunk is fetched, decoded, and resolved under that one
+    /// permit, which is dropped with the
     /// chunk future's scope before any of the chunk's items reach user code, so
     /// the permit is **never held across a yield to user code (items and errors
     /// alike)**. A *scan-path* stream takes the gate only for its init metadata
