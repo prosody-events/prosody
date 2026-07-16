@@ -3,7 +3,7 @@ use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use std::time::Duration;
 
 /// `MAX_CASSANDRA_TTL_SECS` fits a `u32`, so the ceiling and one second past
-/// it are both representable as a `CompactDuration`.
+/// it are both representable as a `u32`/`Duration`.
 const CEILING_SECS: u32 = MAX_CASSANDRA_TTL_SECS as u32;
 
 #[test]

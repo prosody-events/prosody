@@ -87,7 +87,7 @@ pub enum CommitMode {
 /// here at registration time, not at event scope creation time.
 #[derive(Clone, Copy, Debug)]
 pub struct CollectionDef {
-    /// Per-collection TTL override.
+    /// Per-collection TTL.
     pub ttl: Option<CompactDuration>,
 
     /// Per-collection commit mode.
