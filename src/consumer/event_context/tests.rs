@@ -446,6 +446,22 @@ where
                     return Ok(false);
                 }
             }
+            // Batch reads preserve input positions, including duplicates and
+            // an untracked key, and agree with the same visible-state model.
+            let query = [KEYS[2], "absent", KEYS[0], KEYS[2]];
+            let keys = query.map(str::to_owned).to_vec();
+            let batch = handle
+                .get_many(keys)
+                .await
+                .map_err(|e| eyre!("erased map get_many: {e}"))?;
+            if batch.len() != query.len()
+                || batch
+                    .iter()
+                    .zip(query)
+                    .any(|(actual, key)| !opt_same::<P>(actual.as_ref(), visible.get(key)))
+            {
+                return Ok(false);
+            }
             // A forward scan must yield exactly the visible key-ordered entries.
             let scanned = drain_cursor(&handle.scan(Direction::Forward)).await?;
             let expected: Vec<(String, P)> = visible

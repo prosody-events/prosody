@@ -176,6 +176,10 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// Reads `key`'s value (`None` when absent).
     async fn get(&self, key: String) -> Result<Option<Item>, ErasedStateError>;
 
+    /// Reads each key in input order as one isolated batch. Absent keys yield
+    /// `None`, and duplicate keys retain their positions.
+    async fn get_many(&self, keys: Vec<String>) -> Result<Vec<Option<Item>>, ErasedStateError>;
+
     /// Inserts or overwrites `key`. Rejects the JSON-null sentinel
     /// (`Permanent`).
     async fn set(&self, key: String, item: Item) -> Result<(), ErasedStateError>;
@@ -558,6 +562,16 @@ where
     async fn get(&self, key: String) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .get(&key)
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn get_many(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<Vec<Option<ResolvedOf<T>>>, ErasedStateError> {
+        self.handle
+            .get_many(&keys)
             .await
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
