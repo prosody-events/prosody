@@ -44,9 +44,11 @@ use crate::state::order_codec::{UnitKey, Utf8KeyCodec};
 use crate::state::session::CellSession;
 use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::FutureExt;
 use futures::stream::{BoxStream, StreamExt};
 use std::fmt::Display;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -262,7 +264,7 @@ pub struct StateCursor<Item> {
     inner: Mutex<CursorInner<Item>>,
 }
 
-/// The cursor's three states. Exhaustion and close/failure are distinct so a
+/// The cursor's states. Exhaustion and close/failure are distinct so a
 /// fully-drained cursor keeps answering `Ok(None)` (fused) while a closed or
 /// failed one errors on the next `next()`.
 enum CursorInner<Item> {
@@ -271,6 +273,11 @@ enum CursorInner<Item> {
 
     /// The stream returned `None`; further `next()` calls fuse to `Ok(None)`.
     Exhausted,
+
+    /// A ready-chunk pull encountered an error after one or more ready items.
+    /// Those items are returned first; the next pull surfaces this original
+    /// error and transitions to `Closed`.
+    DeferredError(Option<ErasedStateError>),
 
     /// Explicit `close()` or a first error; further `next()` calls error.
     Closed,
@@ -302,6 +309,16 @@ impl<Item> StateCursor<Item> {
                     "state cursor used after it was closed",
                 ));
             }
+            CursorInner::DeferredError(error) => {
+                let Some(error) = error.take() else {
+                    *guard = CursorInner::Closed;
+                    return Err(ErasedStateError::terminated(
+                        "state cursor used after it was closed",
+                    ));
+                };
+                *guard = CursorInner::Closed;
+                return Err(error);
+            }
             CursorInner::Open(stream) => stream,
         };
         match stream.next().await {
@@ -315,6 +332,94 @@ impl<Item> StateCursor<Item> {
                 Ok(None)
             }
         }
+    }
+
+    /// Awaits one item, then drains up to `max_items - 1` additional items
+    /// only while they are immediately ready.
+    ///
+    /// This is the shared FFI batching primitive: clients transport the
+    /// returned vector across their language boundary and flatten it into the
+    /// language's item-oriented async iterator. It never waits to fill the
+    /// vector, so first-item latency and demand-driven backpressure are
+    /// preserved. Whole chunk pulls serialize on the cursor mutex.
+    ///
+    /// If an error is immediately ready after one or more items, the items are
+    /// returned first and the original error is deferred until the next pull,
+    /// preserving item-before-error stream order. Exhaustion remains fused.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stream's [`ErasedStateError`], including a deferred error
+    /// from the preceding chunk, or a terminated-family error once closed.
+    pub async fn next_ready_chunk(
+        &self,
+        max_items: NonZeroUsize,
+    ) -> Result<Option<Vec<Item>>, ErasedStateError> {
+        enum Tail {
+            Pending,
+            Exhausted,
+            Failed(ErasedStateError),
+        }
+
+        let mut guard = self.inner.lock().await;
+        let stream = match &mut *guard {
+            CursorInner::Exhausted => return Ok(None),
+            CursorInner::Closed => {
+                return Err(ErasedStateError::terminated(
+                    "state cursor used after it was closed",
+                ));
+            }
+            CursorInner::DeferredError(error) => {
+                let Some(error) = error.take() else {
+                    *guard = CursorInner::Closed;
+                    return Err(ErasedStateError::terminated(
+                        "state cursor used after it was closed",
+                    ));
+                };
+                *guard = CursorInner::Closed;
+                return Err(error);
+            }
+            CursorInner::Open(stream) => stream,
+        };
+
+        let Some(first) = stream.next().await else {
+            *guard = CursorInner::Exhausted;
+            return Ok(None);
+        };
+        let first = match first {
+            Ok(item) => item,
+            Err(error) => {
+                *guard = CursorInner::Closed;
+                return Err(error);
+            }
+        };
+
+        // Clients currently use 256. Bound eager allocation even if another
+        // caller supplies a much larger cap; the vector can still grow to that
+        // cap when the stream actually has that many ready items.
+        let mut items = Vec::with_capacity(max_items.get().min(256));
+        items.push(first);
+        let mut tail = Tail::Pending;
+        while items.len() < max_items.get() {
+            match stream.next().now_or_never() {
+                None => break,
+                Some(None) => {
+                    tail = Tail::Exhausted;
+                    break;
+                }
+                Some(Some(Ok(item))) => items.push(item),
+                Some(Some(Err(error))) => {
+                    tail = Tail::Failed(error);
+                    break;
+                }
+            }
+        }
+        match tail {
+            Tail::Pending => {}
+            Tail::Exhausted => *guard = CursorInner::Exhausted,
+            Tail::Failed(error) => *guard = CursorInner::DeferredError(Some(error)),
+        }
+        Ok(Some(items))
     }
 
     /// Closes the cursor, dropping the stream (RAII releases any resources it
@@ -735,7 +840,11 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::stream::{self, StreamExt};
     use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     /// Builds a cursor over an explicit item sequence.
     fn cursor(items: Vec<Result<i32, ErasedStateError>>) -> StateCursor<i32> {
@@ -783,6 +892,94 @@ mod tests {
             ));
         };
         assert_eq!(terminated.category(), ErasedCategory::Transient);
+        Ok(())
+    }
+
+    /// Ready chunks stop at the caller's cap, preserve every item exactly
+    /// once, and retain fused exhaustion. Falsify: remove the length guard
+    /// from `next_ready_chunk` and the first assertion receives all items.
+    #[tokio::test]
+    async fn ready_chunks_respect_the_cap_and_fuse() -> Result<()> {
+        let cursor = cursor((0_i32..600_i32).map(Ok).collect());
+        let cap = NonZeroUsize::new(256).ok_or_else(|| eyre!("256 is nonzero"))?;
+        let first = cursor
+            .next_ready_chunk(cap)
+            .await?
+            .ok_or_else(|| eyre!("first chunk missing"))?;
+        let second = cursor
+            .next_ready_chunk(cap)
+            .await?
+            .ok_or_else(|| eyre!("second chunk missing"))?;
+        let third = cursor
+            .next_ready_chunk(cap)
+            .await?
+            .ok_or_else(|| eyre!("third chunk missing"))?;
+        assert_eq!((first.len(), second.len(), third.len()), (256, 256, 88));
+        let all: Vec<i32> = first.into_iter().chain(second).chain(third).collect();
+        assert_eq!(all, (0_i32..600_i32).collect::<Vec<_>>());
+        assert_eq!(cursor.next_ready_chunk(cap).await?, None);
+        assert_eq!(cursor.next_ready_chunk(cap).await?, None);
+        Ok(())
+    }
+
+    /// A ready error behind successful items is not allowed to erase those
+    /// items: the chunk arrives first, then the original categorized error,
+    /// then the ordinary closed-cursor error. Falsify: return the tail error
+    /// immediately and the first call loses `[1, 2]`.
+    #[tokio::test]
+    async fn ready_chunk_defers_an_error_behind_items() -> Result<()> {
+        let cursor = cursor(vec![Ok(1_i32), Ok(2_i32), Err(boom()), Ok(4_i32)]);
+        let cap = NonZeroUsize::new(256).ok_or_else(|| eyre!("256 is nonzero"))?;
+        assert_eq!(
+            cursor.next_ready_chunk(cap).await?,
+            Some(vec![1_i32, 2_i32])
+        );
+        let Err(error) = cursor.next().await else {
+            return Err(eyre!("the original deferred error must surface"));
+        };
+        assert_eq!(error.message(), "boom");
+        assert!(cursor.next_ready_chunk(cap).await.is_err());
+        Ok(())
+    }
+
+    /// A ready chunk never waits for the cap after its first item. Falsify:
+    /// replace the non-blocking tail polls with `.await` and this times out on
+    /// the permanently-pending second item.
+    #[tokio::test]
+    async fn ready_chunk_does_not_wait_to_fill() -> Result<()> {
+        let source = stream::once(async { Ok(7_i32) }).chain(stream::pending());
+        let cursor = StateCursor::new(source.boxed());
+        let cap = NonZeroUsize::new(256).ok_or_else(|| eyre!("256 is nonzero"))?;
+        let chunk = timeout(Duration::from_millis(100), cursor.next_ready_chunk(cap))
+            .await
+            .map_err(|_| eyre!("ready chunk waited for a second item"))??;
+        assert_eq!(chunk, Some(vec![7_i32]));
+        Ok(())
+    }
+
+    /// Cancelling a blocked first-item pull leaves the owned stream in the
+    /// open cursor, so a later pull can continue it. Falsify: move the stream
+    /// out of `CursorInner` while awaiting and cancellation drops it.
+    #[tokio::test]
+    async fn cancelled_ready_chunk_pull_preserves_the_stream() -> Result<()> {
+        let (release, blocked) = oneshot::channel();
+        let source = stream::once(async move {
+            blocked
+                .await
+                .map_err(|error| ErasedStateError::terminated(&error.to_string()))
+        });
+        let cursor = StateCursor::new(source.boxed());
+        let cap = NonZeroUsize::new(256).ok_or_else(|| eyre!("256 is nonzero"))?;
+        assert!(
+            timeout(Duration::from_millis(10), cursor.next_ready_chunk(cap))
+                .await
+                .is_err(),
+            "the first pull must block and be cancelled"
+        );
+        release
+            .send(9_i32)
+            .map_err(|_| eyre!("the cancelled pull dropped the stream"))?;
+        assert_eq!(cursor.next_ready_chunk(cap).await?, Some(vec![9_i32]));
         Ok(())
     }
 
