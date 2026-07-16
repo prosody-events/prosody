@@ -394,6 +394,46 @@ where
         Ok(self.entries.get(&permit, key).await?)
     }
 
+    /// Reads the values for `keys` as one isolated batch — one result per input
+    /// key, aligned index-wise (`results[i]` answers `keys[i]`; duplicate keys
+    /// are answered per position; absent keys read `None`).
+    ///
+    /// The whole read runs under one session-gate hold (the gate is a single
+    /// exclusive per-event mutex every collection op acquires for its body), so
+    /// no session-side mutation — a sibling op under `join!`, an attempt reset,
+    /// a settle close — can interleave anywhere inside this call. Isolation
+    /// does not freeze wall-clock TTL passage: keys deduplicated into one
+    /// internal batch answer from that batch's single observation, while
+    /// cells read across a batch (or cache-probe) boundary are each
+    /// answered at their own instant. Those observation rules are the store
+    /// layer's batch-read contract, stated once on the internal batch-read
+    /// verb; this method adds only gate ownership and the user-sized `Vec`,
+    /// no observation behavior of its own.
+    ///
+    /// Keys are addressed directly — there is no keyset consult, so a key
+    /// outside the tracked keyset simply reads `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a codec error (`Permanent`) when a cell does not decode, a
+    /// resolution error, or an access error from the session. A terminated or
+    /// closed session errors as a whole; no partial result is ever returned
+    /// (the `Result<Vec<_>>` shape makes partiality unrepresentable).
+    #[instrument(
+        name = "map.get_many",
+        skip_all,
+        fields(collection = self.entries.name().as_str(), keys = keys.len() as i64),
+        err
+    )]
+    pub async fn get_many(
+        &self,
+        keys: &[KC::Key],
+    ) -> Result<Vec<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>> {
+        let permit = self.entries.read_permit().await;
+        let resolved = self.entries.get_many(&permit, keys).await?;
+        Ok(resolved.into_vec())
+    }
+
     /// Streams the live entries in key order — ascending for
     /// [`Direction::Forward`], descending for [`Direction::Backward`]. Each
     /// entry's value is resolved as it is yielded.

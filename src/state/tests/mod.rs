@@ -14,9 +14,10 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeHoles, DequeInterleave, DequeTrace, MapInterleave, MapTrace, finalize_and_promote,
-    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_keyset_exact_trace,
-    run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
+    DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave, MapTrace,
+    finalize_and_promote, run_deque_holes, run_deque_stream_interleave, run_deque_trace,
+    run_map_get_many_parity_trace, run_map_keyset_exact_trace, run_map_stream_interleave,
+    run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
 use super::cell::ProvisionalWrite;
@@ -441,6 +442,20 @@ fn prop_map_keyset_exact() {
         executor::block_on(run_map_keyset_exact_trace(trace))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// `Map::get_many` parity: it answers each position exactly as the point `get`
+/// over random populations and query lists (duplicates, absent keys, and
+/// `> CELL_BATCH` lengths crossing sub-batches), in both the dirty-overlay and
+/// committed arms. The deterministic resolver and absent TTL collapse the
+/// observation rules to exact point-parity, so a scatter/alignment,
+/// concatenation, or ordering defect diverges from `get`.
+#[test]
+fn prop_map_get_many_parity() {
+    fn property(input: MapGetManyInput) -> Result<bool> {
+        executor::block_on(run_map_get_many_parity_trace(input))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapGetManyInput) -> Result<bool>);
 }
 
 /// Map TTL keyset-refresh: on a TTL'd map every `set` — including a re-set of

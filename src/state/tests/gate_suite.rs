@@ -28,7 +28,7 @@ use super::super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::super::registry::{CollectionDef, CollectionDefRegistry};
 use super::super::session::sealed::StateLifecycle;
 use super::super::session::{KeyedStateSession, SessionParts, TerminationWatch};
-use super::super::store::CellStore;
+use super::super::store::{CELL_BATCH, CellStore};
 use super::super::{
     CollectionId, CollectionRef, Direction, PartitionBackend, StateAccessError, StateKey,
     StateName, StateType, StoreOutcome,
@@ -915,6 +915,85 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
     })
 }
 
+/// The single-hold isolation pin for `Map::get_many`: a `> CELL_BATCH` call
+/// holds the session gate ONCE across its two internal sub-batches, so a
+/// concurrent mutator queued on the gate serializes entirely AFTER the whole
+/// read and the read observes no intermediate state. The first sub-batch is
+/// cold, so `get_many` parks in its cache-fill holding the gate; a `set` on a
+/// sub-batch-2 key is queued (FIFO); on release `get_many` finishes both
+/// sub-batches — reading the committed pre-set value for that key — before the
+/// set runs. Red-proven by rewriting `Map::get_many` to acquire the read permit
+/// PER `CELL_BATCH` chunk (drop + reacquire between sub-batches): the queued
+/// set then wins the gate at the boundary and buffers its dirty write, so
+/// sub-batch 2's overlay read answers the NEW value.
+#[test]
+fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
+    /// Two sub-batches: the first full `CELL_BATCH` chunk, then the remainder.
+    const N: i64 = CELL_BATCH as i64 + 2;
+    /// First key of sub-batch 2 — the one the concurrent set targets.
+    const TARGET: i64 = CELL_BATCH as i64;
+
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("gate_get_many_isolation")?;
+        let cref = CollectionRef::new(fx.id("m")?, None);
+
+        // Seed N keys committed BENEATH the cache (cold), value == key.
+        let mut seeded = Vec::new();
+        for k in 0..N {
+            seeded.push((
+                map::entry_cell_for(&I64KeyCodec::encode(&k)),
+                Some(json_entry(k)?),
+            ));
+        }
+        fx.counting.write_resolved(&cref, &seeded, &[]).await?;
+
+        let session = fx.session(1);
+        let map = map_state::<I64KeyCodec, JsonCodec>("m")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        let keys: Vec<i64> = (0..N).collect();
+
+        // Park get_many in sub-batch 1's cold cache-fill (its first lower read),
+        // holding the gate.
+        fx.holds.get_for_cache().arm(1);
+        let reader = tokio::spawn({
+            let map = map.clone();
+            let keys = keys.clone();
+            async move { map.get_many(&keys).await }
+        });
+        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+            .await
+            .map_err(|_| eyre!("get_many never reached the sub-batch-1 hold"))?;
+
+        // A set on the sub-batch-2 target parks on the gate (get_many holds it).
+        let writer = tokio::spawn({
+            let map = map.clone();
+            async move { map.set(TARGET, Value::from(999_i64)).await }
+        });
+        let_task_park().await;
+
+        // Release the hold; correct code keeps the gate across the boundary.
+        fx.holds.get_for_cache().release();
+        let out = timeout(HANG_GUARD, reader)
+            .await
+            .map_err(|_| eyre!("get_many hung"))??
+            .map_err(|e| eyre!("get_many: {e}"))?;
+        timeout(HANG_GUARD, writer)
+            .await
+            .map_err(|_| eyre!("set hung"))??
+            .map_err(|e| eyre!("set: {e}"))?;
+
+        assert_eq!(out.len(), keys.len(), "every position answered");
+        assert_eq!(
+            out[TARGET as usize],
+            Some(Value::from(TARGET)),
+            "the sub-batch-2 read observed the committed pre-set value; the queued set serialized \
+             after the whole get_many"
+        );
+        Ok(())
+    })
+}
+
 /// The pop-between-chunks pin (the chunked-stream contract, deque twin of
 /// `gate_excludes_set_during_keyset_stream`): a mutator racing a live stream
 /// lands **between chunks**, not mid-chunk. The window (20) spans two chunks
@@ -1508,6 +1587,33 @@ fn handle_op_after_reset_is_terminated() -> Result<()> {
             "the fenced set left the committed cell unchanged",
         )
         .await?;
+        Ok(())
+    })
+}
+
+/// `Map::get_many` after a `reset()` epoch bump errors `Terminated` as a whole
+/// — never a partial `Vec`. The batch twin of
+/// `handle_op_after_reset_is_terminated`: `ensure_live` fences at the first
+/// `raw_get_many` before any cell is read, and the `Result<Vec<_>>` shape makes
+/// a partial answer unrepresentable. Red-proven by deleting the
+/// `!session.attempt_current()` pin compare in `ensure_live`: the stale-pinned
+/// `get_many` then answers live.
+#[test]
+fn map_get_many_after_reset_is_terminated() -> Result<()> {
+    runtime()?.block_on(async {
+        let fx = GateFixture::new("fence_reset_get_many")?;
+        let session = fx.session(1);
+        let map = map_state::<I64KeyCodec, JsonCodec>("m")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+
+        // Attempt boundary: discard + bump. `map` keeps the stale pin.
+        session.reset(RepinProof::for_test()).await;
+
+        match map.get_many(&[0, 1, 2]).await {
+            Err(ref e) if map_item_terminated(e) => {}
+            other => bail!("get_many after reset must be Terminated, got {other:?}"),
+        }
         Ok(())
     })
 }
