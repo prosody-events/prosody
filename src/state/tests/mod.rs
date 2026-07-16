@@ -447,9 +447,8 @@ fn prop_map_keyset_exact() {
 /// `Map::get_many` parity: it answers each position exactly as the point `get`
 /// over random populations and query lists (duplicates, absent keys, and
 /// `> CELL_BATCH` lengths crossing sub-batches), in both the dirty-overlay and
-/// committed arms. The deterministic resolver and absent TTL collapse the
-/// observation rules to exact point-parity, so a scatter/alignment,
-/// concatenation, or ordering defect diverges from `get`.
+/// committed arms. See `run_map_get_many_parity_trace` for why the point path
+/// is a valid oracle here.
 #[test]
 fn prop_map_get_many_parity() {
     fn property(input: MapGetManyInput) -> Result<bool> {

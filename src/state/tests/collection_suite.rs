@@ -794,7 +794,8 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
 }
 
 /// Population pool for the `Map::get_many` parity property — 20 distinct keys,
-/// so a populated map can itself exceed one `CELL_BATCH` (16) sub-batch.
+/// enough content to distinguish present, absent, and duplicate answers. Query
+/// keys at/above it (see below) are guaranteed absent.
 const GET_MANY_POPULATE_KEYS: u8 = 20;
 /// Query-key range `[lo, hi)`: it spans below `0` and at/above the populate
 /// pool, so keys `< 0` and `>= 20` are guaranteed absent (never set), forcing

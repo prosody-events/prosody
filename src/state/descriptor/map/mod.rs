@@ -402,13 +402,11 @@ where
     /// exclusive per-event mutex every collection op acquires for its body), so
     /// no session-side mutation — a sibling op under `join!`, an attempt reset,
     /// a settle close — can interleave anywhere inside this call. Isolation
-    /// does not freeze wall-clock TTL passage: keys deduplicated into one
-    /// internal batch answer from that batch's single observation, while
-    /// cells read across a batch (or cache-probe) boundary are each
-    /// answered at their own instant. Those observation rules are the store
-    /// layer's batch-read contract, stated once on the internal batch-read
-    /// verb; this method adds only gate ownership and the user-sized `Vec`,
-    /// no observation behavior of its own.
+    /// does not freeze wall-clock TTL passage; how deduplicated and
+    /// cross-batch cells are timed is the store layer's batch-read
+    /// observation contract, stated once on the internal batch-read verb.
+    /// This method adds only gate ownership and the user-sized `Vec`, no
+    /// observation behavior of its own.
     ///
     /// Keys are addressed directly — there is no keyset consult, so a key
     /// outside the tracked keyset simply reads `None`.
