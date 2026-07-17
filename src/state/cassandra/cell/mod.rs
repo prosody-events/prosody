@@ -448,6 +448,18 @@ impl<O> CassandraStore<O> {
     /// row-disjoint by construction (the marker address is disjoint from every
     /// cell row by `kind`), so no same-batch timestamp tie can pit a delete
     /// against a write of one row.
+    ///
+    /// Allocation ruling (write-path buffer audit): every mutator's `units`
+    /// buffer — and the `blobs` its rows borrow — stays a `Vec`, never a
+    /// [`CellBuffer`]/`SmallVec`.
+    /// `BatchUnit<CellBatchRow>` is 320 B and `CellBlobs` 80 B, and both live
+    /// across this `.await`; an inline capacity would embed hundreds of bytes
+    /// to kilobytes in every stage/settle future the way `StagedCollection`
+    /// tripped clippy `large_futures` (`crate::state::session`). Write sets are
+    /// not `CELL_BATCH`-bounded (the packer splits by byte/statement budget
+    /// downstream), and each build site is already exactly-sized
+    /// `Vec::with_capacity`, so a conversion removes at most one allocation and
+    /// cannot earn the footprint.
     async fn run_batches(
         &self,
         units: &[BatchUnit<CellBatchRow<'_>>],
@@ -467,6 +479,8 @@ impl<O> CassandraStore<O> {
     /// construction of `write_resolved` and `abort_provisional`. A present
     /// value binds the resolved-value shape; an absent value **deletes** the
     /// `kind=Cell` row (the row-absence invariant — no null-blob residue).
+    /// Returns an exactly-sized `Vec`; see [`run_batches`] for why it is not a
+    /// [`CellBuffer`].
     fn resolved_units<'u>(
         &'u self,
         pk: Pk<'u>,
@@ -962,6 +976,7 @@ where
         // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
         // bound rows borrow into it and into each input cell's coordinate slice,
         // so the whole batch is one `blobs` allocation with no per-cell copy.
+        // Stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
         let mut blobs = Vec::with_capacity(writes.len());
         for (_, write) in writes {
             blobs.push(
@@ -982,7 +997,8 @@ where
                 &self.queries.marker_write_no_ttl,
             )
         };
-        // The marker unit leads; each cell unit is one row.
+        // The marker unit leads; each cell unit is one row. `units` stays a
+        // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
         let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
         if let Some((blob, event)) = &marker_blob {
             units.push(BatchUnit::new(
@@ -1057,7 +1073,8 @@ where
         // the gaps positionally, so every batch row stays disjoint.
         let pk = Pk::of(collection.id());
         // Encode each cell's committed `data` up front (owns the `Bytes`); no
-        // `prev`, so the blobs carry only `data` + its encoding/version.
+        // `prev`, so the blobs carry only `data` + its encoding/version. Both
+        // `blobs` and `units` stay a `Vec` — see the `run_batches` ruling.
         let mut blobs = Vec::with_capacity(cells.len());
         for (_, data) in cells {
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
@@ -1081,7 +1098,8 @@ where
         let pk = Pk::of(collection.id());
         // A marker-free single-row primitive. Promotes carry no blob — only
         // key columns — so every unit weighs the fixed overhead and the count
-        // budget alone splits an enormous promote set.
+        // budget alone splits an enormous promote set. `units` stays a `Vec`
+        // (not a `CellBuffer`) — see the `run_batches` ruling.
         let units: Vec<BatchUnit<CellBatchRow>> = cells
             .iter()
             .map(|cell| {
@@ -1179,6 +1197,7 @@ where
         // is a delete/delete tie — harmless), individually idempotent,
         // order-free.
         let pk = Pk::of(collection.id());
+        // `units` stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
         let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
         units.extend(writes.iter().map(|(cell, write)| {
             let addr = CellAddr::new(pk, cell);
@@ -1229,10 +1248,15 @@ where
         // `route_abort` defines) plus the marker delete, in one `run_batches`
         // packing.
         let pk = Pk::of(collection.id());
+        // Synthesized (cell, prev) pairs for the shared `resolved_units` helper;
+        // kept a `Vec` (the clones are O(1) `Arc`/`Bytes` refcount bumps) —
+        // deleting it would force `resolved_units` onto a less-clear iterator
+        // signature on the common `write_resolved` path, for the rare rollback.
         let cells: Vec<(CellKey, Option<Bytes>)> = writes
             .iter()
             .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
             .collect();
+        // `blobs` and `units` stay a `Vec` — see the `run_batches` ruling.
         let mut blobs = Vec::with_capacity(cells.len());
         for (_, data) in &cells {
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);

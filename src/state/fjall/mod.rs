@@ -799,6 +799,8 @@ impl FjallCellCache {
             let hop_excluded = excluded.clone();
             let hop_lo = lo;
             let resume = spawn_blocking(move || -> fjall::Result<Option<Vec<u8>>> {
+                // A `Vec`: bounded by `SCAN_HOP_ROWS` and always spilling past
+                // any small inline on this recovery/must-succeed-delete path.
                 let mut doomed: Vec<Vec<u8>> = Vec::new();
                 let mut resume: Option<Vec<u8>> = None;
                 let mut examined = 0usize;
@@ -973,6 +975,7 @@ impl FjallCellCache {
         let handle = self.inner.index_handle().clone();
         let prefix = codec::index_coord_prefix(collection);
         spawn_blocking(move || {
+            // A `Vec`: unbounded (∝ #provisional) → `Vec` is correct.
             let mut out: Vec<CellKey> = Vec::new();
             for guard in handle.prefix(prefix) {
                 let (key, _) = guard.into_inner()?;
