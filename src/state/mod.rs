@@ -140,6 +140,18 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 /// round-trip / oracle-consult *overlap* (latency), not throughput; kept modest
 /// because it nests inside the per-collection `STATE_FANOUT_CONCURRENCY`
 /// fan-out, so the product is the per-shard in-flight depth.
+///
+/// Ruling: retained at eight pending a benchmark sweep over candidate values
+/// `1, 2, 4, 8, 16, 32, 64`, exercised under cold multi-chunk stage reads,
+/// cold and warm-index recovery spanning multiple chunks, oracle-resolving
+/// provisional write-back, over-budget provisional/resolved/promote/abort
+/// writes, and simultaneous events across many keys (to expose global shard
+/// pressure, not one isolated shard). Batching moved what this bounds — it is
+/// now concurrent batch chunks, recovery resolution, and over-budget write
+/// batches against one shard, never point-query multiplication — so a value
+/// picked before batching would have tuned the wrong thing. Not made
+/// configurable speculatively: if the optimum proves strongly
+/// deployment-dependent, a separately validated config field is the follow-up.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
 /// Maximum concurrent typed resolves in flight within one `CellView::get_many`

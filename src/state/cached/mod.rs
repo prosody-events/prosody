@@ -365,6 +365,25 @@ where
         Ok(committed)
     }
 
+    /// Batch point read with the **all-hits-or-refetch** contract: one blocking
+    /// probe of the whole `CoordinateBatch`; every position a hit serves the
+    /// batch verbatim (KV1, zero lower reads), and any miss or expired entry
+    /// discards all sampled values and refetches every position from durable
+    /// truth.
+    ///
+    /// Serving the pure-hit batch with zero marker consults rests on the
+    /// cache-coherence invariant underpinning KV1: no cache entry ever coexists
+    /// with an oracle-committed-but-unpromoted provisional cell a same-key
+    /// event could read. It holds by construction — per-key dispatch runs
+    /// each event's settle (retry-forever promote included) to completion
+    /// before the next same-key event (KV4), and every ownership change
+    /// mints a born-cold workspace (KV5), so no stale entry survives a
+    /// crash or rebalance. Ruling: selective partial-refetch (retaining
+    /// sampled hits beside durably-fetched misses) is sound under this same
+    /// invariant but stays deferred — held as all-hits-or-refetch pending a
+    /// benchmark showing material Cassandra bytes/latency improvement; a
+    /// partial-refetch design must pin the committed-but-unpromoted window
+    /// with a property.
     async fn get_many<'a>(
         &'a self,
         collection: &'a CollectionId,

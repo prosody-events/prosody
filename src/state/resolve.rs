@@ -402,6 +402,14 @@ where
 /// yielding `false`; anything else — a transient/terminal backend or oracle
 /// failure, or a `provisional_cells` stream failure — propagates so the trigger
 /// aborts and the sweep refires.
+///
+/// Ruling: grouping the per-cell mop-up by `(collection, event)` — cells of one
+/// event sharing a single oracle decision and one commit/abort write batch — is
+/// deferred (low priority). The marker leg already performs one oracle lookup
+/// and one collection-grain settle for the common standing marker, so the
+/// mop-up is the rare residue (a Permanent-skipped or concurrently-resolved
+/// cell); grouping would complicate the permanent-skip / transient-fail posture
+/// for a gain that only matters if residues prove common.
 pub(crate) async fn sweep_provisional<S, O>(
     store: &S,
     oracle: &O,
