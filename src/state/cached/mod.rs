@@ -374,16 +374,18 @@ where
     /// Serving the pure-hit batch with zero marker consults rests on the
     /// cache-coherence invariant underpinning KV1: no cache entry ever coexists
     /// with an oracle-committed-but-unpromoted provisional cell a same-key
-    /// event could read. It holds by construction — per-key dispatch runs
-    /// each event's settle (retry-forever promote included) to completion
-    /// before the next same-key event (KV4), and every ownership change
-    /// mints a born-cold workspace (KV5), so no stale entry survives a
-    /// crash or rebalance. Ruling: selective partial-refetch (retaining
-    /// sampled hits beside durably-fetched misses) is sound under this same
-    /// invariant but stays deferred — held as all-hits-or-refetch pending a
-    /// benchmark showing material Cassandra bytes/latency improvement; a
-    /// partial-refetch design must pin the committed-but-unpromoted window
-    /// with a property.
+    /// event could read. It holds by construction — the D5 settle transform
+    /// installs the committed `data` projection into the cache before the
+    /// promote, so any entry standing through the committed-but-unpromoted
+    /// window already IS the current projection; per-key dispatch serializes
+    /// whole events, so no other same-key event races that settle; and every
+    /// ownership change mints a born-cold workspace (KV5), so no stale entry
+    /// survives a crash or rebalance. Ruling: selective partial-refetch
+    /// (retaining sampled hits beside durably-fetched misses) is sound
+    /// under this same invariant but stays deferred — held as
+    /// all-hits-or-refetch pending a benchmark showing material Cassandra
+    /// bytes/latency improvement; a partial-refetch design must pin the
+    /// committed-but-unpromoted window with a property.
     async fn get_many<'a>(
         &'a self,
         collection: &'a CollectionId,
