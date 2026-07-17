@@ -399,9 +399,9 @@ impl<O> CassandraStore<O> {
     /// lowest-coordinate order.
     ///
     /// `uniques` is caller-deduped and non-empty by [`CoordinateBatch`]
-    /// construction, so the `IN` list has no repeats and is never empty;
-    /// bounded by `CELL_BATCH`, so the result never spills the stack
-    /// buffer.
+    /// construction, so the `IN` list has no repeats and is never empty; and
+    /// bounded by `CELL_BATCH`, so the [`CellBuffer`] result stays bounded —
+    /// inline for small reads, a single heap spill for larger ones.
     async fn batch_read(
         &self,
         id: &CollectionId,

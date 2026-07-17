@@ -275,7 +275,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
         async move {
             let (uniques, plan) = dedupe(batch);
-            let mut answers: CommittedBatch = SmallVec::new();
+            let mut answers: CommittedBatch = SmallVec::with_capacity(uniques.len());
             for &coordinate in &uniques {
                 let cell = CellKey {
                     section,
@@ -318,7 +318,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
         async move {
             let (uniques, plan) = dedupe(batch);
-            let mut answers: CacheBatch = SmallVec::new();
+            let mut answers: CacheBatch = SmallVec::with_capacity(uniques.len());
             for &coordinate in &uniques {
                 let cell = CellKey {
                     section,
