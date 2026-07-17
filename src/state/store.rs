@@ -340,20 +340,23 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// recovery sweep, filtering resolved rows in code.
     ///
     /// This is the **cold** recovery source: on the Cassandra store, the
-    /// event-marker point read (memoized per assignment) followed by one point
-    /// read per listed coordinate — cost ∝ #provisional, never partition size.
-    /// The warm short-circuit that skips it on a quiescent sweep lives on
-    /// [`Cached`](super::cached::Cached).
+    /// event-marker point read (memoized per assignment) followed by one raw
+    /// `IN` batch read per `<=CELL_BATCH` section chunk
+    /// ([`provisional_many`](Self::provisional_many)) — cost ∝ #provisional,
+    /// never partition size. The warm short-circuit that skips it on a
+    /// quiescent sweep lives on [`Cached`](super::cached::Cached).
     fn provisional_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a;
 
     /// Point-reads one coordinate's provisional cell, or `None` when it is
-    /// absent or resolved (over-report-safe). Drives the **warm** recovery
-    /// sweep: [`Cached`](super::cached::Cached) has the provisional coordinates
-    /// from its local fjall index and rebuilds each `ProvisionalCell` with
-    /// this, with zero Cassandra range reads.
+    /// absent or resolved (over-report-safe). The single-coordinate primitive
+    /// that [`provisional_point_loop`] fans out over to
+    /// supply [`provisional_many`](Self::provisional_many) for backends with no
+    /// native batch read (the memory store, test doubles); a backend with a
+    /// native `IN` read implements [`provisional_many`](Self::provisional_many)
+    /// directly and never routes through this.
     ///
     /// # Errors
     ///

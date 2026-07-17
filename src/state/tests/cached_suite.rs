@@ -274,7 +274,8 @@ where
 /// fjall workspace (not a fresh assignment) is warm — its disk-backed
 /// provisional-coordinate cache and committed-cell entries both survive. The
 /// rebuilt cache's recovery sweep answers from the local fjall index with
-/// **zero** cold `provisional_cells` sweeps (only bounded warm point reads),
+/// **zero** cold `provisional_cells` sweeps (rebuilding via a single
+/// `provisional_many` lower batch, never a per-coordinate point read),
 /// and a warm `get` serves with zero lower reads. This is the
 /// in-assignment-warm proxy the crash case (a fresh assignment) is the cold
 /// complement of.
@@ -325,7 +326,8 @@ fn warm_entries_and_index_survive_same_workspace_rebuild() -> Result<()> {
         counting.reset();
 
         // The rebuilt sweep is WARM: zero cold `provisional_cells` sweeps, and it
-        // still finds the provisional cell via bounded warm point reads.
+        // still finds the provisional cell via a single `provisional_many` lower
+        // batch (zero per-coordinate point reads).
         let warm = drain_provisional(&restarted, &id).await?;
         assert_eq!(
             warm,
@@ -1799,7 +1801,7 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
 }
 
 /// The recovery sweep never calls `scan_cells` — it rides `standing_marker`,
-/// the warm index, and `provisional_cell_at` point reads — so "scans are
+/// the warm index, and `provisional_many` batch reads — so "scans are
 /// durable" (KV3) adds zero recovery cost. Falsified through the
 /// counting-store seam: the exact op set is asserted, never the sweep
 /// rewritten.
@@ -1826,7 +1828,7 @@ fn sweep_issues_no_scan_cells() -> Result<()> {
         assert_eq!(
             counting.lower_scans(),
             0,
-            "the sweep issues no scan_cells — recovery rides point reads only"
+            "the sweep issues no scan_cells — recovery rides marker + batch reads only"
         );
         assert!(
             counting.marker_reads() >= 1,

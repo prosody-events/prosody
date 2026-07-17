@@ -874,8 +874,9 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
     // marker lists its coordinate on the real wire path), then corrupt the
     // cell row's `event` UDT by raw CQL: the Timer arm rejects the unknown
     // `timer_type: 99` in the literal (whose own `kind: 1` field means Timer —
-    // distinct from the clustering `kind` column). Recovery point-reads the
-    // marker-listed coordinate and must reject the ONE row, not the partition.
+    // distinct from the clustering `kind` column). Recovery batch-reads the
+    // marker-listed coordinate (a one-row `IN` query) and must reject the ONE
+    // row, not the partition.
     let cell = value_cell();
     let writes = [(
         cell.clone(),

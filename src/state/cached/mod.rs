@@ -454,8 +454,9 @@ where
         // Cassandra queries (the zero-query-on-quiescence goal); an empty
         // snapshot yields nothing. Cold (a fresh assignment after
         // crash/rebalance mints an empty `index` keyspace): the lower store's
-        // bounded seed runs — the event-marker point read and its
-        // listed-coordinate point reads (cost ∝ #provisional, never #cells) —
+        // bounded seed runs — the event-marker point read and its per-section
+        // batch reads (one raw `IN` read per `<=CELL_BATCH` chunk; cost ∝
+        // #provisional, never #cells) —
         // each coordinate is recorded into fjall as it streams, and the
         // collection is marked seeded.
         //

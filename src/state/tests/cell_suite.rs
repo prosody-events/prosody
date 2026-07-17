@@ -2500,8 +2500,8 @@ impl<S> FailingCellStore<S> {
 
     /// Wraps `inner`, poisoning `provisional_many` with `category` for the
     /// `poison` collection — the raw recovery-reconstruction read
-    /// (`provisional_cell_at` stays healthy, so seeding a marker still works
-    /// once disarmed).
+    /// (`provisional_cell_at` and `write_provisional` stay healthy, so seeding
+    /// a marker is unaffected by the arm).
     pub(crate) fn armed_provisional_many(
         inner: S,
         poison: StateName,
