@@ -322,3 +322,34 @@ fn prop_index_coord_key_bytes_spill_and_round_trip() {
     }
     QuickCheck::new().quickcheck(prop as fn(PrefixFields, i8, Vec<u8>) -> TestResult);
 }
+
+/// Pins the coord key's 32-byte inline capacity unconditionally at its exact
+/// spill boundary: a `[hash=16][Coord][section]` head is 18 bytes, so a 14-byte
+/// coordinate fills the buffer exactly (stays inline) and a 15-byte one is the
+/// first to spill. The property above only lands on this edge
+/// probabilistically; shrinking the `SmallVec` inline size regresses this
+/// deterministically.
+#[test]
+fn index_coord_key_spill_boundary() -> Result<()> {
+    let id = fixed_collection("spill-boundary")?;
+    for (coord_len, want_spill) in [(14usize, false), (15usize, true)] {
+        let cell = CellKey {
+            section: Section::new(3),
+            coordinate: Coordinate::from_bytes(vec![0xEE; coord_len]),
+        };
+        let key = index_coord_key(&id, &cell);
+        assert_eq!(
+            key.len(),
+            18 + coord_len,
+            "encoded length (coord {coord_len})"
+        );
+        assert_eq!(
+            key.spilled(),
+            want_spill,
+            "spill at coord {coord_len} (encoded {})",
+            key.len()
+        );
+        assert_eq!(coord_cell_key(&key), cell, "round-trip (coord {coord_len})");
+    }
+    Ok(())
+}

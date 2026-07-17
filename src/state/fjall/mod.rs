@@ -1078,13 +1078,14 @@ fn encode_frame(payload: Option<&Bytes>, expiry: u64) -> Bytes {
     }
 }
 
-/// The encoded warm-index keys of a batch of coordinates — built up front
-/// (bounded, sized once) so the blocking batch closure only touches fjall.
+/// The encoded warm-index keys of a batch of coordinates — built up front on a
+/// [`CellBuffer`] inline buffer (bounded, sized once) so the common small write
+/// set stays on the stack and the blocking batch closure only touches fjall.
 fn index_keys<'a>(
     collection: &CollectionId,
     cells: impl ExactSizeIterator<Item = &'a CellKey>,
-) -> Vec<SmallVec<[u8; 32]>> {
-    let mut keys: Vec<SmallVec<[u8; 32]>> = Vec::with_capacity(cells.len());
+) -> CellBuffer<SmallVec<[u8; 32]>> {
+    let mut keys: CellBuffer<SmallVec<[u8; 32]>> = SmallVec::with_capacity(cells.len());
     for cell in cells {
         keys.push(codec::index_coord_key(collection, cell));
     }
