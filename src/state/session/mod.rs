@@ -1520,7 +1520,7 @@ struct StageChunk {
 /// reproduces the input; each chunk's `batch` is built from its own records, so
 /// it aligns 1:1 with them. Splitting per section (not purely by count) keeps
 /// every `get_many` call single-section, as its `section` argument requires.
-fn section_batches(
+fn stage_chunks(
     survivors: impl Iterator<Item = (CellKey, Option<Bytes>)>,
 ) -> impl Iterator<Item = StageChunk> {
     let mut it = survivors.peekable();
@@ -1593,7 +1593,7 @@ where
                 .into_iter()
                 .filter(|(cell, value)| !subsumed(cell, value))
                 .map(|(cell, value)| (cell, value.into_data()));
-            let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(section_batches(survivors))
+            let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(stage_chunks(survivors))
                 .map(|chunk| {
                     cooperative(async move {
                         let StageChunk {
