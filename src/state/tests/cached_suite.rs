@@ -27,7 +27,7 @@ use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::resolve::sweep_provisional;
-use super::super::store::CellStore;
+use super::super::store::{CellBuffer, CellStore, CoordinateBatch};
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
     FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle, SECTION,
@@ -159,6 +159,16 @@ where
         cell: &'a CellKey,
     ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
         self.inner.provisional_cell_at(collection, cell)
+    }
+
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
+    {
+        self.inner.provisional_many(collection, section, batch)
     }
 
     fn write_provisional<'a>(
@@ -633,6 +643,59 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             "the re-published value serves from fjall"
         );
         assert_eq!(lower.lower_reads(), 0, "the re-published get reads nothing");
+        Ok(())
+    })
+}
+
+/// `Cached::provisional_many` delegates the raw read to the lower store and
+/// publishes NOTHING into the committed-value cache: it delegates exactly once
+/// (one lower batch read), and a subsequent point `get` of a read coordinate
+/// still incurs a lower read (a fjall miss) — proving no committed projection
+/// was warmed by the raw verb.
+#[test]
+fn cached_provisional_many_does_not_publish() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle,
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let id = collection("cached-no-publish")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        // Stage a provisional cell in the LOWER store directly, so fjall stays
+        // untouched (a cached stage would publish the cell's `prev`).
+        let event = probe(0x5EED);
+        let prev = counting.get(&id, &cell_at(2), event).await?;
+        let writes = [(
+            cell_at(2),
+            ProvisionalWrite::new(Some(bytes(20)), prev, event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
+        counting
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+
+        let cached = Cached::new(test_db::cache("cached-no-publish")?, counting.clone());
+        counting.reset();
+
+        let batch = batch_of([2])?;
+        let out = cached.provisional_many(&id, SECTION, &batch).await?;
+        assert_eq!(out.len(), 1, "the staged provisional cell survives");
+        assert_eq!(
+            counting.raw_batch_reads(),
+            1,
+            "delegated exactly once to the lower batch"
+        );
+
+        // Nothing was published, so a point get of the read coordinate still
+        // falls through to the lower store (a fjall miss).
+        counting.reset();
+        cached.get(&id, &cell_at(2), probe(7)).await?;
+        assert!(
+            counting.lower_reads() >= 1,
+            "provisional_many must not warm the committed-value cache"
+        );
         Ok(())
     })
 }

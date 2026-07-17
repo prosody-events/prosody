@@ -15,7 +15,9 @@ use crate::state::oracle::CommitOracle;
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
-use crate::state::store::{CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch};
+use crate::state::store::{
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
+};
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
     StoreOutcome,
@@ -65,6 +67,37 @@ impl CommitOracle for FixedOracle {
         _event: EventRef,
     ) -> Result<CommitDecision, Self::Error> {
         Ok(self.0)
+    }
+}
+
+/// A commit oracle counting every `resolve` consult — the no-oracle pins'
+/// probe: a verb that must never resolve leaves the counter at zero.
+/// `record_message` is a no-op; `resolve` bumps and returns a fixed
+/// `NotCommitted`.
+#[derive(Clone, Default)]
+pub(crate) struct CountingOracle(Arc<AtomicUsize>);
+
+impl CountingOracle {
+    /// Resolutions counted so far.
+    pub(crate) fn resolves(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl CommitOracle for CountingOracle {
+    type Error = Infallible;
+
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn resolve<'a>(
+        &'a self,
+        _state_key: &'a StateKey,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(CommitDecision::NotCommitted)
     }
 }
 
@@ -298,6 +331,7 @@ struct OpCounts {
     scan_cells: AtomicUsize,
     provisional_cells: AtomicUsize,
     provisional_cell_at: AtomicUsize,
+    provisional_many: AtomicUsize,
 }
 
 impl<S> CountingCellStore<S> {
@@ -384,6 +418,13 @@ impl<S> CountingCellStore<S> {
         self.counts.provisional_cell_at.load(Ordering::Relaxed)
     }
 
+    /// `provisional_many` raw batch reads issued to the lower store — the
+    /// query-count view of the batch verb (one per call, never inflating
+    /// `raw_point_reads`).
+    pub(crate) fn raw_batch_reads(&self) -> usize {
+        self.counts.provisional_many.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
@@ -397,6 +438,7 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
+        self.counts.provisional_many.store(0, Ordering::Relaxed);
     }
 }
 
@@ -477,6 +519,19 @@ where
             .provisional_cell_at
             .fetch_add(1, Ordering::Relaxed);
         self.inner.provisional_cell_at(collection, cell).await
+    }
+
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
+    {
+        // One increment per batch *request*; the inner store's own reads stay
+        // off this wrapper's point-read counter.
+        self.counts.provisional_many.fetch_add(1, Ordering::Relaxed);
+        self.inner.provisional_many(collection, section, batch)
     }
 
     async fn write_provisional<'a>(
@@ -748,6 +803,16 @@ where
         self.inner.provisional_cell_at(collection, cell)
     }
 
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
+    {
+        provisional_point_loop(self, collection, section, batch)
+    }
+
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
@@ -864,6 +929,18 @@ impl CellStore for TtlStub {
         _cell: &'a CellKey,
     ) -> Result<Option<ProvisionalCell>, Self::Error> {
         Ok(None)
+    }
+
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
+    {
+        // `provisional_cell_at` returns `None`, so the loop yields an empty
+        // batch — correct for this read-only stub.
+        provisional_point_loop(self, collection, section, batch)
     }
 
     async fn write_provisional<'a>(
@@ -1040,6 +1117,15 @@ mod tests {
         store.provisional_cell_at(&id, &cell).await?;
         assert_eq!(store.raw_point_reads(), 1);
         assert_eq!(store.visible_point_reads(), 0);
+        assert_eq!(store.batch_reads(), 0);
+
+        // Raw provisional batch read — bumps only `raw_batch_reads`; the inner
+        // store's point reads bypass this wrapper, so `raw_point_reads` stays 0.
+        store.reset();
+        let batch = batch_of([0])?;
+        store.provisional_many(&id, Section::new(0), &batch).await?;
+        assert_eq!(store.raw_batch_reads(), 1);
+        assert_eq!(store.raw_point_reads(), 0);
         assert_eq!(store.batch_reads(), 0);
 
         Ok(())

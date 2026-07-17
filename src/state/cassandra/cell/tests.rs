@@ -23,17 +23,20 @@ use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::fjall::{MarkerPresence, test_db};
 use crate::state::marker::{EventMarker, SectionClear};
+use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CellStore;
 use crate::state::store::CoordinateBatch;
 use crate::state::tests::cell_suite::{
     ApplyTrace, BatchReadTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle,
-    ProbedMarker, SECTIONS, ScanTrace, ScriptedOracle, ShapeProbe, Trace, bytes, cell_in,
-    probed_parts, run_apply_idempotence, run_batch_alignment, run_batch_duplicate_co_observation,
-    run_batch_read_parity_trace, run_bottom_scan_trace, run_crash_equivalence_trace,
-    run_overlay_trace, run_overwrite_trace, value_cell,
+    ProbedMarker, RawBatchTrace, SECTIONS, ScanTrace, ScriptedOracle, ShapeProbe, Trace, bytes,
+    cell_in, probed_parts, run_apply_idempotence, run_batch_alignment,
+    run_batch_duplicate_co_observation, run_batch_read_parity_trace, run_bottom_scan_trace,
+    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
+    value_cell,
 };
-use crate::state::tests::support::{fresh_collection, probe as event};
+use crate::state::tests::support::{CountingOracle, fresh_collection, probe as event};
 use crate::state::{
     CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
 };
@@ -230,6 +233,18 @@ impl Fixture {
         oracle: ScriptedOracle,
         presence: MarkerPresence,
     ) -> CassandraStore<ScriptedOracle> {
+        self.bottom_store_oracle(oracle, presence)
+    }
+
+    /// A bare store over an arbitrary [`CommitOracle`] and presence handle —
+    /// generalizes [`bottom_store_with`](Self::bottom_store_with) for pins that
+    /// need a non-[`ScriptedOracle`] oracle (e.g. the [`CountingOracle`]
+    /// no-side-effects pin).
+    fn bottom_store_oracle<O: CommitOracle>(
+        &self,
+        oracle: O,
+        presence: MarkerPresence,
+    ) -> CassandraStore<O> {
         CassandraStore::new(
             self.cassandra.clone(),
             self.queries.clone(),
@@ -646,7 +661,6 @@ async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
 #[tokio::test]
 async fn committed_clear_deletes_the_row() -> Result<()> {
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
-    use crate::state::oracle::CommitOracle;
 
     init_test_logging();
     let fx = fixture().await?;
@@ -1587,8 +1601,6 @@ async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
 /// without a generated schedule.
 #[tokio::test]
 async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
-    use crate::state::oracle::CommitOracle;
-
     init_test_logging();
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
@@ -1842,8 +1854,6 @@ async fn first_error_is_first_input_position() -> Result<()> {
 /// pre-clear rows for `1` and `3`.
 #[tokio::test]
 async fn batch_returns_post_clear_truth() -> Result<()> {
-    use crate::state::oracle::CommitOracle;
-
     init_test_logging();
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
@@ -1885,4 +1895,214 @@ async fn batch_returns_post_clear_truth() -> Result<()> {
         "the cleared coordinates read absent and the survivor reads present"
     );
     Ok(())
+}
+
+/// Sort-necessity unit pin (no cluster): a SHUFFLED raw batch with two corrupt
+/// rows — low coord `0x01` = `PrevWithoutEvent`, high coord `0xFE` =
+/// `BlobWithoutEncoding`, pushed high-then-low — must surface the LOWEST
+/// coordinate's error after `decode_provisional_batch`'s ascending sort. This
+/// is the honest proof the Cassandra sort is load-bearing; a live test cannot
+/// show it because `IN` already returns ascending clustering order.
+#[test]
+fn decode_provisional_batch_orders_by_coordinate() -> Result<()> {
+    use super::CellCorruptReason;
+    use super::decode::CellTtlRow;
+    use super::decode_provisional_batch;
+    use super::encoding::{Encoding, encode_payload};
+    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::store::CellBuffer;
+    use smallvec::SmallVec;
+
+    let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
+    // event = None throughout, so no RawEventRef construction is needed.
+    let high: CellTtlRow = (Some(vec![0xBB]), None, None, None, None, None, None);
+    let low: CellTtlRow = (
+        None,
+        Some(prev_blob.to_vec()),
+        Some(4_i16),
+        Some(1_i32),
+        None,
+        None,
+        None,
+    );
+    let mut rows: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::new();
+    rows.push((Coordinate::from_bytes(vec![0xFE]), high));
+    rows.push((Coordinate::from_bytes(vec![0x01]), low));
+    match decode_provisional_batch(rows) {
+        Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
+            reason,
+            CellCorruptReason::PrevWithoutEvent,
+            "the lowest coordinate's error is surfaced after the ascending sort"
+        ),
+        other => return Err(eyre!("expected PrevWithoutEvent, got {other:?}")),
+    }
+    Ok(())
+}
+
+/// Live end-to-end mirror of the sort pin: two corrupt rows seeded by raw CQL
+/// at coords A (`0x01`, `PrevWithoutEvent`) and B (`0xFE`,
+/// `BlobWithoutEncoding`), read via `provisional_many` over the batch `[0xFE,
+/// 0x01]`. Because the verb decodes in ascending coordinate order, it surfaces
+/// A's `PrevWithoutEvent` (the LOWEST coordinate) — the OPPOSITE of
+/// `get_many`'s first-input rule.
+#[tokio::test]
+async fn cassandra_raw_batch_lowest_corrupt_coordinate() -> Result<()> {
+    use super::CellCorruptReason;
+    use super::encoding::{Encoding, encode_payload};
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::resolve::ResolveCellError;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("raw-lowest-corrupt")?;
+    let id = c.id();
+    let cell_a = cell_in(0, 0x01);
+    let cell_b = cell_in(0, 0xFE);
+
+    let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
+    let insert_a = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate, prev_data, encoding, version) VALUES (?, ?, ?, ?, 0, 0, ?, ?, \
+         4, 1)"
+    );
+    let insert_b = format!(
+        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
+         kind, section, coordinate, data) VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
+    );
+    let session = fx.cassandra.session();
+    session
+        .query_unpaged(
+            insert_a,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                cell_a.coordinate.as_bytes(),
+                prev_blob.as_ref(),
+            ),
+        )
+        .await?;
+    session
+        .query_unpaged(
+            insert_b,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+                cell_b.coordinate.as_bytes(),
+                bytes(0xBB).as_ref(),
+            ),
+        )
+        .await?;
+
+    // Read list `[B, A]`: ascending-order decode must surface A's (lowest) error.
+    let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    match Box::pin(store.provisional_many(id, SECTIONS[0], &batch)).await {
+        Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => assert_eq!(
+            reason,
+            CellCorruptReason::PrevWithoutEvent,
+            "the lowest coordinate (A) determines the surfaced error"
+        ),
+        other => return Err(eyre!("expected A's PrevWithoutEvent, got {other:?}")),
+    }
+    Ok(())
+}
+
+/// Query-count pin: `provisional_many` issues exactly ONE `IN` query per chunk
+/// and NO point reads or marker reads. A fresh reader store (cold counters)
+/// stages nothing itself, so the counters reflect the verb alone; the dedicated
+/// `provisional_in_queries` counter proves it BATCHED rather than merely "no
+/// point reads".
+#[tokio::test]
+async fn cassandra_raw_batch_is_one_query() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    let seed = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("raw-one-query")?;
+    let id = c.id();
+    let staging = event(0x11);
+    let mut writes = Vec::new();
+    for b in [1u8, 2] {
+        let cell = cell_in(0, b);
+        let prev = seed.get(id, &cell, staging).await?;
+        writes.push((
+            cell,
+            ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
+        ));
+    }
+    let marker = EventMarker::frozen(staging, &writes, &[]);
+    seed.write_provisional(&c, &writes, Some(&marker)).await?;
+
+    // A fresh store: cold counters shared across its clones.
+    let reader = fx.bottom_store(ScriptedOracle::default());
+    let counters = reader.recovery_reads();
+    let batch = CoordinateBatch::chunks([1u8, 2].map(|b| Coordinate::from_bytes(vec![b])))
+        .next()
+        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
+    let out = Box::pin(reader.provisional_many(id, SECTIONS[0], &batch)).await?;
+    assert_eq!(out.len(), 2, "both staged provisional cells survive");
+    assert_eq!(
+        counters.provisional_in_queries.load(Ordering::Relaxed),
+        1,
+        "exactly one IN query"
+    );
+    assert_eq!(
+        counters.cell_point_reads.load(Ordering::Relaxed),
+        0,
+        "no per-coordinate point reads"
+    );
+    assert_eq!(
+        counters.marker_point_reads.load(Ordering::Relaxed),
+        0,
+        "no marker point read"
+    );
+    Ok(())
+}
+
+/// Raw-provisional batch parity over the bare live store: `provisional_many`
+/// returns exactly the survivors the sequential `provisional_cell_at` loop
+/// does.
+#[test]
+fn prop_cassandra_raw_batch_parity() {
+    async fn run(trace: RawBatchTrace) -> Result<bool> {
+        let fx = fixture().await?;
+        let store = fx.bottom_store(ScriptedOracle::default());
+        Box::pin(run_raw_batch_parity_trace(store, trace)).await
+    }
+
+    init_test_logging();
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(
+            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(RawBatchTrace) -> TestResult,
+        );
+}
+
+/// Ascending-output pin over the live store (correctness; the sort-necessity
+/// itself is pinned by `decode_provisional_batch_orders_by_coordinate`).
+#[tokio::test]
+async fn cassandra_raw_batch_ascending_output() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    Box::pin(run_raw_batch_ascending_output(
+        fx.bottom_store(ScriptedOracle::default()),
+    ))
+    .await
+}
+
+/// No-side-effects pin over the live store built on a [`CountingOracle`]:
+/// `provisional_many` never resolves, writes, or caches.
+#[tokio::test]
+async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
+    init_test_logging();
+    let fx = fixture().await?;
+    let oracle = CountingOracle::default();
+    let store = fx.bottom_store_oracle(oracle.clone(), fx.presence.clone());
+    Box::pin(run_raw_batch_no_side_effects(store, oracle)).await
 }

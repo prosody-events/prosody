@@ -1,7 +1,7 @@
 //! In-memory keyed-state stores.
 
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
-use super::cell_key::{CellKey, Direction, Scan};
+use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
@@ -12,7 +12,9 @@ use super::resolve::{
     ResolveCellError, Resolver, flatten_resolve, help_read_window, peek_read, resolve_marker,
     resolve_read,
 };
-use super::store::{CellStore, route_abort, route_commit};
+use super::store::{
+    CellBuffer, CellStore, CoordinateBatch, provisional_point_loop, route_abort, route_commit,
+};
 use super::{CollectionId, CollectionRef, EventRef, StateType};
 use ahash::RandomState;
 use async_stream::try_stream;
@@ -20,6 +22,7 @@ use bytes::Bytes;
 use futures::Stream;
 use scc::hash_map::Entry;
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
@@ -320,6 +323,18 @@ where
             Cell::Provisional(provisional) => Some(provisional),
             Cell::Resolved(_) => None,
         })
+    }
+
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
+    {
+        // No batch query of its own — the raw point-loop reference, reading each
+        // distinct coordinate through `provisional_cell_at` in ascending order.
+        provisional_point_loop(self, collection, section, batch)
     }
 
     async fn write_provisional<'a>(

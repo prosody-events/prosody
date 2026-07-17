@@ -364,6 +364,45 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         cell: &'a CellKey,
     ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a;
 
+    /// Batch twin of [`Self::provisional_cell_at`]: the provisional cells among
+    /// the batch's **distinct** coordinates in one section, each tagged with
+    /// its coordinate, in **ascending coordinate order**.
+    ///
+    /// Order is defined on the OUTPUT, so a duplicate coordinate is
+    /// indistinguishable from a single mention and there is no sorted-unique
+    /// input precondition; [`CoordinateBatch`] is non-empty, so there is no
+    /// empty-input case. Absent and already-resolved coordinates are omitted
+    /// (over-report-safe), with exact [`Self::provisional_cell_at`] parity for
+    /// malformed / partially-expired rows — the raw decoder, never a visible
+    /// resolve. Surviving rows retain `data`/`prev`/[`EventRef`] **without
+    /// consulting the oracle, writing durable state, or publishing into the
+    /// committed-value cache** — this is the raw recovery-reconstruction read,
+    /// not a resolving one.
+    ///
+    /// A whole-batch failure carries no input position (as
+    /// [`Self::get_many`]'s whole-collection failures). A per-row decode
+    /// failure fails the batch with the **lowest failing coordinate's**
+    /// error — the backends read in ascending coordinate order so this is
+    /// deterministic. One collection partition and one section per call.
+    ///
+    /// Required with no default: a default inherited by a wrapper (notably
+    /// [`Cached`](super::cached::Cached), whose committed-value cache cannot
+    /// answer a raw provisional read) would loop [`Self::provisional_cell_at`]
+    /// — N uncached point reads that silently defeat the batch. Making it
+    /// required turns a forgotten forward into a compile error, as the
+    /// settle verbs do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] on a store failure or a per-row decode failure
+    /// (at the lowest failing coordinate).
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a;
+
     /// Stages each `(cell, write)`'s provisional cell (`data | prev | event`)
     /// in one same-partition batch, binding `collection`'s TTL, and
     /// creates/overwrites the collection's **event marker** from the
@@ -547,6 +586,37 @@ pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellB
         plan.push(idx);
     }
     (uniques, plan)
+}
+
+/// Reference point-loop behind every [`CellStore::provisional_many`] that has
+/// no batch query of its own (the memory backend and the test doubles): reads
+/// each **distinct** requested coordinate through
+/// [`CellStore::provisional_cell_at`] in **ascending coordinate order**,
+/// keeping only the survivors. Reading ascending makes the output ascending (no
+/// post-sort) and surfaces a per-row failure at the lowest failing coordinate —
+/// the batch-read error rule. The `uniques` scratch and the output are the only
+/// allocations, each bounded by `batch.len()`.
+pub(crate) async fn provisional_point_loop<S: CellStore>(
+    store: &S,
+    collection: &CollectionId,
+    section: Section,
+    batch: &CoordinateBatch,
+) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, S::Error> {
+    let mut uniques: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+    uniques.extend(batch.iter());
+    uniques.sort_unstable();
+    uniques.dedup();
+    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(uniques.len());
+    for coordinate in uniques {
+        let cell = CellKey {
+            section,
+            coordinate: coordinate.clone(),
+        };
+        if let Some(provisional) = store.provisional_cell_at(collection, &cell).await? {
+            out.push((coordinate.clone(), provisional));
+        }
+    }
+    Ok(out)
 }
 
 /// Routes a committed settle to the primitive verbs: present-data cells promote

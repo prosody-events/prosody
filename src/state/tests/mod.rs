@@ -7,10 +7,11 @@ pub(crate) mod support;
 
 use self::cell_suite::{
     ApplyTrace, BatchReadTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace,
-    PoisonHandle, ScanTrace, ScriptedOracle, Trace, run_apply_idempotence, run_batch_alignment,
-    run_batch_duplicate_co_observation, run_batch_read_parity_trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_precedence_pin, run_overlay_trace,
-    run_overwrite_trace,
+    PoisonHandle, RawBatchTrace, ScanTrace, ScriptedOracle, Trace, run_apply_idempotence,
+    run_batch_alignment, run_batch_duplicate_co_observation, run_batch_read_parity_trace,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_precedence_pin,
+    run_overlay_trace, run_overwrite_trace, run_raw_batch_ascending_output,
+    run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
@@ -19,7 +20,9 @@ use self::collection_suite::{
     run_map_get_many_parity_trace, run_map_keyset_exact_trace, run_map_stream_interleave,
     run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
-use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
+use self::support::{
+    CountingCellStore, CountingOracle, CountingResolver, ResolveCounter, fresh_collection,
+};
 use super::cell::ProvisionalWrite;
 use super::descriptor::{
     STREAM_CHUNK, StateDescriptor, WithResolver, deque, deque_state, map_state,
@@ -236,6 +239,40 @@ fn prop_memory_batch_read_parity() {
         executor::block_on(run_batch_read_parity_trace(store, oracle, trace))
     }
     QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
+}
+
+/// Raw-provisional batch parity over the memory store: `provisional_many`
+/// returns exactly the survivors the sequential `provisional_cell_at` loop
+/// does.
+#[test]
+fn prop_memory_raw_batch_parity() {
+    fn property(trace: RawBatchTrace) -> Result<bool> {
+        let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
+        executor::block_on(run_raw_batch_parity_trace(store, trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(RawBatchTrace) -> Result<bool>);
+}
+
+/// Ascending-output pin over the memory store (deterministic): the sort in
+/// `provisional_point_loop` is load-bearing here — without it the output
+/// collapses to input byte order.
+#[test]
+fn memory_raw_batch_ascending_output() -> Result<()> {
+    let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
+    executor::block_on(run_raw_batch_ascending_output(store))
+}
+
+/// No-side-effects pin over the memory store built on a [`CountingOracle`]:
+/// `provisional_many` never resolves, writes, or caches.
+#[test]
+fn memory_raw_batch_no_side_effects() -> Result<()> {
+    let oracle = CountingOracle::default();
+    let store = MemoryCellStore::new(
+        MemoryCells::new(),
+        oracle.clone(),
+        Arc::new(CollectionDefRegistry::default()),
+    );
+    executor::block_on(run_raw_batch_no_side_effects(store, oracle))
 }
 
 /// Within-batch duplicate co-observation + scatter alignment over the memory

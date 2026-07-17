@@ -251,6 +251,10 @@ pub(crate) struct RecoveryReadCounts {
     /// `kind=Cell` point reads issued during recovery — bounded by
     /// #provisional.
     pub(crate) cell_point_reads: AtomicUsize,
+    /// `provisional_many` IN queries — exactly one per non-empty chunk.
+    /// Distinct from `cell_point_reads` so the query-count pin proves the verb
+    /// BATCHED (one IN query) rather than point-looped.
+    pub(crate) provisional_in_queries: AtomicUsize,
 }
 
 /// Per-assignment RAM record of the markers known to stand: one standing
@@ -421,7 +425,9 @@ impl<O> CassandraStore<O> {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?;
-        let mut out: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::new();
+        // At most one row per unique coordinate, so size once at the IN-list
+        // upper bound rather than growing an inline buffer up to `CELL_BATCH`.
+        let mut out: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::with_capacity(uniques.len());
         for row in result
             .rows::<KeyedCellTtlRow>()
             .map_err(CassandraStoreError::from)?
@@ -915,6 +921,32 @@ where
             Cell::Provisional(provisional) => Ok(Some(provisional)),
             Cell::Resolved(_) => Ok(None),
         }
+    }
+
+    async fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error> {
+        #[cfg(test)]
+        self.counters
+            .provisional_in_queries
+            .fetch_add(1, Ordering::Relaxed);
+        // Sorted-distinct IN list (no scatter plan — the output is survivor-only,
+        // not index-aligned).
+        let mut uniques: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+        uniques.extend(batch.iter());
+        uniques.sort_unstable();
+        uniques.dedup();
+        // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
+        // the decoder. Never consults the oracle, never resolves, never writes —
+        // no read-window marker resolve, exactly as `provisional_cell_at`.
+        let rows = self
+            .batch_read(collection, section, &uniques)
+            .await
+            .map_err(ResolveCellError::Store)?;
+        decode_provisional_batch(rows).map_err(ResolveCellError::Store)
     }
 
     async fn write_provisional<'a>(
@@ -1845,6 +1877,29 @@ fn ttl_to_i32(ttl: CompactDuration) -> i32 {
 /// a durable row that dies within the second.
 fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuration> {
     ttl.map(|s| CompactDuration::new(u32::try_from(s).unwrap_or(0)))
+}
+
+/// Decodes a raw provisional batch ([`CassandraStore::provisional_many`]):
+/// sorts the re-keyed rows into ASCENDING coordinate order, then keeps only the
+/// provisional survivors, dropping absent (never present) and already-resolved
+/// rows. Sorting before decoding surfaces a per-row decode failure at the
+/// **lowest** failing coordinate, independent of the order `IN` returned the
+/// rows — the batch-read error rule. TTL is discarded (raw recovery
+/// reconstruction co-expires no cache). Output sized once at the row-count
+/// upper bound; duplicate coordinates are impossible (the caller deduped the IN
+/// list and the primary key is unique), so the sort is unstable.
+fn decode_provisional_batch(
+    mut rows: CellBuffer<(Coordinate, CellTtlRow)>,
+) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, CassandraCellStoreError> {
+    rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());
+    for (coordinate, row) in rows {
+        match decode::try_decode_cell_ttl(row)?.0 {
+            Cell::Provisional(provisional) => out.push((coordinate, provisional)),
+            Cell::Resolved(_) => {}
+        }
+    }
+    Ok(out)
 }
 
 cassandra_queries! {

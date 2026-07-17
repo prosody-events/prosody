@@ -148,7 +148,7 @@
 
 use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::cell_key::{CellKey, Scan, Section};
+use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
@@ -556,6 +556,19 @@ where
     ) -> Result<Option<ProvisionalCell>, Self::Error> {
         // A pure lower read — no fjall step, so no fuse arm is needed.
         self.lower.provisional_cell_at(collection, cell).await
+    }
+
+    fn provisional_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
+    {
+        // A raw provisional read the committed-value cache cannot answer, so
+        // delegate straight to the lower store — no fjall step, no fuse arm
+        // (like `provisional_cell_at`). Nothing is published into the cache.
+        self.lower.provisional_many(collection, section, batch)
     }
 
     async fn write_provisional<'a>(
