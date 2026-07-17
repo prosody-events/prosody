@@ -479,47 +479,44 @@ impl<O> CassandraStore<O> {
     /// construction of `write_resolved` and `abort_provisional`. A present
     /// value binds the resolved-value shape; an absent value **deletes** the
     /// `kind=Cell` row (the row-absence invariant — no null-blob residue).
-    /// Returns an exactly-sized `Vec`; see [`run_batches`] for why it is not a
-    /// [`CellBuffer`].
+    /// Returns a borrowing iterator the callers extend into their pre-sized
+    /// `units` — no intermediate buffer; see [`run_batches`] for why the
+    /// callers' `units` is a `Vec` rather than a [`CellBuffer`].
     fn resolved_units<'u>(
         &'u self,
         pk: Pk<'u>,
         ttl: Option<i32>,
         blobs: &'u [CellBlobs],
         cells: &'u [(CellKey, Option<Bytes>)],
-    ) -> Vec<BatchUnit<CellBatchRow<'u>>> {
+    ) -> impl Iterator<Item = BatchUnit<CellBatchRow<'u>>> + 'u {
         let cell_stmt = if ttl.is_some() {
             &self.queries.write_resolved
         } else {
             &self.queries.write_resolved_no_ttl
         };
-        blobs
-            .iter()
-            .zip(cells)
-            .map(|(blob, (cell, _))| {
-                let addr = CellAddr::new(pk, cell);
-                let row = match blob.data {
-                    Some(_) => CellBatchRow {
-                        statement: cell_stmt,
-                        row: RowShape::Resolved(ResolvedRow {
-                            ttl,
-                            data: blob.data.as_deref(),
-                            encoding: blob.encoding,
-                            version: blob.version,
-                            addr,
-                        }),
-                    },
-                    None => CellBatchRow {
-                        statement: &self.queries.cell_delete,
-                        row: RowShape::Key(KeyRow {
-                            kind: CellKind::Cell,
-                            addr,
-                        }),
-                    },
-                };
-                BatchUnit::new(blob_weight(blob), smallvec![row])
-            })
-            .collect()
+        blobs.iter().zip(cells).map(move |(blob, (cell, _))| {
+            let addr = CellAddr::new(pk, cell);
+            let row = match blob.data {
+                Some(_) => CellBatchRow {
+                    statement: cell_stmt,
+                    row: RowShape::Resolved(ResolvedRow {
+                        ttl,
+                        data: blob.data.as_deref(),
+                        encoding: blob.encoding,
+                        version: blob.version,
+                        addr,
+                    }),
+                },
+                None => CellBatchRow {
+                    statement: &self.queries.cell_delete,
+                    row: RowShape::Key(KeyRow {
+                        kind: CellKind::Cell,
+                        addr,
+                    }),
+                },
+            };
+            BatchUnit::new(blob_weight(blob), smallvec![row])
+        })
     }
 
     /// Mirrors a successful settle into the marker memo ([`MarkerMemo`]'s
@@ -1262,7 +1259,8 @@ where
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
         }
         let ttl = collection.ttl().map(ttl_to_i32);
-        let mut units = self.resolved_units(pk, ttl, &blobs, &cells);
+        let mut units = Vec::with_capacity(cells.len() + 1);
+        units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
         units.push(marker_delete_unit(pk, &self.queries));
         self.run_batches(&units)
             .await
