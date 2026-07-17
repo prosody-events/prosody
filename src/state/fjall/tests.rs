@@ -23,6 +23,7 @@ use color_eyre::eyre::{Report, Result, eyre};
 use fjall::{Database, KeyspaceCreateOptions};
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -387,7 +388,7 @@ fn prop_index_batches_round_trip_the_snapshot() {
 #[test]
 fn for_workspace_retains_the_workspace() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let client = FjallClient::open(dir.path())?;
+    let client = FjallClient::open(dir.path(), None)?;
     let database = client.database().clone();
     let live_cache_partitions = || {
         database
@@ -423,7 +424,7 @@ fn open_sweeps_stale_value_keyspaces() -> Result<()> {
         }
     }
 
-    let client = FjallClient::open(dir.path())?;
+    let client = FjallClient::open(dir.path(), None)?;
     let names = client.database().list_keyspace_names();
     assert!(
         !names.iter().any(|name| name.starts_with("value_")),
@@ -442,7 +443,7 @@ fn open_sweeps_stale_value_keyspaces() -> Result<()> {
 #[test]
 fn workspace_names_are_never_reused() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let client = FjallClient::open(dir.path())?;
+    let client = FjallClient::open(dir.path(), None)?;
     let database = client.database().clone();
     let value_names = || -> BTreeSet<String> {
         database
@@ -486,11 +487,45 @@ fn workspace_names_are_never_reused() -> Result<()> {
 #[test]
 fn open_fails_clearly_when_cache_dir_is_in_use() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let _first = FjallClient::open(dir.path())?;
-    let second = FjallClient::open(dir.path());
+    let _first = FjallClient::open(dir.path(), None)?;
+    let second = FjallClient::open(dir.path(), None);
     assert!(
         matches!(second, Err(FjallClientError::CacheDirInUse { .. })),
         "a second client on a live cache_dir must fail with CacheDirInUse, got {second:?}"
+    );
+    Ok(())
+}
+
+/// An explicit `cache_size_bytes` reaches fjall's block cache: the opened
+/// database's `cache_capacity()` equals the bytes requested.
+#[test]
+fn explicit_cache_size_forwards() -> Result<()> {
+    const SEVEN_MIB: u64 = 7 * 1024 * 1024; // deliberately != fjall's 32 MiB default
+    let dir = tempfile::tempdir()?;
+    let cap = NonZeroU64::new(SEVEN_MIB).ok_or_else(|| eyre!("SEVEN_MIB is nonzero"))?;
+    let client = FjallClient::open(dir.path(), Some(cap))?;
+    assert_eq!(
+        client.database().cache_capacity(),
+        SEVEN_MIB,
+        "explicit cache_size_bytes must reach fjall's block cache verbatim"
+    );
+    Ok(())
+}
+
+/// `None` must omit `Builder::cache_size` entirely — proven by matching the
+/// capacity of an untouched builder control, not a hardcoded 32 MiB (which
+/// would freeze an upstream number).
+#[test]
+fn none_cache_size_matches_untouched_builder() -> Result<()> {
+    let opened = tempfile::tempdir()?;
+    let control = tempfile::tempdir()?;
+    let default_capacity = FjallClient::open(opened.path(), None)?
+        .database()
+        .cache_capacity();
+    let control_capacity = Database::builder(control.path()).open()?.cache_capacity();
+    assert_eq!(
+        default_capacity, control_capacity,
+        "None must leave the builder untouched, matching fjall's own default"
     );
     Ok(())
 }

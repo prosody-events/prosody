@@ -1076,8 +1076,11 @@ where
     // The fjall workspace root is wiped on restart (Cassandra is
     // authoritative), so creating the default directory here is safe.
     fs::create_dir_all(&keyed_state.config.cache_dir)?;
-    let fjall_client =
-        FjallClient::open(&keyed_state.config.cache_dir).map_err(KeyedStateInitError::from)?;
+    let fjall_client = FjallClient::open(
+        &keyed_state.config.cache_dir,
+        keyed_state.config.cache_size_bytes,
+    )
+    .map_err(KeyedStateInitError::from)?;
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
         cell_store,

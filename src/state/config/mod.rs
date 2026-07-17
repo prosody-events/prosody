@@ -4,9 +4,10 @@ use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
-use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
 use derive_builder::Builder;
 use std::env;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -14,6 +15,9 @@ use validator::{Validate, ValidationError};
 
 /// Environment variable for the local fjall workspace directory.
 const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
+
+/// Environment variable for the fjall block-cache capacity, in bytes.
+const FJALL_CACHE_SIZE_ENV: &str = "PROSODY_FJALL_CACHE_SIZE_BYTES";
 
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_KEYED_STATE_RECOVERY_DELAY";
@@ -72,6 +76,20 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_recovery_delay"))]
     pub recovery_delay: CompactDuration,
 
+    /// Block-cache capacity for the local fjall workspace, in **bytes**.
+    ///
+    /// `None` (the default) leaves fjall to choose its own library default —
+    /// prosody deliberately does not copy that number, so an upstream tuning
+    /// change is inherited. `Some(bytes)` sets the capacity of the one
+    /// `Database` this consumer opens at `cache_dir`; it is shared by every
+    /// per-partition keyspace, never multiplied per partition.
+    ///
+    /// Environment variable: `PROSODY_FJALL_CACHE_SIZE_BYTES` (a positive
+    /// integer count of bytes; `0`, negative, non-numeric, and
+    /// out-of-`u64`-range values are rejected at build).
+    #[builder(default = "from_option_env(FJALL_CACHE_SIZE_ENV)?")]
+    pub cache_size_bytes: Option<NonZeroU64>,
+
     #[builder(setter(skip), default)]
     registrations: Vec<(StateType, &'static str, StructuralIdentity, CollectionDef)>,
 }
@@ -83,6 +101,7 @@ impl Default for KeyedStateConfiguration {
                 .unwrap_or_else(|_| default_cache_dir()),
             recovery_delay: recovery_delay_from_env()
                 .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
+            cache_size_bytes: from_option_env(FJALL_CACHE_SIZE_ENV).unwrap_or_default(),
             registrations: Vec::new(),
         }
     }

@@ -38,6 +38,7 @@ use crate::{Partition, Topic};
 use educe::Educe;
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -78,20 +79,28 @@ impl FjallClient {
     /// Production deployments mount it at an emptyDir-type volume; on
     /// partition revocation the per-partition keyspaces are dropped.
     ///
+    /// `cache_size_bytes` is fjall's block-cache capacity in bytes; `None`
+    /// leaves fjall to pick its own default (the call is simply omitted).
+    ///
     /// # Errors
     ///
     /// Returns [`FjallClientError::CacheDirInUse`] when another live client
     /// holds `cache_dir`, and [`FjallClientError::Engine`] when the database
     /// cannot be opened.
-    pub fn open(cache_dir: &Path) -> Result<Arc<Self>, FjallClientError> {
-        let database = Database::builder(cache_dir)
-            .open()
-            .map_err(|error| match error {
-                fjall::Error::Locked => FjallClientError::CacheDirInUse {
-                    path: cache_dir.to_path_buf(),
-                },
-                other => FjallClientError::Engine(other),
-            })?;
+    pub fn open(
+        cache_dir: &Path,
+        cache_size_bytes: Option<NonZeroU64>,
+    ) -> Result<Arc<Self>, FjallClientError> {
+        let mut builder = Database::builder(cache_dir);
+        if let Some(bytes) = cache_size_bytes {
+            builder = builder.cache_size(bytes.get());
+        }
+        let database = builder.open().map_err(|error| match error {
+            fjall::Error::Locked => FjallClientError::CacheDirInUse {
+                path: cache_dir.to_path_buf(),
+            },
+            other => FjallClientError::Engine(other),
+        })?;
         sweep_orphaned(&database)?;
         Ok(Arc::new(Self { database }))
     }
