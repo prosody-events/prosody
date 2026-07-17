@@ -72,7 +72,7 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::store::{CellBuffer, CellStore, CoordinateBatch};
+use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -87,6 +87,7 @@ pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, Sessio
 use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
+use std::iter::from_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1504,6 +1505,47 @@ where
     }
 }
 
+/// One batch-read unit of a `ReadCommitted` stage: a section's contiguous
+/// `≤CELL_BATCH` survivor run, its coordinate batch, and the dirty records —
+/// in the same order — each batched committed base pairs with. `batch` aligns
+/// 1:1 with `records` by construction (each is built from the same run).
+struct StageChunk {
+    section: Section,
+    batch: CoordinateBatch,
+    records: CellBuffer<(CellKey, Option<Bytes>)>,
+}
+
+/// Splits order-preserved survivors (sorted by `(section, coordinate)`) into
+/// per-section `≤CELL_BATCH` [`StageChunk`]s. Concatenating the chunks' records
+/// reproduces the input; each chunk's `batch` is built from its own records, so
+/// it aligns 1:1 with them. Splitting per section (not purely by count) keeps
+/// every `get_many` call single-section, as its `section` argument requires.
+fn section_batches(
+    survivors: impl Iterator<Item = (CellKey, Option<Bytes>)>,
+) -> impl Iterator<Item = StageChunk> {
+    let mut it = survivors.peekable();
+    from_fn(move || {
+        // `Section` is `Copy`, so the peek borrow ends here, before `next_if`.
+        let section = it.peek()?.0.section;
+        let mut records: CellBuffer<(CellKey, Option<Bytes>)> = CellBuffer::new();
+        while let Some(record) =
+            it.next_if(|(cell, _)| cell.section == section && records.len() < CELL_BATCH)
+        {
+            records.push(record);
+        }
+        // `records` is non-empty (peek showed a same-section head) and
+        // `≤CELL_BATCH`, so `chunks` yields exactly one batch. Bind it in its
+        // own statement so the borrow of `records` ends before it is moved.
+        let batch =
+            CoordinateBatch::chunks(records.iter().map(|(cell, _)| cell.coordinate.clone())).next();
+        batch.map(|batch| StageChunk {
+            section,
+            batch,
+            records,
+        })
+    })
+}
+
 /// Stages one collection's touched cells in a single batch, returning the
 /// frozen [`StagedCollection`] record the receipt promotes / rolls back (or
 /// `None` for a `ReadUncommitted` collection, which resolves at stage time).
@@ -1532,42 +1574,68 @@ where
     match registry.commit_mode_for(id.state_type(), id.name()) {
         CommitMode::ReadCommitted => {
             let id = &id;
-            // Read each touched cell's committed base concurrently: the
-            // own-event committed read returns this event's `prev` while its
+            // Read each surviving cell's committed base in per-section batches
+            // instead of one point read per cell. Passing `event` as
+            // `get_many`'s `own` returns this event's `prev` while its
             // provisional cell stands, so a retry re-stages over the same base
             // (idempotent) — a `Set` cell in a cleared section keeps its
             // committed pre-clear `prev` this way. `cooperative` adds a
-            // per-cell coop-budget yield point; `buffer_unordered` keeps full
-            // concurrency. Reordering is irrelevant — the cells are distinct
-            // coordinates landing in one same-partition batch. These reads are
-            // all within this one collection (one shard), so they fan out
-            // under the within-partition `SHARD_FANOUT_CONCURRENCY`, not the
-            // cross-partition bound.
-            // Sized once to the snapshot cardinality (the subsumed filter can
-            // only shrink it) — bounded-allocation rule, the fold replacing an
-            // unconstrained `try_collect`.
+            // per-batch coop-budget yield point; `buffered` keeps full
+            // concurrency while preserving order — inert (marker/clear freezing
+            // sort internally and settle is row-disjoint), with only
+            // `≤SHARD_FANOUT_CONCURRENCY` result buffers in flight. Cells
+            // subsumed by a section clear are dropped first, keeping the batch
+            // row-disjoint (survivors == the section's present cells). Sized
+            // once to the pre-filter snapshot cardinality (the filter can only
+            // shrink it) — bounded-allocation rule.
             let capacity = cells.len();
-            let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(
-                cells
-                    .into_iter()
-                    .filter(|(cell, value)| !subsumed(cell, value)),
-            )
-            .map(|(cell, value)| {
-                let data = value.into_data();
-                cooperative(async move {
-                    let prev = lower
-                        .get(id, &cell, event)
-                        .await
-                        .map_err(|e| StateAccessError::store(&e))?;
-                    Ok((cell, ProvisionalWrite::new(data, prev, event)))
+            let survivors = cells
+                .into_iter()
+                .filter(|(cell, value)| !subsumed(cell, value))
+                .map(|(cell, value)| (cell, value.into_data()));
+            let writes: Vec<(CellKey, ProvisionalWrite)> = stream::iter(section_batches(survivors))
+                .map(|chunk| {
+                    cooperative(async move {
+                        let StageChunk {
+                            section,
+                            batch,
+                            records,
+                        } = chunk;
+                        let bases = lower
+                            .get_many(id, section, &batch, event)
+                            .await
+                            .map_err(|e| StateAccessError::store(&e))?;
+                        // `get_many`'s contract: bases.len() == batch.len()
+                        // == records.len(). Pair this chunk's bases with
+                        // EXACTLY its records BEFORE the fold flattens
+                        // across chunks. The debug_assert mirrors the store
+                        // default's / `Overlay::get_many`'s alignment
+                        // posture (a hard panic is banned); by construction
+                        // the lengths match.
+                        debug_assert_eq!(
+                            bases.len(),
+                            records.len(),
+                            "get_many must answer every batched cell"
+                        );
+                        let chunk_writes: CellBuffer<(CellKey, ProvisionalWrite)> = records
+                            .into_iter()
+                            .zip(bases)
+                            .map(|((cell, data), prev)| {
+                                (cell, ProvisionalWrite::new(data, prev, event))
+                            })
+                            .collect();
+                        Ok::<_, StateAccessError>(chunk_writes)
+                    })
                 })
-            })
-            .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
-            .try_fold(Vec::with_capacity(capacity), |mut acc, write| async move {
-                acc.push(write);
-                Ok(acc)
-            })
-            .await?;
+                .buffered(SHARD_FANOUT_CONCURRENCY)
+                .try_fold(
+                    Vec::with_capacity(capacity),
+                    |mut acc, chunk_writes| async move {
+                        acc.extend(chunk_writes);
+                        Ok(acc)
+                    },
+                )
+                .await?;
             if writes.is_empty() && cleared.is_empty() {
                 return Ok(None);
             }
