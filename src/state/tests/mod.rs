@@ -361,11 +361,18 @@ fn memory_resolve_marker_batches_reads() -> Result<()> {
 /// Section-rekey pin: a marker staging the SAME coordinate byte in BOTH
 /// sections with DIFFERENT values must commit each survivor at its own
 /// `(section, coordinate)`, never collapse to one section. A regression that
-/// drops the chunk's section (keys every survivor at section 0) commits the
-/// section-1 value over the section-0 cell and leaves `(1, 7)` absent.
+/// drops the chunk's section (keys every survivor at section 0) commits both
+/// survivors onto `(0, 7)` and leaves `(1, 7)` unresolved-provisional.
+///
+/// The discriminator is a provisional-sweep drain taken IMMEDIATELY after
+/// `resolve_marker`, before any `get`: a foreign-reader `get` self-heals a
+/// still-provisional cell through its own oracle consult (`resolve_cell`
+/// promotes the cell's stored bytes in place), so a `get`-after-drain would
+/// repair the collapse before an assertion could observe it. The drain reads
+/// `resolve_marker`'s own output.
 /// FALSIFICATION: replace the chunk's `section` with a fixed `SECTIONS[0]` in
-/// `resolve_marker`/`section_batches` → `get(cell_in(1, 7))` reads absent / the
-/// wrong value.
+/// `resolve_marker`/`section_batches` → the drain reports `(1, 7)` still
+/// provisional (`remaining.is_empty()` red).
 #[test]
 fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
     executor::block_on(async {
@@ -400,6 +407,18 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
             .await
             .map_err(|e| eyre!("resolve_marker: {e}"))?;
 
+        // Observe `resolve_marker`'s own output BEFORE any `get`: nothing may be
+        // left provisional. A `get` here would self-heal a survivor the collapse
+        // regression left provisional (see the doc comment), so this drain must
+        // run first.
+        let remaining = drain_memory_provisional(&store, &id)
+            .await
+            .map_err(|e| eyre!("drain: {e}"))?;
+        assert!(
+            remaining.is_empty(),
+            "both survivors are resolved by resolve_marker, none left provisional: {remaining:?}"
+        );
+
         // A foreign reader event: the cells are already resolved, so `get`
         // returns the committed value directly.
         let reader = EventRef::Message {
@@ -420,15 +439,6 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
                 .map_err(|e| eyre!("get s1: {e}"))?,
             Committed::new(Some(bytes(90))),
             "the section-1 survivor commits at (1, 7), not collided onto (0, 7)"
-        );
-
-        // Nothing provisional remains after the committed settle.
-        let remaining = drain_memory_provisional(&store, &id)
-            .await
-            .map_err(|e| eyre!("drain: {e}"))?;
-        assert!(
-            remaining.is_empty(),
-            "both survivors are resolved, none left provisional: {remaining:?}"
         );
         Ok(())
     })
