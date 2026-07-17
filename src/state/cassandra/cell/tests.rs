@@ -48,6 +48,7 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
+use scylla::client::session::Session;
 use std::collections::BTreeSet;
 use std::iter;
 use std::slice;
@@ -225,22 +226,13 @@ impl Fixture {
         self.bottom_store_with(oracle, self.presence.clone())
     }
 
-    /// A bare store over an explicit presence handle — for assemblies that
-    /// model reassignment (crash/overwrite rebuilds, fresh cold readers) and
-    /// the presence-degradation test.
-    fn bottom_store_with(
-        &self,
-        oracle: ScriptedOracle,
-        presence: MarkerPresence,
-    ) -> CassandraStore<ScriptedOracle> {
-        self.bottom_store_oracle(oracle, presence)
-    }
-
-    /// A bare store over an arbitrary [`CommitOracle`] and presence handle —
-    /// generalizes [`bottom_store_with`](Self::bottom_store_with) for pins that
-    /// need a non-[`ScriptedOracle`] oracle (e.g. the [`CountingOracle`]
+    /// A bare store over an explicit presence handle and an arbitrary
+    /// [`CommitOracle`] — for assemblies that model reassignment
+    /// (crash/overwrite rebuilds, fresh cold readers), the
+    /// presence-degradation test, and pins that need a
+    /// non-[`ScriptedOracle`] oracle (e.g. the [`CountingOracle`]
     /// no-side-effects pin).
-    fn bottom_store_oracle<O: CommitOracle>(
+    fn bottom_store_with<O: CommitOracle>(
         &self,
         oracle: O,
         presence: MarkerPresence,
@@ -1743,33 +1735,22 @@ async fn cassandra_batch_alignment() -> Result<()> {
     .await
 }
 
-/// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
-/// whose clustering order (A `0x01` < B `0xFE`) is the reverse of the read list
-/// `[B, A]`. `get_many` decodes the uniques in first-occurrence input order, so
-/// it must surface B's `BlobWithoutEncoding` — not A's `PrevWithoutEvent`,
-/// which the `IN` query returns first in clustering order. The corruptions are
-/// seeded by raw CQL (unreachable through the store verbs), and the sequential
-/// point `get`s confirm the two rows are distinguishable.
-#[tokio::test]
-async fn first_error_is_first_input_position() -> Result<()> {
-    use super::CellCorruptReason;
+/// Seeds two raw-CQL corrupt cells (unreachable through the store verbs) in
+/// `id`'s section 0, returning `(cell_a, cell_b)`. A (`0x01`, low): `prev_data`
+/// present with a valid frame, `event` NULL ⇒ `PrevWithoutEvent`. B (`0xFE`,
+/// high): `data` present, `encoding` NULL ⇒ `BlobWithoutEncoding`. The
+/// clustering order (A < B) is the reverse of the `[B, A]` read list both
+/// resolve-order pins issue, so the decode order the reader picks decides which
+/// error surfaces.
+async fn seed_prev_without_event_and_blob_without_encoding(
+    session: &Session,
+    id: &CollectionId,
+) -> Result<(CellKey, CellKey)> {
     use super::encoding::{Encoding, encode_payload};
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
-    use crate::state::cassandra::CassandraCellStoreError;
-    use crate::state::resolve::ResolveCellError;
 
-    init_test_logging();
-    let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
-    let c = collection("resolve-order")?;
-    let id = c.id();
-    let own = event(9);
     let cell_a = cell_in(0, 0x01);
     let cell_b = cell_in(0, 0xFE);
-
-    // A (`0x01`, low): `prev_data` present with a valid frame, `event` NULL ⇒
-    // PrevWithoutEvent. B (`0xFE`, high): `data` present, `encoding` NULL ⇒
-    // BlobWithoutEncoding.
     let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
     let insert_a = format!(
         "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
@@ -1780,7 +1761,6 @@ async fn first_error_is_first_input_position() -> Result<()> {
         "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
          kind, section, coordinate, data) VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
     );
-    let session = fx.cassandra.session();
     session
         .query_unpaged(
             insert_a,
@@ -1807,6 +1787,30 @@ async fn first_error_is_first_input_position() -> Result<()> {
             ),
         )
         .await?;
+    Ok((cell_a, cell_b))
+}
+
+/// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
+/// whose clustering order (A `0x01` < B `0xFE`) is the reverse of the read list
+/// `[B, A]`. `get_many` decodes the uniques in first-occurrence input order, so
+/// it must surface B's `BlobWithoutEncoding` — not A's `PrevWithoutEvent`,
+/// which the `IN` query returns first in clustering order. The corruptions are
+/// seeded by raw CQL (unreachable through the store verbs), and the sequential
+/// point `get`s confirm the two rows are distinguishable.
+#[tokio::test]
+async fn first_error_is_first_input_position() -> Result<()> {
+    use super::CellCorruptReason;
+    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::resolve::ResolveCellError;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("resolve-order")?;
+    let id = c.id();
+    let own = event(9);
+    let (cell_a, cell_b) =
+        seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
 
     // The two rows are distinguishable through the sequential oracle.
     assert!(
@@ -1948,8 +1952,6 @@ fn decode_provisional_batch_orders_by_coordinate() -> Result<()> {
 #[tokio::test]
 async fn cassandra_raw_batch_lowest_corrupt_coordinate() -> Result<()> {
     use super::CellCorruptReason;
-    use super::encoding::{Encoding, encode_payload};
-    use crate::cassandra::TABLE_KEYED_STATE_CELL;
     use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::resolve::ResolveCellError;
 
@@ -1958,46 +1960,7 @@ async fn cassandra_raw_batch_lowest_corrupt_coordinate() -> Result<()> {
     let store = fx.bottom_store(ScriptedOracle::default());
     let c = collection("raw-lowest-corrupt")?;
     let id = c.id();
-    let cell_a = cell_in(0, 0x01);
-    let cell_b = cell_in(0, 0xFE);
-
-    let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
-    let insert_a = format!(
-        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
-         kind, section, coordinate, prev_data, encoding, version) VALUES (?, ?, ?, ?, 0, 0, ?, ?, \
-         4, 1)"
-    );
-    let insert_b = format!(
-        "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
-         kind, section, coordinate, data) VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
-    );
-    let session = fx.cassandra.session();
-    session
-        .query_unpaged(
-            insert_a,
-            (
-                id.state_key().segment_id,
-                id.state_key().key.as_ref(),
-                i8::from(id.state_type()),
-                id.name().as_str(),
-                cell_a.coordinate.as_bytes(),
-                prev_blob.as_ref(),
-            ),
-        )
-        .await?;
-    session
-        .query_unpaged(
-            insert_b,
-            (
-                id.state_key().segment_id,
-                id.state_key().key.as_ref(),
-                i8::from(id.state_type()),
-                id.name().as_str(),
-                cell_b.coordinate.as_bytes(),
-                bytes(0xBB).as_ref(),
-            ),
-        )
-        .await?;
+    seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
 
     // Read list `[B, A]`: ascending-order decode must surface A's (lowest) error.
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
@@ -2103,6 +2066,6 @@ async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let oracle = CountingOracle::default();
-    let store = fx.bottom_store_oracle(oracle.clone(), fx.presence.clone());
+    let store = fx.bottom_store_with(oracle.clone(), fx.presence.clone());
     Box::pin(run_raw_batch_no_side_effects(store, oracle)).await
 }

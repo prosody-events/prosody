@@ -389,17 +389,19 @@ impl<O> CassandraStore<O> {
 
     /// Reads a section's `uniques` coordinates in one `IN` query, returning the
     /// matching rows **un-decoded**, each re-keyed to its clustering
-    /// `coordinate`. Absent coordinates simply do not appear (the reader treats
-    /// them as `Committed(None)`). Semantic decode is deliberately deferred to
-    /// the caller's first-occurrence resolve loop
-    /// ([`get_many_for_cache`](CellStore::get_many_for_cache)) — decoding here
-    /// would surface a corrupt row in clustering order, violating the batch
-    /// read's earliest-input-position error rule.
+    /// `coordinate`. Absent coordinates simply do not appear. Semantic decode
+    /// is deliberately deferred to the caller, so each caller imposes its
+    /// own decode order and a corrupt row surfaces where that caller's
+    /// error rule demands:
+    /// [`get_many_for_cache`](CellStore::get_many_for_cache) decodes in
+    /// first-input-position order;
+    /// [`provisional_many`](CellStore::provisional_many) decodes in ascending /
+    /// lowest-coordinate order.
     ///
-    /// `uniques` is caller-deduped ([`dedupe`]) and non-empty by
-    /// [`CoordinateBatch`] construction, so the `IN` list has no repeats and is
-    /// never empty; bounded by `CELL_BATCH`, so the result never spills the
-    /// stack buffer.
+    /// `uniques` is caller-deduped and non-empty by [`CoordinateBatch`]
+    /// construction, so the `IN` list has no repeats and is never empty;
+    /// bounded by `CELL_BATCH`, so the result never spills the stack
+    /// buffer.
     async fn batch_read(
         &self,
         id: &CollectionId,
@@ -801,7 +803,7 @@ where
         // clustering order the `IN` query returns. A coordinate with no row
         // resolves as `Committed(None)`. `rows` is bounded by `CELL_BATCH`, so
         // the linear scan is all-stack and O(CELL_BATCH²) at worst.
-        let mut answers: CacheBatch = SmallVec::new();
+        let mut answers: CacheBatch = SmallVec::with_capacity(uniques.len());
         for &coordinate in &uniques {
             let cell = CellKey {
                 section,

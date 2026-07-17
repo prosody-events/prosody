@@ -2829,20 +2829,7 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     oracle: ScriptedOracle,
     trace: BatchReadTrace,
 ) -> Result<bool> {
-    // Collapse the population last-writer-wins into one final state per cell.
-    let mut final_state: BTreeMap<(u8, u8), BatchCellState> = BTreeMap::new();
-    for (s, c, state) in trace.population {
-        final_state.insert((section_idx(s), c % CELLS), state);
-    }
-    let mut resolved: Vec<(CellKey, Option<Bytes>)> = Vec::new();
-    let mut provisional: Vec<(CellKey, u8)> = Vec::new();
-    for (&(s, c), state) in &final_state {
-        match *state {
-            BatchCellState::Present(v) => resolved.push((cell_in(s, c), Some(bytes(v)))),
-            BatchCellState::Absent => {}
-            BatchCellState::Provisional(v) => provisional.push((cell_in(s, c), v)),
-        }
-    }
+    let (resolved, provisional) = collapse_population(&trace.population);
 
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(0x5EED),

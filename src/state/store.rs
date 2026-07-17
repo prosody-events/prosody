@@ -574,8 +574,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 /// position. Both buffers use [`CellBuffer`], so small calls stay inline. The
 /// `uniques` borrow from `batch`.
 pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellBuffer<usize>) {
-    let mut uniques: CellBuffer<&Coordinate> = SmallVec::new();
-    let mut plan: CellBuffer<usize> = SmallVec::new();
+    let mut uniques: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+    let mut plan: CellBuffer<usize> = SmallVec::with_capacity(batch.len());
     for coordinate in batch.iter() {
         let idx = if let Some(i) = uniques.iter().position(|u| *u == coordinate) {
             i
