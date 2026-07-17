@@ -339,8 +339,13 @@ fn warm_entries_and_index_survive_same_workspace_rebuild() -> Result<()> {
         );
         assert_eq!(
             counting.warm_point_reads(),
+            0,
+            "the warm sweep issues no per-coordinate point read"
+        );
+        assert_eq!(
+            counting.raw_batch_reads(),
             1,
-            "the warm sweep point-reads exactly the one provisional coordinate"
+            "the warm sweep rebuilds the one provisional coordinate via a single lower batch"
         );
 
         // The committed-cell entry also survives: the warm `9` serves from

@@ -26,9 +26,10 @@ use super::identity::{CollectionId, CollectionRef};
 use super::marker::EventMarker;
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
-use super::store::CellStore;
+use super::store::{CellBuffer, CellStore, section_batches};
 use crate::error::{ClassifyError, ErrorCategory};
-use futures::{StreamExt, TryStreamExt};
+use futures::future::join;
+use futures::{StreamExt, TryStreamExt, stream};
 use std::error::Error;
 use std::fmt;
 use std::slice;
@@ -246,8 +247,11 @@ where
 /// of the sweep and (in the memory backend) the stage boundary.
 ///
 /// One oracle verdict on the marker's event decides the whole stage: rebuild
-/// the still-live staged writes — for each listed coordinate,
-/// [`CellStore::provisional_cell_at`], keeping only a cell still owned by the
+/// the still-live staged writes — the marker's already-sorted staged
+/// coordinates are grouped by section into `<=CELL_BATCH` raw batches
+/// ([`CellStore::provisional_many`]), each survivor's [`CellKey`] rebuilt from
+/// its chunk's section (coordinates repeat across sections, so the section is
+/// reattached inside the chunk stage), keeping only a cell still owned by the
 /// marker's event (an absent / resolved / foreign-event cell is already
 /// settled, an over-report-safe drop) — then
 /// [`commit_provisional`](CellStore::commit_provisional) (committed) or
@@ -256,10 +260,22 @@ where
 /// which is why no separate marker-delete verb exists. `clears` ride through
 /// verbatim to the commit arm, which applies the frozen gap erase.
 ///
+/// # Oracle-preempts-cell precedence
+///
+/// The single oracle verdict runs **concurrently** with the read-only batch
+/// reads via [`join`] — both legs are read-only until the join completes, so
+/// the overlap is observably identical to reading the oracle first. The
+/// results are matched **oracle-first**, so a double failure surfaces the
+/// [`ResolveCellError::Oracle`] error and its retry/skip classification
+/// governs; a first-error-short-circuiting combinator would instead surface
+/// whichever leg failed first, making the classification schedule-dependent.
+/// Mutations (commit/abort) run strictly after the join.
+///
 /// # Errors
 ///
-/// Returns [`ResolveCellError::Oracle`] on an oracle failure or
-/// [`ResolveCellError::Store`] on a rebuild / settle failure.
+/// Returns [`ResolveCellError::Oracle`] on an oracle failure (preempting a
+/// concurrent cell-read failure) or [`ResolveCellError::Store`] on a rebuild /
+/// settle failure.
 pub(crate) async fn resolve_marker<S, O>(
     store: &S,
     oracle: &O,
@@ -270,22 +286,52 @@ where
     S: CellStore,
     O: CommitOracle,
 {
-    let decision = oracle
-        .resolve(collection.id().state_key(), marker.event())
-        .await
-        .map_err(ResolveCellError::Oracle)?;
+    // The read-only rebuild: one raw batch per per-section chunk of the
+    // marker's already-sorted staged coordinates, each survivor's `CellKey`
+    // rebuilt from the chunk's section. `buffered` makes the first-failing chunk
+    // deterministic (lowest chunk in staged order).
+    let reads = stream::iter(section_batches(marker.staged()))
+        .map(|(section, batch)| async move {
+            let survivors = store
+                .provisional_many(collection.id(), section, &batch)
+                .await
+                .map_err(ResolveCellError::Store)?;
+            Ok::<CellBuffer<(CellKey, ProvisionalCell)>, ResolveCellError<S::Error, O::Error>>(
+                survivors
+                    .into_iter()
+                    .map(|(coordinate, provisional)| {
+                        (
+                            CellKey {
+                                section,
+                                coordinate,
+                            },
+                            provisional,
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .buffered(SHARD_FANOUT_CONCURRENCY)
+        .try_collect::<Vec<_>>();
+
+    // Overlap the oracle verdict with the batch reads; match the oracle result
+    // FIRST (see the precedence invariant above). Both legs are read-only, so
+    // no mutation happens until the join completes.
+    let (decision, rebuilt) = join(
+        oracle.resolve(collection.id().state_key(), marker.event()),
+        reads,
+    )
+    .await;
+    let decision = decision.map_err(ResolveCellError::Oracle)?;
+    let rebuilt = rebuilt?;
+
+    // Keep only cells still owned by the marker's event (over-report-safe drop).
     let mut writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(marker.staged().len());
-    for cell in marker.staged() {
-        let provisional = store
-            .provisional_cell_at(collection.id(), cell)
-            .await
-            .map_err(ResolveCellError::Store)?;
-        if let Some(provisional) = provisional
-            && provisional.event() == marker.event()
-        {
+    for (cell, provisional) in rebuilt.into_iter().flatten() {
+        if provisional.event() == marker.event() {
             // A resolved decision site: `Committed::new` is legal here.
             writes.push((
-                cell.clone(),
+                cell,
                 ProvisionalWrite::new(
                     provisional.data().cloned(),
                     Committed::new(provisional.prev().cloned()),

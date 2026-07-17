@@ -404,6 +404,11 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
         0,
         "a quiescent sweep issues no recovery point read"
     );
+    assert_eq!(
+        counts.provisional_in_queries.load(Ordering::Relaxed),
+        0,
+        "a quiescent sweep issues no raw batch IN query"
+    );
 
     // The clear leg adds NO steady-state queries: a second event stages with
     // a section clear and settles through `commit_provisional(…, clears)` —
@@ -434,6 +439,11 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
         0,
         "the clear leg adds no recovery point read"
     );
+    assert_eq!(
+        counts.provisional_in_queries.load(Ordering::Relaxed),
+        0,
+        "the clear leg adds no raw batch IN query"
+    );
     Ok(())
 }
 
@@ -443,9 +453,9 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 /// **total** (the shared memo, seeded by whichever consumer fires first —
 /// pinned by staying at 1 across the first read's read-help seed, the second
 /// read, the stage's boundary check, the cold sweep, AND a second sweep) plus
-/// exactly one cell point read per provisional coordinate per sweep. The
-/// committed cells live in the `kind=Cell` range recovery never touches, so
-/// they cost nothing.
+/// exactly one raw `IN` query per section per sweep (the provisional cells all
+/// fit one `<=CELL_BATCH` chunk here). The committed cells live in the
+/// `kind=Cell` range recovery never touches, so they cost nothing.
 ///
 /// This also pins who pays the seed: a committed `write_resolved` is
 /// marker-free by design (no counter moves), the FIRST read pays the one
@@ -534,8 +544,9 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         );
 
         // A cold sweep: the marker leg answers from the memo (zero durable
-        // marker reads) + one point read per listed coordinate, independent of
-        // `committed` (the same `counts` handle).
+        // marker reads) + one raw `IN` query for the single section-0 chunk,
+        // and NO per-coordinate point reads, independent of `committed` (the
+        // same `counts` handle).
         let found = provisional_cells(&store, c.id()).await?;
         assert_eq!(found.len(), PROVISIONAL as usize);
         assert_eq!(
@@ -544,9 +555,14 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
             "the cold sweep rides the memo — still one durable marker read {committed}"
         );
         assert_eq!(
+            counts.provisional_in_queries.load(Ordering::Relaxed),
+            1,
+            "one IN query for the single section-0 chunk, not #committed {committed}"
+        );
+        assert_eq!(
             counts.cell_point_reads.load(Ordering::Relaxed),
-            PROVISIONAL as usize,
-            "recovery point reads bounded by #provisional, not #committed {committed}"
+            0,
+            "the batched sweep issues no per-coordinate point reads {committed}"
         );
 
         // A second sweep re-reads the listed cells but STILL pays no durable
@@ -559,9 +575,14 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
             "a second sweep pays no durable marker read {committed}"
         );
         assert_eq!(
+            counts.provisional_in_queries.load(Ordering::Relaxed),
+            2,
+            "each sweep pays exactly one IN query per section {committed}"
+        );
+        assert_eq!(
             counts.cell_point_reads.load(Ordering::Relaxed),
-            2 * PROVISIONAL as usize,
-            "each sweep pays exactly #provisional cell point reads {committed}"
+            0,
+            "no sweep issues a per-coordinate point read {committed}"
         );
     }
     Ok(())
@@ -2024,6 +2045,93 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
         counters.marker_point_reads.load(Ordering::Relaxed),
         0,
         "no marker point read"
+    );
+    Ok(())
+}
+
+/// Cold recovery `provisional_cells` batches by section at the `CELL_BATCH`
+/// boundary: staging `n` provisional cells and draining the sweep issues
+/// exactly `ceil(n / CELL_BATCH)` raw `IN` queries and ZERO per-coordinate
+/// point reads at n = 127/128/129, plus one query per additional section — the
+/// query-count formula `raw_batch_reads = Σ_s ceil(n_s / CELL_BATCH)`,
+/// `raw_point_reads = 0`. One store per case so its `recovery_reads` counters
+/// start clean; staging never touches `provisional_in_queries`, so the drain's
+/// count is the whole assertion.
+#[tokio::test]
+async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
+    use crate::state::store::CELL_BATCH;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let staging = event(0x22);
+
+    for n in [127u32, 128, 129] {
+        let store = fx.bottom_store(ScriptedOracle::default());
+        let c = collection(&format!("recovery-boundary-{n}"))?;
+        let counters = store.recovery_reads();
+        let writes: Vec<(CellKey, ProvisionalWrite)> = (0..n)
+            .map(|i| {
+                (
+                    cell_i(i),
+                    ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), staging),
+                )
+            })
+            .collect();
+        let marker = EventMarker::frozen(staging, &writes, &[]);
+        store.write_provisional(&c, &writes, Some(&marker)).await?;
+
+        let found = provisional_cells(&store, c.id()).await?;
+        assert_eq!(
+            found.len(),
+            n as usize,
+            "every staged cell recovers (n={n})"
+        );
+        assert_eq!(
+            counters.provisional_in_queries.load(Ordering::Relaxed),
+            n.div_ceil(CELL_BATCH as u32) as usize,
+            "one IN query per <=CELL_BATCH chunk, not #cells (n={n})"
+        );
+        assert_eq!(
+            counters.cell_point_reads.load(Ordering::Relaxed),
+            0,
+            "the batched sweep issues no per-coordinate point reads (n={n})"
+        );
+    }
+
+    // Two sections: 129 in section 0 (two chunks) + 1 in section 1 (one chunk)
+    // ⇒ ceil(129/128) + ceil(1/128) = 3 IN queries.
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("recovery-boundary-two-sections")?;
+    let counters = store.recovery_reads();
+    let mut writes: Vec<(CellKey, ProvisionalWrite)> = (0..129u32)
+        .map(|i| {
+            (
+                cell_i(i),
+                ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), staging),
+            )
+        })
+        .collect();
+    writes.push((
+        CellKey {
+            section: Section::new(1),
+            coordinate: Coordinate::from_bytes(vec![0, 0, 0, 0]),
+        },
+        ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), staging),
+    ));
+    let marker = EventMarker::frozen(staging, &writes, &[]);
+    store.write_provisional(&c, &writes, Some(&marker)).await?;
+
+    let found = provisional_cells(&store, c.id()).await?;
+    assert_eq!(found.len(), 130, "all cells across both sections recover");
+    assert_eq!(
+        counters.provisional_in_queries.load(Ordering::Relaxed),
+        3,
+        "ceil(129/128) + ceil(1/128) = 2 + 1"
+    );
+    assert_eq!(
+        counters.cell_point_reads.load(Ordering::Relaxed),
+        0,
+        "no per-coordinate point reads across sections"
     );
     Ok(())
 }

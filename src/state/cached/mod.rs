@@ -146,21 +146,21 @@
 //! `Cached::get`) — correctness rests on the lower store, so
 //! `Cached::Error` is just the lower store's error.
 
-use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
-use super::store::{CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch};
+use super::store::{
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
+};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::{Stream, StreamExt, pin_mut, stream};
+use futures::{Stream, StreamExt, pin_mut};
 use std::future::Future;
 use std::time::Duration;
-use tokio::task::coop::cooperative;
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -499,25 +499,21 @@ where
                 }
             };
             if let Some(coords) = warm_coords {
-                // The point-reads run concurrently — the sweep resolves cells
-                // independently and order-free — with each per-item future
-                // coop-wrapped so a large drain still yields to the runtime. A
-                // concurrently-resolved or absent coordinate reads `None` and
-                // is dropped (over-report-safe, matching the cold path's
-                // filter).
-                let reads = stream::iter(coords)
-                    .map(|cell| {
-                        cooperative(async move {
-                            let read = self.lower.provisional_cell_at(collection, &cell).await;
-                            read.map(|provisional| (cell, provisional))
-                        })
-                    })
-                    .buffered(SHARD_FANOUT_CONCURRENCY);
-                pin_mut!(reads);
-                while let Some(item) = reads.next().await {
-                    let (cell, provisional) = item?;
-                    if let Some(provisional) = provisional {
-                        yield (cell, provisional);
+                // Rebuild each warm coordinate through one lower batch per
+                // per-section `<=CELL_BATCH` chunk (the section is reattached to
+                // each survivor, since coordinates repeat across sections). A
+                // concurrently-resolved or absent coordinate is dropped by
+                // `provisional_many` (over-report-safe, matching the cold path's
+                // filter). Sub-batches run sequentially: real lower-store I/O
+                // leaves drive the coop budget.
+                for (section, batch) in section_batches(&coords) {
+                    // `Box::pin` keeps the large per-chunk batch-read future off
+                    // this generator's state so it stays small across the yield
+                    // (bounded per-chunk alloc on a warm recovery path).
+                    let survivors =
+                        Box::pin(self.lower.provisional_many(collection, section, &batch)).await?;
+                    for (coordinate, provisional) in survivors {
+                        yield (CellKey { section, coordinate }, provisional);
                     }
                 }
             } else {

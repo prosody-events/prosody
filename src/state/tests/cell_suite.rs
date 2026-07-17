@@ -60,8 +60,11 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
 use std::iter;
+use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use uuid::Uuid;
 
 /// Distinct collections a crash/overwrite trace cycles through. Small so events
@@ -194,6 +197,76 @@ impl CommitOracle for ScriptedOracle {
         } else {
             CommitDecision::NotCommitted
         })
+    }
+}
+
+/// A commit oracle whose `resolve` YIELDS ONCE then fails `Transient`, counting
+/// consults. The single yield is load-bearing for the overlap-precedence
+/// falsification (`resolve_marker_double_failure_surfaces_oracle`): it forces
+/// `resolve` to observe `Pending` on the first poll pass while the (ready)
+/// batch read errors, so `resolve_marker`'s
+/// [`join`](futures::future::join)-plus-oracle-first surfaces the ORACLE error,
+/// whereas a first-error-short-circuiting combinator would surface the STORE
+/// error. `record_message` is inert.
+#[derive(Clone, Default)]
+pub(crate) struct FailingOracle(Arc<AtomicUsize>);
+
+impl FailingOracle {
+    /// Resolutions counted so far.
+    pub(crate) fn resolves(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl CommitOracle for FailingOracle {
+    type Error = FailingOracleError;
+
+    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn resolve<'a>(
+        &'a self,
+        _state_key: &'a StateKey,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        YieldOnce::default().await;
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Err(FailingOracleError::Injected)
+    }
+}
+
+/// A runtime-agnostic "`Pending` on the first poll, `Ready` after" future —
+/// robust under `futures::executor::block_on` (which the memory pins use),
+/// unlike `tokio::task::yield_now`. Wakes itself so the executor re-polls.
+#[derive(Default)]
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+/// Error of a [`FailingOracle`]: a single injected transient failure.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FailingOracleError {
+    /// The injected resolve failure.
+    #[error("injected oracle failure")]
+    Injected,
+}
+
+impl ClassifyError for FailingOracleError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Transient
     }
 }
 
@@ -2362,6 +2435,11 @@ pub(crate) enum Poison {
     /// batch after earlier positions succeeded (the read-fill error arm: a
     /// failed lower batch publishes nothing).
     GetForCache(BTreeMap<u8, ErrorCategory>),
+    /// Raw recovery-reconstruction read path: `provisional_many` fails with the
+    /// given category (`Ready(Err)` on the first poll) for one named
+    /// collection — the overlap-precedence pin's cell-read leg, run
+    /// concurrently with a failing oracle.
+    ProvisionalMany(StateName, ErrorCategory),
 }
 
 /// A runtime-armable poison slot shared by a [`FailingCellStore`], its
@@ -2420,6 +2498,18 @@ impl<S> FailingCellStore<S> {
         Self::armed(inner, Poison::GetForCache(cells))
     }
 
+    /// Wraps `inner`, poisoning `provisional_many` with `category` for the
+    /// `poison` collection — the raw recovery-reconstruction read
+    /// (`provisional_cell_at` stays healthy, so seeding a marker still works
+    /// once disarmed).
+    pub(crate) fn armed_provisional_many(
+        inner: S,
+        poison: StateName,
+        category: ErrorCategory,
+    ) -> Self {
+        Self::armed(inner, Poison::ProvisionalMany(poison, category))
+    }
+
     /// Wraps `inner` around a shared runtime `poison` slot — the trace
     /// runner's constructor, re-wrapping each crash-rebuilt store around one
     /// handle.
@@ -2447,7 +2537,10 @@ impl<S> FailingCellStore<S> {
                 .iter()
                 .find_map(|c| targets.get(&coord_of(c)).copied()),
             Some(
-                Poison::WriteProvisional(..) | Poison::WriteResolved(..) | Poison::GetForCache(..),
+                Poison::WriteProvisional(..)
+                | Poison::WriteResolved(..)
+                | Poison::GetForCache(..)
+                | Poison::ProvisionalMany(..),
             )
             | None => None,
         }
@@ -2464,7 +2557,8 @@ impl<S> FailingCellStore<S> {
                 Poison::Collection(..)
                 | Poison::Cells(..)
                 | Poison::WriteResolved(..)
-                | Poison::GetForCache(..),
+                | Poison::GetForCache(..)
+                | Poison::ProvisionalMany(..),
             )
             | None => None,
         }
@@ -2481,7 +2575,8 @@ impl<S> FailingCellStore<S> {
                 Poison::Collection(..)
                 | Poison::Cells(..)
                 | Poison::WriteProvisional(..)
-                | Poison::GetForCache(..),
+                | Poison::GetForCache(..)
+                | Poison::ProvisionalMany(..),
             )
             | None => None,
         }
@@ -2497,7 +2592,27 @@ impl<S> FailingCellStore<S> {
                 Poison::Collection(..)
                 | Poison::Cells(..)
                 | Poison::WriteProvisional(..)
-                | Poison::WriteResolved(..),
+                | Poison::WriteResolved(..)
+                | Poison::ProvisionalMany(..),
+            )
+            | None => None,
+        }
+    }
+
+    /// The category to inject when `provisional_many` reads `collection`, or
+    /// `None` — the raw recovery-read fault, mirroring
+    /// [`Self::injected_stage`].
+    fn injected_provisional_many(&self, collection: &CollectionId) -> Option<ErrorCategory> {
+        match &*self.poison.lock() {
+            Some(Poison::ProvisionalMany(name, category)) => {
+                (*collection.name() == *name).then_some(*category)
+            }
+            Some(
+                Poison::Collection(..)
+                | Poison::Cells(..)
+                | Poison::WriteProvisional(..)
+                | Poison::WriteResolved(..)
+                | Poison::GetForCache(..),
             )
             | None => None,
         }
@@ -2600,16 +2715,20 @@ where
             .map_err(FailCellError::Inner)
     }
 
-    fn provisional_many<'a>(
+    async fn provisional_many<'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
-        // Inherits the inner store's survivors through this wrapper's
-        // `provisional_cell_at` (which wraps the inner error).
-        provisional_point_loop(self, collection, section, batch)
+    ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error> {
+        // A poisoned collection fails `Ready(Err)` on the first poll (the
+        // overlap-precedence pin's cell-read leg). Otherwise inherit the inner
+        // store's survivors through this wrapper's `provisional_cell_at` (which
+        // wraps the inner error).
+        if let Some(category) = self.injected_provisional_many(collection) {
+            return Err(FailCellError::Poison(category));
+        }
+        provisional_point_loop(self, collection, section, batch).await
     }
 
     async fn write_provisional<'a>(

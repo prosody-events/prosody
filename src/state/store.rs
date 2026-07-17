@@ -588,6 +588,25 @@ pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellB
     (uniques, plan)
 }
 
+/// Groups already-`(section, coordinate)`-sorted cell keys into per-section
+/// `<=CELL_BATCH` batches, preserving order, for the recovery reconstruction
+/// paths (`resolve_marker`, the cold/warm `provisional_cells` sweeps). Each
+/// yielded `(section, batch)` carries the section its coordinates belong to —
+/// coordinates repeat across sections, so the section must travel with the
+/// batch and be reattached to each survivor. The bounded upfront `Vec`
+/// (recovery-path allocation, not steady-state) lets a caller inside an
+/// `async-stream` generator loop the batches without holding a `chunk_by`
+/// borrow across an `await`.
+pub(crate) fn section_batches(keys: &[CellKey]) -> Vec<(Section, CoordinateBatch)> {
+    keys.chunk_by(|a, b| a.section == b.section)
+        .flat_map(|run| {
+            let section = run[0].section;
+            CoordinateBatch::chunks(run.iter().map(|key| key.coordinate.clone()))
+                .map(move |batch| (section, batch))
+        })
+        .collect()
+}
+
 /// Reference point-loop behind every [`CellStore::provisional_many`] that has
 /// no batch query of its own (the memory backend and the test doubles): reads
 /// each **distinct** requested coordinate through

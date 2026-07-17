@@ -107,7 +107,7 @@ use crate::state::resolve::{
     resolve_read,
 };
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe, section_batches,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
@@ -116,7 +116,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use decode::{CellTtlRow, KeyedCellRow, KeyedCellTtlRow, RawCellRow, split_keyed_cell_ttl};
 use encoding::encode_payload;
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
+use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
 use scylla::deserialize::row::DeserializeRow;
 use scylla::serialize::SerializationError;
@@ -861,40 +861,23 @@ where
             let Some(marker) = self.standing_marker(collection).await? else {
                 return;
             };
-            // Bounded by one event's staged set, sized once.
-            let coords: Vec<CellKey> = marker.staged().to_vec();
 
-            // Point-read each listed coordinate's `kind=Cell` row to rebuild
-            // its `ProvisionalCell`, pipelined on the partition's shard
-            // fan-out — the reads are independent and both consumers are
-            // order-free (the sweep resolves `buffer_unordered`; the warm
-            // index records a set). A listed coordinate whose row is absent
-            // (cell and marker share one TTL) or decodes `Cell::Resolved`
-            // (first-touch or concurrently resolved) is silently dropped —
-            // the marker's over-report is safe.
-            let reads = stream::iter(coords)
-                .map(|key| {
-                    // `cooperative` adds a per-cell coop-budget yield point;
-                    // `buffered` keeps full concurrency (and the index order).
-                    cooperative(async move {
-                        #[cfg(test)]
-                        self.counters.cell_point_reads.fetch_add(1, Ordering::Relaxed);
-                        let raw = self
-                            .point_read::<RawCellRow>(&self.queries.read_cell, collection, &key)
-                            .await
-                            .map_err(ResolveCellError::Store)?;
-                        Ok::<_, CellStoreError<O::Error>>((key, raw))
-                    })
-                })
-                .buffered(SHARD_FANOUT_CONCURRENCY);
-            pin_mut!(reads);
-            while let Some((key, raw)) = reads.try_next().await? {
-                let Some(raw) = raw else {
-                    continue;
-                };
-                let cell = decode::try_decode_cell(raw).map_err(ResolveCellError::Store)?;
-                if let Cell::Provisional(provisional) = cell {
-                    yield (key, provisional);
+            // Rebuild each listed coordinate's `ProvisionalCell` through one
+            // raw `IN` query per per-section `<=CELL_BATCH` chunk (the section
+            // is reattached to each survivor, since coordinates repeat across
+            // sections). A listed coordinate whose row is absent (cell and
+            // marker share one TTL) or already resolved (first-touch or a
+            // concurrent resolve) is dropped by `provisional_many` — the
+            // marker's over-report is safe. Sub-batches run sequentially: real
+            // `IN`-query I/O leaves drive the coop budget.
+            for (section, batch) in section_batches(marker.staged()) {
+                // `Box::pin` keeps the large per-chunk batch-read future off
+                // this generator's state so it stays small across the yield
+                // (bounded per-chunk alloc on a cold recovery path).
+                let survivors =
+                    Box::pin(self.provisional_many(collection, section, &batch)).await?;
+                for (coordinate, provisional) in survivors {
+                    yield (CellKey { section, coordinate }, provisional);
                 }
             }
         }

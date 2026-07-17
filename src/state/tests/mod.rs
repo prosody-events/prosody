@@ -6,12 +6,12 @@ pub(crate) mod identity_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    ApplyTrace, BatchReadTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, OverwriteTrace,
-    PoisonHandle, RawBatchTrace, ScanTrace, ScriptedOracle, Trace, run_apply_idempotence,
-    run_batch_alignment, run_batch_duplicate_co_observation, run_batch_read_parity_trace,
-    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_precedence_pin,
-    run_overlay_trace, run_overwrite_trace, run_raw_batch_ascending_output,
-    run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
+    ApplyTrace, BatchReadTrace, FailingCellStore, FailingOracle, MemoryShapeProbe, OverlayTrace,
+    OverwriteTrace, PoisonHandle, RawBatchTrace, ScanTrace, ScriptedOracle, Trace,
+    run_apply_idempotence, run_batch_alignment, run_batch_duplicate_co_observation,
+    run_batch_read_parity_trace, run_bottom_scan_trace, run_crash_equivalence_trace,
+    run_overlay_precedence_pin, run_overlay_trace, run_overwrite_trace,
+    run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
@@ -21,9 +21,11 @@ use self::collection_suite::{
     run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
 use self::support::{
-    CountingCellStore, CountingOracle, CountingResolver, ResolveCounter, fresh_collection,
+    CountingCellStore, CountingOracle, CountingResolver, FixedOracle, ResolveCounter,
+    fresh_collection,
 };
-use super::cell::ProvisionalWrite;
+use super::cell::{Committed, ProvisionalWrite};
+use super::cell_key::CellKey;
 use super::descriptor::{
     STREAM_CHUNK, StateDescriptor, WithResolver, deque, deque_state, map_state,
 };
@@ -33,6 +35,7 @@ use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore}
 use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
+use super::resolve::{ResolveCellError, resolve_marker};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
@@ -41,6 +44,7 @@ use super::{
 };
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::ErrorCategory;
 use crate::loader::MemoryLoader;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -288,6 +292,216 @@ fn memory_batch_duplicate_co_observation() -> Result<()> {
 fn memory_batch_alignment() -> Result<()> {
     let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
     executor::block_on(run_batch_alignment(store))
+}
+
+/// `resolve_marker` rebuilds the staged set through per-section
+/// `<=CELL_BATCH` `provisional_many` batches (never per-coordinate point
+/// reads) and consults the oracle exactly ONCE: staging 129 cells in section 0
+/// and 3 in section 1 makes the marker leg issue `ceil(129/128) + ceil(3/128)
+/// = 3` raw batch reads, zero raw point reads, and one oracle resolve. The
+/// memory `provisional_many` is a point-loop, so `raw_batch_reads` counts the
+/// LOGICAL batch calls (one per chunk) — a faithful pin that the marker leg
+/// issues `ceil` batch calls and no direct point reads.
+/// FALSIFICATION: revert `resolve_marker`'s chunk loop to `provisional_cell_at`
+/// → `raw_batch_reads == 0` and `raw_point_reads == 132`, both asserts red.
+#[test]
+fn memory_resolve_marker_batches_reads() -> Result<()> {
+    executor::block_on(async {
+        let counting =
+            CountingCellStore::new(memory_store(MemoryCells::new(), ScriptedOracle::default()));
+        let oracle = CountingOracle::default();
+        let id = fresh_collection("resolve-marker-batches")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+
+        let mut writes: Vec<(CellKey, ProvisionalWrite)> = (0..129u8)
+            .map(|i| {
+                (
+                    cell_in(0, i),
+                    ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), event),
+                )
+            })
+            .collect();
+        writes.extend((0..3u8).map(|c| {
+            (
+                cell_in(1, c),
+                ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), event),
+            )
+        }));
+        let marker = EventMarker::frozen(event, &writes, &[]);
+        counting
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await
+            .map_err(|e| eyre!("stage: {e}"))?;
+
+        // The oracle answers NotCommitted ⇒ abort; the verdict is irrelevant to
+        // the read counts this pin measures.
+        counting.reset();
+        resolve_marker(&counting, &oracle, &cref, &marker)
+            .await
+            .map_err(|e| eyre!("resolve_marker: {e}"))?;
+
+        assert_eq!(
+            counting.raw_batch_reads(),
+            3,
+            "ceil(129/128) + ceil(3/128) batch calls (two sections)"
+        );
+        assert_eq!(
+            counting.raw_point_reads(),
+            0,
+            "the marker leg issues no per-coordinate point read"
+        );
+        assert_eq!(oracle.resolves(), 1, "exactly one oracle verdict");
+        Ok(())
+    })
+}
+
+/// Section-rekey pin: a marker staging the SAME coordinate byte in BOTH
+/// sections with DIFFERENT values must commit each survivor at its own
+/// `(section, coordinate)`, never collapse to one section. A regression that
+/// drops the chunk's section (keys every survivor at section 0) commits the
+/// section-1 value over the section-0 cell and leaves `(1, 7)` absent.
+/// FALSIFICATION: replace the chunk's `section` with a fixed `SECTIONS[0]` in
+/// `resolve_marker`/`section_batches` → `get(cell_in(1, 7))` reads absent / the
+/// wrong value.
+#[test]
+fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
+    executor::block_on(async {
+        let store = MemoryCellStore::new(
+            MemoryCells::new(),
+            FixedOracle::committed(),
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let id = fresh_collection("resolve-marker-rekey")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let writes = [
+            (
+                cell_in(0, 7),
+                ProvisionalWrite::new(Some(bytes(70)), Committed::new(None), event),
+            ),
+            (
+                cell_in(1, 7),
+                ProvisionalWrite::new(Some(bytes(90)), Committed::new(None), event),
+            ),
+        ];
+        let marker = EventMarker::frozen(event, &writes, &[]);
+        store
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await
+            .map_err(|e| eyre!("stage: {e}"))?;
+
+        let oracle = FixedOracle::committed();
+        resolve_marker(&store, &oracle, &cref, &marker)
+            .await
+            .map_err(|e| eyre!("resolve_marker: {e}"))?;
+
+        // A foreign reader event: the cells are already resolved, so `get`
+        // returns the committed value directly.
+        let reader = EventRef::Message {
+            dedup_id: Uuid::from_u128(2),
+        };
+        assert_eq!(
+            store
+                .get(&id, &cell_in(0, 7), reader)
+                .await
+                .map_err(|e| eyre!("get s0: {e}"))?,
+            Committed::new(Some(bytes(70))),
+            "the section-0 survivor commits at (0, 7)"
+        );
+        assert_eq!(
+            store
+                .get(&id, &cell_in(1, 7), reader)
+                .await
+                .map_err(|e| eyre!("get s1: {e}"))?,
+            Committed::new(Some(bytes(90))),
+            "the section-1 survivor commits at (1, 7), not collided onto (0, 7)"
+        );
+
+        // Nothing provisional remains after the committed settle.
+        let remaining = drain_memory_provisional(&store, &id)
+            .await
+            .map_err(|e| eyre!("drain: {e}"))?;
+        assert!(
+            remaining.is_empty(),
+            "both survivors are resolved, none left provisional: {remaining:?}"
+        );
+        Ok(())
+    })
+}
+
+/// Overlap-precedence pin: when BOTH the oracle read and a raw batch read fail,
+/// `resolve_marker` surfaces the ORACLE error (its retry/skip classification
+/// governs), and the overlap leaves the oracle-read and raw-batch-read counts
+/// unchanged. [`FailingOracle`] yields once so the oracle is observed `Pending`
+/// on the first poll pass while the poisoned batch read is `Ready(Err)` — the
+/// `join`-plus-oracle-first ordering is what surfaces the oracle error.
+/// FALSIFICATION: swap `join(oracle, reads)` + oracle-first for
+/// `try_join!(oracle, reads)` → the store error surfaces (matches! fails) and
+/// `oracle.resolves() == 0`.
+#[test]
+fn resolve_marker_double_failure_surfaces_oracle() -> Result<()> {
+    executor::block_on(async {
+        let id = fresh_collection("resolve-marker-double-fail")?;
+        let name = id.name().clone();
+        let cref = CollectionRef::new(id.clone(), None);
+        // Arm the raw-read poison from the start; it targets `provisional_many`
+        // only, so seeding the marker via `write_provisional` still works.
+        let counting = CountingCellStore::new(FailingCellStore::armed_provisional_many(
+            memory_store(MemoryCells::new(), ScriptedOracle::default()),
+            name,
+            ErrorCategory::Transient,
+        ));
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let writes = [(
+            cell_in(0, 1),
+            ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), event),
+        )];
+        let marker = EventMarker::frozen(event, &writes, &[]);
+        counting
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await
+            .map_err(|e| eyre!("stage: {e}"))?;
+
+        counting.reset();
+        let oracle = FailingOracle::default();
+        let err = match resolve_marker(&counting, &oracle, &cref, &marker).await {
+            Ok(()) => return Err(eyre!("expected a double failure, got Ok")),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ResolveCellError::Oracle(_)),
+            "a double failure surfaces the oracle error, got {err:?}"
+        );
+        assert_eq!(oracle.resolves(), 1, "the oracle is consulted exactly once");
+        assert_eq!(
+            counting.raw_batch_reads(),
+            1,
+            "the overlap leaves the raw-batch-read count unchanged (one chunk)"
+        );
+        Ok(())
+    })
+}
+
+/// Drains a memory store's `provisional_cells` sweep into its yielded cells,
+/// for the recovery pins that assert nothing is left provisional.
+async fn drain_memory_provisional<S: CellStore>(
+    store: &S,
+    id: &CollectionId,
+) -> Result<Vec<CellKey>, S::Error> {
+    let stream = store.provisional_cells(id);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(item?.0);
+    }
+    Ok(out)
 }
 
 /// A dirty `Set` inside a standing dirty section-clear answers its bytes
