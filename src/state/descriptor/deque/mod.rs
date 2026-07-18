@@ -230,8 +230,8 @@ where
     }
 
     /// Reads and resolves the front element (position `0`) — exactly
-    /// [`get(0)`](Self::get) minus the length round-trip: a single cell read at
-    /// `head`, `None` when the deque is empty.
+    /// [`get(0)`](Self::get), reading the front slot `head` directly instead of
+    /// deriving it from a position, so `None` when the deque is empty.
     ///
     /// # Endpoint-slot semantics
     ///
@@ -240,7 +240,11 @@ where
     /// expired endpoint slot yields `None` **even when [`len`](Self::len)
     /// `> 0` and live interior elements exist**, matching what a `get` at
     /// that position returns. [`peek_back`](Self::peek_back) is the
-    /// symmetric back-endpoint read and shares this contract.
+    /// symmetric back-endpoint read and shares this contract. Parity with
+    /// `get` is total: an over-wide window whose span exceeds `usize` errors
+    /// [`IndexOverflow`](MetaDecodeError::IndexOverflow) here exactly as it
+    /// does through `get`'s length check — the span validation is pure
+    /// arithmetic on the bounds cell already in hand, adding no read.
     ///
     /// # Errors
     ///
@@ -253,6 +257,7 @@ where
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
         let permit = self.entries.read_permit().await;
         let window = self.bounds(&permit).await?;
+        window.len()?;
         if window.head >= window.tail {
             return Ok(None);
         }
@@ -260,11 +265,11 @@ where
     }
 
     /// Reads and resolves the back element (position `len - 1`) — exactly
-    /// [`get(len - 1)`](Self::get) minus the length round-trip, and without the
-    /// empty-deque negative-index error that a manual `len`-then-`get` incurs:
-    /// a single cell read at `tail − 1`, `None` when the deque is empty.
-    /// Shares [`peek_front`](Self::peek_front)'s endpoint-slot / TTL-hole
-    /// contract.
+    /// [`get(len - 1)`](Self::get) reading the back slot `tail − 1` directly,
+    /// and without the empty-deque negative-index error that a manual
+    /// `len`-then-`get` incurs: `None` when the deque is empty. Shares
+    /// [`peek_front`](Self::peek_front)'s endpoint-slot / TTL-hole contract and
+    /// its total parity with `get`.
     ///
     /// # Errors
     ///
@@ -275,6 +280,7 @@ where
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
         let permit = self.entries.read_permit().await;
         let window = self.bounds(&permit).await?;
+        window.len()?;
         if window.head >= window.tail {
             return Ok(None);
         }

@@ -1318,6 +1318,65 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     Ok(())
 }
 
+/// Endpoint-peek parity holds even at the over-wide window the operations can
+/// never reach: `[i64::MIN, 0)` is ordered (so `Window::new` admits it) yet its
+/// span exceeds `usize`, so `get`'s length check errors `IndexOverflow`. A peek
+/// reads the endpoint slot directly and must take the same overflow path —
+/// `peek == get` is total, not "except at a degenerate window". Seeded directly
+/// because reaching `head = i64::MIN` would need 2^63 pushes.
+#[test]
+fn deque_peeks_match_get_on_an_over_wide_window() -> Result<()> {
+    use crate::state::descriptor::deque::{DequeStateError, MetaDecodeError, meta_cell};
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[(
+            meta_cell(),
+            Some(Bytes::from(deque::seed_frame(i64::MIN, 0))),
+        )],
+        &[],
+    ))?;
+
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+    let overflows = |result| {
+        matches!(
+            result,
+            Err(DequeStateError::Meta(MetaDecodeError::IndexOverflow))
+        )
+    };
+    block_on(async {
+        assert!(overflows(handle.get(0).await), "get(0) must overflow");
+        assert!(
+            overflows(handle.peek_front().await),
+            "peek_front must match get"
+        );
+        assert!(
+            overflows(handle.peek_back().await),
+            "peek_back must match get"
+        );
+        Ok::<_, color_eyre::Report>(())
+    })
+}
+
 /// Map clear, pinned at the physical grain the `BTreeMap` model cannot reach: a
 /// committed `clear()` erases the keyset cell with the entries, so the
 /// absent-keyset ⇒ empty-map reading (`KeysetPresence`) survives a cleared map,
