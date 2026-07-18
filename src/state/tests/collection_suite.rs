@@ -64,6 +64,7 @@ use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::iter::once;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -271,6 +272,46 @@ impl Arbitrary for DequeHoles {
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         let head = self.head;
         Box::new(self.cells.shrink().map(move |cells| Self { head, cells }))
+    }
+}
+
+/// The capacity pool the deque-capacity property ranges over — small so a
+/// seeded over-wide window (`span = cap + D`) needs few catch-up pushes to
+/// converge, and so eviction fires on nearly every push-to-full.
+const CAP_POOL: [usize; 4] = [1, 2, 3, 4];
+
+/// A directly-seeded over-wide (possibly holed) deque window plus a bounded
+/// capacity and a push direction, for the capacity-convergence property. The
+/// seeded span is `cells.len()`; the excess over `cap` is trimmed lazily by the
+/// catch-up pushes. `from_back` pushes at the back (evicting the front) when
+/// `true`, else at the front (evicting the back). Seeded straight into the
+/// store (never produced by the handle) so the window can start **wider than**
+/// the current capacity — the redeploy case lazy enforcement must converge.
+#[derive(Clone, Debug)]
+pub(crate) struct DequeCapacityShape {
+    cap: NonZeroUsize,
+    cells: Vec<Option<u8>>,
+    from_back: bool,
+}
+
+impl Arbitrary for DequeCapacityShape {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let cap = g.choose(&CAP_POOL).copied().unwrap_or(1);
+        Self {
+            cap: NonZeroUsize::new(cap).unwrap_or(NonZeroUsize::MIN),
+            cells: capped_vec(g, MAX_DEQUE_WINDOW),
+            from_back: bool::arbitrary(g),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let cap = self.cap;
+        let from_back = self.from_back;
+        Box::new(self.cells.shrink().map(move |cells| Self {
+            cap,
+            cells,
+            from_back,
+        }))
     }
 }
 
@@ -576,26 +617,51 @@ where
 }
 
 /// Drives a deque trace, asserting the handle equals a `VecDeque` model after
-/// every event and that each `pop` returns the model's value.
-pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) -> Result<bool> {
+/// every event and that each `pop` returns the model's value. A
+/// `Some(capacity)` registers a bounded deque and applies the **identical**
+/// capped-trim rule to the model (a plain loop, never a call to `evictions`),
+/// so the oracle tracks the handle's lazy push-only eviction op-for-op — the
+/// abort/crash arms then exercise rollback of those evictions. A dense no-TTL
+/// window keeps `VecDeque::len` equal to the handle's window span, so the model
+/// stays exact.
+pub(crate) async fn run_deque_trace(
+    trace: DequeTrace,
+    commit_mode: CommitMode,
+    capacity: Option<NonZeroUsize>,
+) -> Result<bool> {
     run_collection_trace(
         trace,
         deque_state::<JsonCodec>("dq"),
         "dq",
         CollectionDef {
             commit_mode,
+            capacity,
             ..CollectionDef::new(None)
         },
-        async |handle, op, scratch: &mut VecDeque<Value>| match op {
+        async move |handle, op, scratch: &mut VecDeque<Value>| match op {
             DequeOp::PushBack(b) => {
                 let v = Value::from(b);
                 handle.push_back(v.clone()).await?;
+                if let Some(cap) = capacity {
+                    let mut evicted = 0;
+                    while scratch.len() + 1 > cap.get() && evicted < deque::TRIM_MAX {
+                        scratch.pop_front();
+                        evicted += 1;
+                    }
+                }
                 scratch.push_back(v);
                 Ok(OpOutcome::Continue)
             }
             DequeOp::PushFront(b) => {
                 let v = Value::from(b);
                 handle.push_front(v.clone()).await?;
+                if let Some(cap) = capacity {
+                    let mut evicted = 0;
+                    while scratch.len() + 1 > cap.get() && evicted < deque::TRIM_MAX {
+                        scratch.pop_back();
+                        evicted += 1;
+                    }
+                }
                 scratch.push_front(v);
                 Ok(OpOutcome::Continue)
             }
@@ -935,6 +1001,46 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     Ok(batch == point)
 }
 
+/// Seeds a deque window directly into `store`: the `head ‖ tail` meta frame for
+/// `[head, head + cells.len())` plus a present entry cell for each `Some` slot,
+/// leaving `None` slots as holes (a TTL-expired entry not yet swept). The only
+/// way to reach a window the handle never produces — a sparse window, or one
+/// wider than the current capacity.
+async fn seed_deque_window<S: CellStore>(
+    store: &S,
+    collection_ref: &CollectionRef,
+    head: i64,
+    cells: &[Option<u8>],
+) -> Result<()> {
+    use bytes::Bytes;
+
+    let tail = head + cells.len() as i64;
+    store
+        .write_resolved(
+            collection_ref,
+            &[(
+                deque::meta_cell(),
+                Some(Bytes::from(deque::seed_frame(head, tail))),
+            )],
+            &[],
+        )
+        .await?;
+    for (i, cell) in cells.iter().enumerate() {
+        if let Some(value) = cell {
+            let coordinate = I64KeyCodec::encode(&(head + i as i64));
+            let bytes = Bytes::from(serde_json::to_vec(&Value::from(*value))?);
+            store
+                .write_resolved(
+                    collection_ref,
+                    &[(deque::entry_cell_for(&coordinate), Some(bytes))],
+                    &[],
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Deque TTL-hole read contract: over a directly-seeded sparse window, `len`
 /// is the full span `tail − head` (an upper bound on the live count), `get`
 /// returns `None` at a hole and past the span, both stream directions yield
@@ -944,8 +1050,6 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
 /// interior). Seeded directly — never via wall-clock TTL — the only way to
 /// reach a holed window the handle itself never produces.
 pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
-    use bytes::Bytes;
-
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
@@ -954,31 +1058,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
         registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
     let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
 
-    let head = shape.head;
-    let tail = head + shape.cells.len() as i64;
-    store
-        .write_resolved(
-            &collection_ref,
-            &[(
-                deque::meta_cell(),
-                Some(Bytes::from(deque::seed_frame(head, tail))),
-            )],
-            &[],
-        )
-        .await?;
-    for (i, cell) in shape.cells.iter().enumerate() {
-        if let Some(value) = cell {
-            let coordinate = I64KeyCodec::encode(&(head + i as i64));
-            let bytes = Bytes::from(serde_json::to_vec(&Value::from(*value))?);
-            store
-                .write_resolved(
-                    &collection_ref,
-                    &[(deque::entry_cell_for(&coordinate), Some(bytes))],
-                    &[],
-                )
-                .await?;
-        }
-    }
+    seed_deque_window(&store, &collection_ref, shape.head, &shape.cells).await?;
 
     let armed: ArmedKeys = Arc::default();
     let session = make_session(
@@ -1015,6 +1095,173 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
         return Ok(false);
     }
     assert_peeks(&handle).await
+}
+
+/// Applies the deque's capped-trim rule to a window model op-for-op: evict at
+/// most `TRIM_MAX` slots from the far end (front for a back push, back for a
+/// front push) toward `cap`, then append. A plain loop, deliberately **not** a
+/// call to the production `evictions`, so the oracle is an independent check.
+fn apply_capped_push(model: &mut VecDeque<Option<u8>>, cap: usize, from_back: bool, value: u8) {
+    let mut evicted = 0;
+    while model.len() + 1 > cap && evicted < deque::TRIM_MAX {
+        if from_back {
+            model.pop_front();
+        } else {
+            model.pop_back();
+        }
+        evicted += 1;
+    }
+    if from_back {
+        model.push_back(Some(value));
+    } else {
+        model.push_front(Some(value));
+    }
+}
+
+/// Deque runtime-capacity convergence: over a directly-seeded window that may
+/// start **wider than** the current cap (the redeploy case) and may hold TTL
+/// holes, lazy push-only eviction converges to `len <= cap` within
+/// `⌈D / (TRIM_MAX − 1)⌉` catch-up pushes, evicting **at most `TRIM_MAX` slots
+/// per push** and surviving values equal the opposite-end suffix/prefix. Proves
+/// the plan's B (a within-cap excess lands exactly `cap` on the first push),
+/// C (convergence + reads never enforce), D (a hole eviction is a no-op clear
+/// that never errors), and G (the per-push physical eviction cap) in one
+/// property. The physical eviction count is read from the buffered dirty
+/// overlay — the buffered entry-section deletes — not a net `len` delta, since
+/// a net delta alone cannot bound the physical clears an impl issues.
+pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) -> Result<bool> {
+    let DequeCapacityShape {
+        cap,
+        cells,
+        from_back,
+    } = shape;
+    let oracle = ScriptedOracle::default();
+    let store_cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = deque_state::<JsonCodec>("dq");
+    let (registry, collection_ref) = registry_and_ref(
+        &descriptor,
+        "dq",
+        &state_key,
+        CollectionDef {
+            capacity: Some(cap),
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let id = collection_ref.id();
+    let store = MemoryCellStore::new(store_cells.clone(), oracle.clone(), registry.clone());
+    let armed: ArmedKeys = Arc::default();
+
+    // Seed the (possibly over-wide, possibly holed) window directly at index 0 —
+    // the handle never produces a window wider than the cap, so it must be seeded.
+    let span = cells.len();
+    seed_deque_window(&store, &collection_ref, 0, &cells).await?;
+
+    // Reads never enforce: before any push, the whole seeded window is visible.
+    {
+        let read = make_session(
+            &store_cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            read_event(0),
+        );
+        let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+        if handle.len().await? != span {
+            return Ok(false);
+        }
+    }
+
+    // The model of the window slots (holes as `None`), applying the identical
+    // capped-trim rule per push — a plain loop, never a call to `evictions`.
+    let mut model: VecDeque<Option<u8>> = cells.iter().copied().collect();
+    let excess = span.saturating_sub(cap.get());
+    let step = deque::TRIM_MAX.saturating_sub(1).max(1);
+    let budget = excess.div_ceil(step).max(1);
+
+    for i in 0..budget {
+        let value = 100u8.wrapping_add(i as u8);
+        let len_before = model.len();
+        apply_capped_push(&mut model, cap.get(), from_back, value);
+        let expected_evictions = len_before + 1 - model.len();
+
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(i as u128 + 1),
+        };
+        let dirty = Arc::new(DirtyStore::new());
+        let session = make_session_with_dirty(
+            &store_cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            dirty.clone(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        if from_back {
+            handle.push_back(Value::from(value)).await?;
+        } else {
+            handle.push_front(Value::from(value)).await?;
+        }
+
+        // Physical buffered eviction count: entry-section deletes in the dirty
+        // overlay (the meta bounds cell and the appended entry are `Set`s, so a
+        // buffered `None` is exactly an evicted slot — including a holed one).
+        let physical_evictions = dirty
+            .collection_snapshot(id)
+            .iter()
+            .filter(|(_, val)| val.is_none())
+            .count();
+        if physical_evictions > deque::TRIM_MAX {
+            return Ok(false); // G: at most TRIM_MAX slots per push
+        }
+        if physical_evictions != expected_evictions {
+            return Ok(false); // net convergence tracks physical clears
+        }
+        // B: a within-cap excess lands exactly `cap` on the very first push.
+        if i == 0 && (1..deque::TRIM_MAX).contains(&excess) && model.len() != cap.get() {
+            return Ok(false);
+        }
+
+        finalize_and_promote(&session, &oracle, event_dedup(event), &store_cells, id).await?;
+
+        // Committed read-back: the span equals the model (holes included).
+        let read = make_session(
+            &store_cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            read_event(i + 1),
+        );
+        let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+        if handle.len().await? != model.len() {
+            return Ok(false);
+        }
+    }
+
+    // Converged: within the cap, and the surviving values equal the model's
+    // opposite-end suffix/prefix (holes skipped by `stream`, never an error).
+    let read = make_session(
+        &store_cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(budget + 1),
+    );
+    let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+    if handle.len().await? > cap.get() {
+        return Ok(false);
+    }
+    let survivors: Vec<Value> = model.iter().filter_map(|c| c.map(Value::from)).collect();
+    if collect_deque(&handle, Direction::Forward).await? != survivors {
+        return Ok(false);
+    }
+    let reversed: Vec<Value> = survivors.iter().rev().cloned().collect();
+    Ok(collect_deque(&handle, Direction::Backward).await? == reversed)
 }
 
 /// Map key-scan presence: over a directly-seeded map whose keyset frame

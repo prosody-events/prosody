@@ -32,6 +32,7 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -162,6 +163,16 @@ where
         // Unreachable in practice: every op on this stub errors `Unavailable`
         // first. The default keeps the trait total.
         DEFAULT_KEYSET_LIMIT
+    }
+
+    fn collection_capacity(
+        &self,
+        _state_type: StateType,
+        _name: &StateName,
+    ) -> Option<NonZeroUsize> {
+        // Unreachable in practice (see `collection_keyset_limit`); unbounded
+        // keeps the trait total.
+        None
     }
 
     fn verify_state_registration(

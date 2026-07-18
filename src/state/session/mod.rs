@@ -88,6 +88,7 @@ use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -140,6 +141,12 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
     /// Read per `set`/`stream` on a Map handle. No default impl: a wrong
     /// silent default would mis-size the keyset for a real session.
     fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize;
+
+    /// The Deque push capacity for `(state_type, name)` — the window-slot cap a
+    /// bounded deque trims toward on push; `None` is unbounded. Read per push
+    /// on a Deque handle. No default impl: mirrors
+    /// [`Self::collection_keyset_limit`].
+    fn collection_capacity(&self, state_type: StateType, name: &StateName) -> Option<NonZeroUsize>;
 
     /// Validates that the keyed-state collection named `(state_type, name)` is
     /// registered with the asserted structural identity, returning the
@@ -1149,6 +1156,10 @@ where
 
     fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize {
         self.inner.registry.keyset_limit_for(state_type, name)
+    }
+
+    fn collection_capacity(&self, state_type: StateType, name: &StateName) -> Option<NonZeroUsize> {
+        self.inner.registry.capacity_for(state_type, name)
     }
 
     fn verify_state_registration(

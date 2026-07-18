@@ -69,6 +69,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
@@ -90,6 +91,15 @@ const ENTRY_SECTION: Section = Section::new(DequeNs::Entries as i8);
 /// wider window pays one durable range scan instead of `len` point reads. A
 /// read-shape choice, not configuration.
 pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
+
+/// The most window slots a single bounded push evicts, bounding per-event
+/// eviction work. `>= 2` so a full push nets a `TRIM_MAX − 1` window reduction:
+/// a push appends one slot, so at `1` it would evict one and append one and
+/// never shrink an over-wide window. A capacity reduction of excess `D`
+/// therefore converges in `⌈D / (TRIM_MAX − 1)⌉` pushes. See `evictions`.
+pub(crate) const TRIM_MAX: usize = 2;
+
+const _: () = assert!(TRIM_MAX >= 2, "a bounded push must net a window reduction");
 
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column), so
@@ -430,6 +440,16 @@ where
 
     /// Appends `value` at the back, extending the window to `tail + 1`.
     ///
+    /// # Bounded capacity
+    ///
+    /// On a deque registered with a `capacity`,
+    /// this first evicts from the **front** toward the cap (see the module's
+    /// capacity invariant): up to `TRIM_MAX` slots per push, each a single-cell
+    /// clear co-stamped with the append and the bounds move — no decode, no
+    /// resolver, the evicted value discarded. The evictions and the append
+    /// stage as one transaction (`ReadCommitted` rollback restores the
+    /// evicted front slots; `ReadUncommitted` applies them eagerly).
+    ///
     /// # Errors
     ///
     /// Returns a codec error (`Permanent`) when `value` does not encode, a
@@ -441,16 +461,33 @@ where
     ) -> Result<(), DequeStateError<CellCodecError<T>>> {
         let permit = self.mutate_permit().await?;
         let window = self.bounds(&permit).await?;
+        // Compute every fallible endpoint before mutating: a caught overflow or
+        // encode error must leave the deque untouched, never a partial eviction
+        // with stale bounds.
         let next_tail = window
             .tail
             .checked_add(1)
             .ok_or(MetaDecodeError::IndexOverflow)?;
+        let evict = i64::try_from(evictions(window.len()?, self.entries.capacity()))
+            .map_err(|_| MetaDecodeError::IndexOverflow)?;
+        let new_head = window
+            .head
+            .checked_add(evict)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        // Append first (the sole encode); then evict the front. `evict ≤ len`
+        // (`cap ≥ 1`), so `new_head ≤ tail` and the window never inverts.
         self.entries.set(&permit, &window.tail, value).await?;
-        self.write_bounds(&permit, window.head, next_tail).await?;
+        for idx in window.head..new_head {
+            self.entries.clear(&permit, &idx).await?;
+        }
+        self.write_bounds(&permit, new_head, next_tail).await?;
         Ok(())
     }
 
     /// Prepends `value` at the front, extending the window to `head − 1`.
+    ///
+    /// The mirror of [`Self::push_back`]: on a bounded deque this evicts from
+    /// the **back** toward the cap.
     ///
     /// # Errors
     ///
@@ -466,8 +503,17 @@ where
             .head
             .checked_sub(1)
             .ok_or(MetaDecodeError::IndexOverflow)?;
+        let evict = i64::try_from(evictions(window.len()?, self.entries.capacity()))
+            .map_err(|_| MetaDecodeError::IndexOverflow)?;
+        let new_tail = window
+            .tail
+            .checked_sub(evict)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
         self.entries.set(&permit, &prev_head, value).await?;
-        self.write_bounds(&permit, prev_head, window.tail).await?;
+        for idx in new_tail..window.tail {
+            self.entries.clear(&permit, &idx).await?;
+        }
+        self.write_bounds(&permit, prev_head, new_tail).await?;
         Ok(())
     }
 
@@ -598,6 +644,45 @@ where
     T: CellType<Key = UnitKey>,
 {
     DequeDescriptor::new(name)
+}
+
+impl<T> Descriptor<DequeKind<T>> {
+    /// Bounds this deque to at most `capacity` window slots, enforced lazily on
+    /// push: a `push_back` evicts from the front and a `push_front` from the
+    /// back, at most `TRIM_MAX` slots per push and decode-free (see the
+    /// module's capacity invariant). Runtime-only — never persisted, not part
+    /// of identity, and freely changed (bounded ⇄ unbounded) across
+    /// redeploys, so a reduction converges over the next pushes rather than
+    /// atomically. `NonZeroUsize` keeps `0` unrepresentable.
+    ///
+    /// Available on Deque registrations only — a capacity on a Value or Map is
+    /// uncompilable, since this inherent method exists only at this type.
+    #[must_use]
+    pub fn capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.def.capacity = Some(capacity);
+        self
+    }
+}
+
+/// Slots to evict from the far end before a bounded push appends one,
+/// converging the window toward `capacity`. Zero when unbounded or already
+/// within capacity; capped at `TRIM_MAX` so one push does bounded, decode-free
+/// work. `len` is the current window span; a push adds one slot, so `len + 1`
+/// slots exist after the append and the trim is that count over `capacity`.
+///
+/// See the module's capacity invariant: enforcement is lazy and push-only, so a
+/// persisted window may exceed `capacity`; a reduction of excess `D` converges
+/// in `⌈D / (TRIM_MAX − 1)⌉` pushes.
+fn evictions(len: usize, capacity: Option<NonZeroUsize>) -> usize {
+    let Some(cap) = capacity else { return 0 };
+    // `checked_add`, not `saturating_add`: at `len == usize::MAX` the window is
+    // vastly over any cap (evict the max). That span is itself unreachable
+    // through `Window::len`'s overflow guard on a 64-bit target, so the `None`
+    // arm is belt-and-suspenders for a 32-bit one.
+    match len.checked_add(1) {
+        Some(needed) => needed.saturating_sub(cap.get()).min(TRIM_MAX),
+        None => TRIM_MAX,
+    }
 }
 
 /// Re-homes a bounds-cell access or codec error under the deque's entry-codec

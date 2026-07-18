@@ -15,10 +15,11 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave, MapKeyHoles, MapTrace,
-    finalize_and_promote, run_deque_holes, run_deque_stream_interleave, run_deque_trace,
-    run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keyset_exact_trace,
-    run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
+    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave,
+    MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence, run_deque_holes,
+    run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
+    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
+    run_map_ttl_keyset_refresh_trace,
 };
 use self::support::{
     CountingCellStore, CountingOracle, CountingResolver, FixedOracle, ResolveCounter,
@@ -53,6 +54,7 @@ use futures::StreamExt;
 use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -906,7 +908,7 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
 #[test]
 fn prop_deque_collection_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(trace, CommitMode::ReadCommitted))
+        executor::block_on(run_deque_trace(trace, CommitMode::ReadCommitted, None))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
 }
@@ -917,9 +919,60 @@ fn prop_deque_collection_lifecycle() {
 #[test]
 fn prop_deque_collection_lifecycle_read_uncommitted() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(trace, CommitMode::ReadUncommitted))
+        executor::block_on(run_deque_trace(trace, CommitMode::ReadUncommitted, None))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
+}
+
+/// The deque lifecycle property on a **bounded** deque (capacity 2, under the
+/// push burst so eviction fires on nearly every push-to-full): the handle keeps
+/// step with a `VecDeque` model that applies the identical capped-trim rule, in
+/// both commit modes — so lazy push-only eviction, its rollback under
+/// abort/crash, and the at-least-once `commit()` floor all hold with a cap in
+/// play. The unbounded lifecycle properties above pin the `capacity = None`
+/// path. FALSIFICATION: make `evictions` always return `0` (skip enforcement) →
+/// after a push-to-full the handle window exceeds the trimmed model →
+/// `assert_deque` mismatch → red.
+#[test]
+fn prop_deque_bounded_lifecycle() {
+    fn property(trace: DequeTrace) -> Result<bool> {
+        executor::block_on(run_deque_trace(
+            trace,
+            CommitMode::ReadCommitted,
+            Some(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN)),
+        ))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
+}
+
+/// The bounded deque lifecycle property in `ReadUncommitted` mode.
+#[test]
+fn prop_deque_bounded_lifecycle_read_uncommitted() {
+    fn property(trace: DequeTrace) -> Result<bool> {
+        executor::block_on(run_deque_trace(
+            trace,
+            CommitMode::ReadUncommitted,
+            Some(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN)),
+        ))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
+}
+
+/// Deque runtime-capacity convergence: over a directly-seeded over-wide (and
+/// possibly holed) window, lazy push-only eviction converges to `len <= cap`
+/// within the computed catch-up pushes, evicting at most `TRIM_MAX` slots per
+/// push (read from the buffered dirty overlay). See
+/// [`run_deque_capacity_convergence`] for the B/C/D/G disposition.
+/// FALSIFICATION: drop `.min(TRIM_MAX)` from `evictions` → an over-wide
+/// window's first push buffers `> TRIM_MAX` entry deletes → the per-push cap
+/// assert → red; set `TRIM_MAX = 1` → a reduction push nets zero shrink → the
+/// `len <= cap` assert → red.
+#[test]
+fn prop_deque_capacity_convergence() {
+    fn property(shape: DequeCapacityShape) -> Result<bool> {
+        executor::block_on(run_deque_capacity_convergence(shape))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequeCapacityShape) -> Result<bool>);
 }
 
 /// Map collection soundness over the real session lifecycle: random
@@ -1874,6 +1927,100 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         resolves.resolves()
     );
     Ok(())
+}
+
+/// A bounded push evicts the opposite end **decode-free**: no value decode, no
+/// resolver run for the discarded slot. Over a message-backed
+/// (resolver-carrying) deque capped at one slot, a `push_back` that evicts the
+/// front resolves **nothing** — a blind push never resolves, so a nonzero count
+/// could come only from the eviction path reading the evicted slot.
+/// FALSIFICATION: change the eviction `entries.clear` to an `entries.get` then
+/// `clear` (as `pop_front` does) → the evicted slot resolves through
+/// `CountingResolver` → `resolves() == 1 != 0` → red. The `resolves()` assert
+/// is read **before** the survivor peek (which does resolve), so nothing masks
+/// it.
+#[test]
+fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
+    executor::block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let descriptor = deque_state::<WithResolver<JsonCodec, CountingResolver>>("cap");
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(
+            &descriptor,
+            CollectionDef {
+                capacity: Some(NonZeroUsize::MIN),
+                ..CollectionDef::new(None)
+            },
+        )?;
+        let registry = Arc::new(registry);
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            registry.clone(),
+        ));
+        let armed: ArmedKeys = Arc::default();
+        let id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("cap")?,
+        );
+
+        // Seed a committed one-element window (a blind `push_back` never resolves).
+        let seed_event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let session = resolve_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            seed_event,
+            ResolveCounter::default(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        handle
+            .push_back(Value::from(1_u8))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+        // Fresh event: push a second value, evicting the front (the capacity is 1).
+        let resolves = ResolveCounter::default();
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(2),
+        };
+        let session = resolve_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            resolves.clone(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        handle
+            .push_back(Value::from(2_u8))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+        assert_eq!(
+            resolves.resolves(),
+            0,
+            "a bounded push resolves nothing — the eviction is decode/resolver-free"
+        );
+
+        // Only now (after the assert) read the survivor, which does resolve.
+        let survivor = handle.peek_front().await.map_err(|e| eyre!("{e}"))?;
+        assert_eq!(
+            survivor,
+            Some(Value::from(2_u8)),
+            "the newest element survives"
+        );
+        Ok(())
+    })
 }
 
 /// The stream-laziness property: both collections' `stream(dir).take(k)` are

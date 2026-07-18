@@ -8,6 +8,7 @@ use crate::state::descriptor::StructuralIdentity;
 use crate::state::{StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 /// Default Map keyset bound — the number of live distinct keys a map tracks
@@ -106,6 +107,17 @@ pub struct CollectionDef {
     /// [`StructuralIdentity`] — changing it needs no migration. Validated
     /// `<= 4096` at registration ([`RegisterStateError::KeysetLimit`]).
     pub keyset_limit: usize,
+
+    /// Deque push cap: at most this many window slots, evicted opposite-end
+    /// first (a `push_back` trims the front, a `push_front` the back), enforced
+    /// **lazily on push only** — reads, `len`, iteration, and `pop` never
+    /// enforce it, and a persisted window need not respect the current cap (it
+    /// may have changed across a redeploy). Meaningful for Deque collections
+    /// only; ignored by Value and Map. `None` is unbounded. Operational, never
+    /// part of the frozen [`StructuralIdentity`] — a bounded and an unbounded
+    /// deque share the same `Deque` kind, so changing it needs no migration.
+    /// `NonZeroUsize` keeps `capacity = 0` unrepresentable.
+    pub capacity: Option<NonZeroUsize>,
 }
 
 impl CollectionDef {
@@ -119,6 +131,7 @@ impl CollectionDef {
             commit_mode: CommitMode::ReadCommitted,
             recovery_within: None,
             keyset_limit: DEFAULT_KEYSET_LIMIT,
+            capacity: None,
         }
     }
 }
@@ -269,6 +282,19 @@ impl CollectionDefRegistry {
     pub(crate) fn keyset_limit_for(&self, state_type: StateType, name: &StateName) -> usize {
         self.lookup_collection(state_type, name)
             .map_or(DEFAULT_KEYSET_LIMIT, |c| c.def.keyset_limit)
+    }
+
+    /// Returns the Deque push capacity for `(state_type, name)` — the
+    /// window-slot cap a bounded deque trims toward on push — or `None`
+    /// (unbounded) for names not in the registry.
+    #[must_use]
+    pub(crate) fn capacity_for(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Option<NonZeroUsize> {
+        self.lookup_collection(state_type, name)
+            .and_then(|c| c.def.capacity)
     }
 
     /// Returns the commit mode bound to `(state_type, name)`, falling back to

@@ -23,6 +23,7 @@ use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use smallvec::SmallVec;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
 /// One item [`CellView::scan`] yields: a decoded key paired with its resolved
@@ -103,6 +104,13 @@ impl<S: CellSession> CellScope<S> {
     pub(in crate::state::descriptor) fn keyset_limit(&self) -> usize {
         self.session
             .collection_keyset_limit(self.state_type, &self.name)
+    }
+
+    /// This collection's Deque push capacity (`None` unbounded) — a cheap
+    /// registry lookup the Deque `push_*` enforcement consults per push.
+    pub(in crate::state::descriptor) fn capacity(&self) -> Option<NonZeroUsize> {
+        self.session
+            .collection_capacity(self.state_type, &self.name)
     }
 
     /// Reads one cell's visible committed bytes. Demands a read permit
@@ -317,6 +325,12 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// [`CellScope::keyset_limit`]).
     pub(in crate::state::descriptor) fn keyset_limit(&self) -> usize {
         self.scope.keyset_limit()
+    }
+
+    /// This view's collection Deque push capacity (see
+    /// [`CellScope::capacity`]).
+    pub(in crate::state::descriptor) fn capacity(&self) -> Option<NonZeroUsize> {
+        self.scope.capacity()
     }
 
     /// Buffers a dirty clear marker over this view's whole section: every
