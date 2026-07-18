@@ -620,6 +620,126 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
     })
 }
 
+/// `contains_key` answers presence through the dirty overlay
+/// (read-your-writes: committed/absent/uncommitted-set/uncommitted-remove/
+/// set-after-clear) while never running the resolver — contrasted against
+/// `get`, which resolves on the very same collection.
+/// FALSIFICATION: an always-`Ok(true)` body flips every `!... .await?` assert
+/// red; a `get`-delegating body (`self.get(key).await.map(|o|
+/// o.is_some())`) makes `resolves.resolves()` nonzero before the `assert_eq!`
+/// runs, since `contains_key(&k1)` on the seeded, resolvable key is the FIRST
+/// call. Both revert to green.
+#[test]
+fn map_contains_key_presence_without_resolving() -> Result<()> {
+    const K1: i64 = 1;
+    const K2: i64 = 2;
+    const K3: i64 = 3;
+    const K_ABSENT: i64 = 99;
+
+    executor::block_on(async {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let descriptor =
+            map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("presence");
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&descriptor, CollectionDef::new(None))?;
+        let registry = Arc::new(registry);
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            registry.clone(),
+        ));
+        let armed: ArmedKeys = Arc::default();
+        let id = CollectionId::new(
+            state_key.clone(),
+            StateType::Application,
+            StateName::try_new("presence")?,
+        );
+
+        // Seed one committed present key.
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(1),
+        };
+        let seed_session = resolve_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            ResolveCounter::default(),
+        );
+        let seed = descriptor
+            .bind(&seed_session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        seed.set(K1, Value::from(K1))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+        finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+        // Fresh cold session, fresh resolve counter, one live dirty overlay.
+        counting.reset();
+        let resolves = ResolveCounter::default();
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(2),
+        };
+        let session = resolve_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            event,
+            resolves.clone(),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+        assert!(
+            handle.contains_key(&K1).await.map_err(|e| eyre!("{e}"))?,
+            "committed key is present"
+        );
+        assert!(
+            !handle
+                .contains_key(&K_ABSENT)
+                .await
+                .map_err(|e| eyre!("{e}"))?,
+            "never-set key is absent"
+        );
+        handle
+            .set(K2, Value::from(K2))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+        assert!(
+            handle.contains_key(&K2).await.map_err(|e| eyre!("{e}"))?,
+            "uncommitted set -> true"
+        );
+        handle.remove(&K1).await.map_err(|e| eyre!("{e}"))?;
+        assert!(
+            !handle.contains_key(&K1).await.map_err(|e| eyre!("{e}"))?,
+            "uncommitted remove -> false (was committed)"
+        );
+        handle.clear().await.map_err(|e| eyre!("{e}"))?;
+        handle
+            .set(K3, Value::from(K3))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+        assert!(
+            handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?,
+            "set after clear -> true"
+        );
+        assert_eq!(resolves.resolves(), 0, "no contains_key resolved");
+
+        // Contrast: the K3 cell IS resolvable, so the zero above is a real skip.
+        assert!(handle.get(&K3).await.map_err(|e| eyre!("{e}"))?.is_some());
+        assert!(
+            resolves.resolves() >= 1,
+            "get resolves; contains_key did not"
+        );
+        Ok(())
+    })
+}
+
 /// A store overriding only `get_for_cache` (returning a TTL) inherits the
 /// default `get_many_for_cache`, which must carry that TTL metadata through for
 /// every position — the guard against defaulting the cache-fill batch to
@@ -684,10 +804,11 @@ fn prop_deque_collection_lifecycle_read_uncommitted() {
 /// set/remove/get/clear/mid-handler-commit traces with commit/abort/crash
 /// outcomes keep the handle's `get` and key-ordered `stream` in step with a
 /// `BTreeMap` oracle — the current-membership keyset (cleared with the
-/// entries; `KeysetPresence`), crash atomicity, and the at-least-once
-/// `commit()` contract (`commit()`-landed ops survive abort/crash-rollback;
-/// post-commit ops roll back — so a commit-then-clear-then-abort trace restores
-/// the `commit()`-landed state).
+/// entries; `KeysetPresence`), crash atomicity, the at-least-once `commit()`
+/// contract (`commit()`-landed ops survive abort/crash-rollback; post-commit
+/// ops roll back — so a commit-then-clear-then-abort trace restores the
+/// `commit()`-landed state), and `contains_key` parity (`contains_key(k) ==
+/// get(k).is_some()`) at every step.
 #[test]
 fn prop_map_collection_lifecycle() {
     fn property(trace: MapTrace) -> Result<bool> {

@@ -14,7 +14,9 @@
 //! classification are pinned alongside; duplicate-name is a registry-level pin
 //! in `state/descriptor/tests.rs`.
 
-use super::{DynEventContext, ErasedCategory, ErasedStateError, EventContext, StateCursor};
+use super::{
+    BoxMapState, DynEventContext, ErasedCategory, ErasedStateError, EventContext, StateCursor,
+};
 use crate::codec::{BinaryPayload, ErasedStateCodec, JsonCodec};
 use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
 use crate::consumer::message::ConsumerMessage;
@@ -160,6 +162,31 @@ fn opt_same<P: ParityPayload>(a: Option<&P>, b: Option<&P>) -> bool {
         (Some(a), Some(b)) => P::same(a, b),
         _ => false,
     }
+}
+
+/// Sweeps the pooled `KEYS` through the erased handle, asserting `get` and
+/// `contains_key` both agree with `visible` for every key.
+async fn assert_keys_visible<P: ParityPayload>(
+    handle: &BoxMapState<P>,
+    visible: &BTreeMap<String, P>,
+) -> Result<bool> {
+    for key in KEYS {
+        let owned = (*key).to_owned();
+        let erased = handle
+            .get(owned.clone())
+            .await
+            .map_err(|e| eyre!("get: {e}"))?;
+        let present = handle
+            .contains_key(owned)
+            .await
+            .map_err(|e| eyre!("has: {e}"))?;
+        if !opt_same::<P>(erased.as_ref(), visible.get(*key))
+            || present != visible.contains_key(*key)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // --- Value parity -----------------------------------------------------------
@@ -368,12 +395,12 @@ impl Arbitrary for MapTrace {
 
 /// Drives a map trace through the erased handle and a `(floor, visible)`
 /// `BTreeMap` model, asserting after every op that each pooled key reads equal
-/// and a full forward scan yields exactly `visible`'s key-ordered entries.
-/// `visible` is the read-your-writes map; `floor` is the last committed
-/// snapshot. `commit` promotes `visible` to `floor`; `rollback` reverts
-/// `visible` to `floor`. Both are issued through the **erased** handle only —
-/// the typed handle shares the overlay, so calling its commit would mask a
-/// no-op erased commit.
+/// (`get` and `contains_key` both) and a full forward scan yields exactly
+/// `visible`'s key-ordered entries. `visible` is the read-your-writes map;
+/// `floor` is the last committed snapshot. `commit` promotes `visible` to
+/// `floor`; `rollback` reverts `visible` to `floor`. Both are issued through
+/// the **erased** handle only — the typed handle shares the overlay, so
+/// calling its commit would mask a no-op erased commit.
 fn run_map_parity<P>(ops: &[MapOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
@@ -437,14 +464,8 @@ where
                     visible = floor.clone();
                 }
             }
-            for key in KEYS {
-                let erased = handle
-                    .get((*key).to_owned())
-                    .await
-                    .map_err(|e| eyre!("erased map get: {e}"))?;
-                if !opt_same::<P>(erased.as_ref(), visible.get(*key)) {
-                    return Ok(false);
-                }
+            if !assert_keys_visible(&handle, &visible).await? {
+                return Ok(false);
             }
             // Batch reads preserve input positions, including duplicates and
             // an untracked key, and agree with the same visible-state model.

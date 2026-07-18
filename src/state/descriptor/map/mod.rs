@@ -394,6 +394,39 @@ where
         Ok(self.entries.get(&permit, key).await?)
     }
 
+    /// Whether a stored cell exists for `key`, **without decoding its value or
+    /// running the resolver**.
+    ///
+    /// Answers "a stored cell exists," read through the event's dirty overlay
+    /// (read-your-writes): an uncommitted `set` → `true`, an uncommitted
+    /// `remove` → `false`, `clear` hides entries, a `set` after `clear` →
+    /// `true`, and `rollback` restores the prior view. For a message-backed map
+    /// this can return `true` even when the referenced Kafka message can no
+    /// longer be fetched — presence is about the cell, not the message. The
+    /// guarantee is "no value decode, no resolver run," **not** "no I/O": a
+    /// cold cache still reaches the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    #[instrument(
+        name = "map.contains_key",
+        skip_all,
+        fields(collection = self.entries.name().as_str(), map.key = %key),
+        err
+    )]
+    pub async fn contains_key(
+        &self,
+        key: &KC::Key,
+    ) -> Result<bool, MapStateError<CellCodecError<V>>> {
+        let permit = self.entries.read_permit().await;
+        Ok(self
+            .entries
+            .contains(&permit, key)
+            .await
+            .map_err(CellStateError::Access)?)
+    }
+
     /// Reads the values for `keys` as one isolated batch — one result per input
     /// key, aligned index-wise (`results[i]` answers `keys[i]`; duplicate keys
     /// are answered per position; absent keys read `None`).

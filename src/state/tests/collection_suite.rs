@@ -594,8 +594,9 @@ pub(crate) async fn run_deque_trace(trace: DequeTrace, commit_mode: CommitMode) 
 }
 
 /// Drives a map trace, asserting the handle equals a `BTreeMap` model after
-/// every event, that each mid-trace `get` returns the model's value, and that
-/// `KeysetPresence` holds (any live entry implies a present keyset cell).
+/// every event, that each mid-trace `get` returns the model's value and
+/// `contains_key` agrees with it, and that `KeysetPresence` holds (any live
+/// entry implies a present keyset cell).
 pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
     run_collection_trace(
         trace,
@@ -622,9 +623,13 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
                 scratch.remove(&k);
                 Ok(OpOutcome::Continue)
             }
-            MapOp::Get(k) => Ok(mismatch_unless(
-                handle.get(&k).await? == scratch.get(&k).cloned(),
-            )),
+            MapOp::Get(k) => {
+                let got = handle.get(&k).await?;
+                let present = handle.contains_key(&k).await?;
+                Ok(mismatch_unless(
+                    got == scratch.get(&k).cloned() && present == got.is_some(),
+                ))
+            }
             MapOp::Clear => {
                 handle.clear().await?;
                 scratch.clear();
@@ -1045,9 +1050,9 @@ where
     Ok(out)
 }
 
-/// Asserts a map handle equals the model: `get` over the whole key pool and
-/// both stream directions (ascending for `Forward`, descending for
-/// `Backward`).
+/// Asserts a map handle equals the model: `get` (with `contains_key` parity)
+/// over the whole key pool and both stream directions (ascending for
+/// `Forward`, descending for `Backward`).
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
@@ -1056,7 +1061,11 @@ where
     S: CellSession,
 {
     for key in KEY_POOL {
-        if handle.get(&key).await? != model.get(&key).cloned() {
+        let got = handle.get(&key).await?;
+        if got != model.get(&key).cloned() {
+            return Ok(false);
+        }
+        if handle.contains_key(&key).await? != got.is_some() {
             return Ok(false);
         }
     }

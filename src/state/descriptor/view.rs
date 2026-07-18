@@ -285,6 +285,24 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
         }
     }
 
+    /// Whether a stored cell exists at `key`, read through the dirty overlay
+    /// (read-your-writes) — the presence half of [`Self::get`] with **no value
+    /// decode and no resolver run**. The guarantee is "no decode, no resolve,"
+    /// not "no I/O": a cold cache still reaches the store. Demands a read
+    /// permit, exactly like [`Self::get`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(in crate::state::descriptor) async fn contains(
+        &self,
+        permit: &OpPermit<'_>,
+        key: &KeyOf<T>,
+    ) -> Result<bool, StateAccessError> {
+        let cell = self.cell(key);
+        Ok(self.scope.raw_get(permit, &cell).await?.is_some())
+    }
+
     /// Whether this view's collection carries a TTL (see
     /// [`CellScope::has_ttl`]).
     pub(in crate::state::descriptor) fn has_ttl(&self) -> bool {

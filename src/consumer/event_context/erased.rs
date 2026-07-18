@@ -178,6 +178,10 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// Reads `key`'s value (`None` when absent).
     async fn get(&self, key: String) -> Result<Option<Item>, ErasedStateError>;
 
+    /// Whether a stored cell exists for `key`, without decoding its value or
+    /// running the resolver (a presence read through the dirty overlay).
+    async fn contains_key(&self, key: String) -> Result<bool, ErasedStateError>;
+
     /// Reads each key in input order as one isolated batch. Absent keys yield
     /// `None`, and duplicate keys retain their positions.
     async fn get_many(&self, keys: Vec<String>) -> Result<Vec<Option<Item>>, ErasedStateError>;
@@ -667,6 +671,13 @@ where
     async fn get(&self, key: String) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .get(&key)
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn contains_key(&self, key: String) -> Result<bool, ErasedStateError> {
+        self.handle
+            .contains_key(&key)
             .await
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
