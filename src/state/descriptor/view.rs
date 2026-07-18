@@ -426,6 +426,11 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
                 );
             }
         }
+        debug_assert_eq!(
+            bytes.len(),
+            keys.len(),
+            "batch read answers every input position"
+        );
         Ok(bytes)
     }
 
@@ -617,11 +622,6 @@ where
     ) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>> {
         // PHASE 1: sequential store reads → aligned committed bytes.
         let bytes = self.read_bytes(permit, keys).await?;
-        debug_assert_eq!(
-            bytes.len(),
-            keys.len(),
-            "batch read answers every input position"
-        );
         // PHASE 2: whole-call concurrent typed resolve, input-ordered.
         let resolved: CellBuffer<Option<ResolvedOf<T>>> = stream::iter(bytes)
             .map(|slot| {

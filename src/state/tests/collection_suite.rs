@@ -60,6 +60,7 @@ use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::iter::once;
@@ -1173,19 +1174,26 @@ where
     Ok(handle.peek_back().await? == back)
 }
 
+/// Drains a fallible stream into a vector.
+async fn drain<T, E>(stream: impl futures::Stream<Item = Result<T, E>>) -> Result<Vec<T>>
+where
+    E: Error + Send + Sync + 'static,
+{
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
 /// Collects a deque handle's `stream(dir)` into a vector.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
     S: CellSession,
     C: Codec<Payload = Value>,
 {
-    let mut out = Vec::new();
-    let stream = handle.stream(dir);
-    futures::pin_mut!(stream);
-    while let Some(item) = stream.next().await {
-        out.push(item?);
-    }
-    Ok(out)
+    drain(handle.stream(dir)).await
 }
 
 /// Asserts a map handle equals the model: `get` (with `contains_key` parity)
@@ -1233,13 +1241,7 @@ async fn collect_map<S>(
 where
     S: CellSession,
 {
-    let mut out = Vec::new();
-    let stream = handle.stream(dir);
-    futures::pin_mut!(stream);
-    while let Some(item) = stream.next().await {
-        out.push(item?);
-    }
-    Ok(out)
+    drain(handle.stream(dir)).await
 }
 
 /// Collects a map handle's `keys(dir)` into a key vector.
@@ -1250,13 +1252,7 @@ async fn collect_map_keys<S>(
 where
     S: CellSession,
 {
-    let mut out = Vec::new();
-    let stream = handle.keys(dir);
-    futures::pin_mut!(stream);
-    while let Some(item) = stream.next().await {
-        out.push(item?);
-    }
-    Ok(out)
+    drain(handle.keys(dir)).await
 }
 
 /// Corrupt-coordinate classification: a stored entry whose coordinate does not
@@ -1269,7 +1265,7 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     use crate::error::{ClassifyError, ErrorCategory};
     use crate::state::cell_key::Coordinate;
     use crate::state::descriptor::CellStateError;
-    use crate::state::descriptor::map::{MapStateError, entry_cell_for};
+    use crate::state::descriptor::map::MapStateError;
     use bytes::Bytes;
     use futures::executor::block_on;
 
@@ -1887,7 +1883,6 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
 /// directions of the same `is_oversized` boundary.
 #[test]
 fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
-    use crate::state::descriptor::map::entry_cell_for;
     use bytes::Bytes;
     use futures::executor::block_on;
 

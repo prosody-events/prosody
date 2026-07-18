@@ -840,7 +840,14 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
             }
             out
         };
-        assert_eq!(drained.len(), n, "keys() enumerates every present key");
+        let mut expected: Vec<i64> = (0..i64::try_from(n)?).collect();
+        if dir == Direction::Backward {
+            expected.reverse();
+        }
+        assert_eq!(
+            drained, expected,
+            "keys() enumerates every present key in order"
+        );
     }
     assert_eq!(
         resolves.resolves(),

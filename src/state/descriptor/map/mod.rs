@@ -514,19 +514,9 @@ where
             direction = ?dir,
         );
         try_stream! {
-            // Init: read the keyset plan under one permit, released before any
-            // resolve or yield. The fallible read runs inside an inner `async`
-            // block (which `try_stream!` leaves untransformed, so its `?` is an
-            // ordinary early return that drops the permit), so the outer `?`
-            // fires only after the permit is dropped.
-            let plan = {
-                let permit = self.entries.read_permit().instrument(span.clone()).await;
-                let init = async { self.stream_plan(&permit, dir).await }
-                    .instrument(span.clone())
-                    .await;
-                drop(permit);
-                init?
-            };
+            // Init: `stream_plan` reads the keyset plan under a permit it drops
+            // as it returns, before this `?` observes the result.
+            let plan = self.stream_plan(dir).instrument(span.clone()).await?;
             match plan {
                 // The degrade fallback walks the whole entry section: no keyset
                 // enumeration remains to fence it, so both edges are
@@ -582,14 +572,7 @@ where
             direction = ?dir,
         );
         try_stream! {
-            let plan = {
-                let permit = self.entries.read_permit().instrument(span.clone()).await;
-                let init = async { self.stream_plan(&permit, dir).await }
-                    .instrument(span.clone())
-                    .await;
-                drop(permit);
-                init?
-            };
+            let plan = self.stream_plan(dir).instrument(span.clone()).await?;
             match plan {
                 StreamPlan::Scan => {
                     let inner = self.entries.key_scan(dir);
@@ -621,10 +604,13 @@ where
     /// access error propagates; it never silently degrades.
     async fn stream_plan(
         &self,
-        permit: &OpPermit<'_>,
         dir: Direction,
     ) -> Result<StreamPlan<KC::Key>, MapStateError<CellCodecError<V>>> {
-        let coordinates = match self.read_keyset_state(permit).await? {
+        // The read permit is a local, dropped as this future returns on every
+        // path (like the point-op helpers): the caller's `?` observes the
+        // result only after the permit is gone, so the gate never spans a yield.
+        let permit = self.entries.read_permit().await;
+        let coordinates = match self.read_keyset_state(&permit).await? {
             // Absent ⇒ no live entries: an empty Tracked list — zero
             // coordinates, so zero point gets and no scan.
             PriorKeyset::Absent => return Ok(StreamPlan::Tracked(Vec::new())),
