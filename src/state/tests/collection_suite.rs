@@ -910,10 +910,12 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
 
 /// Deque TTL-hole read contract: over a directly-seeded sparse window, `len`
 /// is the full span `tail − head` (an upper bound on the live count), `get`
-/// returns `None` at a hole and past the span, and both stream directions yield
+/// returns `None` at a hole and past the span, both stream directions yield
 /// exactly the present values in index order (ascending forward, reversed
-/// backward) without error. Seeded directly — never via wall-clock TTL — the
-/// only way to reach a holed window the handle itself never produces.
+/// backward) without error, and the endpoint peeks share `get`'s slot
+/// semantics under holes (an expired endpoint yields `None` even with a live
+/// interior). Seeded directly — never via wall-clock TTL — the only way to
+/// reach a holed window the handle itself never produces.
 pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
     use bytes::Bytes;
 
@@ -982,7 +984,18 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
         return Ok(false);
     }
     let reversed: Vec<Value> = present.iter().rev().cloned().collect();
-    Ok(collect_deque(&handle, Direction::Backward).await? == reversed)
+    if collect_deque(&handle, Direction::Backward).await? != reversed {
+        return Ok(false);
+    }
+    if handle.peek_front().await? != handle.get(0).await? {
+        return Ok(false);
+    }
+    let back = if len == 0 {
+        None
+    } else {
+        handle.get(len - 1).await?
+    };
+    Ok(handle.peek_back().await? == back)
 }
 
 /// `KeysetPresence` (Map): whenever the map holds any live entry, the raw
@@ -1009,8 +1022,9 @@ fn assert_keyset_present(
 }
 
 /// Asserts a deque handle equals the model: `len`, `is_empty`, both stream
-/// directions (front-to-back for `Forward`, back-to-front for `Backward`), and
-/// `get` at every position (including out of range → `None`).
+/// directions (front-to-back for `Forward`, back-to-front for `Backward`),
+/// `get` at every position (including out of range → `None`), and the
+/// endpoint peeks (`peek_front == get(0)`, `peek_back == get(len-1)`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
     S: CellSession,
@@ -1031,6 +1045,17 @@ where
         if handle.get(index).await? != model.get(index).cloned() {
             return Ok(false);
         }
+    }
+    if handle.peek_front().await? != handle.get(0).await? {
+        return Ok(false);
+    }
+    let back = if model.is_empty() {
+        None
+    } else {
+        handle.get(model.len() - 1).await?
+    };
+    if handle.peek_back().await? != back {
+        return Ok(false);
     }
     Ok(true)
 }

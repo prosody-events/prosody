@@ -229,6 +229,62 @@ where
         Ok(self.entries.get(&permit, &absolute).await?)
     }
 
+    /// Reads and resolves the front element (position `0`) — exactly
+    /// [`get(0)`](Self::get) minus the length round-trip: a single cell read at
+    /// `head`, `None` when the deque is empty.
+    ///
+    /// # Endpoint-slot semantics
+    ///
+    /// A peek is an endpoint-*slot* read and never searches inward. Under a TTL
+    /// the window can hold holes (see the module's window invariant): an
+    /// expired endpoint slot yields `None` **even when [`len`](Self::len)
+    /// `> 0` and live interior elements exist**, matching what a `get` at
+    /// that position returns. [`peek_back`](Self::peek_back) is the
+    /// symmetric back-endpoint read and shares this contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a codec error (`Permanent`) when the entry does not decode, a
+    /// `Permanent` meta error when the bounds cell is corrupt, or an access
+    /// error from the session.
+    #[instrument(name = "deque.peek_front", skip_all, fields(collection = self.entries.name().as_str()), err)]
+    pub async fn peek_front(
+        &self,
+    ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let permit = self.entries.read_permit().await;
+        let window = self.bounds(&permit).await?;
+        if window.head >= window.tail {
+            return Ok(None);
+        }
+        Ok(self.entries.get(&permit, &window.head).await?)
+    }
+
+    /// Reads and resolves the back element (position `len - 1`) — exactly
+    /// [`get(len - 1)`](Self::get) minus the length round-trip, and without the
+    /// empty-deque negative-index error that a manual `len`-then-`get` incurs:
+    /// a single cell read at `tail − 1`, `None` when the deque is empty.
+    /// Shares [`peek_front`](Self::peek_front)'s endpoint-slot / TTL-hole
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`peek_front`](Self::peek_front).
+    #[instrument(name = "deque.peek_back", skip_all, fields(collection = self.entries.name().as_str()), err)]
+    pub async fn peek_back(
+        &self,
+    ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
+        let permit = self.entries.read_permit().await;
+        let window = self.bounds(&permit).await?;
+        if window.head >= window.tail {
+            return Ok(None);
+        }
+        let last = window
+            .tail
+            .checked_sub(1)
+            .ok_or(MetaDecodeError::IndexOverflow)?;
+        Ok(self.entries.get(&permit, &last).await?)
+    }
+
     /// Streams the live elements in index order — front to back for
     /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
     /// element is resolved as it is yielded.

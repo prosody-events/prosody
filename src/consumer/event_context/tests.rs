@@ -15,7 +15,8 @@
 //! in `state/descriptor/tests.rs`.
 
 use super::{
-    BoxMapState, DynEventContext, ErasedCategory, ErasedStateError, EventContext, StateCursor,
+    BoxDequeState, BoxMapState, DynEventContext, ErasedCategory, ErasedStateError, EventContext,
+    StateCursor,
 };
 use crate::codec::{BinaryPayload, ErasedStateCodec, JsonCodec};
 use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
@@ -583,9 +584,30 @@ impl Arbitrary for DequeTrace {
     }
 }
 
+/// Asserts the erased deque's endpoint peeks agree with `visible.front()` /
+/// `.back()`.
+async fn assert_deque_peeks<P: ParityPayload>(
+    handle: &BoxDequeState<P>,
+    visible: &VecDeque<P>,
+) -> Result<bool> {
+    let front = handle
+        .peek_front()
+        .await
+        .map_err(|e| eyre!("peek_front: {e}"))?;
+    if !opt_same::<P>(front.as_ref(), visible.front()) {
+        return Ok(false);
+    }
+    let back = handle
+        .peek_back()
+        .await
+        .map_err(|e| eyre!("peek_back: {e}"))?;
+    Ok(opt_same::<P>(back.as_ref(), visible.back()))
+}
+
 /// Drives a deque trace through the erased handle and a `(floor, visible)`
-/// `VecDeque` model, asserting `len`, every positional `get`, and a full
-/// forward scan agree with `visible` after every op. `visible` is the
+/// `VecDeque` model, asserting `len`, every positional `get`, the endpoint
+/// peeks (`peek_front`/`peek_back` against `visible.front()`/`.back()`), and a
+/// full forward scan agree with `visible` after every op. `visible` is the
 /// read-your-writes deque; `floor` is the last committed snapshot. `commit`
 /// promotes `visible` to `floor`; `rollback` reverts `visible` to `floor`. Both
 /// are issued through the **erased** handle only — the typed handle shares the
@@ -678,6 +700,9 @@ where
                 if !opt_same::<P>(erased.as_ref(), visible.get(index)) {
                     return Ok(false);
                 }
+            }
+            if !assert_deque_peeks(&handle, &visible).await? {
+                return Ok(false);
             }
             let scanned = drain_cursor(&handle.scan(Direction::Forward)).await?;
             if scanned.len() != visible.len()

@@ -232,6 +232,12 @@ pub trait DynDequeState<Item: Send + 'static>: Send + Sync {
     /// Removes and returns the back element (`None` when empty).
     async fn pop_back(&self) -> Result<Option<Item>, ErasedStateError>;
 
+    /// Reads the front element without a length read (`None` when empty).
+    async fn peek_front(&self) -> Result<Option<Item>, ErasedStateError>;
+
+    /// Reads the back element without a length read (`None` when empty).
+    async fn peek_back(&self) -> Result<Option<Item>, ErasedStateError>;
+
     /// Removes every element.
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
@@ -803,6 +809,20 @@ where
     async fn pop_back(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .pop_back()
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn peek_front(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
+        self.handle
+            .peek_front()
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn peek_back(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
+        self.handle
+            .peek_back()
             .await
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
