@@ -144,8 +144,8 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
 
     /// The Deque push capacity for `(state_type, name)` — the window-slot cap a
     /// bounded deque trims toward on push; `None` is unbounded. Read per push
-    /// on a Deque handle. No default impl: mirrors
-    /// [`Self::collection_keyset_limit`].
+    /// on a Deque handle. No default impl: a silent `None` default would
+    /// disable trim for a real session, leaving its window unbounded.
     fn collection_capacity(&self, state_type: StateType, name: &StateName) -> Option<NonZeroUsize>;
 
     /// Validates that the keyed-state collection named `(state_type, name)` is

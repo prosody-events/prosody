@@ -60,6 +60,14 @@ use tokio::runtime::Builder;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+/// The bounded-deque capacity the lifecycle properties run under. `match`, not
+/// `NonZeroUsize::new(..).unwrap_or(..)`: `Option::unwrap_or` is not const, and
+/// the tests forbid `unwrap`.
+const BOUNDED_TEST_CAP: NonZeroUsize = match NonZeroUsize::new(2) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
+
 /// `CollectionRef` equality and hashing key on the inner `CollectionId` only —
 /// the TTL is a per-write hint, not part of identity. Two refs to the same
 /// collection with different TTLs must compare and hash equal, so a
@@ -939,7 +947,7 @@ fn prop_deque_bounded_lifecycle() {
         executor::block_on(run_deque_trace(
             trace,
             CommitMode::ReadCommitted,
-            Some(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN)),
+            Some(BOUNDED_TEST_CAP),
         ))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
@@ -952,7 +960,7 @@ fn prop_deque_bounded_lifecycle_read_uncommitted() {
         executor::block_on(run_deque_trace(
             trace,
             CommitMode::ReadUncommitted,
-            Some(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN)),
+            Some(BOUNDED_TEST_CAP),
         ))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
@@ -965,8 +973,7 @@ fn prop_deque_bounded_lifecycle_read_uncommitted() {
 /// [`run_deque_capacity_convergence`] for the B/C/D/G disposition.
 /// FALSIFICATION: drop `.min(TRIM_MAX)` from `evictions` → an over-wide
 /// window's first push buffers `> TRIM_MAX` entry deletes → the per-push cap
-/// assert → red; set `TRIM_MAX = 1` → a reduction push nets zero shrink → the
-/// `len <= cap` assert → red.
+/// assert → red.
 #[test]
 fn prop_deque_capacity_convergence() {
     fn property(shape: DequeCapacityShape) -> Result<bool> {

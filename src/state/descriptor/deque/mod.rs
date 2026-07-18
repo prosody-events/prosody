@@ -51,6 +51,18 @@
 //! absent cell resolves as skipped (`get` → `None`, `stream` omits it), never
 //! an error. This is acceptable time-window semantics: a TTL'd deque is a
 //! sliding window of not-yet-expired elements.
+//!
+//! # Invariant: capacity
+//!
+//! A registered `capacity` is a runtime-only cap on window slots — never
+//! persisted, not part of identity, freely changed across redeploys. It is
+//! enforced **lazily, on push only**: reads, `len`, iteration, `pop`, and
+//! `clear` never enforce it. A bounded [`DequeHandle::push_back`] evicts from
+//! the **front** and [`DequeHandle::push_front`] from the **back**, at most
+//! `TRIM_MAX` slots per push and decode-free / resolver-free — each a
+//! single-cell clear co-stamped with the append and the bounds move. So a
+//! persisted window may exceed the cap; a reduction of excess `D` converges in
+//! `⌈D / (TRIM_MAX − 1)⌉` pushes.
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,

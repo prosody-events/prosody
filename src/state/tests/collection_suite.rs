@@ -1151,6 +1151,16 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
     let id = collection_ref.id();
     let store = MemoryCellStore::new(store_cells.clone(), oracle.clone(), registry.clone());
     let armed: ArmedKeys = Arc::default();
+    let read_session = |idx: usize| {
+        make_session(
+            &store_cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            read_event(idx),
+        )
+    };
 
     // Seed the (possibly over-wide, possibly holed) window directly at index 0 —
     // the handle never produces a window wider than the cap, so it must be seeded.
@@ -1158,19 +1168,10 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
     seed_deque_window(&store, &collection_ref, 0, &cells).await?;
 
     // Reads never enforce: before any push, the whole seeded window is visible.
-    {
-        let read = make_session(
-            &store_cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(0),
-        );
-        let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
-        if handle.len().await? != span {
-            return Ok(false);
-        }
+    let read = read_session(0);
+    let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
+    if handle.len().await? != span {
+        return Ok(false);
     }
 
     // The model of the window slots (holes as `None`), applying the identical
@@ -1214,11 +1215,10 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
             .iter()
             .filter(|(_, val)| val.is_none())
             .count();
-        if physical_evictions > deque::TRIM_MAX {
-            return Ok(false); // G: at most TRIM_MAX slots per push
-        }
-        if physical_evictions != expected_evictions {
-            return Ok(false); // net convergence tracks physical clears
+        // G: at most `TRIM_MAX` clears per push, and the physical clears track
+        // the model's net convergence exactly.
+        if physical_evictions > deque::TRIM_MAX || physical_evictions != expected_evictions {
+            return Ok(false);
         }
         // B: a within-cap excess lands exactly `cap` on the very first push.
         if i == 0 && (1..deque::TRIM_MAX).contains(&excess) && model.len() != cap.get() {
@@ -1228,14 +1228,7 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
         finalize_and_promote(&session, &oracle, event_dedup(event), &store_cells, id).await?;
 
         // Committed read-back: the span equals the model (holes included).
-        let read = make_session(
-            &store_cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(i + 1),
-        );
+        let read = read_session(i + 1);
         let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
         if handle.len().await? != model.len() {
             return Ok(false);
@@ -1244,14 +1237,7 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
 
     // Converged: within the cap, and the surviving values equal the model's
     // opposite-end suffix/prefix (holes skipped by `stream`, never an error).
-    let read = make_session(
-        &store_cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(budget + 1),
-    );
+    let read = read_session(budget + 1);
     let handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
     if handle.len().await? > cap.get() {
         return Ok(false);
@@ -1261,7 +1247,52 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
         return Ok(false);
     }
     let reversed: Vec<Value> = survivors.iter().rev().cloned().collect();
-    Ok(collect_deque(&handle, Direction::Backward).await? == reversed)
+    if collect_deque(&handle, Direction::Backward).await? != reversed {
+        return Ok(false);
+    }
+
+    deque_no_committed_orphans(&store, id, span).await
+}
+
+/// Physical-erasure half of the capacity property: a bounded push must clear
+/// the **correct** committed slots and leave no orphan below `head` or at/above
+/// `tail`. Windowed reads skip such an orphan, so a count-matching mutant that
+/// cleared a wrong coordinate passes every windowed assert — this reads the
+/// committed bounds and requires every seeded index outside `[head, tail)` to
+/// be erased. Pushed cells land inside the window, so only the seed range
+/// `0..span` can orphan. Mirrors `deque_clear_resets_the_index_space`'s leak
+/// guard.
+async fn deque_no_committed_orphans(
+    store: &MemoryCellStore<ScriptedOracle>,
+    id: &CollectionId,
+    span: usize,
+) -> Result<bool> {
+    let Some(bounds) = store
+        .get(id, &deque::meta_cell(), read_event(0))
+        .await?
+        .into_inner()
+    else {
+        bail!("bounds cell missing after the convergence pushes");
+    };
+    let head = i64::from_be_bytes(bounds[0..8].try_into()?);
+    let tail = i64::from_be_bytes(bounds[8..16].try_into()?);
+    for i in 0..span as i64 {
+        let outside = i < head || i >= tail;
+        if outside
+            && store
+                .get(
+                    id,
+                    &deque::entry_cell_for(&I64KeyCodec::encode(&i)),
+                    read_event(0),
+                )
+                .await?
+                .into_inner()
+                .is_some()
+        {
+            return Ok(false); // a committed orphan outside the converged window
+        }
+    }
+    Ok(true)
 }
 
 /// Map key-scan presence: over a directly-seeded map whose keyset frame
