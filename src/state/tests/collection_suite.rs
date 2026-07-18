@@ -987,15 +987,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
     if collect_deque(&handle, Direction::Backward).await? != reversed {
         return Ok(false);
     }
-    if handle.peek_front().await? != handle.get(0).await? {
-        return Ok(false);
-    }
-    let back = if len == 0 {
-        None
-    } else {
-        handle.get(len - 1).await?
-    };
-    Ok(handle.peek_back().await? == back)
+    assert_peeks(&handle).await
 }
 
 /// `KeysetPresence` (Map): whenever the map holds any live entry, the raw
@@ -1046,18 +1038,30 @@ where
             return Ok(false);
         }
     }
-    if handle.peek_front().await? != handle.get(0).await? {
-        return Ok(false);
-    }
-    let back = if model.is_empty() {
-        None
-    } else {
-        handle.get(model.len() - 1).await?
-    };
-    if handle.peek_back().await? != back {
+    if !assert_peeks(handle).await? {
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Handle-internal peek parity: `peek_front == get(0)` and
+/// `peek_back == get(len-1)` (both `None` on an empty deque). Needs no model —
+/// `len` is separately pinned to the model at every call site.
+async fn assert_peeks<S, C>(handle: &DequeHandle<S, C>) -> Result<bool>
+where
+    S: CellSession,
+    C: Codec<Payload = Value>,
+{
+    if handle.peek_front().await? != handle.get(0).await? {
+        return Ok(false);
+    }
+    let len = handle.len().await?;
+    let back = if len == 0 {
+        None
+    } else {
+        handle.get(len - 1).await?
+    };
+    Ok(handle.peek_back().await? == back)
 }
 
 /// Collects a deque handle's `stream(dir)` into a vector.
