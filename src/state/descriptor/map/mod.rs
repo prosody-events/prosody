@@ -321,6 +321,10 @@ enum StreamPlan<K> {
 type MapStreamItem<KC, V> =
     Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
 
+/// One item [`MapHandle::keys`] yields: a decoded key, or the error that ended
+/// the stream. The presence-only, value-free twin of [`MapStreamItem`].
+type MapKeyItem<KC, V> = Result<<KC as OrderedKeyCodec>::Key, MapStateError<CellCodecError<V>>>;
+
 /// Descriptor for a codec-backed ordered map collection. Generic over an
 /// [`OrderedKeyCodec`] `KC` (the key encoding, frozen into the identity) and a
 /// value [`CellType`] `V` — a plain [`Codec`] (JSON by default) or a codec
@@ -547,6 +551,55 @@ where
                 // in `CellView::scan_at`.
                 StreamPlan::Tracked(keys) => {
                     let inner = self.entries.scan_at(keys.into_iter());
+                    futures::pin_mut!(inner);
+                    while let Some(item) = inner.next().instrument(span.clone()).await {
+                        yield item?;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Streams the live entries' **keys** in key order (ascending for
+    /// [`Direction::Forward`], descending for [`Direction::Backward`]) —
+    /// **without decoding or resolving any value**. So a message-backed map
+    /// enumerates keys with **zero Kafka fetches**: the guarantee is "no value
+    /// decode, no resolver run," not "no I/O" (the tracked arm still does a
+    /// presence-only batched read; the degrade arm still transfers each cell
+    /// envelope and discards the value bytes).
+    ///
+    /// Presence-only: a key is yielded for every present cell, even one whose
+    /// value would fail to decode or resolve (unlike [`stream`](Self::stream),
+    /// which errors on such a value) — presence is about the cell, not the
+    /// value (mirrors [`contains_key`](Self::contains_key)). The arm choice,
+    /// per-arm consistency, and gate/fence posture are exactly
+    /// [`stream`](Self::stream)'s (same keyset-plan decision); only the value
+    /// work is dropped.
+    pub fn keys(&self, dir: Direction) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
+        let span = info_span!(
+            "map.keys",
+            collection = self.entries.name().as_str(),
+            direction = ?dir,
+        );
+        try_stream! {
+            let plan = {
+                let permit = self.entries.read_permit().instrument(span.clone()).await;
+                let init = async { self.stream_plan(&permit, dir).await }
+                    .instrument(span.clone())
+                    .await;
+                drop(permit);
+                init?
+            };
+            match plan {
+                StreamPlan::Scan => {
+                    let inner = self.entries.key_scan(dir);
+                    futures::pin_mut!(inner);
+                    while let Some(item) = inner.next().instrument(span.clone()).await {
+                        yield item?;
+                    }
+                }
+                StreamPlan::Tracked(keys) => {
+                    let inner = self.entries.key_scan_at(keys.into_iter());
                     futures::pin_mut!(inner);
                     while let Some(item) = inner.next().instrument(span.clone()).await {
                         yield item?;

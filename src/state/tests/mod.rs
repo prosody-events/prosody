@@ -15,10 +15,10 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave, MapTrace,
+    DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave, MapKeyHoles, MapTrace,
     finalize_and_promote, run_deque_holes, run_deque_stream_interleave, run_deque_trace,
-    run_map_get_many_parity_trace, run_map_keyset_exact_trace, run_map_stream_interleave,
-    run_map_trace, run_map_ttl_keyset_refresh_trace,
+    run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keyset_exact_trace,
+    run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
 use self::support::{
     CountingCellStore, CountingOracle, CountingResolver, FixedOracle, ResolveCounter,
@@ -740,6 +740,121 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
     })
 }
 
+/// The key-scan resolver-skip pin: `keys()` runs the resolver zero times on
+/// BOTH arms (tracked point-get and degrade scan) over a dense committed map,
+/// so a message-backed map enumerates keys with no Kafka fetch. The tracked
+/// arm additionally contrasts a `get()` on a present key (which DOES resolve),
+/// proving the zero is a real skip on a resolvable cell — not an unresolvable
+/// one.
+/// FALSIFICATION: routing `MapHandle::keys` through `self.stream(dir)` (mapping
+/// `(k, _)`) resolves every drained key → `resolves() == n > 0` on either arm →
+/// red; routing only the `StreamPlan::Scan` arm through the resolving `scan`
+/// reddens the degrade arm alone. Both revert to green.
+#[test]
+fn map_keys_no_resolve() -> Result<()> {
+    executor::block_on(async {
+        // Tracked arm: keyset_limit >= n keeps the map Tracked; contrast get().
+        map_keys_drain_resolves(4096, 6, true).await?;
+        // Degrade arm: keyset_limit < n overflows → the full-section scan.
+        map_keys_drain_resolves(2, 6, false).await?;
+        Ok(())
+    })
+}
+
+/// Seeds a dense `n`-entry committed map at `keyset_limit`, then over a fresh
+/// cold session drains `keys()` in both directions and asserts the resolver ran
+/// zero times. With `get_contrast`, also asserts a `get()` on a present key
+/// resolves — so the zero above is a real skip on a resolvable cell.
+async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bool) -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("kz");
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(
+        &descriptor,
+        CollectionDef {
+            keyset_limit,
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let registry = Arc::new(registry);
+    let counting = CountingCellStore::new(MemoryCellStore::new(
+        cells.clone(),
+        oracle.clone(),
+        registry.clone(),
+    ));
+    let armed: ArmedKeys = Arc::default();
+    let id = CollectionId::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("kz")?,
+    );
+
+    // Seed a dense committed map (a blind `set` never resolves).
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let session = resolve_session(
+        &counting,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event,
+        ResolveCounter::default(),
+    );
+    let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    for i in 0..n {
+        let key = i64::try_from(i)?;
+        seed.set(key, Value::from(key))
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+    }
+    finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+
+    // Fresh cold session, zeroed resolve counter; drain keys() both directions.
+    counting.reset();
+    let resolves = ResolveCounter::default();
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let session = resolve_session(
+        &counting,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        event,
+        resolves.clone(),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+    for dir in [Direction::Forward, Direction::Backward] {
+        let drained: Vec<i64> = {
+            let stream = handle.keys(dir);
+            futures::pin_mut!(stream);
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                out.push(item.map_err(|e| eyre!("keys: {e}"))?);
+            }
+            out
+        };
+        assert_eq!(drained.len(), n, "keys() enumerates every present key");
+    }
+    assert_eq!(
+        resolves.resolves(),
+        0,
+        "keys() resolves nothing on either arm"
+    );
+
+    if get_contrast {
+        assert!(handle.get(&0).await.map_err(|e| eyre!("{e}"))?.is_some());
+        assert!(resolves.resolves() >= 1, "get resolves; keys() did not");
+    }
+    Ok(())
+}
+
 /// A store overriding only `get_for_cache` (returning a TTL) inherits the
 /// default `get_many_for_cache`, which must carry that TTL metadata through for
 /// every position — the guard against defaulting the cache-fill batch to
@@ -864,6 +979,19 @@ fn prop_map_ttl_keyset_refresh() {
         executor::block_on(run_map_ttl_keyset_refresh_trace(trace))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Map key-scan presence: over a directly-seeded map whose keyset frame
+/// over-reports a TTL-expired coordinate, `keys()` yields exactly the present
+/// keys in order across both arms (tracked point-get and degrade scan), and
+/// agrees with `stream()` on the live key set — the presence-only key scan
+/// skips a coordinate the keyset lists but the store no longer holds.
+#[test]
+fn prop_map_key_scan_holes() {
+    fn property(shape: MapKeyHoles) -> Result<bool> {
+        executor::block_on(run_map_key_scan_holes(shape))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapKeyHoles) -> Result<bool>);
 }
 
 /// Deque TTL holes: over a directly-seeded sparse window, `len` is the full

@@ -199,6 +199,11 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// A demand-driven cursor over the live entries in key order.
     fn scan(&self, dir: Direction) -> BoxStateCursor<(String, Item)>;
 
+    /// A demand-driven cursor over the live entry **keys** in key order,
+    /// without decoding or resolving any value (zero Kafka fetches for a
+    /// message-backed map). A key is present even when its value is not.
+    fn keys(&self, dir: Direction) -> BoxStateCursor<String>;
+
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
 
@@ -727,6 +732,19 @@ where
             while let Some(item) = inner.next().await {
                 let (key, value) = item.map_err(|e| ErasedStateError::from_classified(&e))?;
                 yield (key, value);
+            }
+        };
+        Box::new(StateCursor::new(Box::pin(stream)))
+    }
+
+    fn keys(&self, dir: Direction) -> BoxStateCursor<String> {
+        let handle = self.handle.clone();
+        let stream = try_stream! {
+            let inner = handle.keys(dir);
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                let key = item.map_err(|e| ErasedStateError::from_classified(&e))?;
+                yield key;
             }
         };
         Box::new(StateCursor::new(Box::pin(stream)))
