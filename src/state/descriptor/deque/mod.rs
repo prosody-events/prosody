@@ -683,8 +683,7 @@ impl<T> Descriptor<DequeKind<T>> {
 /// slots exist after the append and the trim is that count over `capacity`.
 ///
 /// See the module's capacity invariant: enforcement is lazy and push-only, so a
-/// persisted window may exceed `capacity`; a reduction of excess `D` converges
-/// in `⌈D / (TRIM_MAX − 1)⌉` pushes.
+/// persisted window may exceed `capacity`.
 fn evictions(len: usize, capacity: Option<NonZeroUsize>) -> usize {
     let Some(cap) = capacity else { return 0 };
     // `checked_add`, not `saturating_add`: at `len == usize::MAX` the window is

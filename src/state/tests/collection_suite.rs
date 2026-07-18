@@ -643,11 +643,7 @@ pub(crate) async fn run_deque_trace(
                 let v = Value::from(b);
                 handle.push_back(v.clone()).await?;
                 if let Some(cap) = capacity {
-                    let mut evicted = 0;
-                    while scratch.len() + 1 > cap.get() && evicted < deque::TRIM_MAX {
-                        scratch.pop_front();
-                        evicted += 1;
-                    }
+                    evict_for_push(scratch, cap.get(), true);
                 }
                 scratch.push_back(v);
                 Ok(OpOutcome::Continue)
@@ -656,11 +652,7 @@ pub(crate) async fn run_deque_trace(
                 let v = Value::from(b);
                 handle.push_front(v.clone()).await?;
                 if let Some(cap) = capacity {
-                    let mut evicted = 0;
-                    while scratch.len() + 1 > cap.get() && evicted < deque::TRIM_MAX {
-                        scratch.pop_back();
-                        evicted += 1;
-                    }
+                    evict_for_push(scratch, cap.get(), false);
                 }
                 scratch.push_front(v);
                 Ok(OpOutcome::Continue)
@@ -1097,11 +1089,11 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
     assert_peeks(&handle).await
 }
 
-/// Applies the deque's capped-trim rule to a window model op-for-op: evict at
-/// most `TRIM_MAX` slots from the far end (front for a back push, back for a
-/// front push) toward `cap`, then append. A plain loop, deliberately **not** a
-/// call to the production `evictions`, so the oracle is an independent check.
-fn apply_capped_push(model: &mut VecDeque<Option<u8>>, cap: usize, from_back: bool, value: u8) {
+/// Evicts the deque's capped-trim prelude to a push on a plain window model —
+/// at most `TRIM_MAX` slots from the far end (front for a back push, back for a
+/// front push) toward `cap`. Deliberately **not** a call to the production
+/// `evictions`, keeping the oracle an independent check.
+fn evict_for_push<T>(model: &mut VecDeque<T>, cap: usize, from_back: bool) {
     let mut evicted = 0;
     while model.len() + 1 > cap && evicted < deque::TRIM_MAX {
         if from_back {
@@ -1111,6 +1103,12 @@ fn apply_capped_push(model: &mut VecDeque<Option<u8>>, cap: usize, from_back: bo
         }
         evicted += 1;
     }
+}
+
+/// Applies the deque's capped-trim rule to a window model op-for-op: evict the
+/// capped-trim prelude (see [`evict_for_push`]), then append.
+fn apply_capped_push(model: &mut VecDeque<Option<u8>>, cap: usize, from_back: bool, value: u8) {
+    evict_for_push(model, cap, from_back);
     if from_back {
         model.push_back(Some(value));
     } else {
