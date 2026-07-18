@@ -257,8 +257,7 @@ where
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
         let permit = self.entries.read_permit().await;
         let window = self.bounds(&permit).await?;
-        window.len()?;
-        if window.head >= window.tail {
+        if window.len()? == 0 {
             return Ok(None);
         }
         Ok(self.entries.get(&permit, &window.head).await?)
@@ -280,8 +279,7 @@ where
     ) -> Result<Option<ResolvedOf<T>>, DequeStateError<CellCodecError<T>>> {
         let permit = self.entries.read_permit().await;
         let window = self.bounds(&permit).await?;
-        window.len()?;
-        if window.head >= window.tail {
+        if window.len()? == 0 {
             return Ok(None);
         }
         let last = window
