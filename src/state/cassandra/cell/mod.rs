@@ -683,6 +683,31 @@ where
             }
         }
     }
+
+    /// Issues a settle's `units` marker-LAST: appends the collection's marker
+    /// delete, then runs one atomic batch when everything fits the budget, else
+    /// awaits the recovery prefix to completion BEFORE issuing the marker
+    /// alone. Owning the append, the split, and the ordered await here
+    /// makes marker misplacement and await reversal unrepresentable at the
+    /// call sites — the coupling [`marker_last_split`]'s positional index
+    /// alone cannot enforce.
+    async fn issue_marker_last<'u>(
+        &'u self,
+        pk: Pk<'u>,
+        mut units: Vec<BatchUnit<CellBatchRow<'u>>>,
+    ) -> Result<(), CellStoreError<O::Error>> {
+        units.push(marker_delete_unit(pk, &self.queries));
+        let split = marker_last_split(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
+        self.run_batches(&units[..split])
+            .await
+            .map_err(ResolveCellError::Store)?;
+        if split < units.len() {
+            self.run_batches(&units[split..])
+                .await
+                .map_err(ResolveCellError::Store)?;
+        }
+        Ok(())
+    }
 }
 
 impl<O> CellStore for CassandraStore<O>
@@ -1226,16 +1251,7 @@ where
             )
         }));
         extend_gap_units(&mut units, &self.queries, pk, clears);
-        units.push(marker_delete_unit(pk, &self.queries));
-        let split = marker_last_split(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
-        self.run_batches(&units[..split])
-            .await
-            .map_err(ResolveCellError::Store)?;
-        if split < units.len() {
-            self.run_batches(&units[split..])
-                .await
-                .map_err(ResolveCellError::Store)?;
-        }
+        self.issue_marker_last(pk, units).await?;
         self.settle_memo(collection.id()).await;
         Ok(())
     }
@@ -1265,16 +1281,7 @@ where
         let ttl = collection.ttl().map(ttl_to_i32);
         let mut units = Vec::with_capacity(cells.len() + 1);
         units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
-        units.push(marker_delete_unit(pk, &self.queries));
-        let split = marker_last_split(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
-        self.run_batches(&units[..split])
-            .await
-            .map_err(ResolveCellError::Store)?;
-        if split < units.len() {
-            self.run_batches(&units[split..])
-                .await
-                .map_err(ResolveCellError::Store)?;
-        }
+        self.issue_marker_last(pk, units).await?;
         self.settle_memo(collection.id()).await;
         Ok(())
     }
@@ -1782,7 +1789,10 @@ fn extend_gap_units<'u>(
 }
 
 /// The one-row batch unit deleting a collection's event-marker row at its
-/// fixed address — appended by the clears-free settle verbs.
+/// fixed address, appended last by [`issue_marker_last`], the shared tail of
+/// both settle verbs.
+///
+/// [`issue_marker_last`]: CassandraStore::issue_marker_last
 fn marker_delete_unit<'u>(pk: Pk<'u>, queries: &'u CellQueries) -> BatchUnit<CellBatchRow<'u>> {
     BatchUnit::new(
         PER_STATEMENT_OVERHEAD,
@@ -1800,6 +1810,13 @@ fn marker_delete_unit<'u>(pk: Pk<'u>, queries: &'u CellQueries) -> BatchUnit<Cel
 /// delete. Everything returns in the first slice when one batch can carry all
 /// rows atomically; otherwise the marker is the second slice's sole unit, so it
 /// is issued only after every recovery-relevant mutation has completed.
+///
+/// **Precondition:** the marker delete is the LAST unit — the split is
+/// positional (`units.len() - 1`), so a marker placed elsewhere, or a caller
+/// awaiting the tail before the prefix, would issue the marker before the
+/// recovery-relevant rows.
+/// [`issue_marker_last`](CassandraStore::issue_marker_last) owns that ordering;
+/// this function only decides where the split falls.
 fn marker_last_split<R>(units: &[BatchUnit<R>], max_bytes: u64, max_count: usize) -> usize {
     if fits_one_batch(units.iter().map(BatchUnit::weight), max_bytes, max_count) {
         units.len()
@@ -1809,10 +1826,13 @@ fn marker_last_split<R>(units: &[BatchUnit<R>], max_bytes: u64, max_count: usize
 }
 
 /// Whether `weights` pack into a **single** batch under the byte and count
-/// budgets — the pure marker-first ordering decision: `chunk_boundaries`
-/// provably yields one chunk iff the weight sum fits `max_bytes` and the count
-/// fits `max_count`, so a stage passing this check may carry its marker in the
-/// atomic batch; otherwise the marker must be awaited alone first.
+/// budgets: `chunk_boundaries` provably yields one chunk iff the weight sum
+/// fits `max_bytes` and the count fits `max_count`. This one predicate
+/// underlies both marker-ordering decisions — the stage's marker-FIRST choice
+/// (`write_provisional`) and the settle's marker-LAST split
+/// ([`marker_last_split`]): when everything fits one atomic batch the marker
+/// rides along; otherwise it is isolated to its own batch — issued first at
+/// stage, last at settle.
 fn fits_one_batch(weights: impl Iterator<Item = u64>, max_bytes: u64, max_count: usize) -> bool {
     let (mut total, mut count) = (0_u64, 0_usize);
     for weight in weights {

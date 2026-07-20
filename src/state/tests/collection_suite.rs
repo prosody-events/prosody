@@ -1890,10 +1890,14 @@ fn deque_peeks_match_get_on_an_over_wide_window() -> Result<()> {
 /// length (evict 0) and extends the window to `[i64::MIN, 1)`. Bounded, the
 /// unmeasurable span trims `TRIM_MAX` toward the cap rather than failing,
 /// advancing `head` by `TRIM_MAX` to `[i64::MIN + TRIM_MAX, 1)` — the first
-/// convergence push a cap exists to drive. Restoring a fallible `window.len()?`
-/// before the capacity check (the bug this fixes) reddens the unbounded case;
-/// failing instead of trimming reddens the bounded case. Seeded directly
-/// because reaching `head = i64::MIN` would need 2^63 pushes.
+/// convergence push a cap exists to drive. A huge capacity (`>= 2^63`) instead
+/// *contains* the over-wide window, so eviction is zero and the window extends
+/// to `[i64::MIN, 1)` — live in-capacity slots must not be erased. Restoring a
+/// fallible `window.len()?` before the capacity check (the bug this fixes)
+/// reddens the unbounded case; failing instead of trimming reddens the bounded
+/// case; evicting `TRIM_MAX` unconditionally on the unmeasurable span reddens
+/// the huge-cap case. Seeded directly because reaching `head = i64::MIN` would
+/// need 2^63 pushes.
 #[test]
 fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
     use crate::state::descriptor::deque::meta_cell;
@@ -1960,6 +1964,15 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
     let cap = NonZeroUsize::new(2).ok_or_else(|| eyre!("2 is nonzero"))?;
     let trim = i64::try_from(deque::TRIM_MAX)?;
     push_and_expect_bounds(Some(cap), i64::MIN + trim, 1)?;
+    // Huge capacity (>= 2^63): the 2^63-wide seeded window is within capacity, so
+    // a correct push evicts NOTHING and the window just extends to `[i64::MIN, 1)`.
+    // A 64-bit property — no `usize` on a 32-bit target can hold such a capacity,
+    // where the window is always over-capacity and full-`TRIM_MAX` eviction is
+    // correct, so `cfg!` skips the case there.
+    if cfg!(target_pointer_width = "64") {
+        let huge = NonZeroUsize::new(usize::MAX).ok_or_else(|| eyre!("MAX is nonzero"))?;
+        push_and_expect_bounds(Some(huge), i64::MIN, 1)?;
+    }
     Ok(())
 }
 

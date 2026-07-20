@@ -1798,7 +1798,10 @@ fn fits_one_batch_decides_on_both_budgets() {
 }
 
 /// Settle's budget decision preserves one atomic batch whenever possible and
-/// otherwise exposes only the final marker unit to the second, ordered issue.
+/// otherwise isolates the final marker unit as the split tail. This pins the
+/// split INDEX `issue_marker_last` relies on; the temporal ordering (prefix
+/// awaited before the marker tail) is enforced structurally by that helper
+/// owning both awaits, not by this pure property.
 #[test]
 fn prop_over_budget_settle_issues_marker_last() {
     use smallvec::SmallVec;

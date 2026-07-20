@@ -691,11 +691,16 @@ fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> usize {
     // reachable only from a corrupt or hand-seeded bounds cell) proceeds
     // untouched, exactly as it did before capacity existed.
     let Some(cap) = capacity else { return 0 };
-    // Bounded: an unmeasurable over-wide span is vastly over any cap, so trim
-    // the max toward it rather than failing the push (the convergence the cap
-    // exists to drive). Only bounded deques ever pay the length read.
+    // Bounded but unmeasurable: `len` overflows `usize`, but `head <= tail`
+    // (Window invariant) makes an unmeasurable span a length of at least
+    // `i64::MAX as usize`. Evict on that lower bound — realistic caps still trim
+    // the max, while a cap so large the window is actually within it under-evicts
+    // (down to zero) rather than erasing live in-capacity cells. Only bounded
+    // deques ever pay the length read.
     let Ok(len) = window.len() else {
-        return TRIM_MAX;
+        return (i64::MAX as usize)
+            .saturating_sub(cap.get() - 1)
+            .min(TRIM_MAX);
     };
     // `len − (cap − 1)`, algebraically `(len + 1) − cap` but overflow-free
     // (`cap ≥ 1`): at `len == cap == usize::MAX` this is the correct single
