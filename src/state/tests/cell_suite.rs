@@ -1625,6 +1625,223 @@ where
     Ok(())
 }
 
+/// Stages the defect shape a deferred repair must survive, shared by the two
+/// repair-provenance pins below: seed `x` = resolved `bytes(7)`, stage event F
+/// over `{x}` then RESTAGE F over `{y}` (the same-event restage overwrites F's
+/// marker WITHOUT resolving it — the stage boundary resolves only foreign
+/// markers — so `x` is left provisional and UNLISTED by any marker), then stage
+/// event E over survivor `s` with a clears-bearing marker on `SECTIONS[0]` (E's
+/// stage boundary aborts the now-foreign `F:{y}` marker; `x` stays untouched
+/// and unlisted). F is never recorded (it crashed before its dedup record), so
+/// its verdict is `NotCommitted`. Returns `(x, s, event_e)`.
+///
+/// Expressing the same-event restage with divergent staged sets in the
+/// `Trace`/`CellModel` generator is structural surgery (unlisted-cell
+/// bookkeeping the model does not carry), so this invariant is pinned
+/// deterministically here rather than folded into the crash/overwrite property.
+pub(crate) async fn stage_deferred_repair_shape<S>(
+    store: &S,
+    cref: &CollectionRef,
+) -> Result<(CellKey, CellKey, EventRef)>
+where
+    S: CellStore,
+{
+    let id = cref.id();
+    let event_f = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+    let event_e = EventRef::Message {
+        dedup_id: Uuid::from_u128(2),
+    };
+    let x = cell_in(0, 5);
+    let y = cell_in(0, 3);
+    let s = cell_in(0, 0);
+
+    // Seed x = resolved bytes(7) (no marker standing → the write-help boundary
+    // is a no-op), then read the still-clean bases before any provisional stage.
+    store
+        .write_resolved(cref, &[(x.clone(), Some(bytes(7)))], &[])
+        .await?;
+    let prev_x = store.get(id, &x, event_f).await?;
+    let prev_y = store.get(id, &y, event_f).await?;
+    let prev_s = store.get(id, &s, event_e).await?;
+
+    // Stage F over {x}, then restage F over {y}: same-event, so the stage
+    // boundary does not resolve F's own standing marker and x is orphaned
+    // provisional, unlisted by the overwriting F:{y} marker.
+    let f_first = vec![(
+        x.clone(),
+        ProvisionalWrite::new(Some(bytes(2)), prev_x, event_f),
+    )];
+    let f_first_marker = EventMarker::frozen(event_f, &f_first, &[]);
+    store
+        .write_provisional(cref, &f_first, Some(&f_first_marker))
+        .await?;
+    let f_second = vec![(
+        y.clone(),
+        ProvisionalWrite::new(Some(bytes(4)), prev_y, event_f),
+    )];
+    let f_second_marker = EventMarker::frozen(event_f, &f_second, &[]);
+    store
+        .write_provisional(cref, &f_second, Some(&f_second_marker))
+        .await?;
+
+    // Stage E over survivor s with a clears-bearing marker: the stage boundary
+    // resolves the now-foreign F:{y} marker (F unrecorded → NotCommitted →
+    // abort), leaving E's marker standing and x still orphaned provisional.
+    let e_writes = vec![(
+        s.clone(),
+        ProvisionalWrite::new(Some(bytes(1)), prev_s, event_e),
+    )];
+    let e_clears = vec![SectionClear::frozen(SECTIONS[0], &e_writes)];
+    let e_marker = EventMarker::frozen(event_e, &e_writes, &e_clears);
+    store
+        .write_provisional(cref, &e_writes, Some(&e_marker))
+        .await?;
+
+    Ok((x, s, event_e))
+}
+
+/// Deterministic regression pin (both backends): a repair whose payload
+/// predates a standing clears-bearing marker must NOT land after that marker
+/// resolves. Beneath E's committed clears-bearing marker, `resolve_cell`
+/// degrades `x`'s repair to peek semantics (value-only, no durable write), so
+/// E's marker still stands and the marker's own resolution — the committed
+/// positional clear — erases `x` instead of a stale repair resurrecting it.
+///
+/// F committed nothing, E committed. The read of `x` (own = E) declines
+/// read-help (own marker) and reaches `resolve_cell`, which defers. The sweep
+/// then resolves E: `s` promotes, the `SECTIONS[0]` gap erase deletes the
+/// non-survivor `x`.
+///
+/// The shape is staged through `stage` — the **prior assignment's** store — so
+/// that `x` never warms the cache above the reading assembly and the
+/// assembly-under-test read of `x` is a genuine cold miss that reaches
+/// `resolve_cell` (a warm hit would serve the correct projection without ever
+/// invoking the guard, so the pin would not exercise the fix on a cached
+/// backend). For the bare memory store `stage` and `store` are two handles over
+/// the same cells; for Cassandra `stage` stages under its own presence latch
+/// and `store` is the `Cached` assembly of a **fresh cold assignment** over the
+/// same durable rows (a cold presence + cold cache — the post-rebalance
+/// recovery posture), so its reads cold-seed from durable truth.
+///
+/// Falsification: delete the `deferred` guard in `resolve_cell` → the read's
+/// repair write-back resolves E's marker early (its clear erases `x`, then the
+/// stale `bytes(7)` lands on top) → the marker-still-stands assertion and the
+/// post-sweep `x`-absent assertion both redden. Prove it once (inject, red,
+/// revert).
+pub(crate) async fn run_repair_defers_beneath_stale_clear<St, S, P>(
+    stage: &St,
+    store: S,
+    oracle: ScriptedOracle,
+    probe: &P,
+) -> Result<()>
+where
+    St: CellStore,
+    S: CellStore,
+    P: ShapeProbe,
+{
+    let (_ids, refs) = pooled_collections()?;
+    let cref = &refs[0];
+    let id = cref.id();
+    let (x, s, event_e) = stage_deferred_repair_shape(stage, cref).await?;
+    oracle.record_message(Uuid::from_u128(2)).await?;
+
+    // The own-event read declines read-help and reaches the deferred repair:
+    // the prev projection is served with no durable write, so E's marker stands.
+    ensure!(
+        store.get(id, &x, event_e).await?.into_inner() == Some(bytes(7)),
+        "the deferred repair must serve the committed-base projection"
+    );
+    ensure!(
+        probe.standing_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
+        "the repair must not resolve E's standing clears-bearing marker"
+    );
+
+    // Resolving E the way production does replays its positional clear, erasing
+    // the non-survivor x (deferred, never durably repaired) and promoting s.
+    let read = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX / 2),
+    };
+    sweep_provisional(&store, &oracle, cref).await?;
+    ensure!(
+        store.get(id, &x, read).await?.into_inner().is_none(),
+        "the committed clear must erase the deferred repair, not a resurrected row"
+    );
+    ensure!(
+        store.get(id, &s, read).await?.into_inner() == Some(bytes(1)),
+        "the staged survivor must promote to its committed value"
+    );
+    Ok(())
+}
+
+/// Deterministic convergence pin (both backends): the deferral wedges nothing —
+/// when the standing marker's event aborts, no clear applies and `x`'s
+/// committed projection stays its base, served correctly.
+///
+/// Same shape as [`run_repair_defers_beneath_stale_clear`] but E is never
+/// recorded (`NotCommitted`). The own-event read of `x` defers (E's marker
+/// stands — the falsifiable guard pin); the sweep aborts E (survivor `s` rolls
+/// back, no clear) and deletes the marker, so nothing blocks. `x` then projects
+/// its committed base (`bytes(7)`) — no committed clear ever ran, so the defect
+/// shape simply drains.
+///
+/// The post-sweep *durable* cleanup of the orphaned, unlisted `x` is
+/// intentionally backend-divergent, so this pin asserts only the cross-backend
+/// truths (marker gone, correct projection): the memory sweep scans every
+/// provisional row and repairs `x` in place, whereas the Cassandra mop-up is
+/// seeded from the standing marker's staged list (recovery cost ∝ #provisional,
+/// not #cells), so an unlisted orphan is left for first-touch or its TTL — a
+/// harmless residue that resolves to exactly the base the cache already serves.
+///
+/// Falsification: delete the `deferred` guard → the read's repair write-back
+/// resolves E's marker early (aborting E mid-flight) → the marker-still-stands
+/// assertion reddens. `stage` is the bare/lower store, as in
+/// [`run_repair_defers_beneath_stale_clear`], so the read is a genuine cold
+/// miss that reaches the guard.
+pub(crate) async fn run_repair_after_marker_abort_converges<St, S, P>(
+    stage: &St,
+    store: S,
+    oracle: ScriptedOracle,
+    probe: &P,
+) -> Result<()>
+where
+    St: CellStore,
+    S: CellStore,
+    P: ShapeProbe,
+{
+    let (_ids, refs) = pooled_collections()?;
+    let cref = &refs[0];
+    let id = cref.id();
+    let (x, _s, event_e) = stage_deferred_repair_shape(stage, cref).await?;
+    // E is deliberately NOT recorded: the marker resolves NotCommitted.
+
+    ensure!(
+        store.get(id, &x, event_e).await?.into_inner() == Some(bytes(7)),
+        "the deferred repair serves the committed-base projection"
+    );
+    ensure!(
+        probe.standing_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
+        "the repair must not resolve E's standing marker"
+    );
+
+    // The sweep aborts E (no clear applied) and drains the marker; x's
+    // committed projection stays its base.
+    sweep_provisional(&store, &oracle, cref).await?;
+    ensure!(
+        probe.standing_marker(id).await?.is_none(),
+        "the abort must resolve E's marker away — the deferral wedges nothing"
+    );
+    let read = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX / 2),
+    };
+    ensure!(
+        store.get(id, &x, read).await?.into_inner() == Some(bytes(7)),
+        "x's committed projection stays its base after the marker aborts"
+    );
+    Ok(())
+}
+
 // ─────────────────────────── implicit overwrite
 // ───────────────────────────────
 

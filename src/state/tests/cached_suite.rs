@@ -32,6 +32,7 @@ use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
     FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle, SECTION,
     ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
+    stage_deferred_repair_shape,
 };
 use super::support::{
     CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
@@ -1115,6 +1116,57 @@ fn blind_write_deletes_beneath_resolved_marker_window() -> Result<()> {
         ensure!(
             cached.get(&id, &cell_at(1), read).await?.get() == Some(&bytes(9)),
             "the blind write did not read back"
+        );
+        Ok(())
+    })
+}
+
+/// Repair-provenance pin (memory-backed Cached): a deferred repair fill is
+/// beaten by the committed clear's D4 eviction. The defect shape is staged
+/// through the **lower** store (so `x` never warms the cache), then a
+/// `cached.get(x)` fills the cache with the deferred peek projection
+/// (`bytes(7)`, no durable repair) because `resolve_cell` defers beneath E's
+/// standing clears-bearing marker. The sweep then resolves E: the D4
+/// clear-eviction deletes `x`'s stale fill and the lower positional gap erase
+/// removes `x` durably, so the next `cached.get(x)` is absent. Reverting the
+/// `deferred` guard in `resolve_cell` lands a stale `bytes(7)` write-back
+/// beneath the cache and reddens the post-sweep absence assertion.
+#[test]
+fn repair_defers_then_clear_evicts_stale_fill() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(test_db::cache("repair-defer")?, counting.clone());
+        let cref = CollectionRef::new(collection("repair-defer")?, None);
+
+        // Stage the defect shape through the lower store so x stays cold in the
+        // cache; record E committed.
+        let (x, s, event_e) = stage_deferred_repair_shape(&counting, &cref).await?;
+        oracle.record_message(Uuid::from_u128(2)).await?;
+
+        // The cold fill defers the repair (own-marker read-help declines below)
+        // and caches the peek projection with no durable write.
+        ensure!(
+            cached.get(cref.id(), &x, event_e).await?.get() == Some(&bytes(7)),
+            "the deferred fill serves the committed-base projection"
+        );
+
+        // Resolving E evicts the stale fill (D4) and erases x durably (gap).
+        sweep_provisional(&cached, &oracle, &cref)
+            .await
+            .map_err(|e| eyre!("sweep failed: {e:?}"))?;
+        let read = probe(u128::MAX / 2);
+        ensure!(
+            cached.get(cref.id(), &x, read).await?.get().is_none(),
+            "the committed clear must evict the stale fill and leave x absent"
+        );
+        ensure!(
+            cached.get(cref.id(), &s, read).await?.get() == Some(&bytes(1)),
+            "the survivor must promote to its committed value"
         );
         Ok(())
     })

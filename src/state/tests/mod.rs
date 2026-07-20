@@ -13,6 +13,7 @@ use self::cell_suite::{
     run_blind_write_survives_stale_clear, run_bottom_scan_trace, run_crash_equivalence_trace,
     run_overlay_precedence_pin, run_overlay_trace, run_overwrite_trace,
     run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
+    run_repair_after_marker_abort_converges, run_repair_defers_beneath_stale_clear,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
@@ -151,6 +152,36 @@ fn blind_write_leaves_clears_free_marker() -> Result<()> {
     let store = memory_store(cells.clone(), oracle);
     let probe = MemoryShapeProbe(cells);
     executor::block_on(run_blind_write_leaves_clears_free_marker(store, &probe))
+}
+
+/// Regression pin over the memory store: a repair whose payload predates a
+/// standing committed clears-bearing marker defers to peek semantics, so the
+/// marker's own resolution erases the cell rather than a stale repair
+/// resurrecting it. Falsify by deleting the `deferred` guard in `resolve_cell`.
+#[test]
+fn repair_defers_beneath_stale_clear() -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let stage = memory_store(cells.clone(), oracle.clone());
+    let store = memory_store(cells.clone(), oracle.clone());
+    let probe = MemoryShapeProbe(cells);
+    executor::block_on(run_repair_defers_beneath_stale_clear(
+        &stage, store, oracle, &probe,
+    ))
+}
+
+/// Convergence pin over the memory store: the deferral wedges nothing — when
+/// the standing marker aborts, x's committed projection stays its base.
+#[test]
+fn repair_after_marker_abort_converges() -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let stage = memory_store(cells.clone(), oracle.clone());
+    let store = memory_store(cells.clone(), oracle.clone());
+    let probe = MemoryShapeProbe(cells);
+    executor::block_on(run_repair_after_marker_abort_converges(
+        &stage, store, oracle, &probe,
+    ))
 }
 
 /// Implicit-overwrite soundness over the memory cell store: a sequence of

@@ -356,7 +356,11 @@ impl<S> CountingCellStore<S> {
     /// Total durable mutations (excludes reads). Folds the two settle verbs in:
     /// a forwarded `commit_provisional` / `abort_provisional` routes through
     /// the *inner* store's own primitives, invisible to this wrapper's
-    /// per-primitive counters, so the settle itself is counted here.
+    /// per-primitive counters, so the settle itself is counted here. The same
+    /// blind spot covers the write-help boundary: a `write_resolved` tick can
+    /// fold in a whole standing-marker resolution performed inside the store,
+    /// so a `write_resolved` count is not a lower bound on the mutations that
+    /// tick issued.
     pub(crate) fn durable_writes(&self) -> usize {
         self.counts.write_provisional.load(Ordering::Relaxed)
             + self.counts.write_resolved.load(Ordering::Relaxed)

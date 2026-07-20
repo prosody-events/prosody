@@ -37,7 +37,7 @@ use crate::state::tests::cell_suite::{
     run_blind_write_leaves_clears_free_marker, run_blind_write_survives_stale_clear,
     run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
     run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
-    value_cell,
+    run_repair_after_marker_abort_converges, run_repair_defers_beneath_stale_clear, value_cell,
 };
 use crate::state::tests::support::{CountingOracle, fresh_collection, probe as event};
 use crate::state::{
@@ -1390,6 +1390,52 @@ fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
             session: fx.cassandra.clone(),
         };
         run_blind_write_leaves_clears_free_marker(store, &probe).await
+    })
+}
+
+/// Regression pin over the production `Cached<CassandraStore>` assembly: a
+/// repair whose payload predates a standing committed clears-bearing marker
+/// defers to peek semantics beneath the cache, so the marker's own resolution
+/// (the committed positional clear) erases the cell instead of a stale repair
+/// resurrecting it. The D4 clear-eviction beats the earlier deferred fill.
+/// Falsify by deleting the `deferred` guard in `resolve_cell`.
+#[test]
+fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let fx = fixture().await?;
+        let oracle = ScriptedOracle::default();
+        // Stage under the fixture's presence (the prior assignment). The reader
+        // is a fresh cold assignment: a cold cache whose own presence latch is
+        // cold, so `x` never warms it and the Cached read cold-seeds from
+        // durable truth, reaching `resolve_cell`.
+        let stage = fx.bottom_store(oracle.clone());
+        let cache = test_db::cold_cache("cassandra_repair_defer")?;
+        let presence = cache.presence();
+        let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_repair_defers_beneath_stale_clear(&stage, store, oracle, &probe).await
+    })
+}
+
+/// Convergence pin over `Cached<CassandraStore>`: the deferral wedges nothing —
+/// when the standing marker aborts, x's committed projection stays its base.
+#[test]
+fn cassandra_repair_after_marker_abort_converges() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let fx = fixture().await?;
+        let oracle = ScriptedOracle::default();
+        let stage = fx.bottom_store(oracle.clone());
+        let cache = test_db::cold_cache("cassandra_repair_abort")?;
+        let presence = cache.presence();
+        let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_repair_after_marker_abort_converges(&stage, store, oracle, &probe).await
     })
 }
 

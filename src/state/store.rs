@@ -22,7 +22,7 @@
 //! cells of one collection as a slice. The invariant every backend upholds is
 //! **atomic multi-cell commit** — a single `write_provisional` /
 //! `write_resolved` / `mark_resolved` call (and `commit_provisional` /
-//! `abort_provisional`, which route to a promote plus the raw resolved apply)
+//! `abort_provisional` — each verb's doc states its routing)
 //! applies *all* its cells
 //! together, so no reader and no crash-recovery ever observes a torn subset
 //! (some cells written, others not), and on the Cassandra backend every cell

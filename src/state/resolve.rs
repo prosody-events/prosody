@@ -196,6 +196,26 @@ where
 /// resulting over-report is harmless — a later point read sees the cell already
 /// resolved and drops it — and the marker is cleared by the next stage boundary
 /// or the sweep's marker leg ([`resolve_marker`]).
+///
+/// # Repair-provenance invariant
+///
+/// A repair's payload derives from durable state that logically **predates**
+/// any standing marker, so it must never land *after* that marker resolves:
+/// [`write_resolved`]'s write-help boundary ([`help_write_window`]) resolves a
+/// standing clears-bearing marker first, and a positional clear erases only the
+/// frozen survivors, so a stale repair write-back landing afterward would
+/// resurrect a row the committed clear erases — a silently lost committed
+/// clear. Beneath a standing clears-bearing marker the repair therefore
+/// **degrades to peek semantics** (value-only, the scan path's posture, no
+/// durable write): the marker's own resolution supersedes it. If the marker
+/// commits, its positional clear erases the cell (the correct final state —
+/// every provisional cell coexisting with a standing marker predates it, the
+/// same argument `mark_resolved`'s over-report already relies on); if it
+/// aborts, no clears apply and a later first-touch or sweep repairs the cell
+/// durably. This is what keeps [`write_resolved`]'s boundary sound: every
+/// payload that reaches it is handler-fresh and postdates the marker.
+///
+/// [`write_resolved`]: CellStore::write_resolved
 pub(crate) async fn resolve_cell<S, O>(
     store: &S,
     oracle: &O,
@@ -211,6 +231,22 @@ where
         .resolve(collection.id().state_key(), provisional.event())
         .await
         .map_err(ResolveCellError::Oracle)?;
+    // Repair-provenance guard (invariant above): beneath a standing
+    // clears-bearing marker the repair degrades to peek semantics — value-only,
+    // deferred to the marker's own resolution. `standing_marker` is RAM-native
+    // on memory and memo-backed on Cassandra, so this is one RAM read on the
+    // rare repair path.
+    let deferred = store
+        .standing_marker(collection.id())
+        .await
+        .map_err(ResolveCellError::Store)?
+        .is_some_and(|marker| !marker.clears().is_empty());
+    if deferred {
+        return Ok(Committed::new(match decision {
+            CommitDecision::Committed => provisional.into_data(),
+            CommitDecision::NotCommitted => provisional.into_prev(),
+        }));
+    }
     match decision {
         CommitDecision::Committed => {
             // Promote-of-a-clear must delete the row, not null it: an absent-data
@@ -367,17 +403,22 @@ where
 /// > clears-bearing marker resolves, so a committed write can never be silently
 /// > erased by a stale clear's replay.
 ///
-/// Returns whether it resolved, so a caller that read concurrently re-issues.
-/// Markers without clears are left standing (first-touch stays cell-grained and
-/// marker-free); the whole write cost stays one memoized standing-marker read
-/// on the ~always marker-free fast path. A resolution failure fails the write,
-/// retryable by the caller.
+/// Returns whether it resolved. The read twin [`help_read_window`] is called
+/// concurrently with a raw read whose result it re-issues on a `true`; the
+/// write callers ([`CellStore::write_resolved`]) hold no concurrent read and
+/// discard the bool — the resolution is the whole point, and their write lands
+/// after it. Markers without clears are left standing (first-touch stays
+/// cell-grained and marker-free); the whole write cost stays one memoized
+/// standing-marker read on the ~always marker-free fast path. A resolution
+/// failure fails the write, retryable by the caller.
 ///
 /// # No own-event guard
 ///
 /// Unlike [`help_read_window`], [`CellStore::write_resolved`] carries no
 /// [`EventRef`], so this helper resolves a standing clears-bearing marker
-/// regardless of whose event owns it. A standing **own-event** marker is
+/// regardless of whose event owns it. Every payload that reaches this boundary
+/// is **handler-fresh** and postdates any standing marker, so resolving the
+/// marker first is always the right order; a standing **own-event** marker is
 /// impossible or benign at every production caller:
 ///
 /// * **Session `commit()` / `ReadUncommitted` finalize.** Both write *before*
@@ -387,17 +428,12 @@ where
 ///   a marker-record that actually landed dedup-filters the redispatch, so the
 ///   handler would not be re-running. Resolving it performs the exact
 ///   oracle-mediated abort the armed sweep would.
-/// * **[`resolve_cell`] write-backs** (first-touch point reads and the sweep
-///   mop-up). Point reads run [`help_read_window`] first and per-key dispatch
-///   serializes every message, timer fire, and recovery backstop, so no new
-///   foreign marker appears mid-read; what can still stand is clears-free
-///   (no-op) or the reading event's own marker — a post-settle hook window
-///   whose resolution merely completes the promote the sweep would, or a
-///   mid-retry stale stage the abort discards. In the sweep mop-up a standing
-///   marker means the marker leg just permanently failed, so re-failing the
-///   cell write-back is the **safe** direction: resolving a cell to committed
-///   under a stuck committed clear would materialize the very row the clear's
-///   eventual replay erases.
+/// * **[`resolve_cell`] write-backs never reach this boundary beneath a
+///   standing clears-bearing marker.** A repair's payload predates the marker,
+///   so `resolve_cell` degrades to peek semantics there and issues no durable
+///   write — the repair-provenance invariant documented on [`resolve_cell`].
+///   What can still reach `write_resolved` from a repair is a clears-free
+///   marker (no-op) or none, both benign.
 /// * **The settle verbs never pass through** — Cassandra settles natively,
 ///   memory routes to its raw apply — so a verb deleting the marker it settles
 ///   never re-enters this boundary.

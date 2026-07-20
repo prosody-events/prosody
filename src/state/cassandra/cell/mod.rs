@@ -43,12 +43,15 @@
 //! lifecycle invariant on
 //! [`commit_provisional`](CellStore::commit_provisional);
 //! [`write_resolved`](CellStore::write_resolved) applies its direct clears
-//! marker-free. Until the gaps land, reads are defended by **read-help**:
-//! `get`/`scan` (and `get`'s cache-fill twin) resolve a standing
-//! foreign clears-bearing marker through the sweep path before serving — the
-//! committed-unapplied read-window contract stated on
-//! [`get`](CellStore::get) — riding the same memo, so the fast path pays no
-//! durable marker read.
+//! marker-free. Until the gaps land, reads are defended by **read-help** and
+//! blind committed writes by its **write twin**: `get`/`scan` (and `get`'s
+//! cache-fill twin) resolve a standing foreign clears-bearing marker through
+//! the sweep path before serving — the committed-unapplied read-window
+//! contract stated on [`get`](CellStore::get) — and `write_resolved` resolves a
+//! standing clears-bearing marker before landing (the committed-unapplied
+//! write-window contract stated on
+//! [`write_resolved`](CellStore::write_resolved)); both ride the same memo, so
+//! the fast path pays no durable marker read.
 //!
 //! The three cell mutators write exactly one cell-column shape each:
 //!
@@ -1194,11 +1197,10 @@ where
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // The committed routing implemented natively — present data promotes
-        // in place, a staged clear deletes its row (the row-absence
-        // invariant). Cell and
-        // gap rows are disjoint and idempotent: gaps exclude survivors and one
-        // another positionally, while a cell delete inside a gap is a harmless
-        // delete/delete tie.
+        // in place, a staged clear deletes its row (the row-absence invariant).
+        // Cell and gap rows are disjoint and idempotent: gaps exclude survivors
+        // and one another positionally, while a cell delete inside a gap is a
+        // harmless delete/delete tie.
         let pk = Pk::of(collection.id());
         // `units` stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
         let mut units: Vec<BatchUnit<CellBatchRow>> =
