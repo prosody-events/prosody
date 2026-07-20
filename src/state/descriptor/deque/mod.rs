@@ -61,8 +61,11 @@
 //! the **front** and [`DequeHandle::push_front`] from the **back**, at most
 //! `TRIM_MAX` slots per push and decode-free / resolver-free — each a
 //! single-cell clear co-stamped with the append and the bounds move. So a
-//! persisted window may exceed the cap; a reduction of excess `D` converges in
-//! `⌈D / (TRIM_MAX − 1)⌉` pushes.
+//! persisted window may exceed the cap; for a **measurable** window a reduction
+//! of excess `D` converges in `⌈D / (TRIM_MAX − 1)⌉` pushes. An unmeasurable
+//! span (only reachable from a corrupt or hand-seeded bounds cell) under an
+//! absurd (`≈ 2^63`) cap deliberately under-evicts and may not converge — the
+//! safe direction, never erasing in-capacity cells (see `evictions`).
 
 use super::{
     CellCodecError, CellScope, CellStateError, CellType, CellView, CollectionSpec, ContextOf,
@@ -107,8 +110,9 @@ pub(crate) const DEQUE_POINT_ITERATION_MAX: usize = 128;
 /// The most window slots a single bounded push evicts, bounding per-event
 /// eviction work. `>= 2` so a full push nets a `TRIM_MAX − 1` window reduction:
 /// a push appends one slot, so at `1` it would evict one and append one and
-/// never shrink an over-wide window. A capacity reduction of excess `D`
-/// therefore converges in `⌈D / (TRIM_MAX − 1)⌉` pushes. See `evictions`.
+/// never shrink an over-wide window. This net reduction is what converges a
+/// measurable over-wide window toward the cap (rate and the unmeasurable-span
+/// caveat are on the module's capacity invariant; see `evictions`).
 pub(crate) const TRIM_MAX: usize = 2;
 
 const _: () = assert!(TRIM_MAX >= 2, "a bounded push must net a window reduction");
