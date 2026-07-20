@@ -446,9 +446,11 @@ where
     ) -> Result<(), Self::Error> {
         // The write-side committed-unapplied boundary (`help_write_window`):
         // resolve any standing clears-bearing marker before this blind write,
-        // so a stale clear's later replay can never erase it. Marker-free
-        // otherwise (the marker lifecycle belongs to the staged verbs). The
-        // marker map is RAM — the ~always marker-free fast path costs one read.
+        // ordering the write after that resolution so a stale clear's replay
+        // cannot erase it (modulo the concurrent-resolver residual documented on
+        // `help_write_window`). Marker-free otherwise (the marker lifecycle
+        // belongs to the staged verbs). The marker map is RAM — the ~always
+        // marker-free fast path costs one read.
         let standing = self.standing_marker(collection.id()).await?;
         help_write_window(self, self.resolver.oracle(), collection, standing.as_ref())
             .await

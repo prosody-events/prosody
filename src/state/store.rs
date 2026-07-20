@@ -478,11 +478,16 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// Before writing, each bottom store resolves any standing clears-bearing
     /// event marker (`help_write_window` in `resolve`, the write-side twin of
-    /// the read window on [`Self::get`]), so a committed write can never be
-    /// silently erased by a stale clear's positional replay. The settle verbs
-    /// bypass this boundary (they delete the very marker they settle); only the
-    /// blind writes — the mid-handler `commit()` and the `ReadUncommitted`
-    /// direct apply — reach it.
+    /// the read window on [`Self::get`]), ordering this write after that
+    /// resolution so a stale clear's positional replay cannot erase it —
+    /// subject to the concurrent-resolver residual stated on
+    /// `help_write_window`. The settle verbs bypass this boundary (they
+    /// delete the very marker they settle); the callers that can reach it
+    /// *with a standing clears-bearing marker* are the blind writes — the
+    /// mid-handler `commit()` and the `ReadUncommitted` direct apply. (The
+    /// `resolve_cell` write-backs also reach `write_resolved`, but only
+    /// ever clears-free or marker-free — see the repair-provenance
+    /// invariant on `resolve_cell`.)
     ///
     /// # Errors
     ///

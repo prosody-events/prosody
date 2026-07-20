@@ -269,7 +269,9 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
     /// provisional, never listed in any event marker, never rolled back (the
     /// bottom store resolves any standing clears-bearing marker before the
     /// write lands — the write-side committed-unapplied window on
-    /// `write_resolved` — so a stale clear's replay can never erase it). Ops
+    /// `write_resolved` — ordering the write after that resolution so a stale
+    /// clear's replay cannot erase it, subject to the concurrent-resolver
+    /// residual noted there). Ops
     /// buffered *after* the commit ride the collection's normal stage→settle
     /// path; reads already see buffered
     /// writes without committing.

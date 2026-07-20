@@ -1067,7 +1067,9 @@ where
     ) -> Result<(), Self::Error> {
         // The write-side committed-unapplied boundary (`help_write_window`):
         // resolve any standing clears-bearing event marker before this blind
-        // write lands, so a stale clear's positional replay can never erase it.
+        // write lands, ordering the write after that resolution so a stale
+        // clear's positional replay cannot erase it (modulo the
+        // concurrent-resolver residual documented on `help_write_window`).
         // Memo-backed (`standing_marker`): one RAM/presence check steady-state,
         // and the first marker consumer per collection per assignment pays the
         // one durable seed read. The verb still never *writes* the marker slice

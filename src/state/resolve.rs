@@ -399,9 +399,24 @@ where
 /// cleared section while the clears-bearing marker still stands is erased when
 /// the marker later resolves. Resolving first closes that window:
 ///
-/// > **Invariant.** A resolved write lands strictly *after* any standing
-/// > clears-bearing marker resolves, so a committed write can never be silently
-/// > erased by a stale clear's replay.
+/// > **Ordering guarantee.** The resolved write lands strictly *after* the
+/// > standing clears-bearing marker resolution this boundary performs, so a
+/// > blind write can no longer drop into a section that a still-standing clear
+/// > will replay over.
+///
+/// # Not single-flight (open correctness residual)
+///
+/// This ordering holds against the resolution *this* boundary performs, not
+/// against every resolver. [`resolve_marker`] is not guarded per collection: it
+/// captures the marker snapshot, then reads before it mutates. A **concurrent**
+/// resolver that captured the same marker before this write landed — a
+/// gate-free scan's read-help, another `write_resolved` — can still resume and
+/// replay that marker's frozen clears at a fresh timestamp *after* the write,
+/// erasing it. This stale-marker-replay race lives in the shared
+/// [`resolve_marker`] core, so [`help_read_window`] carries it too — any
+/// resolver entrant can erase an intervening committed write. Closing it
+/// requires single-flighting marker resolution across every entrant, not a
+/// change at this boundary. It is tracked as a known open correctness residual.
 ///
 /// Returns whether it resolved. The read twin [`help_read_window`] is called
 /// concurrently with a raw read whose result it re-issues on a `true`; the
