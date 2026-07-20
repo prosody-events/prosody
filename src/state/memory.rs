@@ -9,18 +9,17 @@ use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, help_read_window, peek_read, resolve_marker,
-    resolve_read,
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
+    resolve_marker, resolve_read,
 };
-use super::store::{
-    CellBuffer, CellStore, CoordinateBatch, provisional_point_loop, route_abort, route_commit,
-};
+use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
 use super::{CollectionId, CollectionRef, EventRef, StateType};
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::Stream;
 use scc::hash_map::Entry;
+use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
@@ -197,6 +196,50 @@ where
                 .remove_async(&(collection.clone(), cell.clone()))
                 .await;
             self.warm.clear(collection, &cell).await;
+        }
+    }
+
+    /// The raw resolved-write apply — erase the cleared sections, then upsert
+    /// present values / remove absent ones (the row-absence invariant), and
+    /// drop each cell's provisional coordinate from the [`WarmIndex`]. Shared
+    /// by the trait [`write_resolved`](CellStore::write_resolved) (which runs
+    /// the write-help boundary first) and the settle verbs (which run while the
+    /// marker being settled still stands and must NOT re-enter the boundary —
+    /// re-entry would recurse on that marker's own resolution).
+    async fn apply_resolved(
+        &self,
+        collection: &CollectionId,
+        cells: &[(CellKey, Option<Bytes>)],
+        clears: &[SectionClear],
+    ) {
+        // Erase the cleared sections before upserting `cells` (belt-and-braces
+        // — survivors are excluded positionally anyway).
+        for clear in clears {
+            self.erase_clear(collection, clear).await;
+        }
+        for (cell, data) in cells {
+            match data {
+                // Present value: upsert the resolved cell.
+                Some(_) => {
+                    self.map()
+                        .upsert_async(
+                            (collection.clone(), cell.clone()),
+                            StoredCell::Resolved(data.clone()),
+                        )
+                        .await;
+                }
+                // Absent value: remove the entry (the row-absence invariant —
+                // a missing entry already reads `Resolved(Committed(None))` via
+                // `read_raw`'s default). Removing an absent key is a no-op.
+                None => {
+                    self.map()
+                        .remove_async(&(collection.clone(), cell.clone()))
+                        .await;
+                }
+            }
+            // Rollback/committed-write resolves the cell; drop its provisional
+            // coordinate (a no-op for a never-staged direct write).
+            self.warm.clear(collection, cell).await;
         }
     }
 }
@@ -401,36 +444,16 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // Erase the cleared sections before upserting `cells` (belt-and-braces
-        // — survivors are excluded positionally anyway). `write_resolved`
-        // never touches the marker map.
-        for clear in clears {
-            self.erase_clear(collection.id(), clear).await;
-        }
-        for (cell, data) in cells {
-            match data {
-                // Present value: upsert the resolved cell.
-                Some(_) => {
-                    self.map()
-                        .upsert_async(
-                            (collection.id().clone(), cell.clone()),
-                            StoredCell::Resolved(data.clone()),
-                        )
-                        .await;
-                }
-                // Absent value: remove the entry (the row-absence invariant —
-                // a missing entry already reads `Resolved(Committed(None))` via
-                // `read_raw`'s default). Removing an absent key is a no-op.
-                None => {
-                    self.map()
-                        .remove_async(&(collection.id().clone(), cell.clone()))
-                        .await;
-                }
-            }
-            // Rollback/committed-write resolves the cell; drop its provisional
-            // coordinate (a no-op for a never-staged direct write).
-            self.warm.clear(collection.id(), cell).await;
-        }
+        // The write-side committed-unapplied boundary (`help_write_window`):
+        // resolve any standing clears-bearing marker before this blind write,
+        // so a stale clear's later replay can never erase it. Marker-free
+        // otherwise (the marker lifecycle belongs to the staged verbs). The
+        // marker map is RAM — the ~always marker-free fast path costs one read.
+        let standing = self.standing_marker(collection.id()).await?;
+        help_write_window(self, self.resolver.oracle(), collection, standing.as_ref())
+            .await
+            .map_err(flatten_resolve)?;
+        self.apply_resolved(collection.id(), cells, clears).await;
         Ok(())
     }
 
@@ -473,10 +496,30 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // Route, erase, delete — all idempotent, and memory has no mid-call
-        // crash, so the ordering carries no correctness weight (survivors are
-        // excluded from the erase positionally either way).
-        route_commit(self, collection, writes).await?;
+        // Route present-data cells to a promote (`mark_resolved`) and
+        // absent-data cells to a row-deleting raw apply (the row-absence
+        // invariant), then erase the clears and delete the marker. The raw
+        // `apply_resolved` never re-enters the write-help boundary — the marker
+        // being settled here still stands, so a re-entry would recurse on it.
+        // All steps idempotent, and memory has no mid-call crash, so the
+        // ordering carries no correctness weight (survivors are excluded from
+        // the erase positionally either way).
+        let mut keeps: CellBuffer<CellKey> = SmallVec::with_capacity(writes.len());
+        let mut absents: CellBuffer<(CellKey, Option<Bytes>)> =
+            SmallVec::with_capacity(writes.len());
+        for (cell, write) in writes {
+            if write.data().is_some() {
+                keeps.push(cell.clone());
+            } else {
+                absents.push((cell.clone(), None));
+            }
+        }
+        if !keeps.is_empty() {
+            self.mark_resolved(collection, &keeps).await?;
+        }
+        if !absents.is_empty() {
+            self.apply_resolved(collection.id(), &absents, &[]).await;
+        }
         for clear in clears {
             self.erase_clear(collection.id(), clear).await;
         }
@@ -491,7 +534,16 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        route_abort(self, collection, writes).await?;
+        // Write each staged cell's committed base `prev` back as resolved
+        // (`prev = None` restores exact absence) via the raw apply — which,
+        // unlike the trait `write_resolved`, must not re-enter the write-help
+        // boundary on the marker this abort is deleting — then delete the
+        // marker.
+        let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
+            .iter()
+            .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
+            .collect();
+        self.apply_resolved(collection.id(), &cells, &[]).await;
         self.cells.markers.remove_async(collection.id()).await;
         Ok(())
     }

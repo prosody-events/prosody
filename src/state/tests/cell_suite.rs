@@ -52,7 +52,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeMap, BTreeSet};
@@ -515,6 +515,15 @@ impl Arbitrary for Recovery {
 #[derive(Clone, Debug)]
 struct TraceEvent {
     writes: Vec<(u8, u8, u8, Mutation)>,
+    /// Blind resolved writes issued at the TOP of the event, BEFORE any stage —
+    /// modelling the mid-handler `commit()` / `ReadUncommitted` direct apply
+    /// (`write_resolved`). Deliberately **cells-only** (no clears): a
+    /// blind-clears dimension would need gap-trim modelling, and
+    /// `write_resolved`'s clears leg keeps its coverage through the stage path.
+    /// Their whole purpose is to land into a section whose PRIOR event's
+    /// clears-bearing marker still stands, so the write-side boundary
+    /// (`help_write_window`) is exercised over generated traces.
+    blind: Vec<(u8, u8, u8, Mutation)>,
     /// Durable section clears as `(collection, section idx)`. Deduped; the
     /// clear's collection is drawn independently of the writes', so
     /// clears-only stages (a clear on a collection the event never writes)
@@ -538,6 +547,10 @@ impl Arbitrary for TraceEvent {
             .into_iter()
             .map(|(coll, s, c, m)| (coll % POOL, section_idx(s), c % CRASH_CELLS, m))
             .collect();
+        let blind = capped_vec::<(u8, u8, u8, Mutation)>(g, 2)
+            .into_iter()
+            .map(|(coll, s, c, m)| (coll % POOL, section_idx(s), c % CRASH_CELLS, m))
+            .collect();
         let mut clears: Vec<(u8, u8)> = capped_vec::<(u8, u8)>(g, 2)
             .into_iter()
             .map(|(coll, s)| (coll % POOL, section_idx(s)))
@@ -546,6 +559,7 @@ impl Arbitrary for TraceEvent {
         clears.dedup();
         Self {
             writes,
+            blind,
             clears,
             outcome: Outcome::arbitrary(g),
             recovery: Recovery::arbitrary(g),
@@ -567,11 +581,24 @@ impl Arbitrary for TraceEvent {
                 ..base.clone()
             }
         });
+        let blind = self.blind.shrink().map({
+            let base = base.clone();
+            move |blind| Self {
+                blind,
+                ..base.clone()
+            }
+        });
         let clears = self.clears.shrink().map(move |clears| Self {
             clears,
             ..base.clone()
         });
-        Box::new(unfaulted.into_iter().chain(writes).chain(clears))
+        Box::new(
+            unfaulted
+                .into_iter()
+                .chain(writes)
+                .chain(blind)
+                .chain(clears),
+        )
     }
 }
 
@@ -601,6 +628,10 @@ type PlannedStage = (u8, Vec<((u8, u8), Mutation)>, Vec<u8>);
 
 /// One event's stage plan, grouped by collection.
 type StagePlan = Vec<PlannedStage>;
+
+/// One collection's blind-write plan entry: the pool slot and its collapsed
+/// `((section idx, coord), mutation)` cell set (blind writes carry no clears).
+type PlannedBlind = (u8, Vec<((u8, u8), Mutation)>);
 
 /// Groups an event's flat writes by collection (first-seen order, repeats of a
 /// cell collapsed last-writer-wins) and merges in its durable clears — a
@@ -809,11 +840,12 @@ struct Deferred {
 /// staged row keys, and its clear half; `None` ⇒ no marker stands), and the
 /// per-slot lingering (deferred) stages whose convergence/row-shape checks
 /// wait for resolution. The marker model is set on stage; cleared by a clean
-/// settle, a sweep, or — for a clears-bearing marker — the first foreign read
-/// (read-help, [`Self::note_read_help`]); **kept** by clears-free
-/// crash→first-touch (first-touch is marker-free — the over-report the model
-/// pins), a deferral, and a settle failure; replaced by the next stage
-/// (boundary overwrite).
+/// settle, a sweep, the first foreign read (read-help,
+/// [`Self::note_read_help`], clears-bearing only), or a blind write's
+/// write-help ([`Self::apply_write_help`], clears-bearing only); **kept** by
+/// clears-free crash→first-touch (first-touch is marker-free — the over-report
+/// the model pins), a deferral, and a settle failure; replaced by the next
+/// stage (boundary overwrite).
 struct TraceState {
     model: Vec<BTreeMap<(u8, u8), Option<Bytes>>>,
     marker_model: Vec<Option<(u128, RowKeys, ClearMap)>>,
@@ -857,6 +889,75 @@ impl TraceState {
         for &((s, c), mutation) in cells {
             self.model[slot].insert((s, c), mutation.value());
         }
+    }
+
+    /// Models the write-side committed-unapplied boundary (`help_write_window`)
+    /// a blind `write_resolved` runs before it writes: a standing
+    /// **clears-bearing** marker on `slot` is resolved WHOLE (the marker being
+    /// deleted, its stage settled) before the blind cells land. A committed
+    /// stage already advanced the model at its flush; an uncommitted one rolls
+    /// its staged writes back to their `prev`s. A clears-FREE marker is left
+    /// standing (the boundary no-ops on it), so this leaves `deferred[slot]`
+    /// intact for the later resolution — the caller then trims the
+    /// blind-overwritten cells from it. Mirrors `note_read_help`, but per-slot
+    /// and deferral-settling.
+    fn apply_write_help(&mut self, slot: usize) {
+        if self.marker_model[slot]
+            .as_ref()
+            .is_some_and(|(_, _, clears)| !clears.is_empty())
+        {
+            if let Some(d) = self.deferred[slot].take()
+                && !d.committed
+            {
+                self.apply_rollback(slot, &d.writes);
+            }
+            self.marker_model[slot] = None;
+        }
+    }
+
+    /// Issues one event's blind resolved writes against `store` (the
+    /// mid-handler `commit()` / `ReadUncommitted` direct apply) and keeps
+    /// the model in step. Grouped by collection (last-writer-wins per
+    /// cell); each collection's write settles any standing clears-bearing
+    /// marker in the model ([`Self::apply_write_help`]) before the cells
+    /// land, then the blind cells advance the model. A clears-FREE marker's
+    /// deferral survives the boundary no-op, so the blind-overwritten cells
+    /// are trimmed from it — the marker's eventual resolution drops them
+    /// via the ownership check (sound on both verdict arms — the blind ops
+    /// carry no clears).
+    async fn apply_blind_writes<S>(
+        &mut self,
+        store: &FailingCellStore<S>,
+        refs: &[CollectionRef],
+        blind: &[(u8, u8, u8, Mutation)],
+    ) -> Result<()>
+    where
+        S: CellStore,
+    {
+        let mut plan: Vec<PlannedBlind> = Vec::new();
+        for &(coll, s, c, mutation) in blind {
+            match plan.iter_mut().find(|(p, _)| *p == coll) {
+                Some((_, cells)) => collapse_cell_into(cells, (s, c), mutation),
+                None => plan.push((coll, vec![((s, c), mutation)])),
+            }
+        }
+        for (coll, cells) in &plan {
+            let slot = *coll as usize;
+            self.apply_write_help(slot);
+            let resolved: Vec<(CellKey, Option<Bytes>)> = cells
+                .iter()
+                .map(|&((s, c), mutation)| (cell_in(s, c), mutation.value()))
+                .collect();
+            store.write_resolved(&refs[slot], &resolved, &[]).await?;
+            for &((s, c), mutation) in cells {
+                self.model[slot].insert((s, c), mutation.value());
+            }
+            if let Some(d) = self.deferred[slot].as_mut() {
+                d.writes
+                    .retain(|(cell, _)| !cells.iter().any(|&((s, c), _)| cell_in(s, c) == *cell));
+            }
+        }
+        Ok(())
     }
 
     /// Models the read-help side effect of the convergence pass: its `get`s on
@@ -1221,9 +1322,13 @@ where
 /// `SettleFailure` outcome (with directed post-failure reads pinning the
 /// delete-first D4 ordering), and the `stage_fault` dimension make
 /// stage-over-a-standing-foreign-marker, committed-unapplied windows,
-/// rejected stages, and fresh-assignment recovery arise organically. A final
-/// sweep + full assertion pass closes every trace, so no trace ends
-/// unchecked.
+/// rejected stages, and fresh-assignment recovery arise organically. The
+/// per-event `blind` dimension issues mid-handler `write_resolved`s at the top
+/// of each event, so a blind write lands into a section whose prior event's
+/// clears-bearing marker still stands — encoding the write-side invariant in
+/// the model: **a write that lands after a committed clear survives the
+/// clear's resolution**, checked on every generated trace. A final sweep +
+/// full assertion pass closes every trace, so no trace ends unchecked.
 pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -1244,6 +1349,12 @@ where
     for (index, ev) in trace.events.into_iter().enumerate() {
         let dedup_id = Uuid::from_u128(index as u128);
         let event = EventRef::Message { dedup_id };
+
+        // Blind resolved writes run at the TOP of the event, BEFORE any stage —
+        // the mid-handler `commit()` / `ReadUncommitted` direct apply — so each
+        // lands AFTER the write-side boundary resolves any standing
+        // clears-bearing marker (the defect this phase closes).
+        state.apply_blind_writes(&store, &refs, &ev.blind).await?;
 
         // Mid-fan-out tears at CELL granularity: a whole-cell prefix of the
         // stage landed, never a torn cell. Model it by dropping the last
@@ -1368,6 +1479,150 @@ where
         return Ok(false);
     }
     assert_physical(probe, &ids, &state).await
+}
+
+/// Deterministic regression pin (both backends): a blind resolved write that
+/// lands into a section whose clears-bearing marker still stands survives the
+/// marker's later resolution. The write-side committed-unapplied boundary
+/// (`help_write_window`) resolves the standing marker BEFORE the blind cell is
+/// written, so the clear's positional gap erase runs while the cell does not
+/// yet exist and the cell lands on top.
+///
+/// The failed-settle durable shape is reproduced directly (crash-simulation
+/// idiom — real verbs, nothing forgotten): stage a committed event's
+/// clears-bearing marker and leave it standing (no settle), then blind-write a
+/// **non-survivor** coordinate of the cleared section, then resolve the marker
+/// through the sweep. Without the boundary the clear replays at a fresh
+/// timestamp and erases the blind cell (the falsification: remove the boundary
+/// from the store under test → the survival assertion reddens).
+pub(crate) async fn run_blind_write_survives_stale_clear<S>(
+    store: S,
+    oracle: ScriptedOracle,
+) -> Result<()>
+where
+    S: CellStore,
+{
+    let (_ids, refs) = pooled_collections()?;
+    let event_a = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+
+    // Stage collection 0's committed clears-bearing marker and leave it standing
+    // (do NOT settle) — exactly the shape a failed settle leaves behind.
+    let survivor = cell_in(0, 0);
+    let prev = store.get(refs[0].id(), &survivor, event_a).await?;
+    let writes = vec![(
+        survivor.clone(),
+        ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
+    )];
+    let clears = vec![SectionClear::frozen(SECTIONS[0], &writes)];
+    let marker = EventMarker::frozen(event_a, &writes, &clears);
+    store
+        .write_provisional(&refs[0], &writes, Some(&marker))
+        .await?;
+    oracle.record_message(Uuid::from_u128(1)).await?;
+
+    // Blind-write a NON-survivor coordinate of the cleared section. With the
+    // boundary, marker A resolves first (its gap erase runs before this cell
+    // exists), then this cell lands on top.
+    let blind = cell_in(0, 5);
+    store
+        .write_resolved(&refs[0], &[(blind.clone(), Some(bytes(9)))], &[])
+        .await?;
+
+    // Resolve the marker the way production does; with the boundary the marker
+    // is already gone (a no-op), without it the erasing clears replay HERE.
+    sweep_provisional(&store, &oracle, &refs[0]).await?;
+
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX / 2),
+    };
+    ensure!(
+        store.get(refs[0].id(), &blind, probe).await?.into_inner() == Some(bytes(9)),
+        "blind write erased by a stale clears replay"
+    );
+    ensure!(
+        store
+            .get(refs[0].id(), &survivor, probe)
+            .await?
+            .into_inner()
+            == Some(bytes(1)),
+        "the staged survivor did not promote to its committed value"
+    );
+    Ok(())
+}
+
+/// Posture-parity pin (both backends): a blind resolved write leaves a standing
+/// **clears-free** marker standing — the write-side boundary triggers only on
+/// clears (the mirror of read-help's trigger), so a first-touch marker is never
+/// settled by an unrelated blind write. Raw probes throughout: a `get` of the
+/// staged cell would first-touch-resolve it and destroy the shape under test.
+///
+/// Falsification: drop the clears-empty short-circuit in `help_write_window` →
+/// the blind write resolves the clears-free marker (oracle not committed →
+/// abort: the staged cell rolls back, the marker is deleted) → the marker
+/// assertion reddens on both backends.
+pub(crate) async fn run_blind_write_leaves_clears_free_marker<S, P>(
+    store: S,
+    probe: &P,
+) -> Result<()>
+where
+    S: CellStore,
+    P: ShapeProbe,
+{
+    let (_ids, refs) = pooled_collections()?;
+    let id = refs[0].id();
+    let event_a = EventRef::Message {
+        dedup_id: Uuid::from_u128(1),
+    };
+
+    // Stage a clears-FREE marker; the commit is deliberately NOT recorded (a
+    // clears-free marker is never consulted, so the verdict is irrelevant).
+    let staged = cell_in(0, 0);
+    let prev = store.get(id, &staged, event_a).await?;
+    let writes = vec![(
+        staged.clone(),
+        ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
+    )];
+    let marker = EventMarker::frozen(event_a, &writes, &[]);
+    store
+        .write_provisional(&refs[0], &writes, Some(&marker))
+        .await?;
+
+    // Blind-write a different coordinate.
+    let blind = cell_in(0, 5);
+    store
+        .write_resolved(&refs[0], &[(blind.clone(), Some(bytes(9)))], &[])
+        .await?;
+
+    let (expected_staged, expected_clears) = probed_parts(&marker);
+    ensure!(
+        probe.standing_marker(id).await?
+            == Some((event_a, expected_staged.clone(), expected_clears.clone())),
+        "a blind write must leave a clears-free marker standing"
+    );
+    ensure!(
+        probe
+            .provisional_rows(id)
+            .await?
+            .contains(&row_key(&staged)),
+        "the staged provisional row must survive the blind write"
+    );
+
+    // The blind cell reads back, and the marker STILL stands after the read
+    // (read-help leaves clears-free markers standing too — parity with reads).
+    let read_event = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX / 2),
+    };
+    ensure!(
+        store.get(id, &blind, read_event).await?.into_inner() == Some(bytes(9)),
+        "the blind write did not read back"
+    );
+    ensure!(
+        probe.standing_marker(id).await? == Some((event_a, expected_staged, expected_clears)),
+        "reading a clears-free marker's collection must leave it standing"
+    );
+    Ok(())
 }
 
 // ─────────────────────────── implicit overwrite

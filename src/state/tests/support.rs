@@ -355,9 +355,8 @@ impl<S> CountingCellStore<S> {
 
     /// Total durable mutations (excludes reads). Folds the two settle verbs in:
     /// a forwarded `commit_provisional` / `abort_provisional` routes through
-    /// the *inner* store's `mark_resolved` / `write_resolved`, invisible to
-    /// this wrapper's per-primitive counters, so the settle itself is
-    /// counted here.
+    /// the *inner* store's own primitives, invisible to this wrapper's
+    /// per-primitive counters, so the settle itself is counted here.
     pub(crate) fn durable_writes(&self) -> usize {
         self.counts.write_provisional.load(Ordering::Relaxed)
             + self.counts.write_resolved.load(Ordering::Relaxed)

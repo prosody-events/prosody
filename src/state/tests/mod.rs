@@ -9,7 +9,8 @@ use self::cell_suite::{
     ApplyTrace, BatchReadTrace, FailingCellStore, FailingOracle, MemoryShapeProbe, OverlayTrace,
     OverwriteTrace, PoisonHandle, RawBatchTrace, ScanTrace, ScriptedOracle, Trace,
     run_apply_idempotence, run_batch_alignment, run_batch_duplicate_co_observation,
-    run_batch_read_parity_trace, run_bottom_scan_trace, run_crash_equivalence_trace,
+    run_batch_read_parity_trace, run_blind_write_leaves_clears_free_marker,
+    run_blind_write_survives_stale_clear, run_bottom_scan_trace, run_crash_equivalence_trace,
     run_overlay_precedence_pin, run_overlay_trace, run_overwrite_trace,
     run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
 };
@@ -127,6 +128,29 @@ fn prop_memory_cell_crash_equivalence() {
         ))
     }
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
+}
+
+/// Regression pin over the memory store: a blind `write_resolved` into a
+/// section whose clears-bearing marker still stands survives the marker's later
+/// resolution (the write-side committed-unapplied boundary). Falsify by
+/// deleting the `standing_marker` + `help_write_window` lines in
+/// `MemoryCellStore::write_resolved`.
+#[test]
+fn blind_write_survives_stale_clear() -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let store = memory_store(MemoryCells::new(), oracle.clone());
+    executor::block_on(run_blind_write_survives_stale_clear(store, oracle))
+}
+
+/// Posture-parity pin over the memory store: a blind `write_resolved` leaves a
+/// standing clears-FREE marker standing (the boundary triggers on clears only).
+#[test]
+fn blind_write_leaves_clears_free_marker() -> Result<()> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let store = memory_store(cells.clone(), oracle);
+    let probe = MemoryShapeProbe(cells);
+    executor::block_on(run_blind_write_leaves_clears_free_marker(store, &probe))
 }
 
 /// Implicit-overwrite soundness over the memory cell store: a sequence of

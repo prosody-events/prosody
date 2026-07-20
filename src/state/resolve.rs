@@ -352,6 +352,79 @@ where
     }
 }
 
+/// The committed-unapplied **write** window — the write-side twin of
+/// [`help_read_window`], sharing its clears-triggered core.
+///
+/// Before a durable resolved write lands (the marker-free
+/// [`CellStore::write_resolved`]), any standing event marker that carries
+/// section clears is resolved through the sweep path ([`resolve_marker`]).
+/// A clear's gap deletes are **positional, never temporal** — they exclude only
+/// the frozen survivors at a fresh driver timestamp — so a cell written into a
+/// cleared section while the clears-bearing marker still stands is erased when
+/// the marker later resolves. Resolving first closes that window:
+///
+/// > **Invariant.** A resolved write lands strictly *after* any standing
+/// > clears-bearing marker resolves, so a committed write can never be silently
+/// > erased by a stale clear's replay.
+///
+/// Returns whether it resolved, so a caller that read concurrently re-issues.
+/// Markers without clears are left standing (first-touch stays cell-grained and
+/// marker-free); the whole write cost stays one memoized standing-marker read
+/// on the ~always marker-free fast path. A resolution failure fails the write,
+/// retryable by the caller.
+///
+/// # No own-event guard
+///
+/// Unlike [`help_read_window`], [`CellStore::write_resolved`] carries no
+/// [`EventRef`], so this helper resolves a standing clears-bearing marker
+/// regardless of whose event owns it. A standing **own-event** marker is
+/// impossible or benign at every production caller:
+///
+/// * **Session `commit()` / `ReadUncommitted` finalize.** Both write *before*
+///   the event's own stage exists (`ReadUncommitted` never stages), so a
+///   standing same-event marker there is a previous attempt's (or a crashed
+///   incarnation's) uncommitted stage — [`EventRef`] is attempt-independent and
+///   a marker-record that actually landed dedup-filters the redispatch, so the
+///   handler would not be re-running. Resolving it performs the exact
+///   oracle-mediated abort the armed sweep would.
+/// * **[`resolve_cell`] write-backs** (first-touch point reads and the sweep
+///   mop-up). Point reads run [`help_read_window`] first and per-key dispatch
+///   serializes every message, timer fire, and recovery backstop, so no new
+///   foreign marker appears mid-read; what can still stand is clears-free
+///   (no-op) or the reading event's own marker — a post-settle hook window
+///   whose resolution merely completes the promote the sweep would, or a
+///   mid-retry stale stage the abort discards. In the sweep mop-up a standing
+///   marker means the marker leg just permanently failed, so re-failing the
+///   cell write-back is the **safe** direction: resolving a cell to committed
+///   under a stuck committed clear would materialize the very row the clear's
+///   eventual replay erases.
+/// * **The settle verbs never pass through** — Cassandra settles natively,
+///   memory routes to its raw apply — so a verb deleting the marker it settles
+///   never re-enters this boundary.
+///
+/// # Errors
+///
+/// Returns [`ResolveCellError`] as [`resolve_marker`] would.
+pub(crate) async fn help_write_window<S, O>(
+    store: &S,
+    oracle: &O,
+    collection: &CollectionRef,
+    marker: Option<&EventMarker>,
+) -> Result<bool, ResolveCellError<S::Error, O::Error>>
+where
+    S: CellStore,
+    O: CommitOracle,
+{
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    if marker.clears().is_empty() {
+        return Ok(false);
+    }
+    resolve_marker(store, oracle, collection, marker).await?;
+    Ok(true)
+}
+
 /// The committed-unapplied read window: a standing **foreign** event marker
 /// that carries section clears means gap tombstones may not have landed yet,
 /// and a pre-clear resolved row cannot be caught by per-cell oracle resolution
@@ -361,10 +434,12 @@ where
 ///
 /// The one read-help decision, shared by both bottom stores' `get`/`scan`
 /// pairs. Returns whether it resolved, so a caller that read concurrently with
-/// the marker consult re-issues its raw read. The own-event guard is
-/// load-bearing: the staging event's own reads between stage and settle must
-/// NOT resolve its own marker (that would settle the event mid-flight) — the
-/// trigger is strictly *foreign AND clears non-empty*.
+/// the marker consult re-issues its raw read. It shares the clears-triggered
+/// core with its write-side twin [`help_write_window`]; the own-event guard is
+/// the read side's sole addition and is load-bearing: the staging event's own
+/// reads between stage and settle must NOT resolve its own marker (that would
+/// settle the event mid-flight) — the trigger is strictly *foreign AND clears
+/// non-empty*.
 ///
 /// # Errors
 ///
@@ -380,14 +455,10 @@ where
     S: CellStore,
     O: CommitOracle,
 {
-    let Some(marker) = marker else {
-        return Ok(false);
-    };
-    if marker.event() == own || marker.clears().is_empty() {
-        return Ok(false);
+    match marker {
+        Some(marker) if marker.event() == own => Ok(false),
+        marker => help_write_window(store, oracle, collection, marker).await,
     }
-    resolve_marker(store, oracle, collection, marker).await?;
-    Ok(true)
 }
 
 /// Resolves a collection's in-flight stage during recovery. Returns `true` iff

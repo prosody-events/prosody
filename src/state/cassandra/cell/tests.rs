@@ -33,8 +33,9 @@ use crate::state::tests::cell_suite::{
     ApplyTrace, BatchReadTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle,
     ProbedMarker, RawBatchTrace, SECTIONS, ScanTrace, ScriptedOracle, ShapeProbe, Trace, bytes,
     cell_in, probed_parts, run_apply_idempotence, run_batch_alignment,
-    run_batch_duplicate_co_observation, run_batch_read_parity_trace, run_bottom_scan_trace,
-    run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
+    run_batch_duplicate_co_observation, run_batch_read_parity_trace,
+    run_blind_write_leaves_clears_free_marker, run_blind_write_survives_stale_clear,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
     run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
     value_cell,
 };
@@ -459,11 +460,12 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 /// fit one `<=CELL_BATCH` chunk here). The committed cells live in the
 /// `kind=Cell` range recovery never touches, so they cost nothing.
 ///
-/// This also pins who pays the seed: a committed `write_resolved` is
-/// marker-free by design (no counter moves), the FIRST read pays the one
-/// durable marker read (read-help's cold-memo seed), and every later consumer
-/// rides the memo. The fixed values are non-vacuous: the same counters stay
-/// exactly 1 across five more marker consumers below.
+/// This also pins who pays the seed: a committed `write_resolved` still never
+/// *writes* the marker slice, but its write-side boundary (`help_write_window`)
+/// is now the first marker consumer, so it pays the one durable seed read; the
+/// FIRST read, the scan, the stage boundary, and both sweeps then ride the
+/// memo. The fixed value is non-vacuous: the same counter stays exactly 1
+/// across six marker consumers spanning the write, reads, stage, and sweeps.
 ///
 /// Sizes are kept modest (not large production scale) so the live test stays
 /// fast; 16× is ample to distinguish an O(#cells) regression, which would
@@ -480,8 +482,9 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         let store = fx.bottom_store(ScriptedOracle::default());
         let c = collection(&format!("bounded-{committed}"))?;
 
-        // `committed` resolved cells: marker-free (no event marker written) —
-        // the counters must not move on the write itself.
+        // `committed` resolved cells: the write never writes the marker slice,
+        // but its write-side boundary is the first marker consumer of the
+        // assignment, so it pays the one durable seed read and seeds the memo.
         let counts = store.recovery_reads();
         let resolved: Vec<(CellKey, Option<Bytes>)> = (0..committed)
             .map(|i| (cell_i(i), Some(Bytes::from(i.to_be_bytes().to_vec()))))
@@ -489,12 +492,12 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         store.write_resolved(&c, &resolved, &[]).await?;
         assert_eq!(
             counts.marker_point_reads.load(Ordering::Relaxed),
-            0,
-            "a committed write never issues a durable marker read"
+            1,
+            "the write boundary pays the one durable seed read on a cold memo"
         );
 
-        // The FIRST read pays the one durable marker read of the whole
-        // assignment: read-help seeds the cold memo alongside the point read.
+        // The FIRST read rides the memo the write already seeded — no further
+        // durable marker read.
         assert!(
             store
                 .get(c.id(), &cell_i(0), event(1))
@@ -506,7 +509,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
         assert_eq!(
             counts.marker_point_reads.load(Ordering::Relaxed),
             1,
-            "the first read seeds the marker memo with one durable read"
+            "the first read rides the memo the write seeded — still one durable read"
         );
         // A whole-section scan (its read-help rides the memo: still one
         // durable marker read).
@@ -1353,6 +1356,41 @@ fn prop_cassandra_cell_crash_equivalence() {
     QuickCheck::new()
         .tests(integration_test_count(25))
         .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
+}
+
+/// Regression pin over the production `Cached<CassandraStore>` assembly: a
+/// blind `write_resolved` into a section whose clears-bearing marker still
+/// stands survives the marker's later resolution — exercising the helper and
+/// the Cached D3 write leg together. Falsify by deleting the boundary lines in
+/// `CassandraStore::write_resolved` (the survival assertion reddens) or the D3
+/// block in `Cached::write_resolved` (the promoted-cell assertion reddens on
+/// the stale warm Absent entry).
+#[test]
+fn cassandra_blind_write_survives_stale_clear() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let fx = fixture().await?;
+        let oracle = ScriptedOracle::default();
+        let cache = test_db::cold_cache("cassandra_blind_write")?;
+        let presence = cache.presence();
+        let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
+        run_blind_write_survives_stale_clear(store, oracle).await
+    })
+}
+
+/// Posture-parity pin over the bare live store: a blind `write_resolved` leaves
+/// a standing clears-FREE marker standing.
+#[test]
+fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let fx = fixture().await?;
+        let store = fx.bottom_store(ScriptedOracle::default());
+        let probe = CassandraShapeProbe {
+            session: fx.cassandra.clone(),
+        };
+        run_blind_write_leaves_clears_free_marker(store, &probe).await
+    })
 }
 
 /// Apply idempotence over the bare live store: any generated interleaving of

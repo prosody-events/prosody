@@ -103,8 +103,8 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, help_read_window, peek_read, resolve_marker,
-    resolve_read,
+    ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
+    resolve_marker, resolve_read,
 };
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe, section_batches,
@@ -1062,11 +1062,23 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // A marker-free primitive (the marker lifecycle belongs to the staged
-        // verbs — see `CellStore::write_provisional`), so a fresh committed
-        // write never touches the marker slice. Survivors are the present-data
-        // `cells`, excluded from the gaps positionally, so every batch row
-        // stays disjoint and may be packed independently.
+        // The write-side committed-unapplied boundary (`help_write_window`):
+        // resolve any standing clears-bearing event marker before this blind
+        // write lands, so a stale clear's positional replay can never erase it.
+        // Memo-backed (`standing_marker`): one RAM/presence check steady-state,
+        // and the first marker consumer per collection per assignment pays the
+        // one durable seed read. The verb still never *writes* the marker slice
+        // (the marker lifecycle belongs to the staged verbs — see
+        // `CellStore::write_provisional`); the resolution runs through this
+        // store's own `commit_provisional`/`abort_provisional`, keeping the
+        // memo coherent.
+        let standing = self.standing_marker(collection.id()).await?;
+        help_write_window(self, self.resolver.oracle(), collection, standing.as_ref())
+            .await
+            .map_err(flatten_resolve)?;
+        // Survivors are the present-data `cells`, excluded from the gaps
+        // positionally, so every batch row stays disjoint and may be packed
+        // independently.
         let pk = Pk::of(collection.id());
         // Encode each cell's committed `data` up front (owns the `Bytes`); no
         // `prev`, so the blobs carry only `data` + its encoding/version. Both
@@ -1181,8 +1193,9 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // The routing `route_commit` defines — present data promotes in place,
-        // a staged clear deletes its row (the row-absence invariant). Cell and
+        // The committed routing implemented natively — present data promotes
+        // in place, a staged clear deletes its row (the row-absence
+        // invariant). Cell and
         // gap rows are disjoint and idempotent: gaps exclude survivors and one
         // another positionally, while a cell delete inside a gap is a harmless
         // delete/delete tie.
@@ -1229,8 +1242,8 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         // Rollback: write each staged cell's committed base `prev` back as
-        // resolved (`prev = None` restores exact row absence — the routing
-        // `route_abort` defines), then delete the marker.
+        // resolved natively (`prev = None` restores exact row absence), then
+        // delete the marker.
         let pk = Pk::of(collection.id());
         // Synthesized (cell, prev) pairs for the shared `resolved_units` helper;
         // kept a `Vec` (the clones are O(1) `Arc`/`Bytes` refcount bumps) —

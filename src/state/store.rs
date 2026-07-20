@@ -21,8 +21,9 @@
 //! The three mutators work at **collection grain**: each takes the touched
 //! cells of one collection as a slice. The invariant every backend upholds is
 //! **atomic multi-cell commit** — a single `write_provisional` /
-//! `write_resolved` / `mark_resolved` call (hence `commit_provisional` /
-//! `abort_provisional`, which delegate to them) applies *all* its cells
+//! `write_resolved` / `mark_resolved` call (and `commit_provisional` /
+//! `abort_provisional`, which route to a promote plus the raw resolved apply)
+//! applies *all* its cells
 //! together, so no reader and no crash-recovery ever observes a torn subset
 //! (some cells written, others not), and on the Cassandra backend every cell
 //! shares one write timestamp and one TTL anchor (keyset and entries
@@ -473,6 +474,16 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// present-data coordinates — the single survivor definition — so no
     /// written row can overlap a gap range (batches stay row-disjoint).
     ///
+    /// # The committed-unapplied write window
+    ///
+    /// Before writing, each bottom store resolves any standing clears-bearing
+    /// event marker (`help_write_window` in `resolve`, the write-side twin of
+    /// the read window on [`Self::get`]), so a committed write can never be
+    /// silently erased by a stale clear's positional replay. The settle verbs
+    /// bypass this boundary (they delete the very marker they settle); only the
+    /// blind writes — the mid-handler `commit()` and the `ReadUncommitted`
+    /// direct apply — reach it.
+    ///
     /// # Errors
     ///
     /// Returns [`Self::Error`] on a store failure.
@@ -520,9 +531,13 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Settles a staged set as **committed** AND deletes the collection's event
     /// marker: each cell's provisional `data` becomes the committed value.
     ///
-    /// Required with no default (`route_commit` is the reference routing the
-    /// memory backend calls; the Cassandra backend implements the identical
-    /// routing natively with same-partition batches): with markers, a
+    /// Required with no default (present data promotes via
+    /// [`Self::mark_resolved`], absent data deletes its row via the raw
+    /// resolved apply, and the marker is deleted last — the memory backend
+    /// routes to its own raw apply so the settle never re-enters the
+    /// write-help boundary on the marker it is deleting; the Cassandra backend
+    /// implements the identical routing natively with same-partition batches):
+    /// with markers, a
     /// defaulted override behind a trait default is a landmine — a wrapper
     /// store that forgot to forward the verb would fall into a default routing
     /// through the *wrapper's* verbs and bypass the inner store's marker
@@ -639,70 +654,4 @@ pub(crate) async fn provisional_point_loop<S: CellStore>(
         }
     }
     Ok(out)
-}
-
-/// Routes a committed settle to the primitive verbs: present-data cells promote
-/// in place ([`CellStore::mark_resolved`]); absent-data cells
-/// **delete** the row via [`CellStore::write_resolved`]`(cell, None)`,
-/// upholding the row-absence invariant. Both arms are idempotent and
-/// row-disjoint (an event stages each cell at most once), so the two sequential
-/// awaits are order-free; the sweep retries either on failure. A settle with no
-/// absent-data cells issues exactly one `mark_resolved` batch set.
-///
-/// The reference routing: the memory backend calls it before its marker
-/// delete; the Cassandra backend implements the identical routing natively
-/// alongside its gap deletes. Free (not a trait default) so a
-/// wrapper that forwards the verb cannot silently inherit it and bypass the
-/// inner store's marker delete.
-///
-/// # Errors
-///
-/// Returns the store's error on a promote / delete failure.
-pub(crate) async fn route_commit<S>(
-    store: &S,
-    collection: &CollectionRef,
-    writes: &[(CellKey, ProvisionalWrite)],
-) -> Result<(), S::Error>
-where
-    S: CellStore,
-{
-    let mut keeps: CellBuffer<CellKey> = SmallVec::with_capacity(writes.len());
-    let mut clears: CellBuffer<(CellKey, Option<Bytes>)> = SmallVec::with_capacity(writes.len());
-    for (cell, write) in writes {
-        if write.data().is_some() {
-            keeps.push(cell.clone());
-        } else {
-            clears.push((cell.clone(), None));
-        }
-    }
-    if !keeps.is_empty() {
-        store.mark_resolved(collection, &keeps).await?;
-    }
-    if !clears.is_empty() {
-        store.write_resolved(collection, &clears, &[]).await?;
-    }
-    Ok(())
-}
-
-/// Routes an aborted settle to [`CellStore::write_resolved`] over the staged
-/// `prev`s (`prev = None` restores exact absence). The reference rollback
-/// routing — called by the memory backend, implemented natively as one batch
-/// packing by Cassandra — free, for the reason on [`route_commit`].
-///
-/// # Errors
-///
-/// Returns the store's error on a write failure.
-pub(crate) async fn route_abort<S>(
-    store: &S,
-    collection: &CollectionRef,
-    writes: &[(CellKey, ProvisionalWrite)],
-) -> Result<(), S::Error>
-where
-    S: CellStore,
-{
-    let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
-        .iter()
-        .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
-        .collect();
-    store.write_resolved(collection, &cells, &[]).await
 }

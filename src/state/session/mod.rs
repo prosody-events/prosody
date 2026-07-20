@@ -266,7 +266,10 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
     /// reconstructed only when the idempotent handler re-run re-issues the same
     /// ops. The guarantee is **at-least-once**: a
     /// `commit()`-landed write is durable and visible immediately — never
-    /// provisional, never listed in any event marker, never rolled back. Ops
+    /// provisional, never listed in any event marker, never rolled back (the
+    /// bottom store resolves any standing clears-bearing marker before the
+    /// write lands — the write-side committed-unapplied window on
+    /// `write_resolved` — so a stale clear's replay can never erase it). Ops
     /// buffered *after* the commit ride the collection's normal stage→settle
     /// path; reads already see buffered
     /// writes without committing.

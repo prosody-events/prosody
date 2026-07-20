@@ -40,7 +40,7 @@ use crate::error::ErrorCategory;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1054,6 +1054,68 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
             "the fall-through re-warmed the coordinate"
         );
         assert_eq!(counting.lower_reads(), 0, "the re-warmed get reads nothing");
+        Ok(())
+    })
+}
+
+/// D3 write-leg pin (memory-backed): a blind `write_resolved` resolves a
+/// standing clears-bearing marker BENEATH this cache (`help_write_window` in
+/// the lower store), a settle no cache verb observes. The D3 leg deletes the
+/// marker's staged coordinates and cleared sections first, so a later read of a
+/// staged coordinate falls through to the beneath-resolved value instead of
+/// serving the stale published `prev`. Reverting the D3 block freezes the stale
+/// `prev` warm and reddens this pin.
+#[test]
+fn blind_write_deletes_beneath_resolved_marker_window() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let oracle = ScriptedOracle::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let cached = Cached::new(test_db::cache("blind-d3")?, counting);
+        let id = collection("blind-d3")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let event_a = probe(1);
+
+        // Seed a base value (no marker → boundary no-op); the write-through
+        // warms it.
+        cached
+            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
+            .await?;
+
+        // Stage a committed clears-bearing marker through the cache and leave
+        // it standing (no settle). The cache now holds the published `prev`
+        // (bytes(1)) for the staged coordinate.
+        let prev = cached.get(&id, &cell_at(0), event_a).await?;
+        let writes = vec![(
+            cell_at(0),
+            ProvisionalWrite::new(Some(bytes(2)), prev, event_a),
+        )];
+        let clears = vec![SectionClear::frozen(SECTION, &writes)];
+        let marker = EventMarker::frozen(event_a, &writes, &clears);
+        cached
+            .write_provisional(&cref, &writes, Some(&marker))
+            .await?;
+        oracle.record_message(Uuid::from_u128(1)).await?;
+
+        // Blind-write a different coordinate: the lower write resolves marker A
+        // beneath the cache (promoting cell_at(0) to bytes(2) durably), and D3
+        // deletes the staged coordinate's stale warm entry.
+        cached
+            .write_resolved(&cref, &[(cell_at(1), Some(bytes(9)))], &[])
+            .await?;
+
+        let read = probe(u128::MAX / 2);
+        ensure!(
+            cached.get(&id, &cell_at(0), read).await?.get() == Some(&bytes(2)),
+            "the staged coordinate must read the beneath-resolved value, not the stale prev"
+        );
+        ensure!(
+            cached.get(&id, &cell_at(1), read).await?.get() == Some(&bytes(9)),
+            "the blind write did not read back"
+        );
         Ok(())
     })
 }

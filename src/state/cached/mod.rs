@@ -70,7 +70,7 @@
 //! |---|---|---|---|
 //! | D1 | Failed fjall publish after a successful lower write | the written cells' entries | after the lower ack — the durable value moved |
 //! | D2 | Raw `mark_resolved` promote (the value is not carried) | the promoted cells' entries | **before** the lower call — deleting early costs a fall-through; deleting after leaves a promoted-but-cached `prev` on a mid-way cancel, a window the sweep never repairs |
-//! | D3 | Foreign standing marker resolved beneath the cache (fall-through read, `scan_cells`, or the stage boundary) | the marker's staged coordinates **and** cleared sections | before the lower call, verdict-blind; rides the lower store's marker memo |
+//! | D3 | Standing clears-bearing marker resolved beneath the cache (fall-through read, `scan_cells`, the stage boundary, or a blind `write_resolved`) | the marker's staged coordinates **and** cleared sections | before the lower call, verdict-blind; rides the lower store's marker memo |
 //! | D4 | Committed section clears | the cleared sections' entries — at the commit site, **excluding** the staged coordinates the D5 transform just installed | before the lower call — delete-first leaves the sections merely cold on a failed/cancelled lower write |
 //! | D5 | The **settle transform** (`commit_provisional` only) | staged entries rewritten `prev → data` at their stage-anchored expiry, atomically, **before** the lower promote; a failed transform falls back to must-succeed deletion of the same entries | the verdict is already fixed when the verb runs, so `data` *is* the committed projection — installing it pre-call is correct even if the promote fails or the future is dropped, and the staged cells stay **warm** through the settle |
 //!
@@ -678,6 +678,20 @@ where
     ) -> Result<(), Self::Error> {
         if self.fjall.fuse_blown() {
             return self.lower.write_resolved(collection, cells, clears).await;
+        }
+        // D3: the lower `write_resolved` now runs the write-side boundary
+        // (`help_write_window`) — a blind write resolves a standing
+        // clears-bearing marker BENEATH this cache (staged cells promote, gap
+        // tombstones land), a settle no cache verb observes, so no publish
+        // would ever follow. Delete the marker's staged coordinates and cleared
+        // sections first, as the fall-through read guard does. No own event to
+        // compare (`write_resolved` carries no `EventRef`) — deleting an own
+        // marker's window costs a fall-through, never staleness. Rides the
+        // lower store's marker memo, so the fast path adds no durable read.
+        if let Some(standing) = self.lower.standing_marker(collection.id()).await?
+            && !standing.clears().is_empty()
+        {
+            self.delete_marker_window(collection.id(), &standing).await;
         }
         // D4, whole-section, BEFORE the lower call: this is the marker-free
         // direct apply (ReadUncommitted finalize / mid-handler `commit()`) — a
