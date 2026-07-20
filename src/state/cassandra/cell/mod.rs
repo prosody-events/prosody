@@ -39,9 +39,11 @@
 //! The marker also carries the stage's **section clears** (each cleared
 //! section with its frozen survivor list). A committed clear is applied as the
 //! n+1 **gap range deletes** between sorted survivors ([`extend_gap_units`]) —
-//! survivors are excluded positionally, never temporally. Settle follows the
-//! lifecycle invariant on
-//! [`commit_provisional`](CellStore::commit_provisional);
+//! survivors are excluded positionally, never temporally. Settle applies the
+//! lifecycle invariant marker-**last** through the shared
+//! [`issue_marker_last`](CassandraStore::issue_marker_last) tail (used by both
+//! [`commit_provisional`](CellStore::commit_provisional) and its abort twin
+//! [`abort_provisional`](CellStore::abort_provisional));
 //! [`write_resolved`](CellStore::write_resolved) applies its direct clears
 //! marker-free. Until the gaps land, reads are defended by **read-help** and
 //! blind committed writes by its **write twin**: `get`/`scan` (and `get`'s
@@ -1223,8 +1225,8 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // The committed routing implemented natively — present data promotes
-        // in place, a staged clear deletes its row (the row-absence invariant).
+        // Commit applies natively — present data promotes in place, a staged
+        // clear deletes its row (the row-absence invariant).
         // Cell and gap rows are disjoint and idempotent: gaps exclude survivors
         // and one another positionally, while a cell delete inside a gap is a
         // harmless delete/delete tie.

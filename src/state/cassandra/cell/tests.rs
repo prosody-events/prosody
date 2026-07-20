@@ -1777,13 +1777,14 @@ async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
     Ok(())
 }
 
-/// The pure single-batch packing decision `write_provisional` bases its
-/// marker-first ordering on: a unit set fits one batch iff the weight sum is
-/// within the byte budget AND the unit count is within the statement budget.
-/// (The intra-call tear of an over-budget stage cannot be injected through
-/// the trait; the ordering is enforced by the two sequential awaits plus this
-/// decision, and the marker-completeness postcondition guards the durable
-/// shape on every generated trace.)
+/// The pure single-batch packing decision both marker-ordering callers rest
+/// on — `write_provisional`'s stage marker-FIRST choice and
+/// `marker_last_split`'s settle marker-LAST split: a unit set fits one batch
+/// iff the weight sum is within the byte budget AND the unit count is within
+/// the statement budget. (The intra-call tear of an over-budget stage cannot be
+/// injected through the trait; the ordering is enforced by the two sequential
+/// awaits plus this decision, and the marker-completeness postcondition guards
+/// the durable shape on every generated trace.)
 #[test]
 fn fits_one_batch_decides_on_both_budgets() {
     // Strictly under both budgets, and exactly at both boundaries.
