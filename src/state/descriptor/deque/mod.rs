@@ -691,12 +691,13 @@ fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> usize {
     // reachable only from a corrupt or hand-seeded bounds cell) proceeds
     // untouched, exactly as it did before capacity existed.
     let Some(cap) = capacity else { return 0 };
-    // Bounded but unmeasurable: `len` overflows `usize`, but `head <= tail`
-    // (Window invariant) makes an unmeasurable span a length of at least
-    // `i64::MAX as usize`. Evict on that lower bound — realistic caps still trim
-    // the max, while a cap so large the window is actually within it under-evicts
-    // (down to zero) rather than erasing live in-capacity cells. Only bounded
-    // deques ever pay the length read.
+    // Bounded but unmeasurable: `Window::len` fails — the `tail − head` `i64`
+    // subtraction overflows (a 2^63-wide span), or on a 32-bit target the span
+    // exceeds `usize`. `head <= tail` (Window invariant) makes that span a
+    // length of at least `i64::MAX as usize`. Evict on that lower bound —
+    // realistic caps still trim the max, while a cap so large the window is
+    // actually within it under-evicts (down to zero) rather than erasing live
+    // in-capacity cells. Only bounded deques ever pay the length read.
     let Ok(len) = window.len() else {
         return (i64::MAX as usize)
             .saturating_sub(cap.get() - 1)

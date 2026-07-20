@@ -1890,9 +1890,10 @@ fn deque_peeks_match_get_on_an_over_wide_window() -> Result<()> {
 /// length (evict 0) and extends the window to `[i64::MIN, 1)`. Bounded, the
 /// unmeasurable span trims `TRIM_MAX` toward the cap rather than failing,
 /// advancing `head` by `TRIM_MAX` to `[i64::MIN + TRIM_MAX, 1)` — the first
-/// convergence push a cap exists to drive. A huge capacity (`>= 2^63`) instead
-/// *contains* the over-wide window, so eviction is zero and the window extends
-/// to `[i64::MIN, 1)` — live in-capacity slots must not be erased. Restoring a
+/// convergence push a cap exists to drive. A capacity as large as `usize::MAX`
+/// sits so far above the window's `i64::MAX`-lower-bounded length that the
+/// eviction arithmetic yields zero, so the window extends to `[i64::MIN, 1)`
+/// — live in-capacity slots must not be erased. Restoring a
 /// fallible `window.len()?` before the capacity check (the bug this fixes)
 /// reddens the unbounded case; failing instead of trimming reddens the bounded
 /// case; evicting `TRIM_MAX` unconditionally on the unmeasurable span reddens
@@ -1964,11 +1965,13 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
     let cap = NonZeroUsize::new(2).ok_or_else(|| eyre!("2 is nonzero"))?;
     let trim = i64::try_from(deque::TRIM_MAX)?;
     push_and_expect_bounds(Some(cap), i64::MIN + trim, 1)?;
-    // Huge capacity (>= 2^63): the 2^63-wide seeded window is within capacity, so
-    // a correct push evicts NOTHING and the window just extends to `[i64::MIN, 1)`.
-    // A 64-bit property — no `usize` on a 32-bit target can hold such a capacity,
-    // where the window is always over-capacity and full-`TRIM_MAX` eviction is
-    // correct, so `cfg!` skips the case there.
+    // Capacity `usize::MAX`: the lower-bounded length (`i64::MAX as usize`,
+    // 2^63 − 1 on a 64-bit target) sits below the cap, so the eviction
+    // arithmetic yields zero and the window just extends to `[i64::MIN, 1)`.
+    // Skipped on a 32-bit target: there `i64::MAX as usize` truncates to
+    // `usize::MAX`, so the lower bound equals any cap and the arithmetic can
+    // never reach zero — the zero-eviction outcome this case checks is
+    // unreachable there, not wrong.
     if cfg!(target_pointer_width = "64") {
         let huge = NonZeroUsize::new(usize::MAX).ok_or_else(|| eyre!("MAX is nonzero"))?;
         push_and_expect_bounds(Some(huge), i64::MIN, 1)?;
