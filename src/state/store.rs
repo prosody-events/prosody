@@ -522,7 +522,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// Required with no default (`route_commit` is the reference routing the
     /// memory backend calls; the Cassandra backend implements the identical
-    /// routing natively as one same-partition batch packing): with markers, a
+    /// routing natively with same-partition batches): with markers, a
     /// defaulted override behind a trait default is a landmine — a wrapper
     /// store that forgot to forward the verb would fall into a default routing
     /// through the *wrapper's* verbs and bypass the inner store's marker
@@ -531,9 +531,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// `clears` (frozen at stage time) are **applied here**: each cleared
     /// section's non-survivor rows are erased — on Cassandra as the n+1 gap
-    /// range deletes between sorted survivors, packed with the marker delete
-    /// into one indivisible batch unit (a marker delete landing without its
-    /// gaps would lose the committed clear forever). Erasing a
+    /// range deletes between sorted survivors. The marker delete is issued
+    /// only after every cell resolution and gap delete has completed, unless
+    /// one same-partition batch carries all of them atomically. Erasing a
     /// still-provisional **foreign** row is correct: single-writer ordering
     /// puts the committed clear after every pre-existing row, so a
     /// non-survivor's post-clear state is absent regardless of its unresolved
@@ -650,9 +650,8 @@ pub(crate) async fn provisional_point_loop<S: CellStore>(
 /// absent-data cells issues exactly one `mark_resolved` batch set.
 ///
 /// The reference routing: the memory backend calls it before its marker
-/// delete; the Cassandra backend implements the identical routing natively as
-/// one same-partition batch packing (settle + marker delete in one round-trip
-/// set — a recorded divergence, not drift). Free (not a trait default) so a
+/// delete; the Cassandra backend implements the identical routing natively
+/// alongside its gap deletes. Free (not a trait default) so a
 /// wrapper that forwards the verb cannot silently inherit it and bypass the
 /// inner store's marker delete.
 ///

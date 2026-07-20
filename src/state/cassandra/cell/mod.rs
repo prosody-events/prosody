@@ -38,13 +38,13 @@
 //!
 //! The marker also carries the stage's **section clears** (each cleared
 //! section with its frozen survivor list). A committed clear is applied as the
-//! n+1 **gap range deletes** between sorted survivors ([`gaps_unit`]) —
-//! survivors are excluded positionally, never temporally. On the settle path
-//! the gaps and the marker delete ride one indivisible batch unit (a marker
-//! delete landing without its gaps would lose the committed clear forever);
-//! [`write_resolved`](CellStore::write_resolved) applies its direct clears the
-//! same way, marker-free. Until the gaps land, reads are defended by
-//! **read-help**: `get`/`scan` (and `get`'s cache-fill twin) resolve a standing
+//! n+1 **gap range deletes** between sorted survivors ([`extend_gap_units`]) —
+//! survivors are excluded positionally, never temporally. Settle follows the
+//! lifecycle invariant on
+//! [`commit_provisional`](CellStore::commit_provisional);
+//! [`write_resolved`](CellStore::write_resolved) applies its direct clears
+//! marker-free. Until the gaps land, reads are defended by **read-help**:
+//! `get`/`scan` (and `get`'s cache-fill twin) resolve a standing
 //! foreign clears-bearing marker through the sweep path before serving — the
 //! committed-unapplied read-window contract stated on
 //! [`get`](CellStore::get) — riding the same memo, so the fast path pays no
@@ -1064,10 +1064,9 @@ where
     ) -> Result<(), Self::Error> {
         // A marker-free primitive (the marker lifecycle belongs to the staged
         // verbs — see `CellStore::write_provisional`), so a fresh committed
-        // write never touches the marker slice. A cleared section's gap
-        // deletes lead as one unit (NO marker delete — resolved writes are
-        // marker-free); survivors are the present-data `cells`, excluded from
-        // the gaps positionally, so every batch row stays disjoint.
+        // write never touches the marker slice. Survivors are the present-data
+        // `cells`, excluded from the gaps positionally, so every batch row
+        // stays disjoint and may be packed independently.
         let pk = Pk::of(collection.id());
         // Encode each cell's committed `data` up front (owns the `Bytes`); no
         // `prev`, so the blobs carry only `data` + its encoding/version. Both
@@ -1077,10 +1076,8 @@ where
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
         }
         let ttl = collection.ttl().map(ttl_to_i32);
-        let mut units = Vec::with_capacity(cells.len() + 1);
-        if !clears.is_empty() {
-            units.push(gaps_unit(&self.queries, pk, clears, GapsMarker::MarkerFree));
-        }
+        let mut units = Vec::with_capacity(cells.len() + gap_count(clears));
+        extend_gap_units(&mut units, &self.queries, pk, clears);
         units.extend(self.resolved_units(pk, ttl, &blobs, cells));
         self.run_batches(&units)
             .await
@@ -1185,17 +1182,14 @@ where
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // The routing `route_commit` defines — present data promotes in place,
-        // a staged clear deletes its row (the row-absence invariant) — packed
-        // natively with the clear gaps and the marker delete into ONE
-        // `run_batches` call, so the settle stays one batched round-trip set.
-        // Every row disjoint (an event stages each cell at most once; gaps
-        // exclude survivors positionally and each other; the marker address is
-        // kind-disjoint; a `cell_delete` of a staged clear inside a gap range
-        // is a delete/delete tie — harmless), individually idempotent,
-        // order-free.
+        // a staged clear deletes its row (the row-absence invariant). Cell and
+        // gap rows are disjoint and idempotent: gaps exclude survivors and one
+        // another positionally, while a cell delete inside a gap is a harmless
+        // delete/delete tie.
         let pk = Pk::of(collection.id());
         // `units` stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
-        let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
+        let mut units: Vec<BatchUnit<CellBatchRow>> =
+            Vec::with_capacity(writes.len() + gap_count(clears) + 1);
         units.extend(writes.iter().map(|(cell, write)| {
             let addr = CellAddr::new(pk, cell);
             let statement = if write.data().is_some() {
@@ -1214,23 +1208,17 @@ where
                 }],
             )
         }));
-        // Gaps + marker delete ride ONE indivisible unit: the marker must
-        // never be deleted in a batch that lands without the gap tombstones,
-        // or a committed clear is lost forever. The clears-free settle keeps
-        // the standalone marker-delete unit.
-        if clears.is_empty() {
-            units.push(marker_delete_unit(pk, &self.queries));
-        } else {
-            units.push(gaps_unit(
-                &self.queries,
-                pk,
-                clears,
-                GapsMarker::DeleteMarker,
-            ));
-        }
-        self.run_batches(&units)
+        extend_gap_units(&mut units, &self.queries, pk, clears);
+        units.push(marker_delete_unit(pk, &self.queries));
+        let split = marker_last_split(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
+        self.run_batches(&units[..split])
             .await
             .map_err(ResolveCellError::Store)?;
+        if split < units.len() {
+            self.run_batches(&units[split..])
+                .await
+                .map_err(ResolveCellError::Store)?;
+        }
         self.settle_memo(collection.id()).await;
         Ok(())
     }
@@ -1242,8 +1230,7 @@ where
     ) -> Result<(), Self::Error> {
         // Rollback: write each staged cell's committed base `prev` back as
         // resolved (`prev = None` restores exact row absence — the routing
-        // `route_abort` defines) plus the marker delete, in one `run_batches`
-        // packing.
+        // `route_abort` defines), then delete the marker.
         let pk = Pk::of(collection.id());
         // Synthesized (cell, prev) pairs for the shared `resolved_units` helper;
         // kept a `Vec` (the clones are O(1) `Arc`/`Bytes` refcount bumps) —
@@ -1262,9 +1249,15 @@ where
         let mut units = Vec::with_capacity(cells.len() + 1);
         units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
         units.push(marker_delete_unit(pk, &self.queries));
-        self.run_batches(&units)
+        let split = marker_last_split(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
+        self.run_batches(&units[..split])
             .await
             .map_err(ResolveCellError::Store)?;
+        if split < units.len() {
+            self.run_batches(&units[split..])
+                .await
+                .map_err(ResolveCellError::Store)?;
+        }
         self.settle_memo(collection.id()).await;
         Ok(())
     }
@@ -1704,87 +1697,71 @@ impl SerializeRow for GapBetweenRow<'_> {
     }
 }
 
-/// Whether [`gaps_unit`] appends the marker-delete row to the gap rows.
-#[derive(Clone, Copy)]
-enum GapsMarker {
-    /// The commit-settle path: gaps + marker delete are one indivisible unit,
-    /// so the marker can never die in a batch that lands without its gaps.
-    DeleteMarker,
-    /// The resolved-write path: marker-free by design, gaps only.
-    MarkerFree,
+/// The number of gap rows needed to erase `clears` while excluding survivors.
+fn gap_count(clears: &[SectionClear]) -> usize {
+    clears.iter().map(|clear| clear.survivors().len() + 1).sum()
 }
 
-/// One **indivisible** batch unit erasing every cleared section: per section,
-/// the n+1 gap range deletes around its sorted, deduped survivors
-/// (`< k₁`, `(k₁,k₂)`, …, `> kₙ`; `gap_section` alone when no survivor) —
-/// plus, on the commit path, the marker-delete row. Sized once
-/// (`Σ survivors + 1` rows per section); bound coordinates borrow from the
-/// frozen [`SectionClear`]s, no copies. An open interval between adjacent
-/// distinct survivors is never empty-inverted, and a `< k₁` on an empty
-/// coordinate matches nothing — harmless.
-fn gaps_unit<'u>(
+/// Appends one bounded batch unit per gap around each cleared section's sorted,
+/// deduplicated survivors (`< k₁`, `(k₁,k₂)`, …, `> kₙ`; one whole-section
+/// delete when empty). Coordinates borrow from the frozen [`SectionClear`]s.
+fn extend_gap_units<'u>(
+    units: &mut Vec<BatchUnit<CellBatchRow<'u>>>,
     queries: &'u CellQueries,
     pk: Pk<'u>,
     clears: &'u [SectionClear],
-    marker: GapsMarker,
-) -> BatchUnit<CellBatchRow<'u>> {
-    let count = clears
-        .iter()
-        .map(|clear| clear.survivors().len() + 1)
-        .sum::<usize>()
-        + usize::from(matches!(marker, GapsMarker::DeleteMarker));
-    let mut rows: SmallVec<[CellBatchRow<'u>; 2]> = SmallVec::with_capacity(count);
-    let mut weight = count as u64 * PER_STATEMENT_OVERHEAD;
+) {
     for clear in clears {
         let section = i8::from(clear.section());
         let survivors = clear.survivors();
         let (Some(first), Some(last)) = (survivors.first(), survivors.last()) else {
-            rows.push(CellBatchRow {
-                statement: &queries.gap_section,
-                row: RowShape::GapSection(GapSectionRow { pk, section }),
-            });
+            units.push(BatchUnit::new(
+                PER_STATEMENT_OVERHEAD,
+                smallvec![CellBatchRow {
+                    statement: &queries.gap_section,
+                    row: RowShape::GapSection(GapSectionRow { pk, section }),
+                }],
+            ));
             continue;
         };
-        weight += (first.as_bytes().len() + last.as_bytes().len()) as u64;
-        rows.push(CellBatchRow {
-            statement: &queries.gap_below,
-            row: RowShape::GapEdge(GapEdgeRow {
-                pk,
-                section,
-                coordinate: first.as_bytes(),
-            }),
-        });
-        for pair in survivors.windows(2) {
-            weight += (pair[0].as_bytes().len() + pair[1].as_bytes().len()) as u64;
-            rows.push(CellBatchRow {
-                statement: &queries.gap_between,
-                row: RowShape::GapBetween(GapBetweenRow {
+        units.push(BatchUnit::new(
+            first.as_bytes().len() as u64 + PER_STATEMENT_OVERHEAD,
+            smallvec![CellBatchRow {
+                statement: &queries.gap_below,
+                row: RowShape::GapEdge(GapEdgeRow {
                     pk,
                     section,
-                    low: pair[0].as_bytes(),
-                    high: pair[1].as_bytes(),
+                    coordinate: first.as_bytes(),
                 }),
-            });
+            }],
+        ));
+        for pair in survivors.windows(2) {
+            units.push(BatchUnit::new(
+                (pair[0].as_bytes().len() + pair[1].as_bytes().len()) as u64
+                    + PER_STATEMENT_OVERHEAD,
+                smallvec![CellBatchRow {
+                    statement: &queries.gap_between,
+                    row: RowShape::GapBetween(GapBetweenRow {
+                        pk,
+                        section,
+                        low: pair[0].as_bytes(),
+                        high: pair[1].as_bytes(),
+                    }),
+                }],
+            ));
         }
-        rows.push(CellBatchRow {
-            statement: &queries.gap_above,
-            row: RowShape::GapEdge(GapEdgeRow {
-                pk,
-                section,
-                coordinate: last.as_bytes(),
-            }),
-        });
+        units.push(BatchUnit::new(
+            last.as_bytes().len() as u64 + PER_STATEMENT_OVERHEAD,
+            smallvec![CellBatchRow {
+                statement: &queries.gap_above,
+                row: RowShape::GapEdge(GapEdgeRow {
+                    pk,
+                    section,
+                    coordinate: last.as_bytes(),
+                }),
+            }],
+        ));
     }
-    if matches!(marker, GapsMarker::DeleteMarker) {
-        rows.push(CellBatchRow {
-            statement: &queries.marker_delete,
-            row: RowShape::Key(KeyRow {
-                kind: CellKind::Marker,
-                addr: CellAddr::marker(pk),
-            }),
-        });
-    }
-    BatchUnit::new(weight, rows)
 }
 
 /// The one-row batch unit deleting a collection's event-marker row at its
@@ -1800,6 +1777,18 @@ fn marker_delete_unit<'u>(pk: Pk<'u>, queries: &'u CellQueries) -> BatchUnit<Cel
             }),
         }],
     )
+}
+
+/// Returns the boundary between settle's cell/gap work and its final marker
+/// delete. Everything returns in the first slice when one batch can carry all
+/// rows atomically; otherwise the marker is the second slice's sole unit, so it
+/// is issued only after every recovery-relevant mutation has completed.
+fn marker_last_split<R>(units: &[BatchUnit<R>], max_bytes: u64, max_count: usize) -> usize {
+    if fits_one_batch(units.iter().map(BatchUnit::weight), max_bytes, max_count) {
+        units.len()
+    } else {
+        units.len().saturating_sub(1)
+    }
 }
 
 /// Whether `weights` pack into a **single** batch under the byte and count
@@ -1931,7 +1920,7 @@ cassandra_queries! {
     /// in code (`past_end`), so it needs no statement variant. The `marker_*`
     /// statements maintain and point-read the one fixed-address event-marker row
     /// that bounds recovery. The `gap_*` statements are the section-clear range
-    /// deletes (`gaps_unit`) — writes, never reads. Scan issuance is gated: the
+    /// deletes (`extend_gap_units`) — writes, never reads. Scan issuance is gated: the
     /// four cell mutators each write exactly one row shape, so the only reader
     /// that walks a whole section (and thus can meet a tombstone field) is an
     /// `_all` scan, reached solely by the map's degraded full-section fallback —

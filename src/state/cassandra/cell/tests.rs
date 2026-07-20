@@ -15,6 +15,7 @@ use super::decode::try_decode_marker;
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, KeyRow,
     MarkerWriteRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs, fits_one_batch,
+    marker_last_split,
 };
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
@@ -25,6 +26,7 @@ use crate::state::fjall::{MarkerPresence, test_db};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
+use crate::state::resolve::sweep_provisional;
 use crate::state::store::CellStore;
 use crate::state::store::CoordinateBatch;
 use crate::state::tests::cell_suite::{
@@ -1309,8 +1311,8 @@ fn finish(result: Result<bool>) -> TestResult {
 /// `Cached<CassandraStore>` assembly at the full clears-bearing alphabet
 /// (crash-recovery equivalence and oracle-correctness properties). A "crash"
 /// rebuilds the cache cold over the same durable Cassandra rows and oracle
-/// set, so every durable clear leg — gap range deletes, the indivisible
-/// gaps+marker-delete settle unit, the marker payload's clear half, read-help
+/// set, so every durable clear leg — gap range deletes, marker-last settle,
+/// the marker payload's clear half, read-help
 /// — runs beneath the production cache with its D3/D4 deletes, and the
 /// lower fault seam (`FaultDepth::Lower` settle failures + directed
 /// post-failure reads, stage faults) fires beneath the cache against live
@@ -1709,6 +1711,91 @@ fn fits_one_batch_decides_on_both_budgets() {
     assert!(!fits_one_batch([1, 1, 1].into_iter(), 100, 2));
     // Empty always fits.
     assert!(fits_one_batch(iter::empty(), 0, 0));
+}
+
+/// Settle's budget decision preserves one atomic batch whenever possible and
+/// otherwise exposes only the final marker unit to the second, ordered issue.
+#[test]
+fn prop_over_budget_settle_issues_marker_last() {
+    use smallvec::SmallVec;
+
+    fn prop(weights: Vec<u16>, marker_weight: u16, max_bytes: u16, max_count: u8) -> bool {
+        let mut units: Vec<BatchUnit<()>> = Vec::with_capacity(weights.len() + 1);
+        units.extend(
+            weights
+                .into_iter()
+                .map(|weight| BatchUnit::new(u64::from(weight), SmallVec::new())),
+        );
+        units.push(BatchUnit::new(u64::from(marker_weight), SmallVec::new()));
+        let split = marker_last_split(&units, u64::from(max_bytes), usize::from(max_count));
+        let fits = fits_one_batch(
+            units.iter().map(BatchUnit::weight),
+            u64::from(max_bytes),
+            usize::from(max_count),
+        );
+
+        if fits {
+            split == units.len()
+        } else {
+            split + 1 == units.len()
+        }
+    }
+
+    QuickCheck::new().quickcheck(prop as fn(Vec<u16>, u16, u16, u8) -> bool);
+}
+
+/// A raw provisional cell without its recovery marker is invisible to the
+/// sweep, while a point read still repairs it through the commit oracle.
+#[tokio::test]
+async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> Result<()> {
+    use super::{Pk, blob_weight};
+    use smallvec::smallvec;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let oracle = ScriptedOracle::default();
+    let store = fx.bottom_store(oracle.clone());
+    let c = collection("markerless-orphan")?;
+    let cell = value_cell();
+    let data = Bytes::from_static(b"committed-after-crash");
+    let staging = event(0xA11CE);
+    let blob = encode_cell_blobs(Some(&data), None)?;
+    let unit = [BatchUnit::new(
+        blob_weight(&blob),
+        smallvec![CellBatchRow {
+            statement: &fx.queries.write_provisional_no_ttl,
+            row: RowShape::Stage(StageRow {
+                ttl: None,
+                data: blob.data.as_deref(),
+                prev_data: None,
+                encoding: blob.encoding,
+                version: blob.version,
+                event: staging,
+                addr: CellAddr::new(Pk::of(c.id()), &cell),
+            }),
+        }],
+    )];
+    fx.cassandra
+        .execute_unlogged_batches(&unit, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
+        .await?;
+    oracle.record_message(Uuid::from_u128(0xA11CE)).await?;
+
+    assert!(store.standing_marker(c.id()).await?.is_none());
+    assert!(
+        sweep_provisional(&store, &oracle, &c).await?,
+        "a markerless sweep sees no work"
+    );
+    assert!(
+        store.provisional_cell_at(c.id(), &cell).await?.is_some(),
+        "the sweep left the unlisted provisional cell untouched"
+    );
+    assert_eq!(
+        store.get(c.id(), &cell, event(2)).await?,
+        Committed::new(Some(data)),
+        "first-touch resolves the orphan through the commit oracle"
+    );
+    assert!(store.provisional_cell_at(c.id(), &cell).await?.is_none());
+    Ok(())
 }
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
