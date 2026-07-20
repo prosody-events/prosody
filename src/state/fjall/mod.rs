@@ -51,8 +51,10 @@ pub(crate) mod test_db;
 #[cfg(test)]
 mod tests;
 
-pub use error::FjallCellCacheError;
-pub use workspace::{FjallClient, FjallClientError, FjallWorkspace};
+pub(crate) use error::FjallCellCacheError;
+#[cfg(test)]
+pub(crate) use workspace::FjallClientError;
+pub(crate) use workspace::{FjallClient, FjallWorkspace};
 
 use self::codec::Read;
 use crate::state::CollectionId;
@@ -146,7 +148,7 @@ pub(crate) enum CacheRead {
 /// Fjall-backed cell cache.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct FjallCellCache {
+pub(crate) struct FjallCellCache {
     #[educe(Debug(ignore))]
     inner: Arc<Inner>,
     clock: Clock,
@@ -220,6 +222,7 @@ pub struct FjallCellCache {
 /// index is a rebuildable hint (a fresh assignment re-seeds from the durable
 /// event marker), so they need no atomicity with the committed-value write.
 enum Inner {
+    #[cfg(test)]
     Bare {
         database: Database,
         cache: Keyspace,
@@ -232,6 +235,7 @@ impl Inner {
     /// The cache keyspace handle this cache operates.
     fn handle(&self) -> &Keyspace {
         match self {
+            #[cfg(test)]
             Self::Bare { cache, .. } => cache,
             Self::Owned(workspace) => workspace.cache_handle(),
         }
@@ -241,6 +245,7 @@ impl Inner {
     /// cold-seed and marker-presence latches).
     fn index_handle(&self) -> &Keyspace {
         match self {
+            #[cfg(test)]
             Self::Bare { index, .. } => index,
             Self::Owned(workspace) => workspace.index_handle(),
         }
@@ -252,6 +257,7 @@ impl Inner {
     /// [`batch`]: Database::batch
     fn database(&self) -> &Database {
         match self {
+            #[cfg(test)]
             Self::Bare { database, .. } => database,
             Self::Owned(workspace) => workspace.database(),
         }
@@ -266,7 +272,8 @@ impl FjallCellCache {
     /// for keeping them alive for the cache's lifetime. Used by tests;
     /// production uses [`Self::for_workspace`], which owns the workspace.
     #[must_use]
-    pub fn new(database: Database, cache: Keyspace, index: Keyspace) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(database: Database, cache: Keyspace, index: Keyspace) -> Self {
         Self::from_parts(
             Inner::Bare {
                 database,

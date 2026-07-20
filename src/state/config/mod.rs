@@ -13,12 +13,11 @@ use std::time::Duration;
 use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
-/// Environment variable for the local keyed-state disk-cache directory.
-const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
+/// Environment variable for the local keyed-state cache directory.
+const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 
-/// Environment variable for the keyed-state disk cache's in-memory block-cache
-/// capacity, in bytes.
-const FJALL_CACHE_SIZE_ENV: &str = "PROSODY_FJALL_CACHE_SIZE_BYTES";
+/// Environment variable for the in-memory keyed-state cache capacity, in bytes.
+const STATE_CACHE_SIZE_ENV: &str = "PROSODY_STATE_CACHE_SIZE_BYTES";
 
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_KEYED_STATE_RECOVERY_DELAY";
@@ -47,7 +46,7 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// ```
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
-    /// Root directory for the local keyed-state disk cache.
+    /// Disk workspace for the local keyed-state cache.
     ///
     /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
     /// **must** set it — the cache is wiped on process restart, so the mount
@@ -56,8 +55,8 @@ pub struct KeyedStateConfiguration {
     /// so unconfigured consumers (and consumers that never register state)
     /// work out of the box, even several in one process.
     ///
-    /// Environment variable: `PROSODY_FJALL_CACHE_DIR`
-    #[builder(default = "from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())?")]
+    /// Environment variable: `PROSODY_STATE_CACHE_DIR`
+    #[builder(default = "from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir())?")]
     #[validate(custom(function = "validate_cache_dir"))]
     pub cache_dir: PathBuf,
 
@@ -76,18 +75,17 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_recovery_delay"))]
     pub recovery_delay: CompactDuration,
 
-    /// Capacity of the in-memory block cache that accelerates the local
-    /// keyed-state disk cache, in **bytes**.
+    /// Capacity of the in-memory keyed-state cache, in **bytes**.
     ///
     /// `None` (the default) leaves the storage engine to choose its own
-    /// default. `Some(bytes)` sets the capacity of the one
-    /// `Database` this consumer opens at `cache_dir`; it is shared by every
-    /// per-partition keyspace, never multiplied per partition.
+    /// default. `Some(bytes)` sets the capacity of the one cache this consumer
+    /// opens at `cache_dir`; it is shared by every partition, never multiplied
+    /// per partition.
     ///
-    /// Environment variable: `PROSODY_FJALL_CACHE_SIZE_BYTES` (a positive
+    /// Environment variable: `PROSODY_STATE_CACHE_SIZE_BYTES` (a positive
     /// integer count of bytes; `0`, negative, non-numeric, and
     /// out-of-`u64`-range values are rejected at build).
-    #[builder(default = "from_option_env(FJALL_CACHE_SIZE_ENV)?")]
+    #[builder(default = "from_option_env(STATE_CACHE_SIZE_ENV)?")]
     pub cache_size_bytes: Option<NonZeroU64>,
 
     #[builder(setter(skip), default)]
@@ -97,11 +95,11 @@ pub struct KeyedStateConfiguration {
 impl Default for KeyedStateConfiguration {
     fn default() -> Self {
         Self {
-            cache_dir: from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())
+            cache_dir: from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir())
                 .unwrap_or_else(|_| default_cache_dir()),
             recovery_delay: recovery_delay_from_env()
                 .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
-            cache_size_bytes: from_option_env(FJALL_CACHE_SIZE_ENV).unwrap_or_default(),
+            cache_size_bytes: from_option_env(STATE_CACHE_SIZE_ENV).unwrap_or_default(),
             registrations: Vec::new(),
         }
     }
@@ -173,8 +171,8 @@ impl KeyedStateConfiguration {
     }
 }
 
-/// Per-client fallback keyed-state disk cache, used when
-/// [`FJALL_CACHE_DIR_ENV`] is unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped
+/// Per-client fallback keyed-state cache workspace, used when
+/// [`STATE_CACHE_DIR_ENV`] is unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped
 /// on restart, so it needs no persistence. The UUID leaf gives every client its
 /// own database. The directory is locked exclusively per live client, so two
 /// default-config clients in one process never contend.

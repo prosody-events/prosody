@@ -165,7 +165,7 @@ pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationB
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait below.
 pub use crate::state::descriptor::{CellResolver, CellType, FromSession, WithResolver};
-use crate::state::fjall::{FjallClient, FjallClientError};
+use crate::state::fjall::FjallClient;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider, StateManagerProvider};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
@@ -1080,7 +1080,7 @@ where
         &keyed_state.config.cache_dir,
         keyed_state.config.cache_size_bytes,
     )
-    .map_err(KeyedStateInitError::from)?;
+    .map_err(|error| KeyedStateInitError::Cache(error.to_string()))?;
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
         cell_store,
@@ -1838,9 +1838,9 @@ pub enum KeyedStateInitError {
     #[error(transparent)]
     RecoveryTtlMargin(#[from] RecoveryTtlMarginError),
 
-    /// The local keyed-state disk cache could not be opened.
+    /// The local keyed-state cache's disk workspace could not be opened.
     #[error("failed to open the keyed-state cache: {0:#}")]
-    Cache(#[from] FjallClientError),
+    Cache(String),
 
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`] constructor, which runs no state middleware to

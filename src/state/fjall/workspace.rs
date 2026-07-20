@@ -56,7 +56,7 @@ const INDEX_ROLE: &str = "index";
 /// crash-leftover keyspaces at startup.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct FjallClient {
+pub(crate) struct FjallClient {
     #[educe(Debug(ignore))]
     database: Database,
 }
@@ -84,9 +84,8 @@ impl FjallClient {
     ///
     /// # Errors
     ///
-    /// Returns [`FjallClientError::CacheDirInUse`] when another live client
-    /// holds `cache_dir`, and [`FjallClientError::Engine`] when the database
-    /// cannot be opened.
+    /// Returns [`FjallClientError`] when another live client holds
+    /// `cache_dir` or the database cannot be opened.
     pub fn open(
         cache_dir: &Path,
         cache_size_bytes: Option<NonZeroU64>,
@@ -155,7 +154,7 @@ impl FjallClient {
 /// the leftover is reaped on next startup by [`FjallClient::open`].
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct FjallWorkspace {
+pub(crate) struct FjallWorkspace {
     #[educe(Debug(ignore))]
     client: Arc<FjallClient>,
     uuid: Uuid,
@@ -250,23 +249,17 @@ fn partition_name(role: &str, uuid: Uuid) -> String {
     format!("{PARTITION_NAME_PREFIX}{role}_{}", uuid.simple())
 }
 
-/// Errors raised by [`FjallClient`].
+/// Internal errors raised while opening the local keyed-state cache.
 #[derive(Debug, Error)]
-pub enum FjallClientError {
-    /// Underlying fjall engine error.
+pub(crate) enum FjallClientError {
     #[error(transparent)]
     Engine(#[from] fjall::Error),
 
-    /// Another live prosody client owns this `cache_dir` — each consumer
-    /// needs its own.
     #[error(
         "cache_dir {path:?} is already in use by another live prosody client; each consumer needs \
          its own cache_dir"
     )]
-    CacheDirInUse {
-        /// The contended cache directory.
-        path: PathBuf,
-    },
+    CacheDirInUse { path: PathBuf },
 }
 
 impl ClassifyError for FjallClientError {

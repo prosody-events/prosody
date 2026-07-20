@@ -80,7 +80,7 @@
 
 pub mod access;
 pub(crate) mod backend;
-pub mod cached;
+pub(crate) mod cached;
 pub mod cassandra;
 pub mod cell;
 pub mod cell_key;
@@ -90,7 +90,7 @@ pub mod descriptor;
 pub mod descriptor_identity;
 pub(crate) mod dirty;
 pub mod event_ref;
-pub mod fjall;
+pub(crate) mod fjall;
 pub mod identity;
 pub mod manager;
 pub(crate) mod marker;
