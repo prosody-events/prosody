@@ -2,8 +2,8 @@
 //!
 //! [`CellStore`] is the single, uniform, **untyped** durable backend interface
 //! for keyed state. It names no collection family: cells are addressed by
-//! [`CellKey`] (a [`Section`](super::cell_key::Section) + ordered
-//! [`Coordinate`](super::cell_key::Coordinate)), so Value/Map/Deque are
+//! [`CellKey`] (a [`Section`] + ordered
+//! [`Coordinate`]), so Value/Map/Deque are
 //! collection-layer handles over this one trait and the durability layer is
 //! written exactly once.
 //!

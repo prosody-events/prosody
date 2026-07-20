@@ -113,7 +113,7 @@ const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
 /// [`MapHandle::stream`](map::MapHandle::stream) and
 /// [`DequeHandle::stream`](deque::DequeHandle::stream).
 ///
-/// An alias of [`CELL_BATCH`](crate::state::store::CELL_BATCH) — the point-get
+/// An alias of [`CELL_BATCH`] — the point-get
 /// stream chunk width and the store batch-read width are one number, and the
 /// `> 0` invariant the shared `CellView::scan_at` chunk source relies on
 /// (`coords.by_ref().take(STREAM_CHUNK)` must take ≥ 1 coordinate per chunk) is

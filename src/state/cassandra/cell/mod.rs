@@ -480,7 +480,7 @@ impl<O> CassandraStore<O> {
     /// value binds the resolved-value shape; an absent value **deletes** the
     /// `kind=Cell` row (the row-absence invariant — no null-blob residue).
     /// Returns a borrowing iterator the callers extend into their pre-sized
-    /// `units` — no intermediate buffer; see [`run_batches`] for why the
+    /// `units` — no intermediate buffer; see [`Self::run_batches`] for why the
     /// callers' `units` is a `Vec` rather than a [`CellBuffer`].
     fn resolved_units<'u>(
         &'u self,

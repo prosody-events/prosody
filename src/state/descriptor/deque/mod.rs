@@ -480,7 +480,7 @@ where
             .tail
             .checked_add(1)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        let evict = i64::try_from(evictions(window.len()?, self.entries.capacity()))
+        let evict = i64::try_from(evictions(window, self.entries.capacity()))
             .map_err(|_| MetaDecodeError::IndexOverflow)?;
         let new_head = window
             .head
@@ -515,7 +515,7 @@ where
             .head
             .checked_sub(1)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        let evict = i64::try_from(evictions(window.len()?, self.entries.capacity()))
+        let evict = i64::try_from(evictions(window, self.entries.capacity()))
             .map_err(|_| MetaDecodeError::IndexOverflow)?;
         let new_tail = window
             .tail
@@ -679,21 +679,28 @@ impl<T> Descriptor<DequeKind<T>> {
 /// Slots to evict from the far end before a bounded push appends one,
 /// converging the window toward `capacity`. Zero when unbounded or already
 /// within capacity; capped at `TRIM_MAX` so one push does bounded, decode-free
-/// work. `len` is the current window span; a push adds one slot, so `len + 1`
-/// slots exist after the append and the trim is that count over `capacity`.
+/// work. A push adds one slot, so `len + 1` slots exist after the append and
+/// the trim is that count over `capacity`.
 ///
 /// See the module's capacity invariant: enforcement is lazy and push-only, so a
 /// persisted window may exceed `capacity`.
-fn evictions(len: usize, capacity: Option<NonZeroUsize>) -> usize {
+fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> usize {
+    // Unbounded: never read `window.len()`, so a push on an over-wide window
+    // (a span `Window::len` cannot measure — the `tail − head` `i64`
+    // subtraction overflows, or on a 32-bit target the result exceeds `usize`;
+    // reachable only from a corrupt or hand-seeded bounds cell) proceeds
+    // untouched, exactly as it did before capacity existed.
     let Some(cap) = capacity else { return 0 };
-    // `checked_add`, not `saturating_add`: at `len == usize::MAX` the window is
-    // vastly over any cap (evict the max). That span is itself unreachable
-    // through `Window::len`'s overflow guard on a 64-bit target, so the `None`
-    // arm is belt-and-suspenders for a 32-bit one.
-    match len.checked_add(1) {
-        Some(needed) => needed.saturating_sub(cap.get()).min(TRIM_MAX),
-        None => TRIM_MAX,
-    }
+    // Bounded: an unmeasurable over-wide span is vastly over any cap, so trim
+    // the max toward it rather than failing the push (the convergence the cap
+    // exists to drive). Only bounded deques ever pay the length read.
+    let Ok(len) = window.len() else {
+        return TRIM_MAX;
+    };
+    // `len − (cap − 1)`, algebraically `(len + 1) − cap` but overflow-free
+    // (`cap ≥ 1`): at `len == cap == usize::MAX` this is the correct single
+    // eviction, where `(len + 1) − cap` would overflow and saturate to the max.
+    len.saturating_sub(cap.get() - 1).min(TRIM_MAX)
 }
 
 /// Re-homes a bounds-cell access or codec error under the deque's entry-codec

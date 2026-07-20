@@ -7,11 +7,44 @@ use crate::state::registry::RegisterStateError;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use validator::Validate;
 
 fn cart() -> ValueDescriptor {
     value_state("cart")
+}
+
+/// Pins `cache_size_bytes`'s element type to `NonZeroU64` — the choice that
+/// makes the field's documented "rejected at build" contract hold. The build
+/// path is `from_option_env(FJALL_CACHE_SIZE_ENV)?`, which parses a present
+/// value with `<Option<NonZeroU64>>::Item::from_str`; this closure fails to
+/// compile if the field type ever weakens (e.g. to `Option<u64>`, which would
+/// silently accept `0`), and the assertions below prove that element type
+/// accepts a positive byte count and rejects zero, negative, non-numeric,
+/// empty, and out-of-`u64` values. The `"0"` rejection is load-bearing: it is
+/// the sole value distinguishing `NonZeroU64` from a plain `u64`. The env-read
+/// wiring itself (`from_option_env`, [`super::FJALL_CACHE_SIZE_ENV`]) is
+/// trusted std, so this needs none of the `unsafe` env mutation a full
+/// build-path test would.
+const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.cache_size_bytes;
+
+#[test]
+fn cache_size_element_type_parse_contract() -> Result<()> {
+    // A valid positive byte count parses into the field's element type.
+    let parsed: NonZeroU64 = "8388608"
+        .parse()
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+    assert_eq!(parsed.get(), 8_388_608, "a valid byte count parses");
+    // Degenerate values are rejected — `0` because the field is `NonZeroU64`,
+    // the rest because they are not a `u64`.
+    for bad in ["0", "-5", "abc", "", "99999999999999999999999999"] {
+        assert!(
+            bad.parse::<NonZeroU64>().is_err(),
+            "cache size {bad:?} must be rejected",
+        );
+    }
+    Ok(())
 }
 
 /// `MAX_CASSANDRA_TTL_SECS` fits a `u32`, so the ceiling and one second

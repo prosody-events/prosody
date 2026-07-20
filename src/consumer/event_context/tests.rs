@@ -498,6 +498,14 @@ where
             {
                 return Ok(false);
             }
+            // The key-only cursor is the value-free twin of the scan: it must
+            // yield exactly the same visible keys in the same key order,
+            // exercised here through the erased seam.
+            let scanned_keys = drain_cursor(&handle.keys(Direction::Forward)).await?;
+            let expected_keys: Vec<String> = visible.keys().cloned().collect();
+            if scanned_keys != expected_keys {
+                return Ok(false);
+            }
         }
         Ok(true)
     })

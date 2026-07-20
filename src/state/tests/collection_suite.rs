@@ -1121,10 +1121,10 @@ fn apply_capped_push(model: &mut VecDeque<Option<u8>>, cap: usize, from_back: bo
 /// holes, lazy push-only eviction converges to `len <= cap` within
 /// `⌈D / (TRIM_MAX − 1)⌉` catch-up pushes, evicting **at most `TRIM_MAX` slots
 /// per push** and surviving values equal the opposite-end suffix/prefix. Proves
-/// the plan's B (a within-cap excess lands exactly `cap` on the first push),
-/// C (convergence + reads never enforce), D (a hole eviction is a no-op clear
-/// that never errors), and G (the per-push physical eviction cap) in one
-/// property. The physical eviction count is read from the buffered dirty
+/// in one property: a within-cap excess lands exactly `cap` on the first push;
+/// convergence holds while reads never enforce; a hole eviction is a no-op
+/// clear that never errors; and the per-push physical eviction cap holds. The
+/// physical eviction count is read from the buffered dirty
 /// overlay — the buffered entry-section deletes — not a net `len` delta, since
 /// a net delta alone cannot bound the physical clears an impl issues.
 pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) -> Result<bool> {
@@ -1594,6 +1594,105 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     Ok(())
 }
 
+/// Presence and value reads diverge on a present-but-undecodable value: the
+/// documented contract that `contains_key` and `keys()` answer about the
+/// *cell*, while `get` and `stream` answer about the *value* and surface its
+/// decode failure. A cell at a valid coordinate holds bytes that are not valid
+/// JSON, so `contains_key` is `true` and `keys()` yields the key, yet `get`
+/// errors `Permanent` and `stream` ends on that same error — across BOTH keyset
+/// arms (tracked point-get and degrade full-section scan), since both drop the
+/// value before any decode. The property generators only ever write decodable
+/// values, so this divergence is unreachable there and needs a direct seed.
+#[test]
+fn map_presence_survives_an_undecodable_value() -> Result<()> {
+    use crate::error::{ClassifyError, ErrorCategory};
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    // A valid `I64KeyCodec` coordinate (8 bytes) whose value bytes are not
+    // valid JSON — present to a presence read, undecodable to a value read.
+    let key = 0_i64;
+    let coordinate = I64KeyCodec::encode(&key);
+    let bad_value = Bytes::from(vec![0xFF, 0xFF]);
+
+    // Tracked lists the key; Overflowed degrades to the full-section scan. Both
+    // reach the same present-but-undecodable cell.
+    let tracked = Bytes::from(tracked_frame(&[key]));
+    let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
+    for keyset_frame in [tracked, overflowed] {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+        let (registry, collection_ref) = registry_and_ref(
+            &descriptor,
+            "mp",
+            &state_key,
+            CollectionDef {
+                keyset_limit: 4096,
+                ..CollectionDef::new(None)
+            },
+        )?;
+        let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+        block_on(store.write_resolved(
+            &collection_ref,
+            &[
+                (keyset_cell(), Some(keyset_frame)),
+                (entry_cell_for(&coordinate), Some(bad_value.clone())),
+            ],
+            &[],
+        ))?;
+
+        let armed: ArmedKeys = Arc::default();
+        let session = make_session(
+            &cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            read_event(0),
+        );
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+
+        block_on(async {
+            // Presence reads see the cell — no decode, no error.
+            assert!(
+                handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
+                "contains_key answers about the cell, not the value"
+            );
+            assert_eq!(
+                collect_map_keys(&handle, Direction::Forward).await?,
+                vec![key],
+                "keys() yields the key of an undecodable-value cell"
+            );
+
+            // Value reads surface the decode failure as `Permanent`.
+            let got = handle.get(&key).await;
+            assert!(got.is_err(), "get must surface the value decode failure");
+            if let Err(error) = got {
+                assert_eq!(error.classify_error(), ErrorCategory::Permanent);
+            }
+            let stream_ends_in_error = {
+                let stream = handle.stream(Direction::Forward);
+                futures::pin_mut!(stream);
+                let mut errored = false;
+                while let Some(item) = stream.next().await {
+                    if item.is_err() {
+                        errored = true;
+                    }
+                }
+                errored
+            };
+            assert!(
+                stream_ends_in_error,
+                "stream must surface the value decode failure"
+            );
+            Ok::<_, color_eyre::Report>(())
+        })?;
+    }
+    Ok(())
+}
+
 /// Durable meta-frame golden (Deque): after real pushes `commit()`, the raw
 /// bounds cell sits at its frozen address — `Meta` section, *empty*
 /// coordinate — and
@@ -1783,6 +1882,85 @@ fn deque_peeks_match_get_on_an_over_wide_window() -> Result<()> {
         );
         Ok::<_, color_eyre::Report>(())
     })
+}
+
+/// Regression guard for the over-wide push paths: `push_back` on the
+/// `[i64::MIN, 0)` window — whose span `Window::len` cannot measure — must
+/// succeed in BOTH modes, not error. Unbounded, the push never reads the
+/// length (evict 0) and extends the window to `[i64::MIN, 1)`. Bounded, the
+/// unmeasurable span trims `TRIM_MAX` toward the cap rather than failing,
+/// advancing `head` by `TRIM_MAX` to `[i64::MIN + TRIM_MAX, 1)` — the first
+/// convergence push a cap exists to drive. Restoring a fallible `window.len()?`
+/// before the capacity check (the bug this fixes) reddens the unbounded case;
+/// failing instead of trimming reddens the bounded case. Seeded directly
+/// because reaching `head = i64::MIN` would need 2^63 pushes.
+#[test]
+fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
+    use crate::state::descriptor::deque::meta_cell;
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    /// Seeds `[i64::MIN, 0)`, runs one `push_back` under `cap`, commits, and
+    /// asserts the committed bounds are exactly `(want_head, want_tail)`.
+    fn push_and_expect_bounds(
+        cap: Option<NonZeroUsize>,
+        want_head: i64,
+        want_tail: i64,
+    ) -> Result<()> {
+        let oracle = ScriptedOracle::default();
+        let cells = MemoryCells::new();
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+        let descriptor = deque_state::<JsonCodec>("dq");
+        let (registry, collection_ref) = registry_and_ref(
+            &descriptor,
+            "dq",
+            &state_key,
+            CollectionDef {
+                capacity: cap,
+                ..CollectionDef::new(None)
+            },
+        )?;
+        let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+        let id = collection_ref.id();
+        block_on(store.write_resolved(
+            &collection_ref,
+            &[(
+                meta_cell(),
+                Some(Bytes::from(deque::seed_frame(i64::MIN, 0))),
+            )],
+            &[],
+        ))?;
+
+        let armed: ArmedKeys = Arc::default();
+        let event = read_event(0);
+        let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+        let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+        block_on(async {
+            handle.push_back(Value::from(1_u8)).await?;
+            handle.commit().await?;
+            Ok::<_, color_eyre::Report>(())
+        })?;
+
+        let Some(bounds) = block_on(store.get(id, &meta_cell(), event))?.into_inner() else {
+            bail!("bounds cell missing after the over-wide push");
+        };
+        let head = i64::from_be_bytes(bounds[0..8].try_into()?);
+        let tail = i64::from_be_bytes(bounds[8..16].try_into()?);
+        assert_eq!(
+            (head, tail),
+            (want_head, want_tail),
+            "over-wide push must move the window as expected"
+        );
+        Ok(())
+    }
+
+    // Unbounded: evict 0, so the window just extends to `[i64::MIN, 1)`.
+    push_and_expect_bounds(None, i64::MIN, 1)?;
+    // Bounded: the unmeasurable span trims `TRIM_MAX`, advancing `head`.
+    let cap = NonZeroUsize::new(2).ok_or_else(|| eyre!("2 is nonzero"))?;
+    let trim = i64::try_from(deque::TRIM_MAX)?;
+    push_and_expect_bounds(Some(cap), i64::MIN + trim, 1)?;
+    Ok(())
 }
 
 /// Map clear, pinned at the physical grain the `BTreeMap` model cannot reach: a

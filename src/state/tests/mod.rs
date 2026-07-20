@@ -970,7 +970,7 @@ fn prop_deque_bounded_lifecycle_read_uncommitted() {
 /// possibly holed) window, lazy push-only eviction converges to `len <= cap`
 /// within the computed catch-up pushes, evicting at most `TRIM_MAX` slots per
 /// push (read from the buffered dirty overlay). See
-/// [`run_deque_capacity_convergence`] for the B/C/D/G disposition.
+/// [`run_deque_capacity_convergence`] for the full disposition.
 /// FALSIFICATION: drop `.min(TRIM_MAX)` from `evictions` → an over-wide
 /// window's first push buffers `> TRIM_MAX` entry deletes → the per-push cap
 /// assert → red.

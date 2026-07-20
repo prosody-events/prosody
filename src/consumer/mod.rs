@@ -1838,7 +1838,7 @@ pub enum KeyedStateInitError {
     #[error(transparent)]
     RecoveryTtlMargin(#[from] RecoveryTtlMarginError),
 
-    /// The local fjall cache could not be opened.
+    /// The local keyed-state disk cache could not be opened.
     #[error("failed to open the keyed-state cache: {0:#}")]
     Cache(#[from] FjallClientError),
 

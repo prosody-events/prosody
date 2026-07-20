@@ -13,10 +13,11 @@ use std::time::Duration;
 use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
-/// Environment variable for the local fjall workspace directory.
+/// Environment variable for the local keyed-state disk-cache directory.
 const FJALL_CACHE_DIR_ENV: &str = "PROSODY_FJALL_CACHE_DIR";
 
-/// Environment variable for the fjall block-cache capacity, in bytes.
+/// Environment variable for the keyed-state disk cache's in-memory block-cache
+/// capacity, in bytes.
 const FJALL_CACHE_SIZE_ENV: &str = "PROSODY_FJALL_CACHE_SIZE_BYTES";
 
 /// Environment variable for the `StateRecovery` backstop delay.
@@ -46,15 +47,14 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// ```
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
-    /// Root directory for the local fjall workspace (the committed-value
-    /// cache).
+    /// Root directory for the local keyed-state disk cache.
     ///
     /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
     /// **must** set it — the cache is wiped on process restart, so the mount
-    /// needs no persistence. Each live client needs its own directory (fjall
-    /// locks it exclusively). Defaults to a per-client temporary directory so
-    /// unconfigured consumers (and consumers that never register state) work
-    /// out of the box, even several in one process.
+    /// needs no persistence. Each live client needs its own directory because
+    /// it is locked exclusively. Defaults to a per-client temporary directory
+    /// so unconfigured consumers (and consumers that never register state)
+    /// work out of the box, even several in one process.
     ///
     /// Environment variable: `PROSODY_FJALL_CACHE_DIR`
     #[builder(default = "from_env_with_fallback(FJALL_CACHE_DIR_ENV, default_cache_dir())?")]
@@ -76,11 +76,11 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_recovery_delay"))]
     pub recovery_delay: CompactDuration,
 
-    /// Block-cache capacity for the local fjall workspace, in **bytes**.
+    /// Capacity of the in-memory block cache that accelerates the local
+    /// keyed-state disk cache, in **bytes**.
     ///
-    /// `None` (the default) leaves fjall to choose its own library default —
-    /// prosody deliberately does not copy that number, so an upstream tuning
-    /// change is inherited. `Some(bytes)` sets the capacity of the one
+    /// `None` (the default) leaves the storage engine to choose its own
+    /// default. `Some(bytes)` sets the capacity of the one
     /// `Database` this consumer opens at `cache_dir`; it is shared by every
     /// per-partition keyspace, never multiplied per partition.
     ///
@@ -173,11 +173,11 @@ impl KeyedStateConfiguration {
     }
 }
 
-/// Per-client fallback fjall workspace, used when [`FJALL_CACHE_DIR_ENV`] is
-/// unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped on restart, so it needs
-/// no persistence. The UUID leaf gives every client its own database — fjall
-/// locks the directory exclusively per live client, so two default-config
-/// clients in one process never contend.
+/// Per-client fallback keyed-state disk cache, used when
+/// [`FJALL_CACHE_DIR_ENV`] is unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped
+/// on restart, so it needs no persistence. The UUID leaf gives every client its
+/// own database. The directory is locked exclusively per live client, so two
+/// default-config clients in one process never contend.
 fn default_cache_dir() -> PathBuf {
     env::temp_dir()
         .join("prosody")
