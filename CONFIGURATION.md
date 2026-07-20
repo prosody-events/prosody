@@ -77,7 +77,7 @@ reloads and keyed-state message resolution.
 |--------------------------------------|----------------------------------------------------|--------------------------|
 | `PROSODY_STATE_CACHE_DIR`            | Disk workspace for the local keyed-state cache. Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
 | `PROSODY_STATE_CACHE_SIZE_BYTES`     | Capacity of the in-memory keyed-state cache, in bytes. Must be greater than zero. | storage-engine default |
-| `PROSODY_KEYED_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
+| `PROSODY_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
 
 ## Deduplication (All Modes)
 

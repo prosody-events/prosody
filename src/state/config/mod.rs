@@ -20,7 +20,7 @@ const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 const STATE_CACHE_SIZE_ENV: &str = "PROSODY_STATE_CACHE_SIZE_BYTES";
 
 /// Environment variable for the `StateRecovery` backstop delay.
-const RECOVERY_DELAY_ENV: &str = "PROSODY_KEYED_STATE_RECOVERY_DELAY";
+const RECOVERY_DELAY_ENV: &str = "PROSODY_STATE_RECOVERY_DELAY";
 
 /// Default delay between staging a cell and the `StateRecovery` sweep.
 const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
@@ -66,7 +66,7 @@ pub struct KeyedStateConfiguration {
     /// (checked at consumer build) so a provisional cell cannot expire before
     /// the sweep reaches it.
     ///
-    /// Environment variable: `PROSODY_KEYED_STATE_RECOVERY_DELAY`. Accepts a
+    /// Environment variable: `PROSODY_STATE_RECOVERY_DELAY`. Accepts a
     /// duration at second granularity and defaults to 30 seconds. Must be at
     /// least one second: a zero delay would schedule the sweep to run
     /// immediately, leaving no window for the fast post-commit path to resolve
