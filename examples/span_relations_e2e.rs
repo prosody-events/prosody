@@ -34,7 +34,7 @@ use prosody::state::descriptor::{
 };
 use prosody::state::order_codec::Utf8KeyCodec;
 use prosody::timers::duration::CompactDuration;
-use prosody::tracing::{Identity, initialize_tracing};
+use prosody::tracing::{Identity, initialize_tracing, shutdown_telemetry};
 use prosody::{JsonCodec, Key, Topic};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,7 +42,7 @@ use std::convert::Infallible;
 use std::env;
 use std::thread;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 use tracing::{Instrument, Span, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
@@ -285,8 +285,9 @@ async fn main() -> Result<()> {
     client.unsubscribe().await?;
     admin.delete_topic(&topic).await?;
 
-    // The batch span processor exports on a ~5s schedule; give it two cycles.
-    sleep(Duration::from_secs(10)).await;
+    // Export the tail spans deterministically instead of waiting out the
+    // batch span processor's export interval.
+    shutdown_telemetry()?;
 
     #[allow(
         clippy::print_stdout,

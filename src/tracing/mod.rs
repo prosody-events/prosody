@@ -11,9 +11,11 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{
     ExporterBuildError, MetricExporter, Protocol, SpanExporter, WithExportConfig,
 };
+use opentelemetry_sdk::error::OTelSdkError;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use std::env;
+use std::sync::OnceLock;
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
@@ -25,6 +27,23 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, fmt};
 
 /// A layer that does nothing
 pub type Identity = TracingIdentity;
+
+#[cfg(test)]
+mod tests;
+
+/// Provider handles retained by [`initialize_tracing`].
+///
+/// `force_flush`/`shutdown` live on the providers, and the global subscriber
+/// keeps the export pipeline alive for the life of the process — so unless
+/// the handles are retained here, telemetry buffered in the batch span
+/// processor and periodic metric reader can never be exported before exit.
+/// [`flush_telemetry`] and [`shutdown_telemetry`] read this slot.
+struct OtelProviders {
+    tracer: SdkTracerProvider,
+    meter: SdkMeterProvider,
+}
+
+static PROVIDERS: OnceLock<OtelProviders> = OnceLock::new();
 
 /// Initializes the tracing system with optional OpenTelemetry and OTLP
 /// exporter.
@@ -39,6 +58,10 @@ pub type Identity = TracingIdentity;
 ///
 /// An optional additional layer can be added to the tracing subscriber; pass
 /// `Identity` for `T` when there is none.
+///
+/// The tracer and meter provider handles are retained for the life of the
+/// process so [`flush_telemetry`] and [`shutdown_telemetry`] can export
+/// buffered telemetry before exit.
 ///
 /// # Errors
 ///
@@ -66,14 +89,13 @@ where
         .ok();
 
     let trace_provider = match exporter {
-        None => SdkTracerProvider::builder().build().tracer("prosody"),
+        None => SdkTracerProvider::builder().build(),
         Some(exporter) => SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
-            .build()
-            .tracer("prosody"),
+            .build(),
     };
 
-    let telemetry = tracing_opentelemetry::layer().with_tracer(trace_provider);
+    let telemetry = tracing_opentelemetry::layer().with_tracer(trace_provider.tracer("prosody"));
 
     let subscriber = Registry::default()
         .with(telemetry)
@@ -94,8 +116,69 @@ where
             SdkMeterProvider::builder().build()
         }
     };
-    set_meter_provider(meter_provider);
+    set_meter_provider(meter_provider.clone());
 
+    // `set_global_default` succeeds at most once per process, so the slot is
+    // necessarily empty here; the guard covers a future reordering.
+    PROVIDERS
+        .set(OtelProviders {
+            tracer: trace_provider,
+            meter: meter_provider,
+        })
+        .map_err(|_| TracingError::AlreadyInitialized)?;
+
+    Ok(())
+}
+
+/// Exports all buffered telemetry (spans and metrics) without tearing the
+/// pipeline down.
+///
+/// The batch span processor and periodic metric reader export on an interval,
+/// so telemetry recorded shortly before process exit is lost unless exported
+/// explicitly. Use this when the process keeps running — e.g. when one of
+/// several clients shuts down; call [`shutdown_telemetry`] at process exit.
+/// A safe no-op when [`initialize_tracing`] has not run.
+///
+/// Blocks until the export completes — call it after async work has settled,
+/// never from inside a handler.
+///
+/// # Errors
+///
+/// Returns an error if the span or metric exporter fails to flush; both are
+/// attempted regardless.
+pub fn flush_telemetry() -> Result<(), TracingError> {
+    let Some(providers) = PROVIDERS.get() else {
+        return Ok(());
+    };
+    let spans = providers.tracer.force_flush();
+    let metrics = providers.meter.force_flush();
+    spans?;
+    metrics?;
+    Ok(())
+}
+
+/// Flushes all buffered telemetry and shuts the export pipeline down.
+///
+/// Call once at process exit, after all clients have stopped. Spans and
+/// metrics recorded afterwards are silently dropped. A safe no-op when
+/// [`initialize_tracing`] has not run; see [`flush_telemetry`] for a
+/// mid-run flush that keeps the pipeline alive.
+///
+/// Blocks until the final export completes — call it after async work has
+/// settled, never from inside a handler.
+///
+/// # Errors
+///
+/// Returns an error if the span or metric pipeline fails to shut down (which
+/// includes shutting down twice); both are attempted regardless.
+pub fn shutdown_telemetry() -> Result<(), TracingError> {
+    let Some(providers) = PROVIDERS.get() else {
+        return Ok(());
+    };
+    let spans = providers.tracer.shutdown();
+    let metrics = providers.meter.shutdown();
+    spans?;
+    metrics?;
     Ok(())
 }
 
@@ -196,6 +279,14 @@ pub enum TracingError {
     /// Indicates a failure to set the default tracing subscriber.
     #[error("failed to set default tracing subscriber: {0:#}")]
     SetDefault(#[from] SetGlobalDefaultError),
+
+    /// Tracing was already initialized by an earlier call.
+    #[error("tracing already initialized")]
+    AlreadyInitialized,
+
+    /// Indicates a failure to flush or shut down the telemetry pipeline.
+    #[error("failed to flush telemetry: {0:#}")]
+    Flush(#[from] OTelSdkError),
 
     /// Indicates a failure to parse filter directive.
     #[error("failed to parse filter directive: {0:#}")]
