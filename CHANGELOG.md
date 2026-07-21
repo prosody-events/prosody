@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/prosody-events/prosody/compare/prosody-v0.4.0...prosody-v0.5.0) (2026-07-21)
+
+
+### Features
+
+* **state:** durable per-key state for handlers ([#39](https://github.com/prosody-events/prosody/issues/39)) ([9813d7b](https://github.com/prosody-events/prosody/commit/9813d7bb674a8fc4849c5f1464bb2e596177061c))
+
+
+### Bug Fixes
+
+* **cassandra:** reverse-scan static-only LIMIT 1 reads on deferred_offsets and deferred_timers ([#43](https://github.com/prosody-events/prosody/issues/43)) ([327917d](https://github.com/prosody-events/prosody/commit/327917d9c11585a3b70d2d633cca5cfd5abbc5e5))
+* **cassandra:** reverse-scan static-only LIMIT 1 reads on timer_segments ([#41](https://github.com/prosody-events/prosody/issues/41)) ([7beb628](https://github.com/prosody-events/prosody/commit/7beb628c60c9fccad1443db215ecd7e168dd0c19))
+* **telemetry:** disable emitter in mock mode ([#45](https://github.com/prosody-events/prosody/issues/45)) ([b481766](https://github.com/prosody-events/prosody/commit/b481766adececc988ffbd6f454f5e63d18a08c0f))
+
 ## [0.4.0](https://github.com/prosody-events/prosody/compare/prosody-v0.3.0...prosody-v0.4.0) (2026-05-15)
 
 
