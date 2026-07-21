@@ -31,6 +31,7 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Kafka Consumer**: Per-key ordering with cross-key concurrency, offset management, consumer groups.
 - **Kafka Producer**: Idempotent delivery with configurable retries.
 - **Timer System**: Persistent scheduled execution backed by Cassandra or in-memory store.
+- **Keyed State**: Durable Value, Map, and Deque collections scoped to each Kafka message key.
 - **Quality of Service**: Fair scheduling limits concurrency and prevents failures from starving fresh traffic. Pipeline
   mode adds deferred retry and monopolization detection.
 - **Deferred Retry**: Moves transiently-failing keys to timer-based retry, unblocking the partition to continue
@@ -138,6 +139,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Keyed State
+
+Keyed state gives every Kafka key its own durable working memory. Prosody automatically uses the current message or
+timer key, so a handler can relate the current event to earlier events for that key. State survives restarts and
+rebalances, and changes become visible only when the event succeeds by default.
+
+Declare each Value, Map, or Deque collection once, register it before subscribing, and give the returned capability to
+the handler. Most collections should have a TTL comfortably beyond the longest timer or workflow that uses them.
+
+```rust,ignore
+use prosody::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
+use prosody::timers::duration::CompactDuration;
+
+#[derive(Clone)]
+struct CountHandler {
+    count: Registered<ValueDescriptor>,
+}
+
+let count = value_state("count").ttl(CompactDuration::new(30 * 24 * 60 * 60));
+let count = client.register(count).await?;
+client.subscribe(CountHandler { count }).await?;
+
+// Inside CountHandler::on_message:
+let count = context.state(self.count)?;
+let current = count.get().await?.and_then(|value| value.as_u64()).unwrap_or(0);
+count.set(json!(current + 1)).await?;
+```
+
+Keyed-state cache and recovery settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state-pipeline-mode).
 
 ## Quality of Service
 
