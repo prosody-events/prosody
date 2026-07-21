@@ -45,7 +45,7 @@ pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>, Optio
 
 /// Capacity for the per-partition state cache.
 ///
-/// Sized to cover the active working set of keys within a single partition.
+/// Sized to hold the active working set of keys within a single partition.
 /// Cache misses fall back to a DB read, so undersizing only costs an extra
 /// query. On eviction of a hot key, the placeholder guard mechanism in
 /// `quick_cache` ensures the next two concurrent accessors still serialize

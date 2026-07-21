@@ -19,20 +19,20 @@
 //! suitable for testing and development. Production storage backends can
 //! implement the same trait to provide durability.
 
-use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
+use crate::{Key, Partition, Topic};
 use educe::Educe;
 use futures::Stream;
+use opentelemetry::Context;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
-use tracing::Span;
 use uuid::Uuid;
 
 /// Cassandra-based persistent storage implementation.
@@ -132,9 +132,9 @@ pub struct TriggerV1 {
     /// When this timer should execute.
     pub time: CompactDateTime,
 
-    /// Tracing span for distributed observability context.
+    /// Scheduling-time trace context for distributed observability.
     #[educe(PartialEq(ignore), Hash(ignore))]
-    pub span: Span,
+    pub context: Context,
 }
 
 impl PartialOrd for TriggerV1 {
@@ -145,7 +145,7 @@ impl PartialOrd for TriggerV1 {
 
 impl Ord for TriggerV1 {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Compare by (key, time) tuple, ignoring span
+        // Compare by (key, time) tuple, ignoring the trace context
         (&self.key, &self.time).cmp(&(&other.key, &other.time))
     }
 }
@@ -179,10 +179,39 @@ pub struct Segment {
     pub version: SegmentVersion,
 }
 
+impl Segment {
+    /// Canonical per-Kafka-partition segment: id derived from
+    /// `{group}:{topic}/{partition}`, schema V3.
+    ///
+    /// Single source of the formula; the partition loop calls it once per
+    /// acquisition, and the keyed-state commit oracle shares the resulting
+    /// segment by holding a clone of the same store handle (never by
+    /// re-deriving the id).
+    #[must_use]
+    pub fn for_partition(
+        group_id: &str,
+        topic: Topic,
+        partition: Partition,
+        slab_size: CompactDuration,
+    ) -> Self {
+        let name = format!("{group_id}:{topic}/{partition}");
+        Self {
+            id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
+            name,
+            slab_size,
+            version: SegmentVersion::V3,
+        }
+    }
+}
+
 /// Factory for segment-scoped [`TriggerStore`] instances.
 ///
-/// Holds shared resources (Cassandra session, prepared statements) and creates
-/// per-segment stores with independent caches. Store creation is synchronous.
+/// Holds shared resources and creates per-segment stores; store creation is
+/// synchronous. Implementations must ensure that stores minted for the same
+/// segment observe each other's durable writes — see each provider's own
+/// doc for how (e.g.
+/// [`InMemoryTriggerStoreProvider`](memory::InMemoryTriggerStoreProvider),
+/// [`CassandraTriggerStoreProvider`](cassandra::CassandraTriggerStoreProvider)).
 pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
     /// The store type created by this provider.
     type Store: TriggerStore;
@@ -305,7 +334,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Streams scheduled times for a key and timer type.
     ///
     /// Returns only timestamps without full trigger metadata.
-    /// More efficient than `get_key_triggers` when span data not needed.
+    /// More efficient than `get_key_triggers` when trace context not needed.
     fn get_key_times(
         &self,
         timer_type: TimerType,
@@ -314,7 +343,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
 
     /// Streams full trigger objects for a key and timer type.
     ///
-    /// Includes all metadata (key, time, `timer_type`, span).
+    /// Includes all metadata (key, time, `timer_type`, trace context).
     fn get_key_triggers(
         &self,
         timer_type: TimerType,
@@ -380,6 +409,14 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// Returns `None` if the row is absent (commit oracle: "committed").
     /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
+    ///
+    /// **Contract: the answer must reflect every write performed through
+    /// this store and its clones.** The keyed-state commit oracle holds a
+    /// clone of the partition's writing store (handle passing — see
+    /// `StateBackendFactory::for_partition`),
+    /// so a per-instance cache is fine as long as clones share it; a stale
+    /// answer flips a recovery decision (rolling back a committed write, or
+    /// promoting an abandoned one).
     fn current_tag(
         &self,
         key: &Key,

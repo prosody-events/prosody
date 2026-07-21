@@ -14,7 +14,9 @@
 //!   new inline state atomically — one round-trip, zero residual tombstones.
 //!
 //! `resolve_state` is the cache-first entry point used by all higher-level
-//! operations: it returns an `Arc<AsyncMutex<TimerState>>` that callers lock
+//! operations, the commit-oracle read `current_tag` included (sound because
+//! the oracle reads through a clone of the partition's writing store — see
+//! its doc): it returns an `Arc<AsyncMutex<TimerState>>` that callers lock
 //! before reading and hold through the write, serialising mutations per
 //! `(key, timer_type)` without a global lock.
 
@@ -26,7 +28,7 @@ use crate::timers::store::SegmentId;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::state::{
-    CachedState, ClusteringEntry, PeekedTrigger, TimerState,
+    CachedState, ClusteringEntry, InlineTimer, PeekedTrigger, TimerState,
 };
 use crate::timers::store::cassandra::trigger_store::extract_span_map;
 use crate::timers::{TimerType, Trigger};
@@ -67,6 +69,18 @@ struct PromoteOverflowParams<'a> {
     s_key: &'a str,
 }
 
+/// Returns the inline timer inside `state`, or `AbsentStateNotSerializable`
+/// for `Overflow`/`Absent`. Every write that persists `state` to the static
+/// column needs the payload it carries, and only `Inline` carries one.
+fn require_inline(state: &TimerState) -> Result<&InlineTimer, CassandraTriggerStoreError> {
+    match state {
+        TimerState::Inline(timer) => Ok(timer),
+        TimerState::Overflow | TimerState::Absent => {
+            Err(CassandraTriggerStoreError::AbsentStateNotSerializable)
+        }
+    }
+}
+
 impl CassandraTriggerStore {
     /// Fetches the `state` map from the database.
     #[instrument(level = "debug", skip(self), err)]
@@ -92,10 +106,6 @@ impl CassandraTriggerStore {
     ///
     /// Uses `SELECT state[?]` to read only the requested type. Both a missing
     /// partition (no row) and a `NULL` map entry resolve to `Absent`.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn fetch_state(
         &self,
@@ -137,10 +147,6 @@ impl CassandraTriggerStore {
     ///
     /// Post-V3, a NULL/missing MAP entry unambiguously means "new key, 0
     /// timers," so all states (including `Absent`) are cached.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the DB read fails on a cache miss.
     pub(super) async fn resolve_state(
         &self,
         segment_id: &SegmentId,
@@ -172,10 +178,6 @@ impl CassandraTriggerStore {
     ///
     /// This is the safe path for Overflow→Inline and DB-Absent→Inline
     /// transitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_clear_and_set_inline(
         &self,
@@ -184,9 +186,7 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let TimerState::Inline(timer) = state else {
-            return Err(CassandraTriggerStoreError::AbsentStateNotSerializable);
-        };
+        let timer = require_inline(state)?;
         self.execute_with_optional_ttl(
             timer.time,
             &self.queries().batch_clear_and_set_inline,
@@ -228,10 +228,6 @@ impl CassandraTriggerStore {
     /// unlogged batch is correct and carries no cross-partition overhead.
     /// This is the Overflow→Inline demotion path when exactly 1 clustering
     /// row remains after a delete.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_demote_to_inline(
         &self,
@@ -241,9 +237,7 @@ impl CassandraTriggerStore {
         time_to_delete: CompactDateTime,
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let TimerState::Inline(timer) = state else {
-            return Err(CassandraTriggerStoreError::AbsentStateNotSerializable);
-        };
+        let timer = require_inline(state)?;
         self.execute_with_optional_ttl(
             timer.time,
             &self.queries().batch_demote_to_inline,
@@ -283,10 +277,6 @@ impl CassandraTriggerStore {
     /// This is the fast path for Inline→Inline replacement: no BATCH,
     /// no DELETE, no range tombstone. Safe because the caller knows the state
     /// is `Inline` (no clustering rows for this key/type).
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn set_state_inline(
         &self,
@@ -295,9 +285,7 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let TimerState::Inline(timer) = state else {
-            return Err(CassandraTriggerStoreError::AbsentStateNotSerializable);
-        };
+        let timer = require_inline(state)?;
         self.execute_with_optional_ttl(
             timer.time,
             &self.queries().set_state_inline,
@@ -314,10 +302,6 @@ impl CassandraTriggerStore {
     /// A TTL is applied (derived from `ttl_time`) so the marker expires no
     /// later than the clustering rows it describes, preventing zombie Overflow
     /// entries if those rows expire via TTL without an explicit deletion.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn set_state_overflow(
         &self,
@@ -381,10 +365,6 @@ impl CassandraTriggerStore {
     }
 
     /// Removes a state entry for a single timer type (returns to Absent).
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn remove_state_entry(
         &self,
@@ -414,12 +394,8 @@ impl CassandraTriggerStore {
     /// the clustering row.
     ///
     /// Fetches only `time` — no span — to keep the result small.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn peek_trigger_times(
+    pub(super) async fn peek_trigger_times(
         &self,
         segment_id: &SegmentId,
         key: &Key,
@@ -454,10 +430,6 @@ impl CassandraTriggerStore {
     ///
     /// Used in the `1`-remaining demotion branch of `delete_key_trigger` and
     /// `backfill_key_state` to retrieve the span needed to build inline state.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn peek_first_key_trigger(
         &self,
@@ -485,10 +457,6 @@ impl CassandraTriggerStore {
     /// read: the caller filters the target time out and inspects what remains
     /// to choose between three post-delete states (Absent / Inline / Overflow).
     /// Returning a third row signals "≥2 survivors" without needing its data.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn peek_three_key_triggers(
         &self,
@@ -519,16 +487,12 @@ impl CassandraTriggerStore {
         Ok(out)
     }
 
-    /// Atomic batch: DELETE target clustering row + DELETE state[type].
+    /// Atomic batch: DELETE target clustering row + DELETE `state[type]`.
     ///
     /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
     /// read shows zero non-target rows. Both statements target the same
     /// `(segment_id, key)` partition so the unlogged batch carries no
     /// cross-partition coordination overhead and is atomic on the replica.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_delete_to_absent(
         &self,
@@ -559,13 +523,8 @@ impl CassandraTriggerStore {
     /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
     /// read shows exactly one non-target row will survive. The survivor's
     /// time/span/tag has already been captured into `state` so the UPDATE
-    /// writes Inline state in the same round-trip — eliminating both the
-    /// separate target DELETE and the separate demote BATCH that the
-    /// pre-restructure code issued.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
+    /// writes Inline state in the same round-trip, avoiding a separate
+    /// target DELETE and a separate demote BATCH.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_delete_to_inline(
         &self,
@@ -576,9 +535,7 @@ impl CassandraTriggerStore {
         surviving_time: CompactDateTime,
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let TimerState::Inline(timer) = state else {
-            return Err(CassandraTriggerStoreError::AbsentStateNotSerializable);
-        };
+        let timer = require_inline(state)?;
         let key_ref = key.as_ref();
         self.execute_with_optional_ttl(
             timer.time,
@@ -630,10 +587,6 @@ impl CassandraTriggerStore {
     /// - 1 clustering row: normalize to inline state (concurrent
     ///   `set_state_inline` + delete clustering row).
     /// - ≥2 clustering rows: set overflow marker.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if any DB operation fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn backfill_key_state(
         &self,
@@ -641,8 +594,6 @@ impl CassandraTriggerStore {
         key: &Key,
         timer_type: TimerType,
     ) -> Result<(), CassandraTriggerStoreError> {
-        use crate::timers::store::cassandra::state::InlineTimer;
-
         // Skip if already has state (idempotency guard).
         // Uses fetch_state (DB-direct) because backfill writes via set_state_inline /
         // set_state_overflow without updating the in-memory cache.
@@ -707,10 +658,6 @@ impl CassandraTriggerStore {
     /// expires together with the last clustering row it describes — preventing
     /// zombie markers if those rows later expire via TTL without explicit
     /// deletion.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database batch execution fails.
     #[instrument(level = "debug", skip(self), err)]
     pub(super) async fn batch_promote_and_set_overflow(
         &self,
@@ -724,73 +671,63 @@ impl CassandraTriggerStore {
         let ttl_time = promoted.time.max(new.time);
         let key_ref = key.as_ref();
 
-        // `PromoteOverflowParams` is used for both TTL and no-TTL because
-        // the bind value count exceeds the 16-element `SerializeRow` tuple limit.
-        match self.calculate_ttl(ttl_time) {
-            Some(ttl) => {
-                self.execute_unpaged_discard(
-                    &self.queries().batch_promote_and_set_overflow,
-                    PromoteOverflowParams {
-                        p_segment_id: segment_id,
-                        p_key: key_ref,
-                        p_timer_type: timer_type,
-                        p_time: promoted.time,
-                        p_span: promoted.span,
-                        p_tag: promoted.tag,
-                        p_ttl: ttl,
-                        n_segment_id: segment_id,
-                        n_key: key_ref,
-                        n_timer_type: timer_type,
-                        n_time: new.time,
-                        n_span: new.span,
-                        n_tag: new.tag,
-                        n_ttl: ttl,
-                        s_ttl: ttl,
-                        s_timer_type: timer_type,
-                        s_state: &overflow_state,
-                        s_segment_id: segment_id,
-                        s_key: key_ref,
-                    },
+        // `PromoteOverflowParams` is needed for the TTL variant because the
+        // bind value count exceeds the 16-element `SerializeRow` tuple limit.
+        self.execute_with_optional_ttl(
+            ttl_time,
+            &self.queries().batch_promote_and_set_overflow,
+            &self.queries().batch_promote_and_set_overflow_no_ttl,
+            |ttl| PromoteOverflowParams {
+                p_segment_id: segment_id,
+                p_key: key_ref,
+                p_timer_type: timer_type,
+                p_time: promoted.time,
+                p_span: promoted.span,
+                p_tag: promoted.tag,
+                p_ttl: ttl,
+                n_segment_id: segment_id,
+                n_key: key_ref,
+                n_timer_type: timer_type,
+                n_time: new.time,
+                n_span: new.span,
+                n_tag: new.tag,
+                n_ttl: ttl,
+                s_ttl: ttl,
+                s_timer_type: timer_type,
+                s_state: &overflow_state,
+                s_segment_id: segment_id,
+                s_key: key_ref,
+            },
+            || {
+                (
+                    segment_id,
+                    key_ref,
+                    timer_type,
+                    promoted.time,
+                    promoted.span,
+                    promoted.tag,
+                    segment_id,
+                    key_ref,
+                    timer_type,
+                    new.time,
+                    new.span,
+                    new.tag,
+                    timer_type,
+                    &overflow_state,
+                    segment_id,
+                    key_ref,
                 )
-                .await
-            }
-            None => {
-                self.execute_unpaged_discard(
-                    &self.queries().batch_promote_and_set_overflow_no_ttl,
-                    (
-                        segment_id,
-                        key_ref,
-                        timer_type,
-                        promoted.time,
-                        promoted.span,
-                        promoted.tag,
-                        segment_id,
-                        key_ref,
-                        timer_type,
-                        new.time,
-                        new.span,
-                        new.tag,
-                        timer_type,
-                        &overflow_state,
-                        segment_id,
-                        key_ref,
-                    ),
-                )
-                .await
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Inserts a trigger into clustering columns only.
     ///
     /// Used when multiple timers exist for a key/type. Does not touch the
     /// state column.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database insert fails.
     #[instrument(level = "debug", skip(self), err)]
-    pub async fn add_key_trigger_clustering(
+    pub(super) async fn add_key_trigger_clustering(
         &self,
         segment_id: &SegmentId,
         trigger: Trigger,

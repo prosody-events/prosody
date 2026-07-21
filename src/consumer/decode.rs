@@ -69,18 +69,9 @@ pub struct DecodedMessage<P> {
 /// Callers create their own spans from the context, ensuring span lifecycles
 /// are independent of cache eviction.
 ///
-/// # Arguments
-///
-/// * `message` - The Kafka message to decode. Taken as `&mut` so the codec can
-///   parse the payload in place via `payload_mut`, avoiding a copy. The payload
-///   bytes are consumed (left in an unspecified state) by this call.
-/// * `propagator` - Distributed tracing context propagator
-/// * `codec` - Codec used to deserialize the raw payload bytes
-///
-/// # Returns
-///
-/// * `Some(DecodedMessage)` - A validated, parsed message with parent context
-/// * `None` - If the message is invalid or missing required fields
+/// `message` is taken as `&mut` so the codec can parse the payload in place
+/// via `payload_mut`, avoiding a copy; its payload bytes are left in an
+/// unspecified state after this call.
 pub fn decode_message<C: Codec>(
     message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
@@ -169,15 +160,6 @@ pub fn decode_message<C: Codec>(
 /// Extracts the source system header from a Kafka message.
 ///
 /// Logs an error if the header value is invalid UTF-8 and treats it as absent.
-///
-/// # Arguments
-///
-/// * `message` - The Kafka message containing headers
-///
-/// # Returns
-///
-/// * `Some(SourceSystem)` - If the header is present and valid
-/// * `None` - If the header is not present or invalid
 fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
     match message
         .headers()
@@ -202,15 +184,7 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 /// - Uses `CreateTime` or `LogAppendTime` if available
 /// - Falls back to current time if timestamp is not available
 /// - Handles ambiguous timestamps by selecting the earliest
-///
-/// # Arguments
-///
-/// * `message` - The Kafka message containing timestamp metadata
-///
-/// # Returns
-///
-/// The resolved message timestamp
-fn resolve_timestamp(message: &BorrowedMessage) -> chrono::DateTime<chrono::Utc> {
+fn resolve_timestamp(message: &BorrowedMessage) -> chrono::DateTime<Utc> {
     match message.timestamp() {
         Timestamp::NotAvailable => Utc::now(),
         Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {

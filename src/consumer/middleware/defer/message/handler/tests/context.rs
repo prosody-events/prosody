@@ -8,6 +8,10 @@ use super::types::OutputEvent;
 use crate::Key;
 use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
+use crate::consumer::event_context::StateAccessError;
+use crate::consumer::middleware::RepinProof;
+use crate::state::descriptor::{Registered, StateDescriptor};
+use crate::state::tests::support::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use ahash::RandomState;
@@ -147,6 +151,15 @@ impl TimerCapture {
     pub fn active_timer_count(&self) -> usize {
         self.active_timers.len()
     }
+
+    /// Returns the number of scheduled timers for one key. Distinguishes a
+    /// `clear_and_schedule` singleton (1) from an accumulating `schedule` (>1).
+    #[must_use]
+    pub fn key_timer_count(&self, key: &Key) -> usize {
+        self.active_timers
+            .read_sync(key, |_, times| times.len())
+            .unwrap_or(0)
+    }
 }
 
 // ============================================================================
@@ -206,6 +219,23 @@ impl TerminationSignals for KeyedCapturingContext {
 
 impl EventContext for KeyedCapturingContext {
     type Error = Infallible;
+    type Payload = serde_json::Value;
+    type State = UnavailableState<serde_json::Value>;
+
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        registered.descriptor().bind(&UnavailableState::new())
+    }
+
+    fn redispatch(&self, _proof: RepinProof) -> Self {
+        // Leaf mock over stateless keyed state: nothing to re-pin.
+        self.clone()
+    }
 
     fn should_cancel(&self) -> bool {
         false
@@ -223,7 +253,7 @@ impl EventContext for KeyedCapturingContext {
         if timer_type == TimerType::DeferredMessage {
             self.capture.record_schedule(self.key.clone(), time);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn clear_and_schedule(
@@ -236,7 +266,7 @@ impl EventContext for KeyedCapturingContext {
             self.capture.record_clear_all(&self.key);
             self.capture.record_schedule(self.key.clone(), time);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn unschedule(
@@ -248,7 +278,7 @@ impl EventContext for KeyedCapturingContext {
             // Remove specific timer by (key, time)
             self.capture.record_clear(&self.key, time);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn clear_scheduled(
@@ -259,7 +289,7 @@ impl EventContext for KeyedCapturingContext {
             // Remove all timers for this key
             self.capture.record_clear_all(&self.key);
         }
-        future::ready(Ok(()))
+        ready(Ok(()))
     }
 
     fn cancel(&self) {
@@ -267,10 +297,6 @@ impl EventContext for KeyedCapturingContext {
     }
 
     fn uncancel(&self) {
-        // No-op for tests
-    }
-
-    fn invalidate(self) {
         // No-op for tests
     }
 

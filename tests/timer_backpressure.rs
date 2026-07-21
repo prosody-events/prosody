@@ -14,7 +14,10 @@ use prosody::{
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
+    consumer::{
+        ConsumerConfiguration, DemandType, EventHandler, Keyed, KeyedStateConfiguration,
+        ProsodyConsumer, Uncommitted,
+    },
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
     timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
@@ -46,7 +49,7 @@ impl EventHandler for SlowTimerHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
@@ -55,7 +58,7 @@ impl EventHandler for SlowTimerHandler {
         // Schedule a timer based on the message
         if let Some(delay_ms) = payload
             .get("schedule_timer_delay_ms")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(Value::as_u64)
         {
             let delay_secs = (delay_ms / 1000).max(1) as u32; // Convert to seconds, minimum 1
             let delay = CompactDuration::new(delay_secs);
@@ -74,12 +77,12 @@ impl EventHandler for SlowTimerHandler {
             }
         }
 
-        uncommitted.commit();
+        uncommitted.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
         let timer_key = timer.key().to_string();
@@ -143,6 +146,7 @@ async fn test_timer_backpressure() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(slow_timer_handler),
         Telemetry::new(),
     )

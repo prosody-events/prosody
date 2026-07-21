@@ -22,16 +22,6 @@ pub struct AppliedMigration {
 /// Compares checksums of embedded migration files against the checksums
 /// recorded when they were applied. This detects if migration files have
 /// been modified after being applied to the database.
-///
-/// # Arguments
-///
-/// * `migrations` - All available embedded migrations
-/// * `applied_migrations` - Previously applied migrations from the database
-///
-/// # Errors
-///
-/// Returns an error if any applied migration has a different checksum
-/// than the current embedded file.
 pub fn validate_applied_migrations(
     migrations: &[Migration],
     applied_migrations: &HashMap<String, AppliedMigration>,
@@ -66,15 +56,6 @@ pub fn validate_applied_migrations(
 ///
 /// Filters the list of available migrations to find those that don't
 /// appear in the applied migrations tracking table.
-///
-/// # Arguments
-///
-/// * `migrations` - All available embedded migrations
-/// * `applied_migrations` - Previously applied migrations from the database
-///
-/// # Returns
-///
-/// A vector of references to migrations that need to be applied.
 pub fn get_pending_migrations<'b>(
     migrations: &'b [Migration],
     applied_migrations: &HashMap<String, AppliedMigration>,

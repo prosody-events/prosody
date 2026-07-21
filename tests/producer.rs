@@ -8,54 +8,22 @@
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
-use prosody::consumer::event_context::EventContext;
-use prosody::consumer::message::UncommittedMessage;
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::middleware::CloneProvider;
-use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
-use prosody::timers::UncommittedTimer;
 use prosody::tracing::init_test_logging;
 use prosody::{JsonCodec, Topic};
 use serde_json::{Value, json};
 
 type Payload = Value;
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::{Receiver, channel};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 mod common;
-
-/// Handler that forwards messages to a channel for test verification.
-#[derive(Clone)]
-struct TestHandler {
-    tx: Sender<(String, Value)>,
-}
-
-impl EventHandler for TestHandler {
-    type Payload = Value;
-
-    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage<Value>, _demand_type: DemandType)
-    where
-        C: EventContext,
-    {
-        let (inner, uncommitted) = msg.into_inner();
-        let key = inner.key().to_string();
-        let payload = inner.payload().clone();
-        let _ = self.tx.send((key, payload)).await;
-        uncommitted.commit();
-    }
-
-    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
-    where
-        C: EventContext,
-        U: UncommittedTimer,
-    {
-    }
-
-    async fn shutdown(self) {}
-}
 
 /// Asserts that a message with the expected key and payload is received.
 async fn expect_message(
@@ -294,18 +262,24 @@ async fn test_producer_deduplication() -> Result<()> {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &cfg,
             &common::create_cassandra_trigger_store_config(),
-            CloneProvider::new(TestHandler { tx }),
+            KeyedStateConfiguration::default(),
+            CloneProvider::new(common::ChannelHandler::new(tx)),
             Telemetry::new(),
         )
         .await?;
         (consumer, rx)
     };
 
-    let receive_timeout = Duration::from_secs(10);
+    // Per-receive hang-guard: each case awaits a message that will arrive; the
+    // bound only catches a genuine hang, so it is generous and load-insensitive.
+    let receive_timeout = Duration::from_secs(30);
 
     // Capture result so consumer is always shut down, even on failure.
     // Dropping the consumer without shutdown causes a blocking hang in Drop.
-    let result = timeout(Duration::from_secs(20), async {
+    // The outer deadline bounds total runtime and stays above `receive_timeout`
+    // so a single hung case surfaces its own granular error first.
+    let overall_timeout = Duration::from_secs(90);
+    let result = timeout(overall_timeout, async {
         case_duplicate_id_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
         case_same_id_different_keys(&producer, &topic, &mut rx, receive_timeout).await?;
         case_distinct_ids_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
@@ -314,7 +288,7 @@ async fn test_producer_deduplication() -> Result<()> {
         Ok::<(), eyre::Report>(())
     })
     .await
-    .map_err(|_| eyre::eyre!("test timed out after 20 seconds"))
+    .map_err(|_| eyre::eyre!("test timed out after {overall_timeout:?}"))
     .and_then(|r| r);
 
     consumer_client.shutdown().await;

@@ -19,49 +19,6 @@ use std::fmt::Debug;
 
 use tracing::Span;
 
-async fn verify_update_tag_rotates_both_indices<S>(
-    store: &S,
-    segment: &Segment,
-    trigger: &Trigger,
-) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    let new_tag = trigger.tag.wrapping_add(1);
-    store
-        .update_tag(&trigger.key, trigger.time, trigger.timer_type, new_tag)
-        .await
-        .map_err(|e| format!("update_tag failed: {e:?}"))?;
-
-    let current_tag = store
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await
-        .map_err(|e| format!("current_tag failed: {e:?}"))?;
-    if current_tag != Some(new_tag) {
-        return Err(format!(
-            "current_tag did not reflect rotated tag. Expected: {new_tag:?}, got: {current_tag:?}"
-        ));
-    }
-
-    let slab_id = Slab::from_time(segment.slab_size, trigger.time).id();
-    let slab_triggers = get_slab_triggers(store, slab_id).await?;
-    let slab_tag = slab_triggers
-        .iter()
-        .find(|t| {
-            t.key == trigger.key && t.time == trigger.time && t.timer_type == trigger.timer_type
-        })
-        .map(|t| t.tag);
-
-    if slab_tag != Some(new_tag) {
-        return Err(format!(
-            "slab trigger did not reflect rotated tag. Expected: {new_tag:?}, got: {slab_tag:?}"
-        ));
-    }
-
-    Ok(())
-}
-
 async fn verify_duplicate_add_replaces_metadata<S>(
     store: &S,
     segment: &Segment,
@@ -113,8 +70,8 @@ where
     ] {
         if tag != Some(replacement_tag) {
             return Err(format!(
-                "duplicate add did not replace {surface} tag. Expected: {replacement_tag:?}, \
-                 got: {tag:?}"
+                "duplicate add did not replace {surface} tag. Expected: {replacement_tag:?}, got: \
+                 {tag:?}"
             ));
         }
     }
@@ -170,71 +127,50 @@ where
         ));
     }
 
-    // Check slab-based retrieval
-    if let Some(trigger) = input.triggers.first() {
-        let slab_id = Slab::from_time(input.segment.slab_size, trigger.time).id();
+    // Slab retrieval, metadata replacement, removal, and clearing all target the
+    // first trigger, which the emptiness check above guarantees is present.
+    let trigger = &input.triggers[0];
+    let slab_id = Slab::from_time(input.segment.slab_size, trigger.time).id();
 
-        let slab_triggers = get_slab_triggers(store, slab_id).await?;
-
-        // Filter original triggers for this slab
-        let expected_slab_triggers: HashSet<_> = input
-            .triggers
-            .iter()
-            .filter(|t| Slab::from_time(input.segment.slab_size, t.time).id() == slab_id)
-            .cloned()
-            .collect();
-
-        if slab_triggers != expected_slab_triggers {
-            return Err(format!(
-                "Retrieved slab triggers don't match expected. Expected: \
-                 {expected_slab_triggers:?}, Got: {slab_triggers:?}"
-            ));
-        }
+    // Check slab-based retrieval against the original triggers landing in this
+    // slab.
+    let slab_triggers = get_slab_triggers(store, slab_id).await?;
+    let expected_slab_triggers: HashSet<_> = input
+        .triggers
+        .iter()
+        .filter(|t| Slab::from_time(input.segment.slab_size, t.time).id() == slab_id)
+        .cloned()
+        .collect();
+    if slab_triggers != expected_slab_triggers {
+        return Err(format!(
+            "Retrieved slab triggers don't match expected. Expected: {expected_slab_triggers:?}, \
+             Got: {slab_triggers:?}"
+        ));
     }
 
-    // Tag rotation is part of the dual-index contract: the key index is used
-    // by `current_tag`, while slab loading rebuilds active timers from the
-    // slab index after restarts and ownership transfers.
-    if let Some(trigger) = input.triggers.first() {
-        verify_update_tag_rotates_both_indices(store, &input.segment, trigger).await?;
-        verify_duplicate_add_replaces_metadata(store, &input.segment, trigger).await?;
+    // A duplicate add with the same key/time/type must replace the metadata (tag)
+    // across `current_tag` and both indices.
+    verify_duplicate_add_replaces_metadata(store, &input.segment, trigger).await?;
+
+    remove_trigger(store, &trigger.key, trigger.time, trigger.timer_type).await?;
+    let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
+    if remaining_key_times.contains(&trigger.time) {
+        return Err("Trigger still present after removal".to_owned());
+    }
+    let remaining_slab_triggers = get_slab_triggers(store, slab_id).await?;
+    if remaining_slab_triggers
+        .iter()
+        .any(|t| t.key == trigger.key && t.time == trigger.time)
+    {
+        return Err("Trigger still present in slab after removal".to_owned());
     }
 
-    // Test remove_trigger
-    if let Some(trigger) = input.triggers.first() {
-        remove_trigger(store, &trigger.key, trigger.time, trigger.timer_type).await?;
-
-        let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
-
-        let removed_present = remaining_key_times.contains(&trigger.time);
-        if removed_present {
-            return Err("Trigger still present after removal".to_owned());
-        }
-
-        // Check it's also gone from the slab
-        let slab_id = Slab::from_time(input.segment.slab_size, trigger.time).id();
-        let remaining_slab_triggers = get_slab_triggers(store, slab_id).await?;
-
-        let trigger_in_slab = remaining_slab_triggers
-            .iter()
-            .any(|t| t.key == trigger.key && t.time == trigger.time);
-
-        if trigger_in_slab {
-            return Err("Trigger still present in slab after removal".to_owned());
-        }
-    }
-
-    // Test clear_triggers_for_key
-    if let Some(trigger) = input.triggers.first() {
-        clear_triggers_for_key(store, trigger.timer_type, &trigger.key).await?;
-
-        let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
-
-        if !remaining_key_times.is_empty() {
-            return Err(format!(
-                "Key triggers still present after clear: {remaining_key_times:?}"
-            ));
-        }
+    clear_triggers_for_key(store, trigger.timer_type, &trigger.key).await?;
+    let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
+    if !remaining_key_times.is_empty() {
+        return Err(format!(
+            "Key triggers still present after clear: {remaining_key_times:?}"
+        ));
     }
 
     Ok(())
@@ -268,12 +204,7 @@ where
 
         match op {
             TriggerOperation::Add => {
-                let trigger = Trigger::new(
-                    input.key.clone(),
-                    time,
-                    TimerType::Application,
-                    Span::current(),
-                );
+                let trigger = Trigger::for_testing(input.key.clone(), time, TimerType::Application);
 
                 add_trigger(store, &trigger).await?;
                 expected_times.insert(time);

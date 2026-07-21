@@ -26,15 +26,6 @@ impl<'a> MigrationExecutor<'a> {
     /// Executes all CQL statements in the migration file and records
     /// the successful application in the migrations tracking table.
     /// Measures execution time for monitoring purposes.
-    ///
-    /// # Arguments
-    ///
-    /// * `migration` - The migration to apply
-    /// * `keyspace` - The target keyspace for the migration
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if statement execution or migration recording fails.
     pub(crate) async fn apply_migration(
         &self,
         migration: &Migration,

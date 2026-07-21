@@ -58,16 +58,32 @@ When a handler fails, retry with exponential backoff:
 | `PROSODY_DEFER_MAX_DELAY`         | Never wait longer than this                       | 24h     |
 | `PROSODY_DEFER_FAILURE_THRESHOLD` | Disable deferral when failure rate exceeds this   | 0.9     |
 | `PROSODY_DEFER_FAILURE_WINDOW`    | Measure failure rate over this time window        | 5m      |
-| `PROSODY_DEFER_CACHE_SIZE`        | Decoded Kafka messages cached by the defer loader | 1024    |
 | `PROSODY_DEFER_STORE_CACHE_SIZE`  | `(key → next_offset/next_timer, retry_count)` entries cached per Cassandra defer store | 8192    |
-| `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
-| `PROSODY_DEFER_DISCARD_THRESHOLD` | Read optimization (rarely needs changing)         | 100     |
 
-## Deduplication (Pipeline Mode)
+## Message Loader (Pipeline Mode)
+
+The Kafka message loader is consumer-wide: it serves both deferred-message
+reloads and keyed-state message resolution.
+
+| Environment Variable              | Description                                            | Default |
+|-----------------------------------|--------------------------------------------------------|---------|
+| `PROSODY_LOADER_CACHE_SIZE`       | Decoded Kafka messages cached by the loader            | 1024    |
+| `PROSODY_LOADER_SEEK_TIMEOUT`     | Timeout for Kafka seek operations when loading         | 30s     |
+| `PROSODY_LOADER_DISCARD_THRESHOLD`| Sequential reads before seeking (rarely needs changing)| 100     |
+
+## Keyed State (Pipeline Mode)
+
+| Environment Variable                 | Description                                        | Default                  |
+|--------------------------------------|----------------------------------------------------|--------------------------|
+| `PROSODY_STATE_CACHE_DIR`            | Disk workspace for the local keyed-state cache. Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
+| `PROSODY_STATE_CACHE_SIZE_BYTES`     | Capacity of the in-memory keyed-state cache, in bytes. Must be greater than zero. | storage-engine default |
+| `PROSODY_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
+
+## Deduplication (All Modes)
 
 | Environment Variable             | Description                                         | Default |
 |----------------------------------|-----------------------------------------------------|---------|
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Global shared cache capacity (0 to disable)         | 8192    |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Global shared cache capacity (must be at least 1)   | 8192    |
 | `PROSODY_IDEMPOTENCE_VERSION`    | Version string for cache-busting dedup hashes       | 1       |
 | `PROSODY_IDEMPOTENCE_TTL`        | TTL for dedup records in Cassandra                  | 7d      |
 

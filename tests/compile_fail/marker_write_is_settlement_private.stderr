@@ -1,0 +1,15 @@
+error[E0603]: struct `MarkerWrite` is private
+ --> tests/compile_fail/marker_write_is_settlement_private.rs:8:36
+  |
+8 | use prosody::consumer::middleware::MarkerWrite;
+  |                                    ^^^^^^^^^^^ private struct
+  |
+note: the struct `MarkerWrite` is defined here
+ --> src/consumer/middleware/mod.rs
+  |
+  | pub(crate) use settle::{MarkerWrite, NextAttempt, Settlement, SettlementHandler, abandon, settle};
+  |                         ^^^^^^^^^^^
+help: import `MarkerWrite` directly
+  |
+8 | use prosody::consumer::middleware::settle::MarkerWrite;
+  |                                    ++++++++

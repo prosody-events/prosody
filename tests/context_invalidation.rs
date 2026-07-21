@@ -9,34 +9,29 @@
 use color_eyre::eyre::{Result, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, DemandType, EventHandler, ProsodyConsumer, Uncommitted},
-    producer::{ProducerConfiguration, ProsodyProducer},
-    telemetry::Telemetry,
+    consumer::{DemandType, EventHandler, Uncommitted},
     timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
-use tokio::task::yield_now;
 use tracing::info;
-use uuid::Uuid;
 
 mod common;
+use common::ConsumerEnv;
 
 /// Test handler that clones contexts during processing and sends them for later
 /// testing.
 #[derive(Clone)]
 struct ContextInvalidationHandler {
     /// Channel to send cloned contexts for later testing
-    context_tx: Sender<BoxEventContext>,
+    context_tx: Sender<BoxEventContext<Value>>,
 }
 
 impl ContextInvalidationHandler {
-    fn new(context_tx: Sender<BoxEventContext>) -> Self {
+    fn new(context_tx: Sender<BoxEventContext<Value>>) -> Self {
         Self { context_tx }
     }
 }
@@ -50,7 +45,7 @@ impl EventHandler for ContextInvalidationHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         info!("Processing message in handler");
 
@@ -70,7 +65,7 @@ impl EventHandler for ContextInvalidationHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
         // Not used in this test
@@ -97,58 +92,20 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     // Initialize logging
     init_test_logging();
 
-    // Create a unique topic for the test
-    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
-
-    // Setup admin client and create topic
-    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-    admin_client
-        .create_topic(
-            &TopicConfiguration::builder()
-                .name(topic.to_string())
-                .partition_count(1_u16)
-                .replication_factor(1_u16)
-                .build()?,
-        )
-        .await?;
-
-    info!("Created test topic: {topic}");
-
     // Create a channel to receive cloned contexts from the handler
     let (context_tx, mut context_rx) = channel(1);
 
     // Create our test handler
     let handler = ContextInvalidationHandler::new(context_tx);
 
-    // Configure consumer
-    let consumer_config = ConsumerConfiguration::builder()
-        .bootstrap_servers(bootstrap.clone())
-        .group_id(Uuid::new_v4().to_string().as_str())
-        .probe_port(None)
-        .subscribed_topics(&[topic.to_string()])
-        .build()?;
-
-    // Create consumer
-    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
-        &consumer_config,
-        &common::create_cassandra_trigger_store_config(),
-        CloneProvider::new(handler),
-        Telemetry::new(),
-    )
+    let env = ConsumerEnv::new("context-invalidation", async move |_config| {
+        Ok(CloneProvider::new(handler))
+    })
     .await?;
-
-    // Configure and create producer
-    let producer_config = ProducerConfiguration::builder()
-        .bootstrap_servers(bootstrap)
-        .source_system("test-producer")
-        .build()?;
-
-    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Send a test message
     let test_payload = json!({ "test": "context_invalidation" });
-    producer.send([], topic, "test-key", test_payload).await?;
+    env.send_message("test-key", test_payload).await?;
 
     info!("Sent test message, waiting for cloned context...");
 
@@ -160,8 +117,12 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
 
     info!("Received cloned context, handler should have completed and invalidated context");
 
-    // Yield to allow any cleanup/invalidation to complete
-    yield_now().await;
+    // Join the partition task before probing: `env.shutdown()` drives the
+    // consumer down and joins its task, so the hoisted `invalidate()` at the
+    // end of the message arm has provably run. This also satisfies the rdkafka
+    // teardown rule (shut down before propagating any failure); no early `?`
+    // sits between the message send and here.
+    env.shutdown().await;
 
     // Now try to use the cloned context - this should fail with InvalidContext
     let future_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
@@ -170,25 +131,19 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .schedule(future_time, TimerType::Application)
         .await
     {
-        Ok(()) => {
-            return Err(eyre!(
-                "UNEXPECTED: Cloned context usage succeeded when it should have failed"
-            ));
-        }
+        Ok(()) => Err(eyre!(
+            "UNEXPECTED: Cloned context usage succeeded when it should have failed"
+        )),
         Err(error) => {
             let error_string = format!("{error}");
-            if error_string.contains("no longer valid") || error_string.contains("InvalidContext") {
+            // The only source of this message is `TimerManagerError::InvalidContext`'s
+            // `Display` impl, reached through the `Box<dyn EventContextError>` erasure.
+            if error_string.contains("no longer valid") {
                 info!("SUCCESS: Cloned context correctly returned InvalidContext error");
+                Ok(())
             } else {
-                return Err(eyre!("Expected InvalidContext error, got: {error}"));
+                Err(eyre!("Expected InvalidContext error, got: {error}"))
             }
         }
     }
-
-    // Clean up
-    consumer.shutdown().await;
-    admin_client.delete_topic(&topic).await?;
-
-    info!("Test completed successfully");
-    Ok(())
 }

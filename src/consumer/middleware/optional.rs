@@ -31,6 +31,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -123,7 +124,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match self {
             Self::Enabled(handler) => handler
@@ -146,7 +147,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match self {
             Self::Enabled(handler) => handler
@@ -172,7 +173,7 @@ where
     /// consume it.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match (self, result) {
             (Self::Enabled(handler), Ok(OptionOutput::Enabled(o))) => {
@@ -202,7 +203,7 @@ where
     /// `after_abort` fires. Mismatched variants are unreachable.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match (self, result) {
             (Self::Enabled(handler), Ok(OptionOutput::Enabled(o))) => {
@@ -226,6 +227,23 @@ where
         match self {
             Self::Enabled(handler) => handler.shutdown().await,
             Self::Disabled(handler) => handler.shutdown().await,
+        }
+    }
+}
+
+impl<E, D> SettlementHandler for OptionHandler<E, D>
+where
+    E: SettlementHandler,
+    D: SettlementHandler<Payload = E::Payload>,
+{
+    /// Delegates to whichever branch produced the result, mirroring the
+    /// apply-hook routing above.
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            Ok(OptionOutput::Enabled(output)) => E::settlement(Ok(output)),
+            Ok(OptionOutput::Disabled(output)) => D::settlement(Ok(output)),
+            Err(OptionError::Enabled(error)) => E::settlement(Err(error)),
+            Err(OptionError::Disabled(error)) => D::settlement(Err(error)),
         }
     }
 }

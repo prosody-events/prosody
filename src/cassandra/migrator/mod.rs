@@ -115,11 +115,6 @@ impl<'a> CassandraMigrator<'a> {
     /// Initializes the keyspace and tables if needed, and prepares lock
     /// statements for efficient reuse during migration operations.
     ///
-    /// # Arguments
-    ///
-    /// * `session` - Cassandra session for executing migration statements
-    /// * `keyspace` - Target keyspace name where migrations will be applied
-    ///
     /// # Errors
     ///
     /// Returns [`CassandraStoreError`] if:
@@ -303,10 +298,6 @@ impl<'a> CassandraMigrator<'a> {
     }
 
     /// Gets the list of pending migrations that need to be applied.
-    ///
-    /// # Arguments
-    ///
-    /// * `keyspace` - The keyspace to check for pending migrations
     ///
     /// # Errors
     ///

@@ -19,10 +19,6 @@ pub type TestStoreResult = Result<(), String>;
 /// ```rust,ignore
 /// timer_defer_store_tests!(async { MyStore::new().await });
 /// ```
-///
-/// # Arguments
-///
-/// * `$store_constructor` - Expression that creates a `Result<Store, Error>`
 #[macro_export]
 macro_rules! timer_defer_store_tests {
     ($store_constructor:expr) => {

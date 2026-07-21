@@ -22,6 +22,8 @@ impl Codec for JsonCodec {
     type Error = JsonCodecError;
     type Payload = serde_json::Value;
 
+    const FORMAT_ID: &'static str = "json";
+
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         #[cfg(target_arch = "arm")]
         {
@@ -34,14 +36,7 @@ impl Codec for JsonCodec {
     }
 
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        #[cfg(target_arch = "arm")]
-        {
-            serde_json::to_writer(buf, &payload).map_err(JsonCodecError::Serde)
-        }
-        #[cfg(not(target_arch = "arm"))]
-        {
-            simd_json::to_writer(buf, &payload).map_err(JsonCodecError::Simd)
-        }
+        write_json(&payload, buf)
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
@@ -71,13 +66,20 @@ impl EventType for serde_json::Value {
 /// Uses `simd_json` on non-ARM targets and `serde_json` on ARM. Returns
 /// `true` on success and `false` if serialization fails.
 pub fn serialize_to_json<T: serde::Serialize>(value: &T, buf: &mut Vec<u8>) -> bool {
+    write_json(value, buf).is_ok()
+}
+
+/// Writes `value` as JSON into `buf` using the arch-appropriate backend
+/// (`serde_json` on ARM, `simd_json` elsewhere) — the one place that
+/// decision is made.
+fn write_json<T: serde::Serialize>(value: &T, buf: &mut Vec<u8>) -> Result<(), JsonCodecError> {
     #[cfg(target_arch = "arm")]
     {
-        serde_json::to_writer(buf, value).is_ok()
+        serde_json::to_writer(buf, value).map_err(JsonCodecError::Serde)
     }
     #[cfg(not(target_arch = "arm"))]
     {
-        simd_json::to_writer(buf, value).is_ok()
+        simd_json::to_writer(buf, value).map_err(JsonCodecError::Simd)
     }
 }
 
@@ -88,7 +90,7 @@ pub enum JsonCodecError {
     #[error("serde_json error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// Deserialization failed via `simd_json` (non-ARM only).
+    /// Serialization or deserialization failed via `simd_json` (non-ARM only).
     #[cfg(not(target_arch = "arm"))]
     #[error("simd_json error: {0}")]
     Simd(simd_json::Error),

@@ -34,6 +34,13 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 
+/// Shared key pool for store property generators.
+///
+/// Small so operations collide on keys, and shared so pre-trial cleanup
+/// sweeps clear exactly the keys any trial can touch — a generator and
+/// its cleanup drifting apart is a cross-trial isolation bug.
+pub const KEY_POOL: [&str; 3] = ["key-a", "key-b", "key-c"];
+
 /// Deterministic FNV-1a tag derived from `(key, time, timer_type)`.
 ///
 /// Property tests rely on this to keep model-and-store tag comparisons

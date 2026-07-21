@@ -2,8 +2,10 @@
 //!
 //! The handler and client setup below mirror the README's High-Level Client
 //! Example exactly. The only differences are a channel added to `MyHandler`
-//! for observability, a unique topic and group ID for test isolation, and
-//! a disabled probe server to avoid port conflicts with parallel tests.
+//! for observability, a unique topic and group ID for test isolation, a
+//! disabled probe server to avoid port conflicts with parallel tests, and
+//! the ephemeral topic this test creates and deletes around the example
+//! (the README assumes the topic already exists).
 
 #![recursion_limit = "256"]
 
@@ -35,7 +37,7 @@ impl FallibleHandler for MyHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.sender.send(message.key().to_string()).await;
         Ok(())
@@ -48,7 +50,7 @@ impl FallibleHandler for MyHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -109,7 +111,9 @@ async fn quickstart() -> Result<()> {
         .send(topic, "message-key", json!({"value": "Hello, Kafka!"}))
         .await?;
 
-    let message_key = timeout(Duration::from_secs(30), receiver.recv())
+    // Hang-guard for the round-trip; sized generously so cluster slowness never
+    // trips it. Correctness is the `assert_eq!` on the key below, not the wait.
+    let message_key = timeout(Duration::from_mins(1), receiver.recv())
         .await
         .map_err(|_| eyre!("timed out waiting for message"))?
         .ok_or_else(|| eyre!("channel closed before message arrived"))?;

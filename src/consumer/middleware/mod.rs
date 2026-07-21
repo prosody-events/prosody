@@ -52,8 +52,11 @@
 //!
 //! # Usage
 //!
-//! Compose middleware using [`HandlerMiddleware::layer`] and finalize with
-//! [`HandlerMiddleware::into_provider`]:
+//! Compose middleware with [`HandlerMiddleware::layer`] — each call adds a new
+//! **outermost** layer — and finalize with
+//! [`HandlerMiddleware::into_provider`], which terminates the chain with the
+//! handler as the **innermost** component. Retry belongs outermost, since it
+//! re-drives the whole stack:
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
@@ -75,19 +78,19 @@
 //! #     async fn shutdown(self) {}
 //! # }
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
-//! # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-//! # let middle_middleware = CancellationMiddleware;
-//! # let outer_middleware = CancellationMiddleware;
-//! # let my_handler = MyHandler;
+//! # let handler = MyHandler;
 //!
-//! // Basic composition pattern
-//! let provider = inner_middleware
-//!     .layer(middle_middleware)
-//!     .layer(outer_middleware)
-//!     .into_provider(my_handler);
+//! // Stack (outer → inner): retry → cancellation → handler.
+//! let provider = CancellationMiddleware
+//!     .layer(RetryMiddleware::new(retry_config).unwrap())
+//!     .into_provider(handler);
 //! ```
 //!
-//! ## Real Example: Production Pipeline
+//! ## Retrying around a rescue layer
+//!
+//! [`topic::FailureTopicMiddleware`] rescues a failed message to a dead-letter
+//! topic. Wrapping it in its own outer [`retry::RetryMiddleware`] retries the
+//! DLQ write itself, while the inner retry re-drives the handler:
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
@@ -120,7 +123,6 @@
 //! # let telemetry = Telemetry::default();
 //! # let my_business_handler = MyHandler;
 //!
-//! // Low-latency consumer with full error handling
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
 //!     .layer(CancellationMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap())
@@ -158,7 +160,7 @@ use std::marker::PhantomData;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{DemandType, EventHandler, Uncommitted};
+use crate::consumer::{DemandType, EventHandler};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
@@ -174,14 +176,18 @@ pub mod optional;
 pub mod providers;
 pub mod retry;
 pub mod scheduler;
+mod settle;
 pub mod telemetry;
-#[cfg(test)]
-pub mod test_support;
 pub mod timeout;
 pub mod topic;
 
 // Re-export providers for backwards compatibility and convenience
-pub use providers::{CloneProvider, FallibleCloneProvider};
+pub use providers::{CloneProvider, FallibleCloneProvider, LeafHandler};
+pub(crate) use settle::{MarkerWrite, NextAttempt, Settlement, SettlementHandler, abandon, settle};
+// `RepinProof` is named by the public `EventContext::redispatch` signature, so
+// it must be publicly reachable — its constructor stays module-private, so the
+// re-export exposes only an unconstructable token (the `MarkerWrite` idiom).
+pub use settle::RepinProof;
 
 /// Provides fallible handlers for processing messages from specific partitions.
 ///
@@ -194,16 +200,6 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
     type Handler: FallibleHandler + Send + Sync + 'static;
 
     /// Creates a fallible handler for a specific topic and partition.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic of the partition.
-    /// * `partition` - The partition number.
-    ///
-    /// # Returns
-    ///
-    /// A handler instance for processing messages from the specified
-    /// topic-partition.
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
 }
 
@@ -245,15 +241,6 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
         T::Handler: FallibleHandler<Payload = P>;
 
     /// Wraps a handler provider with this middleware.
-    ///
-    /// # Arguments
-    ///
-    /// * `provider` - The fallible handler provider to wrap with this
-    ///   middleware.
-    ///
-    /// # Returns
-    ///
-    /// A new provider that implements `FallibleHandlerProvider`.
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
@@ -266,46 +253,19 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// This method converts the middleware stack (which implements
     /// `HandlerMiddleware`) into a provider (which implements
     /// `FallibleHandlerProvider`) by terminating the stack with the given
-    /// handler.
+    /// handler as the innermost component — adapted through [`LeafHandler`],
+    /// the chain terminator that classifies the leaf's result as final for
+    /// the settlement boundary.
     ///
-    /// # Arguments
-    ///
-    /// * `handler` - The fallible handler to use as the innermost component.
-    ///
-    /// # Returns
-    ///
-    /// A provider that implements `FallibleHandlerProvider`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use prosody::consumer::middleware::*;
-    /// # use prosody::consumer::middleware::retry::*;
-    /// # use prosody::consumer::DemandType;
-    /// # use prosody::consumer::event_context::EventContext;
-    /// # use prosody::consumer::message::ConsumerMessage;
-    /// # use prosody::timers::Trigger;
-    /// # use std::convert::Infallible;
-    /// # #[derive(Clone)]
-    /// # struct MyHandler;
-    /// # impl FallibleHandler for MyHandler {
-    /// #     type Payload = serde_json::Value;
-    /// #     type Error = Infallible;
-    /// #     type Output = ();
-    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn shutdown(self) {}
-    /// # }
-    /// # let config = RetryConfiguration::builder().build().unwrap();
-    /// # let my_handler = MyHandler;
-    /// let provider = RetryMiddleware::new(config).unwrap().into_provider(my_handler);
-    /// ```
-    fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
+    /// See the [module-level usage example](crate::consumer::middleware) for a
+    /// full composition; a single middleware terminates the chain the same way,
+    /// e.g. `RetryMiddleware::new(config)?.into_provider(handler)`.
+    fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<LeafHandler<H>>>
     where
         Self: Sized,
         H: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
     {
-        self.with_provider(FallibleCloneProvider::new(handler))
+        self.with_provider(FallibleCloneProvider::new(LeafHandler::new(handler)))
     }
 
     /// Adds a middleware layer on top of this middleware (inner-to-outer
@@ -332,49 +292,11 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// Each middleware can transform the request, short-circuit execution,
     /// handle errors, and add side effects on both phases.
     ///
-    /// # Arguments
-    ///
-    /// * `outer_middleware` - The middleware to add as the outermost layer.
-    ///
-    /// # Returns
-    ///
-    /// A `ComposedMiddleware` with the new middleware as the outer layer.
-    ///
     /// # Example
     ///
-    /// ```rust,no_run
-    /// # use prosody::consumer::middleware::*;
-    /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
-    /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
-    /// # use prosody::consumer::DemandType;
-    /// # use prosody::consumer::event_context::EventContext;
-    /// # use prosody::consumer::message::ConsumerMessage;
-    /// # use prosody::timers::Trigger;
-    /// # use std::convert::Infallible;
-    /// # #[derive(Clone)]
-    /// # struct MyHandler;
-    /// # impl FallibleHandler for MyHandler {
-    /// #     type Payload = serde_json::Value;
-    /// #     type Error = Infallible;
-    /// #     type Output = ();
-    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-    /// #     async fn shutdown(self) {}
-    /// # }
-    /// # let retry_config = RetryConfiguration::builder().build().unwrap();
-    /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-    /// # let middle_middleware = CancellationMiddleware;
-    /// # let outer_middleware = CancellationMiddleware;
-    /// # let my_handler = MyHandler;
-    /// // Builds from inner to outer: inner -> middle -> outer
-    /// let provider = inner_middleware
-    ///     .layer(middle_middleware)
-    ///     .layer(outer_middleware)
-    ///     .into_provider(my_handler);
-    ///
-    /// // Request:  outer → middle → inner → handler
-    /// // Response: handler → inner → middle → outer
-    /// ```
+    /// See the [module-level usage example](crate::consumer::middleware), which
+    /// composes `CancellationMiddleware.layer(RetryMiddleware…)` so retry ends
+    /// up outermost.
     fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self, P>
     where
         Self: Sized,
@@ -400,7 +322,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// - [`shutdown`](Self::shutdown) — called when the consumer stops or a
 ///   partition is revoked.
 ///
-/// Two optional pieces extend the basic shape for handlers that stage
+/// Two optional parts extend the basic shape for handlers that stage
 /// external work during processing:
 ///
 /// - [`Output`](Self::Output) — a typed value the handler returns on success
@@ -413,9 +335,9 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// The consumer pipeline is itself a stack of `FallibleHandler` impls
 /// (retry, deduplication, defer, telemetry, your handler at the bottom),
 /// so middleware authors implement this same trait. The [module-level
-/// docs](self) cover how impls are composed (layering, providers,
+/// docs](self) describe how impls are composed (layering, providers,
 /// execution flow); [Implementing as middleware](#implementing-as-middleware)
-/// below covers what an individual middleware impl owes its inner
+/// below states what an individual middleware impl owes its inner
 /// handler.
 ///
 /// # Error classification
@@ -488,7 +410,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// # Implementing as middleware
 ///
 /// You can skip this section if your handler sits at the bottom of the
-/// stack. It covers what a `FallibleHandler` middleware (a wrapper around
+/// stack. It states what a `FallibleHandler` middleware (a wrapper around
 /// an inner handler) must do.
 ///
 /// 1. **Forward the handler methods.** Call `self.inner.on_message(...)` and
@@ -527,8 +449,9 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// invocation maps 1:1 to a single dispatch, and resolving the marker
 /// coincides with the work outcome (commit ⇒ final invocation, abort ⇒
 /// re-dispatch on the next poll, which produces a new invocation with
-/// its own apply hook). [`retry`], defer, and topic middlewares take on
-/// this responsibility for richer compositions.
+/// its own apply hook). [`retry`] owns the only other `EventHandler`
+/// boundary; both route their final outcome through the shared `settle`
+/// durability sequence (see [`FallibleEventHandler`]).
 ///
 /// [`EventHandler`]: crate::consumer::EventHandler
 /// [`Uncommitted::commit`]: crate::consumer::Uncommitted::commit
@@ -590,7 +513,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
-        C: EventContext;
+        C: EventContext<Payload = Self::Payload>;
 
     /// Handles a fired timer trigger, returning a typed [`Result`].
     ///
@@ -616,7 +539,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
-        C: EventContext;
+        C: EventContext<Payload = Self::Payload>;
 
     /// Finalizes staged work after the just-completed invocation has been
     /// committed.
@@ -667,7 +590,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         _result: Result<Self::Output, Self::Error>,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         async {}
     }
@@ -718,7 +641,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         _result: Result<Self::Output, Self::Error>,
     ) -> impl Future<Output = ()> + Send
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         async {}
     }
@@ -749,50 +672,59 @@ pub trait FallibleHandler: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 
-/// Provides default `EventHandler` implementation for types that implement
-/// `FallibleHandler`.
+/// Marks a [`FallibleHandler`] as the **durability boundary**, getting the
+/// blanket [`EventHandler`] impl below.
 ///
-/// This is the **default durability boundary**: with no rescue / defer /
-/// retry middleware below it, each `EventHandler::on_message` /
-/// `EventHandler::on_timer` call performs **exactly one** invocation of
-/// the inner `FallibleHandler` and pairs it with **exactly one** apply
-/// hook firing — satisfying the strictly-per-invocation invariant
-/// required by the [`FallibleHandler`] apply-hook contract:
+/// # The durability sequence has one owner: `settle`
 ///
-/// 1. Extract inner message/timer and the uncommitted offset/timer.
-/// 2. Invoke the `FallibleHandler` method **once**.
-/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this invocation
-///    is final from the consumer's POV — and call `after_commit` with the typed
-///    result.
-/// 4. On `Terminal`: abort the marker — the message/timer will be redelivered
-///    on the next poll, producing a **new** invocation that will get its own
-///    apply hook — and call `after_abort` with the typed error.
+/// The blanket impl invokes the inner `FallibleHandler` method **exactly
+/// once**, then hands the single result to `settle` — the one place that
+/// runs the keyed-state durability sequence in straight-line code:
 ///
-/// Because there is exactly one inner invocation per call into this impl,
-/// the per-invocation invariant is satisfied trivially: one invocation
-/// pairs with one apply-hook firing.
+/// ```text
+/// Bypassed final                → commit → after_commit (no stage, no marker)
+/// Final Ok  → stage provisional cells / write resolved (retry transient failures in place)
+///           → arm StateRecovery backstop (clear_and_schedule; per-key singleton)
+///           → record the message marker (read from the session's event
+///             identity; STRICTLY after the stage)
+///           → commit the offset / trigger marker
+///           → promote the staged cells (the backstop stays armed; the sweep
+///             self-clears once the key goes quiet)
+///           → after_commit(Ok)
+/// Final Err Transient/Permanent → record marker iff Permanent → commit → after_commit(Err)
+/// Err Terminal                  → abort → after_abort
+/// ```
 ///
-/// Types can override the default implementations to add custom behavior
-/// like logging. Implementations that change the work-outcome shape (e.g.
-/// rescue an inner error and schedule a retry while still committing the
-/// marker), or any wrapping `FallibleHandler` middleware that re-invokes
-/// the inner more than once per outer call, MUST NOT use this default;
-/// they must drive the apply hooks according to the per-invocation rule
-/// in the [`FallibleHandler`] docs — one hook per inner invocation, never
-/// coalesced.
+/// Because the marker record is textually *after* the stage in one function,
+/// the marker-before-durable-state bug class is **unwritable**, not merely
+/// avoided. The crash-window argument for the full step order — including
+/// why promotion runs strictly after the commit — lives on
+/// `settle_committed` in `settle.rs`. The timer marker (trigger tag) is
+/// written outside the stack by the marker commit; the message marker here
+/// restores message/timer symmetry.
+///
+/// [`RetryHandler`](retry::RetryHandler) is a second durability boundary
+/// (it owns its own `EventHandler` impl so it can map shutdown to abort
+/// rather than commit); it routes its final outcome through the **same**
+/// `settle` / `abandon` functions, so the sequence still has a single
+/// owner. No other middleware should implement `EventHandler` directly.
+///
+/// **Stack contract:** whether a dispatch settles the event is a pure
+/// function of the *final* result the stack returns — the crate-internal
+/// `settlement()` classification. A middleware that swallows or rescues (a
+/// defer swallow into `Ok(Deferred)`, a DLQ route into `Ok(Routed)`, a dedup
+/// skip into `Ok(None)`) classifies its own variants `Bypassed`, so nothing
+/// stages and no marker records for the swallowed attempt; there is no reset
+/// protocol to remember. The blanket impl below therefore requires both this
+/// trait and `SettlementHandler`.
+///
+/// Per-invocation apply-hook correctness is preserved: one inner invocation
+/// pairs with exactly one `after_commit` / `after_abort` firing.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error that occurred during processing
     fn on_message_error(&self, _error: &Self::Error) {}
 
     /// Called when timer processing fails.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error that occurred during processing
     fn on_timer_error(&self, _error: &Self::Error) {}
 }
 
@@ -821,8 +753,7 @@ where
 
 impl<T> EventHandler for T
 where
-    T: FallibleEventHandler,
-    T::Error: ClassifyError,
+    T: FallibleEventHandler + SettlementHandler,
 {
     type Payload = T::Payload;
 
@@ -832,95 +763,31 @@ where
         message: UncommittedMessage<Self::Payload>,
         demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
+        // Invoke the inner FallibleHandler EXACTLY ONCE, then hand its single
+        // result to the shared durability sequence. `settle` fires EXACTLY
+        // ONE apply hook, so the per-invocation invariant holds.
         let (inner_message, uncommitted_offset) = message.into_inner();
-
-        // Per-invocation correctness: this method invokes the inner
-        // `FallibleHandler::on_message` EXACTLY ONCE below, and every
-        // control-flow path through the rest of this function fires
-        // EXACTLY ONE apply hook (`after_commit` or `after_abort`)
-        // carrying that single invocation's `Result`. One inner
-        // invocation, one apply-hook firing — the strictly-per-invocation
-        // invariant is satisfied trivially here.
         let result =
             FallibleHandler::on_message(self, context.clone(), inner_message, demand_type).await;
-
-        // Pick the apply hook by the per-invocation work outcome. At this
-        // default boundary (no rescue middleware below us) committing the
-        // offset coincides with "this invocation is final" and aborting
-        // it coincides with "this invocation is not final — the broker
-        // will redeliver and produce a fresh invocation that gets its
-        // own apply hook".
         if let Err(error) = &result {
             self.on_message_error(error);
-            match error.classify_error() {
-                ErrorCategory::Transient | ErrorCategory::Permanent => {
-                    // Final from this consumer's POV: nothing below us is
-                    // going to redeliver this message into the handler,
-                    // so this invocation pairs with `after_commit`.
-                    uncommitted_offset.commit();
-                    self.after_commit(context, result).await;
-                }
-                ErrorCategory::Terminal => {
-                    // Not final: aborting the offset means the broker will
-                    // redeliver this message to this handler on the next
-                    // poll, producing a new invocation. This invocation
-                    // pairs with `after_abort`; the future invocation
-                    // will get its own apply hook.
-                    uncommitted_offset.abort();
-                    self.after_abort(context, result).await;
-                }
-            }
-        } else {
-            // Success: final invocation, pair with `after_commit`.
-            uncommitted_offset.commit();
-            self.after_commit(context, result).await;
         }
+        settle(self, context, uncommitted_offset, result).await;
     }
 
     async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
         U: UncommittedTimer,
     {
         let (trigger, uncommitted_timer) = timer.into_inner();
-
-        // Per-invocation correctness: as with the message arm, the inner
-        // `FallibleHandler::on_timer` is invoked EXACTLY ONCE below, and
-        // every control-flow path through the rest of this function fires
-        // EXACTLY ONE apply hook carrying that single invocation's
-        // `Result`. One inner invocation, one apply-hook firing.
         let result = FallibleHandler::on_timer(self, context.clone(), trigger, demand_type).await;
-
-        // Same per-invocation work-outcome rule as the message arm: at
-        // this default boundary, committing the timer marker coincides
-        // with "this invocation is final" and aborting coincides with
-        // "this invocation is not final — the timer will fire again,
-        // producing a fresh invocation that gets its own apply hook".
         if let Err(error) = &result {
             self.on_timer_error(error);
-            match error.classify_error() {
-                ErrorCategory::Transient | ErrorCategory::Permanent => {
-                    // Final invocation: no further invocation of the
-                    // handler is coming for this trigger.
-                    uncommitted_timer.commit().await;
-                    self.after_commit(context, result).await;
-                }
-                ErrorCategory::Terminal => {
-                    // Not final: aborting leaves the timer in place to
-                    // fire again, so `after_abort` is the matching hook
-                    // for this invocation. The next firing will produce
-                    // a new invocation paired with its own apply hook.
-                    uncommitted_timer.abort().await;
-                    self.after_abort(context, result).await;
-                }
-            }
-        } else {
-            // Success: final invocation, pair with `after_commit`.
-            uncommitted_timer.commit().await;
-            self.after_commit(context, result).await;
         }
+        settle(self, context, uncommitted_timer, result).await;
     }
 
     async fn shutdown(self) {
@@ -941,519 +808,4 @@ impl ClassifyError for IoError {
 }
 
 #[cfg(test)]
-mod after_hook_tests {
-    //! Tests for the `after_commit` / `after_abort` apply hooks plumbed
-    //! through the blanket `FallibleEventHandler → EventHandler` impl.
-    //!
-    //! These tests pin down the strictly-per-invocation apply-hook
-    //! invariant for the default durability boundary: for every inner
-    //! invocation of `on_message` / `on_timer` that runs and returns,
-    //! exactly one of `after_commit` / `after_abort` fires, carrying the
-    //! handler's typed `Result<Output, Error>` for that invocation. At
-    //! this boundary (no rescue / defer / retry middleware in the stack)
-    //! each call into `EventHandler::on_message` performs exactly one
-    //! inner invocation, so the per-invocation invariant collapses to
-    //! "one apply hook per call": `Ok` / `Permanent` / `Transient` are
-    //! final invocations (`after_commit`), and `Terminal` is a non-final
-    //! invocation (`after_abort`, the broker / timer will redeliver and
-    //! produce a fresh invocation paired with its own apply hook).
-    use std::error::Error as StdError;
-    use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use crossbeam_utils::CachePadded;
-    use parking_lot::Mutex;
-
-    use super::*;
-    use crate::consumer::EventHandler;
-    use crate::consumer::message::ConsumerMessage;
-    use crate::consumer::middleware::test_support::MockEventContext;
-    use crate::consumer::partition::offsets::OffsetTracker;
-    use crate::error::ErrorCategory;
-    use crate::timers::TimerType;
-    use crate::timers::Trigger;
-    use crate::timers::datetime::CompactDateTime;
-
-    /// Test error with a fixed classification. Equality compares the
-    /// classification discriminant + tag, since `ErrorCategory` itself is
-    /// only `Copy + Clone + Debug + Serialize`.
-    #[derive(Debug, Clone)]
-    struct TestError(ErrorCategory, &'static str);
-
-    impl Display for TestError {
-        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-            write!(f, "test error ({}): {:?}", self.1, self.0)
-        }
-    }
-
-    impl StdError for TestError {}
-
-    impl ClassifyError for TestError {
-        fn classify_error(&self) -> ErrorCategory {
-            self.0
-        }
-    }
-
-    impl PartialEq for TestError {
-        fn eq(&self, other: &Self) -> bool {
-            // Compare classification discriminants + tags.
-            let cat_eq = matches!(
-                (self.0, other.0),
-                (ErrorCategory::Transient, ErrorCategory::Transient)
-                    | (ErrorCategory::Permanent, ErrorCategory::Permanent)
-                    | (ErrorCategory::Terminal, ErrorCategory::Terminal)
-            );
-            cat_eq && self.1 == other.1
-        }
-    }
-
-    impl Eq for TestError {}
-
-    impl FallibleEventHandler for ProbeHandler {}
-
-    /// Records every lifecycle hook firing for later assertion.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum HookEvent {
-        Handler,
-        AfterCommit(Result<u64, TestError>),
-        AfterAbort(Result<u64, TestError>),
-    }
-
-    /// Probe handler whose `Output` is a `u64` sentinel; records every
-    /// lifecycle hook into a shared log.
-    #[derive(Clone)]
-    struct ProbeHandler {
-        sentinel: u64,
-        result: Result<(), TestError>,
-        log: Arc<Mutex<Vec<HookEvent>>>,
-    }
-
-    impl ProbeHandler {
-        fn ok(sentinel: u64) -> Self {
-            Self {
-                sentinel,
-                result: Ok(()),
-                log: Arc::default(),
-            }
-        }
-
-        fn err(sentinel: u64, error: TestError) -> Self {
-            Self {
-                sentinel,
-                result: Err(error),
-                log: Arc::default(),
-            }
-        }
-    }
-
-    impl FallibleHandler for ProbeHandler {
-        type Error = TestError;
-        type Output = u64;
-        type Payload = serde_json::Value;
-
-        async fn on_message<C>(
-            &self,
-            _context: C,
-            _message: ConsumerMessage<Self::Payload>,
-            _demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
-        where
-            C: EventContext,
-        {
-            self.log.lock().push(HookEvent::Handler);
-            self.result.clone().map(|()| self.sentinel)
-        }
-
-        async fn on_timer<C>(
-            &self,
-            _context: C,
-            _trigger: Trigger,
-            _demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
-        where
-            C: EventContext,
-        {
-            self.log.lock().push(HookEvent::Handler);
-            self.result.clone().map(|()| self.sentinel)
-        }
-
-        async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
-        where
-            C: EventContext,
-        {
-            self.log.lock().push(HookEvent::AfterCommit(result));
-        }
-
-        async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
-        where
-            C: EventContext,
-        {
-            self.log.lock().push(HookEvent::AfterAbort(result));
-        }
-
-        async fn shutdown(self) {}
-    }
-
-    fn make_offset_tracker() -> OffsetTracker {
-        let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
-        OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version)
-    }
-
-    fn make_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
-        use crate::consumer::message::ConsumerMessageValue;
-        use std::sync::Arc;
-        use tokio::sync::Semaphore;
-        let semaphore = Arc::new(Semaphore::new(10));
-        let permit = semaphore.try_acquire_owned().ok()?;
-        Some(ConsumerMessage::new(
-            ConsumerMessageValue::default(),
-            tracing::Span::current(),
-            permit,
-        ))
-    }
-
-    #[tokio::test]
-    async fn after_commit_fires_with_ok_output_after_handler_success() -> color_eyre::Result<()> {
-        let handler = ProbeHandler::ok(42);
-        let log = handler.log.clone();
-        let context = MockEventContext::new();
-        let tracker = make_offset_tracker();
-        let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
-
-        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(42))],
-            "handler runs first, then after_commit with Ok(sentinel)",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn after_commit_fires_with_err_after_permanent_error() -> color_eyre::Result<()> {
-        let err = TestError(ErrorCategory::Permanent, "permanent");
-        let handler = ProbeHandler::err(0, err.clone());
-        let log = handler.log.clone();
-        let context = MockEventContext::new();
-        let tracker = make_offset_tracker();
-        let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
-
-        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterCommit(Err(err))],
-            "Permanent error commits the marker; after_commit fires with Err",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn after_commit_fires_with_err_after_transient_error() -> color_eyre::Result<()> {
-        // Transient (when no retry middleware is in front) commits like
-        // Permanent at the blanket-impl level.
-        let err = TestError(ErrorCategory::Transient, "transient");
-        let handler = ProbeHandler::err(0, err.clone());
-        let log = handler.log.clone();
-        let context = MockEventContext::new();
-        let tracker = make_offset_tracker();
-        let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
-
-        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterCommit(Err(err))],
-            "Transient error at the blanket-impl level commits + fires after_commit",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn after_abort_fires_with_err_after_terminal_error() -> color_eyre::Result<()> {
-        let err = TestError(ErrorCategory::Terminal, "terminal");
-        let handler = ProbeHandler::err(0, err.clone());
-        let log = handler.log.clone();
-        let context = MockEventContext::new();
-        let tracker = make_offset_tracker();
-        let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
-
-        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterAbort(Err(err))],
-            "Terminal error aborts the marker; after_abort fires with Err",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn hook_1_to_1_invariant_one_apply_per_dispatch() -> color_eyre::Result<()> {
-        // The load-bearing invariant, stated **per inner invocation**:
-        // for every individual call to the inner `on_message` /
-        // `on_timer` that ran and returned, exactly one apply hook
-        // (after_commit OR after_abort) fires — not both, not neither,
-        // and never coalesced across multiple invocations. This is what
-        // 2PC handlers and rescue middleware rely on to know they are
-        // guaranteed a single finalization signal per inner invocation.
-        //
-        // At this default boundary the blanket impl performs exactly one
-        // inner invocation per outer call, so this test exercises the
-        // 1:1 case directly. Wrapping middleware that re-invokes the
-        // inner (e.g. a retry loop) must preserve the same invariant
-        // per invocation; that is verified in the `retry` module's
-        // tests.
-        for category in [
-            ErrorCategory::Permanent,
-            ErrorCategory::Transient,
-            ErrorCategory::Terminal,
-        ] {
-            let handler = ProbeHandler::err(0, TestError(category, "x"));
-            let log = handler.log.clone();
-            let context = MockEventContext::new();
-            let tracker = make_offset_tracker();
-            let uncommitted_offset = tracker.take(0).await?;
-            let message = make_test_message()
-                .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-                .into_uncommitted(uncommitted_offset);
-
-            EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
-
-            let recorded = log.lock().clone();
-            let commit_count = recorded
-                .iter()
-                .filter(|e| matches!(e, HookEvent::AfterCommit(_)))
-                .count();
-            let abort_count = recorded
-                .iter()
-                .filter(|e| matches!(e, HookEvent::AfterAbort(_)))
-                .count();
-            assert_eq!(
-                commit_count + abort_count,
-                1,
-                "{category:?}: exactly one apply hook should fire per dispatch ({recorded:?})",
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn after_commit_for_timer_path_with_ok_output() {
-        // Timer arm of the blanket impl: build a minimal `UncommittedTimer`
-        // and verify the same lifecycle.
-        use std::sync::OnceLock;
-
-        use crate::Key;
-        use crate::consumer::{Keyed, Uncommitted};
-        use crate::timers::UncommittedTimer;
-
-        struct MockUncommittedTimer {
-            committed: Arc<AtomicUsize>,
-            aborted: Arc<AtomicUsize>,
-        }
-
-        struct MockGuard {
-            committed: Arc<AtomicUsize>,
-            aborted: Arc<AtomicUsize>,
-        }
-
-        impl Uncommitted for MockGuard {
-            async fn commit(self) {
-                self.committed.fetch_add(1, Ordering::SeqCst);
-            }
-
-            async fn abort(self) {
-                self.aborted.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        impl Keyed for MockUncommittedTimer {
-            type Key = Key;
-
-            fn key(&self) -> &Self::Key {
-                static KEY: OnceLock<Key> = OnceLock::new();
-                KEY.get_or_init(|| "test-key".into())
-            }
-        }
-
-        impl Uncommitted for MockUncommittedTimer {
-            async fn commit(self) {
-                self.committed.fetch_add(1, Ordering::SeqCst);
-            }
-
-            async fn abort(self) {
-                self.aborted.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        impl UncommittedTimer for MockUncommittedTimer {
-            type CommitGuard = MockGuard;
-
-            fn time(&self) -> CompactDateTime {
-                CompactDateTime::from(0_u32)
-            }
-
-            fn timer_type(&self) -> TimerType {
-                TimerType::Application
-            }
-
-            fn span(&self) -> tracing::Span {
-                tracing::Span::current()
-            }
-
-            fn into_inner(self) -> (Trigger, Self::CommitGuard) {
-                let trigger =
-                    Trigger::for_testing("test-key".into(), self.time(), self.timer_type());
-                let guard = MockGuard {
-                    committed: self.committed.clone(),
-                    aborted: self.aborted.clone(),
-                };
-                (trigger, guard)
-            }
-        }
-
-        let handler = ProbeHandler::ok(99);
-        let log = handler.log.clone();
-        let context = MockEventContext::new();
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let timer = MockUncommittedTimer {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
-
-        EventHandler::on_timer(&handler, context, timer, DemandType::Normal).await;
-
-        assert_eq!(committed.load(Ordering::SeqCst), 1, "marker committed once");
-        assert_eq!(aborted.load(Ordering::SeqCst), 0, "marker not aborted");
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(99))],
-            "timer Ok path: handler then after_commit with sentinel",
-        );
-    }
-
-    /// Minimal pass-through middleware to verify the composition contract.
-    /// Stands in for any real `FallibleHandler` middleware that wraps an
-    /// inner with `type Output = Inner::Output` and forwards apply hooks.
-    struct PassThroughMiddleware<T> {
-        inner: T,
-    }
-
-    impl<T> FallibleHandler for PassThroughMiddleware<T>
-    where
-        T: FallibleHandler,
-    {
-        type Error = T::Error;
-        type Output = T::Output;
-        type Payload = T::Payload;
-
-        async fn on_message<C>(
-            &self,
-            context: C,
-            message: ConsumerMessage<Self::Payload>,
-            demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
-        where
-            C: EventContext,
-        {
-            self.inner.on_message(context, message, demand_type).await
-        }
-
-        async fn on_timer<C>(
-            &self,
-            context: C,
-            trigger: Trigger,
-            demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
-        where
-            C: EventContext,
-        {
-            self.inner.on_timer(context, trigger, demand_type).await
-        }
-
-        async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
-        where
-            C: EventContext,
-        {
-            self.inner.after_commit(context, result).await;
-        }
-
-        async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
-        where
-            C: EventContext,
-        {
-            self.inner.after_abort(context, result).await;
-        }
-
-        async fn shutdown(self) {
-            self.inner.shutdown().await;
-        }
-    }
-
-    impl<T> FallibleEventHandler for PassThroughMiddleware<T> where T: FallibleHandler {}
-
-    #[tokio::test]
-    async fn pass_through_middleware_forwards_output_to_inner_after_commit()
-    -> color_eyre::Result<()> {
-        let inner = ProbeHandler::ok(7);
-        let log = inner.log.clone();
-        let middleware = PassThroughMiddleware { inner };
-        let context = MockEventContext::new();
-        let tracker = make_offset_tracker();
-        let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
-
-        EventHandler::on_message(&middleware, context, message, DemandType::Normal).await;
-
-        // The inner handler observes both Handler (it ran) and AfterCommit
-        // (the middleware forwarded with Ok(7)).
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(7))],
-            "pass-through middleware forwards typed output unchanged",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyre::Result<()> {
-        let err = TestError(ErrorCategory::Terminal, "terminal");
-        let inner = ProbeHandler::err(0, err.clone());
-        let log = inner.log.clone();
-        let middleware = PassThroughMiddleware { inner };
-        let context = MockEventContext::new();
-        let tracker = make_offset_tracker();
-        let uncommitted_offset = tracker.take(0).await?;
-        let message = make_test_message()
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
-            .into_uncommitted(uncommitted_offset);
-
-        EventHandler::on_message(&middleware, context, message, DemandType::Normal).await;
-
-        assert_eq!(
-            log.lock().clone(),
-            vec![HookEvent::Handler, HookEvent::AfterAbort(Err(err))],
-            "pass-through middleware forwards after_abort on terminal",
-        );
-        Ok(())
-    }
-}
+pub(crate) mod tests;

@@ -22,17 +22,18 @@
 //! The inner is invoked at most once per dispatch. [`TimerDeferOutput`]
 //! encodes the routing: `Inner` forwards the framework's chosen hook,
 //! `Deferred` always fires `after_abort` (the original timer's retry is
-//! coming even though our marker commits), and `NoInner` suppresses both.
+//! coming even though this dispatch's own commit still advances — `Bypassed`,
+//! no message marker records), and `NoInner` suppresses both.
 
 use super::context::TimerDeferContext;
 use super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
+use crate::consumer::middleware::{FallibleHandler, Settlement, SettlementHandler};
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::telemetry::event::TimerEventType;
@@ -41,7 +42,7 @@ use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::{TimerType, Trigger};
 use crate::{Partition, Topic};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// Output of [`TimerDeferHandler`] dispatches; drives apply-hook routing.
 ///
@@ -106,7 +107,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Wrap context so inner handlers see unified timer state
         let wrapped_context =
@@ -126,7 +127,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Wrap context so inner handlers see unified timer state
         let wrapped_context =
@@ -138,7 +139,13 @@ where
                 self.handle_application_timer(wrapped_context, trigger, demand_type)
                     .await
             }
-            TimerType::DeferredMessage => self
+            // `DeferredMessage` is owned by the message-defer middleware:
+            // forward it unchanged so that owner can act on it.
+            // `StateRecovery` is handled by the partition loop before a
+            // trigger reaches the middleware stack, so it does not normally
+            // arrive here; it is matched alongside only as a defensive
+            // pass-through.
+            TimerType::DeferredMessage | TimerType::StateRecovery => self
                 .handler
                 .on_timer(wrapped_context, trigger, demand_type)
                 .await
@@ -149,7 +156,7 @@ where
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Apply-hook routing (see module docs):
         // - Inner(o):     inner ran and succeeded         -> after_commit(Ok)
@@ -175,12 +182,12 @@ where
 
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Symmetric to after_commit. The only twist: Deferred(e) still
         // routes to after_abort(Err(e)) on the inner — the inner's prior
         // dispatch is being rolled back regardless of whether the outer
-        // commit/abort decision committed our defer marker.
+        // commit/abort decision advanced this dispatch's own commit.
         match result {
             Ok(TimerDeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;
@@ -197,6 +204,34 @@ where
 
     async fn shutdown(self) {
         self.handler.shutdown().await;
+    }
+}
+
+impl<T, S, D> SettlementHandler for TimerDeferHandler<T, S, D>
+where
+    T: SettlementHandler,
+    S: TimerDeferStore,
+    D: DeferralDecider,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: its result is the dispatch's outcome.
+            Ok(TimerDeferOutput::Inner(output)) => T::settlement(Ok(output)),
+            // Inner ran and its error surfaced.
+            Err(DeferError::Handler(error)) => T::settlement(Err(error)),
+            // `Deferred`/`NoInner` — parked for retry / queued behind /
+            // orphan cleanup: the outcome lives in the defer queue, so
+            // nothing here may stage or record. The error rows are the defer
+            // layer's own rescue failing (store/timer/loader/backoff
+            // computation) — a layer failure, never the event's outcome.
+            Ok(TimerDeferOutput::Deferred(_) | TimerDeferOutput::NoInner)
+            | Err(
+                DeferError::Store(_)
+                | DeferError::Timer(_)
+                | DeferError::Loader(_)
+                | DeferError::CompactTime(_),
+            ) => Settlement::Bypassed,
+        }
     }
 }
 
@@ -226,7 +261,7 @@ where
         demand_type: DemandType,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         // Check if key is already deferred - queue behind existing entry
         if self
@@ -280,7 +315,7 @@ where
         trigger: Trigger,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let key = &trigger.key;
 
@@ -334,9 +369,12 @@ where
             self.source.clone(),
         );
 
+        // Instrument with the reload span so the retried handler runs inside
+        // it ambiently, mirroring the partition dispatch arms.
         let output = match self
             .handler
             .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
+            .instrument(stored_trigger.span())
             .await
         {
             Ok(output) => output,
@@ -371,7 +409,7 @@ where
 
     /// Defers a timer for the first time after the inner handler returned a
     /// transient error. Schedules retry timer before storing to ensure timer
-    /// coverage on partial failure.
+    /// still fires on partial failure.
     ///
     /// Returns [`TimerDeferOutput::Deferred`] carrying the inner error so the
     /// apply hooks can drive `after_abort(Err(inner_err))` on the inner: the
@@ -384,9 +422,9 @@ where
         inner_err: T::Error,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
-        // Timer first, then store: ensures timer coverage on partial failure
+        // Timer first, then store: the timer still fires on partial failure
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store
@@ -448,7 +486,7 @@ where
         error: T::Error,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let error_category = error.classify_error();
         let exception = format!("{error:?}").into_boxed_str();
@@ -539,7 +577,7 @@ where
         trigger: &Trigger,
     ) -> Result<(), DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let result = self
             .store
@@ -557,7 +595,7 @@ where
         retry_count: u32,
     ) -> Result<(), DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         let fire_time = self.next_retry_time(retry_count)?;
 
@@ -584,7 +622,7 @@ where
         result: TimerRetryCompletionResult,
     ) -> Result<(), DeferError<S::Error, T::Error>>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         match result {
             TimerRetryCompletionResult::MoreTimers { .. } => {

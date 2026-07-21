@@ -61,10 +61,6 @@ pub struct KeyEvent {
 pub enum PartitionState {
     /// Partition was assigned to this consumer.
     Assigned,
-    /// Partition consumption was paused due to backpressure.
-    Paused,
-    /// Partition consumption was resumed.
-    Resumed,
     /// Partition was revoked from this consumer.
     Revoked,
 }
@@ -72,16 +68,12 @@ pub enum PartitionState {
 /// Key processing lifecycle states.
 #[derive(Clone, Debug)]
 pub enum KeyState {
-    /// Middleware layer begins processing.
-    MiddlewareEntered,
     /// User handler function is called.
     HandlerInvoked,
     /// User handler completed successfully.
     HandlerSucceeded,
     /// User handler returned an error.
     HandlerFailed,
-    /// Middleware layer completes processing.
-    MiddlewareExited,
 }
 
 /// Timer lifecycle event for external telemetry emission.

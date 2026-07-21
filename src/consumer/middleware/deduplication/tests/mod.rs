@@ -19,10 +19,6 @@ pub mod prop_dedup_store;
 /// ```rust,ignore
 /// dedup_store_tests!(async { Ok::<_, Report>(MyStore::new()) });
 /// ```
-///
-/// # Arguments
-///
-/// * `$store_constructor` - Expression that creates a `Result<Store, Error>`
 #[macro_export]
 macro_rules! dedup_store_tests {
     ($store_constructor:expr) => {

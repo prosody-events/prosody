@@ -39,7 +39,7 @@ pub mod segment;
 pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
-pub use decider::{AlwaysDefer, DeferralDecider, FailureTracker, NeverDefer, TraceBasedDecider};
+pub use decider::{DeferralDecider, FailureTracker};
 pub use error::{CassandraDeferStoreError, DeferInitError};
 pub use message::MessageDeferMiddleware;
 pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
@@ -61,7 +61,7 @@ pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
 ///
 /// Full jitter prevents thundering herd when many keys retry simultaneously.
 #[must_use]
-pub fn calculate_backoff(config: &config::DeferConfiguration, retry_count: u32) -> CompactDuration {
+pub fn calculate_backoff(config: &DeferConfiguration, retry_count: u32) -> CompactDuration {
     // No delay for the initial attempt
     if retry_count == 0 {
         return CompactDuration::MIN;

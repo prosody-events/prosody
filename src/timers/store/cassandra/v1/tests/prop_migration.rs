@@ -3,9 +3,10 @@
 //! Tests V1→V2 schema migration, V2→V3 key state backfill, and slab size
 //! migration using random scenarios to verify all migration invariants.
 
+use super::test_cassandra_config;
 use crate::Key;
-use crate::cassandra::{CassandraConfiguration, CassandraStore};
-use crate::otel::SpanRelation;
+use crate::cassandra::CassandraStore;
+use crate::test_util::TEST_KEYSPACE;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -20,6 +21,7 @@ use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use strum::VariantArray;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Test input containing a migration scenario.
@@ -76,7 +78,7 @@ impl Arbitrary for MigrationTestInput {
         let trigger_count = usize::arbitrary(g) % 51;
         let mut triggers = Vec::with_capacity(trigger_count);
 
-        // Use small key pool for better collision coverage
+        // Use small key pool for better collision density
         let key_pool: Vec<Key> = (0_i32..5_i32).map(|i| format!("key-{i}").into()).collect();
 
         for _ in 0..trigger_count {
@@ -86,12 +88,10 @@ impl Arbitrary for MigrationTestInput {
             // Generate random time using arbitrary
             let time = CompactDateTime::arbitrary(g);
 
-            // Generate random timer type
-            let timer_type = match u8::arbitrary(g) % 3 {
-                0 => TimerType::Application,
-                1 => TimerType::DeferredMessage,
-                _ => TimerType::DeferredTimer,
-            };
+            // Generate random timer type, drawing from every persisted variant
+            // (V2/V3 preserve it; V1 collapses to Application in the model).
+            let timer_type =
+                TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
 
             triggers.push(MigrationTriggerData {
                 key,
@@ -177,10 +177,6 @@ impl MigrationModel {
 ///    `insert_segment_v1()`
 /// 2. Register slabs with `insert_slab()`
 /// 3. Add triggers with `add_trigger()` (no `timer_type`)
-///
-/// # Errors
-///
-/// Returns error if V1 operations fail.
 async fn setup_v1_state(
     operations: &V1Operations,
     input: &MigrationTestInput,
@@ -215,7 +211,7 @@ async fn setup_v1_state(
         let v1_trigger = TriggerV1 {
             key: trigger_data.key.clone(),
             time: trigger_data.time,
-            span: Span::current(),
+            context: Span::current().context(),
         };
 
         operations
@@ -237,10 +233,6 @@ async fn setup_v1_state(
 /// This faithfully reproduces the on-disk layout of a real V2 segment before
 /// V2→V3 migration runs. The state column is left absent so that
 /// `migrate_key_states` / `backfill_key_state` must populate it from scratch.
-///
-/// # Errors
-///
-/// Returns error if any write fails.
 async fn setup_v2_state(
     store: &CassandraTriggerStore,
     input: &MigrationTestInput,
@@ -268,11 +260,10 @@ async fn setup_v2_state(
     // layout produced by old V2 write paths before state backfill existed.
     for trigger_data in &input.triggers {
         let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
-        let trigger = Trigger::new(
+        let trigger = Trigger::for_testing(
             trigger_data.key.clone(),
             trigger_data.time,
             trigger_data.timer_type,
-            Span::current(),
         );
 
         store
@@ -291,10 +282,6 @@ async fn setup_v2_state(
 
 /// Sets up V3 initial state: segment row + triggers written through the full
 /// state-aware path so that state MAP entries are populated on creation.
-///
-/// # Errors
-///
-/// Returns error if any write fails.
 async fn setup_v3_state(
     store: &TableAdapter<CassandraTriggerStore>,
     input: &MigrationTestInput,
@@ -308,17 +295,18 @@ async fn setup_v3_state(
         let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
         // Slab metadata is normally written by the scheduler actor; this
         // fixture writes it directly so the migration test sees the slabs.
-        Box::pin(store.insert_slab(slab))
+        store
+            .insert_slab(slab)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 slab: {e:?}"))?;
 
-        let trigger = Trigger::new(
+        let trigger = Trigger::for_testing(
             trigger_data.key.clone(),
             trigger_data.time,
             trigger_data.timer_type,
-            Span::current(),
         );
-        Box::pin(store.add_trigger(trigger))
+        store
+            .add_trigger(trigger)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to add V3 trigger: {e:?}"))?;
     }
@@ -326,14 +314,10 @@ async fn setup_v3_state(
     Ok(())
 }
 
-/// Verifies invariant 1: Segment metadata is correct after migration.
+/// Verifies that segment metadata is correct after migration.
 ///
 /// Expected: version=V2, `slab_size=target_slab_size`, name preserved (for V2
 /// only).
-///
-/// # Errors
-///
-/// Returns error if segment metadata doesn't match expectations.
 async fn verify_segment_metadata(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -374,47 +358,51 @@ async fn verify_segment_metadata(
     Ok(())
 }
 
-/// Verifies invariant 2: All triggers are preserved with correct `timer_type`.
+/// Collects every trigger the key index holds for each distinct key in the
+/// model, flattened into `(key, time, timer_type)` tuples.
 ///
-/// Builds actual trigger set from store and compares to model.
-///
-/// # Errors
-///
-/// Returns error if triggers don't match model.
-async fn verify_data_preservation(
+/// The key index is the authoritative surface after migration; both the
+/// data-preservation and dual-index checks read it the same way.
+async fn collect_key_index_triggers(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
-) -> color_eyre::Result<()> {
-    let mut actual_triggers = HashSet::default();
-
-    // Collect all triggers from key index (authoritative)
+) -> color_eyre::Result<HashSet<(Key, CompactDateTime, TimerType)>> {
+    let mut triggers = HashSet::default();
     let mut seen_keys = HashSet::default();
 
     for (key, ..) in &model.triggers {
-        if seen_keys.contains(key) {
+        if !seen_keys.insert(key.clone()) {
             continue;
         }
-        seen_keys.insert(key.clone());
 
-        // Get triggers for all timer types
         for &timer_type in TimerType::VARIANTS {
-            let triggers: Vec<Trigger> = store
+            let found: Vec<Trigger> = store
                 .get_key_triggers(timer_type, key)
                 .try_collect()
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!(
-                        "Failed to get key triggers for {} {:?}: {e:?}",
-                        key,
-                        timer_type
+                        "Failed to get key triggers for {key} {timer_type:?}: {e:?}"
                     )
                 })?;
 
-            for trigger in triggers {
-                actual_triggers.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
+            for trigger in found {
+                triggers.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
             }
         }
     }
+
+    Ok(triggers)
+}
+
+/// Verifies that all triggers are preserved with correct `timer_type`.
+///
+/// Builds actual trigger set from store and compares to model.
+async fn verify_data_preservation(
+    store: &TableAdapter<CassandraTriggerStore>,
+    model: &MigrationModel,
+) -> color_eyre::Result<()> {
+    let actual_triggers = collect_key_index_triggers(store, model).await?;
 
     if actual_triggers != model.triggers {
         let missing: Vec<_> = model.triggers.difference(&actual_triggers).collect();
@@ -428,12 +416,8 @@ async fn verify_data_preservation(
     Ok(())
 }
 
-/// Verifies invariant 3: Triggers are in correct slabs based on target slab
+/// Verifies that triggers are in correct slabs based on target slab
 /// size.
-///
-/// # Errors
-///
-/// Returns error if triggers are in wrong slabs.
 async fn verify_correct_indexing(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -478,13 +462,9 @@ async fn verify_correct_indexing(
     Ok(())
 }
 
-/// Verifies invariant 4: Slab index matches key index exactly.
+/// Verifies that the slab index matches the key index exactly.
 ///
 /// Both indices must contain the same triggers (dual-index consistency).
-///
-/// # Errors
-///
-/// Returns error if indices don't match.
 async fn verify_dual_index_consistency(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -508,31 +488,7 @@ async fn verify_dual_index_consistency(
     }
 
     // Collect from key index
-    let mut key_triggers = HashSet::default();
-    let mut seen_keys = HashSet::default();
-
-    for (key, ..) in &model.triggers {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        seen_keys.insert(key.clone());
-
-        for &timer_type in TimerType::VARIANTS {
-            let triggers: Vec<Trigger> = store
-                .get_key_triggers(timer_type, key)
-                .try_collect()
-                .await
-                .map_err(|e| {
-                    color_eyre::eyre::eyre!(
-                        "Failed to get key triggers for dual-index check: {e:?}"
-                    )
-                })?;
-
-            for trigger in triggers {
-                key_triggers.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
-            }
-        }
-    }
+    let key_triggers = collect_key_index_triggers(store, model).await?;
 
     if slab_triggers != key_triggers {
         let missing_in_key: Vec<_> = slab_triggers.difference(&key_triggers).collect();
@@ -548,10 +504,6 @@ async fn verify_dual_index_consistency(
 }
 
 /// Verifies that ONLY expected slabs exist (no extra slabs).
-///
-/// # Errors
-///
-/// Returns error if extra slabs are found.
 async fn verify_no_extra_slabs(
     operations: &CassandraTriggerStore,
     model: &MigrationModel,
@@ -584,11 +536,7 @@ async fn verify_no_extra_slabs(
     Ok(())
 }
 
-/// Verifies invariant 5: Old V1 data and obsolete slabs are cleaned up.
-///
-/// # Errors
-///
-/// Returns error if cleanup didn't happen.
+/// Verifies that old V1 data and obsolete slabs are cleaned up.
 async fn verify_cleanup(
     v1_operations: &V1Operations,
     operations: &CassandraTriggerStore,
@@ -659,7 +607,7 @@ async fn verify_cleanup(
     Ok(())
 }
 
-/// Verifies invariant 6: After migration to V3, all keys with triggers have
+/// Verifies that after migration to V3, all keys with triggers have
 /// correct state entries and correct clustering row counts.
 ///
 /// For each `(key, timer_type)` pair:
@@ -670,10 +618,6 @@ async fn verify_cleanup(
 /// Applies to both V1-initial (V1→V2→V3) and V2-initial (V2→V3) segments.
 /// V3-initial segments already have correct state; they are skipped here since
 /// the state column was populated by the original write path, not by backfill.
-///
-/// # Errors
-///
-/// Returns error if key state invariant is violated.
 async fn verify_key_state_invariant(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -743,21 +687,6 @@ async fn verify_key_state_invariant(
     Ok(())
 }
 
-/// Creates a test Cassandra configuration.
-fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
-    use std::time::Duration;
-
-    CassandraConfiguration {
-        nodes: vec!["127.0.0.1:9042".to_owned()],
-        keyspace: keyspace.to_owned(),
-        datacenter: Some("datacenter1".to_owned()),
-        rack: None,
-        user: None,
-        password: None,
-        retention: Duration::from_hours(24),
-    }
-}
-
 /// Property test: migration preserves all invariants.
 ///
 /// # Test Strategy
@@ -783,7 +712,7 @@ pub async fn prop_migration_invariants(
         SegmentVersion::V2 => {
             // Write true V2 layout: clustering rows + slab entries, no state
             // MAP entries.  backfill_key_state must populate state from scratch.
-            let config = test_cassandra_config("prosody_test");
+            let config = test_cassandra_config(TEST_KEYSPACE);
             let cassandra_base = CassandraStore::new(&config).await?;
             let segment = Segment {
                 id: input.segment_id,
@@ -791,18 +720,14 @@ pub async fn prop_migration_invariants(
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V2,
             };
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                segment,
-                SpanRelation::default(),
-            )
-            .await?;
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             setup_v2_state(&cassandra_store, &input).await?;
         }
         SegmentVersion::V3 => {
             // Write V3 layout: triggers go through the full state-aware path.
-            let config = test_cassandra_config("prosody_test");
+            let config = test_cassandra_config(TEST_KEYSPACE);
             let cassandra_base = CassandraStore::new(&config).await?;
             let segment = Segment {
                 id: input.segment_id,
@@ -810,20 +735,16 @@ pub async fn prop_migration_invariants(
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V3,
             };
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                segment,
-                SpanRelation::default(),
-            )
-            .await?;
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             let store = TableAdapter::new(cassandra_store);
             setup_v3_state(&store, &input).await?;
         }
     }
 
     // Migration phase: Create store with target_slab_size
-    let config = test_cassandra_config("prosody_test");
+    let config = test_cassandra_config(TEST_KEYSPACE);
     let cassandra_base = CassandraStore::new(&config).await?;
     let segment = Segment {
         id: input.segment_id,
@@ -831,13 +752,8 @@ pub async fn prop_migration_invariants(
         slab_size: input.target_slab_size,
         version: SegmentVersion::V3,
     };
-    let cassandra_store = CassandraTriggerStore::with_store(
-        cassandra_base,
-        &config.keyspace,
-        segment,
-        SpanRelation::default(),
-    )
-    .await?;
+    let cassandra_store =
+        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
     let store = TableAdapter::new(cassandra_store);
 
     // Trigger migration by calling get_segment()

@@ -14,8 +14,8 @@ use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, Sche
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{
-    ConsumerConfigurationBuilder, ConsumerError, LowLatencyMiddlewareConfiguration,
-    PipelineMiddlewareConfiguration, ProsodyConsumer,
+    ConsumerConfigurationBuilder, ConsumerError, KeyedStateConfiguration,
+    LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
@@ -27,6 +27,7 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
 use crate::{Codec, JsonCodec, Topic};
@@ -66,6 +67,9 @@ pub struct ConsumerBuilders {
     pub dedup: DeduplicationConfigurationBuilder,
     /// Timeout middleware configuration builder.
     pub timeout: TimeoutConfigurationBuilder,
+    /// Keyed-state configuration (always-on; carries collection
+    /// registrations). Mode-independent — every mode threads it through.
+    pub keyed_state: KeyedStateConfiguration,
     /// Telemetry emitter configuration.
     pub emitter: TelemetryEmitterConfiguration,
 }
@@ -112,10 +116,6 @@ where
     /// The source system is used to identify the originating service or
     /// component in produced messages, enabling message tracing and loop
     /// detection.
-    ///
-    /// # Returns
-    ///
-    /// A string slice containing the source system identifier.
     #[must_use]
     pub fn source_system(&self) -> &str {
         &self.producer_config.source_system
@@ -127,14 +127,6 @@ where
     }
 
     /// Creates a new `HighLevelClient` with the specified configurations.
-    ///
-    /// # Arguments
-    ///
-    /// * `mode` - The operational mode for the client.
-    /// * `producer_builder` - Builder for the producer configuration.
-    /// * `consumer_builders` - Bundled consumer and middleware configuration
-    ///   builders.
-    /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Errors
     ///
@@ -182,14 +174,7 @@ where
 
         let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
             mode,
-            consumer_builder: &consumer_builders.consumer,
-            retry_builder: &consumer_builders.retry,
-            failure_topic_builder: &consumer_builders.failure_topic,
-            scheduler_builder: &consumer_builders.scheduler,
-            monopolization_builder: &consumer_builders.monopolization,
-            defer_builder: &consumer_builders.defer,
-            dedup_builder: &consumer_builders.dedup,
-            timeout_builder: &consumer_builders.timeout,
+            consumer_builders,
             cassandra_builder,
         });
 
@@ -211,12 +196,6 @@ where
 
     /// Sends a message to the specified topic.
     ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to send the message to.
-    /// * `key` - The key associated with the message.
-    /// * `payload` - The payload of the message.
-    ///
     /// # Errors
     ///
     /// Returns a `HighLevelClientError` if the send operation fails.
@@ -230,11 +209,38 @@ where
         Ok(())
     }
 
+    /// Registers a keyed-state collection, returning the [`Registered`]
+    /// capability handle a handler binds via `ctx.state(...)`.
+    ///
+    /// Call this while the consumer is `Configured`, before
+    /// [`subscribe`](Self::subscribe) freezes the registrations into the
+    /// running consumer. Tokens survive the `unsubscribe`/re-subscribe cycle,
+    /// so a re-subscribe needs no re-registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HighLevelClientError::AlreadySubscribed`] when the consumer
+    /// is already running (registrations are frozen), or
+    /// [`HighLevelClientError::UnconfiguredConsumer`] when there is no valid
+    /// consumer configuration to register against.
+    pub async fn register<D>(
+        &self,
+        descriptor: D,
+    ) -> Result<Registered<D>, HighLevelClientError<C::Error>>
+    where
+        D: StateDescriptor,
+    {
+        let mut guard = self.consumer.lock().await;
+        match &mut *guard {
+            ConsumerState::Configured(config) => Ok(config.register(descriptor)),
+            ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
+            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
+                Err(HighLevelClientError::UnconfiguredConsumer)
+            }
+        }
+    }
+
     /// Subscribes the consumer with the provided handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `handler` - The handler to process consumed messages.
     ///
     /// # Errors
     ///
@@ -269,7 +275,6 @@ where
                 retry,
                 monopolization,
                 defer,
-                dedup,
                 common,
                 trigger_store,
             } => {
@@ -280,7 +285,6 @@ where
                         retry: retry.clone(),
                         monopolization: monopolization.clone(),
                         defer: defer.clone(),
-                        dedup: dedup.clone(),
                     },
                     common,
                     self.telemetry.clone(),
@@ -294,7 +298,6 @@ where
                 failure_topic,
                 common,
                 trigger_store,
-                ..
             } => {
                 ProsodyConsumer::low_latency_consumer(
                     consumer,
@@ -314,7 +317,6 @@ where
                 consumer,
                 common,
                 trigger_store,
-                ..
             } => {
                 ProsodyConsumer::<C>::best_effort_consumer(
                     consumer,
@@ -392,15 +394,6 @@ where
 }
 
 /// Checks if all required topics exist for the given consumer state.
-///
-/// # Arguments
-///
-/// * `producer` - The producer used to fetch metadata.
-/// * `consumer_state` - The current state of the consumer.
-///
-/// # Errors
-///
-/// Returns a `HighLevelClientError` if any required topics are missing.
 fn check_topic_existence<S, C: Codec, D: Codec>(
     producer: &ProsodyProducer<C>,
     consumer_state: &ConsumerState<S, D>,
@@ -422,15 +415,6 @@ where
 
 /// Identifies which topics from the given list are missing in the Kafka
 /// cluster.
-///
-/// # Arguments
-///
-/// * `producer` - The producer used to fetch metadata.
-/// * `topics` - A list of topics to check for existence.
-///
-/// # Errors
-///
-/// Returns a `ProducerError` if metadata fetching fails.
 fn missing_topics<C: Codec>(
     producer: &ProsodyProducer<C>,
     mut topics: Vec<Topic>,

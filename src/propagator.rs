@@ -14,11 +14,6 @@ use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 /// `BaggagePropagator` and `TraceContextPropagator`. The resulting propagator
 /// can be used to inject and extract both baggage and trace context in
 /// distributed tracing scenarios.
-///
-/// # Returns
-///
-/// A `TextMapCompositePropagator` configured with baggage and trace context
-/// propagators.
 #[must_use]
 pub fn new_propagator() -> TextMapCompositePropagator {
     TextMapCompositePropagator::new(vec![

@@ -6,14 +6,15 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::SlowTestHandler;
+use std::time::Duration;
+
+use crate::common::ChannelHandler;
 use color_eyre::eyre::Result;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    JsonCodec,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, ProsodyConsumer},
+    consumer::{ConsumerConfiguration, KeyedStateConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
 };
@@ -39,21 +40,9 @@ async fn test_backpressure() -> Result<()> {
     // Initialize the logger.
     init_test_logging();
 
-    // Create a unique topic for the test
-    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    // Create a unique four-partition topic for the test
+    let (topic, admin_client) = common::create_topic_with_partitions(4).await?;
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
-
-    // Setup an admin client to manage the topic creation
-    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-    admin_client
-        .create_topic(
-            &TopicConfiguration::builder()
-                .name(topic.to_string())
-                .partition_count(4_u16)
-                .replication_factor(1_u16)
-                .build()?,
-        )
-        .await?;
 
     // Use a channel with a buffer capacity to accommodate slow processing
     let (messages_tx, mut messages_rx) = channel(64);
@@ -66,10 +55,11 @@ async fn test_backpressure() -> Result<()> {
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
-    let slow_handler = SlowTestHandler { messages_tx };
+    let slow_handler = ChannelHandler::with_delay(messages_tx, Duration::from_secs(1));
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(slow_handler),
         Telemetry::new(),
     )

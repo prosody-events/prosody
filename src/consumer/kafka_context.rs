@@ -12,7 +12,7 @@
 //! The core component is the `Context` struct which implements Kafka's
 //! rebalance callbacks to manage partition lifecycle events.
 
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rdkafka::ClientContext;
@@ -23,127 +23,179 @@ use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
     ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
 };
+use crate::loader::MessageLoader;
+use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
+use crate::state::session::CellSession;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStoreProvider;
-use crate::{EventType, Topic};
+use crate::{EventIdentity, EventType, Partition, Topic};
+
+/// The shared partition-manager map paired with the channel that republishes
+/// its size after each rebalance, so assignment readiness can be awaited rather
+/// than polled.
+pub(super) struct ManagerRegistry<PL> {
+    /// Thread-safe storage for partition managers.
+    pub(super) managers: Arc<Managers<PL>>,
+    /// Publishes the assigned-partition count after each rebalance.
+    pub(super) assignment_tx: watch::Sender<u32>,
+}
+
+/// The per-partition factories the context threads into each
+/// [`PartitionConfiguration`]: trigger stores for the timer system and
+/// keyed-state managers for the state system.
+pub(super) struct PartitionProviders<P, SP> {
+    /// Factory for per-partition trigger stores.
+    pub(super) triggers: P,
+
+    /// Factory for per-partition keyed-state managers.
+    pub(super) state: SP,
+}
+
+/// The partition-manager factory a [`Context`] holds: builds a fresh
+/// [`PartitionManager`] for each newly assigned partition. Implemented
+/// automatically for any matching closure, so the context can name its factory
+/// bound once instead of spelling the full `Fn` signature at every use.
+pub(super) trait MakeManager<PL>:
+    Fn(Topic, Partition) -> PartitionManager<PL> + Send + Sync + 'static
+{
+}
+
+impl<PL, F> MakeManager<PL> for F where
+    F: Fn(Topic, Partition) -> PartitionManager<PL> + Send + Sync + 'static
+{
+}
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
 /// Implements the rebalance protocol to handle dynamic partition assignments
 /// and revocations as consumers join or leave a consumer group. During
 /// assignments, it creates `PartitionManager` instances for each assigned
-/// partition. During revocations, it ensures proper cleanup and graceful
-/// shutdown of partition processing.
+/// partition via `make_manager`. During revocations, it ensures proper cleanup
+/// and graceful shutdown of partition processing.
+///
+/// The context is generic only over what it actually uses at rebalance time:
+/// the payload type and a partition-manager factory. The provider types
+/// (`HandlerProvider`/`TriggerStoreProvider`/`PartitionStateProvider`) are
+/// discharged once inside [`new_context`] and captured into the `make_manager`
+/// closure, so they never surface on the context itself.
 ///
 /// # Type Parameters
 ///
-/// * `T` - Type implementing `HandlerProvider` to create message handlers for
-///   partitions
-/// * `P` - Type implementing `TriggerStoreProvider` for persistent timer
-///   trigger storage
+/// * `F` - The partition-manager factory closure (`Fn(Topic, Partition) ->
+///   PartitionManager<PL>`)
 /// * `PL` - The payload type carried by consumed messages
-pub struct Context<T, P, PL>
-where
-    T: HandlerProvider,
-{
-    /// Partition-level configuration settings
-    config: PartitionConfiguration<P, PL>,
-
-    /// Creates message handlers for partitions
-    handler_provider: T,
+pub(super) struct Context<F, PL> {
+    /// Builds a fresh partition manager for a newly assigned partition.
+    make_manager: F,
 
     /// Thread-safe storage for partition managers
     managers: Arc<Managers<PL>>,
 
+    /// Publishes the assigned-partition count after each rebalance so readiness
+    /// can be awaited rather than polled.
+    assignment_tx: watch::Sender<u32>,
+
     telemetry: TelemetrySender,
 }
 
-impl<T, P, PL> Context<T, P, PL>
-where
-    T: HandlerProvider,
-    PL: Clone + Send + Sync + 'static,
-{
-    /// Creates a new consumer context with the given configuration.
-    ///
-    /// Converts the consumer-level configuration into partition-level
-    /// configuration and initializes the context with the handler provider
-    /// and shared state.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Consumer configuration including buffer sizes and timeouts
-    /// * `handler_provider` - Creates message handlers for partitions
-    /// * `trigger_provider` - Factory for per-partition trigger stores
-    /// * `watermark_version` - Shared counter tracking watermark updates
-    /// * `managers` - Thread-safe storage for partition managers
-    /// * `allowed_events` - Optional filter automaton; payloads supply their
-    ///   event type via [`EventType`]
-    pub fn new(
-        config: &ConsumerConfiguration,
-        handler_provider: T,
-        trigger_provider: P,
-        watermark_version: Arc<WatermarkVersion>,
-        managers: Arc<Managers<PL>>,
-        allowed_events: Option<AhoCorasick>,
-        telemetry: TelemetrySender,
-    ) -> Self {
-        let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
-            error!("invalid timer slab size: {error:#}; using default");
-            CompactDuration::new(10 * 60)
-        });
-
-        let timer_semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| {
-            Arc::new(Semaphore::new(config.max_uncommitted))
-        }));
-
-        let config = PartitionConfiguration {
-            group_id: Arc::from(config.group_id.as_str()),
-            buffer_size: config.max_uncommitted,
-            max_uncommitted: config.max_uncommitted,
-            allowed_events,
-            shutdown_timeout: config.shutdown_timeout,
-            stall_threshold: config.stall_threshold,
-            watermark_version,
-            trigger_provider,
-            timer_slab_size,
-            timer_semaphores,
-            telemetry_sender: telemetry.clone(),
-            timer_spans: config.timer_spans,
-            _payload: PhantomData,
-        };
-
-        Self {
-            config,
-            handler_provider,
-            managers,
-            telemetry,
-        }
-    }
-}
-
-impl<T, P, PL> ClientContext for Context<T, P, PL>
-where
-    T: HandlerProvider,
-    P: TriggerStoreProvider,
-    PL: Clone + Send + Sync + 'static,
-{
-}
-
-impl<T, P, PL> ConsumerContext for Context<T, P, PL>
+/// Creates a new consumer context with the given configuration.
+///
+/// Converts the consumer-level configuration into partition-level
+/// configuration and captures the handler provider and per-partition factories
+/// into a partition-manager factory closure. This discharges the provider
+/// trait bounds in one place; the returned [`Context`] carries only the
+/// payload-erased factory. Fails with a [`BuildError`] if the configured
+/// `allowed_events` prefixes cannot be compiled into a filter automaton.
+pub(super) fn new_context<T, P, SP, PL>(
+    config: &ConsumerConfiguration,
+    handler_provider: T,
+    providers: PartitionProviders<P, SP>,
+    watermark_version: Arc<WatermarkVersion>,
+    registry: ManagerRegistry<PL>,
+    telemetry: TelemetrySender,
+    version: Arc<str>,
+) -> Result<Context<impl MakeManager<PL>, PL>, BuildError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
-    PL: Clone + Send + Sync + 'static + EventType,
+    SP: PartitionStateProvider<P::Store>,
+    <SP::Manager as PartitionStateManager>::Session:
+        CellSession<Loader: MessageLoader<Payload = PL>>,
+    PL: Clone + Send + Sync + 'static + EventType + EventIdentity,
+{
+    // Compile the event-type filter automaton from the configured
+    // prefixes; payloads supply their event type via [`EventType`].
+    let allowed_events = config
+        .allowed_events
+        .as_ref()
+        .map(|prefixes| {
+            AhoCorasick::builder()
+                .start_kind(StartKind::Anchored)
+                .build(prefixes)
+        })
+        .transpose()?;
+
+    let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
+        error!("invalid timer slab size: {error:#}; using default");
+        CompactDuration::new(10 * 60)
+    });
+
+    let timer_semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| {
+        Arc::new(Semaphore::new(config.max_uncommitted))
+    }));
+
+    let partition_config = PartitionConfiguration {
+        group_id: Arc::from(config.group_id.as_str()),
+        buffer_size: config.max_uncommitted,
+        max_uncommitted: config.max_uncommitted,
+        allowed_events,
+        shutdown_timeout: config.shutdown_timeout,
+        stall_threshold: config.stall_threshold,
+        watermark_version,
+        version,
+        trigger_provider: providers.triggers,
+        state_provider: providers.state,
+        timer_slab_size,
+        timer_semaphores,
+        telemetry_sender: telemetry.clone(),
+        timer_spans: config.timer_spans,
+        _payload: PhantomData,
+    };
+
+    let make_manager = move |topic: Topic, partition: Partition| {
+        let handler = handler_provider.handler_for_partition(topic, partition);
+        PartitionManager::new(partition_config.clone(), handler, topic, partition)
+    };
+
+    Ok(Context {
+        make_manager,
+        managers: registry.managers,
+        assignment_tx: registry.assignment_tx,
+        telemetry,
+    })
+}
+
+impl<F, PL> ClientContext for Context<F, PL>
+where
+    F: MakeManager<PL>,
+    PL: Send + Sync + 'static,
+{
+}
+
+impl<F, PL> ConsumerContext for Context<F, PL>
+where
+    F: MakeManager<PL>,
+    PL: Send + Sync + 'static,
 {
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.
@@ -156,12 +208,6 @@ where
     ///   assigned partitions
     /// - For revocations: Shuts down `PartitionManager` instances for revoked
     ///   partitions
-    ///
-    /// # Arguments
-    ///
-    /// * `consumer` - The Kafka consumer instance
-    /// * `rebalance` - The rebalance event details containing partition
-    ///   assignments or revocations
     fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         debug!("rebalance is starting");
 
@@ -187,14 +233,10 @@ where
                         continue;
                     };
 
-                    // Create a handler for this specific partition
-                    let handler = self
-                        .handler_provider
-                        .handler_for_partition(topic, partition);
-
-                    // Initialize new partition manager
-                    let manager =
-                        PartitionManager::new(self.config.clone(), handler, topic, partition);
+                    // Initialize a new partition manager via the captured
+                    // factory, which builds its handler and threads in the
+                    // partition configuration.
+                    let manager = (self.make_manager)(topic, partition);
 
                     vacant.insert(manager);
                     debug!("{topic}:{partition} assigned");
@@ -234,6 +276,12 @@ where
             }
         }
 
+        // Publish the new assignment count so readiness can be awaited rather
+        // than polled. Assign, revoke, and rebalance-error all fall through
+        // here; empty rebalances returned early and left the count unchanged.
+        self.assignment_tx
+            .send_replace(self.managers.read().len() as u32);
+
         debug!("pre-rebalance complete");
     }
 
@@ -243,11 +291,6 @@ where
     /// completed. For assignment events, it resumes consumption on the newly
     /// assigned partitions. For all events, it logs that the rebalance has
     /// completed.
-    ///
-    /// # Arguments
-    ///
-    /// * `consumer` - The Kafka consumer instance
-    /// * `rebalance` - The completed rebalance event details
     fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         if let Rebalance::Assign(partitions) = rebalance {
             debug!("resuming assigned partitions: {partitions:#?}");

@@ -1,6 +1,6 @@
 //! Error types for timer management operations.
 //!
-//! Defines [`TimerManagerError`] enum covering all error conditions in
+//! Defines [`TimerManagerError`] enum spanning all error conditions in
 //! [`super::manager::TimerManager`]: storage failures, scheduling failures,
 //! invalid datetime values, and timer lifecycle errors.
 
@@ -15,7 +15,7 @@ use thiserror::Error;
 /// Errors returned by [`super::manager::TimerManager`] methods.
 ///
 /// The type parameter `T` is the error type from the underlying storage
-/// implementation. Covers storage errors, scheduling errors, datetime
+/// implementation. Spans storage errors, scheduling errors, datetime
 /// conversion/range errors, and timer lifecycle errors.
 #[derive(Debug, Error)]
 pub enum TimerManagerError<T>

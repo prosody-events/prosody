@@ -9,19 +9,21 @@
 //!
 //! [`CassandraTriggerStore`]: super::CassandraTriggerStore
 
-use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
+use super::{CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
-use crate::otel::SpanRelation;
+use crate::test_util::{integration_test_count, sampled_remote_context, test_cassandra_config};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::test_support::test_segment;
 use crate::tracing::init_test_logging;
 use crate::trigger_store_tests;
 use color_eyre::Result;
@@ -30,34 +32,9 @@ use futures::pin_mut;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::env;
 use std::ops::RangeInclusive;
-use std::time::Duration;
 use strum::VariantArray;
 use uuid::Uuid;
-
-/// Creates a test configuration for Cassandra integration tests.
-fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
-    CassandraConfiguration {
-        datacenter: None,
-        rack: None,
-        nodes: vec!["localhost:9042".to_owned()],
-        keyspace: keyspace.to_owned(),
-        user: None,
-        password: None,
-        retention: Duration::from_mins(10),
-    }
-}
-
-// Determine the number of tests to run from an environment variable,
-// defaulting to 25 if the variable is not set or invalid.
-// Uses INTEGRATION_TESTS since these tests hit a real Cassandra database.
-fn get_test_count() -> u64 {
-    env::var("INTEGRATION_TESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(25)
-}
 
 /// Creates a test store and segment, returning `(store, segment_id)`.
 async fn setup_test_store(name: &str) -> Result<(CassandraTriggerStore, SegmentId)> {
@@ -70,23 +47,16 @@ async fn setup_test_store_with_version(
     name: &str,
     version: SegmentVersion,
 ) -> Result<(CassandraTriggerStore, SegmentId)> {
-    let slab_size = CompactDuration::new(60);
-    let segment_id = SegmentId::from(Uuid::new_v4());
     let segment = Segment {
-        id: segment_id,
-        name: name.to_owned(),
-        slab_size,
         version,
+        ..test_segment(name, 60_u32)
     };
-    let config = test_cassandra_config("prosody_test");
+    let segment_id = segment.id;
+    let config = test_cassandra_config();
     let cassandra_store = CassandraStore::new(&config).await?;
-    let store = CassandraTriggerStore::with_store(
-        cassandra_store,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
+    let store =
+        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
+            .await?;
     store.insert_segment().await?;
     Ok((store, segment_id))
 }
@@ -97,29 +67,18 @@ async fn setup_test_store_with_version(
 trigger_store_tests!(
     CassandraTriggerStore,
     |slab_size| async move {
-        let config = test_cassandra_config("prosody_test");
+        let config = test_cassandra_config();
         let store = CassandraStore::new(&config).await?;
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            name: String::new(),
-            slab_size,
-            version: SegmentVersion::V3,
-        };
-        CassandraTriggerStore::with_store(store, &config.keyspace, segment, SpanRelation::default())
-            .await
+        let segment = test_segment("", slab_size);
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
-        let config = test_cassandra_config("prosody_test");
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            name: String::new(),
-            slab_size,
-            version: SegmentVersion::V3,
-        };
-        cassandra_store(&config, segment, SpanRelation::default()).await
+        let config = test_cassandra_config();
+        let segment = test_segment("", slab_size);
+        cassandra_store(&config, segment).await
     },
-    get_test_count()
+    integration_test_count(25)
 );
 
 #[tokio::test]
@@ -389,7 +348,7 @@ async fn assert_state_and_reads(
 
 /// Absent → Inline → Overflow → demotion via delete → Absent.
 ///
-/// Covers: Absent→Inline (schedule), Inline→Overflow (insert/promote),
+/// Exercises: Absent→Inline (schedule), Inline→Overflow (insert/promote),
 /// Overflow→Inline (delete demotion 2→1), Inline→Absent (delete 1→0).
 #[tokio::test]
 async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
@@ -515,7 +474,7 @@ async fn test_promote_preserves_tag() -> Result<()> {
 /// Overflow→Inline via `clear_and_schedule_key`, `clear_key_triggers`
 /// paths, Inline→Inline reschedule.
 ///
-/// Covers: Overflow→Inline (`clear_and_schedule`), Inline→Absent (clear),
+/// Exercises: Overflow→Inline (`clear_and_schedule`), Inline→Absent (clear),
 /// Overflow→Absent (clear), Inline→Inline (reschedule, 0 tombstones).
 #[tokio::test]
 async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
@@ -612,7 +571,7 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
 /// Post-V3: inserting on any cold or warm cache with Absent state always
 /// goes to `set_state_inline` (no more clustering-only path).
 ///
-/// Covers: Absent→Inline (insert on cold cache), Inline→Absent (delete
+/// Exercises: Absent→Inline (insert on cold cache), Inline→Absent (delete
 /// match), Absent→Inline (insert on warm/cached Absent).
 #[tokio::test]
 async fn test_state_transitions_insert_and_delete() -> Result<()> {
@@ -1083,6 +1042,54 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
 }
 
 #[tokio::test]
+async fn scheduled_context_survives_persist_fetch_round_trip() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    use opentelemetry::trace::TraceContextExt as _;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("context_round_trip").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("ctx-round-trip-{}", Uuid::new_v4()).into();
+    let time = CompactDateTime::from(1_700_000u32);
+    let timer_type = TimerType::Application;
+
+    // Persist a trigger carrying a known scheduling context, then read it back.
+    let scheduled = sampled_remote_context();
+    let expected = scheduled.span().span_context().clone();
+    store
+        .add_trigger(Trigger::restored(
+            key.clone(),
+            time,
+            timer_type,
+            7,
+            scheduled,
+        ))
+        .await?;
+
+    let fetched: Vec<Trigger> = store
+        .operations()
+        .get_key_triggers_all_types(&key)
+        .try_collect()
+        .await?;
+    assert_eq!(fetched.len(), 1, "exactly one trigger should be persisted");
+    let restored = fetched[0].context().span().span_context().clone();
+    assert_eq!(
+        restored.trace_id(),
+        expected.trace_id(),
+        "the scheduled trace id must survive persist -> fetch -> Trigger::restored"
+    );
+    assert_eq!(
+        restored.span_id(),
+        expected.span_id(),
+        "the scheduled span id must survive the round trip"
+    );
+
+    store.remove_trigger(&key, time, timer_type).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
     use crate::timers::store::TriggerStore;
     use crate::timers::store::adapter::TableAdapter;
@@ -1132,13 +1139,13 @@ async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
 
 /// Property test verifying the timer state invariant:
 ///
-/// - **1 timer** for a `(segment_id, key, timer_type)` → state must be `Inline`
-///   holding it, no clustering rows.
+/// - **1 timer** for a `(key, timer_type)` → state must be `Inline` holding it,
+///   no clustering rows.
 /// - **>1 timer** → state must be `Overflow`, all timers in clustering rows.
 /// - **0 timers** → state must be `Absent`.
 ///
 /// Applies a random sequence of operations then inspects every
-/// `(segment_id, key, timer_type)` combination against the reference model.
+/// `(key, timer_type)` combination against the reference model.
 #[test]
 fn test_prop_timer_state_invariant() {
     use crate::test_util::TEST_RUNTIME;
@@ -1152,21 +1159,10 @@ fn test_prop_timer_state_invariant() {
         let slab_size = input.slab_size;
         let store = match runtime.block_on(
             async {
-                let config = test_cassandra_config("prosody_test");
+                let config = test_cassandra_config();
                 let store = CassandraStore::new(&config).await?;
-                let segment = Segment {
-                    id: Uuid::new_v4(),
-                    name: String::new(),
-                    slab_size,
-                    version: SegmentVersion::V3,
-                };
-                CassandraTriggerStore::with_store(
-                    store,
-                    &config.keyspace,
-                    segment,
-                    SpanRelation::default(),
-                )
-                .await
+                let segment = test_segment("", slab_size);
+                CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
             }
             .instrument(span.clone()),
         ) {
@@ -1184,7 +1180,7 @@ fn test_prop_timer_state_invariant() {
 
     init_test_logging();
     QuickCheck::new()
-        .tests(get_test_count())
+        .tests(integration_test_count(25))
         .quickcheck(prop as fn(KeyTriggerTestInput) -> TestResult);
 }
 
@@ -1202,36 +1198,20 @@ fn test_prop_timer_state_invariant() {
 async fn test_provider_creates_independent_stores() -> Result<()> {
     init_test_logging();
 
-    let slab_size = CompactDuration::new(60);
-    let segment = Segment {
-        id: SegmentId::from(Uuid::new_v4()),
-        name: "provider_independent".to_owned(),
-        slab_size,
-        version: SegmentVersion::V3,
-    };
-    let config = test_cassandra_config("prosody_test");
+    let segment = test_segment("provider_independent", 60_u32);
+    let config = test_cassandra_config();
 
     // Build store A with the chosen segment.
     let base_a = CassandraStore::new(&config).await?;
-    let ops_a = CassandraTriggerStore::with_store(
-        base_a,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
+    let ops_a =
+        CassandraTriggerStore::with_store(base_a, &config.keyspace, segment.clone()).await?;
     ops_a.insert_segment().await?;
 
     // Build store B with the same segment but a fresh (cold) cache, sharing
     // the same prepared queries.
     let base_b = CassandraStore::new(&config).await?;
-    let ops_b = CassandraTriggerStore::with_store(
-        base_b,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
+    let ops_b =
+        CassandraTriggerStore::with_store(base_b, &config.keyspace, segment.clone()).await?;
 
     let key: Key = format!("provider-test-{}", Uuid::new_v4()).into();
     let tt = TimerType::Application;
@@ -1272,6 +1252,81 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     // Cleanup.
     ops_a.delete_segment().await?;
 
+    Ok(())
+}
+
+/// The keyed-state commit oracle reads timer tags through a **clone of the
+/// partition's writing store** (handle passing at partition acquisition —
+/// see `StateBackendFactory::for_partition`). `current_tag` is cache-first,
+/// so the answer must still flip when a mutation lands through the writer:
+/// the clone shares the writer's `state_cache`. Each consult here first
+/// warms the cache, then the writer mutates, and the next consult must
+/// observe the mutation — an answer pinned by the warmed cache would roll a
+/// committed write back (or resurrect an uncommitted one).
+#[tokio::test]
+async fn oracle_reads_through_the_writers_store() -> Result<()> {
+    use super::CassandraTriggerStoreProvider;
+    use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
+    use crate::state::commit::{CommitManager, StoreTagSource};
+    use crate::timers::store::{TriggerStore, TriggerStoreProvider};
+    init_test_logging();
+
+    let config = test_cassandra_config();
+    let base = CassandraStore::new(&config).await?;
+    let provider = CassandraTriggerStoreProvider::with_store(base, &config.keyspace).await?;
+    let segment = test_segment("oracle_writer_handle", 60_u32);
+    let writer = provider.create_store(segment);
+    let oracle = CommitManager::new(
+        MemoryDeduplicationStore::new(),
+        StoreTagSource(writer.clone()),
+    );
+
+    let key: Key = format!("oracle-writer-{}", Uuid::new_v4()).into();
+    let timer_type = TimerType::Application;
+    let time = CompactDateTime::from(1_500_000u32);
+    let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
+    let wal_tag = trigger.tag;
+
+    // Stage → crash: the trigger row stands. Recovery's first-touch consult
+    // observes it (NotCommitted → the event refires) and warms the cache.
+    writer.add_trigger(trigger).await?;
+    assert!(
+        !oracle
+            .is_timer_committed(&key, timer_type, time, wal_tag)
+            .await?,
+        "standing trigger row must read NotCommitted"
+    );
+
+    // The refired event commits the trigger through the partition's store
+    // (row removed). The sweep's consult must observe the commit even though
+    // the previous consult warmed the cache.
+    writer.remove_trigger(&key, time, timer_type).await?;
+    assert!(
+        oracle
+            .is_timer_committed(&key, timer_type, time, wal_tag)
+            .await?,
+        "commit through the writer must flip the warmed oracle to committed"
+    );
+
+    // Reverse flip: a consult that observed (and cached) absence must see a
+    // later schedule through the writer.
+    let second = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
+    let second_tag = second.tag;
+    assert!(
+        oracle
+            .is_timer_committed(&key, timer_type, time, second_tag)
+            .await?,
+        "absent row reads committed before the reschedule"
+    );
+    writer.add_trigger(second).await?;
+    assert!(
+        !oracle
+            .is_timer_committed(&key, timer_type, time, second_tag)
+            .await?,
+        "schedule through the writer must read NotCommitted"
+    );
+
+    writer.remove_trigger(&key, time, timer_type).await?;
     Ok(())
 }
 
@@ -1317,7 +1372,7 @@ async fn apply_op_and_verify_tags(
     expected_tags: &mut HashMap<(Key, TimerType, CompactDateTime), i32>,
 ) -> Result<()> {
     match op {
-        KeyTriggerOperation::Insert { trigger, .. } => {
+        KeyTriggerOperation::Insert { trigger } => {
             store.upsert_key_trigger(trigger.clone()).await?;
             snapshot_tag(
                 store,
@@ -1334,23 +1389,20 @@ async fn apply_op_and_verify_tags(
             timer_type,
             key,
             time,
-            ..
         } => {
             store.delete_key_trigger(*timer_type, key, *time).await?;
             expected_tags.remove(&(key.clone(), *timer_type, *time));
             verify_tags_for_key_type(store, expected_tags, key, *timer_type).await?;
         }
-        KeyTriggerOperation::ClearByType {
-            timer_type, key, ..
-        } => {
+        KeyTriggerOperation::ClearByType { timer_type, key } => {
             store.clear_key_triggers(*timer_type, key).await?;
             expected_tags.retain(|(k, tt, _), _| !(k == key && *tt == *timer_type));
         }
-        KeyTriggerOperation::ClearAllTypes { key, .. } => {
+        KeyTriggerOperation::ClearAllTypes { key } => {
             store.clear_key_triggers_all_types(key).await?;
             expected_tags.retain(|(k, ..), _| k != key);
         }
-        KeyTriggerOperation::ClearAndSchedule { trigger, .. } => {
+        KeyTriggerOperation::ClearAndSchedule { trigger } => {
             store.clear_and_schedule_key(trigger.clone()).await?;
             expected_tags.retain(|(k, tt, _), _| !(k == &trigger.key && *tt == trigger.timer_type));
             snapshot_tag(
@@ -1391,21 +1443,17 @@ async fn snapshot_tag(
 }
 
 /// Applies operations from [`KeyTriggerTestInput`] and verifies the
-/// timer state invariant holds for every `(segment_id, key, timer_type)`.
+/// timer state invariant holds for every `(key, timer_type)`.
 async fn prop_timer_state_invariant(
     store: &CassandraTriggerStore,
     input: KeyTriggerTestInput,
 ) -> Result<()> {
     use crate::timers::store::tests::prop_key_triggers::KeyTriggerModel;
 
-    let key_pool = ["key-a", "key-b", "key-c"];
-
     // Clean up before test
-    for _segment_id in &input.segment_ids {
-        for key_str in &key_pool {
-            let key = Key::from(*key_str);
-            store.clear_key_triggers_all_types(&key).await?;
-        }
+    for key_str in &KEY_POOL {
+        let key = Key::from(*key_str);
+        store.clear_key_triggers_all_types(&key).await?;
     }
 
     // Apply all operations to both model and store, verifying tags as we go.
@@ -1416,35 +1464,37 @@ async fn prop_timer_state_invariant(
         apply_op_and_verify_tags(store, op, &mut expected_tags).await?;
     }
 
-    // Verify timer state invariant for every (segment_id, key, timer_type)
-    for (segment_id, key) in &model.all_keys() {
+    // Verify timer state invariant for every (key, timer_type) against the
+    // store's real partition (its own segment).
+    for key in &model.all_keys() {
         for &timer_type in TimerType::VARIANTS {
-            let expected_count = model.get_times(segment_id, timer_type, key).len();
-            let (handle, _) = store.resolve_state(segment_id, key, timer_type).await?;
+            let expected_count = model.get_times(timer_type, key).len();
+            let (handle, _) = store
+                .resolve_state(&store.segment.id, key, timer_type)
+                .await?;
             let timer_state = handle.lock().await.clone();
 
             match expected_count {
                 0 => {
                     assert!(
                         matches!(timer_state, TimerState::Absent),
-                        "Invariant violation: 0 timers for ({segment_id}, {key}, {timer_type:?}) \
-                         but state is {timer_state:?}"
+                        "Invariant violation: 0 timers for ({key}, {timer_type:?}) but state is \
+                         {timer_state:?}"
                     );
                 }
                 1 => {
-                    let expected_time = model.get_times(segment_id, timer_type, key)[0];
+                    let expected_time = model.get_times(timer_type, key)[0];
                     assert!(
                         matches!(&timer_state, TimerState::Inline(t) if t.time == expected_time),
                         "Invariant violation: exactly 1 timer (time={expected_time:?}) for \
-                         ({segment_id}, {key}, {timer_type:?}) but state is {timer_state:?} — \
-                         expected Inline"
+                         ({key}, {timer_type:?}) but state is {timer_state:?} — expected Inline"
                     );
                 }
                 n => {
                     assert!(
                         matches!(timer_state, TimerState::Overflow),
-                        "Invariant violation: {n} timers for ({segment_id}, {key}, \
-                         {timer_type:?}) but state is {timer_state:?} — expected Overflow"
+                        "Invariant violation: {n} timers for ({key}, {timer_type:?}) but state is \
+                         {timer_state:?} — expected Overflow"
                     );
                 }
             }

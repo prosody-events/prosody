@@ -5,11 +5,15 @@
 
 use super::*;
 use crate::consumer::Keyed;
+use crate::consumer::event_context::StateAccessError;
 use crate::consumer::event_context::TerminationSignals;
+use crate::consumer::middleware::RepinProof;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::otel::SpanRelation;
+use crate::state::descriptor::{Registered, StateDescriptor};
+use crate::state::tests::support::UnavailableState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
@@ -91,6 +95,28 @@ impl TerminationSignals for KeyedMockContext {
 
 impl EventContext for KeyedMockContext {
     type Error = Infallible;
+    type Payload = serde_json::Value;
+    type State = UnavailableState<serde_json::Value>;
+
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        registered.descriptor().bind(&UnavailableState::new())
+    }
+
+    fn redispatch(&self, proof: RepinProof) -> Self {
+        // Forward to the inner mock (compiler-enforced, like `state`); the
+        // key/timer capture are cheap clones this wrapper owns.
+        Self {
+            inner: self.inner.redispatch(proof),
+            key: self.key.clone(),
+            active_timers: self.active_timers.clone(),
+        }
+    }
 
     fn should_cancel(&self) -> bool {
         self.inner.should_cancel()
@@ -145,10 +171,6 @@ impl EventContext for KeyedMockContext {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.active_timers.lock().retain(|(_, t)| *t != timer_type);
         self.inner.clear_scheduled(timer_type)
-    }
-
-    fn invalidate(self) {
-        self.inner.invalidate();
     }
 
     fn scheduled(
@@ -908,8 +930,8 @@ fn context_error_classification_delegates_correctly() {
     init_test_logging();
 
     // Create errors with known classifications
-    let transient_error = OutcomeError::transient();
-    let permanent_error = OutcomeError::permanent();
+    let transient_error = OutcomeError::Transient;
+    let permanent_error = OutcomeError::Permanent;
 
     // Context errors should delegate to inner error classification
     let context_transient: TimerDeferContextError<OutcomeError, Infallible> =
@@ -928,14 +950,14 @@ fn context_error_classification_delegates_correctly() {
 
     // Store errors should delegate to inner error classification
     let store_transient: TimerDeferContextError<Infallible, OutcomeError> =
-        TimerDeferContextError::Store(OutcomeError::transient());
+        TimerDeferContextError::Store(OutcomeError::Transient);
     assert!(
         matches!(store_transient.classify_error(), ErrorCategory::Transient),
         "Store(Transient) should classify as Transient"
     );
 
     let store_permanent: TimerDeferContextError<Infallible, OutcomeError> =
-        TimerDeferContextError::Store(OutcomeError::permanent());
+        TimerDeferContextError::Store(OutcomeError::Permanent);
     assert!(
         matches!(store_permanent.classify_error(), ErrorCategory::Permanent),
         "Store(Permanent) should classify as Permanent"

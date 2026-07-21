@@ -10,7 +10,9 @@
 //!   reloaded from Kafka
 //! - Original time preservation: Handler receives `original_time`, not retry
 //!   time
-//! - Span restoration: Each retry creates a fresh span linked to stored context
+//! - Span restoration: Each retry carries a live reload span built from the
+//!   stored scheduling context per the configured relation (reload time is
+//!   dispatch time on the defer path)
 
 use crate::timers::datetime::CompactDateTime;
 

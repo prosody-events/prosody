@@ -34,6 +34,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::scheduler::dispatch::{DispatchError, Dispatcher};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
 use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
@@ -43,6 +44,8 @@ use crate::{Partition, Topic, TopicPartitionKey};
 
 mod decay;
 mod dispatch;
+#[cfg(test)]
+mod tests;
 
 /// Configuration for the scheduler middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -308,7 +311,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
         let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
@@ -326,7 +329,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let tp_key = TopicPartitionKey::new(self.topic, self.partition, trigger.key.clone());
         let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
@@ -349,7 +352,7 @@ where
     ///   invariant, neither apply hook may fire on the inner in this case.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_commit(context, Ok(output)).await,
@@ -373,7 +376,7 @@ where
     /// this layer — the inner did no work, so no apply hook is fired on it.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         match result {
             Ok(output) => self.handler.after_abort(context, Ok(output)).await,
@@ -390,5 +393,22 @@ where
 
     async fn shutdown(self) {
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for SchedulerHandler<T>
+where
+    T: SettlementHandler,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: delegate.
+            Ok(output) => T::settlement(Ok(output)),
+            Err(SchedulerError::Handler(error)) => T::settlement(Err(error)),
+            // Pre-inner admission rejection: the inner never ran. (Belt and
+            // braces — the variant classifies Terminal today, which settle's
+            // Terminal-first check abandons before consulting this.)
+            Err(SchedulerError::PermitAcquisition(_)) => Settlement::Bypassed,
+        }
     }
 }

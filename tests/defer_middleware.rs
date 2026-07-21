@@ -16,8 +16,12 @@
 //!
 //! # Running Tests
 //!
-//! These tests use real Kafka and Cassandra instances. Each test uses unique
-//! resources (topics, keyspaces) so they can run in parallel:
+//! These tests use real Kafka and Cassandra instances. Each test creates one
+//! environment (topic, consumer group, store handles) per test process and
+//! repeats its scenario `INTEGRATION_TESTS` times against it. Iterations
+//! isolate through unique keys and payload values: per-key ordering and
+//! key-scoped defer queues make each iteration an independent domain, so no
+//! per-iteration topics or consumer groups are needed.
 //!
 //! ```bash
 //! cargo test --test defer_middleware
@@ -25,11 +29,12 @@
 
 #![recursion_limit = "256"]
 
-use color_eyre::eyre::{Result, ensure, eyre};
+use color_eyre::eyre::{Result, ensure};
+use prosody::JsonCodec;
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::defer::message::loader::KafkaLoader;
+use prosody::consumer::middleware::deduplication::DEFAULT_IDEMPOTENCE_VERSION;
 use prosody::consumer::middleware::defer::message::store::CassandraMessageDeferStoreProvider;
 use prosody::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use prosody::consumer::middleware::defer::segment::CassandraSegmentStore;
@@ -38,41 +43,23 @@ use prosody::consumer::middleware::defer::{
 };
 use prosody::consumer::middleware::log::LogMiddleware;
 use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
-use prosody::consumer::{ConsumerConfiguration, DemandType, Keyed, ProsodyConsumer};
+use prosody::consumer::{DemandType, Keyed};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::heartbeat::HeartbeatRegistry;
-use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::loader::KafkaLoader;
 use prosody::telemetry::Telemetry;
 use prosody::timers::Trigger;
 use prosody::tracing::init_test_logging;
-use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
-};
-use quickcheck::{QuickCheck, TestResult};
 use serde_json::{Value, json};
-use std::env;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::timeout;
 use tracing::info;
-use uuid::Uuid;
 
 mod common;
-use common::TEST_RUNTIME;
-
-/// Get the number of times to run each integration test from environment
-/// variable.
-///
-/// Defaults to 1 if `INTEGRATION_TESTS` is not set or invalid.
-fn integration_test_count() -> u64 {
-    env::var("INTEGRATION_TESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1)
-}
+use common::{ConsumerEnv, TEST_RUNTIME};
 
 /// Test error that can be classified.
 #[derive(Debug, Error, Clone)]
@@ -103,11 +90,25 @@ enum HandlerEvent {
     MessageFailedTransient { key: String, value: i64 },
 }
 
-/// Test handler that can be configured to fail specific messages.
+impl HandlerEvent {
+    /// The key the event's message was addressed to.
+    fn key(&self) -> &str {
+        let (Self::MessageSuccess { key, .. } | Self::MessageFailedTransient { key, .. }) = self;
+        key
+    }
+}
+
+/// Test handler that fails configured values a bounded number of times.
 #[derive(Clone)]
 struct DeferTestHandler {
-    /// Messages that should fail with transient errors (will be deferred).
-    fail_values: Arc<parking_lot::Mutex<Vec<i64>>>,
+    /// Remaining transient failures per value: each failing invocation
+    /// consumes one, and at zero the value succeeds. A counted budget —
+    /// rather than a flag the test body clears mid-flight — keeps the
+    /// handler's event stream deterministic: it can never race the defer
+    /// middleware's retry timers, so tests assert on event content and
+    /// order, never on timing. Iterations use disjoint values, so budgets
+    /// are configured up front per iteration and never cleared.
+    fail_budget: Arc<parking_lot::Mutex<HashMap<i64, u64>>>,
 
     /// Channel to report events.
     event_tx: Sender<HandlerEvent>,
@@ -125,13 +126,19 @@ impl FallibleHandler for DeferTestHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = message.key().to_string();
         let payload = message.payload();
 
         if let Some(value) = payload.get("value").and_then(Value::as_i64) {
-            let should_fail = self.fail_values.lock().contains(&value);
+            let should_fail = match self.fail_budget.lock().get_mut(&value) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    true
+                }
+                _ => false,
+            };
 
             if should_fail {
                 let _ = self
@@ -166,7 +173,7 @@ impl FallibleHandler for DeferTestHandler {
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // DeferRetry timers are consumed by the defer middleware: it loads
         // the deferred message and re-dispatches it through `on_message`,
@@ -180,12 +187,13 @@ impl FallibleHandler for DeferTestHandler {
     async fn shutdown(self) {}
 }
 
-/// Handler that wraps [`DeferTestHandler`] to return permanent errors for
-/// specific values.
+/// Handler that wraps [`DeferTestHandler`] to return permanent errors for a
+/// specific value. With `permanent_value: None` no error is injected and it
+/// behaves exactly like the inner handler.
 #[derive(Clone)]
 struct PermanentErrorHandler {
     inner: DeferTestHandler,
-    permanent_value: i64,
+    permanent_value: Option<i64>,
 }
 
 impl FallibleHandler for PermanentErrorHandler {
@@ -200,10 +208,12 @@ impl FallibleHandler for PermanentErrorHandler {
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let payload = message.payload();
-        if payload.get("value").and_then(Value::as_i64) == Some(self.permanent_value) {
+        if self.permanent_value.is_some()
+            && payload.get("value").and_then(Value::as_i64) == self.permanent_value
+        {
             return Err(TestError::Permanent);
         }
         self.inner.on_message(context, message, demand_type).await
@@ -216,7 +226,7 @@ impl FallibleHandler for PermanentErrorHandler {
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.inner.on_timer(context, timer, demand_type).await
     }
@@ -226,11 +236,13 @@ impl FallibleHandler for PermanentErrorHandler {
     }
 }
 
-/// Test environment that encapsulates setup and provides helper methods.
+/// Test environment wrapping [`ConsumerEnv`] with the defer middleware stack
+/// and the handler's event channel.
+///
+/// Created once per test process and shared by all iterations; each iteration
+/// uses keys and values no other iteration touches.
 struct DeferTestEnvironment {
-    consumer: ProsodyConsumer<JsonCodec>,
-    producer: ProsodyProducer<JsonCodec>,
-    topic: Topic,
+    env: ConsumerEnv,
     event_rx: Receiver<HandlerEvent>,
     handler: DeferTestHandler,
 }
@@ -238,416 +250,287 @@ struct DeferTestEnvironment {
 impl DeferTestEnvironment {
     /// Create a new test environment with defer middleware.
     async fn new() -> Result<Self> {
-        let topic = Self::setup_test_topic(1).await?;
-
-        let (event_tx, event_rx) = channel(100);
-        let handler = DeferTestHandler {
-            fail_values: Arc::new(parking_lot::Mutex::new(vec![])),
-            event_tx,
-        };
-
-        let defer_config = DeferConfiguration::builder()
-            .base(Duration::from_secs(1))
-            .failure_threshold(1.0_f64) // Never disable deferral in tests
-            .build()?;
-
-        let consumer_config = ConsumerConfiguration::builder()
-            .group_id(format!("defer-test-{}", Uuid::new_v4()))
-            .bootstrap_servers(vec!["localhost:9094".to_owned()])
-            .subscribed_topics(&[topic.to_string()])
-            .probe_port(None) // Disable probe server to allow parallel test execution
-            .build()?;
-
-        // Use unique keyspace per test to avoid interference
-        let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
-        let cassandra_config = CassandraConfiguration::builder()
-            .nodes(vec!["localhost:9042".to_owned()])
-            .keyspace(keyspace.clone())
-            .build()?;
-
-        let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
-        let message_queries =
-            Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
-        let message_provider = CassandraMessageDeferStoreProvider::new(
-            cassandra_store.clone(),
-            message_queries,
-            segment_store,
-        );
-
-        let telemetry = Telemetry::new();
-        let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_mins(1));
-        let failure_tracker = FailureTracker::new(
-            defer_config.failure_window,
-            defer_config.failure_threshold,
-            &telemetry,
-            &heartbeats,
-        );
-        let loader =
-            KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
-        let defer_middleware = MessageDeferMiddleware::new(
-            defer_config,
-            &consumer_config,
-            message_provider,
-            failure_tracker,
-            loader,
-            &telemetry,
-        )?;
-
-        let handler_provider = defer_middleware
-            .layer(LogMiddleware::new())
-            .into_provider(handler.clone());
-
-        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
-            &consumer_config,
-            &common::create_cassandra_trigger_store_config(),
-            handler_provider,
-            Telemetry::new(),
-        )
-        .await?;
-
-        let producer = ProsodyProducer::<JsonCodec>::new(
-            &ProducerConfiguration::builder()
-                .bootstrap_servers(vec!["localhost:9094".to_owned()])
-                .source_system("defer-integration-test".to_owned())
-                .build()?,
-            Telemetry::new().sender(),
-        )?;
-
-        Ok(Self {
-            consumer,
-            producer,
-            topic,
-            event_rx,
-            handler,
-        })
+        Self::build(None).await
     }
 
-    /// Create test environment with permanent error handler.
+    /// Create test environment that fails `permanent_value` permanently.
     async fn new_with_permanent_error_handler(permanent_value: i64) -> Result<Self> {
-        let topic = Self::setup_test_topic(1).await?;
+        Self::build(Some(permanent_value)).await
+    }
 
+    async fn build(permanent_value: Option<i64>) -> Result<Self> {
         let (event_tx, event_rx) = channel(100);
         let handler = DeferTestHandler {
-            fail_values: Arc::new(parking_lot::Mutex::new(vec![])),
+            fail_budget: Arc::default(),
             event_tx,
         };
-
-        let permanent_handler = PermanentErrorHandler {
+        let leaf = PermanentErrorHandler {
             inner: handler.clone(),
             permanent_value,
         };
 
-        let defer_config = DeferConfiguration::builder()
-            .base(Duration::from_secs(1))
-            .failure_threshold(1.0_f64)
-            .build()?;
+        let env = ConsumerEnv::new("defer-test", async move |consumer_config| {
+            let defer_config = DeferConfiguration::builder()
+                .base(Duration::from_secs(1))
+                .failure_threshold(1.0_f64) // Never disable deferral in tests
+                .build()?;
 
-        let consumer_config = ConsumerConfiguration::builder()
-            .group_id(format!("defer-test-{}", Uuid::new_v4()))
-            .bootstrap_servers(vec!["localhost:9094".to_owned()])
-            .subscribed_topics(&[topic.to_string()])
-            .probe_port(None) // Disable probe server to allow parallel test execution
-            .build()?;
+            // Share the migrated keyspace like every other integration test;
+            // isolation comes from the per-test topic and consumer group, so
+            // no per-test keyspace is created (or left to leak).
+            let keyspace = common::TEST_KEYSPACE.to_owned();
+            let cassandra_config = CassandraConfiguration::builder()
+                .nodes(vec!["localhost:9042".to_owned()])
+                .keyspace(keyspace.clone())
+                .build()?;
 
-        // Use unique keyspace per test
-        let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
-        let cassandra_config = CassandraConfiguration::builder()
-            .nodes(vec!["localhost:9042".to_owned()])
-            .keyspace(keyspace.clone())
-            .build()?;
+            let cassandra_store = CassandraStore::new(&cassandra_config).await?;
+            let segment_store =
+                CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
+            let message_queries =
+                Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
+            let message_provider = CassandraMessageDeferStoreProvider::new(
+                cassandra_store.clone(),
+                message_queries,
+                segment_store,
+            );
 
-        let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
-        let message_queries =
-            Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
-        let message_provider = CassandraMessageDeferStoreProvider::new(
-            cassandra_store.clone(),
-            message_queries,
-            segment_store,
-        );
+            let telemetry = Telemetry::new();
+            let heartbeats =
+                HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_mins(1));
+            let failure_tracker = FailureTracker::new(
+                defer_config.failure_window,
+                defer_config.failure_threshold,
+                &telemetry,
+                &heartbeats,
+            );
+            let loader = KafkaLoader::<JsonCodec>::for_consumer(consumer_config, &heartbeats)?;
+            let defer_middleware = MessageDeferMiddleware::new(
+                defer_config,
+                consumer_config,
+                message_provider,
+                failure_tracker,
+                loader,
+                DEFAULT_IDEMPOTENCE_VERSION,
+                &telemetry,
+            )?;
 
-        let telemetry = Telemetry::new();
-        let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_mins(1));
-        let failure_tracker = FailureTracker::new(
-            defer_config.failure_window,
-            defer_config.failure_threshold,
-            &telemetry,
-            &heartbeats,
-        );
-        let loader =
-            KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
-        let defer_middleware = MessageDeferMiddleware::new(
-            defer_config,
-            &consumer_config,
-            message_provider,
-            failure_tracker,
-            loader,
-            &telemetry,
-        )?;
-
-        let handler_provider = defer_middleware
-            .layer(LogMiddleware::new())
-            .into_provider(permanent_handler);
-
-        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
-            &consumer_config,
-            &common::create_cassandra_trigger_store_config(),
-            handler_provider,
-            Telemetry::new(),
-        )
+            Ok(defer_middleware
+                .layer(LogMiddleware::new())
+                .into_provider(leaf))
+        })
         .await?;
 
-        let producer = ProsodyProducer::<JsonCodec>::new(
-            &ProducerConfiguration::builder()
-                .bootstrap_servers(vec!["localhost:9094".to_owned()])
-                .source_system("defer-integration-test".to_owned())
-                .build()?,
-            Telemetry::new().sender(),
-        )?;
-
         Ok(Self {
-            consumer,
-            producer,
-            topic,
+            env,
             event_rx,
             handler,
         })
     }
 
-    /// Set up a unique test topic and wait for it to be ready.
-    async fn setup_test_topic(partition_count: u16) -> Result<Topic> {
-        let topic_name = format!("defer-test-{}", Uuid::new_v4());
-        let topic = Topic::from(topic_name.as_str());
-
-        let admin_config = AdminConfiguration {
-            bootstrap_servers: vec!["localhost:9094".to_owned()],
-        };
-
-        let client = ProsodyAdminClient::new(&admin_config)?;
-
-        let topic_config = TopicConfiguration::builder()
-            .name(topic.to_string())
-            .partition_count(partition_count)
-            .replication_factor(1_u16)
-            .build()?;
-
-        client.create_topic(&topic_config).await?;
-
-        Ok(topic)
-    }
-
     /// Send a message to the test topic.
     async fn send_message(&self, key: &str, payload: Value) -> Result<()> {
-        self.producer.send([], self.topic, key, payload).await?;
-        Ok(())
+        self.env.send_message(key, payload).await
     }
 
-    /// Wait for a handler event with timeout.
-    async fn expect_event(&mut self, timeout_secs: u64) -> Result<HandlerEvent> {
-        timeout(
-            Duration::from_secs(timeout_secs.max(30)),
-            self.event_rx.recv(),
-        )
-        .await
-        .map_err(|_| {
-            eyre!(
-                "Timeout waiting for handler event after {} seconds",
-                timeout_secs
+    /// Wait for the next handler event for `key`, skipping events addressed
+    /// to other keys (they belong to other iterations' key domains).
+    async fn expect_event(&mut self, key: &str, timeout_secs: u64) -> Result<HandlerEvent> {
+        loop {
+            let event = common::expect_event(
+                &mut self.event_rx,
+                Duration::from_secs(timeout_secs.max(30)),
             )
-        })?
-        .ok_or_else(|| eyre!("Event channel closed unexpectedly"))
+            .await?;
+            if event.key() == key {
+                return Ok(event);
+            }
+            info!("ignoring event for another iteration's key: {event:?}");
+        }
     }
 
     /// Verify that no event occurs within the given timeout.
     async fn expect_no_event(&mut self, timeout_millis: u64) -> Result<()> {
-        let event_result =
-            timeout(Duration::from_millis(timeout_millis), self.event_rx.recv()).await;
-        match event_result {
-            Err(_) => Ok(()),
-            Ok(Some(event)) => color_eyre::eyre::bail!(
-                "Expected no event within {timeout_millis}ms but received: {event:?}"
-            ),
-            Ok(None) => color_eyre::eyre::bail!("Event channel closed unexpectedly"),
-        }
+        common::expect_no_event(&mut self.event_rx, Duration::from_millis(timeout_millis)).await
     }
 
-    /// Configure which values should fail with transient errors.
-    fn set_failing_values(&self, values: Vec<i64>) {
-        *self.handler.fail_values.lock() = values;
+    /// Budget `times` transient failures for `value`; once consumed, further
+    /// invocations succeed. Configured up front (never mid-flight), so the
+    /// event stream cannot race the defer middleware's retry timers.
+    fn fail_value_times(&self, value: i64, times: u64) {
+        self.handler.fail_budget.lock().insert(value, times);
     }
 
-    /// Clear all failing values (all messages will succeed).
-    fn clear_failing_values(&self) {
-        self.handler.fail_values.lock().clear();
-    }
-
-    /// Shut down the consumer.
+    /// Shut down the consumer and delete the test topic.
     async fn shutdown(self) {
-        self.consumer.shutdown().await;
+        self.env.shutdown().await;
     }
+}
+
+/// Runs `scenario` against one shared environment for `INTEGRATION_TESTS`
+/// iterations, shutting the consumer down before propagating any failure
+/// (dropping a live consumer hangs rdkafka threads).
+fn run_iterations<F>(env_result: Result<DeferTestEnvironment>, scenario: &F) -> Result<()>
+where
+    F: AsyncFn(&mut DeferTestEnvironment, u64) -> Result<()>,
+{
+    TEST_RUNTIME.block_on(async {
+        let mut env = env_result?;
+        let mut result = Ok(());
+        for iteration in 0..common::integration_test_count() {
+            result = scenario(&mut env, iteration).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        env.shutdown().await;
+        result
+    })
 }
 
 /// Test: First failure defers message, timer fires, retry succeeds.
 #[test]
-fn test_first_failure_defers_and_retries() {
+fn test_first_failure_defers_and_retries() -> Result<()> {
     init_test_logging();
 
-    QuickCheck::new()
-        .tests(integration_test_count())
-        .quickcheck(prop_first_failure_defers_and_retries as fn(()) -> TestResult);
+    let env = TEST_RUNTIME.block_on(DeferTestEnvironment::new());
+    run_iterations(env, &run_first_failure_defers_and_retries)
 }
 
-fn prop_first_failure_defers_and_retries(_: ()) -> TestResult {
-    match TEST_RUNTIME.block_on(run_first_failure_defers_and_retries()) {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(e.to_string()),
-    }
-}
+async fn run_first_failure_defers_and_retries(
+    env: &mut DeferTestEnvironment,
+    iteration: u64,
+) -> Result<()> {
+    let key = format!("test-key-{iteration}");
+    let value = i64::try_from(iteration)?;
 
-async fn run_first_failure_defers_and_retries() -> Result<()> {
-    let mut env = DeferTestEnvironment::new().await?;
+    // Budget exactly one failure: the first attempt fails and defers, and
+    // the immediate retry (retry_count=0) succeeds. The fixed budget makes
+    // the event stream deterministic regardless of when the retry fires.
+    env.fail_value_times(value, 1);
 
-    // Configure handler to fail value=1 initially
-    env.set_failing_values(vec![1]);
-
-    // Send message that will fail
-    env.send_message("test-key", json!({"value": 1_i64}))
-        .await?;
+    env.send_message(&key, json!({ "value": value })).await?;
 
     // Should receive transient failure event
-    let event = env.expect_event(5).await?;
+    let event = env.expect_event(&key, 5).await?;
     ensure!(
-        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
-        "Expected transient failure for value=1"
+        matches!(event, HandlerEvent::MessageFailedTransient { key: ref event_key, value: event_value }
+            if *event_key == key && event_value == value),
+        "Expected transient failure for value={value}, got: {event:?}"
     );
 
-    // Clear failure condition so retry succeeds
-    env.clear_failing_values();
-
-    // Defer middleware handles timer internally and retries via on_message
-    // (on_timer is NOT called for DeferRetry timers)
-    // Should receive success event after defer delay (~1 second)
-    let event = env.expect_event(10).await?;
+    // Defer middleware handles the timer internally and retries via
+    // on_message (on_timer is NOT called for DeferRetry timers).
+    let event = env.expect_event(&key, 10).await?;
     ensure!(
-        matches!(event, HandlerEvent::MessageSuccess { ref key, value: 1 } if key == "test-key"),
-        "Expected retry to succeed after defer delay"
+        matches!(event, HandlerEvent::MessageSuccess { key: ref event_key, value: event_value }
+            if *event_key == key && event_value == value),
+        "Expected retry to succeed, got: {event:?}"
     );
-
-    env.shutdown().await;
 
     Ok(())
 }
 
 /// Test: Multiple messages for same key are queued and processed in order.
 #[test]
-fn test_multiple_messages_queued_in_order() {
+fn test_multiple_messages_queued_in_order() -> Result<()> {
     init_test_logging();
 
-    QuickCheck::new()
-        .tests(integration_test_count())
-        .quickcheck(prop_multiple_messages_queued_in_order as fn(()) -> TestResult);
+    let env = TEST_RUNTIME.block_on(DeferTestEnvironment::new());
+    run_iterations(env, &run_multiple_messages_queued_in_order)
 }
 
-fn prop_multiple_messages_queued_in_order(_: ()) -> TestResult {
-    match TEST_RUNTIME.block_on(run_multiple_messages_queued_in_order()) {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(e.to_string()),
-    }
-}
+async fn run_multiple_messages_queued_in_order(
+    env: &mut DeferTestEnvironment,
+    iteration: u64,
+) -> Result<()> {
+    let key = format!("test-key-{iteration}");
+    let base = i64::try_from(iteration)? * 3;
+    let values = [base + 1, base + 2, base + 3];
 
-async fn run_multiple_messages_queued_in_order() -> Result<()> {
-    let mut env = DeferTestEnvironment::new().await?;
-
-    // Configure handler to fail value=1 (will be deferred)
-    env.set_failing_values(vec![1]);
+    // Budget exactly two failures for msg1: the first attempt and its
+    // immediate retry (retry_count=0) fail, the second failure re-defers
+    // with retry_count=1 (base backoff, ~1s), and that timer-driven retry
+    // succeeds. The fixed budget makes the whole event stream a
+    // deterministic sequence — no mid-flight reconfiguration racing the
+    // backoff timer, and no wall-clock assertion anywhere.
+    env.fail_value_times(values[0], 2);
 
     // Send all 3 messages quickly (before timer fires)
-    env.send_message("test-key", json!({"value": 1_i64}))
-        .await?;
-    env.send_message("test-key", json!({"value": 2_i64}))
-        .await?;
-    env.send_message("test-key", json!({"value": 3_i64}))
-        .await?;
+    for value in values {
+        env.send_message(&key, json!({ "value": value })).await?;
+    }
 
-    // msg1 fails on the first attempt (retry_count=0 → immediate retry).
-    let event = env.expect_event(5).await?;
-    ensure!(
-        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
-        "Expected first message to fail with transient error, got: {event:?}"
-    );
-
-    // The immediate retry (retry_count=0) fires right away and fails again,
-    // re-deferring with retry_count=1 (base delay = 1s). Drain this second
-    // failure so the next retry is delayed and msgs 2 and 3 remain queued.
-    let event = env.expect_event(5).await?;
-    ensure!(
-        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
-        "Expected second transient failure for value=1, got: {event:?}"
-    );
-
-    // Now msg1 is waiting for its retry_count=1 backoff (~1s). msgs 2 and 3
-    // must be queued and silent during this window.
-    env.expect_no_event(500).await?;
-
-    // Clear failure condition so the next retry succeeds.
-    env.clear_failing_values();
-
-    // Defer middleware handles timer internally and retries via on_message
-    // Wait for all 3 messages to be processed in order after defer delay
-    for expected_value in 1..=3 {
-        let event = env.expect_event(10).await?;
+    // msg1 fails its first attempt, then its immediate retry.
+    for attempt in 1_u32..=2 {
+        let event = env.expect_event(&key, 5).await?;
         ensure!(
-            matches!(event, HandlerEvent::MessageSuccess { ref key, value }
-                if key == "test-key" && value == expected_value),
+            matches!(event, HandlerEvent::MessageFailedTransient { key: ref event_key, value }
+                if *event_key == key && value == values[0]),
+            "Expected transient failure {attempt} for value={}, got: {event:?}",
+            values[0]
+        );
+    }
+
+    // msgs 2 and 3 must stay queued behind the deferred msg1. The handler
+    // emits an event for EVERY invocation, so out-of-order processing would
+    // surface here as a Success(2)/Success(3) arriving before Success(1) —
+    // the ordered drain proves the queueing invariant by content, with the
+    // deadline only as a hang-guard.
+    for expected_value in values {
+        let event = env.expect_event(&key, 10).await?;
+        ensure!(
+            matches!(event, HandlerEvent::MessageSuccess { key: ref event_key, value }
+                if *event_key == key && value == expected_value),
             "Expected MessageSuccess {{ value: {expected_value} }}, got: {event:?}"
         );
     }
 
-    env.shutdown().await;
-
     Ok(())
 }
 
+/// The payload value the permanent-error test's handler rejects permanently.
+const PERMANENT_VALUE: i64 = 999;
+
 /// Test: Permanent errors are NOT deferred (they are irrecoverable).
 #[test]
-fn test_permanent_errors_not_deferred() {
+fn test_permanent_errors_not_deferred() -> Result<()> {
     init_test_logging();
 
-    QuickCheck::new()
-        .tests(integration_test_count())
-        .quickcheck(prop_permanent_errors_not_deferred as fn(()) -> TestResult);
+    let env = TEST_RUNTIME.block_on(DeferTestEnvironment::new_with_permanent_error_handler(
+        PERMANENT_VALUE,
+    ));
+    run_iterations(env, &run_permanent_errors_not_deferred)
 }
 
-fn prop_permanent_errors_not_deferred(_: ()) -> TestResult {
-    match TEST_RUNTIME.block_on(run_permanent_errors_not_deferred()) {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(e.to_string()),
-    }
-}
-
-async fn run_permanent_errors_not_deferred() -> Result<()> {
-    let mut env = DeferTestEnvironment::new_with_permanent_error_handler(999).await?;
+async fn run_permanent_errors_not_deferred(
+    env: &mut DeferTestEnvironment,
+    iteration: u64,
+) -> Result<()> {
+    let permanent_key = format!("test-key-{iteration}-permanent");
+    let ok_key = format!("test-key-{iteration}-ok");
+    // Distinct from PERMANENT_VALUE for every iteration.
+    let ok_value = 1000 + i64::try_from(iteration)?;
 
     // Send a message that fails with permanent error (LogMiddleware logs it)
-    env.send_message("test-key-1", json!({"value": 999_i64}))
+    env.send_message(&permanent_key, json!({ "value": PERMANENT_VALUE }))
         .await?;
 
     // Send a successful message with different key to verify consumer continues
-    env.send_message("test-key-2", json!({"value": 1_i64}))
+    env.send_message(&ok_key, json!({ "value": ok_value }))
         .await?;
 
-    // Should immediately get success for key-2 (not deferred)
-    let event = env.expect_event(5).await?;
+    // Should immediately get success for the ok key (not deferred)
+    let event = env.expect_event(&ok_key, 5).await?;
     ensure!(
-        matches!(event, HandlerEvent::MessageSuccess { ref key, value: 1 } if key == "test-key-2"),
-        "Expected key-2 to succeed immediately (permanent errors don't defer)"
+        matches!(event, HandlerEvent::MessageSuccess { key: ref event_key, value }
+            if *event_key == ok_key && value == ok_value),
+        "Expected {ok_key} to succeed immediately (permanent errors don't defer)"
     );
 
-    // No timer should fire for key-1 (permanent errors aren't retried)
+    // No timer should fire for the permanent key (permanent errors aren't
+    // retried) — and no legal event source of any kind exists in this window.
     env.expect_no_event(2000).await?;
-
-    env.shutdown().await;
 
     Ok(())
 }

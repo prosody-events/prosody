@@ -24,9 +24,9 @@ use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
-use crate::consumer::middleware::defer::message::loader::{MemoryLoader, MessageLoader};
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
+use crate::loader::{MemoryLoader, MessageLoader};
 use crate::telemetry::Telemetry;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
@@ -115,10 +115,6 @@ pub struct TestHarness {
 
 impl TestHarness {
     /// Creates a new test harness with the given key count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the defer handler construction fails.
     pub fn new(key_count: usize) -> color_eyre::Result<Self> {
         let keys: Vec<Key> = (0..key_count)
             .map(|i| Arc::from(format!("key-{i}")))
@@ -161,6 +157,7 @@ impl TestHarness {
             partition,
             sender,
             source: Arc::from("test"),
+            dedup_version: Arc::from("1"),
         };
 
         Ok(Self {

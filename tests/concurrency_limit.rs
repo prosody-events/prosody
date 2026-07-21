@@ -40,13 +40,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::consumer::KeyedStateConfiguration;
 use prosody::consumer::Uncommitted;
 use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
 use prosody::tracing::init_test_logging;
 use prosody::{
     JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::ConsumerConfiguration,
     consumer::ProsodyConsumer,
     consumer::message::UncommittedMessage,
@@ -58,7 +58,6 @@ use prosody::{
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
-use uuid::Uuid;
 
 mod common;
 
@@ -92,7 +91,7 @@ impl EventHandler for ConcurrencyTestHandler {
         message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Increment the current processing count and update maximum observed
         // concurrency
@@ -120,7 +119,7 @@ impl EventHandler for ConcurrencyTestHandler {
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
     }
@@ -176,19 +175,8 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     init_test_logging();
 
     // Create a topic with 3 partitions
-    let partitions = 3_u16;
-    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let (topic, admin_client) = common::create_topic_with_partitions(3).await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-    admin_client
-        .create_topic(
-            &TopicConfiguration::builder()
-                .name(topic.to_string())
-                .partition_count(partitions)
-                .replication_factor(1_u16)
-                .build()?,
-        )
-        .await?;
 
     // Configure test parameters
     let global_limit = 3;
@@ -220,6 +208,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
+        KeyedStateConfiguration::default(),
         CloneProvider::new(handler.clone()),
         Telemetry::new(),
     )

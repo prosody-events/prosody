@@ -20,7 +20,7 @@ pub mod common;
 pub mod contention;
 /// Tests for operations spanning multiple slabs.
 pub mod cross_slab;
-/// Property-based tests for V2 high-level dual-index operations.
+/// Property-based tests for the high-level dual-index trigger operations.
 pub mod prop_high_level;
 /// Property-based tests for key trigger table operations.
 pub mod prop_key_triggers;
@@ -36,8 +36,6 @@ pub mod prop_slab_triggers;
 pub mod sequential_interleavings;
 /// Tests for slab-related functionality in the trigger store.
 pub mod slabs;
-/// Tests verifying trigger consistency across operations.
-pub mod trigger_consistency;
 /// Tests for basic trigger add/remove/clear operations.
 pub mod trigger_operations;
 
@@ -47,11 +45,18 @@ pub type TestStoreResult = Result<(), String>;
 // Implement Arbitrary trait for test types - these should only be available
 // during testing
 
+// The trait impl means "any legal value": the full `u32` domain, so the
+// duration overflow/saturation properties actually reach their `Err` and
+// saturating branches, `MIN` (0) included. Generators that mean "a plausible
+// timer parameter" draw their own bounded value instead (see
+// [`plausible_slab_size`]).
 impl Arbitrary for CompactDuration {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate durations between 1 second and 24 hours
-        let seconds = u32::arbitrary(g) % (24 * 60 * 60) + 1;
-        CompactDuration::new(seconds)
+        CompactDuration::new(u32::arbitrary(g))
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.seconds().shrink().map(CompactDuration::new))
     }
 }
 
@@ -67,11 +72,18 @@ impl Arbitrary for CompactDateTime {
     }
 }
 
+/// A plausible slab size, 1 second to 24 hours. `Segment::arbitrary` must not
+/// draw the full `CompactDuration` domain: `0` divides by zero in the slab
+/// math and `u32::MAX` degenerates every trace to a single slab.
+fn plausible_slab_size(g: &mut Gen) -> CompactDuration {
+    CompactDuration::new(u32::arbitrary(g) % (24 * 60 * 60) + 1)
+}
+
 impl Arbitrary for Segment {
     fn arbitrary(g: &mut Gen) -> Self {
         let id = Uuid::new_v4();
         let name = format!("segment-{}", u16::arbitrary(g));
-        let slab_size = CompactDuration::arbitrary(g);
+        let slab_size = plausible_slab_size(g);
 
         Segment {
             id,
@@ -133,11 +145,10 @@ impl Arbitrary for TriggerTestInput {
             let key = format!("key-{i}");
             for _ in 0..triggers_per_key {
                 let time = CompactDateTime::arbitrary(g);
-                triggers.push(Trigger::new(
+                triggers.push(Trigger::for_testing(
                     Key::from(key.clone()),
                     time,
                     TimerType::Application,
-                    tracing::Span::current(),
                 ));
             }
         }
@@ -209,15 +220,19 @@ impl Arbitrary for TriggerSequence {
 /// # Usage
 ///
 /// ```rust,ignore
-/// trigger_store_tests!(MyStore, MyStore::new(), 100);
+/// trigger_store_tests!(
+///     LowLevelStore, low_level_constructor,
+///     HighLevelStore, high_level_constructor,
+/// );
 /// ```
 ///
-/// # Arguments
-///
-/// * `$store_type` - The type implementing `TriggerStore`
-/// * `$store_constructor` - Async expression that creates a new instance of the
-///   store and returns `Result<$store_type, Error>`
-/// * `$test_count` - Number of property tests to run for each test function
+/// `$operations_type`/`$operations_constructor` build the store used for the
+/// low-level (single-table) suite; `$store_type`/`$store_constructor` build
+/// the store used for the high-level (dual-index) suite, typically
+/// `TableAdapter<$operations_type>`. Each constructor is an async
+/// `|slab_size| -> Result<_, Error>` expression. An optional trailing
+/// `$test_count` sets the number of property-test iterations per test
+/// function; omit it to use `QuickCheck`'s default.
 #[macro_export]
 macro_rules! trigger_store_tests {
     // Variant without test_count - uses QuickCheck's default
@@ -229,7 +244,7 @@ macro_rules! trigger_store_tests {
             use $crate::test_util::TEST_RUNTIME;
             use $crate::timers::store::tests;
 
-            trigger_store_tests!(@test_functions_default);
+            trigger_store_tests!(@test_functions);
             trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
         }
     };
@@ -256,111 +271,11 @@ macro_rules! trigger_store_tests {
         tracing::info_span!("test").entered()
     }};
 
-    // Test functions using QuickCheck's default
-    (@test_functions_default) => {
-        #[test]
-        fn test_get_slab_range() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_trigger_operations() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_trigger_operations
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_trigger_consistency() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_trigger_consistency
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_operation_sequences() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_operation_sequences
-                    as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_cross_slab_operations() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_key_contention() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_sequential_interleavings() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_sequential_interleavings
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_prop_segment_model_equivalence() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_prop_slab_metadata_model_equivalence() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_prop_slab_trigger_model_equivalence() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_prop_key_trigger_model_equivalence() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_prop_high_level_dual_index_consistency() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().quickcheck(
-                prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
-            );
-        }
-    };
-
-    // Test functions with explicit test count
-    (@test_functions, $test_count:expr) => {
+    // Test functions, generic over an optional `$test_count`: with no count,
+    // `QuickCheck::new()$(.tests($test_count))?` degrades to QuickCheck's
+    // default; `test_key_contention` halves the count (contention traces are
+    // the most expensive to run) when a count is supplied.
+    (@test_functions $(, $test_count:expr)?) => {
         // Removed test_segment_operations - redundant with prop_segment_model_equivalence
 
         // Removed test_slab_operations - uses non-public API (insert_slab, get_slabs)
@@ -368,7 +283,7 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_get_slab_range() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
@@ -376,17 +291,8 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_trigger_operations() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_trigger_operations
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_trigger_consistency() {
-            let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
-                prop_trigger_consistency
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
         }
@@ -394,7 +300,7 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_operation_sequences() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_operation_sequences
                     as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
             );
@@ -403,7 +309,7 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_cross_slab_operations() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
@@ -411,7 +317,7 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_key_contention() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count / 2).quickcheck(
+            QuickCheck::new()$(.tests($test_count / 2))?.quickcheck(
                 prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
@@ -419,14 +325,16 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_sequential_interleavings() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_sequential_interleavings
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
-        }#[test]
+        }
+
+        #[test]
         fn test_prop_segment_model_equivalence() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
             );
         }
@@ -434,7 +342,7 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_prop_slab_metadata_model_equivalence() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
             );
         }
@@ -442,7 +350,7 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_prop_slab_trigger_model_equivalence() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
             );
         }
@@ -450,16 +358,19 @@ macro_rules! trigger_store_tests {
         #[test]
         fn test_prop_key_trigger_model_equivalence() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
             );
-        }#[test]
+        }
+
+        #[test]
         fn test_prop_high_level_dual_index_consistency() {
             let _span = trigger_store_tests!(@init_test_tracing);
-            QuickCheck::new().tests($test_count).quickcheck(
+            QuickCheck::new()$(.tests($test_count))?.quickcheck(
                 prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
             );
-        }};
+        }
+    };
 
     // Property functions
     (@prop_functions, $operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr) => {
@@ -629,33 +540,6 @@ macro_rules! trigger_store_tests {
             };
 
             match runtime.block_on(tests::trigger_operations::test_trigger_operations(
-                &store, &input,
-            ).instrument(span)) {
-                Ok(()) => TestResult::passed(),
-                Err(e) => TestResult::error(e),
-            }
-        }
-
-        fn prop_trigger_consistency(input: tests::TriggerTestInput) -> TestResult {
-            use tracing::Instrument;
-
-            if input.triggers.is_empty() {
-                return TestResult::discard();
-            }
-
-            let runtime = &*TEST_RUNTIME;
-
-            // Capture the current span to propagate into async runtime
-            let span = tracing::Span::current();
-
-            // Create store instance with segment's slab_size
-            let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
-                Ok(s) => s,
-                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
-            };
-
-            match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
                 &store, &input,
             ).instrument(span)) {
                 Ok(()) => TestResult::passed(),

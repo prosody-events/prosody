@@ -35,15 +35,6 @@ pub struct LockGuard<'a> {
 
 impl<'a> LockManager<'a> {
     /// Creates a new migration lock manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `session` - The Cassandra session
-    /// * `keyspace` - The keyspace containing the locks table
-    ///
-    /// # Errors
-    ///
-    /// Returns [`super::MigrationError`] if statement preparation fails.
     pub async fn new(session: &'a Session, keyspace: &str) -> Result<Self, super::MigrationError> {
         let (acquire_lock, release_lock) = prepare_lock_statements(session, keyspace).await?;
 
@@ -68,21 +59,9 @@ impl<'a> LockManager<'a> {
     /// - **Self-healing**: TTL automatically releases abandoned locks
     /// - **Process-safe**: Includes hostname and PID for debugging
     ///
-    /// # Arguments
-    ///
-    /// * `lock_name` - The name/identifier of the lock to acquire
-    /// * `timeout` - Lock timeout duration (also used as TTL)
-    ///
-    /// # Returns
-    ///
-    /// A lock guard that requires explicit release.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Lock is already held by another process
-    /// - Database query fails due to network or cluster issues
-    /// - LWT result parsing fails
+    /// Returns an error, rather than blocking or retrying, when the lock is
+    /// already held by another process; also errors on a failed query or
+    /// unparseable LWT result.
     pub async fn acquire(
         &'a self,
         lock_name: &'a str,
@@ -149,10 +128,6 @@ impl LockGuard<'_> {
     /// This method consumes the guard and releases the lock. After calling
     /// this, the guard cannot be used again and will not trigger the drop
     /// warning.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`super::MigrationError`] if the database query fails.
     pub async fn release(mut self) -> Result<(), super::MigrationError> {
         if !self.released {
             debug!(

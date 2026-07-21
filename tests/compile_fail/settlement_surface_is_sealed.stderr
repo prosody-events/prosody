@@ -1,0 +1,29 @@
+error[E0277]: the trait bound `MyHandler: EventHandler` is not satisfied
+  --> tests/compile_fail/settlement_surface_is_sealed.rs:58:28
+   |
+58 |     requires_event_handler(MyHandler);
+   |     ---------------------- ^^^^^^^^^ unsatisfied trait bound
+   |     |
+   |     required by a bound introduced by this call
+   |
+help: the trait `prosody::consumer::middleware::settle::SettlementHandler` is not implemented for `MyHandler`
+  --> tests/compile_fail/settlement_surface_is_sealed.rs:19:1
+   |
+19 | struct MyHandler;
+   | ^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `prosody::consumer::middleware::settle::SettlementHandler`:
+             CancellationHandler<T>
+             DeduplicationHandler<T, S>
+             FailureTopicHandler<T, Enc>
+             LeafHandler<H>
+             LogHandler<T>
+             MessageDeferHandler<T, M, L, D>
+             MonopolizationHandler<T>
+             OptionHandler<E, D>
+           and $N others
+   = note: required for `MyHandler` to implement `EventHandler`
+note: required by a bound in `requires_event_handler`
+  --> tests/compile_fail/settlement_surface_is_sealed.rs:55:30
+   |
+55 | fn requires_event_handler<T: prosody::consumer::EventHandler>(_handler: T) {}
+   |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_event_handler`

@@ -8,21 +8,19 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::TestHandler;
+use crate::common::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    JsonCodec, Topic,
-    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    JsonCodec,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, ProsodyConsumer},
+    consumer::{ConsumerConfiguration, KeyedStateConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
-use uuid::Uuid;
 
 mod common;
 
@@ -40,47 +38,27 @@ async fn test_source_system_filtering() -> Result<()> {
     Ok(())
 }
 
-/// Runs a test scenario where messages are sent and their reception is
-/// verified.
-///
-/// # Arguments
-///
-/// * `source_system`: The source system identifier for the producer.
-/// * `group_id`: The consumer group identifier.
-/// * `expect_messages`: A boolean indicating whether the messages should be
-///   received.
-/// * `event_suffix`: A suffix to uniquely identify the event.
-/// * `timeout_duration`: The duration to wait for message receipt.
-///
-/// # Errors
-///
-/// This function returns an error if the test setup, execution, or verification
-/// fails.
-/// Per-event receive ceiling.
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-event hang-guard for a message that will arrive — sized generously so
+/// cluster slowness never trips it (correctness is in the assertions, not the
+/// wait). Distinct from `SILENCE_TIMEOUT`, the bounded window for the negative
+/// "no message arrives" check.
+const RECEIVE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Shorter window for confirming no messages arrive.
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Runs one filtering scenario end-to-end: creates a unique topic, produces
+/// two messages tagged with `source_system`, and verifies through a consumer
+/// in `group_id` that they are received (`expect_messages`) or filtered out.
+/// The consumer is shut down and the topic deleted on every path.
 async fn run_scenario(
     source_system: &'static str,
     group_id: &'static str,
     expect_messages: bool,
     event_suffix: &'static str,
 ) -> Result<()> {
-    // Create a unique Kafka topic for the test.
-    let topic_string = Uuid::new_v4().to_string();
-    let topic: Topic = topic_string.as_str().into();
+    // Create a unique single-partition Kafka topic for the test.
+    let (topic, admin_client) = common::create_single_partition_topic().await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
-    admin_client
-        .create_topic(
-            &TopicConfiguration::builder()
-                .name(topic.to_string())
-                .partition_count(1_u16)
-                .replication_factor(1_u16)
-                .build()?,
-        )
-        .await?;
 
     // Build producer and consumer configurations.
     let producer_config = ProducerConfiguration::builder()
@@ -100,48 +78,53 @@ async fn run_scenario(
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        CloneProvider::new(TestHandler { messages_tx: tx }),
+        KeyedStateConfiguration::default(),
+        CloneProvider::new(ChannelHandler::new(tx)),
         Telemetry::new(),
     )
     .await?;
     let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
-    // Send a test message and an end-of-stream marker.
-    let key = "test-key";
-    let event_id = format!("unique-event-{event_suffix}");
-    let payload = json!({ "id": event_id, "value": "test message" });
+    let outcome: Result<()> = async {
+        // Send a test message and an end-of-stream marker.
+        let key = "test-key";
+        let event_id = format!("unique-event-{event_suffix}");
+        let payload = json!({ "id": event_id, "value": "test message" });
 
-    producer.send([], topic, key, payload.clone()).await?;
-    producer.send([], topic, key, Value::Null).await?;
+        producer.send([], topic, key, payload.clone()).await?;
+        producer.send([], topic, key, Value::Null).await?;
 
-    // Check whether the messages are received or not, based on `expect_messages`.
-    if expect_messages {
-        // Ensure that the message is received.
-        let recv_result = timeout(RECEIVE_TIMEOUT, rx.recv()).await?;
-        let (recv_key, recv_payload) =
-            recv_result.ok_or_else(|| eyre!("Did not receive the regular message"))?;
+        // Check whether the messages are received or not, based on `expect_messages`.
+        if expect_messages {
+            // Ensure that the message is received.
+            let recv_result = timeout(RECEIVE_TIMEOUT, rx.recv()).await?;
+            let (recv_key, recv_payload) =
+                recv_result.ok_or_else(|| eyre!("Did not receive the regular message"))?;
 
-        ensure!(recv_key == key, "keys did not match");
-        ensure!(recv_payload == payload, "payloads did not match");
+            ensure!(recv_key == key, "keys did not match");
+            ensure!(recv_payload == payload, "payloads did not match");
 
-        // Verify the reception of the end-of-stream marker.
-        let end_mark_result = timeout(RECEIVE_TIMEOUT, rx.recv()).await?;
-        match end_mark_result {
-            Some((_k, Value::Null)) => {} // Expected outcome.
-            _ => return Err(eyre!("Did not receive expected end-of-stream marker")),
+            // Verify the reception of the end-of-stream marker.
+            let end_mark_result = timeout(RECEIVE_TIMEOUT, rx.recv()).await?;
+            match end_mark_result {
+                Some((_k, Value::Null)) => {} // Expected outcome.
+                _ => return Err(eyre!("Did not receive expected end-of-stream marker")),
+            }
+        } else {
+            // Validate that no message was received.
+            let recv = timeout(SILENCE_TIMEOUT, rx.recv()).await;
+            if let Ok(Some((k, v))) = recv {
+                return Err(eyre!("Unexpected message received: key: {k}, payload: {v}"));
+            }
         }
-    } else {
-        // Validate that no message was received.
-        let recv = timeout(SILENCE_TIMEOUT, rx.recv()).await;
-        if let Ok(Some((k, v))) = recv {
-            consumer.shutdown().await;
-            admin_client.delete_topic(&topic).await?;
-            return Err(eyre!("Unexpected message received: key: {k}, payload: {v}"));
-        }
+        Ok(())
     }
+    .await;
 
-    // Shutdown the consumer once complete and clean up the test topic.
+    // Shutdown the consumer and delete the topic on every path — an early
+    // return above would leak rdkafka threads that hang the test binary and
+    // orphan the topic.
     consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
-    Ok(())
+    outcome
 }

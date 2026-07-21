@@ -17,15 +17,18 @@
 
 use crate::Key;
 use crate::consumer::Keyed;
-use crate::consumer::event_context::{EventContext, TerminationSignals};
+use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
+use crate::consumer::middleware::RepinProof;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use futures::TryFutureExt;
 use std::future::Future;
 use thiserror::Error;
+use tracing::{Instrument, error, info_span};
 
 /// Context wrapper that unifies active and deferred timer operations.
 ///
@@ -119,6 +122,31 @@ where
     S: TimerDeferStore + Clone + Send + Sync,
 {
     type Error = TimerDeferContextError<C::Error, S::Error>;
+    type Payload = C::Payload;
+    // The keyed-state session rides the inner context; this wrapper only
+    // intercepts timer operations. The compiler enforces the forward — a
+    // wrapper without `state` does not build.
+    type State = C::State;
+
+    fn state<DESC>(
+        &self,
+        registered: Registered<DESC>,
+    ) -> Result<DESC::Handle<Self::State>, StateAccessError>
+    where
+        DESC: StateDescriptor,
+    {
+        self.inner.state(registered)
+    }
+
+    fn redispatch(&self, proof: RepinProof) -> Self {
+        // Forward the re-pin to the inner context (compiler-enforced, like
+        // `state`); the store/key are cheap clones this wrapper owns.
+        Self {
+            inner: self.inner.redispatch(proof),
+            store: self.store.clone(),
+            key: self.key.clone(),
+        }
+    }
 
     fn should_cancel(&self) -> bool {
         self.inner.should_cancel()
@@ -151,17 +179,30 @@ where
         }
 
         if is_deferred(&self.store, &self.key).await? {
-            // Append to defer store
-            let trigger = Trigger::new(
-                self.key.clone(),
-                time,
-                TimerType::Application,
-                tracing::Span::current(),
+            // Hand-built (not `#[instrument]` on this method): only the
+            // deferred append branch may mint the schedule span — the
+            // delegating branch gets one from the inner context's `schedule`.
+            // Statically an Application timer, so INFO is its level under
+            // the `TimerType::is_application` span-level invariant.
+            let span = info_span!(
+                "schedule",
+                key = %self.key,
+                timer.fire_time = %time.to_rfc3339(),
+                timer.type = ?TimerType::Application,
             );
+            let trigger =
+                Trigger::new(self.key.clone(), time, TimerType::Application, span.clone());
             self.store
                 .append_deferred_timer(&trigger)
+                .instrument(span.clone())
                 .await
-                .map_err(TimerDeferContextError::Store)
+                .map_err(|error| {
+                    // Parity with the instrumented branch's `err`: mark the
+                    // span before the error propagates, so a failed append is
+                    // visible on the trace.
+                    span.in_scope(|| error!(error = %error, "deferred timer append failed"));
+                    TimerDeferContextError::Store(error)
+                })
         } else {
             // Delegate to inner context
             self.inner
@@ -273,10 +314,6 @@ where
                 .await
                 .map_err(TimerDeferContextError::Context)
         }
-    }
-
-    fn invalidate(self) {
-        self.inner.invalidate();
     }
 
     fn scheduled(

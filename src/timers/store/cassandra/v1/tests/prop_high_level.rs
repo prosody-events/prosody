@@ -15,6 +15,7 @@ use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Type alias for V1 trigger tuple (key, time) - no `timer_type` in V1.
@@ -122,7 +123,7 @@ impl Arbitrary for V1HighLevelTestInput {
                         trigger: TriggerV1 {
                             key,
                             time,
-                            span: Span::current(),
+                            context: Span::current().context(),
                         },
                     }
                 }

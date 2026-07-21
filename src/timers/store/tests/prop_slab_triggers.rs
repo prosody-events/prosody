@@ -6,6 +6,7 @@
 //! Each store instance is scoped to exactly one segment. All slab trigger
 //! operations are routed through that segment's partition.
 
+use super::common::KEY_POOL;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -19,7 +20,6 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 use strum::VariantArray;
-use tracing::Span;
 
 /// Operations that can be performed on the slab trigger table.
 #[derive(Clone, Debug)]
@@ -72,9 +72,6 @@ impl Arbitrary for SlabTriggerTestInput {
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
         let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
-        // Use small pools for keys to increase collision probability
-        let key_pool = ["key-a", "key-b", "key-c"];
-
         // Generate 10-50 operations
         let op_count = (usize::arbitrary(g) % 40) + 10;
         let mut operations = Vec::with_capacity(op_count);
@@ -82,20 +79,17 @@ impl Arbitrary for SlabTriggerTestInput {
         for _ in 0..op_count {
             let slab_id = SlabId::from(u8::arbitrary(g) % 5); // 0-4
 
-            let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
-            let key = Key::from(key_pool[key_idx]);
+            let key_idx = usize::from(u8::arbitrary(g)) % KEY_POOL.len();
+            let key = Key::from(KEY_POOL[key_idx]);
 
-            let timer_type = match u8::arbitrary(g) % 3 {
-                0 => TimerType::Application,
-                1 => TimerType::DeferredMessage,
-                _ => TimerType::DeferredTimer,
-            };
+            let timer_type =
+                TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
 
             let time = CompactDateTime::arbitrary(g);
 
             let op = match u8::arbitrary(g) % 5 {
                 0 => {
-                    let trigger = Trigger::new(key, time, timer_type, Span::current());
+                    let trigger = Trigger::for_testing(key, time, timer_type);
                     SlabTriggerOperation::Insert { slab_id, trigger }
                 }
                 1 => SlabTriggerOperation::GetByType {
@@ -123,6 +117,26 @@ impl Arbitrary for SlabTriggerTestInput {
 
 /// Trigger tuple containing type, key, and time.
 type TriggerTuple = (TimerType, Key, CompactDateTime);
+
+/// Projects store triggers to comparable `(type, key, time)` tuples.
+fn to_tuples(triggers: &[Trigger]) -> Vec<TriggerTuple> {
+    triggers
+        .iter()
+        .map(|t| (t.timer_type, t.key.clone(), t.time))
+        .collect()
+}
+
+/// Asserts a trigger tuple sequence is strictly ascending.
+fn assert_ascending(tuples: &[TriggerTuple], context: &str) -> color_eyre::Result<()> {
+    for window in tuples.windows(2) {
+        if window[0] >= window[1] {
+            return Err(color_eyre::eyre::eyre!(
+                "{context}: ordering violation {window:?}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Reference model for slab trigger table behavior.
 ///
@@ -219,10 +233,7 @@ where
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetByType failed: {e:?}"))?;
 
-    let actual: Vec<TriggerTuple> = store_triggers
-        .iter()
-        .map(|t| (t.timer_type, t.key.clone(), t.time))
-        .collect();
+    let actual = to_tuples(&store_triggers);
 
     if expected != actual {
         return Err(color_eyre::eyre::eyre!(
@@ -243,16 +254,10 @@ where
         }
     }
 
-    // Verify ordering
-    for window in actual.windows(2) {
-        if window[0] >= window[1] {
-            return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} Ordering violation in slab {slab_id} type {timer_type:?}: {window:?}"
-            ));
-        }
-    }
-
-    Ok(())
+    assert_ascending(
+        &actual,
+        &format!("Op #{op_idx} slab {slab_id} type {timer_type:?}"),
+    )
 }
 
 /// Verifies all-types query against the model.
@@ -274,10 +279,7 @@ where
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetAllTypes failed: {e:?}"))?;
 
-    let actual_tuples: Vec<TriggerTuple> = actual
-        .iter()
-        .map(|t| (t.timer_type, t.key.clone(), t.time))
-        .collect();
+    let actual_tuples = to_tuples(&actual);
 
     if expected != actual_tuples {
         return Err(color_eyre::eyre::eyre!(
@@ -286,16 +288,10 @@ where
         ));
     }
 
-    // Verify ordering
-    for window in actual_tuples.windows(2) {
-        if window[0] >= window[1] {
-            return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} Ordering violation in all-types for slab {slab_id}: {window:?}"
-            ));
-        }
-    }
-
-    Ok(())
+    assert_ascending(
+        &actual_tuples,
+        &format!("Op #{op_idx} all-types slab {slab_id}"),
+    )
 }
 
 /// Verifies final state of all slabs in the model.
@@ -311,43 +307,12 @@ where
     for slab_id in model.all_slab_ids() {
         let slab = Slab::new(slab_id, slab_size);
 
-        // Verify get_slab_triggers for each timer type
+        // `usize::MAX` marks these as the post-trace final checks rather than a
+        // mid-trace operation index.
         for &timer_type in TimerType::VARIANTS {
             verify_slab_triggers_by_type(operations, model, &slab, timer_type, usize::MAX).await?;
         }
-
-        // Verify get_slab_triggers_all_types
-        let expected_all = model.get_all_types(slab_id);
-        let store_all: Vec<Trigger> = operations
-            .get_slab_triggers_all_types(slab)
-            .try_collect()
-            .await
-            .map_err(|e| {
-                color_eyre::eyre::eyre!("Final GetAllTypes failed for slab {slab_id}: {e:?}")
-            })?;
-
-        let store_all_tuples: Vec<TriggerTuple> = store_all
-            .iter()
-            .map(|t| (t.timer_type, t.key.clone(), t.time))
-            .collect();
-
-        if expected_all != store_all_tuples {
-            return Err(color_eyre::eyre::eyre!(
-                "Final all-types mismatch for slab {slab_id}: expected {expected_all:?}, got \
-                 {store_all_tuples:?}"
-            ));
-        }
-
-        // Verify ordering
-        for window in store_all_tuples.windows(2) {
-            if window[0] >= window[1] {
-                return Err(color_eyre::eyre::eyre!(
-                    "Final ordering violation for slab {slab_id}: {:?} >= {:?}",
-                    window[0],
-                    window[1]
-                ));
-            }
-        }
+        verify_slab_triggers_all_types(operations, model, &slab, usize::MAX).await?;
     }
 
     Ok(())

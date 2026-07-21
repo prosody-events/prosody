@@ -14,8 +14,8 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonMiddlewareConfiguration, ConsumerConfiguration, PipelineMiddlewareConfiguration,
-    ProsodyConsumer,
+    CommonConfiguration, ConsumerConfiguration, KeyedStateConfiguration,
+    PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
@@ -80,12 +80,13 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         retry: RetryConfigurationBuilder::default().build()?,
         monopolization: MonopolizationConfigurationBuilder::default().build()?,
         defer: DeferConfigurationBuilder::default().build()?,
-        dedup: DeduplicationConfigurationBuilder::default().build()?,
     };
 
-    let common_config = CommonMiddlewareConfiguration {
+    let common_config = CommonConfiguration {
         scheduler: SchedulerConfigurationBuilder::default().build()?,
         timeout: TimeoutConfigurationBuilder::default().build()?,
+        dedup: DeduplicationConfigurationBuilder::default().build()?,
+        keyed_state: KeyedStateConfiguration::default(),
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(

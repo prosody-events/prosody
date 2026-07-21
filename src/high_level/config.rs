@@ -10,57 +10,33 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
-use crate::consumer::middleware::deduplication::{
-    DeduplicationConfiguration, DeduplicationConfigurationBuilder,
-    DeduplicationConfigurationBuilderError,
-};
-use crate::consumer::middleware::defer::{
-    DeferConfigError, DeferConfiguration, DeferConfigurationBuilder,
-};
+use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilderError;
+use crate::consumer::middleware::defer::{DeferConfigError, DeferConfiguration};
 use crate::consumer::middleware::monopolization::{
-    MonopolizationConfiguration, MonopolizationConfigurationBuilder,
-    MonopolizationConfigurationBuilderError,
+    MonopolizationConfiguration, MonopolizationConfigurationBuilderError,
 };
-use crate::consumer::middleware::retry::{
-    RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
-};
+use crate::consumer::middleware::retry::{RetryConfiguration, RetryConfigurationBuilderError};
 use crate::consumer::middleware::scheduler::{
-    SchedulerConfigurationBuilder, SchedulerConfigurationBuilderError, SchedulerInitError,
+    SchedulerConfigurationBuilderError, SchedulerInitError,
 };
-use crate::consumer::middleware::timeout::{
-    TimeoutConfigurationBuilder, TimeoutConfigurationBuilderError,
-};
+use crate::consumer::middleware::timeout::TimeoutConfigurationBuilderError;
 use crate::consumer::middleware::topic::{
-    FailureTopicConfiguration, FailureTopicConfigurationBuilder,
-    FailureTopicConfigurationBuilderError,
+    FailureTopicConfiguration, FailureTopicConfigurationBuilderError,
 };
 use crate::consumer::{
-    CommonMiddlewareConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
-    ConsumerConfigurationBuilderError,
+    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilderError,
 };
+use crate::high_level::ConsumerBuilders;
 use crate::high_level::mode::Mode;
+use crate::state::descriptor::{Registered, StateDescriptor};
 use thiserror::Error;
 
 /// Parameters for building a mode configuration.
 pub(crate) struct ModeConfigurationBuildParams<'a> {
     /// The operational mode.
     pub mode: Mode,
-    /// Builder for the consumer configuration.
-    pub consumer_builder: &'a ConsumerConfigurationBuilder,
-    /// Builder for the retry configuration.
-    pub retry_builder: &'a RetryConfigurationBuilder,
-    /// Builder for the failure topic configuration.
-    pub failure_topic_builder: &'a FailureTopicConfigurationBuilder,
-    /// Builder for the scheduler configuration.
-    pub scheduler_builder: &'a SchedulerConfigurationBuilder,
-    /// Builder for the monopolization configuration.
-    pub monopolization_builder: &'a MonopolizationConfigurationBuilder,
-    /// Builder for the defer configuration.
-    pub defer_builder: &'a DeferConfigurationBuilder,
-    /// Builder for the deduplication configuration.
-    pub dedup_builder: &'a DeduplicationConfigurationBuilder,
-    /// Builder for the timeout configuration.
-    pub timeout_builder: &'a TimeoutConfigurationBuilder,
+    /// Bundled consumer and middleware configuration builders.
+    pub consumer_builders: &'a ConsumerBuilders,
     /// Builder for the Cassandra configuration.
     pub cassandra_builder: &'a CassandraConfigurationBuilder,
 }
@@ -87,10 +63,8 @@ pub enum ModeConfiguration {
         monopolization: MonopolizationConfiguration,
         /// Defer middleware configuration.
         defer: DeferConfiguration,
-        /// Deduplication middleware configuration.
-        dedup: DeduplicationConfiguration,
-        /// Common middleware configuration (scheduler, timeout).
-        common: CommonMiddlewareConfiguration,
+        /// Common configuration (scheduler, timeout, dedup, keyed state).
+        common: CommonConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -102,8 +76,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
-        /// Common middleware configuration (scheduler, timeout).
-        common: CommonMiddlewareConfiguration,
+        /// Common configuration (scheduler, timeout, dedup, keyed state).
+        common: CommonConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -111,39 +85,36 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
-        /// Common middleware configuration (scheduler, timeout).
-        common: CommonMiddlewareConfiguration,
+        /// Common configuration (scheduler, timeout, dedup, keyed state).
+        common: CommonConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
 }
 
 impl ModeConfiguration {
-    /// Builds a new `ModeConfiguration` based on the provided parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `params` - The build parameters containing all required configuration
-    ///   builders.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the built `ModeConfiguration` if successful, or a
-    /// `ModeConfigurationError` if any of the builds fail.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any of the configuration builds fail.
+    /// Builds a `ModeConfiguration` from the bundled configuration builders.
     pub(crate) fn build(
         params: &ModeConfigurationBuildParams,
     ) -> Result<Self, ModeConfigurationError> {
-        let consumer = params.consumer_builder.build()?;
-        let retry = params.retry_builder.build()?;
-        let scheduler = params.scheduler_builder.build()?;
-        let timeout = params.timeout_builder.build()?;
+        let builders = params.consumer_builders;
+        let consumer = builders.consumer.build()?;
+        let retry = builders.retry.build()?;
+        let scheduler = builders.scheduler.build()?;
+        let timeout = builders.timeout.build()?;
+        // Deduplication is the commit oracle for every mode, so it lives in the
+        // common configuration rather than pipeline-only.
+        let dedup = builders.dedup.build()?;
 
-        // Build common middleware configuration
-        let common = CommonMiddlewareConfiguration { scheduler, timeout };
+        // Build the common configuration shared by every mode. Keyed state is
+        // mode-independent (it carries the registrations), so it lives here
+        // rather than in a per-mode struct.
+        let common = CommonConfiguration {
+            scheduler,
+            timeout,
+            dedup,
+            keyed_state: builders.keyed_state.clone(),
+        };
 
         // Create trigger store configuration based on mock mode
         let trigger_store = if consumer.mock {
@@ -155,21 +126,19 @@ impl ModeConfiguration {
 
         Ok(match params.mode {
             Mode::Pipeline => {
-                let monopolization = params.monopolization_builder.build()?;
-                let defer = params.defer_builder.clone().build()?;
-                let dedup = params.dedup_builder.build()?;
+                let monopolization = builders.monopolization.build()?;
+                let defer = builders.defer.clone().build()?;
                 Self::Pipeline {
                     consumer,
                     retry,
                     monopolization,
                     defer,
-                    dedup,
                     common,
                     trigger_store,
                 }
             }
             Mode::LowLatency => {
-                let failure_topic = params.failure_topic_builder.build()?;
+                let failure_topic = builders.failure_topic.build()?;
                 Self::LowLatency {
                     consumer,
                     retry,
@@ -187,10 +156,6 @@ impl ModeConfiguration {
     }
 
     /// Returns topics mentioned in the configuration.
-    ///
-    /// # Returns
-    ///
-    /// A vector of `Topic`s configured for the current mode.
     #[must_use]
     pub(crate) fn configured_topics(&self) -> Vec<Topic> {
         match self {
@@ -211,10 +176,6 @@ impl ModeConfiguration {
     }
 
     /// Returns the mode of the configuration.
-    ///
-    /// # Returns
-    ///
-    /// The `Mode` corresponding to this configuration.
     #[must_use]
     pub fn mode(&self) -> Mode {
         match self {
@@ -225,16 +186,29 @@ impl ModeConfiguration {
     }
 
     /// Returns a reference to the consumer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the `ConsumerConfiguration` for this mode.
     #[must_use]
     pub fn consumer_config(&self) -> &ConsumerConfiguration {
         match self {
             Self::Pipeline { consumer, .. }
             | Self::LowLatency { consumer, .. }
             | Self::BestEffort { consumer, .. } => consumer,
+        }
+    }
+
+    /// Registers `descriptor`'s collection with this configuration, returning
+    /// the [`Registered`] capability handle.
+    ///
+    /// Forwarded by `HighLevelClient::register` while the consumer is
+    /// `Configured`; the moved configuration is rebuilt into the running
+    /// consumer's registry on `subscribe`.
+    pub(crate) fn register<D>(&mut self, descriptor: D) -> Registered<D>
+    where
+        D: StateDescriptor,
+    {
+        match self {
+            Self::Pipeline { common, .. }
+            | Self::LowLatency { common, .. }
+            | Self::BestEffort { common, .. } => common.keyed_state.register(descriptor),
         }
     }
 }
@@ -284,14 +258,6 @@ pub enum ModeConfigurationError {
 }
 
 /// Creates an iterator over the subscribed topics in a consumer configuration.
-///
-/// # Arguments
-///
-/// * `consumer` - The consumer configuration to extract topics from.
-///
-/// # Returns
-///
-/// An iterator that yields `Topic`s from the consumer's subscribed topics.
 fn subscription(consumer: &ConsumerConfiguration) -> impl Iterator<Item = Topic> + '_ {
     consumer
         .subscribed_topics

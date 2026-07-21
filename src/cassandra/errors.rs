@@ -92,6 +92,12 @@ pub enum CassandraStoreError {
     /// Invalid column type.
     #[error("Invalid type: {0:#}")]
     TypeCheck(Box<TypeCheckError>),
+
+    /// A row failed to deserialize while iterating an unpaged result — the
+    /// per-row error of `QueryRowsResult::rows`, distinct from the paged
+    /// [`NextRow`](Self::NextRow) error the streaming path surfaces.
+    #[error("Failed to deserialize row: {0:#}")]
+    Deserialization(Box<DeserializationError>),
 }
 
 impl From<NewSessionError> for CassandraStoreError {
@@ -154,6 +160,12 @@ impl From<TypeCheckError> for CassandraStoreError {
     }
 }
 
+impl From<DeserializationError> for CassandraStoreError {
+    fn from(error: DeserializationError) -> Self {
+        Self::Deserialization(Box::new(error))
+    }
+}
+
 impl ClassifyError for CassandraStoreError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
@@ -172,6 +184,7 @@ impl ClassifyError for CassandraStoreError {
             Self::IntoRows(e) => e.classify_error(),
             Self::Rows(e) => e.classify_error(),
             Self::TypeCheck(e) => e.classify_error(),
+            Self::Deserialization(e) => e.classify_error(),
         }
     }
 }

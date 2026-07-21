@@ -15,12 +15,10 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
-use std::cell::RefCell;
 use std::env::var;
 use std::hash::Hasher;
 use std::mem::take;
 use std::num::NonZeroUsize;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Span, info_span, instrument};
@@ -28,7 +26,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::codec::JsonCodec;
+use crate::codec::{JsonCodec, SerializeBufGuard};
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::telemetry::sender::TelemetrySender;
@@ -39,7 +37,7 @@ use crate::util::{
 use crate::{Codec, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER, Topic};
 use std::marker::PhantomData;
 use tracing::field::debug;
-use tracing::log::info;
+use tracing::info;
 use whoami::hostname;
 
 mod error;
@@ -49,50 +47,6 @@ pub use error::ProducerError;
 
 /// Environment variable name for the source system identifier.
 const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
-
-thread_local! {
-    static SERIALIZE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// RAII guard that takes the per-thread serialize buffer for the duration of a
-/// send and returns it on drop, preserving its capacity for reuse.
-struct SerializeBufGuard {
-    buf: Vec<u8>,
-}
-
-impl SerializeBufGuard {
-    fn acquire() -> Self {
-        Self {
-            buf: SERIALIZE_BUF.with_borrow_mut(take),
-        }
-    }
-}
-
-impl Drop for SerializeBufGuard {
-    fn drop(&mut self) {
-        let mut buf = take(&mut self.buf);
-        buf.clear();
-        SERIALIZE_BUF.with_borrow_mut(|tls| {
-            if buf.capacity() > tls.capacity() {
-                *tls = buf;
-            }
-        });
-    }
-}
-
-impl Deref for SerializeBufGuard {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Vec<u8> {
-        &self.buf
-    }
-}
-
-impl DerefMut for SerializeBufGuard {
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.buf
-    }
-}
 
 /// Configuration for the Kafka producer.
 ///
@@ -155,11 +109,7 @@ pub struct ProducerConfiguration {
 }
 
 impl ProducerConfigurationBuilder {
-    /// Currently configured source system
-    ///
-    /// # Returns
-    ///
-    /// An option containing the source system if configured
+    /// Currently configured source system, if any.
     #[must_use]
     pub(crate) fn configured_source_system(&self) -> Option<String> {
         self.source_system
@@ -170,10 +120,6 @@ impl ProducerConfigurationBuilder {
 
 impl ProducerConfiguration {
     /// Creates a new `ProducerConfigurationBuilder`.
-    ///
-    /// # Returns
-    ///
-    /// A new instance of `ProducerConfigurationBuilder`.
     #[must_use]
     pub fn builder() -> ProducerConfigurationBuilder {
         ProducerConfigurationBuilder::default()
@@ -235,14 +181,6 @@ impl<C: Codec> Clone for ProsodyProducer<C> {
 impl<C: Codec> ProsodyProducer<C> {
     /// Creates a new `ProsodyProducer` instance.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance if successful.
-    ///
     /// # Errors
     ///
     /// Returns a `ProducerError` if:
@@ -292,15 +230,6 @@ impl<C: Codec> ProsodyProducer<C> {
     /// This configuration sets the send timeout to `None`, allowing for
     /// indefinite retries.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
-    ///
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
@@ -316,19 +245,6 @@ impl<C: Codec> ProsodyProducer<C> {
     ///
     /// This configuration ensures a send timeout is set, defaulting to 1 second
     /// if not specified.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `ProducerError` if the producer creation fails.
     pub(crate) fn low_latency_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
@@ -341,43 +257,17 @@ impl<C: Codec> ProsodyProducer<C> {
 
     /// Creates a new `ProsodyProducer` instance optimized for best-effort.
     ///
-    /// This configuration ensures a send timeout is set, defaulting to 1 second
-    /// if not specified.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The producer configuration.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `ProducerError` if the producer creation fails.
+    /// Best-effort construction has the same send-timeout defaulting as
+    /// [`Self::low_latency_producer`]; the two modes are distinguished
+    /// elsewhere (retry/monopolization wiring), not at producer construction.
     pub(crate) fn best_effort_producer(
-        mut config: ProducerConfiguration,
+        config: ProducerConfiguration,
         telemetry: TelemetrySender,
     ) -> Result<Self, ProducerError<C::Error>> {
-        if config.send_timeout.is_none() {
-            config.send_timeout = Some(Duration::from_secs(1));
-        }
-        Self::new(&config, telemetry)
+        Self::low_latency_producer(config, telemetry)
     }
 
     /// Sends a message to a Kafka topic.
-    ///
-    /// # Arguments
-    ///
-    /// * `headers` - An iterator of key-value pairs to be added as headers.
-    /// * `topic` - The topic to send the message to.
-    /// * `key` - The message key.
-    /// * `payload` - The message payload as a JSON Value.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or failure of the send operation.
     ///
     /// # Errors
     ///
@@ -387,7 +277,7 @@ impl<C: Codec> ProsodyProducer<C> {
     /// - The Kafka send operation fails
     #[instrument(
         skip(self, topic, headers, payload),
-        fields(topic = topic.as_ref(), payload_size, partition, offset, timestamp),
+        fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, payload_size, partition, offset, timestamp),
         err
     )]
     pub async fn send<'a, H>(
@@ -428,7 +318,13 @@ impl<C: Codec> ProsodyProducer<C> {
         C::with_cached_local(|codec| codec.serialize(payload, &mut serialized))
             .map_err(ProducerError::Serialization)?;
 
-        Span::current().record("payload_size", serialized.len());
+        // Recorded as i64: the OTel layer exports signed ints as typed Int
+        // attributes but stringifies unsigned values through their Debug form.
+        // A payload beyond i64 cannot exist; leave the field unrecorded rather
+        // than invent a value.
+        if let Ok(payload_size) = i64::try_from(serialized.len()) {
+            Span::current().record("payload_size", payload_size);
+        }
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
@@ -495,10 +391,6 @@ impl<C: Codec> ProsodyProducer<C> {
     ///
     /// This method is primarily used for internal purposes like checking topic
     /// existence.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the underlying Kafka client.
     pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
         self.producer.client()
     }

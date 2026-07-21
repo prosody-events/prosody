@@ -1,4 +1,4 @@
-//! Property-based tests for V2 high-level dual-index operations.
+//! Property-based tests for the high-level dual-index trigger operations.
 //!
 //! Tests the high-level operations that coordinate updates across both slab
 //! and key indices, verifying dual-index consistency.
@@ -11,11 +11,12 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
+use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -24,7 +25,10 @@ type TriggerTuple = (Key, CompactDateTime, TimerType);
 type StoreTriggerTuple = (Key, CompactDateTime, TimerType, SegmentId);
 
 /// High-level operations that coordinate across dual indices.
-/// Only uses the 9 public `TriggerStore` methods.
+///
+/// Each variant maps to one `TriggerStore` method that participates in
+/// dual-index maintenance; add a variant whenever the trait gains such a
+/// method.
 #[derive(Clone, Debug)]
 pub enum HighLevelOperation {
     /// Add a trigger to both slab and key indices (`add_trigger`).
@@ -117,14 +121,14 @@ pub enum HighLevelOperation {
     },
 }
 
-/// Test input containing isolated segment IDs and high-level operations.
+/// Test input containing an isolated segment and high-level operations.
 #[derive(Clone, Debug)]
 pub struct HighLevelTestInput {
-    /// Pool of segments used by operations in this trial.
-    pub segments: Vec<Segment>,
+    /// The single segment used by all operations in this trial.
+    pub segment: Segment,
     /// Sequence of operations to apply.
     pub operations: Vec<HighLevelOperation>,
-    /// Slab size used for all segments in this test.
+    /// Slab size used for the segment in this test.
     pub slab_size: CompactDuration,
 }
 
@@ -146,13 +150,9 @@ fn random_key(g: &mut Gen) -> Key {
     format!("key-{}", u8::arbitrary(g) % 5).into()
 }
 
-/// Generates a random timer type.
+/// Generates a random timer type, drawing from every persisted variant.
 fn random_timer_type(g: &mut Gen) -> TimerType {
-    match u8::arbitrary(g) % 3 {
-        0 => TimerType::Application,
-        1 => TimerType::DeferredMessage,
-        _ => TimerType::DeferredTimer,
-    }
+    TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()]
 }
 
 fn model_tag_for_trigger(
@@ -191,7 +191,6 @@ fn generate_add_trigger(
 fn generate_remove_trigger(
     g: &mut Gen,
     segment: &Segment,
-    segments: &[Segment],
     existing_triggers: &mut ExistingTriggers,
 ) -> HighLevelOperation {
     if existing_triggers.is_empty() || bool::arbitrary(g) {
@@ -207,21 +206,15 @@ fn generate_remove_trigger(
             timer_type,
         }
     } else {
-        // Remove an existing trigger
+        // Remove an existing trigger. Every tracked trigger belongs to this
+        // trial's single segment, so `segment` is always the right owner.
         let keys: Vec<_> = existing_triggers.iter().cloned().collect();
         let (seg_id, slab_id, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
 
         existing_triggers.remove(&(*seg_id, *slab_id, key.clone(), *time, *timer_type));
 
-        // Find the matching segment
-        let segment = segments
-            .iter()
-            .find(|s| s.id == *seg_id)
-            .unwrap_or(&segments[0])
-            .clone();
-
         HighLevelOperation::RemoveTrigger {
-            segment,
+            segment: segment.clone(),
             key: key.clone(),
             time: *time,
             timer_type: *timer_type,
@@ -389,12 +382,12 @@ impl Arbitrary for HighLevelTestInput {
         // Single segment per trial — matches the production invariant that each
         // store instance is scoped to one partition (one segment). Using multiple
         // segments would break the per-partition state cache.
-        let segments: Vec<Segment> = vec![Segment {
+        let segment = Segment {
             id: Uuid::new_v4(),
             name: "segment-0".to_owned(),
             slab_size,
             version: SegmentVersion::V3,
-        }];
+        };
 
         // Generate 10-50 operations
         let op_count = (usize::arbitrary(g) % 40) + 10;
@@ -406,8 +399,7 @@ impl Arbitrary for HighLevelTestInput {
         let mut key_trigger_times = KeyTriggerTimes::default();
 
         for _ in 0..op_count {
-            let segment_idx = usize::from(u8::arbitrary(g)) % segments.len();
-            let segment = &segments[segment_idx];
+            let segment = &segment;
 
             let op = match u8::arbitrary(g) % 10 {
                 0 => {
@@ -422,7 +414,7 @@ impl Arbitrary for HighLevelTestInput {
                     op
                 }
                 1 => {
-                    let op = generate_remove_trigger(g, segment, &segments, &mut existing_triggers);
+                    let op = generate_remove_trigger(g, segment, &mut existing_triggers);
                     if let HighLevelOperation::RemoveTrigger {
                         ref segment,
                         ref key,
@@ -465,7 +457,7 @@ impl Arbitrary for HighLevelTestInput {
         }
 
         Self {
-            segments,
+            segment,
             operations,
             slab_size,
         }
@@ -791,15 +783,11 @@ where
         .map(|(_, time, _)| *time)
         .collect();
 
-    let actual: Vec<CompactDateTime> = store
+    let actual_set: BTreeSet<CompactDateTime> = store
         .get_key_times(timer_type, key)
-        .collect::<Vec<_>>()
+        .try_collect()
         .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetKeyTimes failed: {e:?}"))?;
-
-    let actual_set: BTreeSet<CompactDateTime> = actual.into_iter().collect();
 
     if expected != actual_set {
         return Err(color_eyre::eyre::eyre!(
@@ -889,13 +877,11 @@ where
         .copied()
         .collect();
 
-    let actual: Vec<SlabId> = store
+    let actual_set: BTreeSet<SlabId> = store
         .get_slab_range(range.clone())
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange failed: {e:?}"))?;
-
-    let actual_set: BTreeSet<SlabId> = actual.into_iter().collect();
 
     if expected != actual_set {
         return Err(color_eyre::eyre::eyre!(
@@ -1288,13 +1274,11 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    // Insert all segments first
-    for _segment in &input.segments {
-        store
-            .insert_segment()
-            .await
-            .map_err(|e| color_eyre::eyre::eyre!("Failed to insert segment: {e:?}"))?;
-    }
+    // Insert the segment first
+    store
+        .insert_segment()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to insert segment: {e:?}"))?;
 
     let mut model = HighLevelModel::new();
 

@@ -51,17 +51,9 @@ pub enum ConsumerState<T, C: Codec> {
 }
 
 impl<T, C: Codec> ConsumerState<T, C> {
-    /// Builds a new `ConsumerState` based on the provided configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `params` - The build parameters containing all required configuration
-    ///   builders.
-    ///
-    /// # Returns
-    ///
-    /// Returns a `ConsumerState::Configured` if the build is successful,
-    /// otherwise returns `ConsumerState::ConfigurationFailed` with the error.
+    /// Builds a new `ConsumerState` from the given configuration, returning
+    /// [`ConsumerState::Configured`] on success or
+    /// [`ConsumerState::ConfigurationFailed`] with the error otherwise.
     pub(crate) fn build(params: &ModeConfigurationBuildParams) -> Self {
         match ModeConfiguration::build(params) {
             Ok(configuration) => Self::Configured(configuration),

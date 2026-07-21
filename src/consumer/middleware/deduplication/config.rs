@@ -1,6 +1,7 @@
 //! Deduplication middleware configuration.
 
 use derive_builder::Builder;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use validator::{Validate, ValidationError};
 
@@ -8,6 +9,27 @@ use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::util::{
     DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_duration_env_with_fallback, from_env_with_fallback,
 };
+
+/// Environment variable controlling the deduplication hash version.
+///
+/// Shared by the deduplication config default and any other component that
+/// must reproduce the same dedup version (e.g. the keyed-state middleware),
+/// so the version can never silently diverge between the writer and a reader.
+pub const IDEMPOTENCE_VERSION_ENV: &str = "PROSODY_IDEMPOTENCE_VERSION";
+
+/// Default deduplication hash version when [`IDEMPOTENCE_VERSION_ENV`] is
+/// unset.
+pub const DEFAULT_IDEMPOTENCE_VERSION: &str = "1";
+
+/// Default dedup cache capacity as a non-zero value, derived from the shared
+/// [`DEFAULT_IDEMPOTENCE_CACHE_SIZE`]. Deduplication is mandatory (the
+/// keyed-state commit oracle), so — unlike the producer cache — it cannot be
+/// disabled by setting the capacity to zero.
+const DEFAULT_DEDUP_CACHE_CAPACITY: NonZeroUsize =
+    match NonZeroUsize::new(DEFAULT_IDEMPOTENCE_CACHE_SIZE) {
+        Some(capacity) => capacity,
+        None => NonZeroUsize::MIN,
+    };
 
 /// Configuration for the deduplication middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -19,21 +41,23 @@ pub struct DeduplicationConfiguration {
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_VERSION`
     /// Default: `"1"`
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_VERSION\", \"1\".to_owned())?"
-    )]
+    #[builder(default = "from_env_with_fallback(IDEMPOTENCE_VERSION_ENV, \
+                         DEFAULT_IDEMPOTENCE_VERSION.to_owned())?")]
     pub version: String,
 
-    /// Global shared cache capacity across all partitions. Set to 0 to disable
-    /// the deduplication middleware entirely.
+    /// Global shared cache capacity across all partitions. Deduplication is
+    /// mandatory (the keyed-state commit oracle), so the capacity is
+    /// `NonZeroUsize`: a zero capacity is unrepresentable rather than
+    /// validated away. Setting `PROSODY_IDEMPOTENCE_CACHE_SIZE=0` is rejected
+    /// when the configuration is built.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
     /// Default: 8192
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", \
-                   DEFAULT_IDEMPOTENCE_CACHE_SIZE)?"
+                   DEFAULT_DEDUP_CACHE_CAPACITY)?"
     )]
-    pub cache_capacity: usize,
+    pub cache_capacity: NonZeroUsize,
 
     /// Cassandra TTL for deduplication records. Must be at least 1 minute
     /// and must not exceed Cassandra's maximum TTL of 630,720,000 seconds.

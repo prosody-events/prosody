@@ -18,16 +18,8 @@ const BACKOFF_MAX_MS: u64 = 30_000; // 30 seconds
 /// Calculates exponential backoff with full jitter for retry attempts.
 ///
 /// Uses the "full jitter" strategy recommended by AWS for distributed systems
-/// to prevent thundering herd problems. Returns a random duration between
-/// 0 and the calculated exponential backoff value.
-///
-/// # Arguments
-///
-/// * `attempt` - The current retry attempt number (1-based)
-///
-/// # Returns
-///
-/// A random duration between 0 and min(base * 2^attempt, `max_delay`)
+/// to prevent thundering herd problems: a random duration between 0 and
+/// `min(base * 2^attempt, max_delay)`, where `attempt` is 1-based.
 pub fn calculate_backoff(attempt: u32) -> Duration {
     let exp_backoff = min(
         2u64.saturating_pow(attempt).saturating_mul(BACKOFF_BASE_MS),
@@ -43,15 +35,6 @@ pub fn calculate_backoff(attempt: u32) -> Duration {
 /// Creates the tables if they don't already exist. The `schema_migrations`
 /// table tracks which migrations have been applied, while the `locks`
 /// table provides distributed locking for concurrent migration attempts.
-///
-/// # Arguments
-///
-/// * `session` - The Cassandra session
-/// * `keyspace` - The keyspace to create tables in
-///
-/// # Errors
-///
-/// Returns an error if table creation fails.
 pub async fn ensure_migration_tables_exist(
     session: &Session,
     keyspace: &str,

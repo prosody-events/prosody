@@ -36,7 +36,7 @@ use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, T
 /// * `P` – The payload type carried by the message variant.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
-pub enum UncommittedEvent<T, P>
+pub(crate) enum UncommittedEvent<T, P>
 where
     T: TriggerStore,
 {
@@ -61,24 +61,6 @@ where
     }
 }
 
-impl<T, P> From<UncommittedMessage<P>> for UncommittedEvent<T, P>
-where
-    T: TriggerStore,
-{
-    fn from(value: UncommittedMessage<P>) -> Self {
-        Self::Message(value)
-    }
-}
-
-impl<T, P> From<PendingTimer<T>> for UncommittedEvent<T, P>
-where
-    T: TriggerStore,
-{
-    fn from(value: PendingTimer<T>) -> Self {
-        Self::Timer(value)
-    }
-}
-
 /// A Kafka message with offset tracking for commit/abort semantics.
 ///
 /// Wraps a `ConsumerMessage` and its corresponding `UncommittedOffset` handler.
@@ -93,10 +75,6 @@ pub struct UncommittedMessage<P> {
 
 impl<P> UncommittedMessage<P> {
     /// Returns the optional source system identifier from message headers.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing the source system if present.
     #[must_use]
     pub fn source_system(&self) -> Option<&SourceSystem> {
         self.inner.source_system()
@@ -142,13 +120,17 @@ impl<P> UncommittedMessage<P> {
 
     /// Decomposes into its inner `ConsumerMessage` and the offset-tracking
     /// guard.
-    ///
-    /// # Returns
-    ///
-    /// A tuple `(ConsumerMessage<P>, UncommittedOffset)`.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage<P>, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
+    }
+
+    /// Returns the wrapped consumer message.
+    ///
+    /// Used by the partition loop to derive the event's keyed-state
+    /// session before dispatch consumes the message.
+    pub(crate) fn message(&self) -> &ConsumerMessage<P> {
+        &self.inner
     }
 
     fn processing_state(&self) -> Arc<ArcSwapOption<ProcessingState>> {
@@ -166,7 +148,7 @@ impl<P: Send + Sync + 'static> Uncommitted for UncommittedMessage<P> {
             offset = self.offset(),
             "committing message"
         );
-        self.uncommitted_offset.commit();
+        self.uncommitted_offset.commit().await;
     }
 
     /// Abort the message processing and log the action.
@@ -178,7 +160,7 @@ impl<P: Send + Sync + 'static> Uncommitted for UncommittedMessage<P> {
             offset = self.offset(),
             "aborting message"
         );
-        self.uncommitted_offset.abort();
+        self.uncommitted_offset.abort().await;
     }
 }
 
@@ -234,8 +216,8 @@ struct ProcessingState {
     #[educe(Debug(ignore))]
     span: Span,
 
-    /// Permit used to bound buffering
-    permit: OwnedSemaphorePermit,
+    /// Permit used to bound buffering.
+    _permit: OwnedSemaphorePermit,
 }
 
 /// The full data and metadata for a consumer message.
@@ -276,7 +258,7 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             partition: 0,
             offset: 0,
             key: "test-key".into(),
-            timestamp: chrono::Utc::now(),
+            timestamp: Utc::now(),
             payload: serde_json::json!({}),
         }
     }
@@ -285,17 +267,14 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
 impl<P> ConsumerMessage<P> {
     /// Create a new `ConsumerMessage` from a message value and processing state
     /// components.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` – The message data (topic, partition, offset, key, timestamp,
-    ///   payload, etc.).
-    /// * `span` – Tracing span for distributed context.
-    /// * `permit` – Semaphore permit for backpressure management.
     #[must_use]
     pub fn new(value: ConsumerMessageValue<P>, span: Span, permit: OwnedSemaphorePermit) -> Self {
         let value = Arc::new(value);
-        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState {
+            span,
+            _permit: permit,
+        })
+        .into();
 
         Self {
             value,
@@ -307,19 +286,17 @@ impl<P> ConsumerMessage<P> {
     ///
     /// This is used after `decode_message` returns a `DecodedMessage` to
     /// attach the semaphore permit and span for the processing phase.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - Shared immutable message data
-    /// * `span` - Tracing span for this processing phase
-    /// * `permit` - Semaphore permit for backpressure management
     #[must_use]
     pub fn from_decoded(
         value: Arc<ConsumerMessageValue<P>>,
         span: Span,
         permit: OwnedSemaphorePermit,
     ) -> Self {
-        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState {
+            span,
+            _permit: permit,
+        })
+        .into();
 
         Self {
             value,
@@ -375,10 +352,6 @@ impl<P> ConsumerMessage<P> {
     }
 
     /// Convert into `UncommittedMessage` by attaching offset-tracking state.
-    ///
-    /// # Arguments
-    ///
-    /// * `uncommitted_offset` – The offset guard to manage commit/abort.
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage<P> {
         UncommittedMessage {
@@ -391,14 +364,6 @@ impl<P> ConsumerMessage<P> {
     ///
     /// Creates a `ConsumerMessage` suitable for unit testing without requiring
     /// complex setup. Each message gets its own semaphore permit.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - Kafka topic
-    /// * `partition` - Partition index
-    /// * `offset` - Message offset
-    /// * `key` - Message key
-    /// * `payload` - Message payload
     ///
     /// # Errors
     ///
@@ -428,10 +393,10 @@ impl<P> ConsumerMessage<P> {
                 partition,
                 offset,
                 key,
-                timestamp: chrono::Utc::now(),
+                timestamp: Utc::now(),
                 payload,
             },
-            tracing::Span::current(),
+            Span::current(),
             permit,
         ))
     }

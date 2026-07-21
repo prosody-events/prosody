@@ -4,18 +4,15 @@
 //! preserving the original error flow verbatim. This middleware is a pure
 //! pass-through: it observes outcomes and emits log records, but it never
 //! changes the dispatch result or the apply-hook outcome that downstream
-//! layers see. Typically positioned as an outer layer for comprehensive
-//! error visibility.
+//! layers see.
 //!
-//! # Execution Order
-//!
-//! **Request Path:**
-//! 1. Pass control to inner middleware layers (no-op)
-//!
-//! **Response Path:**
-//! 1. Receive result from inner layers
-//! 2. **Log error if present** - Categorizes and logs with appropriate severity
-//! 3. Pass original result through unchanged
+//! Each failure is logged exactly once, from the after-dispatch error hooks
+//! ([`FallibleEventHandler::on_message_error`] /
+//! [`FallibleEventHandler::on_timer_error`]) — the
+//! dispatch path itself is pure delegation. Those hooks fire only when this
+//! middleware terminates the chain, so `LogMiddleware` is meaningful only as
+//! the **outermost (terminal) layer**; composing it under another middleware
+//! silently disables its logging.
 //!
 //! **Apply Hooks:**
 //!
@@ -38,38 +35,10 @@
 //!
 //! # Usage
 //!
-//! Position as outer middleware for complete error visibility:
-//!
-//! ```rust,no_run
-//! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::log::*;
-//! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
-//! # use prosody::consumer::DemandType;
-//! # use prosody::consumer::event_context::EventContext;
-//! # use prosody::consumer::message::ConsumerMessage;
-//! # use prosody::telemetry::Telemetry;
-//! # use prosody::timers::Trigger;
-//! # use std::convert::Infallible;
-//! # #[derive(Clone)]
-//! # struct MyHandler;
-//! # impl FallibleHandler for MyHandler {
-//! #     type Payload = serde_json::Value;
-//! #     type Error = Infallible;
-//! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn shutdown(self) {}
-//! # }
-//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
-//! # let telemetry = Telemetry::default();
-//! # let handler = MyHandler;
-//!
-//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationMiddleware)
-//!     .layer(LogMiddleware) // Logs all errors from inner layers
-//!     .into_provider(handler);
-//! ```
+//! Position as the **outermost** layer for complete error visibility; composing
+//! it under another middleware silently disables its logging (see above). See
+//! the [module docs](crate::consumer::middleware) for a worked composition
+//! example.
 //!
 //! [`ErrorCategory`]: crate::consumer::middleware::ErrorCategory
 
@@ -81,7 +50,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
-    HandlerMiddleware,
+    HandlerMiddleware, Settlement, SettlementHandler,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -145,6 +114,7 @@ where
 impl<T> HandlerProvider for LogProvider<T>
 where
     T: FallibleHandlerProvider,
+    T::Handler: SettlementHandler,
 {
     type Handler = LogHandler<T::Handler>;
 
@@ -170,28 +140,9 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
-        // Attempt to process the message with the wrapped handler
-        let error = match self.handler.on_message(context, message, demand_type).await {
-            Ok(output) => return Ok(output),
-            Err(error) => error,
-        };
-
-        // Log the error based on its category
-        match error.classify_error() {
-            ErrorCategory::Transient => {
-                error!("transient error occurred during message processing: {error:#}");
-            }
-            ErrorCategory::Permanent => {
-                error!("permanent error occurred during message processing: {error:#}");
-            }
-            ErrorCategory::Terminal => {
-                error!("terminal error occurred during message processing: {error:#}");
-            }
-        }
-
-        Err(error)
+        self.handler.on_message(context, message, demand_type).await
     }
 
     async fn on_timer<C>(
@@ -201,28 +152,9 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
-        // Attempt to process the timer with the wrapped handler
-        let error = match self.handler.on_timer(context, trigger, demand_type).await {
-            Ok(output) => return Ok(output),
-            Err(error) => error,
-        };
-
-        // Log the error based on its category
-        match error.classify_error() {
-            ErrorCategory::Transient => {
-                error!("transient error occurred during timer processing: {error:#}");
-            }
-            ErrorCategory::Permanent => {
-                error!("permanent error occurred during timer processing: {error:#}");
-            }
-            ErrorCategory::Terminal => {
-                error!("terminal error occurred during timer processing: {error:#}");
-            }
-        }
-
-        Err(error)
+        self.handler.on_timer(context, trigger, demand_type).await
     }
 
     /// Pass-through forwarder for the final-dispatch apply hook.
@@ -233,7 +165,7 @@ where
     /// the framework chose to commit on.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.handler.after_commit(context, result).await;
     }
@@ -247,7 +179,7 @@ where
     /// would see without this middleware in the stack.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         self.handler.after_abort(context, result).await;
     }
@@ -258,6 +190,16 @@ where
         // No log-specific state to clean up (logging is stateless)
         // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
+    }
+}
+
+impl<T> SettlementHandler for LogHandler<T>
+where
+    T: SettlementHandler,
+{
+    /// Pass-through: logging adds no Output or error variants of its own.
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        T::settlement(result)
     }
 }
 

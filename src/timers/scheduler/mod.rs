@@ -94,18 +94,11 @@ where
     /// Creates a new scheduler, spawning the unified actor task.
     ///
     /// The actor owns the trigger queue, slab metadata writes, slab loads,
-    /// and slab cleanup. Returns the receiver end of the expired-trigger
-    /// channel along with the scheduler handle.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Persistent trigger store; owned by the actor for slab
-    ///   metadata writes, slab loads, and slab cleanup. Must be `Clone` so the
-    ///   manager can keep its own handle for trigger-row writes.
-    /// * `segment` - Segment metadata (id, slab size).
-    /// * `heartbeats` - Registry for the actor's heartbeat.
-    /// * `shutdown_rx` - Watch channel; the actor exits when phase reaches
-    ///   `Draining`.
+    /// and slab cleanup. `store` must be `Clone` so the manager can keep its
+    /// own handle for trigger-row writes; the actor serves commands through
+    /// `Draining` (so settling handlers can still schedule) and exits at
+    /// `shutdown_rx >= Cancelling`. Returns the receiver end of the
+    /// expired-trigger channel along with the scheduler handle.
     pub fn new<T>(
         store: T,
         segment: Segment,

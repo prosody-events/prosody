@@ -33,7 +33,8 @@ use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
-use crate::timers::store::{Segment, SegmentVersion, TriggerStore};
+use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use color_eyre::eyre::Result;
@@ -42,24 +43,15 @@ use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::result::Result as StdResult;
 use std::time::Duration as StdDuration;
+use strum::VariantArray;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::time::{Instant, advance};
 use tracing::Span;
-use uuid::Uuid;
 
 /// Tests use a 300s slab and a deterministic preload window so slab
 /// math is predictable across runs.
 const SLAB_SIZE_SECS: u32 = 300;
 const PRELOAD_SECS: u32 = 120;
-
-fn test_segment() -> Segment {
-    Segment {
-        id: Uuid::new_v4(),
-        name: "scheduler-test".to_owned(),
-        slab_size: CompactDuration::new(SLAB_SIZE_SECS),
-        version: SegmentVersion::V3,
-    }
-}
 
 type TestStore = TableAdapter<InMemoryTriggerStore>;
 
@@ -81,42 +73,25 @@ fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
 // ===================================================================
 
 #[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_future() -> Result<()> {
+async fn test_calculate_wait_time() -> Result<()> {
     let now = CompactDateTime::now()?;
-    let future = now.add_duration(CompactDuration::new(120))?;
-    let preload = CompactDuration::new(30);
-    // 120s out minus 30s preload = 90s wait.
-    assert_eq!(
-        calculate_wait_time(future, preload),
-        CompactDuration::new(90)
-    );
-    Ok(())
-}
+    // (offset_secs, preload_secs, expected_wait_secs)
+    for (offset, preload, expected) in [
+        (120, 30, 90), // future: 120s out minus 30s preload
+        (15, 30, 0),   // within preload window: saturates to zero
+        (30, 30, 0),   // exact preload boundary: saturates to zero
+    ] {
+        let target = now.add_duration(CompactDuration::new(offset))?;
+        assert_eq!(
+            calculate_wait_time(target, CompactDuration::new(preload)),
+            CompactDuration::new(expected)
+        );
+    }
 
-#[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_within_preload_window() -> Result<()> {
-    let now = CompactDateTime::now()?;
-    let near = now.add_duration(CompactDuration::new(15))?;
-    // 15s out minus 30s preload saturates at zero — load immediately.
-    assert!(calculate_wait_time(near, CompactDuration::new(30)).is_zero());
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_past_time() -> Result<()> {
+    // Past time: advance the clock past a previously-computed load time.
     let load_time = CompactDateTime::now()?;
     advance(StdDuration::from_mins(1)).await;
-    // Load time is now in the past — return zero.
     assert!(calculate_wait_time(load_time, CompactDuration::new(30)).is_zero());
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_calculate_wait_time_exact_preload_boundary() -> Result<()> {
-    let now = CompactDateTime::now()?;
-    let boundary = now.add_duration(CompactDuration::new(30))?;
-    // Exactly at the preload boundary — load immediately.
-    assert!(calculate_wait_time(boundary, CompactDuration::new(30)).is_zero());
     Ok(())
 }
 
@@ -134,7 +109,7 @@ fn test_calculate_preload_within_bounds() {
 
 #[test]
 fn test_next_unloaded_slab_id_from_fresh_state() {
-    let segment = test_segment();
+    let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
     let store = memory_store(segment.clone());
     let mut state = fresh_state(store, segment);
     // No watermark, no high-water: scan starts at 0.
@@ -201,11 +176,7 @@ impl TriggerSpec {
 }
 
 fn timer_type_from_idx(idx: u8) -> TimerType {
-    match idx % 3 {
-        0 => TimerType::Application,
-        1 => TimerType::DeferredMessage,
-        _ => TimerType::DeferredTimer,
-    }
+    TimerType::VARIANTS[usize::from(idx) % TimerType::VARIANTS.len()]
 }
 
 impl Arbitrary for TriggerSpec {
@@ -279,9 +250,9 @@ struct TriggerModel {
 type TriggerModels = HashMap<(Key, CompactDateTime, TimerType), TriggerModel>;
 
 struct Fixture {
-    store: TableAdapter<InMemoryTriggerStore>,
+    store: TestStore,
     segment: Segment,
-    state: ActorState<TableAdapter<InMemoryTriggerStore>>,
+    state: ActorState<TestStore>,
     triggers: TriggerQueue,
     /// Authoritative per-trigger model.
     expected: TriggerModels,
@@ -295,7 +266,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> StdResult<Self, String> {
-        let segment = test_segment();
+        let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
         let store = memory_store(segment.clone());
         store
             .insert_segment()
@@ -777,18 +748,14 @@ fn expected_watermark_after_cleanup_for_test(
 /// given `now_slab`. Used to drive an exhaustive per-triple check after
 /// every op without needing to iterate `ActiveTriggers`' internal map.
 fn build_universe(now_slab: SlabId) -> Vec<(Key, CompactDateTime, TimerType)> {
-    let mut out = Vec::with_capacity(usize::from(PROP_KEYS) * 11 * 3);
+    let mut out = Vec::with_capacity(usize::from(PROP_KEYS) * 11 * TimerType::VARIANTS.len());
     for key_idx in 0..PROP_KEYS {
         for offset in -PROP_PAST_SLABS..=PROP_FUTURE_SLABS {
             let signed = i64::from(now_slab) + i64::from(offset);
             let slab_id: SlabId = signed.max(0).try_into().unwrap_or(0);
             let time = CompactDateTime::from(slab_id.saturating_mul(SLAB_SIZE_SECS));
-            for ty_idx in 0_u8..3 {
-                out.push((
-                    Key::from(format!("k{key_idx}")),
-                    time,
-                    timer_type_from_idx(ty_idx),
-                ));
+            for &timer_type in TimerType::VARIANTS {
+                out.push((Key::from(format!("k{key_idx}")), time, timer_type));
             }
         }
     }
@@ -797,7 +764,7 @@ fn build_universe(now_slab: SlabId) -> Vec<(Key, CompactDateTime, TimerType)> {
 
 #[tokio::test]
 async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> Result<()> {
-    let segment = test_segment();
+    let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
     let store = memory_store(segment.clone());
     store.insert_segment().await?;
 

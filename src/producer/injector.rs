@@ -28,15 +28,6 @@ where
 {
     /// Creates a new `RecordInjector` from a mutable reference to a
     /// `FutureRecord`.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - A mutable reference to the `FutureRecord` to inject headers
-    ///   into.
-    ///
-    /// # Returns
-    ///
-    /// A new `RecordInjector` instance.
     pub fn new(record: &'a mut FutureRecord<'b, K, P>) -> Self {
         Self(record)
     }
@@ -51,11 +42,6 @@ where
     ///
     /// This method is called by OpenTelemetry to inject context information
     /// into the Kafka record.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The header key to inject.
-    /// * `value` - The header value to inject.
     fn set(&mut self, key: &str, value: String) {
         // Get or create the headers for the record
         let headers = self

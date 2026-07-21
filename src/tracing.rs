@@ -37,17 +37,8 @@ pub type Identity = TracingIdentity;
 /// ensures the application can still run with local tracing even when telemetry
 /// infrastructure is unavailable.
 ///
-/// An optional additional layer can be added to the tracing subscriber.
-///
-/// # Arguments
-///
-/// * `layer` - An optional additional layer to be added to the tracing
-///   subscriber. Use Identity for T if layer is None.
-///
-/// # Returns
-///
-/// Returns `Ok(())` if the tracing system is successfully initialized,
-/// or a `TracingError` if an error occurs during the process.
+/// An optional additional layer can be added to the tracing subscriber; pass
+/// `Identity` for `T` when there is none.
 ///
 /// # Errors
 ///
@@ -112,20 +103,15 @@ where
 ///
 /// Creates an OTLP span exporter configured via environment variables.
 /// The protocol is determined by `OTEL_EXPORTER_OTLP_PROTOCOL` (defaults to
-/// "http/protobuf").
+/// "http/protobuf"). Fails if `OTEL_EXPORTER_OTLP_ENDPOINT` is unset,
+/// `OTEL_EXPORTER_OTLP_PROTOCOL` names an unsupported protocol, or the
+/// exporter itself fails to initialize.
 ///
 /// # Environment Variables
 ///
 /// * `OTEL_EXPORTER_OTLP_ENDPOINT` - OTLP endpoint URL (required)
 /// * `OTEL_EXPORTER_OTLP_PROTOCOL` - Transport protocol: "grpc",
 ///   "http/protobuf", or "http/json" (defaults to "http/protobuf")
-///
-/// # Errors
-///
-/// This function returns an error if:
-/// - `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable is not set
-/// - `OTEL_EXPORTER_OTLP_PROTOCOL` contains an unsupported protocol value
-/// - The trace exporter initialization fails
 fn build_exporter() -> Result<SpanExporter, TracingError> {
     // Check if the OTLP endpoint is configured
     if env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {

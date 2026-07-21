@@ -21,7 +21,6 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::otel::SpanRelation;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::queries::Queries;
@@ -60,7 +59,9 @@ pub use state::{InlineTimer, TimerState};
 
 /// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///
-/// Each instance is scoped to a single partition and has its own state cache.
+/// Each store is scoped to a single partition and carries a per-store state
+/// cache **shared by its clones** — the sharing the commit oracle's
+/// cache-first `current_tag` read relies on (see its doc).
 /// Created by [`CassandraTriggerStoreProvider`].
 #[derive(Clone, Educe)]
 #[educe(Debug)]
@@ -68,7 +69,6 @@ pub struct CassandraTriggerStore {
     pub(super) store: CassandraStore,
     pub(super) queries: Arc<Queries>,
     pub(super) segment: Segment,
-    pub(super) timer_spans: SpanRelation,
     /// Per-partition cache of `(Key, TimerType) → TimerState`.
     ///
     /// Tracks the current state of each key/type pair:
@@ -95,12 +95,6 @@ impl CassandraTriggerStore {
     /// (e.g., trigger store and defer store), avoiding the creation of multiple
     /// sessions which is not allowed.
     ///
-    /// # Arguments
-    ///
-    /// * `store` - Existing `CassandraStore` to share
-    /// * `keyspace` - Cassandra keyspace name for query preparation
-    /// * `segment` - Segment this store is scoped to
-    ///
     /// # Errors
     ///
     /// Returns error if query preparation fails.
@@ -108,7 +102,6 @@ impl CassandraTriggerStore {
         store: CassandraStore,
         keyspace: &str,
         segment: Segment,
-        timer_spans: SpanRelation,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
@@ -117,7 +110,6 @@ impl CassandraTriggerStore {
             queries,
             segment,
             state_cache: state::new_state_cache(),
-            timer_spans,
         })
     }
 
@@ -129,14 +121,12 @@ impl CassandraTriggerStore {
         store: CassandraStore,
         queries: Arc<Queries>,
         segment: Segment,
-        timer_spans: SpanRelation,
     ) -> Self {
         Self {
             store,
             queries,
             segment,
             state_cache: state::new_state_cache(),
-            timer_spans,
         }
     }
 
@@ -156,10 +146,8 @@ impl CassandraTriggerStore {
         self.store.calculate_ttl(time)
     }
 
-    /// Helper to execute a query conditionally based on TTL.
-    ///
-    /// Executes `query_with_ttl` if TTL is available, otherwise executes
-    /// `query_no_ttl`. The `params_with_ttl` builder receives the TTL value.
+    /// Resolves `time` to a TTL and runs the matching query, delegating to
+    /// [`CassandraStore::execute_with_optional_ttl`].
     pub(super) async fn execute_with_optional_ttl<P1, P2>(
         &self,
         time: CompactDateTime,
@@ -172,36 +160,26 @@ impl CassandraTriggerStore {
         P1: SerializeRow,
         P2: SerializeRow,
     {
-        match self.calculate_ttl(time) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(query_with_ttl, params_with_ttl(ttl))
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(query_no_ttl, params_no_ttl())
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-            }
-        }
+        self.store
+            .execute_with_optional_ttl(
+                self.calculate_ttl(time),
+                query_with_ttl,
+                query_no_ttl,
+                params_with_ttl,
+                params_no_ttl,
+            )
+            .await?;
         Ok(())
     }
 
-    /// Executes an unpaged query and discards the result.
-    ///
-    /// Convenience wrapper for fire-and-forget mutations that only need
-    /// error propagation.
+    /// Executes an unpaged query and discards the result, delegating to
+    /// [`CassandraStore::execute_unpaged_discard`].
     pub(super) async fn execute_unpaged_discard(
         &self,
         query: &PreparedStatement,
         params: impl SerializeRow,
     ) -> Result<(), CassandraTriggerStoreError> {
-        self.session()
-            .execute_unpaged(query, params)
-            .await
-            .map_err(CassandraStoreError::from)?;
+        self.store.execute_unpaged_discard(query, params).await?;
         Ok(())
     }
 

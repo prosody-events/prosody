@@ -86,14 +86,6 @@ where
     Fut: Future,
 {
     /// Creates a new `KeyManager` with the specified processing function.
-    ///
-    /// # Arguments
-    ///
-    /// * `process` - A function that processes a message and returns a future
-    ///
-    /// # Returns
-    ///
-    /// A new `KeyManager` instance
     pub fn new(process: F) -> Self {
         Self {
             process,
@@ -107,12 +99,8 @@ where
     /// Processes incoming messages from a stream until draining is signaled or
     /// the stream ends, then waits for in-flight tasks to complete.
     ///
-    /// # Arguments
-    ///
-    /// * `messages` - A stream of incoming messages to process
-    /// * `heartbeat` - A heartbeat used to detect stalled processing
-    /// * `shutdown_rx` - Receiver for [`ShutdownPhase`] transitions; the main
-    ///   loop exits at `Draining` and the drain loop exits at `Terminating`
+    /// `shutdown_rx` signals [`ShutdownPhase`] transitions: the main loop
+    /// exits at `Draining` and the drain loop exits at `Terminating`.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
@@ -186,10 +174,6 @@ where
     ///
     /// Called only from the main loop while draining has not yet been
     /// signaled (biased select guarantees this).
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message to dispatch
     #[instrument(level = "debug", skip(self))]
     fn dispatch_message(&mut self, message: M)
     where
@@ -214,10 +198,6 @@ where
     ///
     /// Called only from the main loop while draining has not yet been
     /// signaled (biased select guarantees this).
-    ///
-    /// # Arguments
-    ///
-    /// * `hash_value` - The hash value of the key whose processing completed
     #[instrument(level = "debug", skip(self))]
     fn handle_completion(&mut self, hash_value: HashValue)
     where
@@ -241,11 +221,6 @@ where
     }
 
     /// Enqueues a message for a key that is currently busy.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message to enqueue
-    /// * `hash_value` - The hash value of the message's key
     #[instrument(level = "debug", skip(self))]
     fn enqueue_message(&mut self, message: M, hash_value: HashValue)
     where
@@ -263,11 +238,6 @@ where
     ///
     /// Called only while draining has not yet been signaled — no drain check
     /// needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message to process
-    /// * `hash_value` - The hash value of the message's key
     #[instrument(level = "debug", skip(self))]
     fn process_message(&mut self, message: M, hash_value: HashValue)
     where

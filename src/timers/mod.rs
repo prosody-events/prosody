@@ -19,8 +19,8 @@
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
-//! use prosody::timers::store::TriggerStore;
 //! use prosody::timers::UncommittedTimer;
+//! use prosody::timers::store::TriggerStore;
 //!
 //! struct MyHandler;
 //!
@@ -58,12 +58,14 @@ pub use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::ParseError;
 use arc_swap::ArcSwap;
 use educe::Educe;
+use opentelemetry::Context;
 use rand::RngExt;
 use serde::Serialize;
 use std::sync::Arc;
 use strum::EnumCount;
 use tokio::sync::Semaphore;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod active;
 pub mod datetime;
@@ -75,6 +77,10 @@ mod scheduler;
 mod segment;
 mod slab;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
 pub mod uncommitted;
 
 /// Classifies a timer by its origin, used to route and account for execution
@@ -83,8 +89,8 @@ pub mod uncommitted;
 /// Application code should use [`TimerType::Application`] when scheduling
 /// timers via [`crate::consumer::event_context::EventContext::schedule`] or
 /// [`crate::consumer::event_context::EventContext::clear_and_schedule`].
-/// The `DeferredMessage` and `DeferredTimer` variants are reserved for internal
-/// middleware use.
+/// The `DeferredMessage`, `DeferredTimer`, and `StateRecovery` variants are
+/// reserved for internal middleware use.
 #[derive(
     Copy,
     Clone,
@@ -110,7 +116,45 @@ pub enum TimerType {
     DeferredMessage = 1,
     /// Internal: timer scheduled by defer middleware to retry a failed timer.
     DeferredTimer = 2,
+    /// Internal: keyed-state recovery sweep scheduled by the keyed-state
+    /// middleware after stage. Routes back into the middleware on fire and is
+    /// never dispatched to user handlers.
+    StateRecovery = 3,
 }
+
+impl TimerType {
+    /// `true` only for [`TimerType::Application`] — timers scheduled by user
+    /// code, as opposed to the framework-internal types.
+    ///
+    /// This is the span-level axis: spans for application timers export at
+    /// INFO, spans for internal timer types at DEBUG, so a trace filtered at
+    /// INFO contains only spans the user's own code caused (see the
+    /// crate-internal `timer_span!` macro). The match is exhaustive so a new
+    /// variant must pick a side.
+    #[must_use]
+    pub fn is_application(self) -> bool {
+        match self {
+            Self::Application => true,
+            Self::DeferredMessage | Self::DeferredTimer | Self::StateRecovery => false,
+        }
+    }
+}
+
+/// Creates a timer-operation span at the level owed to its [`TimerType`]:
+/// `info_span!` for application timers, `debug_span!` for framework-internal
+/// ones (the [`TimerType::is_application`] invariant). A macro because a
+/// tracing callsite's level is static — selecting it at runtime requires
+/// branching between two invocations.
+macro_rules! timer_span {
+    ($timer_type:expr, $name:literal $(, $($fields:tt)*)?) => {
+        if $crate::timers::TimerType::is_application($timer_type) {
+            ::tracing::info_span!($name $(, $($fields)*)?)
+        } else {
+            ::tracing::debug_span!($name $(, $($fields)*)?)
+        }
+    };
+}
+pub(crate) use timer_span;
 
 impl From<TimerType> for i8 {
     fn from(timer_type: TimerType) -> Self {
@@ -126,6 +170,7 @@ impl TryFrom<i8> for TimerType {
             0 => Ok(Self::Application),
             1 => Ok(Self::DeferredMessage),
             2 => Ok(Self::DeferredTimer),
+            3 => Ok(Self::StateRecovery),
             _ => Err(ParseError::UnknownTimerType(value)),
         }
     }
@@ -181,11 +226,30 @@ impl TimerRequest {
     }
 }
 
+/// Tracing state of a [`Trigger`], from scheduling to dispatch.
+///
+/// A trigger starts `Scheduled`, holding only the scheduling-time
+/// [`Context`] — captured at construction for in-process triggers, or
+/// deserialized from storage for restored ones. Spans are never persisted or
+/// carried pre-fire: a span must finish to flush, while a context is plain
+/// data, so memory- and Cassandra-backed triggers hold exactly the same
+/// thing. At fire time [`FiringTimer::set_dispatch_span`] creates the live
+/// dispatch span from that context and moves the trace to `Dispatched`.
+///
+/// [`FiringTimer::set_dispatch_span`]: uncommitted::FiringTimer::set_dispatch_span
+#[derive(Debug)]
+pub(crate) enum TriggerTrace {
+    /// Pre-dispatch: the scheduling-time trace context.
+    Scheduled(Context),
+    /// Post-dispatch: the live dispatch span.
+    Dispatched(Span),
+}
+
 /// Scheduled timer event containing execution metadata.
 ///
 /// Contains the key, execution time, timer type, and tracing context for a
-/// timer that will fire at a specific moment. The `span` and `tag` fields are
-/// excluded from equality and ordering comparisons.
+/// timer that will fire at a specific moment. The `trace` and `tag` fields
+/// are excluded from equality and ordering comparisons.
 ///
 /// `tag` is excluded from `Hash/Eq/Ord` to preserve the schema's primary-key
 /// invariant `(key, time, timer_type)`: two `Trigger`s for the same logical
@@ -209,9 +273,12 @@ pub struct Trigger {
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
     pub tag: i32,
 
-    /// Tracing span for distributed observability context.
+    /// Tracing state for distributed observability; phase invariant documented
+    /// on [`TriggerTrace`]. A duplicate insert may replace one `Scheduled`
+    /// trace with a newer one ([`Trigger::adopt_trace_from`]) — never the
+    /// reverse.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    span: Arc<ArcSwap<Span>>,
+    trace: Arc<ArcSwap<TriggerTrace>>,
 }
 
 /// Logical identity of a timer.
@@ -227,23 +294,13 @@ impl Trigger {
     ///
     /// Generates a fresh random `tag` via `rand::rng().random::<i32>()` so
     /// every newly constructed trigger has a unique identity.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` – Entity key identifying what this timer belongs to
-    /// * `time` – When this timer should execute
-    /// * `timer_type` – Timer type classification
-    /// * `span` – Tracing span for distributed observability context
     #[must_use]
     pub fn new(key: Key, time: CompactDateTime, timer_type: TimerType, span: Span) -> Self {
         Self::with_tag(key, time, timer_type, rand::rng().random::<i32>(), span)
     }
 
-    /// Restore-from-store constructor. Preserves the loaded `tag`.
-    ///
-    /// Use this when deserializing a trigger from persistent storage so the
-    /// stored tag value is kept intact rather than replaced with a fresh
-    /// random.
+    /// Creates a trigger with a caller-provided `tag`, capturing `span`'s
+    /// context as the scheduling context.
     #[must_use]
     pub fn with_tag(
         key: Key,
@@ -252,12 +309,29 @@ impl Trigger {
         tag: i32,
         span: Span,
     ) -> Self {
+        // The span is consumed by value at the scheduling boundary; only its
+        // context survives into the trace (see `TriggerTrace`).
+        let context = span.context();
+        drop(span);
+        Self::restored(key, time, timer_type, tag, context)
+    }
+
+    /// Restore-from-store constructor: preserves the stored `tag` and carries
+    /// the persisted scheduling `context` directly.
+    #[must_use]
+    pub fn restored(
+        key: Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        tag: i32,
+        context: Context,
+    ) -> Self {
         Self {
             key,
             time,
             timer_type,
             tag,
-            span: ArcSwap::from_pointee(span).into(),
+            trace: ArcSwap::from_pointee(TriggerTrace::Scheduled(context)).into(),
         }
     }
 
@@ -270,19 +344,40 @@ impl Trigger {
         Self::with_tag(key, time, timer_type, 0, Span::current())
     }
 
-    /// Returns the tracing span associated with this trigger.
+    /// Returns the live dispatch span, or `Span::none()` before dispatch.
+    ///
+    /// Pre-dispatch a trigger holds only a scheduling [`Context`] — there is
+    /// no live span to return until
+    /// [`FiringTimer::set_dispatch_span`](uncommitted::FiringTimer::set_dispatch_span)
+    /// installs one at fire time. Use [`Trigger::context`] for the trace
+    /// context, which exists in both phases.
     #[must_use]
     pub fn span(&self) -> Span {
-        let span = self.span.load();
-        span.as_ref().clone()
+        match &**self.trace.load() {
+            TriggerTrace::Scheduled(_) => Span::none(),
+            TriggerTrace::Dispatched(span) => span.clone(),
+        }
     }
 
-    /// Replaces the tracing span on this trigger.
-    ///
-    /// Used to refresh context when a duplicate trigger is inserted, ensuring
-    /// the most recent caller's trace context is preserved.
+    /// Returns the trace context: the scheduling context before dispatch, or
+    /// the dispatch span's context after.
+    #[must_use]
+    pub fn context(&self) -> Context {
+        match &**self.trace.load() {
+            TriggerTrace::Scheduled(context) => context.clone(),
+            TriggerTrace::Dispatched(span) => span.context(),
+        }
+    }
+
+    /// Installs the live dispatch span, moving the trace to `Dispatched`.
     pub fn set_span(&self, span: Span) {
-        self.span.store(Arc::new(span));
+        self.trace.store(Arc::new(TriggerTrace::Dispatched(span)));
+    }
+
+    /// Adopts `other`'s trace, so a duplicate insert re-parents this trigger
+    /// onto the newest caller's trace.
+    pub(crate) fn adopt_trace_from(&self, other: &Self) {
+        self.trace.store(other.trace.load_full());
     }
 
     /// Returns the immutable logical identity for this trigger.

@@ -6,8 +6,8 @@
 //! BATCH only when clustering rows actually need to change.
 //!
 //! **Locking contract.** State-mutating methods call `resolve_state` to obtain
-//! the per-`(key, timer_type)` [`CachedState`] mutex (see
-//! [`crate::timers::store::cassandra::state`]) and hold it from the state
+//! the per-`(key, timer_type)` [`CachedState`](super::state::CachedState) mutex
+//! (see [`crate::timers::store::cassandra::state`]) and hold it from the state
 //! check through the DB write — that is what makes the read-decide-write
 //! sequence linearisable against concurrent callers on the same
 //! `(key, timer_type)`. Read-only stream methods take the same lock briefly
@@ -20,14 +20,22 @@
 //! yielding triggers in `(timer_type, time)` order without issuing a
 //! clustering scan for types that are already inline-or-absent.
 //!
+//! **Restored triggers carry the persisted scheduling context, never a
+//! span.** A fetched trigger is rebuilt via [`Trigger::restored`] from the
+//! stored span map, so its trace is exactly the scheduling-time context —
+//! the origin trace is never touched after scheduling. The configured
+//! `timer_spans` relation is applied exactly once, at fire time, by
+//! [`FiringTimer::set_dispatch_span`] against that context, which is what
+//! makes memory- and Cassandra-backed timers produce identical dispatch-span
+//! topology.
+//!
+//! [`FiringTimer::set_dispatch_span`]: crate::timers::uncommitted::FiringTimer::set_dispatch_span
 //! [`TriggerOperations`]: crate::timers::store::operations::TriggerOperations
 //! [`CassandraTriggerStore`]: crate::timers::store::cassandra::CassandraTriggerStore
 //! [`TimerState`]: crate::timers::store::cassandra::TimerState
 
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::otel::SpanRelation;
-use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -54,7 +62,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, instrument};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 impl TriggerOperations for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
@@ -133,103 +140,36 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    // Note: This method handles a complex edge case due to the mismatch between
-    // SlabId (u32) and the database storage (i32).
-    //
-    // Problem: SlabId is u32 (0 to 4,294,967,295) but Cassandra stores slab_id as
-    // int (i32). When we convert u32 to i32 using byte reinterpretation:
-    // - u32 values 0 to 2,147,483,647 → positive i32 values
-    // - u32 values 2,147,483,648 to 4,294,967,295 → negative i32 values
-    //
-    // This causes "wrap-around" where a range like [2,147,483,640, 2,147,483,660]
-    // becomes [2,147,483,640, -2,147,483,636] in signed representation.
-    // A single SQL query "WHERE slab_id >= start AND slab_id <= end" fails when
-    // start > end.
-    //
-    // Solution: Detect wrap-around and split into two queries:
-    // 1. slab_id >= start AND slab_id <= i32::MAX (for low u32 values, positive
-    //    i32)
-    // 2. slab_id >= i32::MIN AND slab_id <= end (for high u32 values, negative i32)
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
         let segment_id = self.segment.id;
         try_stream! {
-            // First, validate that this is a proper range in u32 space
-            // If start > end in u32 terms, this is an invalid range and we should return
-            // nothing
+            // An invalid range (start > end in u32 terms) yields nothing.
             if range.start() > range.end() {
-                // Invalid range - return empty stream
                 return;
             }
 
             let start = i32::from_le_bytes(range.start().to_le_bytes());
             let end = i32::from_le_bytes(range.end().to_le_bytes());
 
-            // Detect wrap-around: start > end in signed representation means the range
-            // crosses the u32/i32 boundary (around 2^31), not that it's an invalid range
-            if start > end {
-                // Wrap-around case: split into two queries to cover the full range
-
-                // Query 1: Handle the "low" u32 values that remain as positive i32 values
-                // This covers slab_id >= start up to the maximum i32 value
-                let stream1 = self
-                    .session()
-                    .execute_iter(
-                        self.queries().get_slab_range.clone(),
-                        (segment_id, start, i32::MAX),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                    .rows_stream::<(Option<i32>,)>()
-                    .map_err(CassandraStoreError::from)?;
-
-                pin_mut!(stream1);
-                while let Some((value,)) = cooperative(stream1.try_next())
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                {
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    yield SlabId::from_le_bytes(value.to_le_bytes())
-                }
-
-                // Query 2: Handle the "high" u32 values that appear as negative i32 values
-                // This covers from minimum i32 value up to slab_id <= end
-                let stream2 = self
-                    .session()
-                    .execute_iter(
-                        self.queries().get_slab_range.clone(),
-                        (segment_id, i32::MIN, end),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                    .rows_stream::<(Option<i32>,)>()
-                    .map_err(CassandraStoreError::from)?;
-
-                pin_mut!(stream2);
-                while let Some((value,)) = cooperative(stream2.try_next())
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                {
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    yield SlabId::from_le_bytes(value.to_le_bytes())
-                }
+            // Reinterpreting a u32 range as i32 bytes can flip `start > end`
+            // even though the u32 range above was valid: u32 values at or
+            // past 2^31 become negative i32 values, so a range straddling
+            // that boundary needs two queries — one for the (still
+            // positive) low half up to `i32::MAX`, one for the (now
+            // negative) high half from `i32::MIN`.
+            let bounds: [Option<(i32, i32)>; 2] = if start > end {
+                [Some((start, i32::MAX)), Some((i32::MIN, end))]
             } else {
-                // Normal case: no wrap-around, single query is sufficient
-                // Both start and end have the same sign in i32 representation
+                [Some((start, end)), None]
+            };
+
+            for (lo, hi) in bounds.into_iter().flatten() {
                 let stream = self
                     .session()
-                    .execute_iter(
-                        self.queries().get_slab_range.clone(),
-                        (segment_id, start, end),
-                    )
+                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, lo, hi))
                     .await
                     .map_err(CassandraStoreError::from)?
                     .rows_stream::<(Option<i32>,)>()
@@ -240,11 +180,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     .await
                     .map_err(CassandraStoreError::from)?
                 {
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    yield SlabId::from_le_bytes(value.to_le_bytes())
+                    let Some(value) = value else { continue };
+                    yield SlabId::from_le_bytes(value.to_le_bytes());
                 }
             }
         }
@@ -369,10 +306,9 @@ impl TriggerOperations for CassandraTriggerStore {
                 cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger");
                 let tag = tag_opt.unwrap_or(0_i32);
 
-                yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
+                yield Trigger::restored(key.into(), time, timer_type, tag, context);
             }
         }
     }
@@ -405,11 +341,9 @@ impl TriggerOperations for CassandraTriggerStore {
                     .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
-                let span =
-                    related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger_all_types");
                 let tag = tag_opt.unwrap_or(0_i32);
 
-                yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
+                yield Trigger::restored(key.into(), time, timer_type, tag, context);
             }
         }
     }
@@ -559,9 +493,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 TimerState::Inline(timer) => {
                     // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
-                    let span =
-                        related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                    yield Trigger::with_tag(key_clone.clone(), timer.time, timer_type, timer.tag, span);
+                    yield Trigger::restored(key_clone.clone(), timer.time, timer_type, timer.tag, context);
                 }
                 TimerState::Overflow => {
                     // Overflow: scan clustering rows.
@@ -583,10 +515,8 @@ impl TriggerOperations for CassandraTriggerStore {
                             .map_err(CassandraStoreError::from)?
                     {
                         let context = self.propagator().extract(&span_map);
-                        let span =
-                            related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger");
                         let tag = tag_opt.unwrap_or(0_i32);
-                        yield Trigger::with_tag(key_clone.clone(), time, timer_type, tag, span);
+                        yield Trigger::restored(key_clone.clone(), time, timer_type, tag, context);
                     }
                 }
                 TimerState::Absent => {
@@ -663,19 +593,27 @@ impl TriggerOperations for CassandraTriggerStore {
 
                 let mut variants_iter = TimerType::VARIANTS.iter();
                 let mut inline_next = advance_inline(
-                    &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                    &key_clone,
+                    &state_map,
+                    &mut variants_iter,
+                    self.propagator(),
                 );
 
                 // For each clustering row, flush any inline entries that
                 // sort before it.
                 while let Some(clustering) = advance_clustering(
-                    &key_clone, &mut clustering_stream, self.propagator(),
+                    &key_clone,
+                    &mut clustering_stream,
+                    self.propagator(),
                 ).await? {
                     while let Some(s) = inline_next.take() {
                         if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
                             yield s;
                             inline_next = advance_inline(
-                                &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                                &key_clone,
+                                &state_map,
+                                &mut variants_iter,
+                                self.propagator(),
                             );
                         } else {
                             inline_next = Some(s);
@@ -689,7 +627,10 @@ impl TriggerOperations for CassandraTriggerStore {
                 while let Some(trigger) = inline_next {
                     yield trigger;
                     inline_next = advance_inline(
-                        &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                        &key_clone,
+                        &state_map,
+                        &mut variants_iter,
+                        self.propagator(),
                     );
                 }
             } else {
@@ -698,9 +639,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 for &tt in TimerType::VARIANTS {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
-                        let span =
-                            related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                        yield Trigger::with_tag(key_clone.clone(), timer.time, tt, timer.tag, span);
+                        yield Trigger::restored(key_clone.clone(), timer.time, tt, timer.tag, context);
                     }
                 }
             }
@@ -1023,13 +962,16 @@ impl TriggerOperations for CassandraTriggerStore {
 
     /// Reads the commit-oracle tag for a single timer at `time`.
     ///
-    /// Uses `resolve_state` (cache-first):
-    /// - **Inline(timer), time matches**: tag from cache (0 DB reads).
-    /// - **Inline(_), time mismatch** or **Absent**: `None` (Inline guarantees
-    ///   no other timers; post-V3 Absent is unambiguous).
-    /// - **Overflow**: SELECT the clustering row's tag column under the per-key
-    ///   mutex so a concurrent promote/demote cannot interleave between the
-    ///   state check and the row read.
+    /// Cache-first via `resolve_state`: a hit answers with zero DB reads.
+    /// This is sound because the partition's single writer is the only
+    /// mutator of this instance's `state_cache`, and the keyed-state commit
+    /// oracle consults through a **clone of this instance** (handle passing
+    /// at partition acquisition — see `StateBackendFactory::for_partition`), so
+    /// writer and oracle share one cache; per-key serialization orders every
+    /// consult against the mutations it must observe. On `Overflow`, the
+    /// clustering row's tag column is read under the per-key mutex so a
+    /// concurrent promote/demote cannot interleave between the state check and
+    /// the row read.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_tag(
         &self,
@@ -1270,7 +1212,7 @@ pub(super) fn extract_span_map(
     trigger: &Trigger,
 ) -> HashMap<String, String> {
     let mut span_map = HashMap::with_capacity(2);
-    let context = trigger.span.load().context();
+    let context = trigger.context();
     propagator.inject_context(&context, &mut span_map);
     span_map
 }
@@ -1291,22 +1233,17 @@ fn advance_inline<'a>(
     })?;
 
     let context = propagator.extract(&timer.span);
-    let span = related_span!(
-        SpanRelation::Child,
-        context.clone(),
-        "fetch_key_trigger_all_types_inline"
-    );
-    Some(Trigger::with_tag(
+    Some(Trigger::restored(
         key.clone(),
         timer.time,
         timer_type,
         timer.tag,
-        span,
+        context,
     ))
 }
 
 /// Returns the next clustering trigger, skipping NULL static-only rows.
-pub(super) async fn advance_clustering(
+async fn advance_clustering(
     key: &Key,
     stream: &mut (
              impl Stream<
@@ -1334,18 +1271,12 @@ pub(super) async fn advance_clustering(
         let tag = tag_opt.unwrap_or(0_i32);
 
         let context = propagator.extract(&span_map);
-        let span = related_span!(
-            SpanRelation::Child,
-            context.clone(),
-            "fetch_key_trigger_all_types"
-        );
-
-        return Ok(Some(Trigger::with_tag(
+        return Ok(Some(Trigger::restored(
             key.clone(),
             time,
             timer_type,
             tag,
-            span,
+            context,
         )));
     }
     Ok(None)

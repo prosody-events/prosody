@@ -13,26 +13,36 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
-use crate::consumer::event_context::{EventContext, TimerContext};
+use crate::consumer::event_context::PartitionEventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
+use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
+use crate::state::manager::{
+    EventStateScope, PartitionStateManager, PartitionStateProvider, SweepResolution,
+};
+use crate::state::session::{CellSession, TerminationWatch};
+use crate::state::{EventRef, TimerEventRef};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
-use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
-use crate::{EventType, Offset, Partition, ProcessScope, Topic};
+use crate::timers::store::{Segment, TriggerStore, TriggerStoreProvider};
+use crate::timers::{
+    PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores, TimerType, UncommittedTimer,
+};
+use crate::{EventIdentity, EventType, Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
-use futures::{Stream, StreamExt, pin_mut};
-use std::future::{Ready, ready};
+use futures::{FutureExt, Stream, StreamExt, pin_mut};
+use std::future::{Future, Ready, ready};
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -43,8 +53,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::{Instant, sleep, sleep_until};
-use tracing::{debug, debug_span, error, info_span, instrument};
-use uuid::Uuid;
+use tracing::{Instrument, debug, debug_span, error, info_span, instrument};
 
 mod keyed;
 mod metrics;
@@ -52,7 +61,7 @@ pub mod offsets;
 mod util;
 
 #[cfg(test)]
-mod test;
+mod tests;
 
 /// Grace period numerator: handlers run uninterrupted for this fraction of
 /// `shutdown_timeout` before the abort signal fires.
@@ -115,9 +124,11 @@ struct PartitionContext<P> {
 /// and filtering options.
 ///
 /// `S` is a [`TriggerStoreProvider`] that creates per-partition stores.
-/// `P` is the payload type carried by consumed messages.
+/// `SP` is a [`PartitionStateProvider`] that acquires per-partition
+/// keyed-state managers. `P` is the payload type carried by consumed
+/// messages.
 #[derive(Clone, Debug)]
-pub struct PartitionConfiguration<S, P> {
+pub struct PartitionConfiguration<S, SP, P> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
@@ -139,9 +150,17 @@ pub struct PartitionConfiguration<S, P> {
     /// Shared counter tracking watermark updates
     pub watermark_version: Arc<CachePadded<AtomicUsize>>,
 
+    /// Deduplication hash version. Threaded into the per-message
+    /// [`EventRef::Message`] dedup id so recovery resolves a message's
+    /// committed state by the exact id the settle boundary records.
+    pub version: Arc<str>,
+
     /// Trigger store provider — creates per-partition stores with independent
     /// caches.
     pub trigger_provider: S,
+
+    /// Keyed-state provider — acquires per-partition state managers.
+    pub state_provider: SP,
 
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
@@ -158,7 +177,7 @@ pub struct PartitionConfiguration<S, P> {
 
     /// Phantom marker for the payload type, used to keep `P` consistent
     /// between [`PartitionConfiguration`] and [`PartitionManager`].
-    pub _payload: PhantomData<fn() -> P>,
+    pub(crate) _payload: PhantomData<fn() -> P>,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -205,19 +224,8 @@ pub struct PartitionManager<P> {
 
 impl<P: Send + 'static> PartitionManager<P> {
     /// Creates a new partition manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The partition configuration
-    /// * `handler` - The message handler that will process messages
-    /// * `topic` - The Kafka topic this partition belongs to
-    /// * `partition` - The partition number
-    ///
-    /// # Returns
-    ///
-    /// A new `PartitionManager<P>` instance
-    pub fn new<T, S>(
-        config: PartitionConfiguration<S, P>,
+    pub fn new<T, S, SP>(
+        config: PartitionConfiguration<S, SP, P>,
         handler: T,
         topic: Topic,
         partition: Partition,
@@ -225,7 +233,10 @@ impl<P: Send + 'static> PartitionManager<P> {
     where
         T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
-        P: Sync + EventType,
+        SP: PartitionStateProvider<S::Store>,
+        <SP::Manager as PartitionStateManager>::Session:
+            CellSession<Loader: MessageLoader<Payload = P>>,
+        P: Sync + EventType + EventIdentity,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -269,11 +280,6 @@ impl<P: Send + 'static> PartitionManager<P> {
     ///
     /// This method indicates whether the internal message queue has capacity
     /// for more messages, which is used to implement backpressure.
-    ///
-    /// # Returns
-    ///
-    /// `true` if there is space in the message queue, `false` if the queue is
-    /// at capacity
     pub fn has_capacity(&self) -> bool {
         self.message_tx.capacity() > 0
     }
@@ -281,17 +287,8 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// Attempts to enqueue a message for processing.
     ///
     /// This non-blocking method tries to send a message to the internal
-    /// processing queue without waiting. If the queue is full or closed,
-    /// the original message is returned.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message to enqueue
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the message was enqueued, or `Err(ConsumerMessage)`
-    /// containing the original message if the queue is full or closed
+    /// processing queue without waiting. If the queue is full or closed, the
+    /// original message is returned to the caller in the `Err` variant.
     pub fn try_send(&self, message: ConsumerMessage<P>) -> Result<(), ConsumerMessage<P>> {
         self.message_tx
             .try_send(message)
@@ -304,12 +301,8 @@ impl<P: Send + 'static> PartitionManager<P> {
     ///
     /// The watermark represents the highest contiguous offset that has been
     /// successfully processed and committed. This is used for offset management
-    /// and reporting consumer progress.
-    ///
-    /// # Returns
-    ///
-    /// The highest contiguous committed offset if any messages have been
-    /// committed, or `None` if no messages have been committed
+    /// and reporting consumer progress. Returns `None` if no messages have
+    /// been committed yet.
     pub fn watermark(&self) -> Option<Offset> {
         self.offsets.watermark()
     }
@@ -326,11 +319,6 @@ impl<P: Send + 'static> PartitionManager<P> {
     ///
     /// This method is used by health monitoring systems to detect processing
     /// issues.
-    ///
-    /// # Returns
-    ///
-    /// `true` if messages are not being processed within the configured stall
-    /// threshold, `false` otherwise
     pub fn is_stalled(&self) -> bool {
         self.offsets.is_stalled() || self.heartbeats.any_stalled()
     }
@@ -343,12 +331,9 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// 3. Waits for in-flight messages to complete processing
     /// 4. Performs final offset commits
     ///
-    /// Used during consumer rebalancing or application shutdown.
-    ///
-    /// # Returns
-    ///
-    /// The final committed offset watermark if shutdown completes successfully,
-    /// or `None` if an error occurs during shutdown
+    /// Used during consumer rebalancing or application shutdown. Returns the
+    /// final committed offset watermark, or `None` if an error occurs during
+    /// shutdown.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
         // Close the message channel to stop accepting new messages
@@ -403,7 +388,6 @@ impl<P: Send + 'static> PartitionManager<P> {
 /// Returns `None` if shutdown is signaled before initialization succeeds.
 /// Arguments for [`init_timer_manager`] that don't depend on the store type.
 struct TimerInitContext<'a> {
-    name: &'a str,
     telemetry_sender: &'a TelemetrySender,
     group_id: &'a Arc<str>,
     timer_semaphores: &'a Arc<TimerSemaphores>,
@@ -425,11 +409,10 @@ where
         }
 
         let timer_config = TimerManagerConfig {
-            name: ctx.name.to_owned(),
             store: trigger_store.clone(),
             telemetry: ctx
                 .telemetry_sender
-                .for_partition(ctx.partition_info.topic, ctx.partition_info.partition),
+                .partition_sender(ctx.partition_info.topic, ctx.partition_info.partition),
             source: ctx.group_id.clone(),
         };
 
@@ -450,35 +433,79 @@ where
     }
 }
 
+/// Acquires the partition's keyed-state manager, retrying on failure until
+/// the shutdown signal is received — the same pattern as
+/// [`init_timer_manager`]. Acquisition is eager: descriptor identities are
+/// validated against the segment's durable rows before any event
+/// dispatches. `trigger_store` is the partition's own store handle, cloned
+/// into each attempt so the commit oracle reads timer tags through the
+/// exact instance the timer manager writes through.
+///
+/// Returns `None` if shutdown is signaled before acquisition succeeds.
+async fn init_state_manager<SP, S>(
+    state_provider: &SP,
+    trigger_store: &S,
+    topic: Topic,
+    partition: Partition,
+    shutdown_rx: &watch::Receiver<ShutdownPhase>,
+) -> Option<SP::Manager>
+where
+    SP: PartitionStateProvider<S>,
+    S: Clone,
+{
+    loop {
+        if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
+            return None;
+        }
+
+        match state_provider
+            .acquire(topic, partition, trigger_store.clone())
+            .await
+        {
+            Ok(manager) => return Some(manager),
+            Err(error) => {
+                error!("failed to acquire keyed-state manager: {error:#}; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// Store-agnostic fields extracted from [`PartitionConfiguration`] for
 /// [`run_partition`].
 struct PartitionParams {
     group_id: Arc<str>,
+    version: Arc<str>,
     allowed_events: Option<AhoCorasick>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
-    name: String,
     timer_spans: SpanRelation,
 }
 
-/// Extracts the store from the provider `S` then delegates to
-/// [`run_partition`], which is generic only over `S::Store`.  This keeps the
-/// provider type `S` out of the long-lived coroutine state machine, preventing
-/// future-size explosion with the deeply nested middleware handler type `T`.
-async fn handle_messages<T, S, P>(
-    config: PartitionConfiguration<S, P>,
+/// Extracts the store from the provider `S` and the state manager from the
+/// provider `SP`, then delegates to [`run_partition`], which is generic
+/// only over `S::Store` and `SP::Manager`. This keeps the provider types
+/// out of the long-lived coroutine state machine, preventing future-size
+/// explosion with the deeply nested middleware handler type `T`.
+async fn handle_messages<T, S, SP, P>(
+    config: PartitionConfiguration<S, SP, P>,
     partition_info: PartitionInfo,
     handler: T,
     context: PartitionContext<P>,
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
-    P: Send + Sync + 'static + EventType,
+    SP: PartitionStateProvider<S::Store>,
+    <SP::Manager as PartitionStateManager>::Session:
+        CellSession<Loader: MessageLoader<Payload = P>>,
+    P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionConfiguration {
         group_id,
+        version,
         allowed_events,
         trigger_provider,
+        state_provider,
         timer_slab_size,
         timer_semaphores,
         telemetry_sender,
@@ -486,32 +513,51 @@ async fn handle_messages<T, S, P>(
         ..
     } = config;
 
-    let name = format!(
-        "{}:{}/{}",
-        group_id, partition_info.topic, partition_info.partition
+    let segment = Segment::for_partition(
+        &group_id,
+        partition_info.topic,
+        partition_info.partition,
+        timer_slab_size,
     );
-    let trigger_store = trigger_provider.create_store(Segment {
-        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
-        name: name.clone(),
-        slab_size: timer_slab_size,
-        version: SegmentVersion::V3,
-    });
+    let trigger_store = trigger_provider.create_store(segment);
+
+    let Some(state_manager) = init_state_manager(
+        &state_provider,
+        &trigger_store,
+        partition_info.topic,
+        partition_info.partition,
+        &context.shutdown_rx,
+    )
+    .await
+    else {
+        return;
+    };
 
     let params = PartitionParams {
         group_id,
+        version,
         allowed_events,
         timer_semaphores,
         telemetry_sender,
-        name,
         timer_spans,
     };
 
-    run_partition(trigger_store, partition_info, handler, context, params).await;
+    run_partition(
+        trigger_store,
+        state_manager,
+        partition_info,
+        handler,
+        context,
+        params,
+    )
+    .await;
 }
 
-/// Core partition loop, generic over `S: TriggerStore` and `P` (payload type).
-async fn run_partition<T, S, P>(
+/// Core partition loop, generic over `S: TriggerStore`, the keyed-state
+/// manager `M`, and `P` (payload type).
+async fn run_partition<T, S, M, P>(
     trigger_store: S,
+    state_manager: M,
     partition_info: PartitionInfo,
     handler: T,
     context: PartitionContext<P>,
@@ -519,14 +565,15 @@ async fn run_partition<T, S, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
-    P: Send + Sync + 'static + EventType,
+    M: PartitionStateManager<Session: CellSession<Loader: MessageLoader<Payload = P>>>,
+    P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionParams {
         group_id,
+        version,
         allowed_events,
         timer_semaphores,
         telemetry_sender,
-        name,
         timer_spans,
     } = params;
     let PartitionContext {
@@ -547,7 +594,6 @@ async fn run_partition<T, S, P>(
     );
 
     let timer_ctx = TimerInitContext {
-        name: &name,
         telemetry_sender: &telemetry_sender,
         group_id: &group_id,
         timer_semaphores: &timer_semaphores,
@@ -577,7 +623,21 @@ async fn run_partition<T, S, P>(
 
     let process = |event: UncommittedEvent<S, P>| async {
         debug!(?event, "calling handler");
-        process_event(event, &handler, &shutdown_rx, &timer_manager, timer_spans).await;
+        process_event(
+            event,
+            &handler,
+            &shutdown_rx,
+            &timer_manager,
+            &state_manager,
+            DedupIdentity {
+                version: version.as_ref(),
+                group_id: group_id.as_ref(),
+                topic: partition_info.topic.as_ref(),
+                partition: partition_info.partition,
+            },
+            timer_spans,
+        )
+        .await;
     };
 
     KeyManager::<UncommittedEvent<S, P>, _, _>::new(process)
@@ -592,45 +652,165 @@ async fn run_partition<T, S, P>(
 }
 
 /// Processes a single event (message or timer) through the handler.
-async fn process_event<T, S, P>(
+///
+/// Each event gets a fresh per-event keyed-state session from the state
+/// manager and a fresh message-cancellation channel; the session's
+/// termination watch shares the channel's receiver with the context, so
+/// descriptor handles observe the same cancellation a timeout middleware
+/// signals through the context.
+async fn process_event<T, S, M, P>(
     event: UncommittedEvent<S, P>,
     handler: &T,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
     timer_manager: &TimerManager<S>,
+    state_manager: &M,
+    dedup_identity: DedupIdentity<'_>,
     timer_spans: SpanRelation,
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
-    P: Send + 'static,
+    M: PartitionStateManager<Session: CellSession<Loader: MessageLoader<Payload = P>>>,
+    P: Send + Sync + 'static + EventIdentity,
 {
     match event {
         UncommittedEvent::Message(message) => {
-            let context = TimerContext::new(
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            // Derive the dedup id for every message — even when no
+            // descriptors are registered — because the EventRef must exist
+            // before we know whether the handler touches state. The
+            // derivation matches the marker the settle boundary records, so
+            // recovery resolves a message by the exact recorded id.
+            let msg = message.message();
+            let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
+            // The scope owns the event's state lifetime; its `Drop` clears the
+            // dirty buffer. Keep it bound (never `let _`) through dispatch and
+            // `invalidate` so it drops last — per-key serialization keeps the
+            // key busy until this future completes, so no next same-key event
+            // sees stale dirty in the drop window.
+            let scope = state_manager.session(
+                msg.key().clone(),
+                EventRef::Message { dedup_id },
+                TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+            );
+            let context = PartitionEventContext::new(
                 message.key().clone(),
                 shutdown_rx.clone(),
+                (cancel_tx, cancel_rx),
                 timer_manager.clone(),
+                scope.handle(),
             );
             let cloned_context = context.clone();
             let _guard = message.process_scope();
-            handler
-                .on_message(context, message, DemandType::Normal)
-                .await;
+            // Instrument with the receive span so handler-created spans (and
+            // `Span::current()` captures like `EventContext::schedule`) nest
+            // under it ambiently.
+            let receive_span = message.span();
+            guarded_dispatch(
+                &scope,
+                handler
+                    .on_message(context, message, DemandType::Normal)
+                    .instrument(receive_span),
+            )
+            .await;
             cloned_context.invalidate();
         }
         UncommittedEvent::Timer(timer) => {
             if let Some(firing) = timer.fire().await {
                 firing.set_dispatch_span(timer_spans);
-                let context = TimerContext::new(
+
+                // `StateRecovery` is framework-internal: the sweep runs
+                // here, owned by the state manager, and user handlers
+                // structurally never see the trigger. State is always
+                // wired, so the sweep is always intercepted (it is inert
+                // when no collections are registered). See
+                // `PartitionStateManager::recover` for the
+                // never-abort-except-shutdown posture behind the
+                // `SweepResolution` mapping below.
+                if firing.timer_type() == TimerType::StateRecovery {
+                    let _guard = firing.process_scope();
+                    let (trigger, commit_guard) = firing.into_inner();
+                    match state_manager
+                        .recover(trigger.key.clone(), timer_manager, shutdown_rx)
+                        .await
+                    {
+                        SweepResolution::Commit => commit_guard.commit().await,
+                        SweepResolution::Abort => commit_guard.abort().await,
+                    }
+                    return;
+                }
+
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                let trigger = firing.trigger();
+                let event = EventRef::Timer(TimerEventRef::new(
+                    trigger.timer_type,
+                    trigger.time,
+                    trigger.tag,
+                ));
+                // Kept bound through dispatch + `invalidate` so its `Drop`
+                // clears the dirty buffer last (see the message arm above).
+                let scope = state_manager.session(
+                    firing.key().clone(),
+                    event,
+                    TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+                );
+                let context = PartitionEventContext::new(
                     firing.key().clone(),
                     shutdown_rx.clone(),
+                    (cancel_tx, cancel_rx),
                     timer_manager.clone(),
+                    scope.handle(),
                 );
                 let cloned_context = context.clone();
                 let _guard = firing.process_scope();
-                handler.on_timer(context, firing, DemandType::Normal).await;
+                // Instrument with the dispatch span so handler-created spans
+                // nest under it ambiently (mirrors the message arm).
+                let dispatch_span = firing.trigger().span();
+                guarded_dispatch(
+                    &scope,
+                    handler
+                        .on_timer(context, firing, DemandType::Normal)
+                        .instrument(dispatch_span),
+                )
+                .await;
                 cloned_context.invalidate();
             }
         }
+    }
+}
+
+/// Runs one event's dispatch under a panic-unwind guard — the single catch
+/// site above every [`EventHandler`] impl (the
+/// blanket durability-boundary impl *and*
+/// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler), since
+/// retry is outermost and its own `on_message`/`on_timer` is `dispatch` here).
+///
+/// On the normal path this returns without action: the event's teardown
+/// (`invalidate`) is hoisted to the two `process_event` call sites, run after
+/// this returns. On an unwind it runs the gate-held terminal
+/// transition on the scope's own session — acquire the closed-gate permit
+/// (which FIFO-serializes *after* any already-admitted mutator, so a detached
+/// op in flight lands fully before the discard), discard the uncommitted
+/// overlay, flip the session terminated, release — then resumes the unwind so
+/// a panic still kills the partition task. It writes **no** epoch: a leaked
+/// current-pin handle is fenced for reads by termination and for mutations
+/// (including `commit()`) by the closed gate, and a genuinely-stale clone stays
+/// fenced by its old pin.
+///
+/// `process_event` legitimately owns the scope, so reaching the sealed
+/// lifecycle through [`EventStateScope::handle`] here is not the tunnel the
+/// settlement/marker split restricts — no `context` accessor is used.
+async fn guarded_dispatch<S, F>(scope: &EventStateScope<S>, dispatch: F)
+where
+    S: CellSession,
+    F: Future<Output = ()>,
+{
+    if let Err(panic) = AssertUnwindSafe(dispatch).catch_unwind().await {
+        let session = scope.handle();
+        let permit = session.close_gate().await;
+        session.discard_dirty();
+        session.terminate();
+        drop(permit);
+        resume_unwind(panic);
     }
 }
 
@@ -642,18 +822,8 @@ async fn process_event<T, S, P>(
 /// - Prevents consumer group loops by filtering messages from the same group
 /// - Filters messages based on their event type (if filtering is configured)
 ///
-/// # Arguments
-///
-/// * `offsets` - Offset tracker for managing message offsets
-/// * `message_rx` - Receiver channel for incoming messages
-/// * `group_id` - Consumer group identifier
-/// * `highest_offset_seen` - Tracks the highest offset processed
-/// * `allowed_events` - Optional filter for permitted event types
-///
-/// # Returns
-///
-/// A stream of [`UncommittedEvent`] items (each wrapping an
-/// [`UncommittedMessage`] or a timer) ready for processing
+/// Yields [`UncommittedEvent`] items (each wrapping an [`UncommittedMessage`]
+/// or a timer) ready for processing.
 fn build_message_stream<T, P>(
     offsets: &OffsetTracker,
     mut message_rx: Receiver<ConsumerMessage<P>>,
@@ -696,16 +866,6 @@ where
 ///
 /// This prevents processing duplicate messages that might be delivered by
 /// Kafka, especially after consumer rebalances.
-///
-/// # Arguments
-///
-/// * `highest_offset_seen` - Reference to the highest offset already processed
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `true` if the message should be processed, `false` if it should be filtered
-/// out
 fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerMessage<P>) -> Ready<bool> {
     let partition = message.partition();
     let offset = message.offset();
@@ -730,16 +890,7 @@ fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerMessage<P>)
 }
 
 /// Reserves an offset for a message and converts it to an uncommitted message.
-///
-/// # Arguments
-///
-/// * `offsets` - The offset tracker to reserve offsets from
-/// * `received` - The consumer message to process
-///
-/// # Returns
-///
-/// `Some(UncommittedMessage)` if the offset was successfully reserved,
-/// `None` if the reservation failed
+/// Returns `None` if the reservation failed.
 async fn reserve_offset<P: Send + 'static>(
     offsets: &OffsetTracker,
     received: ConsumerMessage<P>,
@@ -765,16 +916,7 @@ async fn reserve_offset<P: Send + 'static>(
 }
 
 /// Filters out messages produced by the same consumer group to prevent loops.
-///
-/// # Arguments
-///
-/// * `group_id` - The consumer group ID
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `Some(message)` if the message should be processed,
-/// `None` if it should be filtered out
+/// Returns `None` if the message should be filtered out.
 async fn filter_loops<P: Send + Sync + 'static>(
     group_id: &str,
     message: UncommittedMessage<P>,
@@ -805,17 +947,7 @@ async fn filter_loops<P: Send + Sync + 'static>(
 /// Filters messages based on their event type if filtering is enabled.
 ///
 /// Only messages with event types matching the allowed patterns will be
-/// processed.
-///
-/// # Arguments
-///
-/// * `allowed_events` - Optional automaton defining allowed event type patterns
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `Some(message)` if the message should be processed,
-/// `None` if it should be filtered out
+/// processed. Returns `None` if the message should be filtered out.
 async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,
@@ -833,7 +965,8 @@ async fn filter_event_type<P: Send + Sync + 'static + EventType>(
         info_span!(
             parent: message.span(),
             "message.filtered",
-            reason = "event-type"
+            reason = "event-type",
+            event_type
         )
         .in_scope(|| {
             debug!("skipping message because {event_type} is not an allowed event type");

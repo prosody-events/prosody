@@ -11,8 +11,6 @@
 use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::otel::SpanRelation;
-use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
@@ -26,7 +24,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 use tracing::instrument;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(test)]
 pub mod tests;
@@ -46,11 +43,6 @@ pub(crate) struct V1Operations {
 
 impl V1Operations {
     /// Creates a new `V1Operations` instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Cassandra store providing session and propagator access
-    /// * `queries` - Shared prepared CQL queries
     pub(crate) fn new(store: CassandraStore, queries: Arc<Queries>) -> Self {
         Self { store, queries }
     }
@@ -117,12 +109,11 @@ impl V1Operations {
         slab_id: SlabId,
         trigger: TriggerV1,
     ) -> Result<(), CassandraTriggerStoreError> {
-        // Extract span context from tracing::Span
+        // Serialize the trigger's scheduling context for storage.
         let mut span_map: HashMap<String, String> = HashMap::new();
-        let context = trigger.span.context();
         self.store
             .propagator()
-            .inject_context(&context, &mut span_map);
+            .inject_context(&trigger.context, &mut span_map);
 
         self.store
             .session()
@@ -210,12 +201,11 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context, "fetch_slab_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),
                     time,
-                    span,
+                    context,
                 };
             }
         }
@@ -299,12 +289,11 @@ impl V1Operations {
         segment_id: &SegmentId,
         trigger: TriggerV1,
     ) -> Result<(), CassandraTriggerStoreError> {
-        // Extract span context for v1 trigger
+        // Serialize the trigger's scheduling context for storage.
         let mut span_map: HashMap<String, String> = HashMap::new();
-        let context = trigger.span.context();
         self.store
             .propagator()
-            .inject_context(&context, &mut span_map);
+            .inject_context(&trigger.context, &mut span_map);
 
         self.store
             .session()
@@ -350,12 +339,11 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context, "fetch_key_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),
                     time,
-                    span,
+                    context,
                 };
             }
         }
@@ -416,18 +404,9 @@ impl V1Operations {
     /// 1. The slab index (`timer_slabs` table) - for time-based queries
     /// 2. The key index (`timer_keys` table) - for entity-based queries
     ///
-    /// Both operations execute in parallel using `try_join!` for efficiency.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - The segment identifier
-    /// * `slab_id` - The slab ID (time partition)
-    /// * `trigger` - The trigger to add
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either insertion fails. Partial completion may
-    /// occur if one insert succeeds and the other fails.
+    /// Both operations execute in parallel using `try_join!` for efficiency,
+    /// so if one insertion fails the other may still have succeeded, leaving
+    /// the indices inconsistent until the caller retries.
     #[instrument(level = "debug", skip(self, trigger), err)]
     pub(crate) async fn add_trigger(
         &self,
@@ -453,19 +432,9 @@ impl V1Operations {
     /// 1. The slab index (`timer_slabs` table)
     /// 2. The key index (`timer_keys` table)
     ///
-    /// Both operations execute in parallel using `try_join!` for efficiency.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - The segment identifier
-    /// * `slab_id` - The slab ID (time partition)
-    /// * `key` - The trigger key
-    /// * `time` - The trigger time
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either deletion fails. Partial completion may
-    /// occur if one delete succeeds and the other fails.
+    /// Both operations execute in parallel using `try_join!` for efficiency,
+    /// so if one deletion fails the other may still have succeeded, leaving
+    /// the indices inconsistent until the caller retries.
     #[instrument(level = "debug", skip(self), err)]
     pub(crate) async fn remove_trigger(
         &self,
@@ -494,17 +463,8 @@ impl V1Operations {
     /// 3. Deleting each trigger from its respective slab index (concurrently)
     /// 4. Clearing all triggers from the key index
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - The segment identifier
-    /// * `key` - The key whose triggers should be cleared
-    /// * `slab_size` - The slab size used to calculate slab IDs from trigger
-    ///   times
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any operation fails. Partial completion may occur
-    /// if an error interrupts processing.
+    /// If an error interrupts processing partway through, some triggers may
+    /// already be deleted from one index but not the other.
     #[instrument(level = "debug", skip(self), err)]
     pub(crate) async fn clear_triggers_for_key(
         &self,
@@ -553,15 +513,8 @@ impl V1Operations {
     /// 3. Clearing all triggers from the slab index
     /// 4. Deleting the slab metadata
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - The segment identifier
-    /// * `slab_id` - The slab to delete
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deletion fails. Partial completion may occur
-    /// if an error interrupts processing.
+    /// If an error interrupts processing partway through, some steps may
+    /// already be complete while others are not.
     #[instrument(level = "debug", skip(self), err)]
     pub(crate) async fn delete_slab(
         &self,

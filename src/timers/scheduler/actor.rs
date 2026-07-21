@@ -109,7 +109,15 @@ pub(super) async fn run_actor<T>(
     loop {
         heartbeat.beat();
 
-        if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
+        // Serve commands through `Draining` — in-flight handlers still arm
+        // recovery backstops as they settle, and their contexts permit timer
+        // ops until `Cancelling`. Exit only once `Cancelling` is visible. This
+        // gate owns the exit decision; the `changed()` arms below merely wake
+        // a parked actor and route back here. It also bounds the transition
+        // race: `select!` is unbiased, so with commands continuously ready the
+        // wake arm only eventually wins — this loop-boundary check caps that at
+        // one extra command served after `Cancelling`.
+        if *shutdown_rx.borrow() >= ShutdownPhase::Cancelling {
             debug!("Scheduler actor shutting down");
             return;
         }
@@ -133,9 +141,18 @@ pub(super) async fn run_actor<T>(
                     load_step(&mut state, &mut triggers).await;
                 }
                 () = heartbeat.next() => {},
-                _ = shutdown_rx.changed() => {
-                    debug!("Scheduler actor shutting down");
-                    return;
+                // Wake a parked actor on any phase change: an `Ok` falls
+                // through to the loop-top gate, which exits iff the phase is
+                // now `>= Cancelling` (and re-parks otherwise, without
+                // spinning — `changed()` consumes the notification). An `Err`
+                // means every sender dropped below `Cancelling`, so exit.
+                // (`changed()` yields `Result<(), _>`, not a `!Send` `Ref`
+                // like `wait_for`, keeping this spawned future `Send`.)
+                result = shutdown_rx.changed() => {
+                    if result.is_err() {
+                        debug!("Scheduler actor shutting down");
+                        return;
+                    }
                 }
             }
         } else {
@@ -156,9 +173,12 @@ pub(super) async fn run_actor<T>(
                     load_step(&mut state, &mut triggers).await;
                 }
                 () = heartbeat.next() => {},
-                _ = shutdown_rx.changed() => {
-                    debug!("Scheduler actor shutting down");
-                    return;
+                // Wake-and-route-to-the-gate; see the trigger_to_send branch.
+                result = shutdown_rx.changed() => {
+                    if result.is_err() {
+                        debug!("Scheduler actor shutting down");
+                        return;
+                    }
                 }
             }
         }

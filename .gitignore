@@ -1,5 +1,8 @@
 /target
-.claude
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+*/**/.claude/
 debug/
 release/
 *.rs.bk
@@ -14,5 +17,6 @@ Thumbs.db
 *.swp
 .vscode/
 .ai/
+.agents/
 docs/
 specs/

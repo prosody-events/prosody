@@ -13,6 +13,7 @@ use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Type alias for v1 trigger tuple without `timer_type`.
@@ -86,7 +87,7 @@ impl Arbitrary for V1KeyTriggerTestInput {
                     let trigger = TriggerV1 {
                         key: key.clone(),
                         time,
-                        span: Span::current(),
+                        context: Span::current().context(),
                     };
                     V1KeyTriggerOperation::InsertTrigger {
                         segment_id,
@@ -193,10 +194,6 @@ impl V1KeyTriggerModel {
 
 /// Applies v1 key trigger operations to both store and model with inline
 /// verification.
-///
-/// # Errors
-///
-/// Returns an error if operations fail or query results don't match model.
 async fn apply_v1_key_trigger_operations(
     v1_ops: &V1Operations,
     model: &mut V1KeyTriggerModel,

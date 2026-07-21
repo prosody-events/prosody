@@ -8,9 +8,16 @@
 //! The cache is shared across all partitions so it survives partition
 //! reassignments without cold-start penalties.
 //!
-//! The middleware sits just inside the retry layer on the pipeline consumer.
-//! It is optional — setting `cache_capacity = 0` disables it via the
-//! [`Option<M>`](crate::consumer::middleware::optional) pattern.
+//! The middleware lives in the common block (built by
+//! `build_common_middleware`), just outside `cancellation`. It is a
+//! **stateless duplicate filter**: a dedup hit short-circuits before the
+//! inner runs. The marker it checks is the boundary-readable message
+//! identity (`message_marker()` — the session `EventRef`'s dedup id, or the
+//! deferred-reload override), and the marker **write** belongs to the
+//! `settle` durability boundary, strictly after the stage — filter and
+//! record read the same accessor, so they cannot disagree, and the commit
+//! marker can never precede the durable state it certifies. Deduplication is
+//! mandatory; there is no disabled variant.
 //!
 //! # Apply hooks
 //!
@@ -21,7 +28,7 @@
 pub mod cassandra;
 pub mod config;
 pub mod memory;
-pub mod queries;
+pub(crate) mod queries;
 pub mod store;
 #[cfg(test)]
 pub mod tests;
@@ -43,14 +50,16 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+    Settlement, SettlementHandler,
 };
+use crate::state::session::MarkerAccessExt;
 use crate::timers::Trigger;
 use crate::{EventIdentity, Partition, Topic};
 
 pub use self::cassandra::{CassandraDeduplicationStore, CassandraDeduplicationStoreProvider};
 pub use self::config::{
-    DeduplicationConfiguration, DeduplicationConfigurationBuilder,
-    DeduplicationConfigurationBuilderError,
+    DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, DeduplicationConfigurationBuilder,
+    DeduplicationConfigurationBuilderError, IDEMPOTENCE_VERSION_ENV,
 };
 pub use self::memory::{MemoryDeduplicationStore, MemoryDeduplicationStoreProvider};
 pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
@@ -58,7 +67,6 @@ pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
 /// Shared state for the deduplication middleware.
 #[derive(Clone, Debug)]
 struct DeduplicationShared<S> {
-    config: DeduplicationConfiguration,
     group_id: Arc<str>,
     store_provider: S,
 }
@@ -78,34 +86,32 @@ pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
 }
 
 impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
-    /// Creates a new middleware, or `None` if `cache_capacity == 0`.
+    /// Creates a new middleware.
+    ///
+    /// Deduplication is mandatory: it is the commit oracle for keyed state, so
+    /// there is no disabled variant.
     ///
     /// # Errors
     ///
     /// Returns `ValidationErrors` if the configuration is invalid.
     pub fn new(
-        config: DeduplicationConfiguration,
+        config: &DeduplicationConfiguration,
         group_id: &str,
         store_provider: S,
-    ) -> Result<Option<Self>, validator::ValidationErrors> {
+    ) -> Result<Self, validator::ValidationErrors> {
         config.validate()?;
 
-        if config.cache_capacity == 0 {
-            return Ok(None);
-        }
-
-        Ok(Some(Self {
+        Ok(Self {
             shared: Arc::new(DeduplicationShared {
-                config,
                 group_id: Arc::from(group_id),
                 store_provider,
             }),
             _payload: PhantomData,
-        }))
+        })
     }
 }
 
-impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> HandlerMiddleware<P>
+impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static> HandlerMiddleware<P>
     for DeduplicationMiddleware<S, P>
 {
     type Provider<T>
@@ -136,7 +142,6 @@ pub struct DeduplicationProvider<T, S: DeduplicationStoreProvider> {
 impl<T, S> FallibleHandlerProvider for DeduplicationProvider<T, S>
 where
     T: FallibleHandlerProvider,
-    <T::Handler as FallibleHandler>::Payload: EventIdentity,
     S: DeduplicationStoreProvider,
 {
     type Handler = DeduplicationHandler<T::Handler, S::Store>;
@@ -148,33 +153,25 @@ where
                 .store_provider
                 .create_store(topic, partition, &self.shared.group_id);
 
-        DeduplicationHandler {
-            inner,
-            store,
-            version: self.shared.config.version.clone(),
-            group_id: self.shared.group_id.clone(),
-            topic,
-            partition,
-        }
+        DeduplicationHandler { inner, store }
     }
 }
 
 /// Handler that checks messages against the shared dedup store (with cache).
+#[derive(Clone)]
 pub struct DeduplicationHandler<T, S: DeduplicationStore> {
-    inner: T,
-    store: S,
-    version: String,
-    group_id: Arc<str>,
-    topic: Topic,
-    partition: Partition,
+    pub(crate) inner: T,
+    pub(crate) store: S,
 }
 
 /// Computes the dedup UUID for a message.
 ///
 /// Length-prefixes each field before hashing so that adjacent fields cannot
-/// be confused — the prefix is load-bearing for canonical equality. Both
-/// the deduplication middleware and any future state-middleware WAL writer
-/// must call this function with the same arguments to produce the same UUID.
+/// be confused — the prefix is load-bearing for canonical equality. Every
+/// deriver of a message's dedup UUID — the partition loop's per-message
+/// `EventRef` derivation and the deferred-reload override, both through
+/// [`dedup_uuid_for_message`] — must call this function with identical
+/// arguments to produce the same UUID.
 #[must_use]
 pub fn dedup_uuid(
     version: &str,
@@ -209,29 +206,56 @@ pub fn dedup_uuid(
     uuid::Builder::from_custom_bytes(hash.to_le_bytes()).into_uuid()
 }
 
-impl<T, S> DeduplicationHandler<T, S>
+/// The fixed coordinates a consumer deduplicates a partition's messages
+/// under: the hash version, consumer group, topic, and partition. These four
+/// never vary across a partition's message stream — only the per-message key,
+/// event id, and offset do. Bundled so every deriver of a message's id — the
+/// partition loop building the `EventRef`, the message-defer reload setting
+/// the identity override, and the keyed-state recovery oracle — uses the
+/// same identity, and passed by value (it borrows; the fields are cheap to
+/// reference).
+#[derive(Clone, Copy)]
+pub struct DedupIdentity<'a> {
+    /// Deduplication hash version.
+    pub version: &'a str,
+    /// Consumer group.
+    pub group_id: &'a str,
+    /// Kafka topic.
+    pub topic: &'a str,
+    /// Kafka partition.
+    pub partition: Partition,
+}
+
+/// Computes the dedup UUID for a message, assembling the per-message hash
+/// arguments (key, `event_id`, offset) from `message` and the fixed
+/// coordinates from `identity` in one place.
+///
+/// This is the single source of truth for the message → dedup-id mapping,
+/// with exactly two callers: the partition loop (minting each message's
+/// `EventRef::Message { dedup_id }`, which the settle boundary records and
+/// this middleware's filter checks) and the message-defer reload (setting
+/// the session's identity override for the reloaded message). Both must use
+/// the same [`DedupIdentity`] so derivations cannot drift apart on the
+/// `event_id`/offset branch selection inside [`dedup_uuid`].
+#[must_use]
+pub fn dedup_uuid_for_message<P>(identity: DedupIdentity<'_>, message: &ConsumerMessage<P>) -> Uuid
 where
-    T: FallibleHandler,
-    T::Payload: EventIdentity,
-    S: DeduplicationStore,
+    P: EventIdentity,
 {
-    fn dedup_uuid_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
-        dedup_uuid(
-            &self.version,
-            &self.group_id,
-            &self.topic,
-            self.partition,
-            message.key().as_bytes(),
-            message.payload().event_id().map(str::as_bytes),
-            message.offset(),
-        )
-    }
+    dedup_uuid(
+        identity.version,
+        identity.group_id,
+        identity.topic,
+        identity.partition,
+        message.key().as_bytes(),
+        message.payload().event_id().map(str::as_bytes),
+        message.offset(),
+    )
 }
 
 impl<T, S> FallibleHandler for DeduplicationHandler<T, S>
 where
     T: FallibleHandler,
-    T::Payload: EventIdentity,
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
@@ -247,15 +271,23 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
-        let id = self.dedup_uuid_for_message(&message);
-
-        if self
-            .store
-            .exists(id)
-            .await
-            .map_err(|e| DeduplicationError::Store(Box::new(e)))?
+        // The filter reads the same boundary-readable identity the settle
+        // boundary records (the session EventRef's dedup id, or the
+        // deferred-reload override), so filter and record cannot disagree.
+        // A context with no marker source (stateless / invalidated session)
+        // dispatches unfiltered.
+        let marker = context
+            .marker_identity()
+            .ok()
+            .and_then(|marker| marker.message_marker());
+        if let Some(marker) = marker
+            && self
+                .store
+                .exists(marker.into_uuid())
+                .await
+                .map_err(|e| DeduplicationError::Store(Box::new(e)))?
         {
             info_span!(
                 parent: message.span(),
@@ -268,27 +300,11 @@ where
             return Ok(None);
         }
 
-        // Process message.
-        let result = self
-            .inner
+        self.inner
             .on_message(context, message, demand_type)
             .await
-            .map_err(DeduplicationError::Inner);
-
-        // Record on success or permanent error.
-        let should_dedup = match &result {
-            Ok(_) => true,
-            Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
-        };
-
-        if should_dedup {
-            self.store
-                .insert(id)
-                .await
-                .map_err(|e| DeduplicationError::Store(Box::new(e)))?;
-        }
-
-        result.map(Some)
+            .map(Some)
+            .map_err(DeduplicationError::Inner)
     }
 
     async fn on_timer<C>(
@@ -298,7 +314,7 @@ where
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
         self.inner
             .on_timer(context, trigger, demand_type)
@@ -309,16 +325,15 @@ where
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
-        // The `Err(Store(_))` arm covers two cases:
-        //   1. Inner did not run (store read failed before dispatch).
-        //   2. Inner ran, then the post-inner store write failed.
-        // Both deliberately suppress the inner's apply hook. `Store(_)` is
-        // classified as Transient (see `ClassifyError` impl below), so the
-        // outer retry layer will redrive the whole stack and the inner sees
-        // a fresh invocation. Apply hooks are best-effort by design — see
-        // `FallibleHandler::after_commit` docs.
+        // `Store(_)` arises only from the `exists` read before dispatch —
+        // the inner never ran — so suppressing the inner's apply hook is
+        // correct. `Store(_)` is classified Transient (see `ClassifyError`
+        // below), so the outer retry layer redrives the whole stack and the
+        // inner sees a fresh invocation. (The marker is never written here;
+        // the `settle` boundary records it after the stage.) Apply hooks
+        // are best-effort by design — see `FallibleHandler::after_commit`.
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
             Ok(None) | Err(DeduplicationError::Store(_)) => {}
@@ -330,11 +345,10 @@ where
 
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
-        C: EventContext,
+        C: EventContext<Payload = T::Payload>,
     {
-        // See `after_commit`: `Err(Store(_))` covers both pre-inner read
-        // failure and post-inner write failure. Both suppress the inner hook;
-        // retry redrives.
+        // See `after_commit`: `Err(Store(_))` is the pre-inner read failure;
+        // the inner never ran, so suppress its hook and let retry redrive.
         match result {
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
             Ok(None) | Err(DeduplicationError::Store(_)) => {}
@@ -346,6 +360,25 @@ where
 
     async fn shutdown(self) {
         self.inner.shutdown().await;
+    }
+}
+
+impl<T, S> SettlementHandler for DeduplicationHandler<T, S>
+where
+    T: SettlementHandler,
+    S: DeduplicationStore,
+{
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        match result {
+            // Inner ran: its result is the dispatch's outcome.
+            Ok(Some(output)) => T::settlement(Ok(output)),
+            Err(DeduplicationError::Inner(error)) => T::settlement(Err(error)),
+            // `Ok(None)` — dedup hit: the message already committed on an
+            // earlier dispatch; nothing here may stage or re-record.
+            // `Store(_)` — the filter's read failed before the inner ran: a
+            // layer failure, not the event's outcome.
+            Ok(None) | Err(DeduplicationError::Store(_)) => Settlement::Bypassed,
+        }
     }
 }
 

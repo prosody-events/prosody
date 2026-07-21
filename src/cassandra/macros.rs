@@ -13,19 +13,6 @@ use scylla::statement::prepared::PreparedStatement;
 /// It prepares the given CQL statement and applies performance optimizations:
 /// - Enables cached result metadata for better performance
 /// - Marks the statement as idempotent for safer retries
-///
-/// # Arguments
-///
-/// * `session` - The Cassandra session to use for preparation
-/// * `statement` - The CQL statement string to prepare
-///
-/// # Returns
-///
-/// A [`PreparedStatement`] ready for execution with optimizations applied.
-///
-/// # Errors
-///
-/// Returns an error if statement preparation fails.
 #[doc(hidden)]
 pub(crate) async fn prepare_statement(
     session: &Session,
@@ -153,11 +140,6 @@ macro_rules! cassandra_queries {
         // Generate the impl block with new() function
         impl $name {
             /// Creates a new instance with all prepared statements.
-            ///
-            /// # Arguments
-            ///
-            /// * `session` - Cassandra session to use for statement preparation
-            /// * `keyspace` - Keyspace name for statement preparation
             ///
             /// # Errors
             ///

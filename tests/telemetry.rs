@@ -11,15 +11,8 @@ use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::FallibleHandler;
-use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
-use prosody::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
-use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
-use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
-use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
-use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use prosody::consumer::{ConsumerConfigurationBuilder, DemandType, Keyed};
-use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::high_level::mode::Mode;
 use prosody::high_level::{ConsumerBuilders, HighLevelClient};
 use prosody::producer::ProducerConfigurationBuilder;
@@ -33,83 +26,37 @@ use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use serde_json::{Value, json};
-use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::time::Duration;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 mod common;
+use common::{FallibleTestHandler, TestError, TransientError};
 
 const BOOTSTRAP: &str = "localhost:9094";
 const CASSANDRA_HOST: &str = "localhost:9042";
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Top-level timeout for any single integration test.
-const TEST_TIMEOUT: Duration = Duration::from_secs(45);
-/// Timeout for tests that involve timer scheduling (3 s delay + startup).
-const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(1);
-/// Timeout for defer tests: warm-up + 3 s timer + backoff + telemetry drain.
-const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// Hang-guard for an individual wait on an event that *must* arrive (a message
+/// handler completing, a timer firing, a telemetry record landing). These tests
+/// assert on event *content* — scheduled times, lifecycle completeness — which
+/// is deterministic; the wait itself only guards against a genuine hang, so it
+/// is sized generously. A slow or degraded cluster (e.g. late in a long suite)
+/// must never trip it. Kept comfortably below the per-test deadlines so a hung
+/// step surfaces its own granular error before the outer deadline fires.
+const RECEIVE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Top-level deadline for a single non-timer integration test.
+const TEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// Deadline for tests that involve timer scheduling (a few-second timer delay
+/// plus consumer startup and telemetry drain).
+const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(3);
+/// Deadline for defer tests: warm-up + timer + retry backoff + telemetry drain.
+const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 // ── Test Handlers ────────────────────────────────────────────────────────────
-
-/// Test error type for handler results.
-#[derive(Debug, Clone)]
-struct TestError;
-
-impl Display for TestError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "test error")
-    }
-}
-
-impl Error for TestError {}
-
-impl ClassifyError for TestError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
-    }
-}
-
-/// Handler that forwards message keys to a channel.
-#[derive(Clone)]
-struct ForwardHandler {
-    tx: Sender<String>,
-}
-
-impl FallibleHandler for ForwardHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = Value;
-
-    async fn on_message<C>(
-        &self,
-        _ctx: C,
-        msg: ConsumerMessage<Value>,
-        _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
-    where
-        C: EventContext,
-    {
-        let _ = self.tx.send(msg.key().to_string()).await;
-        Ok(())
-    }
-
-    async fn on_timer<C>(
-        &self,
-        _ctx: C,
-        _trigger: Trigger,
-        _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
-    where
-        C: EventContext,
-    {
-        Ok(())
-    }
-
-    async fn shutdown(self) {}
-}
+//
+// The plain forward-to-channel handler lives in `common`
+// ([`FallibleTestHandler`]); only specialized handlers (error injection,
+// timer scheduling) are defined here.
 
 /// Handler that always fails on messages.
 #[derive(Clone)]
@@ -129,7 +76,7 @@ impl FallibleHandler for FailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.tx.send(msg.key().to_string()).await;
         Err(TestError)
@@ -142,7 +89,7 @@ impl FallibleHandler for FailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -169,7 +116,7 @@ impl FallibleHandler for TimerSchedulingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let schedule_time = CompactDateTime::now()
@@ -189,7 +136,7 @@ impl FallibleHandler for TimerSchedulingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.timer_tx.send(trigger.key.to_string()).await;
         Ok(())
@@ -217,7 +164,7 @@ impl FallibleHandler for TimerFailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let schedule_time = CompactDateTime::now()
@@ -237,7 +184,7 @@ impl FallibleHandler for TimerFailingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let _ = self.timer_tx.send(trigger.key.to_string()).await;
         Err(TestError)
@@ -264,7 +211,7 @@ impl FallibleHandler for TimerCancellingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let schedule_time = CompactDateTime::now()
@@ -287,7 +234,7 @@ impl FallibleHandler for TimerCancellingHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -314,7 +261,7 @@ impl FallibleHandler for ClearAndScheduleHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         let key = msg.key().to_string();
         let step = msg
@@ -352,99 +299,12 @@ impl FallibleHandler for ClearAndScheduleHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
 
     async fn shutdown(self) {}
-}
-
-/// Handler that schedules a timer on first message, then calls
-/// `clear_and_schedule` on second message and reports both the replacement
-/// time and the actual trigger time so the test can verify the inline
-/// replacement path.
-#[derive(Clone)]
-struct InlineReplacementHandler {
-    messages: Sender<String>,
-    replacement_time: Sender<CompactDateTime>,
-    timer_fired: Sender<CompactDateTime>,
-}
-
-impl FallibleHandler for InlineReplacementHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = Value;
-
-    async fn on_message<C>(
-        &self,
-        ctx: C,
-        msg: ConsumerMessage<Value>,
-        _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
-    where
-        C: EventContext,
-    {
-        let key = msg.key().to_string();
-        let step = msg
-            .payload()
-            .get("step")
-            .and_then(Value::as_i64)
-            .ok_or(TestError)?;
-
-        if step == 1 {
-            let schedule_time = CompactDateTime::now()
-                .and_then(|now| now.add_duration(CompactDuration::new(3)))
-                .map_err(|_| TestError)?;
-            ctx.schedule(schedule_time, TimerType::Application)
-                .await
-                .map_err(|_| TestError)?;
-        } else {
-            let new_time = CompactDateTime::now()
-                .and_then(|now| now.add_duration(CompactDuration::new(5)))
-                .map_err(|_| TestError)?;
-            ctx.clear_and_schedule(new_time, TimerType::Application)
-                .await
-                .map_err(|_| TestError)?;
-            let _ = self.replacement_time.send(new_time).await;
-        }
-
-        let _ = self.messages.send(key).await;
-        Ok(())
-    }
-
-    async fn on_timer<C>(
-        &self,
-        _ctx: C,
-        trigger: Trigger,
-        _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
-    where
-        C: EventContext,
-    {
-        let _ = self.timer_fired.send(trigger.time).await;
-        Ok(())
-    }
-
-    async fn shutdown(self) {}
-}
-
-/// Test error type that classifies as transient.
-#[derive(Debug, Clone)]
-struct TransientError;
-
-impl Display for TransientError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "transient test error")
-    }
-}
-
-impl Error for TransientError {}
-
-impl ClassifyError for TransientError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Transient
-    }
 }
 
 /// Fails transiently on `Normal` demand when the key starts with `"defer-"`,
@@ -467,7 +327,7 @@ impl FallibleHandler for TransientMessageHandler {
         demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Non-defer keys always succeed (used to seed the FailureTracker).
         if !msg.key().starts_with("defer-") {
@@ -490,7 +350,7 @@ impl FallibleHandler for TransientMessageHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         Ok(())
     }
@@ -520,7 +380,7 @@ impl FallibleHandler for TransientTimerHandler {
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Non-defer keys don't schedule a timer — just succeed immediately.
         if !msg.key().starts_with("defer-") {
@@ -544,7 +404,7 @@ impl FallibleHandler for TransientTimerHandler {
         demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
-        C: EventContext,
+        C: EventContext<Payload = Self::Payload>,
     {
         // Fail on Normal for defer keys so retry exhausts and defer activates.
         // Only succeed when re-driven by the DeferredTimer.
@@ -575,6 +435,17 @@ async fn create_topic(admin: &ProsodyAdminClient, name: &str) -> Result<()> {
         )
         .await?;
     Ok(())
+}
+
+/// Mints a fresh telemetry topic and a second (source/destination) topic, both
+/// single-partition, and returns the shared admin client alongside their names.
+async fn create_telemetry_topics() -> Result<(&'static ProsodyAdminClient, String, String)> {
+    let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+    let telemetry_topic = Uuid::new_v4().to_string();
+    let topic = Uuid::new_v4().to_string();
+    create_topic(admin, &telemetry_topic).await?;
+    create_topic(admin, &topic).await?;
+    Ok((admin, telemetry_topic, topic))
 }
 
 fn create_telemetry_consumer(telemetry_topic: &str) -> Result<StreamConsumer> {
@@ -677,13 +548,14 @@ fn assert_succeeded_contract(succeeded: &Value, expected_key: &str) -> Result<()
 }
 
 /// Collects telemetry events whose `key` field matches `key` and whose
-/// `type` starts with `"prosody.timer."` until `done` returns `true`
-/// for the accumulated set.
+/// `type` starts with `type_prefix` (`"prosody.timer."` or
+/// `"prosody.message."`) until `done` returns `true` for the accumulated set.
 ///
 /// Each individual `recv` is guarded by `per_event_timeout`.
-async fn collect_timer_events_for_key(
+async fn collect_events_for_key(
     consumer: &StreamConsumer,
     key: &str,
+    type_prefix: &str,
     per_event_timeout: Duration,
     done: impl Fn(&[Value]) -> bool,
 ) -> Result<Vec<Value>> {
@@ -696,8 +568,8 @@ async fn collect_timer_events_for_key(
             .await
             .map_err(|_| {
                 eyre!(
-                    "timed out waiting for timer events for key {key:?}; collected so far: \
-                     {events:?}",
+                    "timed out waiting for {type_prefix}* events for key {key:?}; collected so \
+                     far: {events:?}",
                 )
             })?
             .map_err(|e| eyre!("consumer error: {e}"))?;
@@ -708,11 +580,11 @@ async fn collect_timer_events_for_key(
             continue;
         };
         let matches_key = value.get("key").and_then(Value::as_str) == Some(key);
-        let is_timer = value
+        let matches_type = value
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|t| t.starts_with("prosody.timer."));
-        if matches_key && is_timer {
+            .is_some_and(|t| t.starts_with(type_prefix));
+        if matches_key && matches_type {
             events.push(value);
         }
     }
@@ -757,49 +629,6 @@ fn has_timer_lifecycle(events: &[Value], timer_type: &str) -> bool {
         && matching.contains(&"prosody.timer.dispatched")
         && (matching.contains(&"prosody.timer.succeeded")
             || matching.contains(&"prosody.timer.failed"))
-}
-
-/// Collects telemetry events whose `key` matches and whose `type` starts
-/// with `"prosody.message."` until `done` returns `true` for the accumulated
-/// set.
-///
-/// Each individual `recv` is guarded by `per_event_timeout`.
-async fn collect_message_events_for_key(
-    consumer: &StreamConsumer,
-    key: &str,
-    per_event_timeout: Duration,
-    done: impl Fn(&[Value]) -> bool,
-) -> Result<Vec<Value>> {
-    let mut events = Vec::new();
-    loop {
-        if done(&events) {
-            break;
-        }
-        let msg = timeout(per_event_timeout, consumer.recv())
-            .await
-            .map_err(|_| {
-                eyre!(
-                    "timed out waiting for message events for key {key:?}; collected so far: \
-                     {events:?}",
-                )
-            })?
-            .map_err(|e| eyre!("consumer error: {e}"))?;
-        let Some(payload) = msg.payload() else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_slice::<Value>(payload) else {
-            continue;
-        };
-        let matches_key = value.get("key").and_then(Value::as_str) == Some(key);
-        let is_message = value
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|t| t.starts_with("prosody.message."));
-        if matches_key && is_message {
-            events.push(value);
-        }
-    }
-    Ok(events)
 }
 
 /// Asserts the three-event invariant for a timer: scheduled → dispatched →
@@ -947,66 +776,12 @@ async fn assert_no_telemetry_events(consumer: &StreamConsumer, wait: Duration) -
     Ok(())
 }
 
-/// Build a `HighLevelClient` for best-effort mode with a custom telemetry
-/// topic.
-fn build_client(
+/// Build a `HighLevelClient` in the given mode with a custom telemetry topic.
+fn build_client_with<T: FallibleHandler>(
+    mode: Mode,
     source_topic: &str,
     telemetry_topic: &str,
     emitter_enabled: bool,
-) -> Result<HighLevelClient<ForwardHandler>> {
-    let mut producer_builder = ProducerConfigurationBuilder::default();
-    producer_builder
-        .bootstrap_servers(bootstrap_servers())
-        .source_system("test-telemetry");
-
-    let mut consumer_builder = ConsumerConfigurationBuilder::default();
-    consumer_builder
-        .bootstrap_servers(bootstrap_servers())
-        .group_id(Uuid::new_v4().to_string())
-        .subscribed_topics(vec![source_topic.to_owned()])
-        .probe_port(None);
-
-    let consumer_builders = ConsumerBuilders {
-        consumer: consumer_builder,
-        retry: RetryConfigurationBuilder::default(),
-        failure_topic: FailureTopicConfigurationBuilder::default(),
-        scheduler: SchedulerConfigurationBuilder::default(),
-        monopolization: MonopolizationConfigurationBuilder::default(),
-        defer: DeferConfigurationBuilder::default(),
-        dedup: DeduplicationConfigurationBuilder::default(),
-        timeout: TimeoutConfigurationBuilder::default(),
-        emitter: TelemetryEmitterConfiguration {
-            topic: telemetry_topic.to_owned(),
-            enabled: emitter_enabled,
-        },
-    };
-
-    let mut cassandra_builder = CassandraConfigurationBuilder::default();
-    cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
-
-    let client = HighLevelClient::new(
-        Mode::BestEffort,
-        &mut producer_builder,
-        &consumer_builders,
-        &cassandra_builder,
-    )?;
-    Ok(client)
-}
-
-fn build_typed_client<T: FallibleHandler>(
-    source_topic: &str,
-    telemetry_topic: &str,
-) -> Result<HighLevelClient<T>> {
-    build_typed_client_with_defer(
-        source_topic,
-        telemetry_topic,
-        DeferConfigurationBuilder::default(),
-    )
-}
-
-fn build_typed_client_with_defer<T: FallibleHandler>(
-    source_topic: &str,
-    telemetry_topic: &str,
     defer: DeferConfigurationBuilder,
 ) -> Result<HighLevelClient<T>> {
     let mut producer_builder = ProducerConfigurationBuilder::default();
@@ -1023,29 +798,60 @@ fn build_typed_client_with_defer<T: FallibleHandler>(
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
-        retry: RetryConfigurationBuilder::default(),
-        failure_topic: FailureTopicConfigurationBuilder::default(),
-        scheduler: SchedulerConfigurationBuilder::default(),
-        monopolization: MonopolizationConfigurationBuilder::default(),
         defer,
-        dedup: DeduplicationConfigurationBuilder::default(),
-        timeout: TimeoutConfigurationBuilder::default(),
         emitter: TelemetryEmitterConfiguration {
             topic: telemetry_topic.to_owned(),
-            enabled: true,
+            enabled: emitter_enabled,
         },
+        ..Default::default()
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
     let client = HighLevelClient::new(
-        Mode::Pipeline,
+        mode,
         &mut producer_builder,
         &consumer_builders,
         &cassandra_builder,
     )?;
     Ok(client)
+}
+
+/// Best-effort-mode client using the shared forward-to-channel handler.
+fn build_client(
+    source_topic: &str,
+    telemetry_topic: &str,
+    emitter_enabled: bool,
+) -> Result<HighLevelClient<FallibleTestHandler>> {
+    build_client_with(
+        Mode::BestEffort,
+        source_topic,
+        telemetry_topic,
+        emitter_enabled,
+        DeferConfigurationBuilder::default(),
+    )
+}
+
+fn build_typed_client<T: FallibleHandler>(
+    source_topic: &str,
+    telemetry_topic: &str,
+) -> Result<HighLevelClient<T>> {
+    build_client_with(
+        Mode::Pipeline,
+        source_topic,
+        telemetry_topic,
+        true,
+        DeferConfigurationBuilder::default(),
+    )
+}
+
+fn build_typed_client_with_defer<T: FallibleHandler>(
+    source_topic: &str,
+    telemetry_topic: &str,
+    defer: DeferConfigurationBuilder,
+) -> Result<HighLevelClient<T>> {
+    build_client_with(Mode::Pipeline, source_topic, telemetry_topic, true, defer)
 }
 
 // ── Integration Tests ────────────────────────────────────────────────────────
@@ -1055,27 +861,27 @@ async fn message_lifecycle_events_on_kafka() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client = build_client(&source_topic, &telemetry_topic, true)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        client.subscribe(ForwardHandler { tx: msg_tx }).await?;
+        client
+            .subscribe(FallibleTestHandler {
+                messages_tx: msg_tx,
+            })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client.send(source, "test-key", json!({"v": 1_i32})).await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
-        let events = collect_message_events_for_key(
+        let events = collect_events_for_key(
             &telemetry_consumer,
             "test-key",
+            "prosody.message.",
             RECEIVE_TIMEOUT,
             |evts| has_message_lifecycle(evts, true),
         )
@@ -1096,13 +902,8 @@ async fn producer_message_sent_on_kafka() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let dest_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, dest_topic) = create_telemetry_topics().await?;
         let dest: Topic = dest_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &dest_topic).await?;
 
         let client = build_client(&dest_topic, &telemetry_topic, true)?;
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
@@ -1168,18 +969,17 @@ async fn emitter_disabled_no_events() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client = build_client(&source_topic, &telemetry_topic, false)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        client.subscribe(ForwardHandler { tx: msg_tx }).await?;
+        client
+            .subscribe(FallibleTestHandler {
+                messages_tx: msg_tx,
+            })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -1204,18 +1004,17 @@ async fn json_payload_contract_validation() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client = build_client(&source_topic, &telemetry_topic, true)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        client.subscribe(ForwardHandler { tx: msg_tx }).await?;
+        client
+            .subscribe(FallibleTestHandler {
+                messages_tx: msg_tx,
+            })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -1330,13 +1129,8 @@ async fn message_failed_event_on_kafka() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client: HighLevelClient<FailingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
@@ -1349,9 +1143,10 @@ async fn message_failed_event_on_kafka() -> Result<()> {
         client.send(source, "fail-key", json!({"v": 1_i32})).await?;
         let _ = timeout(RECEIVE_TIMEOUT, fail_rx.recv()).await?;
 
-        let events = collect_message_events_for_key(
+        let events = collect_events_for_key(
             &telemetry_consumer,
             "fail-key",
+            "prosody.message.",
             RECEIVE_TIMEOUT,
             |evts| has_message_lifecycle(evts, false),
         )
@@ -1372,13 +1167,8 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
     timeout(TIMER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client: HighLevelClient<TimerSchedulingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
@@ -1399,11 +1189,12 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         // Wait for timer handler to fire (~3 s delay)
-        let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, timer_rx.recv()).await?;
 
-        let events = collect_timer_events_for_key(
+        let events = collect_events_for_key(
             &telemetry_consumer,
             "timer-key",
+            "prosody.timer.",
             RECEIVE_TIMEOUT,
             |evts| {
                 has_at_least(evts, "prosody.timer.scheduled", 1)
@@ -1428,13 +1219,8 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
     timeout(TIMER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client: HighLevelClient<TimerFailingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
@@ -1455,11 +1241,12 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         // Wait for timer handler to fire (~3 s delay)
-        let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, timer_rx.recv()).await?;
 
-        let events = collect_timer_events_for_key(
+        let events = collect_events_for_key(
             &telemetry_consumer,
             "timer-fail-key",
+            "prosody.timer.",
             RECEIVE_TIMEOUT,
             |evts| {
                 has_at_least(evts, "prosody.timer.scheduled", 1)
@@ -1484,13 +1271,8 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
     timeout(DEFER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let mut defer = DeferConfigurationBuilder::default();
         defer.failure_threshold(1.0_f64);
@@ -1518,13 +1300,14 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
             .await?;
 
         // Wait for the retry to succeed
-        let _ = timeout(Duration::from_secs(30), done_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, done_rx.recv()).await?;
 
         // Collect all timer events — there must be a full scheduled → dispatched
         // → succeeded lifecycle for the deferredMessage timer.
-        let events = collect_timer_events_for_key(
+        let events = collect_events_for_key(
             &telemetry_consumer,
             "defer-msg-key",
+            "prosody.timer.",
             RECEIVE_TIMEOUT,
             |evts| {
                 has_at_least(evts, "prosody.timer.scheduled", 1)
@@ -1549,13 +1332,8 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
     timeout(DEFER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let mut defer = DeferConfigurationBuilder::default();
         defer.failure_threshold(1.0_f64);
@@ -1588,13 +1366,14 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
 
         // Wait for the deferred timer retry to succeed (~3 s application timer
         // + defer backoff)
-        let _ = timeout(Duration::from_secs(30), done_rx.recv()).await?;
+        let _ = timeout(RECEIVE_TIMEOUT, done_rx.recv()).await?;
 
         // Collect timer events until both the application and deferredTimer
         // lifecycles are complete (each has scheduled + dispatched + terminal).
-        let all_events = collect_timer_events_for_key(
+        let all_events = collect_events_for_key(
             &telemetry_consumer,
             "defer-timer-key",
+            "prosody.timer.",
             RECEIVE_TIMEOUT,
             |evts| {
                 has_timer_lifecycle(evts, "application")
@@ -1621,13 +1400,8 @@ async fn timer_cancelled_event_on_kafka() -> Result<()> {
     timeout(TIMER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client: HighLevelClient<TimerCancellingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
@@ -1644,9 +1418,10 @@ async fn timer_cancelled_event_on_kafka() -> Result<()> {
         // Wait for message handler to complete (schedule + cancel inside)
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
-        let events = collect_timer_events_for_key(
+        let events = collect_events_for_key(
             &telemetry_consumer,
             "cancel-key",
+            "prosody.timer.",
             RECEIVE_TIMEOUT,
             |evts| {
                 has_at_least(evts, "prosody.timer.scheduled", 1)
@@ -1694,13 +1469,8 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
     timeout(TIMER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
+        let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
 
         let client: HighLevelClient<ClearAndScheduleHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
@@ -1722,12 +1492,17 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
-        let events =
-            collect_timer_events_for_key(&telemetry_consumer, "cas-key", RECEIVE_TIMEOUT, |evts| {
+        let events = collect_events_for_key(
+            &telemetry_consumer,
+            "cas-key",
+            "prosody.timer.",
+            RECEIVE_TIMEOUT,
+            |evts| {
                 has_at_least(evts, "prosody.timer.scheduled", 2)
                     && has_at_least(evts, "prosody.timer.cancelled", 1)
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         let types: Vec<&str> = events
             .iter()
@@ -1754,79 +1529,6 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
             "expected at least 1 cancelled event (old timer cleared); got {cancelled_count}; \
              types: {types:?}"
         );
-
-        client.unsubscribe().await?;
-        admin.delete_topic(&source_topic).await?;
-        admin.delete_topic(&telemetry_topic).await?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
-}
-
-/// Verifies the Inline→Inline tombstone-free timer replacement path:
-/// `schedule` followed by `clear_and_schedule` on the same key results in
-/// exactly one timer firing at the replacement time.
-#[tokio::test(flavor = "multi_thread")]
-async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
-    timeout(TIMER_TEST_TIMEOUT, async {
-        init_test_logging();
-
-        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
-        let telemetry_topic = Uuid::new_v4().to_string();
-        let source_topic = Uuid::new_v4().to_string();
-        let source: Topic = source_topic.as_str().into();
-
-        create_topic(admin, &telemetry_topic).await?;
-        create_topic(admin, &source_topic).await?;
-
-        let client: HighLevelClient<InlineReplacementHandler> =
-            build_typed_client(&source_topic, &telemetry_topic)?;
-
-        let (messages, mut msg_rx) = channel(16);
-        let (replacement_time, mut replacement_time_rx) = channel(16);
-        let (timer_fired, mut timer_rx) = channel(16);
-        client
-            .subscribe(InlineReplacementHandler {
-                messages,
-                replacement_time,
-                timer_fired,
-            })
-            .await?;
-
-        // Step 1: schedule at t+3s
-        client
-            .send(source, "replace-key", json!({"step": 1_i32}))
-            .await?;
-        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
-
-        // Step 2: clear_and_schedule at t+5s (replaces the original)
-        client
-            .send(source, "replace-key", json!({"step": 2_i32}))
-            .await?;
-        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
-
-        // Capture the replacement time the handler recorded
-        let replacement_time = timeout(RECEIVE_TIMEOUT, replacement_time_rx.recv())
-            .await
-            .map_err(|_| eyre!("timeout waiting for replacement time"))?
-            .ok_or_else(|| eyre!("replacement_time channel closed"))?;
-
-        // Wait for the timer to fire (should be ~5s from step 2)
-        let trigger_time = timeout(Duration::from_secs(15), timer_rx.recv())
-            .await
-            .map_err(|_| eyre!("timeout waiting for on_timer — timer never fired"))?
-            .ok_or_else(|| eyre!("timer_fired channel closed"))?;
-
-        // The timer must fire at the replacement time, not the original
-        ensure!(
-            trigger_time == replacement_time,
-            "timer fired at {trigger_time:?} but expected replacement time {replacement_time:?}"
-        );
-
-        // Verify no second timer fires (the original t+3s was replaced)
-        let second = timeout(Duration::from_secs(5), timer_rx.recv()).await;
-        ensure!(second.is_err(), "expected no second timer but received one");
 
         client.unsubscribe().await?;
         admin.delete_topic(&source_topic).await?;
