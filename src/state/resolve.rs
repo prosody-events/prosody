@@ -207,14 +207,15 @@ where
 /// resurrect a row the committed clear erases — a silently lost committed
 /// clear. Beneath a standing clears-bearing marker the repair therefore
 /// **degrades to peek semantics** (value-only, the scan path's posture, no
-/// durable write): the marker's own resolution supersedes it. If the marker
-/// commits, its positional clear erases the cell (the correct final state —
-/// every provisional cell coexisting with a standing marker predates it, the
-/// same argument `mark_resolved`'s over-report already relies on); if it
-/// aborts, no clears apply and a later first-touch or sweep repairs the cell
-/// durably. This is what keeps [`write_resolved`]'s boundary sound: every
-/// payload that reaches it is handler-fresh and postdates the marker.
+/// durable write): the marker's own resolution supersedes it. Once the marker
+/// settles — a commit lands the frozen clears and promotes the marker's own
+/// staged survivors (the erasure argument on [`commit_provisional`] covers
+/// every other row in a cleared section); an abort applies no clears — a later
+/// first-touch or sweep repairs any still-provisional cell durably. This is
+/// what keeps [`write_resolved`]'s boundary sound: every payload that reaches
+/// it is handler-fresh and postdates the marker.
 ///
+/// [`commit_provisional`]: CellStore::commit_provisional
 /// [`write_resolved`]: CellStore::write_resolved
 pub(crate) async fn resolve_cell<S, O>(
     store: &S,
