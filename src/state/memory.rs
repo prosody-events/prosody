@@ -660,7 +660,7 @@ impl PublicationStore for MemoryPublicationStore {
             subsystem: subsystem.clone(),
             name: name.clone(),
             group_id: Arc::from(group_id),
-            topic: Arc::from(topic.as_ref()),
+            topic,
         });
         Ok(())
     }
@@ -682,15 +682,15 @@ impl PublicationStore for MemoryPublicationStore {
 }
 
 /// One publication row's address in [`MemoryPublicationStore`]'s tree: the full
-/// primary key. `topic` is stored as `Arc<str>` (not [`Topic`]) so the key can
-/// derive `Ord` — `Intern<str>` compares by pointer, not lexical order. The
-/// [`StatePublication`] value keeps the interned `topic`.
+/// primary key. Every field orders deterministically — [`Topic`] is
+/// `Intern<str>`, whose `Ord` delegates to the interned `str` (lexical) — so
+/// the `#[derive(Ord)]` total order is a valid tree ordering directly.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PublicationKey {
     subsystem: SubsystemName,
     name: StateName,
     group_id: Arc<str>,
-    topic: Arc<str>,
+    topic: Topic,
 }
 
 /// Bounding query for every [`PublicationKey`] of one `(subsystem, name)` —
@@ -734,8 +734,7 @@ impl scc::Comparable<PublicationKey> for PublicationScope {
     }
 }
 
-/// Builds the tree key for one publication source. `topic` is copied into an
-/// `Arc<str>` (de-interned) so [`PublicationKey`] can derive `Ord`.
+/// Builds the tree key for one publication source.
 fn publication_key(
     subsystem: &SubsystemName,
     name: &StateName,
@@ -745,7 +744,7 @@ fn publication_key(
         subsystem: subsystem.clone(),
         name: name.clone(),
         group_id: row.group_id.clone(),
-        topic: Arc::from(row.topic.as_ref()),
+        topic: row.topic,
     }
 }
 
