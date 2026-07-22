@@ -27,9 +27,9 @@
 //!   predicate.
 //! - [`CellWrite`] — the mutating remainder: the buffering mutators
 //!   `set`/`clear`/`clear_section` and the mid-handler transactional pair
-//!   `commit`/`rollback`, over its own mutate-permit GAT. `CellWrite: CellRead
-//!   + StateLifecycle + MarkerIdentity`; a read-only handle cannot express a
-//!   mutation because the mutators live only on `CellWrite`.
+//!   `commit`/`rollback`, over its own mutate-permit GAT. It supertraits
+//!   [`CellRead`], `StateLifecycle`, and `MarkerIdentity`; a read-only handle
+//!   cannot express a mutation because the mutators live only on `CellWrite`.
 //!   [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
 //!   (`finalize` and the attempt/teardown verbs — settling moved onto the
@@ -1362,10 +1362,9 @@ where
         Self: 's;
 
     async fn mutate_permit(&self) -> Result<MutatePermit<'_>, StateAccessError> {
-        // The one total admission order under the held permit: pin → closed →
-        // termination (see the trait doc). The permit is held across all three,
-        // and the epoch bump needs the gate exclusively, so the pin is stable
-        // between the check and the mint.
+        // The one total admission order (see the trait doc), applied under the
+        // held permit. The epoch bump needs the gate exclusively, so the pin is
+        // stable between the check and the mint.
         let permit = self.inner.gate.read().await;
         if !self.attempt_current() {
             return Err(StateAccessError::Terminated);

@@ -47,7 +47,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
 use crate::state::session::{
-    CellWrite, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
+    CellRead, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
 use crate::state::{
@@ -1405,7 +1405,7 @@ fn assert_keyset_present(
 /// endpoint peeks (`peek_front == get(0)`, `peek_back == get(len-1)`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
-    S: CellWrite,
+    S: CellRead,
     C: Codec<Payload = Value>,
 {
     if handle.len().await? != model.len() || handle.is_empty().await? != model.is_empty() {
@@ -1435,7 +1435,7 @@ where
 /// `len` is separately pinned to the model at every call site.
 async fn assert_peeks<S, C>(handle: &DequeHandle<S, C>) -> Result<bool>
 where
-    S: CellWrite,
+    S: CellRead,
     C: Codec<Payload = Value>,
 {
     if handle.peek_front().await? != handle.get(0).await? {
@@ -1466,7 +1466,7 @@ where
 /// Collects a deque handle's `stream(dir)` into a vector.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
-    S: CellWrite,
+    S: CellRead,
     C: Codec<Payload = Value>,
 {
     drain(handle.stream(dir)).await
@@ -1480,7 +1480,7 @@ async fn assert_map<S>(
     model: &BTreeMap<i64, Value>,
 ) -> Result<bool>
 where
-    S: CellWrite,
+    S: CellRead,
 {
     for key in KEY_POOL {
         let got = handle.get(&key).await?;
@@ -1515,7 +1515,7 @@ async fn collect_map<S>(
     dir: Direction,
 ) -> Result<Vec<(i64, Value)>>
 where
-    S: CellWrite,
+    S: CellRead,
 {
     drain(handle.stream(dir)).await
 }
@@ -1526,7 +1526,7 @@ async fn collect_map_keys<S>(
     dir: Direction,
 ) -> Result<Vec<i64>>
 where
-    S: CellWrite,
+    S: CellRead,
 {
     drain(handle.keys(dir)).await
 }

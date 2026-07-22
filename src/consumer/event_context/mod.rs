@@ -174,8 +174,9 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// (`type State = C::State`). State itself is Kafka-agnostic, so the
     /// payload tie lives here: the session's loader yields `Self::Payload`,
     /// which keeps Kafka-message handles fully typed inside generic handlers
-    /// without [`CellWrite`] ever naming a payload — its `Loader` associated
-    /// type is pinned to the message loader here.
+    /// without a payload appearing on [`CellRead`]/[`CellWrite`] — the `Loader`
+    /// associated type [`CellRead`] carries is pinned to the message loader
+    /// here.
     type State: CellWrite<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a registered keyed-state collection, returning its typed handle.

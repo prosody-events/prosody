@@ -113,8 +113,8 @@ impl<S: CellRead> CellScope<S> {
             .collection_capacity(self.state_type, &self.name)
     }
 
-    /// Reads one cell's visible committed bytes. Demands a read permit
-    /// (`GateWitness`); `_permit` is a terminal token — the borrow is not
+    /// Reads one cell's visible committed bytes. Demands a read permit;
+    /// `_permit` is a terminal token — the borrow is not
     /// threaded into the unwitnessed [`CellRead`] trait, but the returned
     /// future's edition-2024 lifetime capture still binds it to the gate.
     async fn raw_get(
@@ -155,8 +155,8 @@ impl<S: CellRead> CellScope<S> {
 }
 
 impl<S: CellWrite> CellScope<S> {
-    /// Buffers a set of one cell's bytes. Demands a mutate permit
-    /// (`GateWitness`); see [`Self::raw_get`] for the `_permit` token.
+    /// Buffers a set of one cell's bytes. Demands a mutate permit; see
+    /// [`Self::raw_get`] for the `_permit` token.
     async fn raw_set(
         &self,
         _permit: &S::MutatePermit<'_>,
@@ -169,7 +169,7 @@ impl<S: CellWrite> CellScope<S> {
             .await
     }
 
-    /// Buffers a clear of one cell. Demands a mutate permit (`GateWitness`).
+    /// Buffers a clear of one cell. Demands a mutate permit.
     async fn raw_clear(
         &self,
         _permit: &S::MutatePermit<'_>,
@@ -180,7 +180,7 @@ impl<S: CellWrite> CellScope<S> {
     }
 
     /// Buffers a dirty clear marker over one section; see
-    /// [`CellWrite::clear_section`]. Demands a mutate permit (`GateWitness`).
+    /// [`CellWrite::clear_section`]. Demands a mutate permit.
     async fn clear_section(
         &self,
         _permit: &S::MutatePermit<'_>,
@@ -194,7 +194,7 @@ impl<S: CellWrite> CellScope<S> {
 
     /// Durably commits this collection's buffered ops mid-handler.
     /// At-least-once; see [`CellWrite::commit`] for the contract. Demands a
-    /// mutate permit (`GateWitness`).
+    /// mutate permit.
     async fn raw_commit(
         &self,
         _permit: &S::MutatePermit<'_>,
@@ -224,9 +224,10 @@ impl<S: CellWrite> CellScope<S> {
 /// Every op guards on session termination.
 ///
 /// The one op bound `for<'s> ContextOf<'s, T>: FromSession<'s, S>` sits on the
-/// resolving impl blocks — one for `S: CellRead` (the resolving reads) and one
-/// for `S: CellWrite` (the resolving mutators): it is what lets `get`/`scan`
-/// extract the resolver's context from the session for any lifetime.
+/// resolving read impl block (`S: CellRead`): it is what lets `get`/`scan`
+/// extract the resolver's context from the session for any lifetime. The
+/// mutators need no such bound — `set` only lowers through the resolver's
+/// `stored_from`, and `clear`/`commit` do not resolve at all.
 pub(crate) struct CellView<S, T> {
     scope: CellScope<S>,
     section: Section,
@@ -545,6 +546,60 @@ impl<S: CellWrite, T: CellType> CellView<S, T> {
     pub(in crate::state::descriptor) async fn rollback(&self) -> StoreOutcome {
         self.scope.raw_rollback().await
     }
+
+    /// Lowers `value` through the resolver, encodes it, and buffers a set at
+    /// `key`.
+    ///
+    /// Desugared like [`Self::get`]: the key is lowered to its coordinate and
+    /// the value through the resolver *before* the async block, so only owned
+    /// values cross the buffering await (a borrowed `&KeyOf<T>` never does).
+    ///
+    /// # Errors
+    ///
+    /// Returns a codec error (Permanent) when the cell fails to encode, or an
+    /// access error from the session.
+    pub(in crate::state::descriptor) fn set<'a>(
+        &'a self,
+        permit: &'a S::MutatePermit<'_>,
+        key: &KeyOf<T>,
+        value: WriteOf<'_, T>,
+    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
+        let cell = self.cell(key);
+        let stored = <T::Resolver as CellResolver>::stored_from(value);
+        async move {
+            let buf = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
+            Ok(self.scope.raw_set(permit, &cell, &buf).await?)
+        }
+    }
+
+    /// Buffers a clear of the cell at `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(in crate::state::descriptor) fn clear<'a>(
+        &'a self,
+        permit: &'a S::MutatePermit<'_>,
+        key: &KeyOf<T>,
+    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
+        let cell = self.cell(key);
+        async move { Ok(self.scope.raw_clear(permit, &cell).await?) }
+    }
+
+    /// Durably commits this collection's buffered ops mid-handler — the
+    /// single `commit()` home, draining the whole collection's buffered ops
+    /// (every typed view over the scope), not just this view's cells.
+    /// At-least-once; see [`CellWrite::commit`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(in crate::state::descriptor) async fn commit(
+        &self,
+        permit: &S::MutatePermit<'_>,
+    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.raw_commit(permit).await?)
+    }
 }
 
 impl<S, T> CellView<S, T>
@@ -803,67 +858,6 @@ where
                 yield item?;
             }
         }
-    }
-}
-
-impl<S, T> CellView<S, T>
-where
-    S: CellWrite,
-    T: CellType,
-    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-{
-    /// Lowers `value` through the resolver, encodes it, and buffers a set at
-    /// `key`.
-    ///
-    /// Desugared like [`Self::get`]: the key is lowered to its coordinate and
-    /// the value through the resolver *before* the async block, so only owned
-    /// values cross the buffering await (a borrowed `&KeyOf<T>` never does).
-    ///
-    /// # Errors
-    ///
-    /// Returns a codec error (Permanent) when the cell fails to encode, or an
-    /// access error from the session.
-    pub(in crate::state::descriptor) fn set<'a>(
-        &'a self,
-        permit: &'a S::MutatePermit<'_>,
-        key: &KeyOf<T>,
-        value: WriteOf<'_, T>,
-    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
-        let cell = self.cell(key);
-        let stored = <T::Resolver as CellResolver>::stored_from(value);
-        async move {
-            let buf = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
-            Ok(self.scope.raw_set(permit, &cell, &buf).await?)
-        }
-    }
-
-    /// Buffers a clear of the cell at `key`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(in crate::state::descriptor) fn clear<'a>(
-        &'a self,
-        permit: &'a S::MutatePermit<'_>,
-        key: &KeyOf<T>,
-    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
-        let cell = self.cell(key);
-        async move { Ok(self.scope.raw_clear(permit, &cell).await?) }
-    }
-
-    /// Durably commits this collection's buffered ops mid-handler — the
-    /// single `commit()` home, draining the whole collection's buffered ops
-    /// (every typed view over the scope), not just this view's cells.
-    /// At-least-once; see [`CellWrite::commit`] for the contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(in crate::state::descriptor) async fn commit(
-        &self,
-        permit: &S::MutatePermit<'_>,
-    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        Ok(self.scope.raw_commit(permit).await?)
     }
 }
 
