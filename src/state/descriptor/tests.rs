@@ -458,9 +458,13 @@ fn visibility_and_read_cache_thread_into_the_collection_def() {
     assert_eq!(def.visibility, StateVisibility::Published);
     assert_eq!(def.read_cache, cached);
     assert_eq!(
-        cart().published(false).collection_def().visibility,
+        cart()
+            .published(true)
+            .published(false)
+            .collection_def()
+            .visibility,
         StateVisibility::Private,
-        "published(false) reverts to Private",
+        "published(true).published(false) reverts to Private",
     );
 }
 
