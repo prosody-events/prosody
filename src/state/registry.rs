@@ -89,8 +89,10 @@ pub enum ReadCache {
 
 /// Operational per-collection settings.
 ///
-/// Carries the collection's TTL, [`CommitMode`], and recovery-convergence
-/// bound. `ttl` is `None` for
+/// Carries the collection's per-write operational settings — TTL,
+/// [`CommitMode`], recovery-convergence bound, and the runtime read policy
+/// (visibility and cache) — each detailed on its field below. `ttl` is `None`
+/// for
 /// "do not bind a TTL" (explicit indefinite retention); a `Some(ttl)` over
 /// Cassandra's `USING TTL` ceiling is rejected at
 /// `CollectionDefRegistry::register` time, never silently collapsed.

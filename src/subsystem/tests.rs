@@ -1,4 +1,5 @@
 use super::SubsystemName;
+use crate::error::{ClassifyError, ErrorCategory};
 use quickcheck::{QuickCheck, TestResult};
 
 /// A trimmed-non-empty name is accepted and round-trips as its trimmed form; a
@@ -26,8 +27,11 @@ fn prop_subsystem_name_trims_and_rejects_blank() {
 fn blank_subsystem_names_rejected() {
     for blank in ["", "   ", "\t\n"] {
         assert!(
-            SubsystemName::try_new(blank).is_err(),
-            "blank name {blank:?} must be rejected",
+            matches!(
+                SubsystemName::try_new(blank),
+                Err(e) if e.classify_error() == ErrorCategory::Permanent
+            ),
+            "blank name {blank:?} must be rejected as Permanent",
         );
     }
 }

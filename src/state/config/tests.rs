@@ -199,7 +199,10 @@ fn prop_published_requires_subsystem() {
             let _ = config.register(cart().published(published));
             match config.build_registry() {
                 Ok(_) if published && !with_subsystem => {
-                    color_eyre::eyre::bail!("published-without-subsystem must be rejected")
+                    color_eyre::eyre::bail!(
+                        "published={published} with_subsystem={with_subsystem}: \
+                         published-without-subsystem must be rejected"
+                    )
                 }
                 Ok(_) => Ok(()),
                 Err(RegisterStateError::PublishedWithoutSubsystem { .. })
@@ -207,7 +210,10 @@ fn prop_published_requires_subsystem() {
                 {
                     Ok(())
                 }
-                Err(e) => color_eyre::eyre::bail!("unexpected build_registry error: {e}"),
+                Err(e) => color_eyre::eyre::bail!(
+                    "published={published} with_subsystem={with_subsystem}: unexpected \
+                     build_registry error: {e}"
+                ),
             }
         };
         match build() {

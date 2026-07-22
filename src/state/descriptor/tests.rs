@@ -446,6 +446,24 @@ fn keyset_limit_threads_into_the_collection_def() {
     assert_eq!(descriptor.keyset_limit(7).collection_def().keyset_limit, 7);
 }
 
+/// `.published(bool)` and `.read_cache(..)` thread into the collection def, and
+/// `.published` is a reversible flag, mirroring the other fluent setters.
+#[test]
+fn visibility_and_read_cache_thread_into_the_collection_def() {
+    use std::time::Duration;
+    let cached = ReadCache::Cached {
+        ttl: Duration::from_secs(30),
+    };
+    let def = cart().published(true).read_cache(cached).collection_def();
+    assert_eq!(def.visibility, StateVisibility::Published);
+    assert_eq!(def.read_cache, cached);
+    assert_eq!(
+        cart().published(false).collection_def().visibility,
+        StateVisibility::Private,
+        "published(false) reverts to Private",
+    );
+}
+
 /// An empty descriptor name fails loudly at registration — the
 /// fallible boundary backing the infallible `value_state`.
 #[test]

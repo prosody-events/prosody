@@ -419,8 +419,8 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// different identity.
     fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
-    /// The operational settings (TTL, commit mode) this descriptor carries
-    /// into registration, set via its fluent methods (see [`Self::ttl`]).
+    /// The operational settings this descriptor carries into registration, set
+    /// via its fluent methods (see [`Self::ttl`]).
     ///
     /// Defaults to [`CollectionDef::new`] with `None` (indefinite retention,
     /// read-committed) so framework-internal descriptors need not carry one.
