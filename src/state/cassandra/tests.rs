@@ -11,10 +11,12 @@
 //! collides across runs.
 
 use super::identity::{CassandraDescriptorIdentityStore, IdentityQueries};
+use super::publication::{CassandraPublicationStore, PublicationQueries};
 use crate::cassandra::CassandraStore;
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
+use crate::state::tests::publication_suite::{PublicationTrace, run_publication_trace};
 use crate::test_util::{TEST_RUNTIME, integration_test_count, test_cassandra_config};
 use crate::tracing::init_test_logging;
 use color_eyre::eyre::Result;
@@ -32,6 +34,38 @@ async fn setup() -> Result<CassandraDescriptorIdentityStore> {
 /// A fresh group per iteration so the shared keyspace never collides.
 fn group() -> String {
     Uuid::new_v4().to_string()
+}
+
+async fn publication_setup() -> Result<CassandraPublicationStore> {
+    let config = test_cassandra_config();
+    let cassandra = CassandraStore::new(&config).await?;
+    let queries = Arc::new(PublicationQueries::new(cassandra.session(), &config.keyspace).await?);
+    Ok(CassandraPublicationStore::new(cassandra, queries))
+}
+
+/// The backend-generic publication contract over Cassandra — the same runner
+/// the memory suite drives. A fresh subsystem token per iteration keeps the
+/// shared keyspace collision-free. Connecting via `CassandraStore::new` applies
+/// the new migration to `prosody_test`, so this test also proves it applies
+/// cleanly.
+#[test]
+fn prop_cassandra_publication_trace() {
+    fn prop(trace: PublicationTrace) -> TestResult {
+        let store = match TEST_RUNTIME.block_on(publication_setup()) {
+            Ok(store) => store,
+            Err(error) => return TestResult::error(format!("store setup failed: {error:?}")),
+        };
+        let token = Uuid::new_v4().to_string();
+        match TEST_RUNTIME.block_on(run_publication_trace(&store, &token, trace)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+    init_test_logging();
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(prop as fn(PublicationTrace) -> TestResult);
 }
 
 /// The backend-generic store contract (immutability, namespacing, idempotence)

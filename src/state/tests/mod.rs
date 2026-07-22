@@ -3,6 +3,7 @@ pub(crate) mod cell_suite;
 mod collection_suite;
 mod gate_suite;
 pub(crate) mod identity_suite;
+pub(crate) mod publication_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
@@ -23,6 +24,7 @@ use self::collection_suite::{
     run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
     run_map_ttl_keyset_refresh_trace,
 };
+use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{
     CountingCellStore, CountingOracle, CountingResolver, FixedOracle, ResolveCounter,
     fresh_collection,
@@ -34,7 +36,9 @@ use super::descriptor::{
 };
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
-use super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use super::memory::{
+    MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
+};
 use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
@@ -1332,6 +1336,19 @@ fn prop_memory_apply_idempotence() {
         executor::block_on(run_apply_idempotence(store, oracle, input, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ApplyTrace) -> Result<bool>);
+}
+
+/// Routing-only publication store over the memory backend — the same runner the
+/// Cassandra suite drives. Upsert idempotence, remove, and subsystem/name
+/// isolation, asserted after every op against a `BTreeMap` oracle.
+#[test]
+fn prop_memory_publication_trace() {
+    fn property(trace: PublicationTrace) -> Result<bool> {
+        let store = MemoryPublicationStore::new();
+        let token = Uuid::new_v4().to_string();
+        executor::block_on(run_publication_trace(&store, &token, trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(PublicationTrace) -> Result<bool>);
 }
 
 /// The per-partition backend over a [`CountingCellStore`], so a directed test

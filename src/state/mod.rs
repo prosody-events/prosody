@@ -99,6 +99,7 @@ pub mod oracle;
 pub mod order_codec;
 pub(crate) mod overlay;
 pub(crate) mod production;
+pub mod publication;
 pub mod registry;
 pub mod resolve;
 pub mod session;

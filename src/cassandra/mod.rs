@@ -87,6 +87,10 @@ pub const TABLE_KEYED_STATE_CELL: &str = "keyed_state_cell";
 /// Table for the frozen group-global keyed-state descriptor identities.
 pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 
+/// Table for the routing-only keyed-state publication rows readers discover
+/// sources through.
+pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
+
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
 

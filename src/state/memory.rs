@@ -7,21 +7,27 @@ use super::descriptor_identity::{
 };
 use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
+use super::publication::{PublicationStore, StatePublication};
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
     ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
     resolve_marker, resolve_read,
 };
 use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
-use super::{CollectionId, CollectionRef, EventRef, StateType};
+use super::{CollectionId, CollectionRef, EventRef, StateName, StateType};
+use crate::Topic;
+use crate::subsystem::SubsystemName;
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::Stream;
 use scc::hash_map::Entry;
+use scc::{Guard, TreeIndex};
 use smallvec::SmallVec;
+use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::future::Future;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
@@ -600,6 +606,167 @@ impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
             }
             Entry::Occupied(existing) => Ok(RegisterOutcome::Conflict(existing.get().clone())),
         }
+    }
+}
+
+/// In-memory routing-only [`PublicationStore`].
+///
+/// The discovery half of in-memory keyed state: a [`scc::TreeIndex`] over the
+/// full publication primary key `((subsystem, name), group_id, topic)`, so a
+/// `read_publications` is a prefix range over one `(subsystem, name)`. Cloning
+/// shares the `Arc`, mirroring the sibling memory stores.
+///
+/// Removal path: the [`remove`](PublicationStore::remove) verb drops one source
+/// row, and dropping the last handle drops the whole tree (mock-mode lifetime).
+/// The map is bounded by the live published `(group, topic)` set of the
+/// collections in play — no unbounded keyed growth, and no `Mutex` (scc is
+/// lock-free).
+#[derive(Clone, Debug, Default)]
+pub struct MemoryPublicationStore {
+    rows: Arc<TreeIndex<PublicationKey, StatePublication>>,
+}
+
+impl MemoryPublicationStore {
+    /// Creates an empty publication store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PublicationStore for MemoryPublicationStore {
+    type Error = Infallible;
+
+    async fn upsert(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        row: &StatePublication,
+    ) -> Result<(), Self::Error> {
+        self.rows
+            .upsert_sync(publication_key(subsystem, name, row), row.clone());
+        Ok(())
+    }
+
+    async fn remove(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        group_id: &str,
+        topic: Topic,
+    ) -> Result<(), Self::Error> {
+        self.rows.remove_sync(&PublicationKey {
+            subsystem: subsystem.clone(),
+            name: name.clone(),
+            group_id: Arc::from(group_id),
+            topic: Arc::from(topic.as_ref()),
+        });
+        Ok(())
+    }
+
+    async fn read_publications(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+    ) -> Result<Vec<StatePublication>, Self::Error> {
+        let guard = Guard::new();
+        let out = self
+            .rows
+            .range(PublicationScope::range(subsystem, name), &guard)
+            .map(|(_key, row)| row.clone())
+            .collect();
+        drop(guard);
+        Ok(out)
+    }
+}
+
+/// One publication row's address in [`MemoryPublicationStore`]'s tree: the full
+/// primary key. `topic` is stored as `Arc<str>` (not [`Topic`]) so the key can
+/// derive `Ord` — `Intern<str>` compares by pointer, not lexical order. The
+/// [`StatePublication`] value keeps the interned `topic`.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PublicationKey {
+    subsystem: SubsystemName,
+    name: StateName,
+    group_id: Arc<str>,
+    topic: Arc<str>,
+}
+
+/// Which edge of a `(subsystem, name)` prefix sub-range a [`PublicationScope`]
+/// bound marks. See the `dirty` module's `Edge` for the strict-separator
+/// rationale: a bound that compares `Equal` to a whole prefix span can land
+/// `scc`'s range descent in the middle of the span and skip rows, so each bound
+/// tie-breaks strictly past the span instead.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Edge {
+    Low,
+    High,
+}
+
+impl Edge {
+    /// The ordering to return once the prefix compares `Equal`: `Low` sinks
+    /// below the span, `High` rises above it.
+    fn beyond(self) -> Ordering {
+        match self {
+            Self::Low => Ordering::Less,
+            Self::High => Ordering::Greater,
+        }
+    }
+}
+
+/// Bounding query for every [`PublicationKey`] of one `(subsystem, name)` —
+/// the `read_publications` sub-range. Compares on `(subsystem, name)`, ignoring
+/// `group_id`/`topic`, so the range spans exactly that collection's sources;
+/// see [`Edge`] for the strict-separator bounds.
+#[derive(Clone, Eq, PartialEq)]
+struct PublicationScope {
+    subsystem: SubsystemName,
+    name: StateName,
+    edge: Edge,
+}
+
+impl PublicationScope {
+    /// The inclusive separator pair spanning `(subsystem, name)`'s sources.
+    fn range(subsystem: &SubsystemName, name: &StateName) -> RangeInclusive<Self> {
+        let at = |edge| Self {
+            subsystem: subsystem.clone(),
+            name: name.clone(),
+            edge,
+        };
+        at(Edge::Low)..=at(Edge::High)
+    }
+
+    fn cmp_key(&self, key: &PublicationKey) -> Ordering {
+        self.subsystem
+            .cmp(&key.subsystem)
+            .then(self.name.cmp(&key.name))
+    }
+}
+
+impl scc::Equivalent<PublicationKey> for PublicationScope {
+    fn equivalent(&self, key: &PublicationKey) -> bool {
+        scc::Comparable::compare(self, key) == Ordering::Equal
+    }
+}
+
+impl scc::Comparable<PublicationKey> for PublicationScope {
+    fn compare(&self, key: &PublicationKey) -> Ordering {
+        self.cmp_key(key).then(self.edge.beyond())
+    }
+}
+
+/// Builds the tree key for one publication source. `topic` interns down to its
+/// bytes as `Arc<str>` so [`PublicationKey`] can derive `Ord`.
+fn publication_key(
+    subsystem: &SubsystemName,
+    name: &StateName,
+    row: &StatePublication,
+) -> PublicationKey {
+    PublicationKey {
+        subsystem: subsystem.clone(),
+        name: name.clone(),
+        group_id: row.group_id.clone(),
+        topic: Arc::from(row.topic.as_ref()),
     }
 }
 

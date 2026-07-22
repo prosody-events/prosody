@@ -16,6 +16,7 @@
 mod cell;
 mod error;
 mod identity;
+mod publication;
 mod serialize;
 #[cfg(test)]
 mod tests;
@@ -29,3 +30,4 @@ pub use error::{CassandraCellStoreError, CorruptUdtError};
 pub use identity::{
     CassandraDescriptorIdentityError, CassandraDescriptorIdentityStore, IdentityQueries,
 };
+pub use publication::{CassandraPublicationError, CassandraPublicationStore, PublicationQueries};
