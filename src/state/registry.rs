@@ -9,6 +9,7 @@ use crate::state::{StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Default Map keyset bound — the number of live distinct keys a map tracks
@@ -51,6 +52,39 @@ pub enum CommitMode {
     /// Apply the write to committed state immediately — cheaper, with
     /// at-least-once, read-uncommitted semantics.
     ReadUncommitted,
+}
+
+/// Whether a collection's committed state is discoverable by cross-group
+/// readers. Runtime-only policy — never part of the frozen
+/// [`StructuralIdentity`] and never persisted, so a collection can be published
+/// and un-published across redeploys with no migration (un-publishing is the
+/// first half of a source-of-truth handoff).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StateVisibility {
+    /// Not discoverable outside the owning consumer group (the default).
+    #[default]
+    Private,
+
+    /// Discoverable by cross-group readers through the publication table.
+    Published,
+}
+
+/// A published collection's read-side cache policy. Runtime-only, like
+/// [`StateVisibility`]. The byte budget is not here — a single bundle-wide
+/// budget on the reader's shared deps bounds every cache; this only declares
+/// whether a collection is cached and its entry TTL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadCache {
+    /// Every read hits the durable store (the default).
+    #[default]
+    Uncached,
+
+    /// Cache read values for `ttl`. Validated at reader acquisition (a later
+    /// slice), where it is consumed — not at registration.
+    Cached {
+        /// How long a cached read value stays fresh.
+        ttl: Duration,
+    },
 }
 
 /// Operational per-collection settings.
@@ -118,6 +152,17 @@ pub struct CollectionDef {
     /// deque share the same `Deque` kind, so changing it needs no migration.
     /// `NonZeroUsize` keeps `capacity = 0` unrepresentable.
     pub capacity: Option<NonZeroUsize>,
+
+    /// Cross-group read visibility. Runtime-only policy, never part of the
+    /// frozen [`StructuralIdentity`] — see [`StateVisibility`]. A `Published`
+    /// collection requires a configured subsystem, enforced at consumer build
+    /// ([`RegisterStateError::PublishedWithoutSubsystem`]).
+    pub visibility: StateVisibility,
+
+    /// Read-side cache policy for cross-group readers. Runtime-only; see
+    /// [`ReadCache`]. Consumed by the reader (a later slice), inert on the
+    /// owning consumer.
+    pub read_cache: ReadCache,
 }
 
 impl CollectionDef {
@@ -132,6 +177,8 @@ impl CollectionDef {
             recovery_within: None,
             keyset_limit: DEFAULT_KEYSET_LIMIT,
             capacity: None,
+            visibility: StateVisibility::default(),
+            read_cache: ReadCache::default(),
         }
     }
 }
@@ -411,6 +458,15 @@ pub enum RegisterStateError {
     #[error("state collection {name:?} is already registered")]
     Duplicate {
         /// The duplicated collection name.
+        name: StateName,
+    },
+
+    /// A collection declared `.published(true)` but the keyed-state
+    /// configuration names no subsystem. A published collection must belong to
+    /// a subsystem so readers can address it; rejected at consumer build.
+    #[error("published state collection {name:?} requires a configured subsystem name")]
+    PublishedWithoutSubsystem {
+        /// The published collection lacking a subsystem.
         name: StateName,
     },
 }

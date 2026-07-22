@@ -4,6 +4,7 @@ use crate::codec::JsonCodec;
 use crate::state::descriptor::{StateDescriptor, ValueDescriptor, map_state, value_state};
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::registry::RegisterStateError;
+use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
@@ -181,6 +182,40 @@ fn keyset_limit_over_ceiling_is_rejected() -> Result<()> {
         "the ceiling and 0 both register cleanly"
     );
     Ok(())
+}
+
+/// Registration succeeds unless a `Published` collection is declared with no
+/// configured subsystem, in which case build fails `PublishedWithoutSubsystem`.
+/// Covers the full published × subsystem matrix.
+#[test]
+fn prop_published_requires_subsystem() {
+    fn prop(published: bool, with_subsystem: bool) -> TestResult {
+        let build = || -> Result<()> {
+            let mut builder = KeyedStateConfiguration::builder();
+            if with_subsystem {
+                builder.subsystem(Some(SubsystemName::try_new("orders")?));
+            }
+            let mut config = builder.build()?;
+            let _ = config.register(cart().published(published));
+            match config.build_registry() {
+                Ok(_) if published && !with_subsystem => {
+                    color_eyre::eyre::bail!("published-without-subsystem must be rejected")
+                }
+                Ok(_) => Ok(()),
+                Err(RegisterStateError::PublishedWithoutSubsystem { .. })
+                    if published && !with_subsystem =>
+                {
+                    Ok(())
+                }
+                Err(e) => color_eyre::eyre::bail!("unexpected build_registry error: {e}"),
+            }
+        };
+        match build() {
+            Ok(()) => TestResult::passed(),
+            Err(e) => TestResult::error(e.to_string()),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(bool, bool) -> TestResult);
 }
 
 /// Registers `descriptor` and reads its `recovery_within` back from the

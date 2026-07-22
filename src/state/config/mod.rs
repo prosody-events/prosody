@@ -1,8 +1,9 @@
 //! User-facing configuration for the always-on keyed-state layer.
 
-use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
+use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError, StateVisibility};
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
+use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
 use derive_builder::Builder;
@@ -88,6 +89,14 @@ pub struct KeyedStateConfiguration {
     #[builder(default = "from_option_env(STATE_CACHE_SIZE_ENV)?")]
     pub cache_size_bytes: Option<NonZeroU64>,
 
+    /// Subsystem this consumer publishes keyed state under. Required whenever
+    /// any registered collection is `.published(true)` — a published collection
+    /// with no subsystem is rejected at build
+    /// ([`RegisterStateError::PublishedWithoutSubsystem`]). `None` (the
+    /// default) is valid for consumers that publish nothing.
+    #[builder(default)]
+    pub subsystem: Option<SubsystemName>,
+
     #[builder(setter(skip), default)]
     registrations: Vec<(StateType, &'static str, StructuralIdentity, CollectionDef)>,
 }
@@ -100,6 +109,7 @@ impl Default for KeyedStateConfiguration {
             recovery_delay: recovery_delay_from_env()
                 .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
             cache_size_bytes: from_option_env(STATE_CACHE_SIZE_ENV).unwrap_or_default(),
+            subsystem: None,
             registrations: Vec::new(),
         }
     }
@@ -152,10 +162,16 @@ impl KeyedStateConfiguration {
     ///
     /// Fails with [`RegisterStateError`] on an empty descriptor name, a TTL
     /// over Cassandra's `USING TTL` ceiling, a TTL at or below
-    /// `recovery_delay`, or an identity conflict.
+    /// `recovery_delay`, a `Published` collection with no configured subsystem,
+    /// or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::default();
         for (state_type, name, identity, def) in &self.registrations {
+            if def.visibility == StateVisibility::Published && self.subsystem.is_none() {
+                return Err(RegisterStateError::PublishedWithoutSubsystem {
+                    name: StateName::try_new(name)?,
+                });
+            }
             if let Some(ttl) = def.ttl
                 && ttl.seconds() <= self.recovery_delay.seconds()
             {

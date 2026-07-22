@@ -1,0 +1,71 @@
+//! Subsystem naming.
+//!
+//! A [`SubsystemName`] identifies a keyed-state subsystem — the logical unit a
+//! consumer group publishes state under and a reader addresses. It is neutral
+//! of Cassandra state on purpose: the same name will later route request/reply
+//! responders that need no durable state, so it lives at the crate root rather
+//! than under `state`.
+
+use crate::error::{ClassifyError, ErrorCategory};
+use std::borrow::Borrow;
+use std::sync::Arc;
+use thiserror::Error;
+
+/// Human-readable subsystem name.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubsystemName(Arc<str>);
+
+impl SubsystemName {
+    /// Creates a non-empty subsystem name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubsystemNameError`] when the trimmed name is empty.
+    pub fn try_new<N>(name: N) -> Result<Self, SubsystemNameError>
+    where
+        N: AsRef<str>,
+    {
+        let name = name.as_ref().trim();
+        if name.is_empty() {
+            return Err(SubsystemNameError);
+        }
+
+        Ok(Self(Arc::from(name)))
+    }
+
+    /// Returns the subsystem name as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SubsystemName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Lets maps keyed by [`SubsystemName`] resolve `&str` lookups without
+/// allocating, mirroring [`StateName`](crate::state::StateName). Sound because
+/// the derived `Hash`/`Eq` delegate to the inner `str`, matching `str`'s own
+/// implementations.
+impl Borrow<str> for SubsystemName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Error returned for an empty subsystem name.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("subsystem name must not be empty")]
+pub struct SubsystemNameError;
+
+impl ClassifyError for SubsystemNameError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
+
+#[cfg(test)]
+mod tests;

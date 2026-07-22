@@ -72,7 +72,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
 use crate::state::cell_key::Section;
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
-use crate::state::registry::CollectionDef;
+use crate::state::registry::{CollectionDef, ReadCache, StateVisibility};
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::CELL_BATCH;
 use crate::state::{CollectionKindId, CommitMode, StateType, StoreOutcome};
@@ -461,6 +461,30 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     fn read_uncommitted(self) -> Self {
         let mut def = self.collection_def();
         def.commit_mode = CommitMode::ReadUncommitted;
+        self.with_collection_def(def)
+    }
+
+    /// Sets the collection's cross-group read visibility. A reversible flag —
+    /// `.published(false)` reverts to [`StateVisibility::Private`], the first
+    /// half of a source-of-truth handoff — not a one-way opt-in. A `Published`
+    /// collection requires a configured subsystem, checked at consumer build.
+    #[must_use]
+    fn published(self, published: bool) -> Self {
+        let mut def = self.collection_def();
+        def.visibility = if published {
+            StateVisibility::Published
+        } else {
+            StateVisibility::Private
+        };
+        self.with_collection_def(def)
+    }
+
+    /// Sets the collection's read-side cache policy for cross-group readers.
+    /// Inert on the owning consumer; consumed by the reader.
+    #[must_use]
+    fn read_cache(self, read_cache: ReadCache) -> Self {
+        let mut def = self.collection_def();
+        def.read_cache = read_cache;
         self.with_collection_def(def)
     }
 }

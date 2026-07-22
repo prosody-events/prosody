@@ -117,7 +117,7 @@ pub use order_codec::{
     I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, UnitKey, Utf8KeyCodec,
     order_preserving_i64, order_preserving_i64_decode,
 };
-pub use registry::CommitMode;
+pub use registry::{CommitMode, ReadCache, StateVisibility};
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without
