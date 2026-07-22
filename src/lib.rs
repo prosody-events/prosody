@@ -52,6 +52,7 @@ pub mod producer;
 pub mod propagator;
 mod segment;
 pub mod state;
+pub mod state_reader;
 pub mod telemetry;
 pub mod timers;
 pub mod tracing;

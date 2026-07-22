@@ -208,6 +208,10 @@ impl<C: Codec> ProsodyProducer<C> {
             .set("client.id", hostname()?)
             .set("compression.codec", "lz4")
             .set("enable.idempotence", "true")
+            // Pin today's librdkafka default so the reader's `partition_for_key`
+            // (crc32(key) % count) stays in lockstep with produced partitions even
+            // if a future librdkafka release changes its default partitioner.
+            .set("partitioner", "consistent_random")
             .set_log_level(RDKafkaLogLevel::Error);
 
         // Create idempotence cache if size is non-zero
