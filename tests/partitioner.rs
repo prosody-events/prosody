@@ -107,9 +107,7 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
 
     // Single consumer owns all partitions; wait before producing so no record
     // is missed by an unassigned partition.
-    consumer
-        .wait_for_assigned_partitions(u32::from(PRIME_PARTITIONS))
-        .await;
+    common::wait_for_assignment(&consumer, u32::from(PRIME_PARTITIONS)).await?;
 
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())

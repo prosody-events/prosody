@@ -153,6 +153,24 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
     TriggerStoreConfiguration::Cassandra(cassandra_config)
 }
 
+/// Awaits the consumer's partition assignment under a generous hang-guard,
+/// failing with a clear error rather than hanging if the rebalance stalls or
+/// only partially assigns.
+///
+/// # Errors
+///
+/// Returns an error if the consumer does not receive `count` partition
+/// assignments within the hang-guard.
+pub async fn wait_for_assignment(consumer: &ProsodyConsumer<JsonCodec>, count: u32) -> Result<()> {
+    timeout(
+        StdDuration::from_secs(30),
+        consumer.wait_for_assigned_partitions(count),
+    )
+    .await
+    .map_err(|_| eyre!("consumer did not receive a partition assignment in time"))?;
+    Ok(())
+}
+
 /// The generic forward-to-channel [`EventHandler`]: sends every received
 /// `(key, payload)` pair to a channel and commits.
 ///
@@ -380,14 +398,8 @@ impl ConsumerEnv {
         // Wait until Kafka has assigned the consumer its partition before
         // producing — records sent before the subscription is live can be
         // missed. Awaits the assignment signal the rebalance callback
-        // publishes (not a poll) under a generous hang-guard, rather than
-        // guessing a fixed startup delay that is sensitive to load.
-        timeout(
-            StdDuration::from_secs(30),
-            consumer.wait_for_assigned_partitions(1),
-        )
-        .await
-        .map_err(|_| eyre!("consumer did not receive a partition assignment in time"))?;
+        // publishes (not a poll) under a generous hang-guard.
+        wait_for_assignment(&consumer, 1).await?;
 
         Ok(Self {
             topic,
