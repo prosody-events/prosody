@@ -899,7 +899,9 @@ mod hook_visibility {
     use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
     use crate::state::oracle::CommitOracle;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+    use crate::state::session::{
+        CellRead, CellWrite, KeyedStateSession, SessionParts, TerminationWatch,
+    };
     use crate::state::store::CellStore;
     use crate::state::tests::cell_suite::{FailingCellStore, value_cell};
     use crate::state::{

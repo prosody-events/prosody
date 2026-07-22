@@ -41,7 +41,7 @@ use crate::state::descriptor::{
     MapHandle, MapStateError, ResolvedOf, ValueHandle,
 };
 use crate::state::order_codec::{UnitKey, Utf8KeyCodec};
-use crate::state::session::CellSession;
+use crate::state::session::CellWrite;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -461,7 +461,7 @@ trait ErasedWrite: CellType + Sized {
         item: ResolvedOf<Self>,
     ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
 
     fn map_set<'a, S>(
@@ -470,7 +470,7 @@ trait ErasedWrite: CellType + Sized {
         item: ResolvedOf<Self>,
     ) -> impl Future<Output = Result<(), MapStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
 
     fn deque_push_back<'a, S>(
@@ -478,7 +478,7 @@ trait ErasedWrite: CellType + Sized {
         item: ResolvedOf<Self>,
     ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
 
     fn deque_push_front<'a, S>(
@@ -486,7 +486,7 @@ trait ErasedWrite: CellType + Sized {
         item: ResolvedOf<Self>,
     ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
 }
 
@@ -509,7 +509,7 @@ where
         item: C::Payload,
     ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.set(item)
@@ -521,7 +521,7 @@ where
         item: C::Payload,
     ) -> impl Future<Output = Result<(), MapStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.set(key, item)
@@ -532,7 +532,7 @@ where
         item: C::Payload,
     ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.push_back(item)
@@ -543,7 +543,7 @@ where
         item: C::Payload,
     ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.push_front(item)
@@ -565,7 +565,7 @@ impl<L: MessageLoader + 'static> ErasedWrite for MessageCell<L> {
         item: ConsumerMessage<L::Payload>,
     ) -> Result<(), CellStateError<CellCodecError<Self>>>
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.set(&item).await
@@ -577,7 +577,7 @@ impl<L: MessageLoader + 'static> ErasedWrite for MessageCell<L> {
         item: ConsumerMessage<L::Payload>,
     ) -> Result<(), MapStateError<CellCodecError<Self>>>
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.set(key, &item).await
@@ -588,7 +588,7 @@ impl<L: MessageLoader + 'static> ErasedWrite for MessageCell<L> {
         item: ConsumerMessage<L::Payload>,
     ) -> Result<(), DequeStateError<CellCodecError<Self>>>
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.push_back(&item).await
@@ -599,7 +599,7 @@ impl<L: MessageLoader + 'static> ErasedWrite for MessageCell<L> {
         item: ConsumerMessage<L::Payload>,
     ) -> Result<(), DequeStateError<CellCodecError<Self>>>
     where
-        S: CellSession,
+        S: CellWrite,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
         handle.push_front(&item).await
@@ -620,7 +620,7 @@ impl<S, T> ErasedValue<S, T> {
 #[async_trait]
 impl<S, T> DynValueState<ResolvedOf<T>> for ErasedValue<S, T>
 where
-    S: CellSession,
+    S: CellWrite,
     T: CellType<Key = UnitKey> + ErasedWrite,
     ResolvedOf<T>: Send + 'static,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
@@ -674,7 +674,7 @@ impl<S, T> ErasedMap<S, T> {
 #[async_trait]
 impl<S, T> DynMapState<ResolvedOf<T>> for ErasedMap<S, T>
 where
-    S: CellSession,
+    S: CellWrite,
     T: CellType<Key = UnitKey> + ErasedWrite + 'static,
     ResolvedOf<T>: Send + 'static,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
@@ -777,7 +777,7 @@ impl<S, T> ErasedDeque<S, T> {
 #[async_trait]
 impl<S, T> DynDequeState<ResolvedOf<T>> for ErasedDeque<S, T>
 where
-    S: CellSession,
+    S: CellWrite,
     T: CellType<Key = UnitKey> + ErasedWrite + 'static,
     ResolvedOf<T>: Send + 'static,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,

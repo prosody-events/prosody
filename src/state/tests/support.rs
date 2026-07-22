@@ -13,8 +13,10 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
-use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
-use crate::state::session::{CellSession, Finalized, MessageMarker, OpPermit, SessionGate};
+use crate::state::session::sealed::{MarkerIdentity, ReadAdmission, StateLifecycle};
+use crate::state::session::{
+    CellRead, CellWrite, Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate,
+};
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
 };
@@ -141,7 +143,26 @@ impl<P> fmt::Debug for UnavailableState<P> {
     }
 }
 
-impl<P> CellSession for UnavailableState<P>
+impl<P> ReadAdmission for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    type Permit<'s>
+        = OpPermit<'s>
+    where
+        Self: 's;
+
+    async fn permit(&self) -> OpPermit<'_> {
+        self.gate.read().await
+    }
+
+    fn attempt_current(&self) -> bool {
+        // Inert: every op errors `Unavailable` before the pin is consulted.
+        true
+    }
+}
+
+impl<P> CellRead for UnavailableState<P>
 where
     P: Clone + Send + Sync + 'static,
 {
@@ -210,6 +231,22 @@ where
         _scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
+    }
+}
+
+impl<P> CellWrite for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    type MutatePermit<'s>
+        = MutatePermit<'s>
+    where
+        Self: 's;
+
+    async fn mutate_permit(&self) -> Result<MutatePermit<'_>, StateAccessError> {
+        // Inert stub: every op is unreachable past `Unavailable`, so the mutate
+        // admission errors before minting a witness.
+        Err(StateAccessError::Unavailable)
     }
 
     async fn set(
@@ -284,11 +321,6 @@ where
     fn discard_dirty(&self) {}
 
     fn terminate(&self) {}
-
-    fn attempt_current(&self) -> bool {
-        // Inert: every op errors `Unavailable` before the pin is consulted.
-        true
-    }
 
     async fn reset(&self, _proof: RepinProof) {}
 

@@ -77,8 +77,8 @@ pub enum CommitDecision {
 /// Did this call take effect.
 ///
 /// Returned by the mid-handler transactional pair
-/// ([`commit`](super::session::CellSession::commit) /
-/// [`rollback`](super::session::CellSession::rollback)):
+/// ([`commit`](super::session::CellWrite::commit) /
+/// [`rollback`](super::session::CellWrite::rollback)):
 /// [`StoreOutcome::Applied`] when buffered ops were drained — written to the
 /// committed value by `commit()`, discarded by `rollback()` —
 /// [`StoreOutcome::NoOp`] when nothing was buffered.

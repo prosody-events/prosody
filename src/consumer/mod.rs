@@ -170,7 +170,7 @@ use crate::state::manager::{PartitionStateManager, PartitionStateProvider, State
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
-use crate::state::session::CellSession;
+use crate::state::session::CellWrite;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
@@ -780,7 +780,7 @@ impl PipelineMiddlewareStack {
         PP: TriggerStoreProvider,
         SP: PartitionStateProvider<PP::Store>,
         <SP::Manager as PartitionStateManager>::Session:
-            CellSession<Loader: MessageLoader<Payload = C::Payload>>,
+            CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
@@ -1113,7 +1113,7 @@ where
     P: TriggerStoreProvider,
     SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
-        CellSession<Loader: MessageLoader<Payload = C::Payload>>,
+        CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
 {

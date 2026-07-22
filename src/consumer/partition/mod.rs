@@ -25,7 +25,7 @@ use crate::otel::SpanRelation;
 use crate::state::manager::{
     EventStateScope, PartitionStateManager, PartitionStateProvider, SweepResolution,
 };
-use crate::state::session::{CellSession, TerminationWatch};
+use crate::state::session::{CellWrite, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
@@ -235,7 +235,7 @@ impl<P: Send + 'static> PartitionManager<P> {
         S: TriggerStoreProvider,
         SP: PartitionStateProvider<S::Store>,
         <SP::Manager as PartitionStateManager>::Session:
-            CellSession<Loader: MessageLoader<Payload = P>>,
+            CellWrite<Loader: MessageLoader<Payload = P>>,
         P: Sync + EventType + EventIdentity,
     {
         // Initialize offset tracker to manage offset state
@@ -496,8 +496,7 @@ async fn handle_messages<T, S, SP, P>(
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
     SP: PartitionStateProvider<S::Store>,
-    <SP::Manager as PartitionStateManager>::Session:
-        CellSession<Loader: MessageLoader<Payload = P>>,
+    <SP::Manager as PartitionStateManager>::Session: CellWrite<Loader: MessageLoader<Payload = P>>,
     P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionConfiguration {
@@ -565,7 +564,7 @@ async fn run_partition<T, S, M, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
-    M: PartitionStateManager<Session: CellSession<Loader: MessageLoader<Payload = P>>>,
+    M: PartitionStateManager<Session: CellWrite<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static + EventType + EventIdentity,
 {
     let PartitionParams {
@@ -669,7 +668,7 @@ async fn process_event<T, S, M, P>(
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
-    M: PartitionStateManager<Session: CellSession<Loader: MessageLoader<Payload = P>>>,
+    M: PartitionStateManager<Session: CellWrite<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static + EventIdentity,
 {
     match event {
@@ -801,7 +800,7 @@ async fn process_event<T, S, M, P>(
 /// settlement/marker split restricts — no `context` accessor is used.
 async fn guarded_dispatch<S, F>(scope: &EventStateScope<S>, dispatch: F)
 where
-    S: CellSession,
+    S: CellWrite,
     F: Future<Output = ()>,
 {
     if let Err(panic) = AssertUnwindSafe(dispatch).catch_unwind().await {

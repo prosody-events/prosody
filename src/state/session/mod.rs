@@ -13,23 +13,31 @@
 //! backstop, the event, the registry), so repeated descriptor binds of one
 //! collection accumulate into one write.
 //!
-//! # The session / lifecycle split
+//! # The capability split
 //!
-//! The session surface is the handler surface plus two sealed supertraits:
+//! The session surface is two capability traits plus the sealed supertraits
+//! that seal them:
 //!
-//! - [`CellSession`] — the read/buffer/mutate surface handlers reach through
-//!   collection handles: `get`/`scan` + the buffering mutators
+//! - [`CellRead`] — the complete non-mutating surface handlers (and a future
+//!   read-only session) reach through collection handles: `get`/`get_many`/
+//!   `scan` plus `loader`/`is_terminated`/`verify_state_registration` and the
+//!   collection-metadata queries. Every read method is written **once** here so
+//!   the owner session and a future reader share one implementation. Sealed by
+//!   `sealed::ReadAdmission`, which owns the read-permit GAT and the epoch-pin
+//!   predicate.
+//! - [`CellWrite`] — the mutating remainder: the buffering mutators
 //!   `set`/`clear`/`clear_section` and the mid-handler transactional pair
-//!   `commit`/`rollback`, plus
-//!   `loader`/`is_terminated`/`verify_state_registration`.
+//!   `commit`/`rollback`, over its own mutate-permit GAT. `CellWrite: CellRead
+//!   + StateLifecycle + MarkerIdentity`; a read-only handle cannot express a
+//!   mutation because the mutators live only on `CellWrite`.
 //!   [`EventContext::State`] bounds this.
 //! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
 //!   (`finalize` and the attempt/teardown verbs — settling moved onto the
 //!   receipt `finalize` returns) — and `sealed::MarkerIdentity` — the
 //!   boundary-readable message-marker identity. Both are `pub(crate)`
-//!   supertraits of [`CellSession`] that seal it: downstream crates can name
-//!   `CellSession` in bounds but can neither implement it nor reach either
-//!   surface.
+//!   supertraits of [`CellWrite`] that seal it: downstream crates can name the
+//!   capability traits in bounds but can neither implement them nor reach
+//!   either surface.
 //!
 //! # Lifecycle
 //!
@@ -84,11 +92,12 @@ use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
-use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
+use sealed::{MarkerIdentity, ReadAdmission, StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -100,22 +109,19 @@ use uuid::Uuid;
 #[cfg(test)]
 mod tests;
 
-/// The per-event session collections read, buffer, and mutate through.
+/// The complete non-mutating surface of a per-event session — every read a
+/// collection handle performs, written **once** here so the owner
+/// [`KeyedStateSession`] and a future read-only session share one
+/// implementation.
 ///
-/// `get`/`scan` describe the session's **visible committed bytes** for a cell —
-/// [`KeyedStateSession`] realises that through the dirty overlay + oracle
-/// resolution — and `set`/`clear`/`clear_section` buffer this event's
-/// mutations (`commit` writes them through mid-handler; `rollback` discards
-/// them). After the settle boundary's stage drains the buffer (`finalize` on
-/// success), a handle's reads fall through to the lower store: the apply
-/// hooks observe the per-cell committed projection (an own-event provisional
-/// cell reads as its committed base `prev`), not the event's pre-settle
-/// overlay. The framework reaches the manager-driven lifecycle and the
-/// message-marker identity through the sealed `StateLifecycle` and
-/// `MarkerIdentity` supertraits, which seal `CellSession`: downstream crates
-/// can name it in bounds (e.g. [`EventContext::State`]) but can neither
-/// implement it nor reach either surface.
-pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + 'static {
+/// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
+/// for a cell — [`KeyedStateSession`] realises that through the dirty overlay +
+/// oracle resolution. The buffering mutators live on the [`CellWrite`]
+/// subtrait, so a read-only handle cannot express a mutation. Sealed by the
+/// crate-internal `sealed::ReadAdmission`, which owns the read-permit GAT and
+/// the epoch-pin predicate: downstream crates can name `CellRead` in bounds but
+/// can neither implement it nor forge a session.
+pub trait CellRead: ReadAdmission {
     /// Opaque per-session capability slot. The keyed-state machinery never
     /// interprets it; a
     /// [`CellResolver`](crate::state::descriptor::CellResolver)
@@ -205,6 +211,60 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
         name: &'a StateName,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
+}
+
+/// The mutating remainder of a per-event session: the buffering mutators and
+/// the mid-handler transactional pair, over the mutate-permit GAT. A read-only
+/// handle cannot express any of these — they live only on `CellWrite` bounds,
+/// while every read is inherited unchanged from [`CellRead`].
+///
+/// `set`/`clear`/`clear_section` buffer this event's mutations (`commit` writes
+/// them through mid-handler; `rollback` discards them). After the settle
+/// boundary's stage drains the buffer (`finalize` on success), a handle's reads
+/// fall through to the lower store: the apply hooks observe the per-cell
+/// committed projection (an own-event provisional cell reads as its committed
+/// base `prev`), not the event's pre-settle overlay. Doubly sealed: the
+/// crate-internal `sealed::ReadAdmission` seals the [`CellRead`] half;
+/// `StateLifecycle` +
+/// `MarkerIdentity` (the manager-driven lifecycle and the message-marker
+/// identity) seal the lifecycle and marker halves. Downstream crates can name
+/// `CellWrite` in bounds (e.g. [`EventContext::State`]) but can neither
+/// implement it nor reach either sealed surface.
+pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity {
+    /// A held gate permit that additionally witnesses a session **mutation**,
+    /// minted by [`Self::mutate_permit`] after the ordered admission. `Deref`s
+    /// to the read `ReadAdmission::Permit` so a mutator's one
+    /// permit also witnesses the reads inside its body (a read under a mutate
+    /// hold is legal; the converse is a type error). `Sync` because the permit
+    /// is held across `.await`s inside a `Send` mutator future.
+    type MutatePermit<'s>: Send + Sync + Deref<Target = <Self as ReadAdmission>::Permit<'s>>
+    where
+        Self: 's;
+
+    /// Acquires the operation gate for a mutator, then applies the one total
+    /// admission order under the held permit before minting the witness:
+    ///
+    /// 1. **pin** — a stale attempt (this handle outlived its dispatch; the
+    ///    epoch was bumped) errors [`StateAccessError::Terminated`].
+    /// 2. **closed** — the settle boundary already closed the session, so an
+    ///    own-event mutation past the settle window errors
+    ///    [`StateAccessError::SessionClosed`] (pin-first means a *current*-pin
+    ///    hook mutation classifies `SessionClosed`, not `Terminated`, even
+    ///    under shutdown/cancellation).
+    /// 3. **termination** — shutdown or cancellation errors
+    ///    [`StateAccessError::Terminated`].
+    ///
+    /// The permit is held across all three checks and the epoch bump needs the
+    /// gate exclusively, so the pin is stable between the check and the mint.
+    ///
+    /// # Errors
+    ///
+    /// [`StateAccessError::Terminated`] on a stale attempt or a
+    /// shutting-down/cancelled session, or [`StateAccessError::SessionClosed`]
+    /// once the settle boundary has closed the session.
+    fn mutate_permit(
+        &self,
+    ) -> impl Future<Output = Result<Self::MutatePermit<'_>, StateAccessError>> + Send;
 
     /// Buffers a set of the cell's bytes.
     ///
@@ -337,11 +397,12 @@ pub trait CellSession: StateLifecycle + MarkerIdentity + Clone + Send + Sync + '
     ) -> impl Future<Output = StoreOutcome> + Send;
 }
 
-/// Crate-sealed lifecycle half of [`CellSession`].
+/// Crate-sealed halves of the [`CellRead`]/[`CellWrite`] capability pair.
 ///
-/// The module is `pub(crate)`, so downstream crates can name [`CellSession`] in
-/// bounds but can neither implement it nor reach the lifecycle: staging,
-/// promoting, and discarding are framework-only moves.
+/// The module is `pub(crate)`, so downstream crates can name the capability
+/// traits in bounds but can neither implement them nor reach the sealed
+/// surfaces: read admission is crate plumbing, and staging, promoting, and
+/// discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
         CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
@@ -522,11 +583,12 @@ pub(crate) mod sealed {
     /// A held [`SessionGate`] permit (RAII: dropping it releases the gate).
     ///
     /// Witnesses admission for a session **read**: the descriptor's cell-op
-    /// sinks demand `&OpPermit` so "forgot to acquire the gate" and "let the
-    /// acquire outlive the op" cannot compile. The settle boundary's closure
-    /// hold ([`SessionGate::close`]) is also this type — the name stays
-    /// `OpPermit` (not `ReadPermit`) because `close` returns one and a
-    /// mutator's [`MutatePermit`] derefs to it. The read-vs-mutate split
+    /// sinks demand `&S::Permit<'_>` (the owner's is this `OpPermit`) so
+    /// "forgot to acquire the gate" and "let the acquire outlive the op"
+    /// cannot compile. It is the owner's [`ReadAdmission::Permit`] and the
+    /// settle boundary's closure hold ([`SessionGate::close`]) — the name
+    /// stays `OpPermit` (not `ReadPermit`) because `close` returns one and
+    /// a mutator's [`MutatePermit`] derefs to it. The read-vs-mutate split
     /// encodes the gate's closure check, **not** shared-vs-exclusive access:
     /// both permits are exclusive holds (a session read is not pure — a
     /// point-get miss does durable read-repair and publishes a cache fill,
@@ -538,7 +600,7 @@ pub(crate) mod sealed {
 
     impl OpPermit<'_> {
         /// Whether the settle boundary has closed the session — consulted by
-        /// [`CellSession::rollback`](super::CellSession::rollback), whose
+        /// [`CellWrite::rollback`](super::CellWrite::rollback), whose
         /// infallible contract answers a closed session with `NoOp` instead of
         /// an error.
         pub(crate) fn is_closed(&self) -> bool {
@@ -551,10 +613,12 @@ pub(crate) mod sealed {
     /// Minted only through [`Self::witness`], from a held read permit once the
     /// caller has sequenced the mutator admission order (pin → closed →
     /// termination — see
-    /// [`CellView::mutate_permit`](crate::state::descriptor)). The descriptor's
-    /// mutating sinks (`raw_set`/`raw_clear`/`clear_section`/`raw_commit`)
-    /// demand `&MutatePermit`, so "acquired too weakly" (a read permit at a
-    /// write) does not compile. It [`Deref`]s to [`OpPermit`], so a mutator's
+    /// [`CellWrite::mutate_permit`](super::CellWrite::mutate_permit)). The
+    /// descriptor's mutating sinks
+    /// (`raw_set`/`raw_clear`/`clear_section`/`raw_commit`) demand
+    /// `&S::MutatePermit<'_>` (the owner's is this `MutatePermit`), so
+    /// "acquired too weakly" (a read permit at a write) does not compile.
+    /// It [`Deref`]s to [`OpPermit`], so a mutator's
     /// one permit also witnesses the reads inside its body — the read-under-
     /// mutate grade subtyping is one-directional and deliberate: a read is
     /// legal under a mutate hold, but the converse (mutate under a read
@@ -564,10 +628,10 @@ pub(crate) mod sealed {
 
     impl<'a> MutatePermit<'a> {
         /// Wraps a held read permit as a mutation witness. The caller
-        /// (`CellView::mutate_permit`) has already sequenced the
-        /// pin/closed/termination admission checks under this same permit, so
-        /// possessing a `MutatePermit` proves the session admitted the
-        /// mutation.
+        /// ([`CellWrite::mutate_permit`](super::CellWrite::mutate_permit)) has
+        /// already sequenced the pin/closed/termination admission checks under
+        /// this same permit, so possessing a `MutatePermit` proves the session
+        /// admitted the mutation.
         pub(in crate::state) fn witness(permit: OpPermit<'a>) -> Self {
             Self(permit)
         }
@@ -745,8 +809,42 @@ pub(crate) mod sealed {
         Incomplete,
     }
 
-    /// Framework-only lifecycle over a per-event session.
-    pub trait StateLifecycle {
+    /// Owns the read-permit GAT and the epoch-pin predicate, and seals
+    /// [`CellRead`](super::CellRead). Admission is crate plumbing: a sealed
+    /// supertrait's methods are not implementable by a downstream crate, so no
+    /// external crate can forge a session.
+    ///
+    /// The methods **are** callable downstream through the public [`CellRead`]
+    /// subtrait (a sealed supertrait seals implementation, not calling) — both
+    /// are benign: [`Self::permit`] hands back an opaque witness, and
+    /// [`Self::attempt_current`] is a `bool` predicate.
+    pub trait ReadAdmission: Clone + Send + Sync + 'static {
+        /// Witness that this session's read admission (if any) is held. Never
+        /// inspected — a pure witness the view's read sinks demand. `Sync`
+        /// because read futures capture `&Permit` across awaits.
+        type Permit<'s>: Send + Sync
+        where
+            Self: 's;
+
+        /// Acquires the read admission — the owner's gate read guard (a future
+        /// read-only session would hand back `()`).
+        fn permit(&self) -> impl Future<Output = Self::Permit<'_>> + Send;
+
+        /// Whether this handle/session clone's pinned epoch still equals the
+        /// live session epoch. `false` once a later attempt boundary
+        /// ([`StateLifecycle::reset`]) bumped it — the pin half of
+        /// `ensure_live`, the mutator admission order, and `rollback`'s `NoOp`
+        /// guard. It lives here (not on [`StateLifecycle`]) so
+        /// `ensure_live<S: CellRead>` can consult it; a future read-only
+        /// session, having no attempt epoch, is always current.
+        fn attempt_current(&self) -> bool;
+    }
+
+    /// Framework-only lifecycle over a per-event session. The projection
+    /// equality `Permit<'s> = OpPermit<'s>` is load-bearing: it lets a generic
+    /// mutator hand `&*mutate_permit` (a `&OpPermit`) to a `&S::Permit<'_>`
+    /// read sink.
+    pub trait StateLifecycle: for<'s> ReadAdmission<Permit<'s> = OpPermit<'s>> {
         /// The uniform durable cell store the session settles against —
         /// [`KeyedStateSession`](super::KeyedStateSession) projects its
         /// backend's store (`B::Cell`).
@@ -754,8 +852,8 @@ pub(crate) mod sealed {
 
         /// The session's operation gate (KV4) — the descriptor handles acquire
         /// their per-op permits through this accessor. On the sealed trait,
-        /// not public [`CellSession`](super::CellSession): the gate is
-        /// framework plumbing, never a handler surface.
+        /// not the public capability pair: the gate is framework plumbing,
+        /// never a handler surface.
         fn gate(&self) -> &SessionGate;
 
         /// Closes the session's gate for settlement — one acquire, phase
@@ -809,7 +907,7 @@ pub(crate) mod sealed {
 
         /// Flips this session terminated, synchronously and idempotently — the
         /// teardown half of
-        /// [`CellSession::is_terminated`](super::CellSession::is_terminated).
+        /// [`CellRead::is_terminated`](super::CellRead::is_terminated).
         /// The [`EventStateScope`](crate::state::manager::EventStateScope)'s
         /// `Drop` calls it on every dispatch exit (including a future dropped
         /// mid-flight, where no gated teardown runs), and the panic-unwind
@@ -819,12 +917,6 @@ pub(crate) mod sealed {
         /// closes first in the catch). Writes no epoch: a genuinely-leaked
         /// stale clone stays fenced by its old pin regardless.
         fn terminate(&self);
-
-        /// Whether this handle/session clone's pinned epoch still equals the
-        /// live session epoch. `false` once a later attempt boundary
-        /// ([`Self::reset`]) bumped it — the pin half of `ensure_live`, the
-        /// mutator admission order, and `rollback`'s `NoOp` guard.
-        fn attempt_current(&self) -> bool;
 
         /// The attempt-boundary transition: acquire the gate, discard this
         /// attempt's dirty overlay, and bump the epoch — all under **one** gate
@@ -1007,7 +1099,7 @@ where
     reload_marker: SyncMutex<Option<MessageMarker>>,
     /// Session-owned termination flag, flipped synchronously by
     /// [`StateLifecycle::terminate`]. It is
-    /// the teardown half of [`is_terminated`](CellSession::is_terminated): the
+    /// the teardown half of [`is_terminated`](CellRead::is_terminated): the
     /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
     /// runs on every dispatch exit — including a future dropped mid-flight
     /// (task cancellation), where no other teardown runs — so a handle leaked
@@ -1140,7 +1232,26 @@ where
     }
 }
 
-impl<B, L> CellSession for KeyedStateSession<B, L>
+impl<B, L> ReadAdmission for KeyedStateSession<B, L>
+where
+    B: StateBackend,
+    L: Clone + Send + Sync + 'static,
+{
+    type Permit<'s>
+        = OpPermit<'s>
+    where
+        Self: 's;
+
+    async fn permit(&self) -> OpPermit<'_> {
+        self.inner.gate.read().await
+    }
+
+    fn attempt_current(&self) -> bool {
+        self.pinned == self.current_epoch()
+    }
+}
+
+impl<B, L> CellRead for KeyedStateSession<B, L>
 where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
@@ -1237,6 +1348,35 @@ where
                 yield item.map_err(|e| StateAccessError::store(&e))?;
             }
         }
+    }
+}
+
+impl<B, L> CellWrite for KeyedStateSession<B, L>
+where
+    B: StateBackend,
+    L: Clone + Send + Sync + 'static,
+{
+    type MutatePermit<'s>
+        = MutatePermit<'s>
+    where
+        Self: 's;
+
+    async fn mutate_permit(&self) -> Result<MutatePermit<'_>, StateAccessError> {
+        // The one total admission order under the held permit: pin → closed →
+        // termination (see the trait doc). The permit is held across all three,
+        // and the epoch bump needs the gate exclusively, so the pin is stable
+        // between the check and the mint.
+        let permit = self.inner.gate.read().await;
+        if !self.attempt_current() {
+            return Err(StateAccessError::Terminated);
+        }
+        if permit.is_closed() {
+            return Err(StateAccessError::SessionClosed);
+        }
+        if self.is_terminated() {
+            return Err(StateAccessError::Terminated);
+        }
+        Ok(MutatePermit::witness(permit))
     }
 
     async fn set(
@@ -1454,10 +1594,6 @@ where
 
     fn terminate(&self) {
         self.inner.terminated.store(true, Ordering::Relaxed);
-    }
-
-    fn attempt_current(&self) -> bool {
-        self.pinned == self.current_epoch()
     }
 
     async fn reset(&self, _proof: RepinProof) {
@@ -1793,12 +1929,13 @@ impl DescriptorIdentity for LifecycleAccess {
 impl SealedDescriptor for LifecycleAccess {}
 
 impl StateDescriptor for LifecycleAccess {
-    type Handle<S: CellSession> = S;
+    type Handle<S: CellRead> = S;
 
     /// Returns the session itself — the lifecycle tunnel binds no typed handle
     /// and validates no registration; the boundary drives the sealed
-    /// [`StateLifecycle`] on the returned session.
-    fn bind<S: CellSession>(self, session: &S) -> Result<S, StateAccessError> {
+    /// [`StateLifecycle`] on the returned session (every real caller binds a
+    /// [`CellWrite`] session, so the returned `S` carries the full lifecycle).
+    fn bind<S: CellRead>(self, session: &S) -> Result<S, StateAccessError> {
         Ok(session.clone())
     }
 
@@ -1867,11 +2004,11 @@ impl DescriptorIdentity for MarkerAccess {
 impl SealedDescriptor for MarkerAccess {}
 
 impl StateDescriptor for MarkerAccess {
-    type Handle<S: CellSession> = MarkerHandle<S>;
+    type Handle<S: CellRead> = MarkerHandle<S>;
 
     /// Wraps the session in a [`MarkerHandle`], validating no registration —
     /// the marker tunnel carries no typed collection.
-    fn bind<S: CellSession>(self, session: &S) -> Result<MarkerHandle<S>, StateAccessError> {
+    fn bind<S: CellRead>(self, session: &S) -> Result<MarkerHandle<S>, StateAccessError> {
         Ok(MarkerHandle(session.clone()))
     }
 

@@ -32,7 +32,7 @@ use crate::consumer::{
 };
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
-use crate::state::session::CellSession;
+use crate::state::session::CellWrite;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
@@ -129,8 +129,7 @@ where
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
     SP: PartitionStateProvider<P::Store>,
-    <SP::Manager as PartitionStateManager>::Session:
-        CellSession<Loader: MessageLoader<Payload = PL>>,
+    <SP::Manager as PartitionStateManager>::Session: CellWrite<Loader: MessageLoader<Payload = PL>>,
     PL: Clone + Send + Sync + 'static + EventType + EventIdentity,
 {
     // Compile the event-type filter automaton from the configured

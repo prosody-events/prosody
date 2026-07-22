@@ -62,10 +62,10 @@
 //! [`StateDescriptor`] itself is **sealed** (by the crate-private
 //! `SealedDescriptor` supertrait): a downstream crate can register and bind the
 //! framework's descriptors but cannot add its own impl, so no custom descriptor
-//! can receive the raw, gate-free [`CellSession`] from `bind` and reach cells
-//! outside the KV4 session gate. This closes the one hole `CollectionSpec`'s
-//! Exposure note (on [`CollectionSpec`]) does not — that seals cell *reach* for
-//! kinds, this seals descriptor *authorship*.
+//! can receive the raw, gate-free [`CellRead`] session from `bind` and reach
+//! cells outside the KV4 session gate. This closes the one hole
+//! `CollectionSpec`'s Exposure note (on [`CollectionSpec`]) does not — that
+//! seals cell *reach* for kinds, this seals descriptor *authorship*.
 
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -73,7 +73,7 @@ use crate::state::StateAccessError;
 use crate::state::cell_key::Section;
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::CollectionDef;
-use crate::state::session::CellSession;
+use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::CELL_BATCH;
 use crate::state::{CollectionKindId, CommitMode, StateType, StoreOutcome};
 use crate::timers::duration::CompactDuration;
@@ -197,7 +197,7 @@ impl<'s, S> FromSession<'s, S> for () {
     fn from_session(_session: &'s S) -> Self {}
 }
 
-impl<'s, S: CellSession> FromSession<'s, S> for &'s S::Loader {
+impl<'s, S: CellRead> FromSession<'s, S> for &'s S::Loader {
     fn from_session(session: &'s S) -> Self {
         session.loader()
     }
@@ -370,8 +370,8 @@ pub trait DescriptorIdentity {
 /// crate-internal lifecycle tunnel (`LifecycleAccess` in
 /// [`crate::state::session`]). A downstream crate can name [`StateDescriptor`]
 /// in bounds and call `bind`, but cannot add an impl — so it can never hand its
-/// own `bind` the raw, gate-free [`CellSession`] and reach cells outside the
-/// KV4 session gate.
+/// own `bind` the raw, gate-free [`CellRead`] session and reach cells outside
+/// the KV4 session gate.
 pub(crate) mod sealed {
     use super::Descriptor;
 
@@ -384,7 +384,7 @@ pub(crate) mod sealed {
 pub(crate) use sealed::SealedDescriptor;
 
 /// A typed view over one keyed-state collection, bindable to any
-/// [`CellSession`].
+/// [`CellRead`] session.
 ///
 /// Handlers reach this through
 /// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
@@ -397,11 +397,11 @@ pub(crate) use sealed::SealedDescriptor;
 /// the framework's own [`Descriptor<K>`] and the lifecycle tunnel, so `bind`'s
 /// raw-session access stays framework-only (see the module's Exposure note).
 ///
-/// [`verify_state_registration`]: CellSession::verify_state_registration
+/// [`verify_state_registration`]: CellRead::verify_state_registration
 pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
-    /// [`CellSession`].
-    type Handle<S: CellSession>;
+    /// [`CellRead`] session.
+    type Handle<S: CellRead>;
 
     /// Validates registration + structural identity and returns the typed
     /// handle.
@@ -417,7 +417,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// collection is unregistered, or
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
-    fn bind<S: CellSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
+    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings (TTL, commit mode) this descriptor carries
     /// into registration, set via its fluent methods (see [`Self::ttl`]).
@@ -524,12 +524,12 @@ pub trait CollectionSpec {
     type Cell: CellType;
 
     /// The typed handle [`Descriptor::bind`] returns over session `S`.
-    type Handle<S: CellSession>;
+    type Handle<S: CellRead>;
 
     /// Mints the handle over a bound [`CellScope`]. The scope pins the
     /// collection's partition; the kind projects the typed views it needs from
     /// it (see `CellScope::typed`).
-    fn handle<S: CellSession>(scope: CellScope<S>) -> Self::Handle<S>;
+    fn handle<S: CellRead>(scope: CellScope<S>) -> Self::Handle<S>;
 }
 
 /// The one descriptor skeleton every collection kind shares: an interned name,
@@ -585,9 +585,9 @@ impl<K: CollectionSpec> DescriptorIdentity for Descriptor<K> {
 }
 
 impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
-    type Handle<S: CellSession> = K::Handle<S>;
+    type Handle<S: CellRead> = K::Handle<S>;
 
-    fn bind<S: CellSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
         // The scope carries the binding descriptor's `state_type` so its cell
         // ops address the right namespace.
         let name = session.verify_state_registration(
@@ -629,11 +629,11 @@ pub struct ValueKind<T>(PhantomData<fn() -> T>);
 
 impl<T: CellType<Key = UnitKey>> CollectionSpec for ValueKind<T> {
     type Cell = T;
-    type Handle<S: CellSession> = ValueHandle<S, T>;
+    type Handle<S: CellRead> = ValueHandle<S, T>;
 
     const KIND: CollectionKindId = CollectionKindId::Value;
 
-    fn handle<S: CellSession>(scope: CellScope<S>) -> ValueHandle<S, T> {
+    fn handle<S: CellRead>(scope: CellScope<S>) -> ValueHandle<S, T> {
         ValueHandle::new(&scope)
     }
 }
@@ -662,7 +662,7 @@ pub struct ValueHandle<S, T> {
     view: CellView<S, T>,
 }
 
-impl<S: CellSession, T> ValueHandle<S, T> {
+impl<S: CellRead, T> ValueHandle<S, T> {
     /// Wraps a bound [`CellScope`] as the typed view over the single
     /// [`UnitKey`]-addressed Value cell. Bound-free in `T` so
     /// [`StateDescriptor::bind`] can mint it without the op bound.
@@ -675,7 +675,7 @@ impl<S: CellSession, T> ValueHandle<S, T> {
 
 impl<S, T> ValueHandle<S, T>
 where
-    S: CellSession,
+    S: CellRead,
     T: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
@@ -691,7 +691,14 @@ where
         let permit = self.view.read_permit().await;
         self.view.get(&permit, &()).await
     }
+}
 
+impl<S, T> ValueHandle<S, T>
+where
+    S: CellWrite,
+    T: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+{
     /// Lowers `value` through the resolver, encodes it, and buffers a set.
     ///
     /// # Errors
@@ -719,7 +726,7 @@ where
     }
 
     /// Durably commits the buffered op mid-handler, so it survives a restart
-    /// after failure. At-least-once; see [`CellSession::commit`] for the
+    /// after failure. At-least-once; see [`CellWrite::commit`] for the
     /// contract.
     ///
     /// # Errors
@@ -733,7 +740,7 @@ where
 
     /// Discards the buffered uncommitted op, reverting reads to the last
     /// [`commit`](Self::commit) — or the pre-event committed value if none.
-    /// Infallible; see [`CellSession::rollback`] for the contract.
+    /// Infallible; see [`CellWrite::rollback`] for the contract.
     #[instrument(name = "value.rollback", skip_all, fields(collection = self.view.name().as_str()))]
     pub async fn rollback(&self) -> StoreOutcome {
         self.view.rollback().await

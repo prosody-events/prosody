@@ -46,7 +46,7 @@
 //! real boundary is driven.)
 
 use super::sealed::{ApplyOutcome, StagedState, StateLifecycle};
-use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{CellRead, CellWrite, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ErrorCategory;
@@ -1503,7 +1503,7 @@ fn replay_dirty(ops: &[StageOp]) -> (HashMap<CellKey, DirtyVal>, HashSet<Section
 
 /// Applies `ops` to `session` in order — the same sequence [`replay_dirty`]
 /// models. Generic over the session so both fixtures drive it.
-async fn apply_stage_ops<S: CellSession>(
+async fn apply_stage_ops<S: CellWrite>(
     session: &S,
     name: &StateName,
     ops: &[StageOp],
