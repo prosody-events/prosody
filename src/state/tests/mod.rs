@@ -1338,9 +1338,8 @@ fn prop_memory_apply_idempotence() {
     QuickCheck::new().quickcheck(property as fn(ApplyTrace) -> Result<bool>);
 }
 
-/// Routing-only publication store over the memory backend — the same runner the
-/// Cassandra suite drives. Upsert idempotence, remove, and subsystem/name
-/// isolation, asserted after every op against a `BTreeMap` oracle.
+/// Routing-only publication store over the memory backend. The Cassandra
+/// instantiation in [`state::cassandra::tests`] runs the same runner.
 #[test]
 fn prop_memory_publication_trace() {
     fn property(trace: PublicationTrace) -> Result<bool> {

@@ -68,7 +68,8 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
     /// All published sources of `(subsystem, name)` — one partition read.
     ///
     /// # Errors
-    /// Backend failure, or a decoded partition count outside `[1, i32::MAX]`.
+    /// Backend failure, or (Cassandra backend) a decoded partition count
+    /// outside `[1, i32::MAX]`.
     fn read_publications(
         &self,
         subsystem: &SubsystemName,

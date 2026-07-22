@@ -1,13 +1,17 @@
-//! Live-cluster instantiation of the backend-generic descriptor-identity
-//! suite.
+//! Live-cluster instantiation of the backend-generic descriptor-identity and
+//! publication suites.
 //!
 //! These run the same [`identity_suite`](crate::state::tests::identity_suite)
-//! runners as the memory suite against [`CassandraDescriptorIdentityStore`]'s
+//! and [`publication_suite`](crate::state::tests::publication_suite) runners as
+//! the memory suite against [`CassandraDescriptorIdentityStore`]'s
 //! [`DescriptorIdentityStore`](crate::state::descriptor_identity::DescriptorIdentityStore)
-//! impl over the real `keyed_state_identity` table — so the production
-//! point-read, the `INSERT … IF NOT EXISTS` LWT, and the conflict-row
-//! name-matched decoding all run under the same invariants the model checks.
-//! Each iteration uses a fresh `group_id`, so the shared keyspace never
+//! impl over the real `keyed_state_identity` table and
+//! [`CassandraPublicationStore`]'s
+//! [`PublicationStore`](crate::state::publication::PublicationStore)
+//! impl over `keyed_state_publication` — so the production point-read, the
+//! `INSERT … IF NOT EXISTS` LWT, the conflict-row name-matched decoding, and
+//! the routing upsert/remove/read all run under the same invariants the models
+//! check. Each iteration uses a fresh `group_id`, so the shared keyspace never
 //! collides across runs.
 
 use super::identity::{CassandraDescriptorIdentityStore, IdentityQueries};

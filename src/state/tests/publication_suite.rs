@@ -44,6 +44,16 @@ const TOPICS: [&str; 2] = ["t0", "t1"];
 /// A full-PK oracle key: `(subsystem, name, group, topic)`.
 type OracleKey = (String, String, String, String);
 
+/// The full-PK oracle key for one publication source.
+fn oracle_key(subsystem: &SubsystemName, name: &StateName, group: &str, topic: Topic) -> OracleKey {
+    (
+        subsystem.as_str().to_owned(),
+        name.as_str().to_owned(),
+        group.to_owned(),
+        topic.as_ref().to_owned(),
+    )
+}
+
 /// Resolves a subsystem seed to a name from the pool. `token` namespaces the
 /// subsystem pool so concurrent/repeated runs against the shared keyspace never
 /// collide, while the distinct subsystems within a run give isolation coverage.
@@ -172,12 +182,7 @@ where
                     .await
                     .map_err(|e| eyre!("upsert failed: {e}"))?;
                 oracle.insert(
-                    (
-                        subsystem.as_str().to_owned(),
-                        name.as_str().to_owned(),
-                        group.to_owned(),
-                        topic.as_ref().to_owned(),
-                    ),
+                    oracle_key(&subsystem, &name, group, topic),
                     i32::from(count),
                 );
             }
@@ -195,19 +200,14 @@ where
                     .remove(&subsystem, &name, group, topic)
                     .await
                     .map_err(|e| eyre!("remove failed: {e}"))?;
-                oracle.remove(&(
-                    subsystem.as_str().to_owned(),
-                    name.as_str().to_owned(),
-                    group.to_owned(),
-                    topic.as_ref().to_owned(),
-                ));
+                oracle.remove(&oracle_key(&subsystem, &name, group, topic));
             }
         }
 
         // Re-read every pool (subsystem, name) and compare sorted set-equality
-        // against the oracle's matching prefix. Content, not order — Slice 4
-        // does not couple to a clustering-order guarantee (both backends happen
-        // to return group/topic-ascending anyway).
+        // against the oracle's matching prefix. Content, not order —
+        // PublicationStore makes no clustering-order guarantee (both backends
+        // happen to return group/topic-ascending anyway).
         for s in 0..u8::try_from(SUBSYSTEMS)? {
             for n in 0..u8::try_from(NAMES.len())? {
                 let subsystem = subsystem_for(token, s)?;

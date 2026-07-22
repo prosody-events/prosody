@@ -383,7 +383,7 @@ fn marker_key(collection: &CollectionId, section: Section) -> MarkerKey {
 /// definition (`equivalent ⇔ compare == Equal`); widening it to prefix
 /// equality would desynchronize it from `compare`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Edge {
+pub(crate) enum Edge {
     Low,
     High,
 }
@@ -391,7 +391,7 @@ enum Edge {
 impl Edge {
     /// The ordering to return once the prefix compares `Equal`: a `Low` bound
     /// sinks below the span, a `High` bound rises above it.
-    fn beyond(self) -> Ordering {
+    pub(crate) fn beyond(self) -> Ordering {
         match self {
             Self::Low => Ordering::Less,
             Self::High => Ordering::Greater,

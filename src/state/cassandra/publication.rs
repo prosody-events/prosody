@@ -99,15 +99,15 @@ impl PublicationStore for CassandraPublicationStore {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(rows.rows_num());
         for row in rows
-            .rows::<(String, String, i32)>()
+            .rows::<(&str, &str, i32)>()
             .map_err(CassandraStoreError::from)?
         {
             let (group_id, topic, partition_count) = row.map_err(CassandraStoreError::from)?;
             out.push(StatePublication {
                 group_id: Arc::from(group_id),
-                topic: Intern::<str>::from(topic.as_str()),
+                topic: Intern::<str>::from(topic),
                 partition_count: PartitionCount::try_from(partition_count)?,
             });
         }

@@ -5,6 +5,7 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
+use super::dirty::Edge;
 use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::publication::{PublicationStore, StatePublication};
@@ -692,28 +693,6 @@ struct PublicationKey {
     topic: Arc<str>,
 }
 
-/// Which edge of a `(subsystem, name)` prefix sub-range a [`PublicationScope`]
-/// bound marks. See the `dirty` module's `Edge` for the strict-separator
-/// rationale: a bound that compares `Equal` to a whole prefix span can land
-/// `scc`'s range descent in the middle of the span and skip rows, so each bound
-/// tie-breaks strictly past the span instead.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Edge {
-    Low,
-    High,
-}
-
-impl Edge {
-    /// The ordering to return once the prefix compares `Equal`: `Low` sinks
-    /// below the span, `High` rises above it.
-    fn beyond(self) -> Ordering {
-        match self {
-            Self::Low => Ordering::Less,
-            Self::High => Ordering::Greater,
-        }
-    }
-}
-
 /// Bounding query for every [`PublicationKey`] of one `(subsystem, name)` —
 /// the `read_publications` sub-range. Compares on `(subsystem, name)`, ignoring
 /// `group_id`/`topic`, so the range spans exactly that collection's sources;
@@ -755,8 +734,8 @@ impl scc::Comparable<PublicationKey> for PublicationScope {
     }
 }
 
-/// Builds the tree key for one publication source. `topic` interns down to its
-/// bytes as `Arc<str>` so [`PublicationKey`] can derive `Ord`.
+/// Builds the tree key for one publication source. `topic` is copied into an
+/// `Arc<str>` (de-interned) so [`PublicationKey`] can derive `Ord`.
 fn publication_key(
     subsystem: &SubsystemName,
     name: &StateName,
