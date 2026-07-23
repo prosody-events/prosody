@@ -16,6 +16,20 @@ use crate::error::{ClassifyError, ErrorCategory};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartitionCount(NonZeroU32);
 
+impl PartitionCount {
+    /// One partition — the smallest valid count; a total fallback for
+    /// infallible const construction.
+    pub(crate) const MIN: Self = Self(NonZeroU32::MIN);
+    /// The mock / in-memory topology's fixed partition count, matching
+    /// `MockCluster::new(3)` and `create_topic(_, 3, 3)` in the crate root.
+    /// The mock arm of the publication count source returns this; it is
+    /// cosmetic in mock mode (no cross-process reader consults it).
+    pub(crate) const MOCK: Self = match NonZeroU32::new(3) {
+        Some(count) => Self(count),
+        None => Self::MIN,
+    };
+}
+
 impl TryFrom<i32> for PartitionCount {
     type Error = PartitionCountError;
 

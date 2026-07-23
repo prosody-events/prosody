@@ -74,6 +74,7 @@ use crate::state::descriptor::{
     DescriptorIdentity, Registered, SealedDescriptor, StateDescriptor, StructuralIdentity,
 };
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
+use crate::state::first_write::{FirstWritePublisher, PublicationError};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::manager::ArmedKeys;
 use crate::state::marker::{EventMarker, SectionClear};
@@ -950,6 +951,26 @@ pub(crate) mod sealed {
         /// Records that a `StateRecovery` backstop firing at `fire` now stands
         /// for this session's key (overwriting any earlier standing fire).
         fn mark_backstop_armed(&self, fire: CompactDateTime) -> impl Future<Output = ()> + Send;
+
+        /// Publishes a routing row for every `Published` collection this event
+        /// touched, the settle-boundary precondition of staging the durable
+        /// state writes. Idempotent and memoized: a `commit()` that already
+        /// published latches the memo, so this scan's hit is a no-op. A `None`
+        /// publisher (no published collection / no subsystem) or an
+        /// all-private touched set publishes nothing. Runs off the intact
+        /// dirty overlay (`touched` is non-draining, so `finalize` reads it
+        /// again), never enumerating the whole registry — a published
+        /// collection that never wrote gets no row.
+        ///
+        /// # Errors
+        ///
+        /// A count-fetch or upsert failure, type-erased into
+        /// [`StateAccessError::Store`] with the publication error's
+        /// `Permanent`/`Transient` classification preserved (never `Terminal`);
+        /// the settle boundary retries it until it succeeds or shutdown
+        /// intervenes.
+        fn publish_first_writes(&self)
+        -> impl Future<Output = Result<(), StateAccessError>> + Send;
     }
 
     /// The message commit-marker identity surface — the sole home of
@@ -1052,6 +1073,12 @@ where
 
     /// Termination signals captured at mint.
     pub termination: TerminationWatch,
+
+    /// The first-write publication barrier, bound to this session's topic —
+    /// `None` when no collection is published or no subsystem is configured
+    /// (nothing to advertise). Consulted before every session-owned durable
+    /// write of a `Published` collection.
+    pub(crate) publisher: Option<FirstWritePublisher>,
 }
 
 /// The per-event attempt epoch. Bumped once per retry attempt boundary
@@ -1121,6 +1148,10 @@ where
     /// emission read a pre-bump value; the guard is a leaf, dropped inside the
     /// one-line accessors and never held across an `.await`.
     epoch: RwLock<AttemptEpoch>,
+    /// The first-write publication barrier for this session's topic — see
+    /// [`SessionParts::publisher`]. `None` disables publication (no published
+    /// collection / no subsystem).
+    publisher: Option<FirstWritePublisher>,
 }
 
 /// The real per-event session over a partition's cell store.
@@ -1185,6 +1216,7 @@ where
             recovery_delay,
             armed,
             termination,
+            publisher,
         } = parts;
         Self {
             inner: Arc::new(SessionInner {
@@ -1201,6 +1233,7 @@ where
                 terminated: AtomicBool::new(false),
                 gate: SessionGate::new(),
                 epoch: RwLock::new(AttemptEpoch::INITIAL),
+                publisher,
             }),
             // A freshly-minted session is attempt 1: `pinned == *epoch.read()`.
             pinned: AttemptEpoch::INITIAL,
@@ -1210,6 +1243,23 @@ where
     /// The collection id for `(state_type, name)` under this session's key.
     fn id_for(&self, state_type: StateType, name: &StateName) -> CollectionId {
         CollectionId::new(self.inner.state_key.clone(), state_type, name.clone())
+    }
+
+    /// Runs the first-write publication barrier for `(state_type, name)`, the
+    /// precondition of every session-owned durable write of a `Published`
+    /// collection. A `None` publisher (no published collection / no subsystem)
+    /// or a private collection returns `Ok(())` immediately — the visibility
+    /// gate lives inside [`FirstWritePublisher::ensure_one`], which is what
+    /// makes startup reconciliation's removal final for an un-publishing group.
+    async fn ensure_published(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Result<(), PublicationError> {
+        match &self.inner.publisher {
+            Some(publisher) => publisher.ensure_one(state_type, name).await,
+            None => Ok(()),
+        }
     }
 
     /// The session's live attempt epoch. A one-line copy-out: the leaf
@@ -1424,6 +1474,17 @@ where
         if resolved.is_empty() && cleared.is_empty() {
             return Ok(StoreOutcome::NoOp);
         }
+        // First-write publication precedes the durable write: a `commit()`
+        // bypasses the settle boundary (it calls `write_resolved` directly and
+        // drains the collection, so settle's `touched()` scan never sees it), so
+        // the barrier must run HERE for the routing row to precede committed
+        // published state. Fallible on the handler's own retry path — `commit()`
+        // is already fallible, so no new posture is needed; `write_resolved`
+        // below is gated behind it. Private collections / no publisher return
+        // immediately. Held under the caller's gate — no re-acquire.
+        self.ensure_published(state_type, name)
+            .await
+            .map_err(|e| StateAccessError::store(&e))?;
         // A `Cleared` cell in a cleared section is subsumed by the clear's gap
         // erase — dropping it keeps the batch row-disjoint (no written row
         // overlaps a gap range); the remaining present cells of a cleared
@@ -1629,6 +1690,29 @@ where
             .armed
             .upsert_async(self.inner.state_key.key.clone(), fire)
             .await;
+    }
+
+    async fn publish_first_writes(&self) -> Result<(), StateAccessError> {
+        // No publisher → nothing to advertise (short-circuit before the
+        // dirty-overlay scan).
+        if self.inner.publisher.is_none() {
+            return Ok(());
+        }
+        // Read the intact dirty overlay (non-draining — `finalize` reads it
+        // again), so only collections this event actually wrote are considered.
+        // `ensure_published` filters to `Published` and dedups via the memo, so
+        // a `commit()` that already published turns this into a no-op.
+        let touched = self
+            .inner
+            .overlay
+            .dirty()
+            .touched(&self.inner.state_key.key);
+        for ((state_type, name), _cleared, _cells) in touched {
+            self.ensure_published(state_type, &name)
+                .await
+                .map_err(|e| StateAccessError::store(&e))?;
+        }
+        Ok(())
     }
 }
 

@@ -155,6 +155,7 @@ impl GateFixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         })
     }
 

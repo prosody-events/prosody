@@ -180,6 +180,7 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), self.cancel_rx.clone()),
+            publisher: None,
         }))
     }
 
@@ -204,6 +205,7 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), cancel_rx),
+            publisher: None,
         }))
     }
 
@@ -297,6 +299,7 @@ async fn staged_fire_delay(
         recovery_delay: CompactDuration::new(floor_secs),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     });
     for name in &names {
         session
@@ -1355,6 +1358,7 @@ impl CountingFixture {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         });
         let id = CollectionId::new(
             state_key.clone(),

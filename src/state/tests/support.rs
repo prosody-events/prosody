@@ -36,9 +36,17 @@ use std::fmt;
 use std::future::{Future, ready};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
+
+use crate::Topic;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::memory::MemoryPublicationStore;
+use crate::state::publication::{PublicationStore, StatePublication};
+use crate::subsystem::SubsystemName;
+use parking_lot::Mutex;
+use thiserror::Error;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
 /// event resolves to the one fixed decision. Use it where the test is not
@@ -337,6 +345,11 @@ where
     }
 
     async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
+
+    async fn publish_first_writes(&self) -> Result<(), StateAccessError> {
+        // Inert session: nothing is published.
+        Ok(())
+    }
 }
 
 impl<P> MarkerIdentity for UnavailableState<P>
@@ -1116,6 +1129,247 @@ pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionI
         bail!("settlement left an event marker standing");
     }
     Ok(())
+}
+
+/// One recorded call against a [`ScriptedPublicationStore`]. Drives the
+/// ordering and truthful-set assertions of the first-write publication tests
+/// (a row appears with the live count; a collection that never writes gets no
+/// upsert; a private write never upserts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationCall {
+    /// An `upsert` reached the store (recorded only for a successful,
+    /// non-failing call, after any release gate opened).
+    Upsert {
+        /// The collection name.
+        name: String,
+        /// The publishing group.
+        group: String,
+        /// The topic.
+        topic: String,
+        /// The recorded live partition count.
+        partition_count: i32,
+    },
+    /// A `remove` reached the store.
+    Remove {
+        /// The collection name.
+        name: String,
+        /// The group whose row was removed.
+        group: String,
+        /// The topic.
+        topic: String,
+    },
+    /// A `read_publications` reached the store.
+    Read {
+        /// The collection name.
+        name: String,
+    },
+}
+
+/// A single-use release gate: a successful upsert signals `entered`, then
+/// blocks on `released` until the test opens it. Lets a test observe the
+/// pre-stage window (row not yet written, cell not yet durable)
+/// deterministically without wall-clock timing.
+struct ReleaseGate {
+    entered: Semaphore,
+    released: Semaphore,
+}
+
+/// Scripted routing-only publication store for the first-write publication
+/// tests. Records every call, can be flipped to fail every `upsert` with a
+/// `Transient` error, and can gate a successful `upsert` on a test-controlled
+/// release. Wraps a real [`MemoryPublicationStore`] for the actual rows so
+/// reads reflect what upserts applied. Cloning shares all state (the `Arc`s).
+#[derive(Clone)]
+pub(crate) struct ScriptedPublicationStore {
+    inner: MemoryPublicationStore,
+    calls: Arc<Mutex<Vec<PublicationCall>>>,
+    /// When set, every `upsert` returns a `Transient` error (signalling
+    /// `errored`) instead of applying — models a persistently-failing store.
+    fail: Arc<AtomicBool>,
+    errored: Arc<Semaphore>,
+    /// When present, a successful `upsert` blocks on the release gate.
+    gate: Option<Arc<ReleaseGate>>,
+}
+
+impl ScriptedPublicationStore {
+    /// A store that applies every upsert immediately.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: MemoryPublicationStore::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: Arc::new(AtomicBool::new(false)),
+            errored: Arc::new(Semaphore::new(0)),
+            gate: None,
+        }
+    }
+
+    /// A store that fails every upsert with a `Transient` error until
+    /// [`heal`](Self::heal) is called.
+    pub(crate) fn failing() -> Self {
+        let store = Self::new();
+        store.fail.store(true, Ordering::Release);
+        store
+    }
+
+    /// A store whose successful upserts block on a release gate.
+    pub(crate) fn gated() -> Self {
+        Self {
+            gate: Some(Arc::new(ReleaseGate {
+                entered: Semaphore::new(0),
+                released: Semaphore::new(0),
+            })),
+            ..Self::new()
+        }
+    }
+
+    /// Stops failing upserts (pairs with [`failing`](Self::failing)).
+    pub(crate) fn heal(&self) {
+        self.fail.store(false, Ordering::Release);
+    }
+
+    /// Waits until at least one upsert has failed — the deterministic signal
+    /// that the settle loop has attempted (and been blocked by) publication.
+    pub(crate) async fn wait_errored(&self) {
+        if let Ok(permit) = self.errored.acquire().await {
+            permit.forget();
+        }
+    }
+
+    /// Waits until a gated upsert has entered and is blocked.
+    pub(crate) async fn wait_entered(&self) {
+        if let Some(gate) = &self.gate
+            && let Ok(permit) = gate.entered.acquire().await
+        {
+            permit.forget();
+        }
+    }
+
+    /// Opens the release gate for one blocked upsert.
+    pub(crate) fn release(&self) {
+        if let Some(gate) = &self.gate {
+            gate.released.add_permits(1);
+        }
+    }
+
+    /// Seeds a row directly, bypassing the call log, failure flag, and gate —
+    /// the "pre-existing row" setup for the wrong-count and reconciliation
+    /// tests.
+    pub(crate) async fn seed(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        row: &StatePublication,
+    ) {
+        let _ = self.inner.upsert(subsystem, name, row).await;
+    }
+
+    /// A snapshot of the recorded calls, in order.
+    pub(crate) fn calls(&self) -> Vec<PublicationCall> {
+        self.calls.lock().clone()
+    }
+
+    /// How many `upsert`s targeted `(name, topic)`.
+    pub(crate) fn upserts_for(&self, name: &str, topic: &str) -> usize {
+        self.calls
+            .lock()
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    PublicationCall::Upsert { name: n, topic: t, .. } if n == name && t == topic
+                )
+            })
+            .count()
+    }
+
+    /// The rows currently stored for `(subsystem, name)`.
+    pub(crate) async fn rows(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+    ) -> Vec<StatePublication> {
+        self.inner
+            .read_publications(subsystem, name)
+            .await
+            .unwrap_or_default()
+    }
+}
+
+impl PublicationStore for ScriptedPublicationStore {
+    type Error = ScriptedPublicationError;
+
+    async fn upsert(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        row: &StatePublication,
+    ) -> Result<(), Self::Error> {
+        if self.fail.load(Ordering::Acquire) {
+            self.errored.add_permits(1);
+            return Err(ScriptedPublicationError(ErrorCategory::Transient));
+        }
+        if let Some(gate) = &self.gate {
+            gate.entered.add_permits(1);
+            if let Ok(permit) = gate.released.acquire().await {
+                permit.forget();
+            }
+        }
+        self.calls.lock().push(PublicationCall::Upsert {
+            name: name.as_str().to_owned(),
+            group: row.group_id.to_string(),
+            topic: row.topic.to_string(),
+            partition_count: i32::from(row.partition_count),
+        });
+        // Inner store is `Infallible`; the empty match discharges it.
+        self.inner
+            .upsert(subsystem, name, row)
+            .await
+            .map_err(|e| match e {})
+    }
+
+    async fn remove(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        group_id: &str,
+        topic: Topic,
+    ) -> Result<(), Self::Error> {
+        self.calls.lock().push(PublicationCall::Remove {
+            name: name.as_str().to_owned(),
+            group: group_id.to_owned(),
+            topic: topic.to_string(),
+        });
+        self.inner
+            .remove(subsystem, name, group_id, topic)
+            .await
+            .map_err(|e| match e {})
+    }
+
+    async fn read_publications(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+    ) -> Result<Vec<StatePublication>, Self::Error> {
+        self.calls.lock().push(PublicationCall::Read {
+            name: name.as_str().to_owned(),
+        });
+        self.inner
+            .read_publications(subsystem, name)
+            .await
+            .map_err(|e| match e {})
+    }
+}
+
+/// Error from a [`ScriptedPublicationStore`], carrying the classification the
+/// settle-path retry posture reads. Never `Terminal`.
+#[derive(Clone, Copy, Debug, Error)]
+#[error("scripted publication error ({0:?})")]
+pub(crate) struct ScriptedPublicationError(ErrorCategory);
+
+impl ClassifyError for ScriptedPublicationError {
+    fn classify_error(&self) -> ErrorCategory {
+        self.0
+    }
 }
 
 #[cfg(test)]

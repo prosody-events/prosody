@@ -15,6 +15,7 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::{CellKey, Direction, ScanEdge};
 use crate::state::dirty::DirtyStore;
+use crate::state::first_write::FirstWritePublisher;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
@@ -114,6 +115,22 @@ pub(crate) fn test_session_with_armed(
     (KeyedStateSession::new(parts), cell_store)
 }
 
+/// Like [`test_session_parts`] but wires a first-write [`FirstWritePublisher`]
+/// into the session, so the settle-boundary publication arms can drive the
+/// barrier.
+///
+/// [`FirstWritePublisher`]: crate::state::first_write::FirstWritePublisher
+pub(crate) fn test_session_with_publisher(
+    loader: MemoryLoader<Value>,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    publisher: FirstWritePublisher,
+) -> (TestSession, MemoryCellStore<FixedOracle>) {
+    let (mut parts, cell_store) = session_parts(loader, registry, state_key, Arc::default(), false);
+    parts.publisher = Some(publisher);
+    (KeyedStateSession::new(parts), cell_store)
+}
+
 /// The partition backend every test-session fixture in this module shares: the
 /// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
 pub(crate) type TestBackend =
@@ -175,6 +192,7 @@ fn session_parts<L>(
         recovery_delay: CompactDuration::new(30),
         armed,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     };
     (parts, cell_store)
 }

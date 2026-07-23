@@ -597,6 +597,7 @@ mod staged_rollback {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
         let context = MockEventContext::new()
             .with_session(session)
@@ -751,6 +752,7 @@ mod staged_rollback {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
 
         // A nested retry's epoch bump: `reset` discards the (empty) dirty and
@@ -874,6 +876,337 @@ mod staged_rollback {
             })
         }
         QuickCheck::new().quickcheck(property as fn(u8, u8, bool) -> TestResult);
+    }
+}
+
+/// First-write publication at the settle boundary and the mid-handler
+/// `commit()` path: a `Published` collection's routing row is written *before*
+/// its committed state, a failing publication store blocks the write (never
+/// settles unpublished), and shutdown during publication abandons without
+/// staging.
+mod settle_publication {
+    use super::*;
+    use crate::loader::MemoryLoader;
+    use crate::state::cell::Committed;
+    use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_with_publisher};
+    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
+    use crate::state::first_write::{PartitionCounts, PublicationBackend, PublisherTemplate};
+    use crate::state::memory::MemoryCellStore;
+    use crate::state::registry::{CollectionDef, CollectionDefRegistry, StateVisibility};
+    use crate::state::store::CellStore;
+    use crate::state::tests::cell_suite::value_cell;
+    use crate::state::tests::support::ScriptedPublicationStore;
+    use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType};
+    use crate::state_reader::PartitionCount;
+    use crate::subsystem::SubsystemName;
+    use bytes::Bytes;
+    use color_eyre::eyre::{Result, eyre};
+    use internment::Intern;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::time::{advance, timeout};
+    use uuid::Uuid;
+
+    type Ctx = MockEventContext<serde_json::Value, TestSession>;
+
+    const GROUP: &str = "group-a";
+    const SUBSYSTEM: &str = "orders";
+    const TOPIC: &str = "orders-topic";
+
+    fn cart() -> ValueDescriptor {
+        value_state("cart")
+    }
+
+    fn published_registry() -> Result<CollectionDefRegistry> {
+        let mut registry = CollectionDefRegistry::default();
+        registry
+            .register(
+                &cart(),
+                CollectionDef {
+                    visibility: StateVisibility::Published,
+                    ..CollectionDef::new(None)
+                },
+            )
+            .map_err(|e| eyre!("register cart: {e}"))?;
+        Ok(registry)
+    }
+
+    fn publisher_template(
+        store: ScriptedPublicationStore,
+        count: i32,
+    ) -> Result<PublisherTemplate> {
+        Ok(PublisherTemplate::new(
+            SubsystemName::try_new(SUBSYSTEM).map_err(|e| eyre!("subsystem: {e}"))?,
+            Arc::from(GROUP),
+            Arc::new(PublicationBackend::Scripted(store)),
+            Arc::new(PartitionCounts::Memory(PartitionCount::try_from(count)?)),
+            Arc::new(published_registry()?),
+        ))
+    }
+
+    /// The resolved committed value of the collection's single Value cell — a
+    /// probe read against the durable store (a distinct probe identity so it
+    /// never aliases the event under test).
+    async fn committed_value(
+        cell_store: &MemoryCellStore<FixedOracle>,
+        id: &CollectionId,
+    ) -> Result<Option<Bytes>> {
+        let probe = EventRef::Message {
+            dedup_id: Uuid::from_u128(u128::MAX),
+        };
+        cell_store
+            .get(id, &value_cell(), probe)
+            .await
+            .map(Committed::into_inner)
+            .map_err(|e| eyre!("read committed: {e}"))
+    }
+
+    /// Buffers one value write on a Published `cart` through a real session
+    /// carrying a first-write publisher over `store`. No finalize — `settle`
+    /// owns the only stage. Returns the settle-ready context, the durable
+    /// store, and the cell id.
+    async fn buffered_published(
+        configure: impl FnOnce(Ctx) -> Ctx,
+        store: ScriptedPublicationStore,
+        count: i32,
+    ) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
+        let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
+        let publisher = publisher_template(store, count)?.bind(Intern::<str>::from(TOPIC));
+        let (session, cell_store) = test_session_with_publisher(
+            MemoryLoader::new(),
+            published_registry()?,
+            state_key.clone(),
+            publisher,
+        );
+        let context: Ctx = configure(MockEventContext::new().with_session(session));
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
+        let cart_id = CollectionId::new(
+            state_key,
+            StateType::Application,
+            StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?,
+        );
+        Ok((context, cell_store, cart_id))
+    }
+
+    fn subsystem() -> Result<SubsystemName> {
+        SubsystemName::try_new(SUBSYSTEM).map_err(|e| eyre!("subsystem: {e}"))
+    }
+
+    fn cart_state_name() -> Result<StateName> {
+        StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))
+    }
+
+    /// Arm (a): the routing row is written BEFORE the durable state. The gated
+    /// upsert parks in settle step 0; while it is parked the cell is not yet
+    /// durable (finalize is step 1). Releasing the gate lets settle stage and
+    /// commit, and the row lands with the live count.
+    #[tokio::test]
+    async fn publication_precedes_the_durable_write() -> Result<()> {
+        let store = ScriptedPublicationStore::gated();
+        let (context, cell_store, cart_id) = buffered_published(|c| c, store.clone(), 3).await?;
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        let task = tokio::spawn(async move {
+            settle(&handler, context, guard, Ok(0)).await;
+        });
+
+        // Wait until the gated upsert has entered settle step 0 and blocked.
+        store.wait_entered().await;
+        // The barrier precedes the stage, so nothing is durable yet.
+        assert_eq!(
+            committed_value(&cell_store, &cart_id).await?,
+            None,
+            "the cell must not be durable while publication is still blocked",
+        );
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
+
+        // Release the barrier; settle now stages, commits, and promotes.
+        store.release();
+        task.await.map_err(|e| eyre!("settle task: {e}"))?;
+
+        let rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        assert_eq!(rows.len(), 1, "the routing row landed");
+        assert_eq!(
+            i32::from(rows[0].partition_count),
+            3_i32,
+            "with the live count"
+        );
+        assert_eq!(committed.load(Ordering::SeqCst), 1);
+        assert!(
+            committed_value(&cell_store, &cart_id).await?.is_some(),
+            "the cell is durable after release",
+        );
+        Ok(())
+    }
+
+    /// Arm (f): a failing publication store BLOCKS the durable write — settle's
+    /// must-succeed publish loop retries forever, so while the store fails no
+    /// cell is durable and nothing commits. Once the store heals, both the row
+    /// and the cell land and the guard commits exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn failed_publication_blocks_the_write() -> Result<()> {
+        let store = ScriptedPublicationStore::failing();
+        let (context, cell_store, cart_id) = buffered_published(|c| c, store.clone(), 3).await?;
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        let task = tokio::spawn(async move {
+            settle(&handler, context, guard, Ok(0)).await;
+        });
+
+        // The publish loop attempted and failed at least once.
+        store.wait_errored().await;
+        assert_eq!(
+            committed_value(&cell_store, &cart_id).await?,
+            None,
+            "no durable write while publication keeps failing",
+        );
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
+
+        // Heal the store and advance past the retry backoff so the loop
+        // succeeds and settle finishes.
+        store.heal();
+        advance(Duration::from_secs(2)).await;
+        timeout(Duration::from_secs(5), task)
+            .await
+            .map_err(|_| eyre!("settle did not finish after the store healed"))?
+            .map_err(|e| eyre!("settle task: {e}"))?;
+
+        let rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the routing row landed once the store healed"
+        );
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            1,
+            "committed exactly once"
+        );
+        assert!(
+            committed_value(&cell_store, &cart_id).await?.is_some(),
+            "the cell is durable after the store healed",
+        );
+        Ok(())
+    }
+
+    /// Shutdown observed at settle step 0 abandons the event before anything
+    /// stages: the guard aborts, no cell is durable, and no routing row lands.
+    #[tokio::test]
+    async fn shutdown_during_publication_abandons() -> Result<()> {
+        // A store that would fail forever, but shutdown short-circuits the loop
+        // before any upsert is attempted.
+        let store = ScriptedPublicationStore::failing();
+        let (context, cell_store, cart_id) = buffered_published(|c| c, store.clone(), 3).await?;
+        // Request shutdown AFTER the write is buffered (the write itself needs a
+        // live session); settle's publish loop then sees shutdown at its top.
+        context.request_shutdown();
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        settle(&handler, context, guard, Ok(0)).await;
+
+        assert_eq!(aborted.load(Ordering::SeqCst), 1, "shutdown abandons");
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            committed_value(&cell_store, &cart_id).await?,
+            None,
+            "nothing staged when shutdown pre-empts publication",
+        );
+        assert!(
+            store
+                .rows(&subsystem()?, &cart_state_name()?)
+                .await
+                .is_empty(),
+            "no routing row is written on the shutdown-abandon path",
+        );
+        Ok(())
+    }
+
+    /// Arm (i): the mid-handler `commit()` path publishes before its direct
+    /// durable write. A successful publication lets `commit()` write the cell;
+    /// a failing publication store makes `commit()` return `Err` and leaves NO
+    /// durable cell (the routing row gates `write_resolved`).
+    #[tokio::test]
+    async fn commit_path_publishes_before_write_resolved() -> Result<()> {
+        // Success: commit publishes then writes.
+        let store = ScriptedPublicationStore::new();
+        let state_key = StateKey::new(Uuid::from_u128(0x9), Arc::from("user-1"));
+        let publisher = publisher_template(store.clone(), 3)?.bind(Intern::<str>::from(TOPIC));
+        let (session, cell_store) = test_session_with_publisher(
+            MemoryLoader::new(),
+            published_registry()?,
+            state_key.clone(),
+            publisher,
+        );
+        let context: Ctx = MockEventContext::new().with_session(session);
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
+        handle.commit().await.map_err(|e| eyre!("commit: {e}"))?;
+
+        let cart_id = CollectionId::new(state_key, StateType::Application, cart_state_name()?);
+        let rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        assert_eq!(rows.len(), 1, "commit() published a routing row");
+        assert_eq!(i32::from(rows[0].partition_count), 3_i32);
+        assert!(
+            committed_value(&cell_store, &cart_id).await?.is_some(),
+            "commit() wrote the cell durably",
+        );
+
+        // Failure: a failing store makes commit() error and write nothing.
+        let store = ScriptedPublicationStore::failing();
+        let state_key = StateKey::new(Uuid::from_u128(0xA), Arc::from("user-2"));
+        let publisher = publisher_template(store.clone(), 3)?.bind(Intern::<str>::from(TOPIC));
+        let (session, cell_store) = test_session_with_publisher(
+            MemoryLoader::new(),
+            published_registry()?,
+            state_key.clone(),
+            publisher,
+        );
+        let context: Ctx = MockEventContext::new().with_session(session);
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
+        assert!(
+            handle.commit().await.is_err(),
+            "commit() fails when publication fails",
+        );
+        let cart_id = CollectionId::new(state_key, StateType::Application, cart_state_name()?);
+        assert_eq!(
+            committed_value(&cell_store, &cart_id).await?,
+            None,
+            "no durable cell when publication gates the write",
+        );
+        assert!(
+            store
+                .rows(&subsystem()?, &cart_state_name()?)
+                .await
+                .is_empty(),
+            "no routing row when the failing store rejects the upsert",
+        );
+        Ok(())
     }
 }
 
@@ -1153,6 +1486,7 @@ mod hook_visibility {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
         session
             .set(StateType::Application, &cart, &value_cell(), b"staged")
@@ -1250,6 +1584,7 @@ mod hook_visibility {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
         session
             .set(StateType::Application, &cart, &value_cell(), b"A1")
@@ -1835,6 +2170,7 @@ mod marker_record_must_succeed {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         });
         let cart_id = CollectionId::new(
             state_key,
@@ -2611,6 +2947,7 @@ mod settled_view {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         });
         let context = MockEventContext::new()
             .with_session(session)

@@ -60,6 +60,7 @@ fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
+        None,
     )
 }
 
@@ -672,6 +673,7 @@ mod unwind {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             })
         }
 

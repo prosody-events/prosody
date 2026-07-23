@@ -162,6 +162,9 @@ pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
 use crate::state::cassandra::{CassandraCellResources, CassandraDescriptorIdentityStore};
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
+use crate::state::first_write::{
+    PartitionCounts, PublicationBackend, PublisherTemplate, reconcile_publications,
+};
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait below.
 pub use crate::state::descriptor::{CellResolver, CellType, FromSession, WithResolver};
@@ -171,6 +174,7 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::state::session::CellWrite;
+use crate::state_reader::PartitionCount;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
@@ -736,14 +740,62 @@ impl KeyedStateInputs {
     /// backend and loader. The partition loop acquires one state manager
     /// per assignment from it; the pending-index scanner now travels inside
     /// the backend the factory mints.
-    fn provider<B, L>(&self, backend: B, loader: L) -> StateManagerProvider<B, L> {
+    fn provider<B, L>(
+        &self,
+        backend: B,
+        loader: L,
+        publisher_template: Option<PublisherTemplate>,
+    ) -> StateManagerProvider<B, L> {
         StateManagerProvider::new(
             backend,
             loader,
             self.registry.clone(),
             self.group.clone(),
             self.config.recovery_delay,
+            publisher_template,
         )
+    }
+
+    /// Runs startup reconciliation and, when publishing is active, builds the
+    /// first-write publisher template for one storage arm's publication store.
+    ///
+    /// Reconciliation runs whenever a subsystem is configured — it retires this
+    /// group's routing rows for collections no longer published (the
+    /// `.published(false)` path), resting on the
+    /// zero/one-instance-per-partition invariant plus stop-then-start
+    /// deploy ordering. The template is built only when a collection is
+    /// actually published; otherwise there is nothing to advertise and
+    /// `None` disables the write-path barrier. The low-level
+    /// [`ProsodyConsumer::new`] constructor never calls this — it rejects
+    /// registrations.
+    ///
+    /// # Errors
+    ///
+    /// A transient reconciliation failure (a broken publication store)
+    /// propagates so the caller's build fails and the deploy retries;
+    /// per-collection permanent decode failures are logged and skipped inside
+    /// [`reconcile_publications`].
+    async fn publication_setup(
+        &self,
+        store: PublicationBackend,
+        counts: PartitionCounts,
+    ) -> Result<Option<PublisherTemplate>, ConsumerError> {
+        let Some(subsystem) = self.config.subsystem.clone() else {
+            return Ok(None);
+        };
+        reconcile_publications(&store, &self.registry, &subsystem, &self.group)
+            .await
+            .map_err(|error| KeyedStateInitError::Publication(error.to_string()))?;
+        if !self.registry.has_published() {
+            return Ok(None);
+        }
+        Ok(Some(PublisherTemplate::new(
+            subsystem,
+            self.group.clone(),
+            Arc::new(store),
+            Arc::new(counts),
+            self.registry.clone(),
+        )))
     }
 }
 
@@ -1035,6 +1087,7 @@ fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,
     loader: MemoryLoader<C::Payload>,
+    publisher_template: Option<PublisherTemplate>,
 ) -> StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
     MemoryLoader<C::Payload>,
@@ -1049,7 +1102,7 @@ where
         dedup_provider,
         keyed_state.group.clone(),
     );
-    keyed_state.provider(backend, loader)
+    keyed_state.provider(backend, loader, publisher_template)
 }
 
 /// Builds the keyed-state provider for a [`StorePair::Cassandra`] arm: opens
@@ -1063,6 +1116,7 @@ fn cassandra_state_provider<C: Codec>(
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
     loader: KafkaLoader<C>,
+    publisher_template: Option<PublisherTemplate>,
 ) -> Result<
     StateManagerProvider<
         CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
@@ -1089,7 +1143,7 @@ where
         dedup_provider,
         keyed_state.group.clone(),
     );
-    Ok(keyed_state.provider(backend, loader))
+    Ok(keyed_state.provider(backend, loader, publisher_template))
 }
 
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
@@ -1301,6 +1355,9 @@ where
                     &keyed_state,
                     dedup_provider,
                     MemoryLoader::<C::Payload>::new(),
+                    // The low-level constructor rejects registrations, so
+                    // nothing is ever published: no publisher, no reconcile.
+                    None,
                 );
                 initialize_consumer::<_, _, _, C>(
                     consumer_config,
@@ -1328,6 +1385,8 @@ where
                     &keyed_state,
                     MemoryDeduplicationStoreProvider::new(),
                     MemoryLoader::<C::Payload>::new(),
+                    // Stateless: registrations are rejected, nothing publishes.
+                    None,
                 );
                 initialize_consumer::<_, _, _, C>(
                     consumer_config,
@@ -1380,15 +1439,23 @@ where
                 message_provider,
                 timer_provider,
                 dedup_provider,
+                publication_store,
             } => {
                 // Memory backend is also the mock-mode path, which must not
                 // touch Kafka — pair it with an in-memory loader, shared by
                 // message defer and the keyed-state Kafka-message handles.
                 let loader = MemoryLoader::<C::Payload>::new();
+                let publisher_template = keyed_state
+                    .publication_setup(
+                        PublicationBackend::Memory(publication_store),
+                        PartitionCounts::Memory(PartitionCount::MOCK),
+                    )
+                    .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
                     loader.clone(),
+                    publisher_template,
                 );
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
@@ -1415,6 +1482,7 @@ where
                 dedup_provider,
                 cell_store,
                 identity_store,
+                publication_store,
             } => {
                 // One Kafka loader per consumer: built once here and shared by
                 // cloning. A clone shares the channel, semaphore, cache, and the
@@ -1424,12 +1492,21 @@ where
                 let loader =
                     KafkaLoader::<C>::for_consumer(&stack.consumer_config, &stack.heartbeats)
                         .map_err(DeferInitError::from)?;
+                let publisher_template = keyed_state
+                    .publication_setup(
+                        PublicationBackend::Cassandra(publication_store),
+                        PartitionCounts::Kafka {
+                            bootstrap: Arc::from(stack.consumer_config.bootstrap_servers.clone()),
+                        },
+                    )
+                    .await?;
                 let state_provider = cassandra_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
                     cell_store,
                     identity_store,
                     loader.clone(),
+                    publisher_template,
                 )?;
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     stack.defer_config.clone(),
@@ -1498,12 +1575,20 @@ where
             StorePair::Memory {
                 trigger_provider,
                 dedup_provider,
+                publication_store,
                 ..
             } => {
+                let publisher_template = keyed_state
+                    .publication_setup(
+                        PublicationBackend::Memory(publication_store),
+                        PartitionCounts::Memory(PartitionCount::MOCK),
+                    )
+                    .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
                     MemoryLoader::new(),
+                    publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1530,16 +1615,26 @@ where
                 dedup_provider,
                 cell_store,
                 identity_store,
+                publication_store,
                 ..
             } => {
                 let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
                     .map_err(DeferInitError::from)?;
+                let publisher_template = keyed_state
+                    .publication_setup(
+                        PublicationBackend::Cassandra(publication_store),
+                        PartitionCounts::Kafka {
+                            bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
+                        },
+                    )
+                    .await?;
                 let state_provider = cassandra_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
                     cell_store,
                     identity_store,
                     loader,
+                    publisher_template,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1594,12 +1689,20 @@ where
             StorePair::Memory {
                 trigger_provider,
                 dedup_provider,
+                publication_store,
                 ..
             } => {
+                let publisher_template = keyed_state
+                    .publication_setup(
+                        PublicationBackend::Memory(publication_store),
+                        PartitionCounts::Memory(PartitionCount::MOCK),
+                    )
+                    .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
                     MemoryLoader::new(),
+                    publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1624,16 +1727,26 @@ where
                 dedup_provider,
                 cell_store,
                 identity_store,
+                publication_store,
                 ..
             } => {
                 let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
                     .map_err(DeferInitError::from)?;
+                let publisher_template = keyed_state
+                    .publication_setup(
+                        PublicationBackend::Cassandra(publication_store),
+                        PartitionCounts::Kafka {
+                            bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
+                        },
+                    )
+                    .await?;
                 let state_provider = cassandra_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
                     cell_store,
                     identity_store,
                     loader,
+                    publisher_template,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
                     common_config,
@@ -1841,6 +1954,12 @@ pub enum KeyedStateInitError {
     /// The local keyed-state cache's disk workspace could not be opened.
     #[error("failed to open the keyed-state cache: {0:#}")]
     Cache(String),
+
+    /// Startup reconciliation of keyed-state publication routing rows failed
+    /// (a broken publication store). Transient — the deploy retries; a
+    /// per-collection permanent decode is logged and skipped, not surfaced.
+    #[error("keyed-state publication reconciliation failed: {0}")]
+    Publication(String),
 
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`] constructor, which runs no state middleware to

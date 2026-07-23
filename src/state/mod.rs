@@ -90,6 +90,7 @@ pub mod descriptor;
 pub mod descriptor_identity;
 pub(crate) mod dirty;
 pub mod event_ref;
+pub(crate) mod first_write;
 pub(crate) mod fjall;
 pub mod identity;
 pub mod manager;

@@ -22,8 +22,10 @@ use crate::consumer::middleware::defer::timer::store::{
 };
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::state::cassandra::{
-    CassandraCellResources, CassandraDescriptorIdentityStore, CellQueries, IdentityQueries,
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
+    CellQueries, IdentityQueries, PublicationQueries,
 };
+use crate::state::memory::MemoryPublicationStore;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::num::NonZeroUsize;
@@ -52,6 +54,8 @@ pub enum StorePair {
         timer_provider: MemoryTimerDeferStoreProvider,
         /// Deduplication store provider (Memory) — the mandatory commit oracle.
         dedup_provider: MemoryDeduplicationStoreProvider,
+        /// Keyed-state routing-only publication store (Memory).
+        publication_store: MemoryPublicationStore,
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
@@ -70,6 +74,8 @@ pub enum StorePair {
         cell_store: CassandraCellResources,
         /// Keyed-state descriptor-identity store sharing the same session.
         identity_store: CassandraDescriptorIdentityStore,
+        /// Keyed-state routing-only publication store sharing the same session.
+        publication_store: CassandraPublicationStore,
     },
 }
 
@@ -124,6 +130,7 @@ impl StorePair {
                     message_provider: MemoryMessageDeferStoreProvider::new(),
                     timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
                     dedup_provider: MemoryDeduplicationStoreProvider::new(),
+                    publication_store: MemoryPublicationStore::new(),
                 });
             }
             (false, TriggerStoreConfiguration::Cassandra(cass_config)) => cass_config,
@@ -174,6 +181,10 @@ impl StorePair {
         let identity_queries = Arc::new(IdentityQueries::new(store.session(), keyspace).await?);
         let identity_store = CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
 
+        let publication_queries =
+            Arc::new(PublicationQueries::new(store.session(), keyspace).await?);
+        let publication_store = CassandraPublicationStore::new(store.clone(), publication_queries);
+
         Ok(Self::Cassandra {
             trigger_provider,
             message_provider,
@@ -181,6 +192,7 @@ impl StorePair {
             dedup_provider,
             cell_store,
             identity_store,
+            publication_store,
         })
     }
 }

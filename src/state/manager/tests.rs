@@ -128,6 +128,7 @@ fn provider_with(
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
+        None,
     )
 }
 
@@ -144,6 +145,7 @@ fn poison_provider(cell: PoisonCell, registry: Arc<CollectionDefRegistry>) -> Po
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
+        None,
     )
 }
 

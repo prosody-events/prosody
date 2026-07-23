@@ -313,6 +313,26 @@ impl CollectionDefRegistry {
         })
     }
 
+    /// Whether `(state_type, name)` is registered `Published` — the write-path
+    /// visibility gate the first-write publisher consults before upserting a
+    /// routing row. An unregistered name is never published.
+    #[must_use]
+    pub(crate) fn is_published(&self, state_type: StateType, name: &StateName) -> bool {
+        self.lookup_collection(state_type, name)
+            .is_some_and(|c| c.def.visibility == StateVisibility::Published)
+    }
+
+    /// Whether any registered collection is `Published`. Gates the whole
+    /// first-write publication subsystem: with no published collection there is
+    /// nothing to advertise and nothing to reconcile.
+    #[must_use]
+    pub(crate) fn has_published(&self) -> bool {
+        self.defs
+            .values()
+            .flat_map(HashMap::values)
+            .any(|c| c.def.visibility == StateVisibility::Published)
+    }
+
     /// Returns the TTL registered for `(state_type, name)`; an unregistered
     /// name yields `None`.
     #[must_use]

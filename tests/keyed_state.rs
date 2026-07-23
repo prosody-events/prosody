@@ -19,6 +19,8 @@
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::cassandra::CassandraStore;
+use prosody::cassandra::config::CassandraConfiguration;
 use prosody::codec::JsonCodecError;
 use prosody::consumer::event_context::{ErasedStateError, EventContext, StateAccessError};
 use prosody::consumer::message::ConsumerMessage;
@@ -36,7 +38,13 @@ use prosody::consumer::{
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::loader::KafkaLoader;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::state::descriptor::{CellStateError, Registered, ValueDescriptor, value_state};
+use prosody::state::StateName;
+use prosody::state::cassandra::{CassandraPublicationStore, PublicationQueries};
+use prosody::state::descriptor::{
+    CellStateError, Registered, StateDescriptor, ValueDescriptor, value_state,
+};
+use prosody::state::publication::PublicationStore;
+use prosody::subsystem::SubsystemName;
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use prosody::timers::duration::CompactDuration;
@@ -47,6 +55,7 @@ use prosody::{
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -411,5 +420,143 @@ async fn verify_observations(rx: &mut Receiver<Observation>, second: &Value) -> 
             return Err(eyre!("expected timer observation, got {other:?}"));
         }
     }
+    Ok(())
+}
+
+/// A `Published` collection's first durable write publishes a routing row into
+/// `keyed_state_publication` carrying the topic's live Kafka partition count.
+/// Mirrors the round-trip test, but `cart` is `.published(true)` under a
+/// configured subsystem; after the writes are observably durable (the timer
+/// read-back fires only after both message events settle), the row is present
+/// with the correct group, topic, and partition count.
+#[tokio::test]
+async fn test_published_collection_writes_routing_row() -> Result<()> {
+    init_test_logging();
+
+    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let bootstrap = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
+
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
+
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
+        .build()?;
+
+    let group_id = Uuid::new_v4().to_string();
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(bootstrap)
+        .group_id(group_id.clone())
+        .probe_port(None)
+        .subscribed_topics(&[topic.to_string()])
+        .build()?;
+
+    let (observations_tx, mut observations_rx) = channel(10);
+
+    // `cart` is published under a subsystem; `last_seen` stays private.
+    let subsystem = SubsystemName::try_new("orders").map_err(|e| eyre!("subsystem: {e}"))?;
+    let mut keyed_state = KeyedStateConfiguration::default();
+    keyed_state.subsystem = Some(subsystem.clone());
+    let cart = keyed_state.register(cart().published(true));
+    let _last_seen = keyed_state.register(last_seen());
+    let handler = CartHandler {
+        observations_tx,
+        cart,
+    };
+
+    let telemetry = Telemetry::new();
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, telemetry.sender())?;
+
+    let pipeline_config = PipelineMiddlewareConfiguration {
+        retry: RetryConfigurationBuilder::default().build()?,
+        monopolization: MonopolizationConfigurationBuilder::default().build()?,
+        defer: DeferConfigurationBuilder::default().build()?,
+    };
+
+    let common_config = CommonConfiguration {
+        scheduler: SchedulerConfigurationBuilder::default().build()?,
+        timeout: TimeoutConfigurationBuilder::default().build()?,
+        dedup: DeduplicationConfigurationBuilder::default().build()?,
+        keyed_state,
+    };
+
+    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
+        &consumer_config,
+        &common::create_cassandra_trigger_store_config(),
+        pipeline_config,
+        &common_config,
+        telemetry,
+        handler,
+    )
+    .await?;
+
+    let key = "cart-key";
+    let first = json!({ "id": "evt-1", "item": "apple" });
+    let second = json!({ "id": "evt-2", "item": "banana" });
+
+    let outcome = async {
+        producer.send([], topic, key, first).await?;
+        producer.send([], topic, key, second.clone()).await?;
+        // The timer read-back fires only after both message events fully settle
+        // (per-key serialization), so by the time it is observed the cart's
+        // publication row is durable.
+        verify_observations(&mut observations_rx, &second).await?;
+        assert_routing_row(&subsystem, &group_id, topic).await
+    }
+    .await;
+    consumer.shutdown().await;
+    admin_client.delete_topic(&topic).await?;
+    outcome
+}
+
+/// Reads the `keyed_state_publication` table directly and asserts exactly one
+/// routing row for `group_id` under `(subsystem, cart)`, carrying `topic` and
+/// the topic's live partition count (1, since the test topic has one
+/// partition).
+async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: Topic) -> Result<()> {
+    let cass_config = CassandraConfiguration {
+        datacenter: None,
+        rack: None,
+        nodes: vec!["localhost:9042".to_owned()],
+        keyspace: common::TEST_KEYSPACE.to_owned(),
+        user: None,
+        password: None,
+        retention: Duration::from_mins(10),
+    };
+    let store = CassandraStore::new(&cass_config).await?;
+    let queries = Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
+    let publication_store = CassandraPublicationStore::new(store, queries);
+    let name = StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?;
+    let rows = publication_store
+        .read_publications(subsystem, &name)
+        .await?;
+    let own: Vec<_> = rows
+        .into_iter()
+        .filter(|r| r.group_id.as_ref() == group_id)
+        .collect();
+    ensure!(
+        own.len() == 1,
+        "exactly one routing row for this group, got {}",
+        own.len()
+    );
+    ensure!(
+        own[0].topic == topic,
+        "row must carry the writing topic, got {:?}",
+        own[0].topic
+    );
+    ensure!(
+        i32::from(own[0].partition_count) == 1_i32,
+        "row must carry the topic's live partition count (1), got {}",
+        i32::from(own[0].partition_count)
+    );
     Ok(())
 }

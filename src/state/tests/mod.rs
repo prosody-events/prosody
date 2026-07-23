@@ -1382,6 +1382,7 @@ fn session_with_loader<L>(
         recovery_delay: CompactDuration::new(30),
         armed: armed.clone(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     })
 }
 

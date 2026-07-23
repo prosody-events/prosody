@@ -34,6 +34,7 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
 use crate::state::dirty::DirtyStore;
+use crate::state::first_write::{FirstWritePublisher, PublisherTemplate};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, sweep_provisional};
@@ -296,6 +297,9 @@ where
     /// the sweep fires. Semantics of an absent key are owned by [`ArmedKeys`]:
     /// unknown, not unarmed.
     armed: ArmedKeys,
+    /// The first-write publisher bound to this partition's topic, or `None`
+    /// when nothing is published. Cloned into every session this manager mints.
+    publisher: Option<FirstWritePublisher>,
 }
 
 /// The real per-partition state manager: owns the partition-lifetime cell
@@ -344,6 +348,7 @@ where
             recovery_delay: self.inner.recovery_delay,
             armed: self.inner.armed.clone(),
             termination,
+            publisher: self.inner.publisher.clone(),
         }))
     }
 
@@ -482,6 +487,11 @@ pub struct StateManagerProvider<F, L> {
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     recovery_delay: CompactDuration,
+    /// The provider-wide first-write publication template, or `None` when no
+    /// collection is published / no subsystem is configured. `acquire` binds
+    /// it to the partition's topic; the shared memo dedups across every session
+    /// this provider mints (see [`PublisherTemplate`]).
+    publisher_template: Option<PublisherTemplate>,
     /// Process-level latch for descriptor-identity validation. The identity
     /// table is group-global, so validating the registry against it is a
     /// once-per-process concern, not per-partition. Shared across provider
@@ -514,6 +524,7 @@ impl<F, L> StateManagerProvider<F, L> {
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
         recovery_delay: CompactDuration,
+        publisher_template: Option<PublisherTemplate>,
     ) -> Self {
         Self {
             backend,
@@ -521,6 +532,7 @@ impl<F, L> StateManagerProvider<F, L> {
             registry,
             consumer_group,
             recovery_delay,
+            publisher_template,
             validated: Arc::new(OnceCell::new()),
         }
     }
@@ -571,6 +583,7 @@ where
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
+                publisher: self.publisher_template.as_ref().map(|t| t.bind(topic)),
             }),
         })
     }

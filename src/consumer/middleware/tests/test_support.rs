@@ -982,6 +982,7 @@ pub fn recording_session_with_loader(
         recovery_delay: CompactDuration::new(30),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     });
     (session, cell_store, dirty, recorded)
 }
