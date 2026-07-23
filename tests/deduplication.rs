@@ -109,21 +109,25 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     producer.send([], topic, key, payload.clone()).await?;
     producer.send([], topic, key, payload_duplicate).await?;
 
-    // Only the first message should be processed
-    let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;
-
+    // Always shut the consumer down and delete the topic before propagating a
+    // failure — an early return would leave the consumer's client threads alive
+    // and hang the test binary, and orphan the UUID-named topic in the shared
+    // cluster.
+    let outcome = async {
+        // Only the first message should be processed.
+        let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;
+        ensure!(
+            received.len() == 1,
+            "Expected one message due to deduplication, got {}",
+            received.len()
+        );
+        let (recv_key, recv_payload) = &received[0];
+        ensure!(recv_key == key);
+        ensure!(recv_payload == &payload);
+        Ok(())
+    }
+    .await;
     consumer.shutdown().await;
-
-    ensure!(
-        received.len() == 1,
-        "Expected one message due to deduplication, got {}",
-        received.len()
-    );
-
-    let (recv_key, recv_payload) = &received[0];
-    ensure!(recv_key == key);
-    ensure!(recv_payload == &payload);
-
     admin_client.delete_topic(&topic).await?;
-    Ok(())
+    outcome
 }
