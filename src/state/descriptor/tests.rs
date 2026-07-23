@@ -118,8 +118,6 @@ pub(crate) fn test_session_with_armed(
 /// Like [`test_session_parts`] but wires a first-write [`FirstWritePublisher`]
 /// into the session, so the settle-boundary publication arms can drive the
 /// barrier.
-///
-/// [`FirstWritePublisher`]: crate::state::first_write::FirstWritePublisher
 pub(crate) fn test_session_with_publisher(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,

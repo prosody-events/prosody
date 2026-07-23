@@ -896,7 +896,7 @@ mod settle_publication {
     use crate::state::store::CellStore;
     use crate::state::tests::cell_suite::value_cell;
     use crate::state::tests::support::ScriptedPublicationStore;
-    use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType};
+    use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType, StoreOutcome};
     use crate::state_reader::PartitionCount;
     use crate::subsystem::SubsystemName;
     use bytes::Bytes;
@@ -1020,7 +1020,9 @@ mod settle_publication {
         });
 
         // Wait until the gated upsert has entered settle step 0 and blocked.
-        store.wait_entered().await;
+        timeout(Duration::from_secs(5), store.wait_entered())
+            .await
+            .map_err(|_| eyre!("gated upsert never entered"))?;
         // The barrier precedes the stage, so nothing is durable yet.
         assert_eq!(
             committed_value(&cell_store, &cart_id).await?,
@@ -1041,6 +1043,11 @@ mod settle_publication {
             "with the live count"
         );
         assert_eq!(committed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            aborted.load(Ordering::SeqCst),
+            0,
+            "the guard never aborts while publication is pending",
+        );
         assert!(
             committed_value(&cell_store, &cart_id).await?.is_some(),
             "the cell is durable after release",
@@ -1069,7 +1076,9 @@ mod settle_publication {
         });
 
         // The publish loop attempted and failed at least once.
-        store.wait_errored().await;
+        timeout(Duration::from_secs(5), store.wait_errored())
+            .await
+            .map_err(|_| eyre!("gated upsert never errored"))?;
         assert_eq!(
             committed_value(&cell_store, &cart_id).await?,
             None,
@@ -1096,6 +1105,11 @@ mod settle_publication {
             committed.load(Ordering::SeqCst),
             1,
             "committed exactly once"
+        );
+        assert_eq!(
+            aborted.load(Ordering::SeqCst),
+            0,
+            "the guard never aborts while publication retries",
         );
         assert!(
             committed_value(&cell_store, &cart_id).await?.is_some(),
@@ -1163,7 +1177,11 @@ mod settle_publication {
             .state(Registered::new(cart()))
             .map_err(|e| eyre!("bind cart: {e}"))?;
         handle.set(json!({ "x": 1_i32 })).await?;
-        handle.commit().await.map_err(|e| eyre!("commit: {e}"))?;
+        assert_eq!(
+            handle.commit().await.map_err(|e| eyre!("commit: {e}"))?,
+            StoreOutcome::Applied,
+            "commit() durably applied the cell",
+        );
 
         let cart_id = CollectionId::new(state_key, StateType::Application, cart_state_name()?);
         let rows = store.rows(&subsystem()?, &cart_state_name()?).await;

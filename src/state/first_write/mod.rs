@@ -331,14 +331,20 @@ impl FirstWritePublisher {
 }
 
 /// Startup reconciliation: removes this group's own routing rows for every
-/// **registered** collection, so a collection un-published
+/// **registered-but-private** collection, so a collection un-published
 /// (`.published(false)`) since the last run retires its routing.
 ///
-/// Every registered name is swept — published or private — for the group's own
-/// rows: the visibility gate lives on the write path (only published
-/// collections ever upsert), so reconciling all registered names is safe, and a
-/// name flipped `Published → Private` is still in the registry. Rows of *other*
-/// groups are left untouched.
+/// Only private names are swept. A name un-published via `.published(false)`
+/// becomes [`StateVisibility::Private`], so [`is_published`] returns false and
+/// the retired name is still swept; a name that remains `Published` keeps its
+/// row across restart so a reader never loses discoverability of that
+/// collection's still-committed state (sweeping it would delete the row until
+/// the next durable write to that `(collection, topic)`, an unbounded window
+/// for a quiescent published collection). Rows of *other* groups are left
+/// untouched.
+///
+/// [`StateVisibility::Private`]: crate::state::registry::StateVisibility::Private
+/// [`is_published`]: CollectionDefRegistry::is_published
 ///
 /// Convergence rests on the zero-or-one-instance-per-partition invariant plus
 /// running at every startup: with stop-then-start deploy ordering the
@@ -358,8 +364,15 @@ pub(crate) async fn reconcile_publications(
 ) -> Result<(), PublicationError> {
     // Own the registered set up front: streaming borrowed registry items into
     // the awaits below would keep the registry borrowed across `.await`.
+    //
+    // The publication table is keyed by `(subsystem, name)` while the registry
+    // is keyed by `(state_type, name)`; today only `StateType::Application`
+    // exists in production, so filtering per `(state_type, name)` is exact. A
+    // second production `StateType` sharing a name would need "sweep a name only
+    // when no registration of that name is Published" — not built here.
     let collections: Vec<StateName> = registry
         .collections()
+        .filter(|(state_type, name)| !registry.is_published(*state_type, name))
         .map(|(_state_type, name)| name.clone())
         .collect();
     for name in &collections {

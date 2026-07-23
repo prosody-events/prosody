@@ -17,6 +17,7 @@ use super::{
     reconcile_publications,
 };
 use crate::Topic;
+use crate::error::ErrorCategory;
 use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::publication::StatePublication;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, StateVisibility};
@@ -324,17 +325,16 @@ async fn distinct_topics_publish_distinct_rows() -> Result<()> {
     Ok(())
 }
 
-/// A `read_publications` failure inside reconciliation of a `Permanent`
-/// category is logged and skipped, not propagated (a corrupt sibling row must
-/// not wedge startup). Here the store is healthy, so reconciliation over an
-/// empty set is a no-op — the positive path; the skip-on-permanent branch is a
-/// documented degradation exercised by the Cassandra integration variant.
+/// The healthy no-op path: reconciliation over a store with no rows removes
+/// nothing. The read-failure degradations are pinned separately by
+/// [`reconcile_skips_collection_whose_reads_fail_permanent`] (skip) and
+/// [`reconcile_propagates_transient_read_failure`] (propagate).
 #[tokio::test]
 async fn reconcile_over_empty_store_is_a_noop() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     reconcile_publications(
         &PublicationBackend::Scripted(store.clone()),
-        &registry(StateVisibility::Published)?,
+        &registry(StateVisibility::Private)?,
         &subsystem()?,
         GROUP,
     )
@@ -345,6 +345,94 @@ async fn reconcile_over_empty_store_is_a_noop() -> Result<()> {
             .iter()
             .any(|c| matches!(c, PublicationCall::Remove { .. })),
         "nothing to remove from an empty store"
+    );
+    Ok(())
+}
+
+/// A `Published` collection's own row survives reconciliation: only
+/// registered-but-private names are swept, so a read-mostly published
+/// collection keeps its routing row across restart and a reader never loses
+/// discoverability of its still-committed state.
+#[tokio::test]
+async fn reconcile_keeps_published_collection_row() -> Result<()> {
+    let store = ScriptedPublicationStore::new();
+    let subsystem = subsystem()?;
+    let name = cart_name()?;
+    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+
+    reconcile_publications(
+        &PublicationBackend::Scripted(store.clone()),
+        &registry(StateVisibility::Published)?,
+        &subsystem,
+        GROUP,
+    )
+    .await?;
+
+    assert!(
+        !store
+            .calls()
+            .iter()
+            .any(|c| matches!(c, PublicationCall::Remove { .. })),
+        "a still-published collection's row must not be swept"
+    );
+    let rows = store.rows(&subsystem, &name).await;
+    assert_eq!(rows.len(), 1, "the published row survives");
+    assert_eq!(rows[0].group_id.as_ref(), GROUP);
+    Ok(())
+}
+
+/// A `Permanent` read failure inside reconciliation is logged and skipped, not
+/// propagated (a corrupt sibling row that will not decode must not wedge
+/// startup). The own row is left in place — nothing was removed.
+#[tokio::test]
+async fn reconcile_skips_collection_whose_reads_fail_permanent() -> Result<()> {
+    let store = ScriptedPublicationStore::new();
+    let subsystem = subsystem()?;
+    let name = cart_name()?;
+    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+    store.fail_reads_with(ErrorCategory::Permanent);
+
+    // Returns Ok despite the read failure — the collection is skipped.
+    reconcile_publications(
+        &PublicationBackend::Scripted(store.clone()),
+        &registry(StateVisibility::Private)?,
+        &subsystem,
+        GROUP,
+    )
+    .await?;
+
+    assert!(
+        !store
+            .calls()
+            .iter()
+            .any(|c| matches!(c, PublicationCall::Remove { .. })),
+        "a Permanent read failure skips the collection; nothing is removed"
+    );
+    Ok(())
+}
+
+/// A `Transient` read failure inside reconciliation propagates, so the caller's
+/// build-time retry re-runs — the classification split from the `Permanent`
+/// skip above.
+#[tokio::test]
+async fn reconcile_propagates_transient_read_failure() -> Result<()> {
+    let store = ScriptedPublicationStore::new();
+    let subsystem = subsystem()?;
+    let name = cart_name()?;
+    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+    store.fail_reads_with(ErrorCategory::Transient);
+
+    let result = reconcile_publications(
+        &PublicationBackend::Scripted(store.clone()),
+        &registry(StateVisibility::Private)?,
+        &subsystem,
+        GROUP,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a Transient read failure propagates so the build-time retry re-runs"
     );
     Ok(())
 }

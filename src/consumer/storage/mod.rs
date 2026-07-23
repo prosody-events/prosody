@@ -221,7 +221,7 @@ pub enum StoreCreationError {
 
     /// Failed to initialize the shared Cassandra store: session creation or
     /// statement preparation for any of the stores it backs (message/timer
-    /// defer, deduplication, keyed-state cell and identity).
+    /// defer, deduplication, keyed-state cell, identity, and publication).
     #[error("failed to initialize cassandra store: {0:#}")]
     Cassandra(Box<CassandraStoreError>),
 

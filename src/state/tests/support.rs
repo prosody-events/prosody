@@ -3,15 +3,19 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
+use crate::Topic;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::marker::{EventMarker, SectionClear};
+use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
+use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
 use crate::state::session::sealed::{MarkerIdentity, ReadAdmission, StateLifecycle};
 use crate::state::session::{
@@ -24,11 +28,13 @@ use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
     StoreOutcome,
 };
+use crate::subsystem::SubsystemName;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::stream::{self, Stream};
+use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::convert::Infallible;
@@ -37,16 +43,9 @@ use std::future::{Future, ready};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
-
-use crate::Topic;
-use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::memory::MemoryPublicationStore;
-use crate::state::publication::{PublicationStore, StatePublication};
-use crate::subsystem::SubsystemName;
-use parking_lot::Mutex;
-use thiserror::Error;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
 /// event resolves to the one fixed decision. Use it where the test is not
@@ -1186,6 +1185,10 @@ pub(crate) struct ScriptedPublicationStore {
     /// When set, every `upsert` returns a `Transient` error (signalling
     /// `errored`) instead of applying — models a persistently-failing store.
     fail: Arc<AtomicBool>,
+    /// When set, every `read_publications` returns an error of this category
+    /// (after recording the [`PublicationCall::Read`]) — models a store whose
+    /// rows will not decode (`Permanent`) or a transient read fault.
+    read_fail: Arc<Mutex<Option<ErrorCategory>>>,
     errored: Arc<Semaphore>,
     /// When present, a successful `upsert` blocks on the release gate.
     gate: Option<Arc<ReleaseGate>>,
@@ -1198,6 +1201,7 @@ impl ScriptedPublicationStore {
             inner: MemoryPublicationStore::new(),
             calls: Arc::new(Mutex::new(Vec::new())),
             fail: Arc::new(AtomicBool::new(false)),
+            read_fail: Arc::new(Mutex::new(None)),
             errored: Arc::new(Semaphore::new(0)),
             gate: None,
         }
@@ -1225,6 +1229,13 @@ impl ScriptedPublicationStore {
     /// Stops failing upserts (pairs with [`failing`](Self::failing)).
     pub(crate) fn heal(&self) {
         self.fail.store(false, Ordering::Release);
+    }
+
+    /// Makes every subsequent `read_publications` fail with `category` (after
+    /// recording the [`PublicationCall::Read`]) — drives reconciliation's
+    /// skip-on-`Permanent` and propagate-on-`Transient` arms.
+    pub(crate) fn fail_reads_with(&self, category: ErrorCategory) {
+        *self.read_fail.lock() = Some(category);
     }
 
     /// Waits until at least one upsert has failed — the deterministic signal
@@ -1353,6 +1364,9 @@ impl PublicationStore for ScriptedPublicationStore {
         self.calls.lock().push(PublicationCall::Read {
             name: name.as_str().to_owned(),
         });
+        if let Some(category) = *self.read_fail.lock() {
+            return Err(ScriptedPublicationError(category));
+        }
         self.inner
             .read_publications(subsystem, name)
             .await

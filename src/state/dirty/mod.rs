@@ -73,6 +73,11 @@ pub type ClearedSections = SmallVec<[Section; SECTIONS_INLINE]>;
 /// sections it cleared (dirty clear markers), and its [`CellSnapshot`].
 pub type TouchedCollection = ((StateType, StateName), ClearedSections, CellSnapshot);
 
+/// One event's distinct touched `(state_type, name)` collections — the
+/// keys-only projection [`DirtyStore::touched_collections`] yields, inline for
+/// the common handful.
+pub type TouchedCollectionNames = SmallVec<[(StateType, StateName); COLLECTIONS_INLINE]>;
+
 /// One event's touched collections — the `finalize` work-list, inline for the
 /// common handful.
 pub type TouchedCollections = SmallVec<[TouchedCollection; COLLECTIONS_INLINE]>;
@@ -303,6 +308,33 @@ impl DirtyStore {
             }
         }
         grouped
+    }
+
+    /// The distinct `(state_type, name)` collections this event's (one `key`)
+    /// dirty overlay touched — the marker and entry ranges projected to their
+    /// collection identity, cloning no cell values or snapshots. This is
+    /// [`Self::touched`] without the per-cell payload: the first-write
+    /// publisher needs only the collection names, so cloning the full
+    /// [`CellSnapshot`] there would be a redundant hot-path allocation.
+    #[must_use]
+    pub fn touched_collections(&self, key: &Key) -> TouchedCollectionNames {
+        let guard = Guard::new();
+        let mut names = TouchedCollectionNames::new();
+        let mut push_distinct = |collection: (StateType, StateName)| {
+            if !names.contains(&collection) {
+                names.push(collection);
+            }
+        };
+        for (marker_key, ()) in self
+            .markers
+            .range(MarkerKeyScope::range(key.clone()), &guard)
+        {
+            push_distinct((marker_key.state_type, marker_key.name.clone()));
+        }
+        for (dirty_key, _value) in self.entries.range(KeyScope::range(key.clone()), &guard) {
+            push_distinct((dirty_key.state_type, dirty_key.name.clone()));
+        }
+        names
     }
 
     /// Discards every cell and dirty clear marker buffered for one event's

@@ -20,7 +20,6 @@
 
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::CassandraStore;
-use prosody::cassandra::config::CassandraConfiguration;
 use prosody::codec::JsonCodecError;
 use prosody::consumer::event_context::{ErasedStateError, EventContext, StateAccessError};
 use prosody::consumer::message::ConsumerMessage;
@@ -523,16 +522,7 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
 /// the topic's live partition count (1, since the test topic has one
 /// partition).
 async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: Topic) -> Result<()> {
-    let cass_config = CassandraConfiguration {
-        datacenter: None,
-        rack: None,
-        nodes: vec!["localhost:9042".to_owned()],
-        keyspace: common::TEST_KEYSPACE.to_owned(),
-        user: None,
-        password: None,
-        retention: Duration::from_mins(10),
-    };
-    let store = CassandraStore::new(&cass_config).await?;
+    let store = CassandraStore::new(&common::test_cassandra_config()).await?;
     let queries = Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
     let publication_store = CassandraPublicationStore::new(store, queries);
     let name = StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?;
@@ -557,6 +547,18 @@ async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: To
         i32::from(own[0].partition_count) == 1_i32,
         "row must carry the topic's live partition count (1), got {}",
         i32::from(own[0].partition_count)
+    );
+
+    // The private `last_seen` collection was durably written alongside `cart`
+    // but never publishes: its routing row must be absent end-to-end (the
+    // visibility gate against the real table, not just the mock stores).
+    let private = StateName::try_new(LAST_SEEN).map_err(|e| eyre!("name: {e}"))?;
+    ensure!(
+        publication_store
+            .read_publications(subsystem, &private)
+            .await?
+            .is_empty(),
+        "a private collection must never write a routing row"
     );
     Ok(())
 }

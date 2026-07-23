@@ -211,7 +211,8 @@ pub(super) enum ArmOutcome {
 /// by a cross-group reader until its routing row exists, so the row must
 /// precede the stage. [`publish_first_writes`] therefore retries **every**
 /// non-shutdown failure — transient, terminal, *and* permanent — forever; the
-/// C1 blind upsert makes a poisoning `Permanent` unreachable, so retrying is
+/// unconditional (blind) idempotent upsert makes a poisoning `Permanent`
+/// unreachable, so retrying is
 /// the correct posture ("durable state with no row is unwritable"). The only
 /// non-`Published` outcome is a shutdown, which abandons before anything
 /// stages.
@@ -351,9 +352,9 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
     }
 }
 
-/// The success arm of [`settle`]: stage, arm the backstop, record the marker
-/// strictly after the stage, commit, then promote the staged cells through
-/// the receipt.
+/// The success arm of [`settle`]: publish, stage, arm the backstop, record the
+/// marker strictly after the stage, commit, then promote the staged cells
+/// through the receipt.
 ///
 /// The marker is read from the session's event identity
 /// (`message_marker()`: the message `EventRef`'s dedup id, or the

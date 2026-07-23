@@ -140,7 +140,15 @@ pub async fn create_single_partition_topic() -> Result<(Topic, &'static ProsodyA
 /// A `TriggerStoreConfiguration::Cassandra` configured for testing.
 #[must_use]
 pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
-    let cassandra_config = CassandraConfiguration {
+    TriggerStoreConfiguration::Cassandra(test_cassandra_config())
+}
+
+/// The shared Cassandra configuration for the integration suites: the local
+/// node and the pre-migrated [`TEST_KEYSPACE`]. Both the trigger-store config
+/// and the direct-read helpers build from this one literal.
+#[must_use]
+pub fn test_cassandra_config() -> CassandraConfiguration {
+    CassandraConfiguration {
         datacenter: None,
         rack: None,
         nodes: vec!["localhost:9042".to_owned()],
@@ -148,9 +156,7 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
         user: None,
         password: None,
         retention: StdDuration::from_mins(10),
-    };
-
-    TriggerStoreConfiguration::Cassandra(cassandra_config)
+    }
 }
 
 /// Awaits the consumer's partition assignment under a generous hang-guard,

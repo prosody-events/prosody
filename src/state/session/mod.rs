@@ -1701,13 +1701,21 @@ where
         // Read the intact dirty overlay (non-draining — `finalize` reads it
         // again), so only collections this event actually wrote are considered.
         // `ensure_published` filters to `Published` and dedups via the memo, so
-        // a `commit()` that already published turns this into a no-op.
+        // a `commit()` that already published turns this into a no-op. The
+        // keys-only projection clones no cell payloads (`finalize` rebuilds the
+        // full `touched()` an instant later); publication needs only the names.
         let touched = self
             .inner
             .overlay
             .dirty()
-            .touched(&self.inner.state_key.key);
-        for ((state_type, name), _cleared, _cells) in touched {
+            .touched_collections(&self.inner.state_key.key);
+        // Intentionally serial: the loop is cold-only (a warm memo hit
+        // short-circuits inside `ensure_published` before any round trip) and
+        // bounded by the touched published-collection count (~6/key). A
+        // `buffer_unordered` fan-out over a `&self` per-item future is
+        // HRTB-prone and adds combinator machinery for a bounded set — not a
+        // simplification.
+        for (state_type, name) in touched {
             self.ensure_published(state_type, &name)
                 .await
                 .map_err(|e| StateAccessError::store(&e))?;
