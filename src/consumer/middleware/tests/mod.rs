@@ -999,6 +999,28 @@ mod settle_publication {
         StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))
     }
 
+    fn wishlist_state_name() -> Result<StateName> {
+        StateName::try_new("wishlist").map_err(|e| eyre!("name: {e}"))
+    }
+
+    /// A registry with BOTH `cart` and `wishlist` registered `Published`, so a
+    /// truthful-set test can register two published collections and write only
+    /// one.
+    fn two_published_registry() -> Result<CollectionDefRegistry> {
+        let mut registry = published_registry()?;
+        let wishlist: ValueDescriptor = value_state("wishlist");
+        registry
+            .register(
+                &wishlist,
+                CollectionDef {
+                    visibility: StateVisibility::Published,
+                    ..CollectionDef::new(None)
+                },
+            )
+            .map_err(|e| eyre!("register wishlist: {e}"))?;
+        Ok(registry)
+    }
+
     /// Arm (a): the routing row is written BEFORE the durable state. The gated
     /// upsert parks in settle step 0; while it is parked the cell is not yet
     /// durable (finalize is step 1). Releasing the gate lets settle stage and
@@ -1223,6 +1245,82 @@ mod settle_publication {
                 .await
                 .is_empty(),
             "no routing row when the failing store rejects the upsert",
+        );
+        Ok(())
+    }
+
+    /// Arm (b): the truthful set. Publication advertises only the collections
+    /// the event actually WROTE — `publish_first_writes` iterates the dirty
+    /// overlay's `touched_collections`, never the registered set. This is the
+    /// defining choice of first-write publication over subscription
+    /// enumeration.
+    ///
+    /// Two `Published` collections are registered; the event writes only
+    /// `cart`. Settling publishes a row for `cart` and NONE for the unwritten
+    /// `wishlist`. Falsify by enumerating the registry instead of the touched
+    /// overlay in `KeyedStateSession::publish_first_writes`: `wishlist` gains a
+    /// row and the no-row assertion goes red.
+    #[tokio::test]
+    async fn only_written_published_collections_are_advertised() -> Result<()> {
+        let store = ScriptedPublicationStore::new();
+        let state_key = StateKey::new(Uuid::from_u128(0xB), Arc::from("user-1"));
+        let publisher = PublisherTemplate::new(
+            subsystem()?,
+            Arc::from(GROUP),
+            Arc::new(PublicationBackend::Scripted(store.clone())),
+            Arc::new(PartitionCounts::Memory(PartitionCount::try_from(3_i32)?)),
+            Arc::new(two_published_registry()?),
+        )
+        .bind(Intern::<str>::from(TOPIC));
+        let (session, _cell_store) = test_session_with_publisher(
+            MemoryLoader::new(),
+            two_published_registry()?,
+            state_key,
+            publisher,
+        );
+        let context: Ctx = MockEventContext::new().with_session(session);
+        // Write ONLY cart; wishlist is Published but untouched by this event.
+        let handle = context
+            .state(Registered::new(cart()))
+            .map_err(|e| eyre!("bind cart: {e}"))?;
+        handle.set(json!({ "x": 1_i32 })).await?;
+
+        let handler = ProbeHandler::ok(0);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+        settle(&handler, context, guard, Ok(0)).await;
+
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            1,
+            "the written event commits"
+        );
+        assert_eq!(
+            store.upserts_for("cart", TOPIC),
+            1,
+            "the written collection is advertised"
+        );
+        assert_eq!(
+            store.upserts_for("wishlist", TOPIC),
+            0,
+            "the unwritten published collection is NOT advertised",
+        );
+        assert!(
+            store
+                .rows(&subsystem()?, &wishlist_state_name()?)
+                .await
+                .is_empty(),
+            "no routing row for a published collection that never wrote",
+        );
+        let cart_rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        assert_eq!(
+            cart_rows.len(),
+            1,
+            "exactly the written collection's row lands"
         );
         Ok(())
     }

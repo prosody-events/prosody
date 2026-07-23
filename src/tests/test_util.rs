@@ -13,13 +13,17 @@ use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::{Map, Value};
 use std::env;
+use std::fmt::{Debug, Write as _};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
-use tracing::subscriber::with_default;
-use tracing_subscriber::Layer as _;
+use tracing::field::{Field, Visit};
+use tracing::subscriber::{DefaultGuard, set_default, with_default};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
 
 /// The shared, pre-migrated keyspace every Cassandra-backed test runs against.
 ///
@@ -122,6 +126,76 @@ pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) 
 
     let spans = exporter.0.lock();
     spans.clone()
+}
+
+/// Accumulates every captured tracing event, rendered field-by-field, into a
+/// shared buffer. Cloning shares the buffer.
+#[derive(Clone, Default)]
+pub(crate) struct CapturedEvents(Arc<Mutex<Vec<String>>>);
+
+impl CapturedEvents {
+    /// Whether any captured event's rendering contains `needle` (matches its
+    /// message or any field value).
+    pub(crate) fn contains(&self, needle: &str) -> bool {
+        self.0.lock().iter().any(|event| event.contains(needle))
+    }
+}
+
+/// Tracing layer capturing every event at or above `max_level` in severity
+/// (WARN captures WARN and ERROR), rendering each field — the `message`
+/// included — into [`CapturedEvents`].
+struct EventCaptureLayer {
+    max_level: Level,
+    events: CapturedEvents,
+}
+
+impl<S> Layer<S> for EventCaptureLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+        if *event.metadata().level() > self.max_level {
+            return;
+        }
+        let mut visitor = EventVisitor::default();
+        event.record(&mut visitor);
+        self.events.0.lock().push(visitor.output);
+    }
+}
+
+/// Renders every event field — including the format-string `message` — into one
+/// string. Only [`Visit::record_debug`] is implemented; every typed
+/// `record_*` forwards to it by default, so this captures all field kinds.
+#[derive(Default)]
+struct EventVisitor {
+    output: String,
+}
+
+impl Visit for EventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        let _ = write!(&mut self.output, "{}={value:?};", field.name());
+    }
+}
+
+/// Installs a subscriber capturing every tracing event at or above `max_level`
+/// in severity for the current thread, returning the shared [`CapturedEvents`]
+/// and the guard that keeps the subscriber active. Unlike [`captured_spans`]
+/// (which scopes a synchronous closure), the guard-based form spans an `async`
+/// test body — a `#[tokio::test]` runs its awaits on the calling thread, so the
+/// thread-local default stays live across them. Drop the guard to uninstall.
+///
+/// The event analog of [`captured_spans`], for asserting that a specific
+/// diagnostic log fired — the `captured_spans` `OTel` pipeline records only
+/// span data, not free-standing events.
+#[must_use]
+pub(crate) fn capture_events(max_level: Level) -> (CapturedEvents, DefaultGuard) {
+    let events = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(EventCaptureLayer {
+        max_level,
+        events: events.clone(),
+    });
+    let guard = set_default(subscriber);
+    (events, guard)
 }
 
 /// A fixed, valid, sampled remote span context wrapped in a [`Context`], for

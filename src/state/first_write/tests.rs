@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, eyre};
 use internment::Intern;
+use tracing::Level;
 
 use super::{
     FirstWritePublisher, PartitionCounts, PublicationBackend, PublisherTemplate,
@@ -25,6 +26,7 @@ use crate::state::tests::support::{PublicationCall, ScriptedPublicationStore};
 use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
+use crate::test_util::capture_events;
 
 const GROUP: &str = "group-a";
 const OTHER_GROUP: &str = "group-b";
@@ -222,7 +224,10 @@ async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
 }
 
 /// Arm (e): a pre-seeded row with a valid but wrong count is overwritten with
-/// the live count — a warn-and-overwrite tripwire, never a hard failure.
+/// the live count AND the `StableRouting` tripwire fires an error-level
+/// mismatch event — a warn-and-overwrite, never a hard failure. Asserting the
+/// event (not just the corrected row) is what keeps the removal of the tripwire
+/// warn from going undetected: the blind upsert corrects the row regardless.
 #[tokio::test]
 async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -232,9 +237,16 @@ async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     store.seed(&subsystem, &name, &row(GROUP, 1)?).await;
 
     let publisher = publisher(store.clone(), registry(StateVisibility::Published)?, 3)?;
+    let (events, guard) = capture_events(Level::ERROR);
     // Must succeed (never a hard fail on mismatch).
     publisher.ensure_one(StateType::Application, &name).await?;
+    drop(guard);
 
+    assert!(
+        events.contains("keyed-state publication partition count mismatch"),
+        "the mismatch tripwire must fire an error-level event when the stored count disagrees \
+         with the live count"
+    );
     let rows = store.rows(&subsystem, &name).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -322,6 +334,49 @@ async fn distinct_topics_publish_distinct_rows() -> Result<()> {
     assert_eq!(i32::from(rows[0].partition_count), 3_i32);
     assert_eq!(rows[1].topic.as_ref(), "topic-2");
     assert_eq!(i32::from(rows[1].partition_count), 7_i32);
+    Ok(())
+}
+
+/// The memo key includes the topic. One shared template (hence ONE shared memo)
+/// bound to two topics publishes the same collection twice — once per topic —
+/// because the topic distinguishes the two memo keys.
+///
+/// This is the falsifiable guard the two-template
+/// [`distinct_topics_publish_distinct_rows`] cannot be: with independent
+/// templates each memo holds a single key, so dropping `topic` from
+/// [`PublicationMemoKey`] would still yield two upserts. Sharing one memo makes
+/// the field load-bearing — drop `topic` and the second topic hits the first's
+/// memo entry, suppressing its upsert (one row, not two) → red.
+#[tokio::test]
+async fn memo_key_includes_topic() -> Result<()> {
+    let store = ScriptedPublicationStore::new();
+    let subsystem = subsystem()?;
+    let name = cart_name()?;
+    // ONE template → one shared memo; two distinct topics.
+    let template = template(store.clone(), registry(StateVisibility::Published)?, 3, 64)?;
+    let t1 = Intern::<str>::from("topic-1");
+    let t2 = Intern::<str>::from("topic-2");
+    template
+        .bind(t1)
+        .ensure_one(StateType::Application, &name)
+        .await?;
+    template
+        .bind(t2)
+        .ensure_one(StateType::Application, &name)
+        .await?;
+
+    assert_eq!(
+        store.upserts_for("cart", "topic-1"),
+        1,
+        "the first topic published"
+    );
+    assert_eq!(
+        store.upserts_for("cart", "topic-2"),
+        1,
+        "the second topic published through the SAME memo — the topic keys it apart"
+    );
+    let rows = store.rows(&subsystem, &name).await;
+    assert_eq!(rows.len(), 2, "one row per topic despite the shared memo");
     Ok(())
 }
 
