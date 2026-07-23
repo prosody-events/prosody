@@ -199,6 +199,16 @@ designs are where bloat and bug re-introduction live:
   constraints that function actually needs — not a superset for the whole
   type. The struct should compile and be usable without the bound unless
   every reachable method requires it.
+- Avoid overused idioms and vague metaphor-filler in prose, comments, docs,
+  commit/PR text, and chat — they read as LLM boilerplate and carry no
+  information. Banned as decoration: "pin"/"pin down", "altitude"/"at a high
+  altitude", "zoom in/out", "double-click", "north star", "surface area",
+  "lean into", "first-class citizen", "load-bearing" as a throwaway, and the
+  like. Say the concrete thing instead ("decide X", "at a high level",
+  "the public API"). This governs *decorative* usage only: a word that names
+  a precise mechanism with a concrete referent keeps its meaning — the
+  probe-and-**pin** source commitment in the reader design is a real
+  operation, not filler, and stays.
 
 **Git:**
 
