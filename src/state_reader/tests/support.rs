@@ -37,7 +37,7 @@ use crate::state_reader::cache::{ReaderCache, ReaderClock};
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::loader::ReaderLoader;
 use crate::state_reader::stores::ReaderStores;
-use crate::state_reader::{PartitionCount, partition_for_key};
+use crate::state_reader::{PartitionCount, StateReaderError, partition_for_key};
 use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use crate::{Key, SegmentId, Topic};
@@ -97,7 +97,7 @@ type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentitySto
 
 /// The real per-event session the seeding handles bind over, over cell store
 /// `C`.
-pub(crate) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
+pub(super) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
 
 /// A registry with `descriptor` registered under `def`.
 pub(super) fn registry_of<D: StateDescriptor>(
@@ -185,7 +185,7 @@ async fn stage_only<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
 /// the handle, then commits (promote). The backend-generic seeding primitive:
 /// the memory and Cassandra reader backends both write committed state through
 /// it, only their `cell` differing.
-pub(crate) async fn owner_commit_cell<C, D, F, Fut>(
+pub(super) async fn owner_commit_cell<C, D, F, Fut>(
     cell: C,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
@@ -248,6 +248,28 @@ where
 
 // --- Control-plane seeding --------------------------------------------------
 
+/// Upserts `publication` as a source of `name` and freezes `identity` against
+/// the memory control-plane stores (both `Infallible`, so the swallow is
+/// total). The shared core of [`publish_source`] and
+/// [`MemoryReaderBackend::publish`].
+async fn seed_memory_publication(
+    publications: &MemoryPublicationStore,
+    identities: &MemoryDescriptorIdentityStore,
+    subsystem: &SubsystemName,
+    name: &StateName,
+    publication: &StatePublication,
+    identity: &DurableDescriptorIdentity,
+) {
+    publications
+        .upsert(subsystem, name, publication)
+        .await
+        .unwrap_or_else(|e| match e {});
+    identities
+        .register_identity(&publication.group_id, identity)
+        .await
+        .unwrap_or_else(|e| match e {});
+}
+
 /// Advertises `(group, topic)` as a source of `name` and freezes its identity
 /// to match `descriptor`, so the reader admits it. The identity row is derived
 /// from the same descriptor the reader carries, so acquisition validates equal.
@@ -261,27 +283,25 @@ pub(super) async fn publish_source<D: StateDescriptor>(
     descriptor: &D,
 ) {
     let (publications, identities) = stores;
-    publications
-        .upsert(
-            subsystem,
-            name,
-            &StatePublication {
-                group_id: Arc::from(group),
-                topic,
-                partition_count: count,
-            },
-        )
-        .await
-        .unwrap_or_else(|e| match e {});
+    let publication = StatePublication {
+        group_id: Arc::from(group),
+        topic,
+        partition_count: count,
+    };
     let row = DurableDescriptorIdentity::from_identity(
         descriptor.state_type(),
         name.as_str(),
         &descriptor.structural_identity(),
     );
-    identities
-        .register_identity(group, &row)
-        .await
-        .unwrap_or_else(|e| match e {});
+    seed_memory_publication(
+        publications,
+        identities,
+        subsystem,
+        name,
+        &publication,
+        &row,
+    )
+    .await;
 }
 
 /// [`publish_source`] against the scripted control-plane stores (the probe and
@@ -356,7 +376,7 @@ impl MemoryHarness {
 /// reader. An impl bundles the owner-seed cell store (seeded through the real
 /// [`KeyedStateSession`] via [`owner_commit_cell`]), the control-plane seeding,
 /// and the reader `deps` bundle — the three pieces that differ by backend.
-pub(crate) trait ReaderBackend {
+pub(super) trait ReaderBackend {
     /// The owner-seed cell store: [`MemoryCellStore`] for memory, the shared
     /// `CassandraStore<FixedOracle>` for Cassandra.
     type OwnerCell: CellStore;
@@ -390,14 +410,14 @@ pub(crate) trait ReaderBackend {
 
 /// The memory [`ReaderBackend`]: a fresh [`MemoryHarness`] plus a registry
 /// carrying the trace's single per-kind def.
-pub(crate) struct MemoryReaderBackend {
+pub(super) struct MemoryReaderBackend {
     harness: MemoryHarness,
     registry: Arc<CollectionDefRegistry>,
 }
 
 impl MemoryReaderBackend {
     /// A backend registering `descriptor` under `def`.
-    pub(crate) fn new<D: StateDescriptor>(descriptor: &D, def: CollectionDef) -> Result<Self> {
+    pub(super) fn new<D: StateDescriptor>(descriptor: &D, def: CollectionDef) -> Result<Self> {
         Ok(Self {
             harness: MemoryHarness::new(),
             registry: registry_of(descriptor, def)?,
@@ -429,24 +449,20 @@ impl ReaderBackend for MemoryReaderBackend {
         count: PartitionCount,
         identity: &DurableDescriptorIdentity,
     ) -> Result<()> {
-        self.harness
-            .publications
-            .upsert(
-                subsystem,
-                name,
-                &StatePublication {
-                    group_id: Arc::from(group),
-                    topic,
-                    partition_count: count,
-                },
-            )
-            .await
-            .unwrap_or_else(|e| match e {});
-        self.harness
-            .identities
-            .register_identity(group, identity)
-            .await
-            .unwrap_or_else(|e| match e {});
+        let publication = StatePublication {
+            group_id: Arc::from(group),
+            topic,
+            partition_count: count,
+        };
+        seed_memory_publication(
+            &self.harness.publications,
+            &self.harness.identities,
+            subsystem,
+            name,
+            &publication,
+            identity,
+        )
+        .await;
         Ok(())
     }
 
@@ -672,4 +688,16 @@ pub(super) fn fixed_clock_cache(budget: u64) -> (ReaderCache, Arc<AtomicU64>) {
     let now = Arc::new(AtomicU64::new(0));
     let cache = ReaderCache::with_clock(budget, ReaderClock::Fixed(now.clone()));
     (cache, now)
+}
+
+/// Collects a fallible reader stream into a `Vec`, surfacing the first error.
+pub(super) async fn collect_stream<T>(
+    stream: impl Stream<Item = Result<T, StateReaderError>>,
+) -> Result<Vec<T>> {
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(item?);
+    }
+    Ok(out)
 }

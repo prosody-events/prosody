@@ -28,7 +28,7 @@
 //! nothing, `get` is `None`).
 
 use super::support::{
-    OwnerSession, ReaderBackend, owner_commit_cell, source_state_key, state_name,
+    OwnerSession, ReaderBackend, collect_stream, owner_commit_cell, source_state_key, state_name,
 };
 use crate::Key;
 use crate::Topic;
@@ -41,10 +41,9 @@ use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::StateKey;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
-use crate::state_reader::{PartitionCount, StateReader, StateReaderError};
+use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, eyre};
-use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -108,26 +107,13 @@ where
     source_state_key(case.topic, case.group, case.key, case.count)
 }
 
-/// Collects the reader stream for `key`/`dir` into a `Vec`, surfacing the first
-/// error.
-async fn collect_stream<T>(
-    stream: impl Stream<Item = Result<T, StateReaderError>>,
-) -> Result<Vec<T>> {
-    futures::pin_mut!(stream);
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        out.push(item?);
-    }
-    Ok(out)
-}
-
 /// Drives a Value trace: commit each event, mirror it into an `Option<Value>`
 /// model, and after every event assert `reader.get(key)` equals the model.
 ///
 /// FALSIFICATION: perturb `ReadSession::collection_id_for` (session.rs) to bind
 /// the wrong partition/state-type → the point `get` reads an empty/foreign
 /// collection → mismatch on the first committed event.
-pub(crate) async fn run_reader_value_trace<B: ReaderBackend>(
+pub(super) async fn run_reader_value_trace<B: ReaderBackend>(
     backend: &B,
     descriptor: ValueDescriptor<JsonCodec>,
     case: &ReaderCase<'_>,
@@ -252,10 +238,16 @@ async fn assert_map<B: ReaderBackend>(
 /// Drives a Map trace: commit each event's `Set`/`Remove`/`Clear`, mirror into
 /// a `BTreeMap`, and after every event assert the reader matches the model.
 ///
-/// FALSIFICATION: in `ReaderStores::scan_committed`/`CassandraCellResources::
-/// scan_committed`, skip the first present yield → the ordered `stream` loses
-/// its front element → the `Vec` comparison reds on the first non-empty event.
-pub(crate) async fn run_reader_map_trace<B: ReaderBackend>(
+/// FALSIFICATION: perturb the reader's committed point read
+/// (`ReaderStores::read_committed`/`read_committed_many`) to drop or misorder
+/// an entry → the tracked-keyset `stream`/`get_many` diverges from the model on
+/// the first non-empty event. The wide committed-scan arm the keyset overflow
+/// falls back to is out of this property's reach (`KEY_POOL` stays under the
+/// keyset limit) and is covered separately — memory by
+/// [`scan_reads_only_pinned_source`](super::probe_tests), Cassandra by
+/// [`reader_deque_scan_committed`](super::cassandra_tests); do not re-add scan
+/// here.
+pub(super) async fn run_reader_map_trace<B: ReaderBackend>(
     backend: &B,
     descriptor: MapDescriptor<I64KeyCodec, JsonCodec>,
     case: &ReaderCase<'_>,
@@ -371,9 +363,13 @@ async fn assert_deque<B: ReaderBackend>(
 /// `VecDeque`, and after every event assert the reader matches the model.
 ///
 /// FALSIFICATION: shifting the front-relative index in the reader's deque `get`
-/// → element 0 diverges; dropping the first scan yield → the forward stream
-/// loses its front.
-pub(crate) async fn run_reader_deque_trace<B: ReaderBackend>(
+/// → element 0 diverges; dropping the first entry of the deque stream's batch
+/// point read → the forward stream loses its front. The wide committed-scan
+/// fallback is out of reach (trace deques stay under
+/// `DEQUE_POINT_ITERATION_MAX`) and is covered by the live-Cassandra witness
+/// [`reader_deque_scan_committed`](super::cassandra_tests); do not re-add scan
+/// here.
+pub(super) async fn run_reader_deque_trace<B: ReaderBackend>(
     backend: &B,
     descriptor: DequeDescriptor<JsonCodec>,
     case: &ReaderCase<'_>,

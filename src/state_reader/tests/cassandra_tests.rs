@@ -19,7 +19,9 @@
 use super::reader_suite::{
     ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
 };
-use super::support::{ReaderBackend, owner_commit_cell, source_state_key, state_name};
+use super::support::{
+    ReaderBackend, collect_stream, owner_commit_cell, source_state_key, state_name,
+};
 use crate::Key;
 use crate::Topic;
 use crate::cassandra::CassandraStore as CassandraConn;
@@ -30,6 +32,8 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CassandraStore as CassandraCellStore, CellQueries, IdentityQueries, PublicationQueries,
 };
+use crate::state::cell_key::Direction;
+use crate::state::descriptor::deque::DEQUE_POINT_ITERATION_MAX;
 use crate::state::descriptor::{DescriptorIdentity, deque_state, map_state, value_state};
 use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::fjall::test_db;
@@ -227,7 +231,7 @@ fn prop_cassandra_reader_value() {
 }
 
 /// The committed==oracle Map property over live Cassandra (point + `get_many` +
-/// ordered scan).
+/// ordered stream).
 #[test]
 fn prop_cassandra_reader_map() {
     fn property(trace: Trace<MapOp>) -> TestResult {
@@ -257,7 +261,7 @@ fn prop_cassandra_reader_map() {
 }
 
 /// The committed==oracle Deque property over live Cassandra (len +
-/// front-relative get + ordered scan).
+/// front-relative get + ordered stream).
 #[test]
 fn prop_cassandra_reader_deque() {
     fn property(trace: Trace<DequeOp>) -> TestResult {
@@ -337,6 +341,78 @@ fn reader_two_group_lowest_wins() -> Result<()> {
         ensure!(
             reader.get(key).await? == Some(Value::from("lowest")),
             "the lowest-SourceId group must win the probe"
+        );
+        Ok(())
+    })
+}
+
+/// A committed-scan witness for the reader's live-Cassandra deque carrier. A
+/// window one past `DEQUE_POINT_ITERATION_MAX` forces the reader stream off its
+/// point-read arm onto `CassandraCellResources::scan_committed`; the small
+/// trace collections never reach it. The whole window is committed through the
+/// real owner in ONE event, then the reader streams it forward and backward and
+/// both must equal the ordered model — exercising the reader carrier's
+/// committed-projection scan loop.
+///
+/// FALSIFICATION: drop the first yield in
+/// `CassandraCellResources::scan_committed` → the forward stream loses its
+/// front element and the assert reds.
+#[test]
+fn reader_deque_scan_committed() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let backend = cassandra_backend().await?;
+        let descriptor = deque_state::<JsonCodec>(DEQUE_NAME);
+        let name = state_name(DEQUE_NAME)?;
+        let topic = reader_topic();
+        let count = PartitionCount::MIN;
+        let (sub, group, key) = namespace()?;
+        let identity = DurableDescriptorIdentity::from_identity(
+            descriptor.state_type(),
+            name.as_str(),
+            &descriptor.structural_identity(),
+        );
+
+        let width = DEQUE_POINT_ITERATION_MAX + 1;
+        let state_key = source_state_key(topic, &group, &key, count)?;
+        owner_commit_cell(
+            backend.owner_cell(),
+            &backend.registry(),
+            &state_key,
+            descriptor,
+            1,
+            move |handle| async move {
+                for i in 0..width {
+                    handle
+                        .push_back(Value::from(i as i64))
+                        .await
+                        .map_err(|e| eyre!("push: {e}"))?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        backend
+            .publish(&sub, &name, &group, topic, count, &identity)
+            .await?;
+
+        let deps = backend.deps();
+        let reader = StateReader::new(&deps, sub, descriptor)?;
+        let model: Vec<Value> = (0..width).map(|i| Value::from(i as i64)).collect();
+        let forward = Box::pin(collect_stream(
+            reader.stream(key.clone(), Direction::Forward),
+        ))
+        .await?;
+        ensure!(
+            forward == model,
+            "forward scan must equal the ordered model"
+        );
+        let backward = Box::pin(collect_stream(reader.stream(key, Direction::Backward))).await?;
+        let mut expect_backward = model;
+        expect_backward.reverse();
+        ensure!(
+            backward == expect_backward,
+            "backward scan must equal the reversed model"
         );
         Ok(())
     })

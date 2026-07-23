@@ -38,7 +38,7 @@ use std::iter::{empty, once};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-// --- P3: snapshot-refresh property ------------------------------------------
+// --- Snapshot-refresh property ----------------------------------------------
 
 /// The ordered source pool the refresh script drives, `g0 < g1 < g2` so
 /// `SourceId` order equals index order and the lowest admitted source is the
@@ -358,7 +358,7 @@ fn outcome_matches(expect: &Expect, observed: &Result<Option<Value>, StateReader
         Expect::IdentityUnavailable => {
             matches!(observed, Err(StateReaderError::IdentityUnavailable { .. }))
         }
-        Expect::ReadError => observed.is_err(),
+        Expect::ReadError => matches!(observed, Err(StateReaderError::Store { .. })),
     }
 }
 

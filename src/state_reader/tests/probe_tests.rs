@@ -11,9 +11,9 @@
 //! the source-call trace proving a pinned scan never opens the decoy.
 
 use super::support::{
-    CountingIdentityStore, FaultPoint, GROUP_A, GROUP_B, ScriptedCellSource, mock_count,
-    owner_commit, publish_scripted, registry_of, scripted_deps, source_state_key, state_name,
-    subsystem, topic,
+    CountingIdentityStore, FaultPoint, GROUP_A, GROUP_B, ScriptedCellSource, collect_stream,
+    mock_count, owner_commit, publish_scripted, registry_of, scripted_deps, source_state_key,
+    state_name, subsystem, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
@@ -36,7 +36,7 @@ use std::iter::{empty, once};
 /// so the scan probe path is exercised.
 const SCAN_ARM_LEN: usize = 130;
 
-// --- P2: probe-and-pin property ---------------------------------------------
+// --- Probe-and-pin property -------------------------------------------------
 
 /// The ordered group pool the fault script assigns sources to. Lexicographic
 /// order (`g0 < g1 < …`) makes `SourceId` order equal index order, so the
@@ -225,21 +225,11 @@ async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
         ReaderCache::with_budget(1 << 20),
     );
     let reader = StateReader::new_eager(&deps, sub, descriptor)?;
-    assert_probe(&reader, &key, selection(&script)).await
+    Box::pin(assert_probe(&reader, &key, selection(&script))).await
 }
 
 /// The concrete deque reader the probe property drives.
 type DequeReader = StateReader<DequeDescriptor<JsonCodec>, JsonCodec>;
-
-/// Collects a reader deque stream, surfacing any error item.
-async fn forward_deque(reader: &DequeReader, key: &Key) -> Result<Vec<Value>> {
-    Ok(reader
-        .stream(key.clone(), Direction::Forward)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?)
-}
 
 /// Asserts the reader's point (`len`/`get`) and scan (`stream`) reads match the
 /// point-fan-out selection the script resolves to.
@@ -247,16 +237,18 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<Value> = (0..len).map(|j| element(idx, j)).collect();
-            let backward: Vec<Value> = reader
-                .stream(key.clone(), Direction::Backward)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<_, _>>()?;
+            let forward = Box::pin(collect_stream(
+                reader.stream(key.clone(), Direction::Forward),
+            ))
+            .await?;
+            let backward = Box::pin(collect_stream(
+                reader.stream(key.clone(), Direction::Backward),
+            ))
+            .await?;
             Ok(reader.len(key.clone()).await? == len
                 && reader.get(key.clone(), 0).await? == Some(element(idx, 0))
                 && reader.get(key.clone(), len).await?.is_none()
-                && forward_deque(reader, key).await? == expected
+                && forward == expected
                 && backward == expected.into_iter().rev().collect::<Vec<_>>())
         }
         Selection::ErrOnly => {
@@ -272,7 +264,11 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
         }
         Selection::EmptyOnly => Ok(reader.len(key.clone()).await? == 0
             && reader.get(key.clone(), 0).await?.is_none()
-            && forward_deque(reader, key).await?.is_empty()),
+            && Box::pin(collect_stream(
+                reader.stream(key.clone(), Direction::Forward),
+            ))
+            .await?
+            .is_empty()),
     }
 }
 

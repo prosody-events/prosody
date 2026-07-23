@@ -44,7 +44,7 @@ fn key(name: &str) -> Result<CacheKey> {
     ))
 }
 
-// --- P4: staleness property -------------------------------------------------
+// --- Staleness property -----------------------------------------------------
 
 /// The distinct collection names the schedule's key pool spans. They differ
 /// **only** by `StateName` (same source, partition key, cell), so a cache key
@@ -116,9 +116,9 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
     present.then(|| Bytes::from(vec![key]))
 }
 
-/// (a) stamp-at-issue age, (b) the `age == ttl` miss, (f) negative-entry
-/// refresh, (g) `StateName` no-aliasing, (h) per-ttl freshness windows over a
-/// shared entry — all at once. A plain `HashMap<key, (issued_ms, value)>` model
+/// The stamp-at-issue age, the `age == ttl` miss, negative-entry refresh,
+/// `StateName` no-aliasing, and per-ttl freshness windows over a shared entry —
+/// all at once. A plain `HashMap<key, (issued_ms, value)>` model
 /// predicts, for every get, both the served value and whether a fill fired
 /// (`age < ttl` is a hit served from the entry; anything else is a miss that
 /// refills). Asserting the served value AND the running fill count after each
@@ -196,7 +196,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
 
 // --- Focused survivors (invariants the serial schedule cannot express) ------
 
-/// (a) Stamp-at-issue: a slow fill enters already-aged, so it cannot launder an
+/// Stamp-at-issue: a slow fill enters already-aged, so it cannot launder an
 /// old value into a fresh window for a later reader.
 ///
 /// Falsify: stamp the entry at fill COMPLETION instead of issue — the entry is
@@ -233,7 +233,7 @@ async fn slow_fill_cannot_launder() -> Result<()> {
     Ok(())
 }
 
-/// (c) Two concurrent cold gets of one key issue exactly ONE store fill
+/// Two concurrent cold gets of one key issue exactly ONE store fill
 /// (single-flight through the guard).
 ///
 /// Falsify: replace `get_value_or_guard_async` with an unconditional read —
@@ -321,7 +321,7 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
     Ok(())
 }
 
-/// (d) Declared weight never exceeds the byte budget across a fill trace.
+/// Declared weight never exceeds the byte budget across a fill trace.
 #[tokio::test]
 async fn declared_weight_bounded_by_budget() -> Result<()> {
     let budget = 4096u64;
