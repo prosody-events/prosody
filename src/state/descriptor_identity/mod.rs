@@ -184,7 +184,13 @@ where
 
 /// Accepts a durable row that equals the asserted identity; otherwise fails
 /// `Permanent` without overwriting the row.
-fn validate<StoreErr>(
+///
+/// The equality-only check the standalone reader's acquisition reuses: it
+/// compares the full wire form field-by-field (raw `i8` discriminators
+/// included), so a future-build discriminant this build does not know compares
+/// unequal and fails `Permanent` rather than coercing. `pub(crate)` so the
+/// reader routes its per-source identity validation through this one site.
+pub(crate) fn validate<StoreErr>(
     stored: DurableDescriptorIdentity,
     asserted: &DurableDescriptorIdentity,
 ) -> Result<(), DescriptorIdentityError<StoreErr>>

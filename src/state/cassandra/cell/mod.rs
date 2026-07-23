@@ -241,6 +241,95 @@ impl CassandraCellResources {
     pub fn new(session: CassandraSession, queries: Arc<CellQueries>) -> Self {
         Self { session, queries }
     }
+
+    /// The oracle-free committed point read: the standalone reader's raw
+    /// primitive. Point-reads the `kind=Cell` row and projects
+    /// [`Cell::project_committed`] — never an in-flight provisional value,
+    /// never owner-side repair (no `help_read_window`, no oracle). An
+    /// absent row reads `None`. Shares the bind tuple with the resolving
+    /// [`CassandraStore`] via [`fetch_cell_row`], so the two paths cannot
+    /// diverge on addressing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraCellStoreError`] on a store failure or a corrupt row
+    /// shape.
+    pub(crate) async fn read_committed(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<Bytes>, CassandraCellStoreError> {
+        let Some(row) =
+            fetch_cell_row::<RawCellRow>(&self.session, &self.queries.read_cell, id, cell).await?
+        else {
+            return Ok(None);
+        };
+        Ok(decode::try_decode_cell(row)?.project_committed().cloned())
+    }
+
+    /// Batch twin of [`Self::read_committed`]: one section's coordinates in one
+    /// `IN` query, index-aligned to `batch` (`result[i]` answers `batch[i]`;
+    /// duplicate coordinates co-observe; an absent coordinate reads `None`).
+    /// Committed-only projection; the co-expiry TTL column is ignored (the
+    /// reader has no write-through cache to mirror it into).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraCellStoreError`] on a store failure or a corrupt row
+    /// shape.
+    pub(crate) async fn read_committed_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<Bytes>>, CassandraCellStoreError> {
+        let (uniques, plan) = dedupe(batch);
+        let mut rows =
+            fetch_cells_batch(&self.session, &self.queries, id, section, &uniques).await?;
+        let mut answers: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(uniques.len());
+        for &coordinate in &uniques {
+            let committed = match rows.iter().position(|(found, _)| found == coordinate) {
+                Some(pos) => {
+                    let (_, row) = rows.swap_remove(pos);
+                    decode::try_decode_cell_ttl(row)?
+                        .0
+                        .project_committed()
+                        .cloned()
+                }
+                None => None,
+            };
+            answers.push(committed);
+        }
+        Ok(plan.iter().map(|&i| answers[i].clone()).collect())
+    }
+
+    /// The oracle-free committed section scan: the reader's raw scan primitive.
+    /// Drives the shared [`page_cells`] pager and yields each present cell's
+    /// [`Cell::project_committed`] in `coordinate` order, honouring the scan's
+    /// `limit` over **present** yields. Skips `help_read_window` entirely —
+    /// owner-side durable repair a reader neither can nor may run; `prev` is
+    /// committed by construction, so the projection is sound without it.
+    pub(crate) fn scan_committed<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), CassandraCellStoreError>> + Send + 'a {
+        let limit = scan.limit;
+        try_stream! {
+            let pages = page_cells(&self.session, &self.queries, id, scan);
+            pin_mut!(pages);
+            let mut yielded = 0usize;
+            while let Some((key, cell)) = pages.try_next().await? {
+                if limit.is_some_and(|n| yielded >= n) {
+                    break;
+                }
+                if let Some(bytes) = cell.project_committed().cloned() {
+                    yield (key, bytes);
+                    yielded += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Test-only recovery-read counters. `marker_point_reads` increments only in
@@ -368,28 +457,7 @@ impl<O> CassandraStore<O> {
     where
         R: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
     {
-        let pk = Pk::of(id);
-        let row = self
-            .cql()
-            .execute_unpaged(
-                statement,
-                (
-                    pk.segment_id,
-                    pk.key,
-                    pk.state_type,
-                    pk.name,
-                    CellKind::Cell,
-                    i8::from(cell.section),
-                    &cell.coordinate,
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<R>()
-            .map_err(CassandraStoreError::from)?;
-        Ok(row)
+        fetch_cell_row(&self.session, statement, id, cell).await
     }
 
     /// Reads a section's `uniques` coordinates in one `IN` query, returning the
@@ -413,37 +481,7 @@ impl<O> CassandraStore<O> {
         section: Section,
         uniques: &[&Coordinate],
     ) -> Result<CellBuffer<(Coordinate, CellTtlRow)>, CassandraCellStoreError> {
-        let pk = Pk::of(id);
-        let result = self
-            .cql()
-            .execute_unpaged(
-                &self.queries.read_cells_batch,
-                (
-                    pk.segment_id,
-                    pk.key,
-                    pk.state_type,
-                    pk.name,
-                    CellKind::Cell,
-                    i8::from(section),
-                    uniques,
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?;
-        // At most one row per unique coordinate, so size once at the IN-list
-        // upper bound rather than growing an inline buffer up to `CELL_BATCH`.
-        let mut out: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::with_capacity(uniques.len());
-        for row in result
-            .rows::<KeyedCellTtlRow>()
-            .map_err(CassandraStoreError::from)?
-        {
-            out.push(split_keyed_cell_ttl(
-                row.map_err(CassandraStoreError::from)?,
-            ));
-        }
-        Ok(out)
+        fetch_cells_batch(&self.session, &self.queries, id, section, uniques).await
     }
 
     /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
@@ -585,67 +623,23 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError<O::Error>>> + Send + 'a {
-        let section = i8::from(scan.section);
-        let dir = scan.dir;
         let limit = scan.limit;
-        // The start edge selects the prepared statement (the comparator cannot
-        // be bound), and — when bounded — supplies the anchor coordinate; an
-        // `Unbounded` start uses a section-only `_all` statement with no
-        // comparator. The end edge is enforced in-code by `past_end`, so it
-        // needs no statement variant. Both edges are held as owned
-        // `Coordinate`s across the stream's awaits — O(1) refcount bumps
-        // (`Coordinate` is `Bytes`), never byte copies.
-        let start = scan.start.cloned();
-        let end = scan.end.cloned();
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
             // Read-help once before the pager opens (`help_read_window`): a
             // standing foreign clears-bearing marker is resolved so the scan
             // pages post-clear truth. Memo-backed — no durable marker read
-            // after the seed read.
+            // after the seed read. The raw reader variant
+            // ([`CassandraCellResources::scan_committed`]) skips this: it
+            // observes `prev`, committed by construction.
             let standing = self.standing_marker(collection).await?;
             help_read_window(self, self.resolver.oracle(), &collection_ref, standing.as_ref(), own)
                 .await
                 .map_err(flatten_resolve)?;
-            let pk = Pk::of(collection);
-            // The section-prefix bind values every scan statement shares.
-            let prefix = (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section);
-            let (seg, key, st, name, cell_kind, sect) = prefix;
-            // Statement selection and binding are one match: the bounded arms
-            // append the anchor coordinate (a 7-tuple), the `Unbounded` arms
-            // bind only the section prefix (a 6-tuple) — distinct Rust types,
-            // so the pager must open inside each arm.
-            let pager = match (dir, start.as_ref()) {
-                (Direction::Forward, ScanEdge::Included(c)) => {
-                    self.cql().execute_iter(self.queries.scan_forward_incl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c)).await
-                }
-                (Direction::Forward, ScanEdge::Excluded(c)) => {
-                    self.cql().execute_iter(self.queries.scan_forward_excl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c)).await
-                }
-                (Direction::Backward, ScanEdge::Included(c)) => {
-                    self.cql().execute_iter(self.queries.scan_backward_incl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c)).await
-                }
-                (Direction::Backward, ScanEdge::Excluded(c)) => {
-                    self.cql().execute_iter(self.queries.scan_backward_excl.clone(),
-                        (seg, key, st, name, cell_kind, sect, c)).await
-                }
-                (Direction::Forward, ScanEdge::Unbounded) => {
-                    self.cql().execute_iter(self.queries.scan_forward_all.clone(), prefix).await
-                }
-                (Direction::Backward, ScanEdge::Unbounded) => {
-                    self.cql().execute_iter(self.queries.scan_backward_all.clone(), prefix).await
-                }
-            };
-            let stream = pager
-                .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O::Error>)?
-                .rows_stream::<KeyedCellRow>()
-                .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O::Error>)?;
-            pin_mut!(stream);
+            // The shared row-pager core (`page_cells`): per-bound statement
+            // selection + decode + `past_end`, with no resolution and no limit.
+            let pages = page_cells(&self.session, &self.queries, collection, scan);
+            pin_mut!(pages);
 
             let mut yielded = 0usize;
             // Deliberately sequential, not an oversight: the common `peek_read`
@@ -659,20 +653,11 @@ where
             // path. `peek_read` is read-only — it never writes a resolution
             // back durably (a scan write-back could clobber a newer `commit()`
             // of the same cell), so this posture costs no write amplification.
-            while let Some(row) = cooperative(stream.try_next())
-                .await
-                .map_err(CassandraStoreError::from)
-                .map_err(into_store_err::<O::Error>)?
-            {
+            while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
                 // The limit bounds *yielded* (present) cells; check it before
                 // processing the next row so `Some(0)` yields nothing (an absent
                 // cell never consumes a slot — only a present yield does).
                 if limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
-                let (key, raw) =
-                    decode::try_decode_keyed_cell(row).map_err(ResolveCellError::Store)?;
-                if past_end(dir, &key, end.as_ref()) {
                     break;
                 }
                 let committed = peek_read(self.resolver.oracle(), &collection_ref, own, raw)
@@ -1848,6 +1833,164 @@ fn fits_one_batch(weights: impl Iterator<Item = u64>, max_bytes: u64, max_count:
 /// the oracle error type `E` the caller's stream carries.
 fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreError<E> {
     ResolveCellError::Store(CassandraCellStoreError::from(error))
+}
+
+/// Point-reads one `kind=Cell` row with `statement`, generic over the selected
+/// row shape — the one bind tuple shared by the resolving
+/// [`CassandraStore::point_read`] and the oracle-free
+/// [`CassandraCellResources::read_committed`], so owner and reader address a
+/// cell identically. `read_cell` ([`RawCellRow`]) and `read_cell_ttl`
+/// ([`CellTtlRow`]) both ride it.
+async fn fetch_cell_row<R>(
+    session: &CassandraSession,
+    statement: &PreparedStatement,
+    id: &CollectionId,
+    cell: &CellKey,
+) -> Result<Option<R>, CassandraCellStoreError>
+where
+    R: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
+{
+    let pk = Pk::of(id);
+    let row = session
+        .session()
+        .execute_unpaged(
+            statement,
+            (
+                pk.segment_id,
+                pk.key,
+                pk.state_type,
+                pk.name,
+                CellKind::Cell,
+                i8::from(cell.section),
+                &cell.coordinate,
+            ),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
+        .map_err(CassandraStoreError::from)?
+        .maybe_first_row::<R>()
+        .map_err(CassandraStoreError::from)?;
+    Ok(row)
+}
+
+/// Reads a section's `uniques` coordinates in one `IN` query, returning the
+/// matching rows **un-decoded**, each re-keyed to its clustering `coordinate` —
+/// the bind shared by the resolving [`CassandraStore::batch_read`] and the
+/// oracle-free [`CassandraCellResources::read_committed_many`]. See
+/// [`CassandraStore::batch_read`]'s superseded doc for the deferred-decode
+/// rationale; `uniques` is caller-deduped, non-empty, and `CELL_BATCH`-bounded.
+async fn fetch_cells_batch(
+    session: &CassandraSession,
+    queries: &CellQueries,
+    id: &CollectionId,
+    section: Section,
+    uniques: &[&Coordinate],
+) -> Result<CellBuffer<(Coordinate, CellTtlRow)>, CassandraCellStoreError> {
+    let pk = Pk::of(id);
+    let result = session
+        .session()
+        .execute_unpaged(
+            &queries.read_cells_batch,
+            (
+                pk.segment_id,
+                pk.key,
+                pk.state_type,
+                pk.name,
+                CellKind::Cell,
+                i8::from(section),
+                uniques,
+            ),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
+        .map_err(CassandraStoreError::from)?;
+    // At most one row per unique coordinate, so size once at the IN-list upper
+    // bound rather than growing an inline buffer up to `CELL_BATCH`.
+    let mut out: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::with_capacity(uniques.len());
+    for row in result
+        .rows::<KeyedCellTtlRow>()
+        .map_err(CassandraStoreError::from)?
+    {
+        out.push(split_keyed_cell_ttl(
+            row.map_err(CassandraStoreError::from)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// The shared section-scan row pager: opens the per-bound prepared statement
+/// (the 6-arm `(dir, start)` selection), builds the [`KeyedCellRow`] stream,
+/// and yields each decoded `(CellKey, Cell)` with the in-code `past_end` cutoff
+/// applied — **no limit and no resolution** (limit counts *present*
+/// post-projection cells, so it stays in each consumer's loop). Both the owner
+/// scan ([`CassandraStore::scan_inner`], which then applies `peek_read`) and
+/// the raw reader scan ([`CassandraCellResources::scan_committed`], which
+/// applies `project_committed`) consume it, so the physical paging cannot drift
+/// between them. Each `try_next` is wrapped in [`cooperative`] so a ready-row
+/// drain yields to the runtime every ~128 items.
+fn page_cells<'a>(
+    session: &'a CassandraSession,
+    queries: &'a CellQueries,
+    collection: &'a CollectionId,
+    scan: Scan<'a>,
+) -> impl Stream<Item = Result<(CellKey, Cell), CassandraCellStoreError>> + Send + 'a {
+    let section = i8::from(scan.section);
+    let dir = scan.dir;
+    // Both edges are held as owned `Coordinate`s across the stream's awaits —
+    // O(1) refcount bumps (`Coordinate` is `Bytes`), never byte copies.
+    let start = scan.start.cloned();
+    let end = scan.end.cloned();
+    try_stream! {
+        let pk = Pk::of(collection);
+        // The section-prefix bind values every scan statement shares.
+        let prefix = (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section);
+        let (seg, key, st, name, cell_kind, sect) = prefix;
+        // Statement selection and binding are one match: the bounded arms
+        // append the anchor coordinate (a 7-tuple), the `Unbounded` arms bind
+        // only the section prefix (a 6-tuple) — distinct Rust types, so the
+        // pager must open inside each arm.
+        let pager = match (dir, start.as_ref()) {
+            (Direction::Forward, ScanEdge::Included(c)) => {
+                session.session().execute_iter(queries.scan_forward_incl.clone(),
+                    (seg, key, st, name, cell_kind, sect, c)).await
+            }
+            (Direction::Forward, ScanEdge::Excluded(c)) => {
+                session.session().execute_iter(queries.scan_forward_excl.clone(),
+                    (seg, key, st, name, cell_kind, sect, c)).await
+            }
+            (Direction::Backward, ScanEdge::Included(c)) => {
+                session.session().execute_iter(queries.scan_backward_incl.clone(),
+                    (seg, key, st, name, cell_kind, sect, c)).await
+            }
+            (Direction::Backward, ScanEdge::Excluded(c)) => {
+                session.session().execute_iter(queries.scan_backward_excl.clone(),
+                    (seg, key, st, name, cell_kind, sect, c)).await
+            }
+            (Direction::Forward, ScanEdge::Unbounded) => {
+                session.session().execute_iter(queries.scan_forward_all.clone(), prefix).await
+            }
+            (Direction::Backward, ScanEdge::Unbounded) => {
+                session.session().execute_iter(queries.scan_backward_all.clone(), prefix).await
+            }
+        };
+        let stream = pager
+            .map_err(CassandraStoreError::from)?
+            .rows_stream::<KeyedCellRow>()
+            .map_err(CassandraStoreError::from)?;
+        pin_mut!(stream);
+        while let Some(row) = cooperative(stream.try_next())
+            .await
+            .map_err(CassandraStoreError::from)?
+        {
+            let (key, cell) = decode::try_decode_keyed_cell(row)?;
+            if past_end(dir, &key, end.as_ref()) {
+                break;
+            }
+            yield (key, cell);
+        }
+    }
 }
 
 /// Whether `key` has walked past the in-code `end` edge for the scan

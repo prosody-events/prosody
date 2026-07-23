@@ -66,6 +66,99 @@ impl MemoryCells {
         Self::default()
     }
 
+    /// The raw stored [`Cell`] at `(collection, cell)`, defaulting a missing
+    /// row to `Resolved(Committed(None))`. Oracle-free — shared by the
+    /// owner store's [`MemoryCellStore::read_raw`] and the reader's
+    /// [`Self::read_committed`], so neither can drift on the default shape.
+    pub(crate) fn read_committed_cell(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
+        self.inner
+            .read_sync(&(collection.clone(), cell.clone()), |_, stored| {
+                stored.to_cell()
+            })
+            .unwrap_or_else(|| Cell::Resolved(Committed::new(None)))
+    }
+
+    /// The oracle-free committed point read: the standalone reader's raw
+    /// primitive over the in-memory backend. Projects
+    /// [`Cell::project_committed`] — never an in-flight provisional value,
+    /// never owner-side repair.
+    pub(crate) fn read_committed(
+        &self,
+        collection: &CollectionId,
+        cell: &CellKey,
+    ) -> Option<Bytes> {
+        self.read_committed_cell(collection, cell)
+            .project_committed()
+            .cloned()
+    }
+
+    /// Batch twin of [`Self::read_committed`], index-aligned to `batch`. Memory
+    /// has no batch statement, so a per-coordinate map read is the in-tree
+    /// idiom (mirroring [`provisional_point_loop`]).
+    pub(crate) fn read_committed_many(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> CellBuffer<Option<Bytes>> {
+        batch
+            .iter()
+            .map(|coordinate| {
+                self.read_committed(
+                    collection,
+                    &CellKey {
+                        section,
+                        coordinate: coordinate.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The oracle-free committed section scan: mirrors
+    /// [`MemoryCellStore::scan_cells`]' snapshot-sort-yield shape **minus** the
+    /// read-help and oracle resolution, projecting [`Cell::project_committed`]
+    /// per raw cell. The per-item projection is wrapped in [`cooperative`] so a
+    /// large in-memory drain yields every ~128 items. Error type is
+    /// [`Infallible`] — an in-memory committed projection cannot fail.
+    pub(crate) fn scan_committed<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Infallible>> + Send + 'a {
+        try_stream! {
+            // Snapshot the matching raw cells synchronously (scc holds no
+            // borrowing iterator across an await), then project each lazily.
+            let mut raw: Vec<(CellKey, Cell)> = Vec::new();
+            self.inner.iter_sync(|(id, cell), stored| {
+                if id == collection
+                    && cell.section == scan.section
+                    && scan.contains(&cell.coordinate)
+                {
+                    raw.push((cell.clone(), stored.to_cell()));
+                }
+                true
+            });
+            raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
+            if scan.dir == Direction::Backward {
+                raw.reverse();
+            }
+            let limit = scan.limit;
+            let mut yielded = 0usize;
+            for (cell, stored) in raw {
+                if limit.is_some_and(|n| yielded >= n) {
+                    break;
+                }
+                if let Some(bytes) =
+                    cooperative(async move { stored.project_committed().cloned() }).await
+                {
+                    yield (cell, bytes);
+                    yielded += 1;
+                }
+            }
+        }
+    }
+
     /// Every stored cell key for `collection`, **regardless of variant** — the
     /// physical-shape probe for the row-absence invariant, so a lingering
     /// `Resolved(None)` entry (which must be a removal, not a tombstone) is
@@ -143,13 +236,10 @@ where
     O: CommitOracle,
 {
     /// The raw stored cell at `(collection, cell)`, defaulting a missing row to
-    /// `Resolved(Committed(None))`.
+    /// `Resolved(Committed(None))` — the oracle-free body now lives on
+    /// [`MemoryCells::read_committed_cell`], shared with the reader.
     fn read_raw(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
-        self.map()
-            .read_sync(&(collection.clone(), cell.clone()), |_, stored| {
-                stored.to_cell()
-            })
-            .unwrap_or_else(|| Cell::Resolved(Committed::new(None)))
+        self.cells.read_committed_cell(collection, cell)
     }
 
     /// The shared cell map.

@@ -87,6 +87,20 @@ pub enum ReadCache {
     },
 }
 
+impl ReadCache {
+    /// The fresh-window TTL for cached reads, or `None` when uncached.
+    ///
+    /// The accessor the standalone reader consumes so its read path selects a
+    /// cache policy without naming the owner's `Cached` cell-cache wrapper.
+    #[must_use]
+    pub(crate) fn ttl(&self) -> Option<Duration> {
+        match self {
+            Self::Uncached => None,
+            Self::Cached { ttl } => Some(*ttl),
+        }
+    }
+}
+
 /// Operational per-collection settings.
 ///
 /// Carries the collection's per-write operational settings — TTL,

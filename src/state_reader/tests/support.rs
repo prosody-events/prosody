@@ -1,0 +1,511 @@
+//! Shared scaffolding for the reader suites.
+//!
+//! Three concerns live here: the **owner-write harness** that seeds committed
+//! (and, for the window arm, provisional) state through the real
+//! [`KeyedStateSession`]; the **scripted fault source**
+//! ([`ScriptedCellSource`]) and **counting identity store**
+//! ([`CountingIdentityStore`]) the closed [`ReaderStores::Scripted`] arm
+//! carries; and the **bundle/reader builders** the suites compose readers
+//! from. Committed state is never hand-written at a cell address — it always
+//! flows through the owner session, so the reader reads exactly what the owner
+//! wrote under the segment [`partition_segment_id`] computes.
+
+use crate::codec::JsonCodec;
+use crate::consumer::partition::ShutdownPhase;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::loader::MemoryLoader;
+use crate::segment::partition_segment_id;
+use crate::state::access::StateAccessError;
+use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::descriptor::StateDescriptor;
+use crate::state::descriptor_identity::{
+    DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
+};
+use crate::state::identity::{CollectionId, StateKey};
+use crate::state::manager::ArmedKeys;
+use crate::state::memory::{
+    MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
+};
+use crate::state::publication::{PublicationStore, StatePublication};
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
+use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore, probe};
+use crate::state::{EventRef, PartitionBackend, StateName, StateType};
+use crate::state_reader::cache::{ReaderCache, ReaderClock};
+use crate::state_reader::deps::SharedDeps;
+use crate::state_reader::loader::ReaderLoader;
+use crate::state_reader::stores::ReaderStores;
+use crate::state_reader::{PartitionCount, partition_for_key};
+use crate::subsystem::SubsystemName;
+use crate::timers::duration::CompactDuration;
+use crate::{Key, SegmentId, Topic};
+use async_stream::try_stream;
+use bytes::Bytes;
+use color_eyre::eyre::{Result, bail, eyre};
+use futures::{Stream, StreamExt};
+use internment::Intern;
+use parking_lot::Mutex;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use thiserror::Error;
+use tokio::sync::watch;
+
+/// The subsystem every suite routes under.
+pub(super) const SUBSYSTEM: &str = "orders";
+
+/// A distinct-source key space: two groups, lexicographically ordered so
+/// `GROUP_A` is the deterministic lowest source and `GROUP_B` the decoy.
+pub(super) const GROUP_A: &str = "group-aaa";
+pub(super) const GROUP_B: &str = "group-zzz";
+
+/// The mock topology's fixed partition count (matches
+/// [`PartitionCount::MOCK`]).
+pub(super) fn mock_count() -> PartitionCount {
+    PartitionCount::try_from(3).unwrap_or(PartitionCount::MIN)
+}
+
+/// The subsystem name.
+pub(super) fn subsystem() -> Result<SubsystemName> {
+    SubsystemName::try_new(SUBSYSTEM).map_err(|e| eyre!("subsystem: {e}"))
+}
+
+/// A collection state name.
+pub(super) fn state_name(name: &str) -> Result<StateName> {
+    StateName::try_new(name).map_err(|e| eyre!("name: {e}"))
+}
+
+/// An interned topic.
+pub(super) fn topic(name: &str) -> Topic {
+    Intern::<str>::from(name)
+}
+
+// --- Owner-write harness ----------------------------------------------------
+
+/// The owner backend the seeding session runs over: an in-memory cell store and
+/// a fixed committed oracle.
+type OwnerBackend =
+    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+
+/// The real per-event session the seeding handles bind over.
+type OwnerSession = KeyedStateSession<OwnerBackend, MemoryLoader<Value>>;
+
+/// A registry with `descriptor` registered under `def`.
+pub(super) fn registry_of<D: StateDescriptor>(
+    descriptor: &D,
+    def: CollectionDef,
+) -> Result<Arc<CollectionDefRegistry>> {
+    let mut registry = CollectionDefRegistry::default();
+    registry
+        .register(descriptor, def)
+        .map_err(|e| eyre!("register: {e}"))?;
+    Ok(Arc::new(registry))
+}
+
+/// The segment the owner writes under (and the reader recomputes) for one
+/// source. The single fabricated-identifier authority — never a hand-invented
+/// id.
+pub(super) fn source_state_key(
+    topic: Topic,
+    group: &str,
+    key: &Key,
+    count: PartitionCount,
+) -> Result<StateKey> {
+    let partition =
+        partition_for_key(key.as_bytes(), count).map_err(|e| eyre!("partition: {e}"))?;
+    Ok(StateKey::new(
+        partition_segment_id(topic, partition, group),
+        key.clone(),
+    ))
+}
+
+/// A fresh owner session over `cells` for one event.
+fn owner_session(
+    cells: &MemoryCells,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    event: EventRef,
+) -> OwnerSession {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    KeyedStateSession::new(SessionParts::<OwnerBackend, _> {
+        cell: MemoryCellStore::new(cells.clone(), FixedOracle::committed(), registry.clone()),
+        dirty: Arc::default(),
+        oracle: FixedOracle::committed(),
+        loader: MemoryLoader::new(),
+        registry: registry.clone(),
+        state_key: state_key.clone(),
+        event,
+        recovery_delay: CompactDuration::new(30),
+        armed: ArmedKeys::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
+    })
+}
+
+/// Finalizes and promotes: the event's staged cells become committed. The full
+/// owner settle for a committed write.
+async fn promote(session: OwnerSession) -> Result<()> {
+    if let Finalized::Staged(staged) = session
+        .finalize()
+        .await
+        .map_err(|e| eyre!("finalize: {e}"))?
+        && staged.certify().promote().await != ApplyOutcome::Resolved
+    {
+        bail!("promote incomplete on a healthy store");
+    }
+    Ok(())
+}
+
+/// Finalizes **without** promoting: the staged provisional cells are durable
+/// but the committed value stays at its prior contents — exactly the
+/// commit→promote window a cross-group reader must read `prev` from. Dropping
+/// the receipt is the "committed step not yet applied" state.
+async fn stage_only(session: OwnerSession) -> Result<()> {
+    let _staged = session
+        .finalize()
+        .await
+        .map_err(|e| eyre!("finalize: {e}"))?;
+    Ok(())
+}
+
+/// Binds `descriptor` to a fresh owner session, runs `ops` against the handle,
+/// then commits (promote). The seeding primitive every suite writes committed
+/// state through.
+pub(super) async fn owner_commit<D, F, Fut>(
+    cells: &MemoryCells,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    descriptor: D,
+    event: u128,
+    ops: F,
+) -> Result<()>
+where
+    D: StateDescriptor,
+    F: FnOnce(D::Handle<OwnerSession>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let session = owner_session(cells, registry, state_key, probe(event));
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    ops(handle).await?;
+    promote(session).await
+}
+
+/// [`owner_commit`] but leaves the event in the commit→promote window (staged,
+/// not promoted) — the provisional-projection driver.
+pub(super) async fn owner_stage<D, F, Fut>(
+    cells: &MemoryCells,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    descriptor: D,
+    event: u128,
+    ops: F,
+) -> Result<()>
+where
+    D: StateDescriptor,
+    F: FnOnce(D::Handle<OwnerSession>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let session = owner_session(cells, registry, state_key, probe(event));
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    ops(handle).await?;
+    stage_only(session).await
+}
+
+// --- Control-plane seeding --------------------------------------------------
+
+/// Advertises `(group, topic)` as a source of `name` and freezes its identity
+/// to match `descriptor`, so the reader admits it. The identity row is derived
+/// from the same descriptor the reader carries, so acquisition validates equal.
+pub(super) async fn publish_source<D: StateDescriptor>(
+    stores: (&MemoryPublicationStore, &MemoryDescriptorIdentityStore),
+    subsystem: &SubsystemName,
+    name: &StateName,
+    group: &str,
+    topic: Topic,
+    count: PartitionCount,
+    descriptor: &D,
+) {
+    let (publications, identities) = stores;
+    publications
+        .upsert(
+            subsystem,
+            name,
+            &StatePublication {
+                group_id: Arc::from(group),
+                topic,
+                partition_count: count,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| match e {});
+    let row = DurableDescriptorIdentity::from_identity(
+        descriptor.state_type(),
+        name.as_str(),
+        &descriptor.structural_identity(),
+    );
+    identities
+        .register_identity(group, &row)
+        .await
+        .unwrap_or_else(|e| match e {});
+}
+
+/// [`publish_source`] against the scripted control-plane stores (the probe and
+/// refresh suites), freezing an identity that matches `descriptor`.
+pub(super) async fn publish_scripted<D: StateDescriptor>(
+    stores: (&ScriptedPublicationStore, &CountingIdentityStore),
+    subsystem: &SubsystemName,
+    name: &StateName,
+    group: &str,
+    topic: Topic,
+    count: PartitionCount,
+    descriptor: &D,
+) {
+    let (publications, identities) = stores;
+    publications
+        .seed(
+            subsystem,
+            name,
+            &StatePublication {
+                group_id: Arc::from(group),
+                topic,
+                partition_count: count,
+            },
+        )
+        .await;
+    let row = DurableDescriptorIdentity::from_identity(
+        descriptor.state_type(),
+        name.as_str(),
+        &descriptor.structural_identity(),
+    );
+    identities.seed(group, &row).await;
+}
+
+// --- Memory reader bundle ---------------------------------------------------
+
+/// The shared handles the memory suites hold: the stores the owner writes into
+/// and the reader reads from, plus the publication and identity control-plane
+/// stores.
+#[derive(Clone)]
+pub(super) struct MemoryHarness {
+    pub(super) cells: MemoryCells,
+    pub(super) publications: MemoryPublicationStore,
+    pub(super) identities: MemoryDescriptorIdentityStore,
+}
+
+impl MemoryHarness {
+    pub(super) fn new() -> Self {
+        Self {
+            cells: MemoryCells::new(),
+            publications: MemoryPublicationStore::new(),
+            identities: MemoryDescriptorIdentityStore::new(),
+        }
+    }
+
+    /// A shared-deps bundle over these handles with a wall-clock cache.
+    pub(super) fn deps(&self, budget: u64) -> SharedDeps<JsonCodec> {
+        SharedDeps::memory(
+            self.cells.clone(),
+            self.publications.clone(),
+            self.identities.clone(),
+            MemoryLoader::new(),
+            budget,
+        )
+    }
+}
+
+// --- Scripted fault source --------------------------------------------------
+
+/// Where a scripted read faults.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum FaultPoint {
+    /// Error before any row is read (a point read errors; a scan errors at
+    /// stream open).
+    AtOpen,
+    /// Yield `n` present cells, then error (scan only).
+    AfterYields(usize),
+}
+
+/// A committed cell source that can fault deterministically per source. Wraps a
+/// real [`MemoryCells`] for the actual committed data (seeded through the owner
+/// harness); the closed [`ReaderStores::Scripted`] arm carries it because the
+/// two production arms cannot script a mid-stream scan error (Memory is
+/// `Infallible`, Cassandra needs a live cluster).
+#[derive(Clone, Default)]
+pub(crate) struct ScriptedCellSource {
+    inner: MemoryCells,
+    faults: Arc<Mutex<HashMap<SegmentId, FaultPoint>>>,
+}
+
+impl ScriptedCellSource {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The backing cells, for the owner harness to seed committed values into.
+    pub(super) fn cells(&self) -> MemoryCells {
+        self.inner.clone()
+    }
+
+    /// Arms a fault for the source addressed by `segment`.
+    pub(super) fn fault_at(&self, segment: SegmentId, fault: FaultPoint) {
+        self.faults.lock().insert(segment, fault);
+    }
+
+    fn fault_of(&self, segment: SegmentId) -> Option<FaultPoint> {
+        self.faults.lock().get(&segment).copied()
+    }
+
+    pub(crate) fn read_committed(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        let segment = id.state_key().segment_id;
+        if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
+            return Err(StateAccessError::store(&ScriptedFaultError));
+        }
+        Ok(self.inner.read_committed(id, cell))
+    }
+
+    pub(crate) fn read_committed_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+        let segment = id.state_key().segment_id;
+        if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
+            return Err(StateAccessError::store(&ScriptedFaultError));
+        }
+        Ok(self.inner.read_committed_many(id, section, batch))
+    }
+
+    pub(crate) fn scan_committed<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        let segment = id.state_key().segment_id;
+        let fault = self.fault_of(segment);
+        let inner = self.inner.clone();
+        try_stream! {
+            if matches!(fault, Some(FaultPoint::AtOpen)) {
+                Err(StateAccessError::store(&ScriptedFaultError))?;
+            }
+            let limit = match fault {
+                Some(FaultPoint::AfterYields(n)) => Some(n),
+                _ => None,
+            };
+            let source = inner.scan_committed(id, scan);
+            futures::pin_mut!(source);
+            let mut yielded = 0usize;
+            while let Some(item) = source.next().await {
+                if limit.is_some_and(|n| yielded >= n) {
+                    Err(StateAccessError::store(&ScriptedFaultError))?;
+                }
+                // Memory scan errors are `Infallible`.
+                let (key, value) = item.map_err(|e: Infallible| -> StateAccessError { match e {} })?;
+                yield (key, value);
+                yielded += 1;
+            }
+        }
+    }
+}
+
+/// A scripted store fault (always `Transient`, never `Terminal` — the reader
+/// layer's posture).
+#[derive(Debug, Error)]
+#[error("scripted cell-source fault")]
+pub(super) struct ScriptedFaultError;
+
+impl ClassifyError for ScriptedFaultError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Transient
+    }
+}
+
+// --- Counting identity store ------------------------------------------------
+
+/// A [`DescriptorIdentityStore`] counting every `read_identity` — the probe for
+/// "an already-admitted source is never re-validated." Wraps a real memory
+/// identity store; cloning shares the counter.
+#[derive(Clone, Default)]
+pub(crate) struct CountingIdentityStore {
+    inner: MemoryDescriptorIdentityStore,
+    reads: Arc<AtomicUsize>,
+}
+
+impl CountingIdentityStore {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Identity reads counted so far.
+    pub(super) fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Freezes an identity row directly (bypassing the counter).
+    pub(super) async fn seed(&self, group: &str, row: &DurableDescriptorIdentity) {
+        self.inner
+            .register_identity(group, row)
+            .await
+            .unwrap_or_else(|e| match e {});
+    }
+}
+
+impl DescriptorIdentityStore for CountingIdentityStore {
+    type Error = Infallible;
+
+    async fn read_identity(
+        &self,
+        group_id: &str,
+        state_type: StateType,
+        name: &str,
+    ) -> Result<Option<DurableDescriptorIdentity>, Self::Error> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_identity(group_id, state_type, name).await
+    }
+
+    async fn register_identity(
+        &self,
+        group_id: &str,
+        row: &DurableDescriptorIdentity,
+    ) -> Result<RegisterOutcome, Self::Error> {
+        self.inner.register_identity(group_id, row).await
+    }
+}
+
+/// A scripted bundle: the fault source over its own backing cells, plus the
+/// scripted publication store and counting identity store the refresh/probe
+/// arms drive.
+pub(super) fn scripted_deps(
+    cells: ScriptedCellSource,
+    publications: ScriptedPublicationStore,
+    identities: CountingIdentityStore,
+    cache: ReaderCache,
+) -> SharedDeps<JsonCodec> {
+    SharedDeps::from_parts(
+        ReaderStores::Scripted {
+            cells,
+            publications,
+            identities,
+        },
+        ReaderLoader::Memory(MemoryLoader::new()),
+        cache,
+    )
+}
+
+/// A cache with a fixed, test-driven clock over `budget` declared bytes,
+/// returning the shared millisecond handle the test advances (never a sleep).
+pub(super) fn fixed_clock_cache(budget: u64) -> (ReaderCache, Arc<AtomicU64>) {
+    let now = Arc::new(AtomicU64::new(0));
+    let cache = ReaderCache::with_clock(budget, ReaderClock::Fixed(now.clone()));
+    (cache, now)
+}
