@@ -268,7 +268,9 @@ where
     }
 
     /// Returns the client's one shared infrastructure bundle, building it from
-    /// `mode` on first call and retaining it for the client's lifetime.
+    /// `mode` on first call and retaining it across the Configured -> Running
+    /// transition. `unsubscribe` drops it (see there); the next `subscribe`
+    /// rebuilds a fresh bundle.
     ///
     /// The caller must already hold the `consumer` lock (this locks `deps`
     /// under it — the invariant lock order). A second call clones the retained
@@ -481,7 +483,7 @@ where
             let mut guard = self.consumer.lock().await;
             let consumer_ref = &mut *guard;
 
-            match take(consumer_ref) {
+            let consumer = match take(consumer_ref) {
                 state @ (ConsumerState::Unconfigured
                 | ConsumerState::ConfigurationFailed(_)
                 | ConsumerState::Configured(_)) => {
@@ -494,7 +496,18 @@ where
                     *consumer_ref = ConsumerState::Configured(config);
                     consumer
                 }
-            }
+            };
+
+            // Drop the retained bundle. Its heartbeat registry holds this
+            // consumer's poll-loop heartbeat, which stops beating at shutdown;
+            // reusing the same registry on a later `subscribe` would fold that
+            // permanently-dead heartbeat into `is_stalled` forever and grow the
+            // registry without a removal path. The next `subscribe` rebuilds a
+            // fresh bundle. Cleared while holding the consumer lock to preserve
+            // the consumer -> deps lock order.
+            *self.deps.lock().await = None;
+
+            consumer
         };
 
         info!("shutting down consumer");

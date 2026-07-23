@@ -347,6 +347,50 @@ fn registrations_survive_resubscribe_cycle() -> Result<()> {
     })
 }
 
+/// `unsubscribe` drops the retained bundle so a later `subscribe` rebuilds a
+/// fresh one. The bundle's heartbeat registry holds the running consumer's
+/// poll-loop heartbeat; that heartbeat stops beating at shutdown, so reusing
+/// the registry across a resubscribe would fold a permanently-dead heartbeat
+/// into `is_stalled` and grow the registry without a removal path. Proven by
+/// the bundle being cleared on `unsubscribe` and by the `SharedDeps`
+/// construction id changing across the cycle. Falsify by retaining `self.deps`
+/// through `unsubscribe`: the bundle survives (first assert red) and the id is
+/// reused (second assert red).
+#[test]
+fn unsubscribe_rebuilds_bundle_on_resubscribe() -> Result<()> {
+    let fixture = create_test_client::<NoOpHandler>("resubscribe-fresh-bundle", None)?;
+    TEST_RUNTIME.block_on(async {
+        // Configured: build and retain the first bundle.
+        let first = fixture
+            .client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await?;
+        let id_first = first.deps_instance_id();
+
+        fixture.client.subscribe(NoOpHandler).await?;
+        fixture.client.unsubscribe().await?;
+
+        // The retained bundle (holding the now-dead poll-loop heartbeat) is
+        // gone, so its stale registry cannot be reused.
+        assert!(
+            fixture.client.retained_deps().await.is_none(),
+            "unsubscribe must drop the retained bundle"
+        );
+
+        // A reader minted after the cycle draws from a freshly built bundle.
+        let second = fixture
+            .client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await?;
+        assert_ne!(
+            id_first,
+            second.deps_instance_id(),
+            "resubscribe must rebuild the bundle, not reuse the stale one"
+        );
+        Result::<()>::Ok(())
+    })
+}
+
 /// Builds a `SubsystemName`, surfacing the (non-`eyre`) name error.
 fn subsystem(name: &str) -> Result<SubsystemName> {
     SubsystemName::try_new(name).map_err(|error| eyre!("subsystem name: {error}"))
