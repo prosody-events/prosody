@@ -30,7 +30,7 @@ use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, CellStore, CoordinateBatch};
 use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore, probe};
 use crate::state::{EventRef, PartitionBackend, StateName, StateType};
 use crate::state_reader::cache::{ReaderCache, ReaderClock};
@@ -87,13 +87,17 @@ pub(super) fn topic(name: &str) -> Topic {
 
 // --- Owner-write harness ----------------------------------------------------
 
-/// The owner backend the seeding session runs over: an in-memory cell store and
-/// a fixed committed oracle.
-type OwnerBackend =
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+/// The owner backend the seeding session runs over, generic over the cell store
+/// `C`. The oracle is always the fixed committed one (a pure seed never
+/// resolves a foreign provisional), and the identity type is **phantom** — the
+/// session never reads it (see [`SessionParts`]), so one type serves every
+/// backend. Only `C` varies: [`MemoryCellStore`] for the memory reader,
+/// `CassandraStore<FixedOracle>` for the live-Cassandra reader.
+type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
 
-/// The real per-event session the seeding handles bind over.
-type OwnerSession = KeyedStateSession<OwnerBackend, MemoryLoader<Value>>;
+/// The real per-event session the seeding handles bind over, over cell store
+/// `C`.
+pub(crate) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
 
 /// A registry with `descriptor` registered under `def`.
 pub(super) fn registry_of<D: StateDescriptor>(
@@ -124,17 +128,17 @@ pub(super) fn source_state_key(
     ))
 }
 
-/// A fresh owner session over `cells` for one event.
-fn owner_session(
-    cells: &MemoryCells,
+/// A fresh owner session over cell store `cell` for one event.
+fn owner_session<C: CellStore>(
+    cell: C,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
     event: EventRef,
-) -> OwnerSession {
+) -> OwnerSession<C> {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    KeyedStateSession::new(SessionParts::<OwnerBackend, _> {
-        cell: MemoryCellStore::new(cells.clone(), FixedOracle::committed(), registry.clone()),
+    KeyedStateSession::new(SessionParts::<OwnerBackend<C>, _> {
+        cell,
         dirty: Arc::default(),
         oracle: FixedOracle::committed(),
         loader: MemoryLoader::new(),
@@ -149,8 +153,11 @@ fn owner_session(
 }
 
 /// Finalizes and promotes: the event's staged cells become committed. The full
-/// owner settle for a committed write.
-async fn promote(session: OwnerSession) -> Result<()> {
+/// owner settle for a committed write. Promotion calls the store's settlement
+/// verb directly — it never consults the oracle — so it returns `Resolved` on
+/// any healthy store (memory or Cassandra); a non-`Resolved` outcome is a real
+/// failure the seed must surface.
+async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
     if let Finalized::Staged(staged) = session
         .finalize()
         .await
@@ -166,7 +173,7 @@ async fn promote(session: OwnerSession) -> Result<()> {
 /// but the committed value stays at its prior contents — exactly the
 /// commit→promote window a cross-group reader must read `prev` from. Dropping
 /// the receipt is the "committed step not yet applied" state.
-async fn stage_only(session: OwnerSession) -> Result<()> {
+async fn stage_only<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
     let _staged = session
         .finalize()
         .await
@@ -174,9 +181,32 @@ async fn stage_only(session: OwnerSession) -> Result<()> {
     Ok(())
 }
 
-/// Binds `descriptor` to a fresh owner session, runs `ops` against the handle,
-/// then commits (promote). The seeding primitive every suite writes committed
-/// state through.
+/// Binds `descriptor` to a fresh owner session over `cell`, runs `ops` against
+/// the handle, then commits (promote). The backend-generic seeding primitive:
+/// the memory and Cassandra reader backends both write committed state through
+/// it, only their `cell` differing.
+pub(crate) async fn owner_commit_cell<C, D, F, Fut>(
+    cell: C,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    descriptor: D,
+    event: u128,
+    ops: F,
+) -> Result<()>
+where
+    C: CellStore,
+    D: StateDescriptor,
+    F: FnOnce(D::Handle<OwnerSession<C>>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let session = owner_session(cell, registry, state_key, probe(event));
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    ops(handle).await?;
+    promote(session).await
+}
+
+/// [`owner_commit_cell`] over an in-memory cell store — the memory-backed
+/// seeding entry point the scripted probe/refresh suites write through.
 pub(super) async fn owner_commit<D, F, Fut>(
     cells: &MemoryCells,
     registry: &Arc<CollectionDefRegistry>,
@@ -187,13 +217,11 @@ pub(super) async fn owner_commit<D, F, Fut>(
 ) -> Result<()>
 where
     D: StateDescriptor,
-    F: FnOnce(D::Handle<OwnerSession>) -> Fut,
+    F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let session = owner_session(cells, registry, state_key, probe(event));
-    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    ops(handle).await?;
-    promote(session).await
+    let cell = MemoryCellStore::new(cells.clone(), FixedOracle::committed(), registry.clone());
+    owner_commit_cell(cell, registry, state_key, descriptor, event, ops).await
 }
 
 /// [`owner_commit`] but leaves the event in the commit→promote window (staged,
@@ -208,10 +236,11 @@ pub(super) async fn owner_stage<D, F, Fut>(
 ) -> Result<()>
 where
     D: StateDescriptor,
-    F: FnOnce(D::Handle<OwnerSession>) -> Fut,
+    F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let session = owner_session(cells, registry, state_key, probe(event));
+    let cell = MemoryCellStore::new(cells.clone(), FixedOracle::committed(), registry.clone());
+    let session = owner_session(cell, registry, state_key, probe(event));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     ops(handle).await?;
     stage_only(session).await
@@ -316,6 +345,113 @@ impl MemoryHarness {
             MemoryLoader::new(),
             budget,
         )
+    }
+}
+
+// --- Backend-generic reader seam --------------------------------------------
+
+/// The seam the backend-generic committed-read runner
+/// (`reader_suite::run_reader_*_trace`) drives, so ONE runner body proves the
+/// committed==oracle invariant over both the memory reader and a live-Cassandra
+/// reader. An impl bundles the owner-seed cell store (seeded through the real
+/// [`KeyedStateSession`] via [`owner_commit_cell`]), the control-plane seeding,
+/// and the reader `deps` bundle — the three pieces that differ by backend.
+pub(crate) trait ReaderBackend {
+    /// The owner-seed cell store: [`MemoryCellStore`] for memory, the shared
+    /// `CassandraStore<FixedOracle>` for Cassandra.
+    type OwnerCell: CellStore;
+
+    /// The registry the sessions and the owner cell store share.
+    fn registry(&self) -> Arc<CollectionDefRegistry>;
+
+    /// A cell store to seed one event through. Cloning shares the committed
+    /// backing (memory cells / Cassandra rows) across a trace's events, and —
+    /// on Cassandra — the one `MarkerMemo`/`MarkerPresence` lifecycle the store
+    /// owns.
+    fn owner_cell(&self) -> Self::OwnerCell;
+
+    /// Advertises `(group, topic)` as a source of `name` and freezes `identity`
+    /// so the reader admits it.
+    async fn publish(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        group: &str,
+        topic: Topic,
+        count: PartitionCount,
+        identity: &DurableDescriptorIdentity,
+    ) -> Result<()>;
+
+    /// A fresh reader bundle over this backend's stores (a fresh cache each
+    /// call, so a per-event reader observes current committed state, not a
+    /// stale cache).
+    fn deps(&self) -> SharedDeps<JsonCodec>;
+}
+
+/// The memory [`ReaderBackend`]: a fresh [`MemoryHarness`] plus a registry
+/// carrying the trace's single per-kind def.
+pub(crate) struct MemoryReaderBackend {
+    harness: MemoryHarness,
+    registry: Arc<CollectionDefRegistry>,
+}
+
+impl MemoryReaderBackend {
+    /// A backend registering `descriptor` under `def`.
+    pub(crate) fn new<D: StateDescriptor>(descriptor: &D, def: CollectionDef) -> Result<Self> {
+        Ok(Self {
+            harness: MemoryHarness::new(),
+            registry: registry_of(descriptor, def)?,
+        })
+    }
+}
+
+impl ReaderBackend for MemoryReaderBackend {
+    type OwnerCell = MemoryCellStore<FixedOracle>;
+
+    fn registry(&self) -> Arc<CollectionDefRegistry> {
+        self.registry.clone()
+    }
+
+    fn owner_cell(&self) -> Self::OwnerCell {
+        MemoryCellStore::new(
+            self.harness.cells.clone(),
+            FixedOracle::committed(),
+            self.registry.clone(),
+        )
+    }
+
+    async fn publish(
+        &self,
+        subsystem: &SubsystemName,
+        name: &StateName,
+        group: &str,
+        topic: Topic,
+        count: PartitionCount,
+        identity: &DurableDescriptorIdentity,
+    ) -> Result<()> {
+        self.harness
+            .publications
+            .upsert(
+                subsystem,
+                name,
+                &StatePublication {
+                    group_id: Arc::from(group),
+                    topic,
+                    partition_count: count,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| match e {});
+        self.harness
+            .identities
+            .register_identity(group, identity)
+            .await
+            .unwrap_or_else(|e| match e {});
+        Ok(())
+    }
+
+    fn deps(&self) -> SharedDeps<JsonCodec> {
+        self.harness.deps(1 << 20)
     }
 }
 

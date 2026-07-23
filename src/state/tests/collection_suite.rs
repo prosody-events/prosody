@@ -97,7 +97,7 @@ type SuiteSession = KeyedStateSession<SuiteBackend, MemoryLoader<Value>>;
 /// The bounded key space the Map trace ranges over — small and spanning the
 /// sign boundary so re-inserts, removes, and ordered scans across negative and
 /// positive `i64` keys all occur.
-const KEY_POOL: [i64; 5] = [-2, -1, 0, 1, 2];
+pub(crate) const KEY_POOL: [i64; 5] = [-2, -1, 0, 1, 2];
 
 /// Max ops per event, keeping each event's batch small while the trace as a
 /// whole still grows and drains the collection.
@@ -233,6 +233,16 @@ impl<O: Arbitrary> Arbitrary for Trace<O> {
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         Box::new(self.events.shrink().map(|events| Self { events }))
+    }
+}
+
+impl<O> Trace<O> {
+    /// The per-event op slices, in order — the reuse seam for the
+    /// standalone-reader committed-read runner, which drives this generator's
+    /// ops but promotes every event (a reader observes only committed state, so
+    /// the per-event outcome is irrelevant to it).
+    pub(crate) fn events_ops(&self) -> impl Iterator<Item = &[O]> + '_ {
+        self.events.iter().map(|event| event.ops.as_slice())
     }
 }
 

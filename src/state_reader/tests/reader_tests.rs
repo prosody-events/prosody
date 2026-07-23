@@ -1,75 +1,101 @@
-//! End-to-end reads through the public [`StateReader`]: committed round-trips
-//! for Value / Map / Deque, the commit→promote window, identity validation,
-//! and the boundary errors.
+//! End-to-end reads through the public [`StateReader`].
+//!
+//! The committed round-trip for Value / Map / Deque is the memory instantiation
+//! of the backend-generic [`reader_suite`](super::reader_suite) runner
+//! (`prop_reader_*_committed`); the focused examples below pin invariants too
+//! narrow to generalize: the commit→promote window (unprovable post-promotion),
+//! Kafka-ref resolution through the loader, identity validation, and the
+//! boundary errors.
 //!
 //! Committed state is seeded through the real owner session; the reader reads
 //! it back over the oracle-free carriers under the segment the owner wrote.
 
+use super::reader_suite::{
+    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
+};
 use super::support::{
-    GROUP_A, MemoryHarness, mock_count, owner_commit, owner_stage, publish_source, registry_of,
-    source_state_key, state_name, subsystem, topic,
+    GROUP_A, MemoryHarness, MemoryReaderBackend, mock_count, owner_commit, owner_stage,
+    publish_source, registry_of, source_state_key, state_name, subsystem, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::{DescriptorIdentity, deque_state, map_state, value_state};
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDef;
+use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
-use futures::StreamExt;
+use futures::executor::block_on;
 use serde_json::Value;
-use std::collections::BTreeMap;
 
-/// A committed Value written by the owner is read back by a standalone reader
-/// over the same in-memory carriers.
-///
-/// Falsify: read a different section/name in `ReadSession::get` — the reader
-/// diverges from the written value.
-#[tokio::test]
-async fn value_reader_reads_committed() -> Result<()> {
-    let harness = MemoryHarness::new();
-    let descriptor = value_state::<JsonCodec>("v-cart");
-    let name = state_name("v-cart")?;
-    let sub = subsystem()?;
-    let tp = topic("orders");
-    let count = mock_count();
-    let key = Key::from("user-42");
-    let state_key = source_state_key(tp, GROUP_A, &key, count)?;
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
+/// The reader observes exactly the committed Value the owner wrote, over an
+/// arbitrary overwrite trace — the memory instantiation of
+/// [`run_reader_value_trace`]. `QUICKCHECK_TESTS` sets the iteration count.
+#[test]
+fn prop_reader_value_committed() {
+    fn property(trace: Trace<ValueOp>) -> Result<bool> {
+        let descriptor = value_state::<JsonCodec>("reader-value");
+        let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
+        let sub = subsystem()?;
+        let key = Key::from("user-1");
+        let case = ReaderCase {
+            sub: &sub,
+            group: GROUP_A,
+            topic: topic("orders"),
+            key: &key,
+            count: mock_count(),
+        };
+        block_on(run_reader_value_trace(&backend, descriptor, &case, trace))
+    }
+    quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<ValueOp>) -> Result<bool>);
+}
 
-    owner_commit(
-        &harness.cells,
-        &registry,
-        &state_key,
-        descriptor,
-        1,
-        |handle| async move {
-            handle
-                .set(Value::from(7i64))
-                .await
-                .map_err(|e| eyre!("set: {e}"))?;
-            Ok(())
-        },
-    )
-    .await?;
-    publish_source(
-        (&harness.publications, &harness.identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp,
-        count,
-        &descriptor,
-    )
-    .await;
+/// The reader's point `get`, `get_many`, and ordered `stream` equal a
+/// `BTreeMap` model of the committed live entries after every event, over an
+/// arbitrary set/remove/clear trace — the memory instantiation of
+/// [`run_reader_map_trace`].
+#[test]
+fn prop_reader_map_committed() {
+    fn property(trace: Trace<MapOp>) -> Result<bool> {
+        let descriptor = map_state::<I64KeyCodec, JsonCodec>("reader-map");
+        let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
+        let sub = subsystem()?;
+        let key = Key::from("user-1");
+        let case = ReaderCase {
+            sub: &sub,
+            group: GROUP_A,
+            topic: topic("orders"),
+            key: &key,
+            count: mock_count(),
+        };
+        block_on(run_reader_map_trace(&backend, descriptor, &case, trace))
+    }
+    quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<MapOp>) -> Result<bool>);
+}
 
-    let deps = harness.deps(1 << 20);
-    let reader = StateReader::new(&deps, sub, descriptor)?;
-    assert_eq!(reader.get(key).await?, Some(Value::from(7i64)));
-    Ok(())
+/// The reader's `len`, front-relative `get`, and ordered `stream` equal a
+/// `VecDeque` model of the committed elements after every event, over an
+/// arbitrary push/pop/clear trace — the memory instantiation of
+/// [`run_reader_deque_trace`].
+#[test]
+fn prop_reader_deque_committed() {
+    fn property(trace: Trace<DequeOp>) -> Result<bool> {
+        let descriptor = deque_state::<JsonCodec>("reader-deque");
+        let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
+        let sub = subsystem()?;
+        let key = Key::from("user-1");
+        let case = ReaderCase {
+            sub: &sub,
+            group: GROUP_A,
+            topic: topic("orders"),
+            key: &key,
+            count: mock_count(),
+        };
+        block_on(run_reader_deque_trace(&backend, descriptor, &case, trace))
+    }
+    quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<DequeOp>) -> Result<bool>);
 }
 
 /// In the commit→promote window (owner staged a provisional cell but has not
@@ -141,137 +167,6 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         Some(Value::from(1i64)),
         "reader sees committed prev, not the in-flight provisional"
     );
-    Ok(())
-}
-
-/// A Map's committed live entries read back in key order equal the owner's
-/// model (a `BTreeMap`), via both `get` and `iter`.
-///
-/// Falsify: drop the `project_committed` present filter in `scan_committed` — a
-/// removed entry reappears and the ordered comparison fails.
-#[tokio::test]
-async fn map_reader_iter_equals_model() -> Result<()> {
-    let harness = MemoryHarness::new();
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("m-cart");
-    let name = state_name("m-cart")?;
-    let sub = subsystem()?;
-    let tp = topic("orders");
-    let count = mock_count();
-    let key = Key::from("user-map");
-    let state_key = source_state_key(tp, GROUP_A, &key, count)?;
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
-
-    let model: BTreeMap<i64, Value> = [
-        (-2, Value::from(10i64)),
-        (0, Value::from(20i64)),
-        (3, Value::from(30i64)),
-    ]
-    .into_iter()
-    .collect();
-    let entries = model.clone();
-    owner_commit(
-        &harness.cells,
-        &registry,
-        &state_key,
-        descriptor,
-        1,
-        |handle| async move {
-            for (k, v) in entries {
-                handle.set(k, v).await.map_err(|e| eyre!("set: {e}"))?;
-            }
-            Ok(())
-        },
-    )
-    .await?;
-    publish_source(
-        (&harness.publications, &harness.identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp,
-        count,
-        &descriptor,
-    )
-    .await;
-
-    let deps = harness.deps(1 << 20);
-    let reader = StateReader::new(&deps, sub, descriptor)?;
-
-    // Point read.
-    assert_eq!(reader.get(key.clone(), &0).await?, Some(Value::from(20i64)));
-    assert_eq!(reader.get(key.clone(), &1).await?, None);
-
-    // Ordered scan equals the model.
-    let scanned: Vec<(i64, Value)> = reader
-        .stream(key, Direction::Forward)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?;
-    let expected: Vec<(i64, Value)> = model.into_iter().collect();
-    assert_eq!(scanned, expected);
-    Ok(())
-}
-
-/// A Deque's committed elements read back front-to-back equal the owner's
-/// model, via `get(index)`, `len`, and `iter`.
-///
-/// Falsify: read a shifted front-relative index in `DequeHandle::get` — the
-/// element at index 0 diverges from the owner's first push.
-#[tokio::test]
-async fn deque_reader_equals_model() -> Result<()> {
-    let harness = MemoryHarness::new();
-    let descriptor = deque_state::<JsonCodec>("d-log");
-    let name = state_name("d-log")?;
-    let sub = subsystem()?;
-    let tp = topic("orders");
-    let count = mock_count();
-    let key = Key::from("user-dq");
-    let state_key = source_state_key(tp, GROUP_A, &key, count)?;
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
-
-    let model: Vec<Value> = (0i64..5).map(Value::from).collect();
-    let pushes = model.clone();
-    owner_commit(
-        &harness.cells,
-        &registry,
-        &state_key,
-        descriptor,
-        1,
-        |handle| async move {
-            for v in pushes {
-                handle.push_back(v).await.map_err(|e| eyre!("push: {e}"))?;
-            }
-            Ok(())
-        },
-    )
-    .await?;
-    publish_source(
-        (&harness.publications, &harness.identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp,
-        count,
-        &descriptor,
-    )
-    .await;
-
-    let deps = harness.deps(1 << 20);
-    let reader = StateReader::new(&deps, sub, descriptor)?;
-
-    assert_eq!(reader.len(key.clone()).await?, 5);
-    assert_eq!(reader.get(key.clone(), 0).await?, Some(Value::from(0i64)));
-    assert_eq!(reader.get(key.clone(), 4).await?, Some(Value::from(4i64)));
-    assert_eq!(reader.get(key.clone(), 5).await?, None);
-
-    let scanned: Vec<Value> = reader
-        .stream(key, Direction::Forward)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?;
-    assert_eq!(scanned, model);
     Ok(())
 }
 

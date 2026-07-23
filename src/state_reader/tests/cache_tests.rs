@@ -1,4 +1,12 @@
-//! The read-through TTL cache invariants (plan arms a–h).
+//! The read-through TTL cache invariants.
+//!
+//! The staleness rules — stamp-at-issue age, the `age == ttl` miss boundary,
+//! negative caching, `StateName` no-aliasing, and per-ttl freshness windows
+//! over a shared entry — are proven together by [`prop_cache_staleness`] over
+//! random clock/get schedules against a plain `HashMap` model. The focused
+//! examples that survive pin invariants the serial schedule cannot express:
+//! concurrent single-flight, fill-mutates-clock timing, the batch newer-wins
+//! corner, and the byte-budget bound.
 //!
 //! All deterministic over an injected millisecond clock — never a sleep. The
 //! cache is exercised directly (no stores) so each invariant is isolated. Each
@@ -14,6 +22,9 @@ use crate::state_reader::cache::CacheKey;
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
+use futures::executor::block_on;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -33,35 +44,157 @@ fn key(name: &str) -> Result<CacheKey> {
     ))
 }
 
-/// (b) An entry exactly `ttl` old is a MISS (`>=`, not `>`).
-///
-/// Falsify: change `fresh`'s `<` to `<=` — age==ttl serves a stale hit, so the
-/// second fill never fires and `fills == 1`.
-#[tokio::test]
-async fn age_equal_ttl_is_a_miss() -> Result<()> {
-    let (cache, now) = fixed_clock_cache(1 << 20);
-    let k = key("boundary")?;
-    let fills = Arc::new(AtomicUsize::new(0));
-    let fill = || {
-        let fills = fills.clone();
-        async move {
-            fills.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, StateAccessError>(Some(Bytes::from_static(b"v")))
-        }
-    };
+// --- P4: staleness property -------------------------------------------------
 
-    cache.get_cached(k.clone(), 100, fill).await?;
-    assert_eq!(fills.load(Ordering::Relaxed), 1, "cold miss fills once");
+/// The distinct collection names the schedule's key pool spans. They differ
+/// **only** by `StateName` (same source, partition key, cell), so a cache key
+/// that dropped `StateName` would collapse them and alias — the no-alias arm.
+const CACHE_NAMES: [&str; 3] = ["cache-n0", "cache-n1", "cache-n2"];
 
-    now.store(99, Ordering::Relaxed);
-    cache.get_cached(k.clone(), 100, fill).await?;
-    assert_eq!(fills.load(Ordering::Relaxed), 1, "age 99 < ttl is a hit");
+/// The per-get TTL pool the schedule draws from — the degenerate `0` (every
+/// read born stale), the minimum meaningful `1`, mid values, and a large window
+/// that never expires within a bounded schedule (the two-ttl-window arm reuses
+/// one key across these).
+const TTL_POOL: [u64; 5] = [0, 1, 10, 100, 1_000_000];
 
-    now.store(100, Ordering::Relaxed);
-    cache.get_cached(k.clone(), 100, fill).await?;
-    assert_eq!(fills.load(Ordering::Relaxed), 2, "age == ttl is a miss");
-    Ok(())
+/// The clock-advance pool (milliseconds). Sharing magnitudes with [`TTL_POOL`]
+/// makes the `age == ttl` boundary (the strict-`<` miss) recur.
+const ADVANCE_POOL: [u64; 5] = [0, 1, 10, 100, 1000];
+
+/// Upper bound on schedule length.
+const MAX_CACHE_STEPS: usize = 24;
+
+/// One step: advance the injected clock, or issue a cached get for a pooled key
+/// at a pooled TTL, filling `Some`/`None`.
+#[derive(Clone, Copy, Debug)]
+enum CacheStep {
+    /// Advance the clock by `ADVANCE_POOL[idx]` ms.
+    Advance(u8),
+    /// Get pooled key `key` at `TTL_POOL[ttl]`; a fill returns `Some` when
+    /// `present`, else the negative `None`.
+    Get { key: u8, ttl: u8, present: bool },
 }
+
+impl Arbitrary for CacheStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            Self::Advance(u8::arbitrary(g) % ADVANCE_POOL.len() as u8)
+        } else {
+            Self::Get {
+                key: u8::arbitrary(g) % CACHE_NAMES.len() as u8,
+                ttl: u8::arbitrary(g) % TTL_POOL.len() as u8,
+                present: bool::arbitrary(g),
+            }
+        }
+    }
+}
+
+/// A shrinkable schedule of cache steps.
+#[derive(Clone, Debug)]
+struct CacheSchedule {
+    steps: Vec<CacheStep>,
+}
+
+impl Arbitrary for CacheSchedule {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            steps: Vec::<CacheStep>::arbitrary(g)
+                .into_iter()
+                .take(MAX_CACHE_STEPS)
+                .collect(),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.steps.shrink().map(|steps| Self { steps }))
+    }
+}
+
+/// The deterministic fill value for a pooled key: `Some(bytes[idx])` (distinct
+/// per key, so an alias would serve the wrong bytes) or the negative `None`.
+fn fill_value(key: u8, present: bool) -> Option<Bytes> {
+    present.then(|| Bytes::from(vec![key]))
+}
+
+/// (a) stamp-at-issue age, (b) the `age == ttl` miss, (f) negative-entry
+/// refresh, (g) `StateName` no-aliasing, (h) per-ttl freshness windows over a
+/// shared entry — all at once. A plain `HashMap<key, (issued_ms, value)>` model
+/// predicts, for every get, both the served value and whether a fill fired
+/// (`age < ttl` is a hit served from the entry; anything else is a miss that
+/// refills). Asserting the served value AND the running fill count after each
+/// step catches a stale hit (wrong count), an alias (wrong bytes), and a
+/// laundered stamp (wrong count) alike.
+///
+/// FALSIFICATION: change `ReaderCache::fresh`'s `<` to `<=` → an `age == ttl`
+/// step serves a stale hit, so the fill count trails the model. Drop
+/// `StateName` from `CacheKey` → a later get of a different name hits the
+/// first's entry, serving the wrong bytes with no fill.
+#[test]
+fn prop_cache_staleness() {
+    fn property(schedule: CacheSchedule) -> Result<bool> {
+        block_on(run_cache_schedule(schedule))
+    }
+    QuickCheck::new().quickcheck(property as fn(CacheSchedule) -> Result<bool>);
+}
+
+async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
+    let (cache, now) = fixed_clock_cache(1 << 20);
+    let keys: Vec<CacheKey> = CACHE_NAMES
+        .iter()
+        .map(|name| key(name))
+        .collect::<Result<_>>()?;
+    let fills = Arc::new(AtomicUsize::new(0));
+    // key idx -> (issue stamp ms, cached value).
+    let mut model: HashMap<u8, (u64, Option<Bytes>)> = HashMap::new();
+    let mut expected_fills = 0usize;
+
+    for step in schedule.steps {
+        match step {
+            CacheStep::Advance(idx) => {
+                let delta = ADVANCE_POOL[idx as usize];
+                now.store(now.load(Ordering::Relaxed) + delta, Ordering::Relaxed);
+            }
+            CacheStep::Get { key, ttl, present } => {
+                let ttl_ms = TTL_POOL[ttl as usize];
+                let cur = now.load(Ordering::Relaxed);
+                let filled = fill_value(key, present);
+
+                let hit = model
+                    .get(&key)
+                    .is_some_and(|(issued, _)| cur.saturating_sub(*issued) < ttl_ms);
+                let expected_value = if hit {
+                    model[&key].1.clone()
+                } else {
+                    expected_fills += 1;
+                    model.insert(key, (cur, filled.clone()));
+                    filled.clone()
+                };
+
+                let counter = fills.clone();
+                let served = cache
+                    .get_cached(keys[key as usize].clone(), ttl_ms, move || {
+                        let counter = counter.clone();
+                        let filled = filled.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, StateAccessError>(filled)
+                        }
+                    })
+                    .await?;
+
+                if served != expected_value {
+                    return Ok(false);
+                }
+                if fills.load(Ordering::Relaxed) != expected_fills {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+// --- Focused survivors (invariants the serial schedule cannot express) ------
 
 /// (a) Stamp-at-issue: a slow fill enters already-aged, so it cannot launder an
 /// old value into a fresh window for a later reader.
@@ -132,124 +265,6 @@ async fn cold_miss_is_single_flight() -> Result<()> {
     Ok(())
 }
 
-/// (f) A cached negative result (`None`) is served until ttl, then refilled.
-#[tokio::test]
-async fn negative_entry_refreshes_after_ttl() -> Result<()> {
-    let (cache, now) = fixed_clock_cache(1 << 20);
-    let k = key("negative")?;
-    let fills = Arc::new(AtomicUsize::new(0));
-    let fill = || {
-        let fills = fills.clone();
-        async move {
-            fills.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, StateAccessError>(None)
-        }
-    };
-
-    assert_eq!(cache.get_cached(k.clone(), 100, fill).await?, None);
-    now.store(50, Ordering::Relaxed);
-    assert_eq!(cache.get_cached(k.clone(), 100, fill).await?, None);
-    assert_eq!(fills.load(Ordering::Relaxed), 1, "negative hit, no refill");
-
-    now.store(100, Ordering::Relaxed);
-    assert_eq!(cache.get_cached(k.clone(), 100, fill).await?, None);
-    assert_eq!(fills.load(Ordering::Relaxed), 2, "negative entry refreshed");
-    Ok(())
-}
-
-/// (g) Two collections with the same source/key/cell never alias — `StateName`
-/// is in the key.
-///
-/// Falsify: drop `StateName` from `CacheKey` — collection `y` serves `x`'s
-/// value.
-#[tokio::test]
-async fn state_name_prevents_alias() -> Result<()> {
-    let (cache, _now) = fixed_clock_cache(1 << 20);
-    let x = cache
-        .get_cached(key("x")?, 1000, || async {
-            Ok::<_, StateAccessError>(Some(Bytes::from_static(b"x")))
-        })
-        .await?;
-    let y = cache
-        .get_cached(key("y")?, 1000, || async {
-            Ok::<_, StateAccessError>(Some(Bytes::from_static(b"y")))
-        })
-        .await?;
-    assert_eq!(x, Some(Bytes::from_static(b"x")));
-    assert_eq!(y, Some(Bytes::from_static(b"y")), "distinct name, no alias");
-    Ok(())
-}
-
-/// (h) Two descriptors over the SAME collection with different TTLs share
-/// entries but keep distinct freshness windows: the short-TTL reader
-/// revalidates the shared issue stamp and refills where the long-TTL reader
-/// still hits.
-#[tokio::test]
-async fn shared_entry_distinct_freshness_windows() -> Result<()> {
-    let (cache, now) = fixed_clock_cache(1 << 20);
-    let k = key("shared")?;
-    let fills = Arc::new(AtomicUsize::new(0));
-    let fill = || {
-        let fills = fills.clone();
-        async move {
-            fills.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, StateAccessError>(Some(Bytes::from_static(b"v")))
-        }
-    };
-
-    // Long reader (ttl 100) fills at t=0.
-    cache.get_cached(k.clone(), 100, fill).await?;
-    assert_eq!(fills.load(Ordering::Relaxed), 1);
-
-    now.store(50, Ordering::Relaxed);
-    // Long reader still fresh (age 50 < 100) — hit.
-    cache.get_cached(k.clone(), 100, fill).await?;
-    assert_eq!(fills.load(Ordering::Relaxed), 1, "long ttl still fresh");
-    // Short reader (ttl 10) sees age 50 >= 10 — miss, refill.
-    cache.get_cached(k.clone(), 10, fill).await?;
-    assert_eq!(
-        fills.load(Ordering::Relaxed),
-        2,
-        "short ttl expired the shared entry"
-    );
-    Ok(())
-}
-
-/// (d) Declared weight never exceeds the byte budget across a fill trace.
-#[tokio::test]
-async fn declared_weight_bounded_by_budget() -> Result<()> {
-    let budget = 4096u64;
-    let (cache, _now) = fixed_clock_cache(budget);
-    let value = Bytes::from(vec![0u8; 256]);
-    for i in 0..200u32 {
-        let k: CacheKey = (
-            SourceId {
-                group_id: Arc::from("group-aaa"),
-                topic: topic("t"),
-            },
-            StateName::try_new("weighted")?,
-            Key::from("user-1"),
-            CellKey {
-                section: Section::new(0),
-                coordinate: Coordinate::from_bytes(i.to_be_bytes().to_vec()),
-            },
-        );
-        let value = value.clone();
-        cache
-            .get_cached(k, 1_000_000, || {
-                let value = value.clone();
-                async move { Ok::<_, StateAccessError>(Some(value)) }
-            })
-            .await?;
-        assert!(
-            cache.weight() <= budget,
-            "declared weight {} exceeded budget {budget}",
-            cache.weight()
-        );
-    }
-    Ok(())
-}
-
 /// Regression pin: `write_through`'s newer-wins compares `seq` (issue order)
 /// alone, never the lexicographic `(issued_ms, seq)`. A later-issued fill that
 /// read an *earlier* millisecond must still win — the two orders disagree only
@@ -303,5 +318,40 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
         })
         .await?;
     assert_eq!(back, Some(Bytes::from_static(b"v2")), "later seq wins");
+    Ok(())
+}
+
+/// (d) Declared weight never exceeds the byte budget across a fill trace.
+#[tokio::test]
+async fn declared_weight_bounded_by_budget() -> Result<()> {
+    let budget = 4096u64;
+    let (cache, _now) = fixed_clock_cache(budget);
+    let value = Bytes::from(vec![0u8; 256]);
+    for i in 0..200u32 {
+        let k: CacheKey = (
+            SourceId {
+                group_id: Arc::from("group-aaa"),
+                topic: topic("t"),
+            },
+            StateName::try_new("weighted")?,
+            Key::from("user-1"),
+            CellKey {
+                section: Section::new(0),
+                coordinate: Coordinate::from_bytes(i.to_be_bytes().to_vec()),
+            },
+        );
+        let value = value.clone();
+        cache
+            .get_cached(k, 1_000_000, || {
+                let value = value.clone();
+                async move { Ok::<_, StateAccessError>(Some(value)) }
+            })
+            .await?;
+        assert!(
+            cache.weight() <= budget,
+            "declared weight {} exceeded budget {budget}",
+            cache.weight()
+        );
+    }
     Ok(())
 }

@@ -1238,6 +1238,13 @@ impl ScriptedPublicationStore {
         *self.read_fail.lock() = Some(category);
     }
 
+    /// Clears a prior [`fail_reads_with`](Self::fail_reads_with), so subsequent
+    /// `read_publications` succeed again — lets a refresh property toggle a
+    /// routing-read outage on and off across rounds.
+    pub(crate) fn heal_reads(&self) {
+        *self.read_fail.lock() = None;
+    }
+
     /// Waits until at least one upsert has failed — the deterministic signal
     /// that the settle loop has attempted (and been blocked by) publication.
     pub(crate) async fn wait_errored(&self) {
