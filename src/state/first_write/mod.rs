@@ -126,6 +126,12 @@ impl PublicationBackend {
 /// [`BaseConsumer`] per fetch under [`spawn_blocking`]; it only ever runs on a
 /// cold memo entry (the first write per `(collection, topic)`), never on the
 /// steady-state path.
+///
+/// A cheap-clone handle: the `Kafka` arm holds an `Arc<[String]>` and `Memory`
+/// a `Copy` count, so cloning the
+/// [`SharedDeps`](crate::state_reader::SharedDeps) bundle that carries one
+/// clones no resources.
+#[derive(Clone)]
 pub(crate) enum PartitionCounts {
     /// Fetch the count from a Kafka broker.
     Kafka {

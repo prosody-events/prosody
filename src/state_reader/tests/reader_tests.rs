@@ -29,6 +29,7 @@ use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor::block_on;
 use serde_json::Value;
+use std::time::Duration;
 
 /// The reader observes exactly the committed Value the owner wrote, over an
 /// arbitrary overwrite trace — the memory instantiation of
@@ -244,6 +245,8 @@ async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
         payload.clone(),
     );
     let deps = SharedDeps::<JsonCodec>::memory(
+        "reader-test".to_owned(),
+        Duration::from_secs(30),
         harness.cells.clone(),
         harness.publications.clone(),
         harness.identities.clone(),

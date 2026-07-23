@@ -98,6 +98,10 @@ pub struct StateReader<D, C: Codec> {
     clock: ReaderClock,
     refresh_interval_ms: u64,
     snapshot: Mutex<SnapshotState>,
+    /// The source bundle's construction id, copied verbatim so a test can prove
+    /// two readers descend from the same [`SharedDeps`] construction.
+    #[cfg(test)]
+    deps_instance_id: u64,
 }
 
 impl<D, C> StateReader<D, C>
@@ -156,6 +160,8 @@ where
                 mismatch: None,
                 refreshed_at_ms: 0,
             }),
+            #[cfg(test)]
+            deps_instance_id: deps.instance_id(),
         })
     }
 
@@ -605,5 +611,10 @@ where
         refresh_interval_ms: u64,
     ) -> Result<Self, StateReaderError> {
         Self::with_refresh_interval(deps, subsystem, descriptor, refresh_interval_ms)
+    }
+
+    /// The source bundle's construction id (see [`SharedDeps::instance_id`]).
+    pub(crate) fn deps_instance_id(&self) -> u64 {
+        self.deps_instance_id
     }
 }

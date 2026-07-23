@@ -23,8 +23,9 @@ mod source;
 mod stores;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
+pub(crate) use deps::DEFAULT_READER_CACHE_SIZE_BYTES;
 pub use deps::SharedDeps;
 pub use error::StateReaderError;
 pub use loader::{ReaderLoader, ReaderLoaderError};

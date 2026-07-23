@@ -19,18 +19,26 @@ use crate::consumer::{
 };
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
+    TriggerStoreConfiguration,
 };
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
+use crate::loader::MemoryLoader;
 use crate::producer::{
     ProducerConfiguration, ProducerConfigurationBuilder, ProducerConfigurationBuilderError,
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
 use crate::state::descriptor::{Registered, StateDescriptor};
+use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
+use crate::state_reader::{
+    DEFAULT_READER_CACHE_SIZE_BYTES, SharedDeps, StateReader, StateReaderError,
+};
+use crate::subsystem::SubsystemName;
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
 use crate::{Codec, JsonCodec, Topic};
+use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use std::time::Duration;
@@ -75,7 +83,8 @@ pub struct ConsumerBuilders {
 }
 
 /// A combined client that manages both producer and consumer operations.
-#[derive(Debug)]
+#[derive(Educe)]
+#[educe(Debug)]
 pub struct HighLevelClient<T, C: Codec = JsonCodec>
 where
     C::Payload: crate::EventIdentity,
@@ -85,6 +94,15 @@ where
     consumer: Mutex<ConsumerState<T, C>>,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
+    /// The one shared infrastructure bundle this client owns for its whole
+    /// lifecycle. Built lazily at the first point of need ([`Self::state`]
+    /// while `Configured`, or [`Self::subscribe`]), retained across
+    /// `Configured→Running`, and handed to the consumer it starts, so no state
+    /// transition constructs a second session/loader/memory store.
+    ///
+    /// Lock order: acquire `consumer` before `deps`, always.
+    #[educe(Debug(ignore))]
+    deps: Mutex<Option<SharedDeps<C>>>,
 }
 
 impl<T, C: Codec> HighLevelClient<T, C>
@@ -191,6 +209,7 @@ where
             consumer,
             propagator: new_propagator(),
             telemetry,
+            deps: Mutex::new(None),
         })
     }
 
@@ -240,6 +259,106 @@ where
         }
     }
 
+    /// The client's retained shared bundle, if one has been built. The test
+    /// hook the composition suite uses to seed committed state into the exact
+    /// stores the running consumer and the client's readers share.
+    #[cfg(test)]
+    pub(crate) async fn retained_deps(&self) -> Option<SharedDeps<C>> {
+        self.deps.lock().await.clone()
+    }
+
+    /// Returns the client's one shared infrastructure bundle, building it from
+    /// `mode` on first call and retaining it for the client's lifetime.
+    ///
+    /// The caller must already hold the `consumer` lock (this locks `deps`
+    /// under it — the invariant lock order). A second call clones the retained
+    /// handle; it never constructs a second session/loader/memory store.
+    async fn shared_deps(
+        &self,
+        mode: &ModeConfiguration,
+    ) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>
+    where
+        C::Payload: Clone,
+    {
+        let mut guard = self.deps.lock().await;
+        if let Some(deps) = guard.as_ref() {
+            return Ok(deps.clone());
+        }
+        let (consumer, keyed_state, trigger_store) = match mode {
+            ModeConfiguration::Pipeline {
+                consumer,
+                common,
+                trigger_store,
+                ..
+            }
+            | ModeConfiguration::LowLatency {
+                consumer,
+                common,
+                trigger_store,
+                ..
+            }
+            | ModeConfiguration::BestEffort {
+                consumer,
+                common,
+                trigger_store,
+            } => (consumer, &common.keyed_state, trigger_store),
+        };
+        // One knob: the reader cache follows `read_cache_size_bytes`, then
+        // `cache_size_bytes`, then the built-in default.
+        let budget = keyed_state
+            .read_cache_size_bytes
+            .or(keyed_state.cache_size_bytes)
+            .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES);
+        let deps = match trigger_store {
+            TriggerStoreConfiguration::InMemory => SharedDeps::memory(
+                consumer.group_id.clone(),
+                consumer.stall_threshold,
+                MemoryCells::new(),
+                MemoryPublicationStore::new(),
+                MemoryDescriptorIdentityStore::new(),
+                MemoryLoader::new(),
+                budget.get(),
+            ),
+            TriggerStoreConfiguration::Cassandra(cassandra) => {
+                SharedDeps::connect(consumer, cassandra, budget).await?
+            }
+        };
+        *guard = Some(deps.clone());
+        Ok(deps)
+    }
+
+    /// Composes a standalone [`StateReader`] over this client's one shared
+    /// bundle, for `descriptor` routed under `subsystem`.
+    ///
+    /// Valid once the consumer is `Configured` or `Running` — both draw from
+    /// the same retained bundle, so a reader minted before `subscribe` and one
+    /// minted after share one session/loader/memory store.
+    ///
+    /// # Errors
+    ///
+    /// [`HighLevelClientError::UnconfiguredConsumer`] if the client has no
+    /// consumer configuration; [`HighLevelClientError::StateReader`] if the
+    /// bundle cannot connect or the descriptor is rejected.
+    pub async fn state<D>(
+        &self,
+        subsystem: SubsystemName,
+        descriptor: D,
+    ) -> Result<StateReader<D, C>, HighLevelClientError<C::Error>>
+    where
+        D: StateDescriptor,
+        C::Payload: Clone,
+    {
+        let guard = self.consumer.lock().await;
+        let mode = match &*guard {
+            ConsumerState::Configured(config) | ConsumerState::Running { config, .. } => config,
+            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
+                return Err(HighLevelClientError::UnconfiguredConsumer);
+            }
+        };
+        let deps = self.shared_deps(mode).await?;
+        StateReader::new(&deps, subsystem, descriptor).map_err(HighLevelClientError::StateReader)
+    }
+
     /// Subscribes the consumer with the provided handler.
     ///
     /// # Errors
@@ -254,6 +373,16 @@ where
         C::Payload: crate::EventType + Clone,
     {
         let mut guard = self.consumer.lock().await;
+
+        // Build (or reuse) the one shared bundle while the config is still
+        // available — before `take` — so the running consumer and any reader
+        // share it. Only `Configured` has a config to build from; other states
+        // fall through to their existing errors below.
+        let deps = match &*guard {
+            ConsumerState::Configured(config) => Some(self.shared_deps(config).await?),
+            _ => None,
+        };
+
         let consumer_ref = &mut *guard;
 
         let config = match take(consumer_ref) {
@@ -289,6 +418,7 @@ where
                     common,
                     self.telemetry.clone(),
                     handler.clone(),
+                    deps,
                 )
                 .await?
             }
@@ -310,6 +440,7 @@ where
                     self.producer.clone(),
                     self.telemetry.clone(),
                     handler.clone(),
+                    deps,
                 )
                 .await?
             }
@@ -324,6 +455,7 @@ where
                     common,
                     self.telemetry.clone(),
                     handler.clone(),
+                    deps,
                 )
                 .await?
             }
@@ -491,4 +623,9 @@ pub enum HighLevelClientError<E> {
     /// Error when the telemetry emitter cannot be started.
     #[error("failed to start telemetry emitter: {0:#}")]
     TelemetryEmitter(#[from] EmitterError),
+
+    /// Error building or using a standalone state reader from the shared bundle
+    /// (a connect failure, or a descriptor the reader rejects).
+    #[error("state reader failed: {0:#}")]
+    StateReader(#[from] StateReaderError),
 }

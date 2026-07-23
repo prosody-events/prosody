@@ -154,7 +154,7 @@ use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
 use crate::consumer::probes::ProbeServer;
-use crate::consumer::storage::StorePair;
+use crate::consumer::storage::{SharedStorage, StorePair};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader};
@@ -174,7 +174,7 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::{CollectionDefRegistry, RegisterStateError};
 use crate::state::session::CellWrite;
-use crate::state_reader::PartitionCount;
+use crate::state_reader::{PartitionCount, SharedDeps};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
@@ -936,11 +936,20 @@ fn validate_recovery_ttl_margin(
 /// canonical `consumer_config.validate()` in [`initialize_consumer`] remains
 /// the single invariant chokepoint; this early validation is the fail-fast
 /// guard.
-async fn build_shared_state(
+async fn build_shared_state<C: Codec>(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
     common_config: &CommonConfiguration,
-) -> Result<(StorePair, KeyedStateInputs, HeartbeatRegistry), ConsumerError> {
+    deps: Option<&SharedDeps<C>>,
+) -> Result<
+    (
+        StorePair,
+        KeyedStateInputs,
+        HeartbeatRegistry,
+        Option<SharedStorage>,
+    ),
+    ConsumerError,
+> {
     consumer_config.validate()?;
     // Clone (never drain) the registered keyed-state config: callers pass
     // `common_config` by reference and retain the intact configuration, so a
@@ -958,10 +967,20 @@ async fn build_shared_state(
         validate_recovery_ttl_margin(dedup_config.ttl, keyed_state_config.recovery_delay)
             .map_err(KeyedStateInitError::from)?;
     }
-    let heartbeats = HeartbeatRegistry::new(
-        consumer_config.group_id.clone(),
-        consumer_config.stall_threshold,
-    );
+    // Reuse the bundle's already-constructed storage when one is supplied, so
+    // no second session/publication store is built on the Configured→Running
+    // transition.
+    let shared = deps.map(SharedDeps::shared_storage);
+    // The bundle's registry when supplied (so the consumer's stall probe covers
+    // the shared loader's poll-loop heartbeat); a fresh one is minted ONLY on
+    // the no-bundle path.
+    let heartbeats = match deps {
+        Some(deps) => deps.heartbeats().clone(),
+        None => HeartbeatRegistry::new(
+            consumer_config.group_id.clone(),
+            consumer_config.stall_threshold,
+        ),
+    };
     // Create both stores atomically — ensures trigger and defer stores match.
     let stores = StorePair::new(
         trigger_store_config,
@@ -969,30 +988,40 @@ async fn build_shared_state(
         dedup_config.ttl,
         dedup_config.cache_capacity,
         consumer_config.timer_spans,
+        shared.as_ref(),
     )
     .await?;
     let keyed_state =
         KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
-    Ok((stores, keyed_state, heartbeats))
+    Ok((stores, keyed_state, heartbeats, shared))
 }
 
 /// Builds the storage pair, keyed-state inputs, and shared middleware stack
 /// for [`ProsodyConsumer::pipeline_consumer`], enforcing the keyed-state
 /// deduplication gate.
-async fn prepare_pipeline_stack(
+async fn prepare_pipeline_stack<C: Codec>(
     consumer_config: &ConsumerConfiguration,
     trigger_store_config: &TriggerStoreConfiguration,
     pipeline_config: PipelineMiddlewareConfiguration,
     common_config: &CommonConfiguration,
     telemetry: Telemetry,
-) -> Result<(StorePair, KeyedStateInputs, PipelineMiddlewareStack), ConsumerError> {
+    deps: Option<&SharedDeps<C>>,
+) -> Result<
+    (
+        StorePair,
+        KeyedStateInputs,
+        PipelineMiddlewareStack,
+        Option<SharedStorage>,
+    ),
+    ConsumerError,
+> {
     let PipelineMiddlewareConfiguration {
         retry: retry_config,
         monopolization: monopolization_config,
         defer: defer_config,
     } = pipeline_config;
-    let (stores, keyed_state, heartbeats) =
-        build_shared_state(consumer_config, trigger_store_config, common_config).await?;
+    let (stores, keyed_state, heartbeats, shared) =
+        build_shared_state(consumer_config, trigger_store_config, common_config, deps).await?;
     let monopolization_middleware =
         MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
     let failure_tracker = FailureTracker::new(
@@ -1013,7 +1042,7 @@ async fn prepare_pipeline_stack(
         telemetry,
     };
 
-    Ok((stores, keyed_state, stack))
+    Ok((stores, keyed_state, stack, shared))
 }
 
 /// The concrete common-block composition `build_common_middleware` returns
@@ -1086,6 +1115,8 @@ where
 fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,
+    cells: MemoryCells,
+    identities: MemoryDescriptorIdentityStore,
     loader: MemoryLoader<C::Payload>,
     publisher_template: Option<PublisherTemplate>,
 ) -> StateManagerProvider<
@@ -1095,14 +1126,90 @@ fn memory_state_provider<C: Codec>(
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
+    // `cells`/`identities` come from the shared bundle when one is supplied, so
+    // a reader minted from the same bundle observes this consumer's committed
+    // writes (mock read-your-writes); a no-bundle consumer passes fresh stores.
     let backend = MemoryStateBackendFactory::new(
-        MemoryCells::new(),
-        MemoryDescriptorIdentityStore::new(),
+        cells,
+        identities,
         keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
     );
     keyed_state.provider(backend, loader, publisher_template)
+}
+
+/// The memory cell + identity stores that back the state provider: the shared
+/// bundle's instances when one was supplied (so a reader minted from the same
+/// bundle reads-your-writes), otherwise fresh stores. An incoherent
+/// Cassandra-bundle-on-a-memory-arm (unreachable — the composition derives both
+/// from one config) falls through to fresh.
+fn shared_memory_handles(
+    shared: Option<SharedStorage>,
+) -> (MemoryCells, MemoryDescriptorIdentityStore) {
+    match shared {
+        Some(SharedStorage::Memory {
+            cells, identities, ..
+        }) => (cells, identities),
+        _ => (MemoryCells::new(), MemoryDescriptorIdentityStore::new()),
+    }
+}
+
+/// The memory-arm inputs a consumer resolves from an optional shared bundle:
+/// `(loader, cells, identities, partition_counts)` — the bundle's when one is
+/// supplied (so a reader minted from the same bundle reads-your-writes),
+/// otherwise fresh mock defaults.
+type MemoryArmInputs<P> = (
+    MemoryLoader<P>,
+    MemoryCells,
+    MemoryDescriptorIdentityStore,
+    PartitionCounts,
+);
+
+fn memory_arm_inputs<C: Codec>(
+    deps: Option<&SharedDeps<C>>,
+    shared: Option<SharedStorage>,
+) -> MemoryArmInputs<C::Payload>
+where
+    C::Payload: Clone,
+{
+    let loader = deps.and_then(SharedDeps::memory_loader).unwrap_or_default();
+    let (cells, identities) = shared_memory_handles(shared);
+    let partition_counts = deps.map_or_else(
+        || PartitionCounts::Memory(PartitionCount::MOCK),
+        SharedDeps::partition_counts,
+    );
+    (loader, cells, identities, partition_counts)
+}
+
+/// The Cassandra-arm inputs a consumer resolves from an optional shared bundle:
+/// the Kafka loader (the bundle's `Clone` shares the client and poll thread,
+/// else a freshly built one) and the partition-count source. A memory bundle
+/// handed to a Cassandra arm is an incoherent-backend bug — unreachable by
+/// construction — surfaced as [`ConsumerError::SharedDepsBackendMismatch`]
+/// rather than an unwrap.
+fn cassandra_arm_inputs<C: Codec>(
+    deps: Option<&SharedDeps<C>>,
+    consumer_config: &ConsumerConfiguration,
+    heartbeats: &HeartbeatRegistry,
+) -> Result<(KafkaLoader<C>, PartitionCounts), ConsumerError>
+where
+    C::Payload: Clone,
+{
+    let loader = match deps {
+        Some(deps) => deps
+            .kafka_loader()
+            .ok_or(ConsumerError::SharedDepsBackendMismatch)?,
+        None => KafkaLoader::<C>::for_consumer(consumer_config, heartbeats)
+            .map_err(|error| ConsumerError::from(DeferInitError::from(error)))?,
+    };
+    let partition_counts = deps.map_or_else(
+        || PartitionCounts::Kafka {
+            bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
+        },
+        SharedDeps::partition_counts,
+    );
+    Ok((loader, partition_counts))
 }
 
 /// Builds the keyed-state provider for a [`StorePair::Cassandra`] arm: opens
@@ -1337,6 +1444,8 @@ where
             Duration::default(),
             NonZeroUsize::MIN,
             consumer_config.timer_spans,
+            // The low-level constructor shares no infrastructure bundle.
+            None,
         )
         .await?;
         let keyed_state = KeyedStateInputs::new(
@@ -1354,6 +1463,8 @@ where
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider,
+                    MemoryCells::new(),
+                    MemoryDescriptorIdentityStore::new(),
                     MemoryLoader::<C::Payload>::new(),
                     // The low-level constructor rejects registrations, so
                     // nothing is ever published: no publisher, no reconcile.
@@ -1384,6 +1495,8 @@ where
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     MemoryDeduplicationStoreProvider::new(),
+                    MemoryCells::new(),
+                    MemoryDescriptorIdentityStore::new(),
                     MemoryLoader::<C::Payload>::new(),
                     // Stateless: registrations are rejected, nothing publishes.
                     None,
@@ -1419,17 +1532,19 @@ where
         common_config: &CommonConfiguration,
         telemetry: Telemetry,
         handler: T,
+        deps: Option<SharedDeps<C>>,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone,
     {
-        let (stores, keyed_state, stack) = prepare_pipeline_stack(
+        let (stores, keyed_state, stack, shared) = prepare_pipeline_stack(
             consumer_config,
             trigger_store_config,
             pipeline_config,
             common_config,
             telemetry,
+            deps.as_ref(),
         )
         .await?;
 
@@ -1441,19 +1556,20 @@ where
                 dedup_provider,
                 publication_store,
             } => {
-                // Memory backend is also the mock-mode path, which must not
-                // touch Kafka — pair it with an in-memory loader, shared by
-                // message defer and the keyed-state Kafka-message handles.
-                let loader = MemoryLoader::<C::Payload>::new();
+                // Memory/mock arm inputs come from the bundle when supplied, else fresh.
+                let (loader, cells, identities, partition_counts) =
+                    memory_arm_inputs(deps.as_ref(), shared);
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
-                        PartitionCounts::Memory(PartitionCount::MOCK),
+                        partition_counts,
                     )
                     .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
+                    cells,
+                    identities,
                     loader.clone(),
                     publisher_template,
                 );
@@ -1484,20 +1600,15 @@ where
                 identity_store,
                 publication_store,
             } => {
-                // One Kafka loader per consumer: built once here and shared by
-                // cloning. A clone shares the channel, semaphore, cache, and the
-                // single background poll thread — so the message-defer middleware
-                // and the keyed-state provider resolve through the same loader,
-                // never two `BaseConsumer`s.
-                let loader =
-                    KafkaLoader::<C>::for_consumer(&stack.consumer_config, &stack.heartbeats)
-                        .map_err(DeferInitError::from)?;
+                // One Kafka loader per consumer (a clone shares the client and
+                // poll thread), from the bundle when supplied — see
+                // `cassandra_arm_inputs`.
+                let (loader, partition_counts) =
+                    cassandra_arm_inputs(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Cassandra(publication_store),
-                        PartitionCounts::Kafka {
-                            bootstrap: Arc::from(stack.consumer_config.bootstrap_servers.clone()),
-                        },
+                        partition_counts,
                     )
                     .await?;
                 let state_provider = cassandra_state_provider::<C>(
@@ -1550,27 +1661,25 @@ where
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        deps: Option<SharedDeps<C>>,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let LowLatencyMiddlewareConfiguration {
-            retry: retry_config,
-            failure_topic: topic_config,
-        } = low_latency_config;
-        let (stores, keyed_state, heartbeats) =
-            build_shared_state(consumer_config, trigger_store_config, common_config).await?;
+        let topic_config = low_latency_config.failure_topic;
+        let (stores, keyed_state, heartbeats, shared) = build_shared_state(
+            consumer_config,
+            trigger_store_config,
+            common_config,
+            deps.as_ref(),
+        )
+        .await?;
         let version = keyed_state.version.clone();
-        let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let retry_middleware = RetryMiddleware::new(low_latency_config.retry)?;
         let topic_middleware =
             FailureTopicMiddleware::new(topic_config, consumer_config.group_id.clone(), producer)?;
-
-        // dedup lives inside the common block; the failure-topic/retry chain
-        // layers OUTSIDE it, so a routed failure (which the topic middleware
-        // swallows) is never recorded as a commit. The keyed-state durability
-        // sequence runs after the stack returns, in the `settle` boundary.
-        // Built per storage arm because the dedup store lives there.
+        // dedup is inside the common block; failure-topic/retry layer OUTSIDE it.
         match stores {
             StorePair::Memory {
                 trigger_provider,
@@ -1578,16 +1687,20 @@ where
                 publication_store,
                 ..
             } => {
+                let (loader, cells, identities, partition_counts) =
+                    memory_arm_inputs(deps.as_ref(), shared);
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
-                        PartitionCounts::Memory(PartitionCount::MOCK),
+                        partition_counts,
                     )
                     .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
-                    MemoryLoader::new(),
+                    cells,
+                    identities,
+                    loader,
                     publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
@@ -1618,14 +1731,12 @@ where
                 publication_store,
                 ..
             } => {
-                let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
-                    .map_err(DeferInitError::from)?;
+                let (loader, partition_counts) =
+                    cassandra_arm_inputs(deps.as_ref(), consumer_config, &heartbeats)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Cassandra(publication_store),
-                        PartitionCounts::Kafka {
-                            bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
-                        },
+                        partition_counts,
                     )
                     .await?;
                 let state_provider = cassandra_state_provider::<C>(
@@ -1672,13 +1783,19 @@ where
         common_config: &CommonConfiguration,
         telemetry: Telemetry,
         handler: T,
+        deps: Option<SharedDeps<C>>,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats) =
-            build_shared_state(consumer_config, trigger_store_config, common_config).await?;
+        let (stores, keyed_state, heartbeats, shared) = build_shared_state(
+            consumer_config,
+            trigger_store_config,
+            common_config,
+            deps.as_ref(),
+        )
+        .await?;
         let version = keyed_state.version.clone();
 
         // dedup lives inside the common block; `log` (which swallows failures)
@@ -1692,16 +1809,20 @@ where
                 publication_store,
                 ..
             } => {
+                let (loader, cells, identities, partition_counts) =
+                    memory_arm_inputs(deps.as_ref(), shared);
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
-                        PartitionCounts::Memory(PartitionCount::MOCK),
+                        partition_counts,
                     )
                     .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
-                    MemoryLoader::new(),
+                    cells,
+                    identities,
+                    loader,
                     publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
@@ -1730,14 +1851,12 @@ where
                 publication_store,
                 ..
             } => {
-                let loader = KafkaLoader::<C>::for_consumer(consumer_config, &heartbeats)
-                    .map_err(DeferInitError::from)?;
+                let (loader, partition_counts) =
+                    cassandra_arm_inputs(deps.as_ref(), consumer_config, &heartbeats)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Cassandra(publication_store),
-                        PartitionCounts::Kafka {
-                            bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
-                        },
+                        partition_counts,
                     )
                     .await?;
                 let state_provider = cassandra_state_provider::<C>(
@@ -1932,6 +2051,13 @@ pub enum ConsumerError {
     /// Indicates a keyed-state initialization failure.
     #[error("Keyed-state initialization failed: {0:#}")]
     KeyedState(#[from] KeyedStateInitError),
+
+    /// The supplied [`SharedDeps`] bundle's backend does not match the
+    /// consumer's storage backend (e.g. a memory bundle for a Cassandra
+    /// consumer). Unreachable when the bundle and the consumer are composed
+    /// from one configuration.
+    #[error("shared dependency bundle backend does not match the consumer's storage backend")]
+    SharedDepsBackendMismatch,
 }
 
 /// Errors raised while wiring the keyed-state layer into a pipeline

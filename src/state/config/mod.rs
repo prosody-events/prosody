@@ -20,6 +20,10 @@ const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 /// Environment variable for the in-memory keyed-state cache capacity, in bytes.
 const STATE_CACHE_SIZE_ENV: &str = "PROSODY_STATE_CACHE_SIZE_BYTES";
 
+/// Environment variable for the reader-side read-through cache capacity, in
+/// bytes.
+const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE_BYTES";
+
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_STATE_RECOVERY_DELAY";
 
@@ -89,6 +93,20 @@ pub struct KeyedStateConfiguration {
     #[builder(default = "from_option_env(STATE_CACHE_SIZE_ENV)?")]
     pub cache_size_bytes: Option<NonZeroU64>,
 
+    /// Byte budget for the reader-side read-through cache the high-level client
+    /// sizes when it composes standalone readers.
+    ///
+    /// `None` (the default) follows
+    /// [`cache_size_bytes`](Self::cache_size_bytes), then a built-in
+    /// default — one knob unless overridden. Only the composing client
+    /// reads it; a consumer never opens a reader cache.
+    ///
+    /// Environment variable: `PROSODY_STATE_READ_CACHE_SIZE_BYTES` (a positive
+    /// integer count of bytes; `0`, negative, non-numeric, and
+    /// out-of-`u64`-range values are rejected at build).
+    #[builder(default = "from_option_env(STATE_READ_CACHE_SIZE_ENV)?")]
+    pub read_cache_size_bytes: Option<NonZeroU64>,
+
     /// Subsystem this consumer publishes keyed state under. Required whenever
     /// any registered collection is `.published(true)` — a published collection
     /// with no subsystem is rejected at build
@@ -109,6 +127,7 @@ impl Default for KeyedStateConfiguration {
             recovery_delay: recovery_delay_from_env()
                 .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
             cache_size_bytes: from_option_env(STATE_CACHE_SIZE_ENV).unwrap_or_default(),
+            read_cache_size_bytes: from_option_env(STATE_READ_CACHE_SIZE_ENV).unwrap_or_default(),
             subsystem: None,
             registrations: Vec::new(),
         }

@@ -1,19 +1,27 @@
 use super::*;
+use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::storage::SharedStorage;
 use crate::consumer::{ConsumerConfiguration, DemandType};
 use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
+use crate::state::registry::CollectionDef;
+use crate::state_reader::tests::support::{
+    mock_count, owner_commit, publish_source, registry_of, source_state_key, state_name, topic,
+};
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use color_eyre::Result;
+use color_eyre::eyre::{bail, ensure, eyre};
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::convert::Infallible;
 /// Owns the helper-produced mock cluster alongside the producer so the
 /// cluster's Drop runs when the test ends (no `mem::forget` leaks).
@@ -336,5 +344,144 @@ fn registrations_survive_resubscribe_cycle() -> Result<()> {
         fixture.client.subscribe(NoOpHandler).await?;
         fixture.client.unsubscribe().await?;
         Result::<()>::Ok(())
+    })
+}
+
+/// Builds a `SubsystemName`, surfacing the (non-`eyre`) name error.
+fn subsystem(name: &str) -> Result<SubsystemName> {
+    SubsystemName::try_new(name).map_err(|error| eyre!("subsystem name: {error}"))
+}
+
+/// `state()` before and after `subscribe` draw from ONE retained bundle: the
+/// reader minted while `Configured` and the reader minted while `Running` carry
+/// the same `SharedDeps` construction id, proving the client builds the bundle
+/// once and reuses it across the state transition (and hands that same bundle
+/// to the consumer it starts).
+#[test]
+fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
+    let fixture = create_test_client::<NoOpHandler>("share-one-bundle", None)?;
+    TEST_RUNTIME.block_on(async {
+        // Configured: builds and retains the bundle.
+        let before = fixture
+            .client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await?;
+        let id_before = before.deps_instance_id();
+
+        fixture.client.subscribe(NoOpHandler).await?;
+
+        // Running: must reuse the retained bundle, not build a second one.
+        let after = fixture
+            .client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await;
+
+        // Shut the consumer down before asserting: a failed assertion must not
+        // leave rdkafka client threads alive and hang the test binary.
+        fixture.client.unsubscribe().await?;
+        let id_after = after?.deps_instance_id();
+        assert_eq!(
+            id_before, id_after,
+            "state() before and after subscribe must share one bundle"
+        );
+        Result::<()>::Ok(())
+    })
+}
+
+/// The owning group whose committed `cart` the reader admits.
+const GROUP: &str = "group-aaa";
+
+/// A reader minted from the client observes committed state present in the
+/// client's ONE retained `SharedDeps` bundle — the same in-memory cell store
+/// the running consumer holds — proving `client.state()` composes readers over
+/// the consumer's shared stores rather than a second set.
+///
+/// A faithful end-to-end variant would drive the write through a produced Kafka
+/// record; the in-process mock cluster delivers no records (nor serves admin
+/// topic creation), so the committed write is seeded directly into the retained
+/// bundle's shared stores through the real owner `KeyedStateSession`
+/// (finalize then promote) — the reader suite's seeding — and read back through
+/// a reader the client composes. Falsify by breaking the bundle memoization (a
+/// fresh bundle per `state()`): the reader then reads empty stores and the
+/// assert goes red.
+#[test]
+fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
+    let fixture = create_test_client::<NoOpHandler>("shared-bundle-ryow", None)?;
+    TEST_RUNTIME.block_on(async {
+        // Start the consumer so the retained bundle is the one it holds.
+        fixture.client.subscribe(NoOpHandler).await?;
+
+        // Collect the scenario into a Result so shutdown runs on every path.
+        let outcome: Result<()> = async {
+            // The bundle the running consumer and the client's readers share.
+            let deps = fixture
+                .client
+                .retained_deps()
+                .await
+                .ok_or_else(|| eyre!("client retained no shared bundle after subscribe"))?;
+            let SharedStorage::Memory {
+                cells,
+                publications,
+                identities,
+            } = deps.shared_storage()
+            else {
+                bail!("mock client must build a memory bundle");
+            };
+
+            // Seed a committed `cart` value plus its published routing row and
+            // frozen identity into the shared stores — as the owning consumer
+            // would on a committed write.
+            let descriptor = value_state::<JsonCodec>("cart");
+            let sub = subsystem("carts")?;
+            let name = state_name("cart")?;
+            let orders = topic("orders");
+            let count = mock_count();
+            let key = Key::from("user-1");
+            let registry = registry_of(&descriptor, CollectionDef::new(None))?;
+            let state_key = source_state_key(orders, GROUP, &key, count)?;
+            publish_source(
+                (&publications, &identities),
+                &sub,
+                &name,
+                GROUP,
+                orders,
+                count,
+                &descriptor,
+            )
+            .await;
+            owner_commit(
+                &cells,
+                &registry,
+                &state_key,
+                descriptor,
+                1,
+                |handle| async move {
+                    handle
+                        .set(json!(["apple"]))
+                        .await
+                        .map_err(|e| eyre!("set: {e}"))?;
+                    Ok(())
+                },
+            )
+            .await?;
+
+            // A reader composed from the client reads the committed value from
+            // the shared cells.
+            let reader = fixture
+                .client
+                .state(sub.clone(), value_state::<JsonCodec>("cart"))
+                .await?;
+            let observed = reader.get("user-1").await?;
+            ensure!(
+                observed == Some(json!(["apple"])),
+                "client reader must observe the committed write in the shared bundle, got \
+                 {observed:?}"
+            );
+            Ok(())
+        }
+        .await;
+
+        fixture.client.unsubscribe().await?;
+        outcome
     })
 }

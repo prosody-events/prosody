@@ -35,14 +35,10 @@ use prosody::consumer::{
     MessageDescriptor, PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
-use prosody::heartbeat::HeartbeatRegistry;
 use prosody::loader::KafkaLoader;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::state::StateName;
-use prosody::state::cassandra::{
-    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
-    CellQueries, IdentityQueries, PublicationQueries,
-};
+use prosody::state::cassandra::{CassandraPublicationStore, PublicationQueries};
 use prosody::state::descriptor::{
     CellStateError, Registered, StateDescriptor, ValueDescriptor, value_state,
 };
@@ -59,6 +55,7 @@ use prosody::{
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
 };
 use serde_json::{Value, json};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -355,6 +352,7 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
         &common_config,
         telemetry,
         handler,
+        None,
     )
     .await?;
 
@@ -500,6 +498,7 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
         &common_config,
         telemetry,
         handler,
+        None,
     )
     .await?;
 
@@ -528,31 +527,22 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
 
 /// Reads the published `cart` value back through a standalone Cassandra-backed
 /// [`StateReader`] — exercising the full production read wiring end-to-end:
-/// [`SharedDeps::cassandra`], publication-source discovery, frozen-identity
+/// `SharedDeps::connect`, publication-source discovery, frozen-identity
 /// validation against the reader's descriptor, probe-and-pin, and the committed
-/// projection (`CassandraCellResources::read_committed`). The read is expected
-/// to observe exactly the value the pipeline consumer committed.
+/// projection. The read is expected to observe exactly the value the pipeline
+/// consumer committed.
 async fn read_cart_via_standalone_reader(
     subsystem: &SubsystemName,
     consumer_config: &ConsumerConfiguration,
     key: &str,
 ) -> Result<()> {
-    let store = CassandraStore::new(&common::test_cassandra_config()).await?;
-    let cell_queries = Arc::new(CellQueries::new(store.session(), common::TEST_KEYSPACE).await?);
-    let cells = CassandraCellResources::new(store.clone(), cell_queries);
-    let identity_queries =
-        Arc::new(IdentityQueries::new(store.session(), common::TEST_KEYSPACE).await?);
-    let identities = CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
-    let publication_queries =
-        Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
-    let publications = CassandraPublicationStore::new(store.clone(), publication_queries);
-
-    // The reader's message loader is required by the Cassandra bundle but never
-    // consulted for a plain Value; a Kafka-ref collection would exercise it.
-    let heartbeats = HeartbeatRegistry::new("reader-loader".to_owned(), Duration::from_mins(1));
-    let loader = KafkaLoader::<JsonCodec>::for_consumer(consumer_config, &heartbeats)?;
-
-    let deps = SharedDeps::<JsonCodec>::cassandra(cells, publications, identities, loader, 1 << 20);
+    // One `connect` opens the session, prepares the reader's queries, and
+    // builds the Kafka loader (required by the Cassandra bundle but never
+    // consulted for a plain Value; a Kafka-ref collection would exercise it).
+    let budget = NonZeroU64::new(1_048_576_u64).ok_or_else(|| eyre!("nonzero budget"))?;
+    let deps =
+        SharedDeps::<JsonCodec>::connect(consumer_config, &common::test_cassandra_config(), budget)
+            .await?;
     let reader = StateReader::new(&deps, subsystem.clone(), cart())?;
 
     let value = reader.get(key).await?;

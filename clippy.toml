@@ -1,0 +1,9 @@
+# The three high-level consumer constructors are the crate's largest by design:
+# each takes config references, a mode-specific middleware config, the producer
+# (low-latency), telemetry, the handler, and the optional shared-infrastructure
+# `SharedDeps` bundle, and inlines two full storage-backend arms (memory and
+# Cassandra) whose identical tails cannot be shared without a helper whose
+# parameter and type-parameter count would be worse than the duplication. These
+# ceilings bound those constructors; nothing else in the crate approaches them.
+too-many-arguments-threshold = 8
+too-many-lines-threshold = 105

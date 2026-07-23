@@ -15,7 +15,7 @@
 //! cache invariants stay scripted/clock-only (production backends cannot inject
 //! faults): [`probe_tests`], [`refresh_tests`], [`cache_tests`].
 
-pub(super) mod support;
+pub(crate) mod support;
 
 mod cache_tests;
 mod cassandra_tests;

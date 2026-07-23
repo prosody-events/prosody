@@ -25,7 +25,7 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CellQueries, IdentityQueries, PublicationQueries,
 };
-use crate::state::memory::MemoryPublicationStore;
+use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::num::NonZeroUsize;
@@ -41,7 +41,7 @@ use crate::otel::SpanRelation;
 ///
 /// This enum ensures that trigger and defer stores always use matching
 /// storage types, making mismatched stores unrepresentable in the type system.
-/// See [`StorePair::new`] for a construction example.
+/// The crate-internal `StorePair::new` constructs it.
 #[derive(Clone)]
 pub enum StorePair {
     /// All stores use in-memory storage.
@@ -79,6 +79,36 @@ pub enum StorePair {
     },
 }
 
+/// Already-constructed shareable storage handed to [`StorePair::new`] so a
+/// consumer that receives a [`SharedDeps`](crate::state_reader::SharedDeps)
+/// bundle reuses the bundle's session (Cassandra) or in-memory stores rather
+/// than building a second one. A closed enum (no `dyn`); its backend must match
+/// the [`StorePair`] backend the same configuration selects — the composition
+/// derives both from one configuration, so a mismatch is unreachable.
+pub(crate) enum SharedStorage {
+    /// In-memory stores from a mock-mode bundle. Only `publications` is
+    /// [`StorePair`]'s; `cells`/`identities` are the consumer's keyed-state
+    /// backend, carried here so the same instances back both the reader and the
+    /// consumer's state provider (mock read-your-writes).
+    Memory {
+        /// Committed cell store shared with the reader.
+        cells: MemoryCells,
+        /// Descriptor-identity store shared with the reader.
+        identities: MemoryDescriptorIdentityStore,
+        /// Routing-only publication store shared with the reader.
+        publications: MemoryPublicationStore,
+    },
+    /// The pre-built Cassandra session handle. Its prepared statements are
+    /// re-prepared against this session inside [`StorePair::new`]; one scylla
+    /// session exists cluster-wide for the consumer and the reader bundle.
+    Cassandra {
+        /// The shared scylla session handle (keyspace from the caller's
+        /// `TriggerStoreConfiguration`, which the composition builds from the
+        /// same `CassandraConfiguration` as the bundle's session).
+        store: CassandraStore,
+    },
+}
+
 impl StorePair {
     /// Creates both trigger and defer store providers atomically.
     ///
@@ -92,32 +122,20 @@ impl StorePair {
     ///
     /// Returns error if store initialization fails.
     ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use prosody::consumer::storage::StorePair;
-    /// # use prosody::otel::SpanRelation;
-    /// # use prosody::high_level::config::TriggerStoreConfiguration;
-    /// # use std::num::NonZeroUsize;
-    /// # use std::time::Duration;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let stores = StorePair::new(
-    ///     &TriggerStoreConfiguration::InMemory,
-    ///     false,
-    ///     Duration::from_secs(7 * 24 * 3600),
-    ///     NonZeroUsize::new(8192).ok_or("cache capacity must be nonzero")?,
-    ///     SpanRelation::FollowsFrom,
-    /// )
-    /// .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn new(
+    /// When `shared` is `Some`, the pair reuses that already-constructed
+    /// storage (the mock publication store, or the pre-built Cassandra
+    /// session) instead of building a fresh one; `None` builds everything
+    /// internally. The backend of `shared` must match the backend `(mock,
+    /// config)` selects — the composition derives both from one
+    /// configuration, so a mismatch cannot arise and the `_` fallbacks
+    /// below build fresh only on that unreachable path.
+    pub(crate) async fn new(
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
         dedup_cache_capacity: NonZeroUsize,
         timer_spans: SpanRelation,
+        shared: Option<&SharedStorage>,
     ) -> Result<Self, StoreCreationError> {
         // Pure config validation first: fail fast before any Cassandra IO
         // (memory mode validates too, deliberately).
@@ -125,19 +143,31 @@ impl StorePair {
 
         let cass_config = match (mock, config) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
+                // Reuse the bundle's publication store so the reader and the
+                // consumer route through one instance; else build a fresh one.
+                let publication_store = match shared {
+                    Some(SharedStorage::Memory { publications, .. }) => publications.clone(),
+                    _ => MemoryPublicationStore::new(),
+                };
                 return Ok(Self::Memory {
                     trigger_provider: InMemoryTriggerStoreProvider::new(),
                     message_provider: MemoryMessageDeferStoreProvider::new(),
                     timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
                     dedup_provider: MemoryDeduplicationStoreProvider::new(),
-                    publication_store: MemoryPublicationStore::new(),
+                    publication_store,
                 });
             }
             (false, TriggerStoreConfiguration::Cassandra(cass_config)) => cass_config,
         };
 
-        // One shared session for every Cassandra store below.
-        let store = CassandraStore::new(cass_config).await?;
+        // One shared session for every Cassandra store below. When a bundle is
+        // supplied, reuse its already-connected session — its keyspace must
+        // match `cass_config.keyspace`, which holds because the composition
+        // builds the bundle and this config from one `CassandraConfiguration`.
+        let store = match shared {
+            Some(SharedStorage::Cassandra { store }) => store.clone(),
+            _ => CassandraStore::new(cass_config).await?,
+        };
         let keyspace = &cass_config.keyspace;
 
         // Create trigger store provider (prepares queries once, creates

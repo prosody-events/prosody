@@ -96,6 +96,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         &common_config,
         telemetry,
         handler,
+        None,
     )
     .await?;
 

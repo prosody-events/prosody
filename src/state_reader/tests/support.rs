@@ -53,6 +53,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -66,7 +67,7 @@ pub(super) const GROUP_B: &str = "group-zzz";
 
 /// The mock topology's fixed partition count (matches
 /// [`PartitionCount::MOCK`]).
-pub(super) fn mock_count() -> PartitionCount {
+pub(crate) fn mock_count() -> PartitionCount {
     PartitionCount::try_from(3).unwrap_or(PartitionCount::MIN)
 }
 
@@ -76,12 +77,12 @@ pub(super) fn subsystem() -> Result<SubsystemName> {
 }
 
 /// A collection state name.
-pub(super) fn state_name(name: &str) -> Result<StateName> {
+pub(crate) fn state_name(name: &str) -> Result<StateName> {
     StateName::try_new(name).map_err(|e| eyre!("name: {e}"))
 }
 
 /// An interned topic.
-pub(super) fn topic(name: &str) -> Topic {
+pub(crate) fn topic(name: &str) -> Topic {
     Intern::<str>::from(name)
 }
 
@@ -93,14 +94,14 @@ pub(super) fn topic(name: &str) -> Topic {
 /// session never reads it (see [`SessionParts`]), so one type serves every
 /// backend. Only `C` varies: [`MemoryCellStore`] for the memory reader,
 /// `CassandraStore<FixedOracle>` for the live-Cassandra reader.
-type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
+pub(crate) type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
 
 /// The real per-event session the seeding handles bind over, over cell store
 /// `C`.
-pub(super) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
+pub(crate) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
 
 /// A registry with `descriptor` registered under `def`.
-pub(super) fn registry_of<D: StateDescriptor>(
+pub(crate) fn registry_of<D: StateDescriptor>(
     descriptor: &D,
     def: CollectionDef,
 ) -> Result<Arc<CollectionDefRegistry>> {
@@ -114,7 +115,7 @@ pub(super) fn registry_of<D: StateDescriptor>(
 /// The segment the owner writes under (and the reader recomputes) for one
 /// source. The single fabricated-identifier authority — never a hand-invented
 /// id.
-pub(super) fn source_state_key(
+pub(crate) fn source_state_key(
     topic: Topic,
     group: &str,
     key: &Key,
@@ -207,7 +208,7 @@ where
 
 /// [`owner_commit_cell`] over an in-memory cell store — the memory-backed
 /// seeding entry point the scripted probe/refresh suites write through.
-pub(super) async fn owner_commit<D, F, Fut>(
+pub(crate) async fn owner_commit<D, F, Fut>(
     cells: &MemoryCells,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
@@ -273,7 +274,7 @@ async fn seed_memory_publication(
 /// Advertises `(group, topic)` as a source of `name` and freezes its identity
 /// to match `descriptor`, so the reader admits it. The identity row is derived
 /// from the same descriptor the reader carries, so acquisition validates equal.
-pub(super) async fn publish_source<D: StateDescriptor>(
+pub(crate) async fn publish_source<D: StateDescriptor>(
     stores: (&MemoryPublicationStore, &MemoryDescriptorIdentityStore),
     subsystem: &SubsystemName,
     name: &StateName,
@@ -359,6 +360,8 @@ impl MemoryHarness {
     /// A shared-deps bundle over these handles with a wall-clock cache.
     pub(super) fn deps(&self, budget: u64) -> SharedDeps<JsonCodec> {
         SharedDeps::memory(
+            "reader-test".to_owned(),
+            Duration::from_secs(30),
             self.cells.clone(),
             self.publications.clone(),
             self.identities.clone(),
