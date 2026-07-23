@@ -300,7 +300,13 @@ impl CassandraCellResources {
             };
             answers.push(committed);
         }
-        Ok(plan.iter().map(|&i| answers[i].clone()).collect())
+        let out: CellBuffer<Option<Bytes>> = plan.iter().map(|&i| answers[i].clone()).collect();
+        debug_assert_eq!(
+            out.len(),
+            batch.len(),
+            "batch read must answer every input position"
+        );
+        Ok(out)
     }
 
     /// The oracle-free committed section scan: the reader's raw scan primitive.

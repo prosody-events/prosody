@@ -80,9 +80,12 @@ impl Cell {
     /// `data` for a resolved one. No oracle, no mutation — sound because of
     /// the prev-is-committed invariant.
     ///
-    /// This is the committed-projection primitive a future non-owner reader
-    /// will observe: one point read, committed-only, possibly stale by the
-    /// single in-flight event. No production caller consumes it yet.
+    /// This is the committed-projection primitive the standalone
+    /// [`StateReader`](crate::state_reader::StateReader) observes: one point
+    /// read, committed-only, possibly stale by the single in-flight event. The
+    /// oracle-free carriers it flows through —
+    /// `read_committed`/`read_committed_many`/`scan_committed` on both the
+    /// Cassandra and memory backends — all resolve values through it.
     #[must_use]
     pub fn project_committed(&self) -> Option<&Bytes> {
         match self {

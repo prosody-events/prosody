@@ -14,7 +14,6 @@ use crate::state_reader::cache::CacheKey;
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
-use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -251,42 +250,58 @@ async fn declared_weight_bounded_by_budget() -> Result<()> {
     Ok(())
 }
 
-/// The batch read-through overwrites a stale entry with the newer-issued fill,
-/// keyed by `seq` (issue order), not by `(issued_ms, seq)` lexicographic order.
-/// The codex Q2(d) regression pin: `write_through` must compare `seq` alone so
-/// a later-issued fill that read an earlier millisecond still wins.
+/// Regression pin: `write_through`'s newer-wins compares `seq` (issue order)
+/// alone, never the lexicographic `(issued_ms, seq)`. A later-issued fill that
+/// read an *earlier* millisecond must still win — the two orders disagree only
+/// when the clock does not advance monotonically between issues, so the test
+/// drives it that way.
 ///
-/// Falsify: compare the full lexicographic `Stamp` in `write_through` — with a
-/// clock that does not advance monotonically the newer batch value can lose to
-/// the older point value.
+/// The point fill is issued at a HIGH millisecond (stamp `ms 1000, seq 0`); the
+/// batch fill is issued later at a LOW millisecond (stamp `ms 1, seq 1`). A
+/// second, absent decoy key forces the batch fill to fire so its write-through
+/// runs against the occupied entry. Under seq-only the batch value (seq 1)
+/// wins; a lexicographic compare would rank `(1, 1) < (1000, 0)` and leave
+/// "v1".
+///
+/// Falsify: compare the full `Stamp` lexicographically in `write_through` — the
+/// read-back returns "v1" and the assert goes red.
 #[tokio::test]
 async fn batch_refill_overwrites_stale_entry() -> Result<()> {
     let (cache, now) = fixed_clock_cache(1 << 20);
-    let k = key("batch")?;
-    let fills = Arc::new(AtomicUsize::new(0));
-    let point_fill = || {
-        let fills = fills.clone();
-        async move {
-            fills.fetch_add(1, Ordering::Relaxed);
+    let k1 = key("batch")?;
+    let k2 = key("batch-decoy")?;
+
+    // Point-fill k1 at a HIGH millisecond (issue stamp: ms 1000, seq 0); the ttl
+    // is large so k1 stays a fresh hit — the test turns on newer-wins, not on
+    // expiry.
+    now.store(1000, Ordering::Relaxed);
+    cache
+        .get_cached(k1.clone(), 1_000_000, || async {
             Ok::<_, StateAccessError>(Some(Bytes::from_static(b"v1")))
-        }
-    };
-
-    // Point fill at t=0 (seq 0), ttl 10.
-    cache.get_cached(k.clone(), 10, point_fill).await?;
-
-    // Advance past the ttl so the entry is stale, then batch-refill "v2"
-    // (issued at a later seq). Newer-wins overwrites the stale point value.
-    now.store(100, Ordering::Relaxed);
-    let got = cache
-        .get_many_cached(slice::from_ref(&k), 10, || async {
-            Ok::<_, StateAccessError>(vec![Some(Bytes::from_static(b"v2"))])
         })
         .await?;
-    assert_eq!(got, vec![Some(Bytes::from_static(b"v2"))]);
 
-    // Read back within the new fresh window: the batch value won.
-    let back = cache.get_cached(k, 10, point_fill).await?;
-    assert_eq!(back, Some(Bytes::from_static(b"v2")), "newer fill wins");
+    // Batch-fill [k1, k2] issued later at an EARLIER millisecond (stamp: ms 1,
+    // seq 1). k1 is still a fresh hit, but k2 is absent, so the fill fires and
+    // write-throughs k1 with the later-seq / earlier-ms stamp.
+    now.store(1, Ordering::Relaxed);
+    let got = cache
+        .get_many_cached(&[k1.clone(), k2], 1_000_000, || async {
+            Ok::<_, StateAccessError>(vec![
+                Some(Bytes::from_static(b"v2")),
+                Some(Bytes::from_static(b"decoy")),
+            ])
+        })
+        .await?;
+    assert_eq!(got[0], Some(Bytes::from_static(b"v2")));
+
+    // Read k1 back: seq-only newer-wins kept the batch value (seq 1 > 0) despite
+    // its earlier millisecond; the fill closure here must not run (k1 is a hit).
+    let back = cache
+        .get_cached(k1, 1_000_000, || async {
+            Ok::<_, StateAccessError>(Some(Bytes::from_static(b"unused")))
+        })
+        .await?;
+    assert_eq!(back, Some(Bytes::from_static(b"v2")), "later seq wins");
     Ok(())
 }

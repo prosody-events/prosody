@@ -71,6 +71,15 @@ pub enum StateReaderError {
         reason: &'static str,
     },
 
+    /// The reader cannot serve this descriptor's collection. Permanent:
+    /// determined once at construction — currently a collection whose name is
+    /// empty.
+    #[error("unsupported collection: {reason}")]
+    Unsupported {
+        /// Why the collection is unsupported.
+        reason: &'static str,
+    },
+
     /// A publication/identity/cell store read failed (type-erased). Carries
     /// the store error's classification so retry posture is preserved.
     #[error("reader store failed: {message}")]
@@ -110,7 +119,8 @@ impl ClassifyError for StateReaderError {
             Self::IdentityMismatch { .. }
             | Self::TooManySources { .. }
             | Self::EmptyKey
-            | Self::InvalidReadCache { .. } => ErrorCategory::Permanent,
+            | Self::InvalidReadCache { .. }
+            | Self::Unsupported { .. } => ErrorCategory::Permanent,
             Self::Store { category, .. } => *category,
             Self::Access(error) => error.classify_error(),
         }

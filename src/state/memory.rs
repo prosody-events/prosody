@@ -70,7 +70,7 @@ impl MemoryCells {
     /// row to `Resolved(Committed(None))`. Oracle-free — shared by the
     /// owner store's [`MemoryCellStore::read_raw`] and the reader's
     /// [`Self::read_committed`], so neither can drift on the default shape.
-    pub(crate) fn read_committed_cell(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
+    fn read_committed_cell(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
         self.inner
             .read_sync(&(collection.clone(), cell.clone()), |_, stored| {
                 stored.to_cell()
@@ -92,9 +92,11 @@ impl MemoryCells {
             .cloned()
     }
 
-    /// Batch twin of [`Self::read_committed`], index-aligned to `batch`. Memory
-    /// has no batch statement, so a per-coordinate map read is the in-tree
-    /// idiom (mirroring [`provisional_point_loop`]).
+    /// Batch twin of [`Self::read_committed`], index-aligned to `batch`
+    /// (mirroring Cassandra's
+    /// [`read_committed_many`](crate::state::cassandra::CassandraCellResources::read_committed_many)).
+    /// Memory has no batch statement, so a per-coordinate map read is the
+    /// in-tree idiom: no dedup, one `Option<Bytes>` per input position.
     pub(crate) fn read_committed_many(
         &self,
         collection: &CollectionId,

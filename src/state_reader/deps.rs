@@ -10,7 +10,7 @@
 //! [`SharedDeps::cassandra`] or [`SharedDeps::memory`].
 
 use crate::codec::Codec;
-use crate::loader::MemoryLoader;
+use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
 };
@@ -62,8 +62,12 @@ impl<C: Codec> SharedDeps<C> {
     }
 
     /// A Cassandra-backed bundle over already-opened handles (the oracle-free
-    /// cell resources, the publication and identity stores) and a message
+    /// cell resources, the publication and identity stores) and a Kafka message
     /// loader, with a wall-clock cache sized to `budget` declared bytes.
+    ///
+    /// Takes the concrete [`KafkaLoader`] and wraps it internally, mirroring
+    /// [`Self::memory`]: pairing a Cassandra store bundle with a non-Kafka
+    /// loader arm is then unrepresentable at the call site.
     ///
     /// Takes the handles rather than a connection config: the heavy `connect`
     /// (scylla session, prepared queries, heartbeat registry) is composed once
@@ -74,7 +78,7 @@ impl<C: Codec> SharedDeps<C> {
         cells: CassandraCellResources,
         publications: CassandraPublicationStore,
         identities: CassandraDescriptorIdentityStore,
-        loader: ReaderLoader<C>,
+        loader: KafkaLoader<C>,
         budget: u64,
     ) -> Self {
         Self {
@@ -83,7 +87,7 @@ impl<C: Codec> SharedDeps<C> {
                 publications,
                 identities,
             },
-            loader: Arc::new(loader),
+            loader: Arc::new(ReaderLoader::Kafka(loader)),
             cache: ReaderCache::with_budget(budget),
         }
     }

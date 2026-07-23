@@ -340,6 +340,10 @@ pub(super) enum FaultPoint {
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
     faults: Arc<Mutex<HashMap<SegmentId, FaultPoint>>>,
+    /// Per-source committed-read counter — the source-call trace. Cloning
+    /// shares it, so a test reads the count after moving the source into a
+    /// bundle.
+    reads: Arc<Mutex<HashMap<SegmentId, usize>>>,
 }
 
 impl ScriptedCellSource {
@@ -361,12 +365,25 @@ impl ScriptedCellSource {
         self.faults.lock().get(&segment).copied()
     }
 
+    /// Committed reads recorded for the source addressed by `segment` — mirrors
+    /// [`CountingIdentityStore::reads`], keyed per source so a test can assert
+    /// which sources a probe touched (e.g. a scan pins one source and never
+    /// opens the decoy).
+    pub(super) fn reads(&self, segment: SegmentId) -> usize {
+        self.reads.lock().get(&segment).copied().unwrap_or(0)
+    }
+
+    fn record_read(&self, segment: SegmentId) {
+        *self.reads.lock().entry(segment).or_insert(0) += 1;
+    }
+
     pub(crate) fn read_committed(
         &self,
         id: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
         let segment = id.state_key().segment_id;
+        self.record_read(segment);
         if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
@@ -380,6 +397,7 @@ impl ScriptedCellSource {
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         let segment = id.state_key().segment_id;
+        self.record_read(segment);
         if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
@@ -392,6 +410,7 @@ impl ScriptedCellSource {
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         let segment = id.state_key().segment_id;
+        self.record_read(segment);
         let fault = self.fault_of(segment);
         let inner = self.inner.clone();
         try_stream! {
@@ -405,14 +424,23 @@ impl ScriptedCellSource {
             let source = inner.scan_committed(id, scan);
             futures::pin_mut!(source);
             let mut yielded = 0usize;
-            while let Some(item) = source.next().await {
+            loop {
+                // Budget is checked BEFORE pulling: the fault fires after exactly
+                // `n` yields regardless of the stream's length (a stream ending
+                // at exactly `n` still faults), and no (n+1)-th item is fetched.
                 if limit.is_some_and(|n| yielded >= n) {
                     Err(StateAccessError::store(&ScriptedFaultError))?;
                 }
-                // Memory scan errors are `Infallible`.
-                let (key, value) = item.map_err(|e: Infallible| -> StateAccessError { match e {} })?;
-                yield (key, value);
-                yielded += 1;
+                match source.next().await {
+                    // Memory scan errors are `Infallible`.
+                    Some(item) => {
+                        let (key, value) =
+                            item.map_err(|e: Infallible| -> StateAccessError { match e {} })?;
+                        yield (key, value);
+                        yielded += 1;
+                    }
+                    None => break,
+                }
             }
         }
     }

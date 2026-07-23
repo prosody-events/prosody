@@ -141,14 +141,21 @@ impl<C: Codec> ReadSession<C> {
         source: &Source,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        let id = self.collection_id_for(source)?;
         match self.def.read_cache.ttl() {
-            None => self.stores.read_committed(&id, cell).await,
+            None => {
+                let id = self.collection_id_for(source)?;
+                self.stores.read_committed(&id, cell).await
+            }
             Some(ttl) => {
                 let ttl_ms = ttl.as_millis() as u64;
                 let key = self.cache_key(source, cell);
+                // `collection_id_for` (key murmur + segment routing) runs only
+                // on a cache miss — the fill closure — never on a hit.
                 self.cache
-                    .get_cached(key, ttl_ms, || self.stores.read_committed(&id, cell))
+                    .get_cached(key, ttl_ms, || async {
+                        let id = self.collection_id_for(source)?;
+                        self.stores.read_committed(&id, cell).await
+                    })
                     .await
             }
         }
@@ -162,9 +169,11 @@ impl<C: Codec> ReadSession<C> {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        let id = self.collection_id_for(source)?;
         match self.def.read_cache.ttl() {
-            None => self.stores.read_committed_many(&id, section, batch).await,
+            None => {
+                let id = self.collection_id_for(source)?;
+                self.stores.read_committed_many(&id, section, batch).await
+            }
             Some(ttl) => {
                 let ttl_ms = ttl.as_millis() as u64;
                 let keys: Vec<CacheKey> = batch
@@ -179,9 +188,12 @@ impl<C: Codec> ReadSession<C> {
                         )
                     })
                     .collect();
+                // `collection_id_for` runs only when the batch fill fires (a
+                // miss), never when the batch is served entirely from the cache.
                 let values = self
                     .cache
                     .get_many_cached(&keys, ttl_ms, || async {
+                        let id = self.collection_id_for(source)?;
                         self.stores
                             .read_committed_many(&id, section, batch)
                             .await
@@ -256,6 +268,13 @@ where
             return self.cached_point(source, cell).await;
         }
         let sources = self.snapshot.sources();
+        // `FuturesOrdered` heap-allocates a node per source (≤
+        // `MAX_PUBLICATION_SOURCES`). Kept over a hand-rolled poll loop on a
+        // pinned `SmallVec`: this is a per-operation, I/O-bound cross-group read
+        // (not the per-message/per-cell steady state the alloc rule targets), so
+        // a bounded 16-node allocation alongside the store reads is not a
+        // pessimization, and the ordered-with-early-exit fan-out reads far
+        // clearer than the zero-alloc alternative.
         let mut ordered = FuturesOrdered::new();
         for source in sources {
             ordered.push_back(cooperative(
@@ -296,6 +315,8 @@ where
             return self.cached_batch(source, section, batch).await;
         }
         let sources = self.snapshot.sources();
+        // Bounded per-operation fan-out; see the ruling on the point-read
+        // `FuturesOrdered` above.
         let mut ordered = FuturesOrdered::new();
         for source in sources {
             ordered.push_back(cooperative(async move {

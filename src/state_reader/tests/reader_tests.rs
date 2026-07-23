@@ -215,6 +215,9 @@ async fn map_reader_iter_equals_model() -> Result<()> {
 
 /// A Deque's committed elements read back front-to-back equal the owner's
 /// model, via `get(index)`, `len`, and `iter`.
+///
+/// Falsify: read a shifted front-relative index in `DequeHandle::get` — the
+/// element at index 0 diverges from the owner's first push.
 #[tokio::test]
 async fn deque_reader_equals_model() -> Result<()> {
     let harness = MemoryHarness::new();
@@ -363,6 +366,9 @@ async fn identity_mismatch_is_permanent() -> Result<()> {
 
 /// An empty key is rejected `EmptyKey` before any acquisition; a collection
 /// with no publication rows fails `UnknownPublication` (Transient).
+///
+/// Falsify: drop the `key.is_empty()` guard in `StateReader::session` — the
+/// empty-key read no longer short-circuits and the `EmptyKey` arm is unreached.
 #[tokio::test]
 async fn boundary_errors() -> Result<()> {
     let harness = MemoryHarness::new();

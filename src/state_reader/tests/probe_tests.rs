@@ -488,3 +488,102 @@ async fn get_many_answers_from_one_source() -> Result<()> {
     );
     Ok(())
 }
+
+/// Single-source coherence for a scan, proven by the source-call trace: the
+/// lowest-ordered source with data pins and answers the whole scan; the decoy
+/// source B is never read (its recorded read count stays zero) — the deque's
+/// bounds read pins A, and every later read addresses that one pinned source.
+///
+/// Falsify: reverse the snapshot's source-preference order (pin the *highest*
+/// source) — B pins instead, its values answer the scan, and both its read
+/// count and the value assert go red.
+#[tokio::test]
+async fn scan_reads_only_pinned_source() -> Result<()> {
+    let cells = ScriptedCellSource::new();
+    let publications = ScriptedPublicationStore::new();
+    let identities = CountingIdentityStore::new();
+    let descriptor = deque_state::<JsonCodec>("d-coherent");
+    let name = state_name("d-coherent")?;
+    let sub = subsystem()?;
+    let count = mock_count();
+    let key = Key::from("user-1");
+    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
+
+    let tp_a = topic("topic-a");
+    let tp_b = topic("topic-b");
+    let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
+    let sk_b = source_state_key(tp_b, GROUP_B, &key, count)?;
+
+    // Both sources hold a full deque (wide enough for the range-scan arm); A
+    // (group-aaa) is the lowest and must answer alone. B's values are tagged
+    // distinctly so a splice would be visible.
+    for (sk, base, event) in [(&sk_a, 0i64, 1u128), (&sk_b, 1000i64, 2u128)] {
+        owner_commit(
+            &cells.cells(),
+            &registry,
+            sk,
+            descriptor,
+            event,
+            |h| async move {
+                for i in 0..SCAN_ARM_LEN {
+                    h.push_back(Value::from(base + i as i64))
+                        .await
+                        .map_err(|e| eyre!("push: {e}"))?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    }
+    publish_scripted(
+        (&publications, &identities),
+        &sub,
+        &name,
+        GROUP_A,
+        tp_a,
+        count,
+        &descriptor,
+    )
+    .await;
+    publish_scripted(
+        (&publications, &identities),
+        &sub,
+        &name,
+        GROUP_B,
+        tp_b,
+        count,
+        &descriptor,
+    )
+    .await;
+
+    let cells_probe = cells.clone();
+    let deps = scripted_deps(
+        cells,
+        publications,
+        identities,
+        ReaderCache::with_budget(1 << 20),
+    );
+    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+
+    let scanned: Vec<Value> = reader
+        .stream(key, Direction::Forward)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
+    let expected: Vec<Value> = (0..SCAN_ARM_LEN).map(|i| Value::from(i as i64)).collect();
+    assert_eq!(
+        scanned, expected,
+        "the whole scan resolves from the lowest source A"
+    );
+    assert!(
+        cells_probe.reads(sk_a.segment_id) >= 1,
+        "source A was scanned"
+    );
+    assert_eq!(
+        cells_probe.reads(sk_b.segment_id),
+        0,
+        "source B (decoy) was never opened"
+    );
+    Ok(())
+}

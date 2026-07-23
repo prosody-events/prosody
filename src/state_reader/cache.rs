@@ -255,19 +255,17 @@ impl ReaderCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<Option<Bytes>>, StateAccessError>>,
     {
-        let mut hits: Vec<Option<Option<Bytes>>> = Vec::with_capacity(keys.len());
-        let mut all_fresh = true;
+        let mut hits: Vec<Option<Bytes>> = Vec::with_capacity(keys.len());
         for key in keys {
             match self.inner.get(key) {
-                Some((stamp, value)) if self.fresh(stamp, ttl_ms) => hits.push(Some(value)),
-                _ => {
-                    all_fresh = false;
-                    hits.push(None);
-                }
+                Some((stamp, value)) if self.fresh(stamp, ttl_ms) => hits.push(value),
+                // A single miss refetches the whole batch, so probing the
+                // remaining keys is wasted work — stop at the first.
+                _ => break,
             }
         }
-        if all_fresh {
-            return Ok(hits.into_iter().flatten().collect());
+        if hits.len() == keys.len() {
+            return Ok(hits);
         }
         // One shared issue stamp for the whole batch fill.
         let stamp = self.issue_stamp();

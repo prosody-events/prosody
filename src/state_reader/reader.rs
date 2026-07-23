@@ -16,7 +16,6 @@
 
 use crate::Key;
 use crate::codec::Codec;
-use crate::error::ErrorCategory;
 use crate::state::StateName;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::Direction;
@@ -38,11 +37,12 @@ use crate::state_reader::source::{
 };
 use crate::state_reader::stores::ReaderStores;
 use crate::subsystem::SubsystemName;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::task::coop::cooperative;
 use tracing::warn;
 
 /// The default snapshot-refresh cadence: a source list changes rarely, so the
@@ -104,13 +104,14 @@ where
     /// The heavy handles (backend stores, message loader, byte-budgeted cache)
     /// are cloned from `deps`, so composing one bundle and minting several
     /// readers shares one session and cache. The descriptor's [`ReadCache`]
-    /// policy is validated here — the one construction-time failure.
+    /// policy and its collection name are validated here — the two
+    /// construction-time failures.
     ///
     /// # Errors
     ///
     /// Returns [`StateReaderError::InvalidReadCache`] when the descriptor's
     /// read-cache TTL is degenerate (zero or sub-millisecond), or
-    /// [`StateReaderError::Store`] when the collection name is empty.
+    /// [`StateReaderError::Unsupported`] when the collection name is empty.
     pub fn new(
         deps: &SharedDeps<C>,
         subsystem: SubsystemName,
@@ -130,9 +131,8 @@ where
         let def = descriptor.collection_def();
         validate_read_cache(def.read_cache)?;
         let name =
-            StateName::try_new(descriptor.name()).map_err(|error| StateReaderError::Store {
-                message: error.to_string(),
-                category: ErrorCategory::Permanent,
+            StateName::try_new(descriptor.name()).map_err(|_| StateReaderError::Unsupported {
+                reason: "collection name is empty",
             })?;
         Ok(Self {
             descriptor,
@@ -268,12 +268,45 @@ where
             }
         }
 
+        // Fan the identity reads for the newly-advertised groups (those absent
+        // from `prior`) out concurrently: a cold snapshot after a rebalance must
+        // not pay one serial round trip per source. `buffered` is
+        // order-preserving, so the read results stay aligned to the
+        // newly-advertised groups in advertisement order and the fold below
+        // stays deterministic.
+        let mut reads = stream::iter(
+            groups
+                .iter()
+                .filter(|group| !prior_groups.iter().any(|prior| prior == *group))
+                .cloned(),
+        )
+        .map(|group| {
+            cooperative(async move {
+                self.stores
+                    .read_identity(&group, self.descriptor.state_type(), self.name.as_str())
+                    .await
+            })
+        })
+        .buffered(MAX_PUBLICATION_SOURCES)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter();
+
+        // Fold sequentially in advertisement order: a prior group is admitted
+        // with no read; a new group consumes its order-aligned identity read.
         let mut admission = Admission::default();
         for group in &groups {
-            let admitted = prior_groups.iter().any(|g| **g == **group)
-                || self
-                    .validate_group(group, &asserted, &mut admission)
-                    .await?;
+            let admitted = if prior_groups.iter().any(|prior| prior == group) {
+                true
+            } else {
+                match reads.next() {
+                    Some(stored) => {
+                        self.classify_identity(stored?, group, &asserted, &mut admission)
+                    }
+                    // Unreachable: every new group produced exactly one read.
+                    None => false,
+                }
+            };
             if admitted {
                 for row in rows.iter().filter(|row| *row.group_id == **group) {
                     admission.admitted.push(Source {
@@ -289,30 +322,29 @@ where
         Ok(admission)
     }
 
-    /// Reads and validates a single new group's frozen identity, recording a
-    /// mismatch or missing identity in `admission`.
-    async fn validate_group(
+    /// Classifies a new group's already-read frozen identity, recording a
+    /// mismatch or missing identity in `admission`; returns whether the group
+    /// is admitted. Pure (no I/O) — the read runs concurrently in
+    /// [`Self::admit`].
+    fn classify_identity(
         &self,
+        stored: Option<DurableDescriptorIdentity>,
         group: &Arc<str>,
         asserted: &DurableDescriptorIdentity,
         admission: &mut Admission,
-    ) -> Result<bool, StateReaderError> {
-        let Some(stored) = self
-            .stores
-            .read_identity(group, self.descriptor.state_type(), self.name.as_str())
-            .await?
-        else {
+    ) -> bool {
+        let Some(stored) = stored else {
             warn!(group = %group, name = %self.name.as_str(), "publication source has no frozen identity yet");
             admission.any_missing = true;
-            return Ok(false);
+            return false;
         };
         if descriptor_identity::validate::<StateAccessError>(stored, asserted).is_ok() {
-            return Ok(true);
+            return true;
         }
         if admission.mismatch.is_none() {
             admission.mismatch = Some(group.as_ref().to_owned());
         }
-        Ok(false)
+        false
     }
 
     /// The `UnknownPublication` error for this reader's collection.

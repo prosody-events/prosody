@@ -90,3 +90,37 @@ impl ValidatedPublications {
         &self.sources
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_reader::PartitionCount;
+    use internment::Intern;
+
+    /// Advertising more than [`MAX_PUBLICATION_SOURCES`] fails `TooManySources`
+    /// (Permanent) at mint — never a silent truncation.
+    ///
+    /// Falsify: drop the length check in [`ValidatedPublications::new`] — the
+    /// oversized snapshot builds and the match arm is never reached.
+    #[test]
+    fn oversized_snapshot_is_too_many_sources() -> color_eyre::Result<()> {
+        let sources: SmallVec<[Source; MAX_PUBLICATION_SOURCES]> = (0..=MAX_PUBLICATION_SOURCES)
+            .map(|i| Source {
+                id: SourceId {
+                    group_id: Arc::from(format!("group-{i}")),
+                    topic: Intern::<str>::from("topic"),
+                },
+                partition_count: PartitionCount::MIN,
+            })
+            .collect();
+        assert_eq!(sources.len(), MAX_PUBLICATION_SOURCES + 1);
+        match ValidatedPublications::new(sources, "orders", "coll") {
+            Err(StateReaderError::TooManySources { found, max }) => {
+                assert_eq!(found, MAX_PUBLICATION_SOURCES + 1);
+                assert_eq!(max, MAX_PUBLICATION_SOURCES);
+            }
+            other => color_eyre::eyre::bail!("expected TooManySources, got {other:?}"),
+        }
+        Ok(())
+    }
+}
