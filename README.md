@@ -170,6 +170,42 @@ count.set(json!(current + 1)).await?;
 
 Keyed-state cache and recovery settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state-pipeline-mode).
 
+### Reading another group's state
+
+By default a collection is private to the consumer group that owns it. Mark a
+collection `.published(true)` and give the owning consumer a `subsystem` name,
+and other services can read that state without owning the partition or running
+the write machinery. A published collection with no subsystem is rejected at
+build.
+
+```rust,ignore
+// Owning consumer: publish the collection under a subsystem.
+let cart = value_state("cart")
+    .published(true)
+    .ttl(CompactDuration::new(30 * 24 * 60 * 60));
+let config = KeyedStateConfiguration::builder()
+    .subsystem(Some(SubsystemName::try_new("carts")?))
+    .build()?;
+```
+
+Any other service reads it through the same high-level client, naming the
+subsystem and the same collection shape:
+
+```rust,ignore
+let reader = client.state(SubsystemName::try_new("carts")?, value_state("cart")).await?;
+let cart = reader.get("user-1").await?; // committed value from the owning group
+```
+
+A reader observes only **committed** state — never an in-flight value and never
+the reader's own writes — read from a single publication source per operation.
+Reads are served through a time-bounded (TTL) cache, so a returned value was the
+store's committed answer within the last refresh interval; there is no ordering
+guarantee across sources. A process with no consumer of its own can build a
+reader directly from a `SharedDeps` bundle (`SharedDeps::connect` +
+`StateReader::new`); the high-level client shares one
+bundle across its consumer and all readers, so composing a reader never opens a
+second Cassandra session, Kafka loader, or cache.
+
 ## Quality of Service
 
 All modes use **fair scheduling** to limit concurrency and distribute execution time. Pipeline mode adds **deferred
