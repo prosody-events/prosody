@@ -43,7 +43,7 @@ use crate::otel::SpanRelation;
 /// storage types, making mismatched stores unrepresentable in the type system.
 /// The crate-internal `StorePair::new` constructs it.
 #[derive(Clone)]
-pub enum StorePair {
+pub(crate) enum StorePair {
     /// All stores use in-memory storage.
     Memory {
         /// Trigger store provider (Memory) — creates per-partition stores.

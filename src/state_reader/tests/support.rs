@@ -94,11 +94,11 @@ pub(crate) fn topic(name: &str) -> Topic {
 /// session never reads it (see [`SessionParts`]), so one type serves every
 /// backend. Only `C` varies: [`MemoryCellStore`] for the memory reader,
 /// `CassandraStore<FixedOracle>` for the live-Cassandra reader.
-pub(crate) type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
+pub(super) type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
 
 /// The real per-event session the seeding handles bind over, over cell store
 /// `C`.
-pub(crate) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
+pub(super) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
 
 /// A registry with `descriptor` registered under `def`.
 pub(crate) fn registry_of<D: StateDescriptor>(

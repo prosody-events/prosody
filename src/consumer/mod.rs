@@ -1107,11 +1107,11 @@ where
 /// Builds the keyed-state provider for a [`StorePair::Memory`] arm (and the
 /// stateless Cassandra arm): the in-memory durable store, backend factory, and
 /// the caller's in-memory message loader, wrapped in the partition state
-/// provider. The pipeline passes a `loader` it also hands to message defer; the
-/// other constructors pass a fresh one. The factory is store-type agnostic —
-/// the commit oracle's trigger store handle arrives per partition via
-/// [`PartitionStateProvider::acquire`] — so the concrete return type serves any
-/// trigger backend.
+/// provider. The pipeline also hands it to message defer; other arms take the
+/// bundle's loader when one is supplied, else a fresh one. The factory is
+/// store-type agnostic — the commit oracle's trigger store handle arrives per
+/// partition via [`PartitionStateProvider::acquire`] — so the concrete return
+/// type serves any trigger backend.
 fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,

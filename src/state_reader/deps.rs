@@ -64,6 +64,8 @@ fn next_instance_id() -> u64 {
 /// handles (see the module docs).
 pub struct SharedDeps<C: Codec> {
     stores: ReaderStores,
+    // `Arc` over an already-cheap-clone enum so this bundle's `Clone` needs no
+    // `C::Payload: Clone` bound — `ReaderLoader<C>: Clone` would require it.
     loader: Arc<ReaderLoader<C>>,
     cache: ReaderCache,
     partition_counts: PartitionCounts,
@@ -90,7 +92,8 @@ impl<C: Codec> SharedDeps<C> {
     /// An in-memory bundle over the given shared stores and loader, with a
     /// wall-clock cache sized to `budget` declared bytes. The mock arm the
     /// consumer's mock mode composes readers from. `group_id`/`stall_threshold`
-    /// seed the (unused-in-mock) heartbeat registry so the bundle's shape
+    /// seed the heartbeat registry — unused only from the reader's `is_stalled`
+    /// view, since a mock has no loader poll loop — so the bundle's shape
     /// matches [`Self::connect`].
     #[must_use]
     pub fn memory(
@@ -127,8 +130,7 @@ impl<C: Codec> SharedDeps<C> {
     /// registry would have nowhere to report. The one session (`store`) is
     /// cloned into every store handle; the keyspace comes from
     /// `cassandra_config`, which the composition also feeds to the consumer's
-    /// [`StorePair`](crate::consumer::storage::StorePair), so session and
-    /// keyspace stay consistent.
+    /// `StorePair`, so session and keyspace stay consistent.
     ///
     /// # Errors
     ///
@@ -214,9 +216,9 @@ impl<C: Codec> SharedDeps<C> {
         }
     }
 
-    /// Whether any registered heartbeat has stalled. A reader-only process has
-    /// no consumer stall probe, so it delegates to the loader's poll-loop
-    /// heartbeat carried in this bundle's registry.
+    /// Whether any registered heartbeat has stalled. Folds over every heartbeat
+    /// registered in this bundle's registry (for a reader-only process, the
+    /// loader's poll loop).
     #[must_use]
     pub fn is_stalled(&self) -> bool {
         self.heartbeats.any_stalled()

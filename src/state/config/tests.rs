@@ -16,19 +16,23 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// Pins `cache_size_bytes`'s element type to `NonZeroU64` — the choice that
-/// makes the field's documented "rejected at build" contract hold. The build
-/// path is `from_option_env(STATE_CACHE_SIZE_ENV)?`, which parses a present
-/// value with `<Option<NonZeroU64>>::Item::from_str`; this closure fails to
-/// compile if the field type ever weakens (e.g. to `Option<u64>`, which would
-/// silently accept `0`), and the assertions below prove that element type
-/// accepts a positive byte count and rejects zero, negative, non-numeric,
-/// empty, and out-of-`u64` values. The `"0"` rejection is load-bearing: it is
-/// the sole value distinguishing `NonZeroU64` from a plain `u64`. The env-read
-/// wiring itself (`from_option_env`, [`super::STATE_CACHE_SIZE_ENV`]) is
-/// trusted std, so this needs none of the `unsafe` env mutation a full
-/// build-path test would.
+/// Pins the element type of both cache-size fields — `cache_size_bytes` and its
+/// structural twin `read_cache_size_bytes` — to `NonZeroU64`, the choice that
+/// makes each field's documented "rejected at build" contract hold. The build
+/// path is `from_option_env(STATE_CACHE_SIZE_ENV)?` (and the read twin's
+/// `STATE_READ_CACHE_SIZE_ENV`), which parses a present value with
+/// `<Option<NonZeroU64>>::Item::from_str`; each closure fails to compile if
+/// that field's type ever weakens (e.g. to `Option<u64>`, which would silently
+/// accept `0`), and the assertions below prove that element type accepts a
+/// positive byte count and rejects zero, negative, non-numeric, empty, and
+/// out-of-`u64` values. The `"0"` rejection is load-bearing: it is the sole
+/// value distinguishing `NonZeroU64` from a plain `u64`. One parse-contract
+/// test covers both fields because they share an identical element type — the
+/// sweep stops there deliberately. The env-read wiring itself
+/// (`from_option_env`, [`super::STATE_CACHE_SIZE_ENV`]) is trusted std, so this
+/// needs none of the `unsafe` env mutation a full build-path test would.
 const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.cache_size_bytes;
+const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.read_cache_size_bytes;
 
 #[test]
 fn cache_size_element_type_parse_contract() -> Result<()> {

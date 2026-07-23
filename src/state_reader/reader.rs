@@ -186,6 +186,12 @@ where
     /// (see [`SnapshotState::mismatch`]) so it surfaces on every read until a
     /// successful refresh clears it; a missing identity skips that source with
     /// a `warn!`.
+    ///
+    /// The `snapshot` mutex is held across [`Self::refresh`]'s network I/O on
+    /// purpose: it single-flights the refresh so only one read re-reads the
+    /// routing table while the rest wait and wake to the fresh snapshot. Do not
+    /// "fix" this by dropping the guard across the await — that would let a
+    /// thundering herd of reads all refresh at once.
     async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
         let mut state = self.snapshot.lock().await;
         let now = self.clock.now_ms();
