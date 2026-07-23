@@ -58,6 +58,13 @@ const DEFAULT_REFRESH_INTERVAL_MS: u64 = 60_000;
 /// snapshot is structural.
 struct SnapshotState {
     snapshot: Option<Arc<ValidatedPublications>>,
+    /// A present-but-unequal identity observed at the last refresh, held sticky
+    /// until the next refresh re-reads. `IdentityMismatch` is a Permanent
+    /// misconfiguration, so it must surface on **every** read within the
+    /// refresh interval — never be masked by the admitted (valid) subset served
+    /// from the cached snapshot. A clean refresh clears it; a re-validated
+    /// refresh recovers automatically.
+    mismatch: Option<String>,
     refreshed_at_ms: u64,
 }
 
@@ -146,6 +153,7 @@ where
             refresh_interval_ms,
             snapshot: Mutex::new(SnapshotState {
                 snapshot: None,
+                mismatch: None,
                 refreshed_at_ms: 0,
             }),
         })
@@ -157,8 +165,9 @@ where
     /// Refresh follows the three-outcome rule (see the plan's "Acquisition and
     /// refresh"):
     ///
-    /// * a **failed** routing-table read keeps the previous snapshot (returned
-    ///   if one is held, else propagated);
+    /// * a **failed** routing-table read keeps the previous acquisition outcome
+    ///   — a held snapshot is returned, but a known sticky mismatch still
+    ///   outranks it (see below), else the read error propagates;
     /// * a **successful** read applies withdrawals unconditionally — a source
     ///   no longer advertised is dropped without consulting its identity — and
     ///   validates identity only for sources whose group is newly admitted, so
@@ -167,15 +176,26 @@ where
     ///   identity) stores the absence and fails, so a later read can re-admit.
     ///
     /// A present-but-unequal identity fails the whole acquisition
-    /// ([`StateReaderError::IdentityMismatch`], Permanent); a missing identity
-    /// skips that source with a `warn!`.
+    /// ([`StateReaderError::IdentityMismatch`], Permanent) and is held sticky
+    /// (see [`SnapshotState::mismatch`]) so it surfaces on every read until a
+    /// successful refresh clears it; a missing identity skips that source with
+    /// a `warn!`.
     async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
         let mut state = self.snapshot.lock().await;
         let now = self.clock.now_ms();
-        if let Some(snapshot) = &state.snapshot
-            && now.saturating_sub(state.refreshed_at_ms) < self.refresh_interval_ms
-        {
-            return Ok(snapshot.clone());
+        if now.saturating_sub(state.refreshed_at_ms) < self.refresh_interval_ms {
+            // A sticky mismatch outranks the cached snapshot: a Permanent
+            // misconfiguration surfaces on every read, never masked by the
+            // admitted subset. An absent snapshot with no mismatch falls
+            // through to re-read (a withdrawn table re-admits eagerly).
+            if let Some(group) = &state.mismatch {
+                return Err(StateReaderError::IdentityMismatch {
+                    group: group.clone(),
+                });
+            }
+            if let Some(snapshot) = &state.snapshot {
+                return Ok(snapshot.clone());
+            }
         }
         self.refresh(&mut state, now).await
     }
@@ -194,17 +214,25 @@ where
             .await
         {
             Ok(rows) => rows,
-            // A failed read keeps the previous snapshot untouched.
+            // A failed read keeps the previous acquisition OUTCOME untouched —
+            // not merely its admitted subset. A known Permanent mismatch
+            // outranks that subset: a transient outage is no evidence the
+            // mismatch was repaired, so it stays sticky through the outage
+            // rather than being demoted to `Ok(subset)`.
             Err(error) => {
-                return match prior {
-                    Some(snapshot) => Ok(snapshot),
-                    None => Err(error),
+                return match (&state.mismatch, prior) {
+                    (Some(group), _) => Err(StateReaderError::IdentityMismatch {
+                        group: group.clone(),
+                    }),
+                    (None, Some(snapshot)) => Ok(snapshot),
+                    (None, None) => Err(error),
                 };
             }
         };
 
         if rows.is_empty() {
             state.snapshot = None;
+            state.mismatch = None;
             state.refreshed_at_ms = now;
             return Err(self.unknown_publication());
         }
@@ -213,7 +241,9 @@ where
 
         // Withdrawals took effect on `admitted` regardless of outcome; store it
         // (or its absence) before surfacing a mismatch so a later refresh sees
-        // the withdrawal.
+        // the withdrawal. The mismatch is recorded sticky so every read within
+        // the interval re-surfaces it (see [`SnapshotState::mismatch`]); a clean
+        // refresh clears it.
         state.snapshot = if admission.admitted.is_empty() {
             None
         } else {
@@ -223,6 +253,7 @@ where
                 self.name.as_str(),
             )?))
         };
+        state.mismatch.clone_from(&admission.mismatch);
         state.refreshed_at_ms = now;
 
         if let Some(group) = admission.mismatch {
@@ -562,5 +593,17 @@ where
         descriptor: D,
     ) -> Result<Self, StateReaderError> {
         Self::with_refresh_interval(deps, subsystem, descriptor, 0)
+    }
+
+    /// A reader with an explicit non-zero refresh interval — the driver for the
+    /// sticky-mismatch test, which needs the cached-snapshot fast path
+    /// (`now - refreshed_at_ms < interval`) to fire on the second operation.
+    pub(crate) fn new_with_interval(
+        deps: &SharedDeps<C>,
+        subsystem: SubsystemName,
+        descriptor: D,
+        refresh_interval_ms: u64,
+    ) -> Result<Self, StateReaderError> {
+        Self::with_refresh_interval(deps, subsystem, descriptor, refresh_interval_ms)
     }
 }

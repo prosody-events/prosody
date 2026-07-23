@@ -35,14 +35,19 @@ use prosody::consumer::{
     MessageDescriptor, PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
+use prosody::heartbeat::HeartbeatRegistry;
 use prosody::loader::KafkaLoader;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::state::StateName;
-use prosody::state::cassandra::{CassandraPublicationStore, PublicationQueries};
+use prosody::state::cassandra::{
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
+    CellQueries, IdentityQueries, PublicationQueries,
+};
 use prosody::state::descriptor::{
     CellStateError, Registered, StateDescriptor, ValueDescriptor, value_state,
 };
 use prosody::state::publication::PublicationStore;
+use prosody::state_reader::{SharedDeps, StateReader};
 use prosody::subsystem::SubsystemName;
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::{CompactDateTime, CompactDateTimeError};
@@ -509,12 +514,53 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
         // (per-key serialization), so by the time it is observed the cart's
         // publication row is durable.
         verify_observations(&mut observations_rx, &second).await?;
-        assert_routing_row(&subsystem, &group_id, topic).await
+        assert_routing_row(&subsystem, &group_id, topic).await?;
+        // The published cart is now durable and advertised: a standalone
+        // Cassandra-backed reader discovers the source, validates identity, and
+        // reads the committed value over the production read path.
+        read_cart_via_standalone_reader(&subsystem, &consumer_config, key).await
     }
     .await;
     consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
     outcome
+}
+
+/// Reads the published `cart` value back through a standalone Cassandra-backed
+/// [`StateReader`] — exercising the full production read wiring end-to-end:
+/// [`SharedDeps::cassandra`], publication-source discovery, frozen-identity
+/// validation against the reader's descriptor, probe-and-pin, and the committed
+/// projection (`CassandraCellResources::read_committed`). The read is expected
+/// to observe exactly the value the pipeline consumer committed.
+async fn read_cart_via_standalone_reader(
+    subsystem: &SubsystemName,
+    consumer_config: &ConsumerConfiguration,
+    key: &str,
+) -> Result<()> {
+    let store = CassandraStore::new(&common::test_cassandra_config()).await?;
+    let cell_queries = Arc::new(CellQueries::new(store.session(), common::TEST_KEYSPACE).await?);
+    let cells = CassandraCellResources::new(store.clone(), cell_queries);
+    let identity_queries =
+        Arc::new(IdentityQueries::new(store.session(), common::TEST_KEYSPACE).await?);
+    let identities = CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
+    let publication_queries =
+        Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
+    let publications = CassandraPublicationStore::new(store.clone(), publication_queries);
+
+    // The reader's message loader is required by the Cassandra bundle but never
+    // consulted for a plain Value; a Kafka-ref collection would exercise it.
+    let heartbeats = HeartbeatRegistry::new("reader-loader".to_owned(), Duration::from_mins(1));
+    let loader = KafkaLoader::<JsonCodec>::for_consumer(consumer_config, &heartbeats)?;
+
+    let deps = SharedDeps::<JsonCodec>::cassandra(cells, publications, identities, loader, 1 << 20);
+    let reader = StateReader::new(&deps, subsystem.clone(), cart())?;
+
+    let value = reader.get(key).await?;
+    ensure!(
+        value == Some(json!(["apple", "banana"])),
+        "standalone reader must observe the committed cart, got {value:?}"
+    );
+    Ok(())
 }
 
 /// Reads the `keyed_state_publication` table directly and asserts exactly one

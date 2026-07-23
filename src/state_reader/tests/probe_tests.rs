@@ -399,6 +399,67 @@ async fn scan_midstream_error_propagates() -> Result<()> {
     Ok(())
 }
 
+/// `get_many`: when the lowest source errors and the next answers with an
+/// all-`None` buffer (it holds none of the batch cells), the read is an `Err` —
+/// absence is not provable through a failed source, exactly as the point read
+/// treats no-data-plus-an-error. Source A (lowest) faults at open; source B is
+/// admitted but empty.
+///
+/// Falsify: return the remembered all-`None` buffer instead of the error — the
+/// Transient store failure is masked as a false batch-absence.
+#[tokio::test]
+async fn get_many_error_beats_all_none() -> Result<()> {
+    let cells = ScriptedCellSource::new();
+    let publications = ScriptedPublicationStore::new();
+    let identities = CountingIdentityStore::new();
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("m-err-none");
+    let name = state_name("m-err-none")?;
+    let sub = subsystem()?;
+    let count = mock_count();
+    let key = Key::from("user-1");
+
+    let tp_a = topic("topic-a");
+    let tp_b = topic("topic-b");
+    let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
+
+    // A (lowest) faults at open; B is published but holds none of the batch
+    // cells, so it answers an all-`None` buffer.
+    cells.fault_at(sk_a.segment_id, FaultPoint::AtOpen);
+    publish_scripted(
+        (&publications, &identities),
+        &sub,
+        &name,
+        GROUP_A,
+        tp_a,
+        count,
+        &descriptor,
+    )
+    .await;
+    publish_scripted(
+        (&publications, &identities),
+        &sub,
+        &name,
+        GROUP_B,
+        tp_b,
+        count,
+        &descriptor,
+    )
+    .await;
+
+    let deps = scripted_deps(
+        cells,
+        publications,
+        identities,
+        ReaderCache::with_budget(1 << 20),
+    );
+    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+
+    match reader.get_many(key, &[0, 1]).await {
+        Err(error) if error.classify_error() == ErrorCategory::Transient => Ok(()),
+        other => bail!("expected a Transient store error, got {other:?}"),
+    }
+}
+
 /// Single-source coherence: the lowest-ordered source with any `Some` answers
 /// the ENTIRE `get_many` batch — never a per-cell splice from a different
 /// source. Source A (lowest) holds only key 0; source B holds only key 1. The

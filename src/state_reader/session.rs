@@ -346,8 +346,12 @@ where
             idx += 1;
         }
         match (all_none, first_err) {
-            (Some(buffer), _) => Ok(buffer),
-            (None, Some(error)) => Err(error),
+            // Data was returned early above, so among the remaining outcomes an
+            // error outranks an all-`None` buffer: absence is not provable
+            // through a source that failed (mirrors the point read, where a
+            // remembered error beats the `None` answers).
+            (_, Some(error)) => Err(error),
+            (Some(buffer), None) => Ok(buffer),
             // Unreachable: the snapshot is non-empty, so at least one source
             // answered with data, all-`None`, or an error.
             (None, None) => Ok((0..batch.len()).map(|_| None).collect()),
@@ -370,6 +374,12 @@ where
                 }
                 return;
             }
+            // Unpinned sequential probe. This is the general `CellRead::scan`
+            // contract for a fresh session; the public Map/Deque reader streams
+            // never reach it, because each first reads its keyset/bounds cell
+            // through the point fan-out (`get`), which pins before any scan is
+            // issued (or yields no scan at all). Kept as the correct behavior
+            // for an unpinned scan, not dead — do not delete it as "unreachable".
             let sources = self.snapshot.sources();
             let mut first_err = None;
             let mut pinned = false;
