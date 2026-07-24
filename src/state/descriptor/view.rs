@@ -113,10 +113,10 @@ impl<S: CellRead> CellScope<S> {
             .collection_capacity(self.state_type, &self.name)
     }
 
-    /// Reads one cell's visible committed bytes. Demands a read permit;
-    /// `_permit` is a terminal token — the borrow is not
-    /// threaded into the unwitnessed [`CellRead`] trait, but the returned
-    /// future's edition-2024 lifetime capture still binds it to the gate.
+    /// Reads one cell's visible committed bytes. Demands a read permit. The
+    /// `_permit` is unused in the body: the [`CellRead`] call does not take it.
+    /// The returned future still captures the borrow through its edition-2024
+    /// lifetime, so the gate stays held while the read runs.
     async fn raw_get(
         &self,
         _permit: &S::Permit<'_>,

@@ -649,10 +649,9 @@ where
     /// Reads the keyset cell, folding a malformed frame into
     /// [`PriorKeyset::Malformed`] (with a warning) so the caller degrades
     /// rather than errors. An access error propagates; a key-decode error
-    /// cannot arise (the cell is read at its one fixed coordinate). A read
-    /// (it takes `&S::Permit`), so it lives on the [`CellRead`] block; mutators
-    /// reach it through their permit's `Deref` (see the coercion note in
-    /// [`Self::set`]).
+    /// cannot arise (the cell is read at its one fixed coordinate). This takes
+    /// a read permit (`&S::Permit`), so it belongs on the [`CellRead`] block.
+    /// Mutators reach it by deref-coercing their own permit; see [`Self::set`].
     async fn read_keyset_state(
         &self,
         permit: &S::Permit<'_>,

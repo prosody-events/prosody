@@ -206,21 +206,19 @@ pub(super) enum ArmOutcome {
 
 /// Outcome of the first-write publication barrier.
 ///
-/// Publishing is must-succeed by the same argument as the backstop arm
-/// (invariant 8): a `Published` collection's committed state is undiscoverable
-/// by a cross-group reader until its routing row exists, so the row must
-/// precede the stage. [`publish_first_writes`] therefore retries **every**
-/// non-shutdown failure — transient, terminal, *and* permanent — forever, the
-/// same posture as `arm_backstop`.
+/// Publishing must succeed, for the same reason arming the backstop must
+/// (invariant 8). A `Published` collection's committed state is undiscoverable
+/// by a cross-group reader until its routing row exists. The row must precede
+/// the stage. [`publish_first_writes`] retries every non-shutdown failure
+/// forever, regardless of category, matching `arm_backstop`.
 ///
-/// A `Permanent` is reachable here, not unwritable: a dropped or misconfigured
-/// publication table surfaces `CassandraPublicationError::Database`, which
-/// classifies `Permanent`. Because the barrier retries even that forever, such
-/// a schema-level fault wedges dispatch until an operator repairs the schema.
-/// That wedge is the accepted tradeoff — strictly preferable to committing a
-/// collection's published state with no routing row to advertise it. The only
-/// non-`Published` outcome is a shutdown, which abandons before anything
-/// stages.
+/// A dropped or misconfigured publication table surfaces
+/// `CassandraPublicationError::Database`, which classifies `Terminal` or
+/// `Transient`. The barrier retries it forever anyway, so a schema-level fault
+/// blocks dispatch until an operator repairs the schema. Blocking is
+/// deliberate: committing published state with no routing row to advertise it
+/// would leave that state permanently unreachable. The only non-`Published`
+/// outcome is a shutdown, which abandons before anything stages.
 enum PublishOutcome {
     /// Every touched `Published` collection has a routing row (or there was
     /// nothing to publish).
@@ -410,13 +408,11 @@ async fn settle_committed<'a, T, C, G>(
         return;
     };
 
-    // 0. First-write publication barrier: a `Published` collection's routing
-    // row must exist BEFORE its committed state does, so publish before the
-    // stage. Must-succeed (retry-until-shutdown). Nothing has staged yet, so a
-    // shutdown here abandons cleanly — the marker is untouched and redelivery
-    // re-runs from clean state. A crash after the upsert but before the stage
-    // leaves a routing row over empty state, which a reader sees as a harmless
-    // absent value.
+    // 0. First-write publication barrier. A `Published` collection's routing
+    // row must exist before its committed state does, so publish before the
+    // stage. This must succeed: it retries until shutdown. A shutdown here
+    // abandons before anything stages, so the marker is untouched and
+    // redelivery re-runs from a clean state.
     if let PublishOutcome::ShuttingDown = publish_first_writes(&context, lifecycle).await {
         discard_uncommitted(Some(lifecycle));
         drop(permit);

@@ -8,18 +8,18 @@ use thiserror::Error;
 /// Error raised by [`StateReader`](super::StateReader) construction and its
 /// read operations.
 ///
-/// One concrete, non-generic enum for the whole reader surface: store, loader,
-/// and codec failures are type-erased at the boundary (rendered message plus a
-/// captured [`ErrorCategory`]) so the public shape stays flat and
-/// FFI-exposable — owned fields, a C-like classification, no generics or
-/// borrows in return position.
+/// One concrete, non-generic enum covers every reader failure. Store, loader,
+/// and codec errors are type-erased at the boundary into a rendered message
+/// plus a captured [`ErrorCategory`]. This keeps the public type flat and
+/// FFI-exposable: owned fields, a C-like classification, no generics or borrows
+/// in return position.
 #[derive(Debug, Error)]
 pub enum StateReaderError {
-    /// No publication rows exist for the collection yet. **Transient in every
-    /// position**: under first-write publication, zero rows is ambiguous
-    /// between a misconfigured name and a publisher that has not written yet,
-    /// and a withdrawal that empties the snapshot may be re-admitted later —
-    /// only a retry tells them apart.
+    /// No publication rows exist for the collection yet. Always transient.
+    /// Under first-write publication, zero rows cannot distinguish a
+    /// misconfigured name from a publisher that has not written yet. A
+    /// withdrawal that empties the snapshot may also be re-admitted later. Only
+    /// a retry tells these apart.
     #[error("no publication rows for {subsystem}/{name}")]
     UnknownPublication {
         /// The subsystem the reader routed under.
@@ -29,8 +29,8 @@ pub enum StateReaderError {
     },
 
     /// A source's frozen descriptor identity disagrees with the reader's
-    /// descriptor — a genuine byte-layout incompatibility. Permanent: the
-    /// deployed descriptor must match the group's frozen identity.
+    /// descriptor. This is a genuine byte-layout incompatibility. Permanent:
+    /// the deployed descriptor must match the group's frozen identity.
     #[error("descriptor identity mismatch for source group {group}")]
     IdentityMismatch {
         /// The publishing group whose frozen identity disagreed.
@@ -38,9 +38,9 @@ pub enum StateReaderError {
     },
 
     /// Publication rows exist but no source has a frozen identity yet.
-    /// Transient: identity registration structurally precedes any state write,
-    /// so a persistently dangling row is administrative residue for the
-    /// runbook, but a transient read may still recover.
+    /// Transient. Identity registration always precedes any state write, so a
+    /// row that stays dangling is leftover state for an operator to clean up. A
+    /// transient read may still recover.
     #[error("no source has a frozen identity yet for {name}")]
     IdentityUnavailable {
         /// The collection name.
@@ -72,8 +72,8 @@ pub enum StateReaderError {
     },
 
     /// The reader cannot serve this descriptor's collection. Permanent:
-    /// determined once at construction — currently a collection whose name is
-    /// empty.
+    /// determined once at construction. Currently this means a collection whose
+    /// name is empty.
     #[error("unsupported collection: {reason}")]
     Unsupported {
         /// Why the collection is unsupported.
@@ -127,11 +127,11 @@ impl ClassifyError for StateReaderError {
     }
 }
 
-/// Clamps an upstream classification to the reader's client posture:
-/// `Terminal` folds to `Transient`, everything else passes through. The reader
+/// Clamps an upstream classification to the reader's client posture.
+/// `Terminal` folds to `Transient`; everything else passes through. The reader
 /// is a leaf, FFI-exposable client with no middleware above it to consume a
-/// `Terminal` ("shut the client down" is meaningless for an ownerless
-/// cross-group reader; a faulted loader or driver may recover on a retry).
+/// `Terminal`. Shutting the client down is meaningless for an ownerless
+/// cross-group reader, and a faulted loader or driver may recover on a retry.
 /// Mirrors the owner-side fold in
 /// [`ErasedStateError::from_classified`](crate::consumer::event_context::ErasedStateError).
 fn client_category(category: ErrorCategory) -> ErrorCategory {
@@ -145,8 +145,8 @@ fn client_category(category: ErrorCategory) -> ErrorCategory {
 mod tests {
     use super::*;
 
-    /// A synthetic upstream error that classifies `Terminal` — a shut-down
-    /// Kafka loader or a scylla driver fault as they reach the reader.
+    /// A synthetic upstream error that classifies `Terminal`. It stands in for
+    /// a shut-down Kafka loader or a scylla driver fault reaching the reader.
     #[derive(Debug, Error)]
     #[error("synthetic terminal")]
     struct SyntheticTerminal;
@@ -163,13 +163,13 @@ mod tests {
     /// `Terminal`-emitting fault through the production `store`/`load`
     /// boundaries.
     ///
-    /// The clamp must hold even for a `Store` value constructed directly with a
-    /// `Terminal` category (bypassing [`StateReaderError::store`]), because the
-    /// variant and its fields are public — so `classify_error` folds on read,
-    /// not only `store(...)` on capture.
+    /// The clamp must also hold for a `Store` value constructed directly with a
+    /// `Terminal` category, bypassing [`StateReaderError::store`]. The variant
+    /// and its fields are public, so `classify_error` must fold on read, not
+    /// only `store(...)` on capture.
     ///
     /// FALSIFICATION: drop the `client_category` clamp from either the
-    /// `store(...)` capture or the `classify_error` `Store`/`Access` arms — a
+    /// `store(...)` capture or the `classify_error` `Store`/`Access` arms. A
     /// `Terminal` then reaches classification and the assert fires.
     #[test]
     fn no_variant_leaks_terminal_to_the_client() {

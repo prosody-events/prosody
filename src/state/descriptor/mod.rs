@@ -434,12 +434,12 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     #[must_use]
     fn with_collection_def(self, def: CollectionDef) -> Self;
 
-    /// Sets the collection's **durable write TTL** — the per-write Cassandra
-    /// `USING TTL` bounding how long stored state is retained — validated
-    /// against the ceiling and the recovery delay at registration. Seconds
-    /// granularity ([`CompactDuration`]), matching what Cassandra can store.
+    /// Sets the collection's durable write TTL: the per-write Cassandra
+    /// `USING TTL` that bounds how long stored state is retained. Registration
+    /// validates it against the ceiling and the recovery delay. The granularity
+    /// is seconds ([`CompactDuration`]), matching what Cassandra can store.
     ///
-    /// This governs retention only, never read freshness: the read-only
+    /// This governs retention only, never read freshness. The read-only
     /// client's cache TTL is the separate [`Self::read_cache`] policy.
     #[must_use]
     fn ttl(self, ttl: CompactDuration) -> Self {
@@ -470,10 +470,10 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
         self.with_collection_def(def)
     }
 
-    /// Sets the collection's cross-group read visibility. A reversible flag —
-    /// `.published(false)` reverts to [`StateVisibility::Private`], the first
-    /// half of a source-of-truth handoff — not a one-way opt-in. A `Published`
-    /// collection requires a configured subsystem, checked at consumer build.
+    /// Sets the collection's cross-group read visibility. The flag is
+    /// reversible: `.published(false)` reverts to [`StateVisibility::Private`].
+    /// A `Published` collection requires a configured subsystem, checked at
+    /// consumer build.
     #[must_use]
     fn published(self, published: bool) -> Self {
         let mut def = self.collection_def();

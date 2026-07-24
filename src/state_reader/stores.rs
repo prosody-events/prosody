@@ -1,10 +1,11 @@
-//! Backend carriage for the reader's stores — the **oracle-free** committed
-//! carriers plus the publication and identity control-plane stores.
+//! The reader's stores for each backend. Every backend provides committed-cell
+//! reads that bypass the commit oracle, plus its publication and identity
+//! stores.
 //!
-//! A closed enum (no `dyn`) delegates each read to the active backend. The
-//! read source is the oracle-free carriers only ([`CassandraCellResources`],
-//! [`MemoryCells`]) — never the resolving stores, the owner's write-through
-//! cache, or a dirty overlay.
+//! A closed enum (no `dyn`) delegates each read to the active backend. Reads
+//! come only from the committed-cell stores ([`CassandraCellResources`],
+//! [`MemoryCells`]). Do not read from the resolving stores, the owner's
+//! write-through cache, or a dirty overlay.
 
 use crate::state::access::StateAccessError;
 use crate::state::cassandra::{
@@ -28,27 +29,26 @@ use crate::state::tests::support::ScriptedPublicationStore;
 #[cfg(test)]
 use crate::state_reader::tests::support::{CountingIdentityStore, ScriptedCellSource};
 
-/// The reader's stores, carried as a closed enum. Each arm bundles a
-/// committed-cell carrier with the publication and identity stores of the same
-/// backend.
+/// The reader's stores as a closed enum. Each arm holds one backend's
+/// committed-cell store together with its publication and identity stores.
 #[derive(Clone)]
 pub(crate) enum ReaderStores {
     /// Cassandra-backed reader stores.
     Cassandra {
-        /// Oracle-free committed cell reads.
+        /// Committed cell reads that bypass the commit oracle.
         cells: CassandraCellResources,
-        /// Routing-row discovery.
+        /// Finds the published sources for a collection.
         publications: CassandraPublicationStore,
-        /// Frozen descriptor-identity validation.
+        /// Reads the frozen descriptor identity for validation.
         identities: CassandraDescriptorIdentityStore,
     },
     /// In-memory reader stores (mock/tests).
     Memory {
-        /// Oracle-free committed cell reads.
+        /// Committed cell reads that bypass the commit oracle.
         cells: MemoryCells,
-        /// Routing-row discovery.
+        /// Finds the published sources for a collection.
         publications: MemoryPublicationStore,
-        /// Frozen descriptor-identity validation.
+        /// Reads the frozen descriptor identity for validation.
         identities: MemoryDescriptorIdentityStore,
     },
     /// Scripted faults for the probe/refresh property tests.
@@ -58,14 +58,15 @@ pub(crate) enum ReaderStores {
         cells: ScriptedCellSource,
         /// Staged publication-row edits with injectable read faults.
         publications: ScriptedPublicationStore,
-        /// Identity store that counts reads (already-admitted no-re-read pin).
+        /// Identity store that counts reads, so a test can assert an
+        /// already-validated identity is not read again.
         identities: CountingIdentityStore,
     },
 }
 
 impl ReaderStores {
-    /// The oracle-free committed point read for `cell`, erasing the backend
-    /// error to [`StateAccessError`].
+    /// Committed point read for `cell` that bypasses the commit oracle. Maps
+    /// the backend error to [`StateAccessError`].
     pub(crate) async fn read_committed(
         &self,
         id: &CollectionId,
@@ -82,7 +83,8 @@ impl ReaderStores {
         }
     }
 
-    /// The oracle-free committed batch read, index-aligned to `batch`.
+    /// Committed batch read that bypasses the commit oracle. The result is
+    /// index-aligned to `batch`.
     pub(crate) async fn read_committed_many(
         &self,
         id: &CollectionId,
@@ -100,8 +102,8 @@ impl ReaderStores {
         }
     }
 
-    /// The oracle-free committed section scan, unified to one stream type over
-    /// [`StateAccessError`].
+    /// Committed section scan that bypasses the commit oracle. Every backend
+    /// yields the same stream type over [`StateAccessError`].
     pub(crate) fn scan_committed<'a>(
         &'a self,
         id: &'a CollectionId,

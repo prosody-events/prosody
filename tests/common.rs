@@ -143,9 +143,10 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
     TriggerStoreConfiguration::Cassandra(test_cassandra_config())
 }
 
-/// The shared Cassandra configuration for the integration suites: the local
-/// node and the pre-migrated [`TEST_KEYSPACE`]. Both the trigger-store config
-/// and the direct-read helpers build from this one literal.
+/// The Cassandra configuration shared by every integration test: the local
+/// node and the pre-migrated [`TEST_KEYSPACE`]. Both
+/// [`create_cassandra_trigger_store_config`] and the tests that open a
+/// Cassandra store directly build from this one value.
 #[must_use]
 pub fn test_cassandra_config() -> CassandraConfiguration {
     CassandraConfiguration {
@@ -159,8 +160,8 @@ pub fn test_cassandra_config() -> CassandraConfiguration {
     }
 }
 
-/// Awaits the consumer's partition assignment under a generous hang-guard,
-/// failing with a clear error rather than hanging if the rebalance stalls or
+/// Awaits the consumer's partition assignment under a generous hang-guard.
+/// Fails with a clear error instead of hanging if the rebalance stalls or
 /// only partially assigns.
 ///
 /// # Errors

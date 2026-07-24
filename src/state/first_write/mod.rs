@@ -151,10 +151,10 @@ impl PublicationBackend {
 /// cold memo entry (the first write per `(collection, topic)`), never on the
 /// steady-state path.
 ///
-/// A cheap-clone handle: the `Kafka` arm holds an `Arc<[String]>` and `Memory`
-/// a `Copy` count, so cloning the
+/// Cloning is cheap: the `Kafka` arm holds an `Arc<[String]>` and `Memory` a
+/// `Copy` count. Cloning the
 /// [`SharedDeps`](crate::state_reader::SharedDeps) bundle that carries one
-/// clones no resources.
+/// copies no resources.
 #[derive(Clone)]
 pub(crate) enum PartitionCounts {
     /// Fetch the count from a Kafka broker.
@@ -218,7 +218,7 @@ struct PublicationMemoKey {
 }
 
 /// Everything the barrier needs except the per-partition topic — shared across
-/// all sessions a state-manager provider mints. Cloning shares the `Arc`s (the
+/// all sessions a state-manager provider opens. Cloning shares the `Arc`s (the
 /// memo included), so the memo dedups across every session of one provider.
 #[derive(Clone)]
 pub(crate) struct PublisherTemplate {
@@ -249,10 +249,9 @@ impl PublisherTemplate {
         )
     }
 
-    /// Builds the template with an explicit memo capacity — the eviction test
-    /// drives a tiny memo to prove a re-run after eviction (the RAM-bound
-    /// guard); production always uses [`PUBLICATION_MEMO_CAPACITY`] via
-    /// [`Self::new`].
+    /// Builds the template with an explicit memo capacity. The eviction test
+    /// uses a tiny memo to prove the barrier re-runs after an entry is evicted.
+    /// Production always uses [`PUBLICATION_MEMO_CAPACITY`] via [`Self::new`].
     pub(crate) fn with_memo_capacity(
         subsystem: SubsystemName,
         group: Arc<str>,
@@ -280,7 +279,7 @@ impl PublisherTemplate {
     }
 }
 
-/// The per-session first-write publisher: a [`PublisherTemplate`] pinned to the
+/// The per-session first-write publisher: a [`PublisherTemplate`] bound to the
 /// session's topic. Cloned into each session; cheap (all `Arc`s).
 #[derive(Clone)]
 pub(crate) struct FirstWritePublisher {
@@ -298,18 +297,17 @@ impl FirstWritePublisher {
     /// state could exist with no routing row to advertise it. Today those
     /// channels are the settle boundary's publication step
     /// (`publish_first_writes` in `settle.rs`) and the mid-handler
-    /// `commit()` path (`session/mod.rs`); any new durable-write channel
+    /// `commit()` path in `session/mod.rs`. Any new durable-write channel
     /// added for published state must call the barrier first too.
     ///
     /// For a `Published`, cold-memo `(collection, topic)` the sequence is:
     /// 1. fetch the topic's live partition count (must ride the caller's retry
     ///    posture);
-    /// 2. **best-effort** own-row read for the `StableRouting` tripwire — a
-    ///    read failure skips it and never gates (the blind upsert in step 3 is
-    ///    the real overwrite, so gating on a decode that a single corrupt
-    ///    sibling row can poison is both unnecessary and dangerous). A stored
-    ///    count that differs from the live count is logged at `error!` and the
-    ///    row is overwritten with the live count (see below);
+    /// 2. **best-effort** own-row read to detect a changed partition count. A
+    ///    read failure skips it and never blocks the upsert, since step 3
+    ///    overwrites the row regardless. A stored count that differs from the
+    ///    live count is logged at `error!` and the row is overwritten with the
+    ///    live count (see below);
     /// 3. blind idempotent upsert of `{group, topic, live_count}` — this is the
     ///    barrier;
     /// 4. latch the memo, **only after** the upsert is acknowledged.
@@ -318,13 +316,13 @@ impl FirstWritePublisher {
     /// is what makes reconciliation's removal final.
     ///
     /// **Partition counts are assumed fixed for the topic's lifetime.** A key's
-    /// routing partition is derived from the count in its routing row, so a
-    /// changed count reroutes every key: keys written under the previous count
-    /// become unreachable to owner and readers alike (the owner's own routing
-    /// moves with the count too). The step-2 tripwire *detects* this divergence
-    /// and overwrites the row so readers stay consistent with the owner's
-    /// post-expansion view — but it cannot *repair* the stranded keys.
-    /// Partition expansion on topics backing keyed state is unsupported.
+    /// routing partition is derived from the count in its routing row. A
+    /// changed count therefore reroutes every key, so keys written under
+    /// the previous count become unreachable to both the owner and its
+    /// readers. Step 2 detects this divergence and overwrites the row,
+    /// keeping readers consistent with the owner's new view. It cannot
+    /// recover the stranded keys. Partition expansion on topics backing
+    /// keyed state is unsupported.
     ///
     /// # Errors
     ///
@@ -349,15 +347,11 @@ impl FirstWritePublisher {
             return Ok(());
         }
         let live = t.counts.live_count(self.topic.as_ref()).await?;
-        // StableRouting tripwire: a decoded own row whose stored count differs
-        // from the live count means the topic's partition count changed since
-        // the row was written — unsupported, because keys route by that count
-        // (see the invariant on this method). Overwrite with the live count so
-        // readers stay consistent with the owner's post-expansion view (the
-        // owner's own old-count keys are unreachable too), and log the
-        // divergence loudly: the tripwire detects the misconfiguration but
-        // cannot recover the stranded keys. A read error skips the diagnostic;
-        // the blind upsert below still overwrites.
+        // Detect a changed partition count. A stored own-row count that differs
+        // from the live count means the topic was repartitioned, which is
+        // unsupported (see this method's doc). Log it as an error. The blind
+        // upsert below overwrites the row with the live count either way. A read
+        // error skips this check.
         if let Ok(rows) = t
             .store
             .read_publications(&t.subsystem, state_type, name)
@@ -395,11 +389,11 @@ impl FirstWritePublisher {
 ///
 /// Only private names are swept. A name un-published via `.published(false)`
 /// becomes [`StateVisibility::Private`], so [`is_published`] returns false and
-/// the retired name is still swept; a name that remains `Published` keeps its
-/// row across restart so a reader never loses discoverability of that
-/// collection's still-committed state (sweeping it would delete the row until
+/// the retired name is swept. A name that remains `Published` keeps its row
+/// across restart, so a reader never loses discoverability of that collection's
+/// still-committed state. Sweeping a published name would delete its row until
 /// the next durable write to that `(collection, topic)`, an unbounded window
-/// for a quiescent published collection). Rows of *other* groups are left
+/// for a quiescent published collection. Rows of *other* groups are left
 /// untouched.
 ///
 /// [`StateVisibility::Private`]: crate::state::registry::StateVisibility::Private
@@ -423,9 +417,8 @@ pub(crate) async fn reconcile_publications(
 ) -> Result<(), PublicationError> {
     // Own the registered set up front: streaming borrowed registry items into
     // the awaits below would keep the registry borrowed across `.await`.
-    // Routing rows are addressed by `(subsystem, state_type, name)` — the same
-    // `(state_type, name)` namespacing as the registry — so the private-name
-    // sweep addresses each collection exactly.
+    // Routing rows use the same `(state_type, name)` namespacing as the
+    // registry, so the private-name sweep addresses each collection exactly.
     let collections: Vec<(StateType, StateName)> = registry
         .collections()
         .filter(|(state_type, name)| !registry.is_published(*state_type, name))

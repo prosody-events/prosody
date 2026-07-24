@@ -110,9 +110,9 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     producer.send([], topic, key, payload_duplicate).await?;
 
     // Always shut the consumer down and delete the topic before propagating a
-    // failure — an early return would leave the consumer's client threads alive
-    // and hang the test binary, and orphan the UUID-named topic in the shared
-    // cluster.
+    // failure. An early return would leave the consumer's client threads alive
+    // and hang the test binary, and it would leak the UUID-named topic in the
+    // shared cluster.
     let outcome = async {
         // Only the first message should be processed.
         let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;

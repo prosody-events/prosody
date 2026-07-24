@@ -55,10 +55,9 @@ pub enum CommitMode {
 }
 
 /// Whether a collection's committed state is discoverable by cross-group
-/// readers. Runtime-only policy — never part of the frozen
-/// [`StructuralIdentity`] and never persisted, so a collection can be published
-/// and un-published across redeploys with no migration (un-publishing is the
-/// first half of a source-of-truth handoff).
+/// readers. Runtime-only policy: never part of the frozen
+/// [`StructuralIdentity`] and never persisted. A collection can be published
+/// and un-published across redeploys with no migration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StateVisibility {
     /// Not discoverable outside the owning consumer group (the default).
@@ -67,23 +66,22 @@ pub enum StateVisibility {
 
     /// Discoverable by cross-group readers through the publication table.
     ///
-    /// Retiring a published collection MUST go through `.published(false)` with
-    /// the registration and the consumer's `subsystem` **retained** for one
-    /// stop-then-start deploy: startup reconciliation only sweeps the routing
-    /// rows of still-registered, `Private`, subsystem-configured names.
-    /// Deleting the registration outright, or dropping the `subsystem`
-    /// config, strands the `(subsystem, name)` routing row — and with `TTL
-    /// = None` the stranded row (and its cells) stay
-    /// cross-group-discoverable indefinitely.
+    /// To retire a published collection, set `.published(false)` but keep both
+    /// its registration and the consumer's `subsystem` for one stop-then-start
+    /// deploy. Startup reconciliation only sweeps the routing rows of names
+    /// that are still registered, now `Private`, and have a configured
+    /// subsystem. Deleting the registration or dropping the `subsystem` config
+    /// strands the `(subsystem, name)` routing row. With `TTL = None` that
+    /// stranded row and its cells stay discoverable by cross-group readers
+    /// indefinitely.
     Published,
 }
 
 /// Operational per-collection settings.
 ///
-/// Carries the collection's per-write operational settings — TTL,
-/// [`CommitMode`], recovery-convergence bound, and the runtime read policy
-/// (visibility and cache) — each detailed on its field below. `ttl` is `None`
-/// for
+/// Carries the collection's operational settings: TTL, [`CommitMode`],
+/// recovery-convergence bound, and the runtime read policy (visibility and
+/// cache TTL). Each is detailed on its field below. `ttl` is `None` for
 /// "do not bind a TTL" (explicit indefinite retention); a `Some(ttl)` over
 /// Cassandra's `USING TTL` ceiling is rejected at
 /// `CollectionDefRegistry::register` time, never silently collapsed.
@@ -146,8 +144,7 @@ pub struct CollectionDef {
     /// `NonZeroUsize` keeps `capacity = 0` unrepresentable.
     pub capacity: Option<NonZeroUsize>,
 
-    /// Cross-group read visibility. Runtime-only policy, never part of the
-    /// frozen [`StructuralIdentity`] — see [`StateVisibility`]. A `Published`
+    /// Cross-group read visibility; see [`StateVisibility`]. A `Published`
     /// collection requires a configured subsystem, enforced at consumer build
     /// ([`RegisterStateError::PublishedWithoutSubsystem`]).
     pub visibility: StateVisibility,
@@ -155,11 +152,11 @@ pub struct CollectionDef {
     /// The read-only client's cache TTL: how long a `StateReader` may serve
     /// this collection's reads from its cache before re-reading the store.
     /// `None` (the default) means every read hits the durable store.
-    /// Runtime-only, like [`StateVisibility`], and consumed solely by the
-    /// reader from its own descriptor — inert on the owning consumer, and
-    /// unrelated to the durable write [`ttl`](Self::ttl). Sub-second TTLs are
-    /// supported; a TTL that truncates to zero milliseconds is rejected at
-    /// reader construction, where the policy is consumed.
+    /// Runtime-only, like [`StateVisibility`]. The reader consumes it from its
+    /// own descriptor; it is inert on the owning consumer and unrelated to the
+    /// durable write [`ttl`](Self::ttl). Sub-second TTLs are supported. A TTL
+    /// that truncates to zero milliseconds is rejected at reader construction,
+    /// where the policy is consumed.
     pub read_cache_ttl: Option<Duration>,
 }
 
@@ -315,9 +312,9 @@ impl CollectionDefRegistry {
         })
     }
 
-    /// Whether `(state_type, name)` is registered `Published` — the write-path
-    /// visibility gate the first-write publisher consults before upserting a
-    /// routing row. An unregistered name is never published.
+    /// Whether `(state_type, name)` is registered as `Published`. The
+    /// first-write publisher consults this before upserting a routing row. An
+    /// unregistered name is never published.
     #[must_use]
     pub(crate) fn is_published(&self, state_type: StateType, name: &StateName) -> bool {
         self.lookup_collection(state_type, name)
@@ -522,11 +519,11 @@ mod tests {
     use color_eyre::eyre::Result;
 
     /// A `Published` collection registered under a non-`Application` state type
-    /// is rejected at the single registration choke point: publication routing
-    /// rows carry no `state_type` and the reader addresses `Application` cells
-    /// only, so any other type would be unaddressable. Proven with the
-    /// `#[cfg(test)]` `Framework` state type; the `Application` arm shows the
-    /// guard is state-type specific, not a blanket published ban.
+    /// is rejected at registration. Publication routing rows carry no
+    /// `state_type`, and the reader addresses `Application` cells only, so any
+    /// other type would be unaddressable. The test uses the `#[cfg(test)]`
+    /// `Framework` state type. Its `Application` arm shows the guard is
+    /// specific to the state type, not a blanket ban on publishing.
     #[test]
     fn published_non_application_state_type_rejected() -> Result<()> {
         let identity = value_state::<JsonCodec>("cart").structural_identity();

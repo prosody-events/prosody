@@ -1,18 +1,18 @@
 //! The public standalone reader.
 //!
-//! [`StateReader`] is the cross-group read entry point: given a published
+//! [`StateReader`] is the cross-group read entry point. Given a published
 //! collection's descriptor and the subsystem it routes under, it discovers the
-//! collection's publication sources, validates each source's frozen identity
-//! against the descriptor, and answers reads against the **committed** state of
-//! at most one source per operation (probe-and-pin; see
+//! collection's publication sources and validates each source's frozen identity
+//! against the descriptor. Reads observe the **committed** state of at most one
+//! source per operation (probe-and-pin; see
 //! [`ReadSession`](super::session::ReadSession)).
 //!
-//! The read methods carry **zero per-descriptor logic**: each mints a
+//! The read methods carry **zero per-descriptor logic**. Each builds a
 //! [`ReadSession`], binds the descriptor to it, and delegates to the resulting
-//! collection handle — the same handle the owning consumer's handlers use, so
-//! owner and reader share one read implementation. A Kafka-message-ref
-//! descriptor rides the identical path because the session's loader is a
-//! [`ReaderLoader`].
+//! collection handle. That handle is the same one the owning consumer's
+//! handlers use, so owner and reader share one read implementation. A
+//! descriptor backed by a Kafka message reference takes the same path because
+//! the session's loader is a [`ReaderLoader`].
 
 use crate::Key;
 use crate::codec::Codec;
@@ -53,18 +53,18 @@ const DEFAULT_REFRESH_INTERVAL_MS: u64 = 60_000;
 /// The reader's cached view of a collection's publication sources plus the
 /// wall-clock instant the view was last refreshed.
 ///
-/// The snapshot is an `Option`: an **absent** snapshot (no admitted source, or
-/// an emptied routing table) is stored as `None`, never as an empty
-/// [`ValidatedPublications`], so the non-empty invariant on the validated
-/// snapshot is structural.
+/// The snapshot is an `Option`. An **absent** snapshot is stored as `None`,
+/// never as an empty [`ValidatedPublications`]. Absence means no admitted
+/// source, or an emptied routing table. This keeps the non-empty invariant on
+/// the validated snapshot structural.
 struct SnapshotState {
     snapshot: Option<Arc<ValidatedPublications>>,
-    /// A present-but-unequal identity observed at the last refresh, held sticky
-    /// until the next refresh re-reads. `IdentityMismatch` is a Permanent
-    /// misconfiguration, so it must surface on **every** read within the
-    /// refresh interval — never be masked by the admitted (valid) subset served
-    /// from the cached snapshot. A clean refresh clears it; a re-validated
-    /// refresh recovers automatically.
+    /// An identity that was present but did not match, observed at the last
+    /// refresh and held until the next refresh re-reads. `IdentityMismatch` is
+    /// a Permanent misconfiguration. It must surface on **every** read within
+    /// the refresh interval, never masked by the valid subset served from the
+    /// cached snapshot. A refresh that re-reads and re-validates clears it
+    /// automatically.
     mismatch: Option<String>,
     refreshed_at_ms: u64,
 }
@@ -83,16 +83,18 @@ struct Admission {
 ///
 /// Built from a [`SharedDeps`] bundle with [`StateReader::new`]. Reads observe
 /// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
-/// of one source per operation, with honest bounded staleness. The descriptor's
-/// read-cache TTL bounds one staleness source (a cached value's age); a
-/// second, independent source is the owner's commit→apply window — a
-/// once-committed value read before the owner applies a committed-yet-unapplied
-/// change (see `project_committed` above), which converges via the owner's
-/// recovery sweep or its next commit, not via the read cache. The reader is
-/// generic over the collection
-/// descriptor `D` and the message codec `C`; the read methods live in
-/// descriptor-specialized impl blocks (Value, Map, Deque), each a thin bind +
-/// delegate over the shared read machinery.
+/// of one source per operation, with honest bounded staleness. Two independent
+/// sources bound that staleness. The descriptor's read-cache TTL bounds a
+/// cached value's age. The owner's commit-to-apply window bounds the second: a
+/// value can be committed before the owner applies it, so a read may return
+/// that once-committed value early (see `project_committed` above). The second
+/// source converges via the owner's recovery sweep or its next commit, not via
+/// the read cache.
+///
+/// The reader is generic over the collection descriptor `D` and the message
+/// codec `C`. The read methods live in descriptor-specialized impl blocks for
+/// Value, Map, and Deque. Each is a thin bind-and-delegate over the shared read
+/// machinery.
 pub struct StateReader<D, C: Codec> {
     descriptor: D,
     subsystem: SubsystemName,
@@ -119,7 +121,7 @@ where
     /// under `subsystem`.
     ///
     /// The heavy handles (backend stores, message loader, byte-budgeted cache)
-    /// are cloned from `deps`, so composing one bundle and minting several
+    /// are cloned from `deps`, so composing one bundle and building several
     /// readers shares one session and cache. The descriptor's read-cache TTL
     /// and its collection name are validated here — the two
     /// construction-time failures.
@@ -181,21 +183,23 @@ where
     ///
     /// Refresh follows a three-outcome rule:
     ///
-    /// * a **failed** routing-table read keeps the previous acquisition outcome
-    ///   — a held snapshot is returned, but a known sticky mismatch still
-    ///   outranks it (see below), else the read error propagates;
-    /// * a **successful** read applies withdrawals unconditionally — a source
-    ///   no longer advertised is dropped without consulting its identity — and
-    ///   validates identity only for sources whose group is newly admitted, so
-    ///   an already-admitted source is never re-validated;
-    /// * an **emptied** routing table (or one whose every source lacks a frozen
-    ///   identity) stores the absence and fails, so a later read can re-admit.
+    /// * a **failed** routing-table read keeps the previous acquisition
+    ///   outcome. A held snapshot is returned. A known sticky mismatch still
+    ///   outranks that snapshot (see below); otherwise the read error
+    ///   propagates.
+    /// * a **successful** read applies withdrawals unconditionally: a source no
+    ///   longer advertised is dropped without consulting its identity. It
+    ///   validates identity only for newly admitted groups, so an
+    ///   already-admitted source is never re-validated.
+    /// * an **emptied** routing table stores the absence and fails, so a later
+    ///   read can re-admit. A table whose every source lacks a frozen identity
+    ///   is treated the same.
     ///
-    /// A present-but-unequal identity fails the whole acquisition
-    /// ([`StateReaderError::IdentityMismatch`], Permanent) and is held sticky
-    /// (see [`SnapshotState::mismatch`]) so it surfaces on every read until a
-    /// successful refresh clears it; a missing identity skips that source with
-    /// a `warn!`.
+    /// An identity that is present but does not match fails the whole
+    /// acquisition with [`StateReaderError::IdentityMismatch`] (Permanent). It
+    /// is held sticky so it surfaces on every read until a successful refresh
+    /// clears it (see [`SnapshotState::mismatch`]). A missing identity skips
+    /// that source with a `warn!`.
     ///
     /// The `snapshot` mutex is held across [`Self::refresh`]'s network I/O on
     /// purpose: it single-flights the refresh so only one read re-reads the
@@ -236,11 +240,11 @@ where
             .await
         {
             Ok(rows) => rows,
-            // A failed read keeps the previous acquisition OUTCOME untouched —
+            // A failed read keeps the previous acquisition outcome untouched,
             // not merely its admitted subset. A known Permanent mismatch
-            // outranks that subset: a transient outage is no evidence the
-            // mismatch was repaired, so it stays sticky through the outage
-            // rather than being demoted to `Ok(subset)`.
+            // outranks that subset. A transient outage is no evidence the
+            // mismatch was repaired, so the mismatch stays sticky through the
+            // outage.
             Err(error) => return held_or_error(state.mismatch.as_deref(), prior, error),
         };
 
@@ -253,18 +257,17 @@ where
 
         let admission = match self.admit(&rows, prior.as_deref()).await {
             Ok(admission) => admission,
-            // An identity-read failure mid-admit is a transient outage on the
-            // same footing as a failed routing read: no evidence a known sticky
-            // mismatch was repaired, so it must not mask it (nor demote a held
-            // snapshot to a bare error).
+            // An identity-read failure mid-admit is a transient outage, on the
+            // same footing as a failed routing read. It is no evidence a known
+            // sticky mismatch was repaired, so it must not mask that mismatch,
+            // nor demote a held snapshot to a bare error.
             Err(error) => return held_or_error(state.mismatch.as_deref(), prior, error),
         };
 
-        // Withdrawals took effect on `admitted` regardless of outcome; store it
-        // (or its absence) before surfacing a mismatch so a later refresh sees
-        // the withdrawal. The mismatch is recorded sticky so every read within
-        // the interval re-surfaces it (see [`SnapshotState::mismatch`]); a clean
-        // refresh clears it.
+        // Withdrawals took effect on `admitted` regardless of outcome. Store it
+        // (or its absence) before surfacing a mismatch, so a later refresh sees
+        // the withdrawal. Record the mismatch as sticky (see
+        // [`SnapshotState::mismatch`]).
         state.snapshot = if admission.admitted.is_empty() {
             None
         } else {
@@ -376,8 +379,8 @@ where
 
     /// Classifies a new group's already-read frozen identity, recording a
     /// mismatch or missing identity in `admission`; returns whether the group
-    /// is admitted. Pure (no I/O) — the read runs concurrently in
-    /// [`Self::admit`].
+    /// is admitted. This function does no I/O. The identity read runs
+    /// concurrently in [`Self::admit`].
     fn classify_identity(
         &self,
         stored: Option<DurableDescriptorIdentity>,
@@ -407,9 +410,9 @@ where
         }
     }
 
-    /// Mints a per-operation [`ReadSession`] over the current snapshot, with a
-    /// fresh source pin. Rejects an empty key before mint — an empty/NULL key
-    /// has no deterministic partition to route to.
+    /// Builds a per-operation [`ReadSession`] over the current snapshot, with a
+    /// fresh source pin. Rejects an empty key first: an empty or NULL key has
+    /// no deterministic partition to route to.
     async fn session(&self, key: Key) -> Result<ReadSession<C>, StateReaderError> {
         if key.is_empty() {
             return Err(StateReaderError::EmptyKey);
@@ -442,11 +445,11 @@ fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
     Ok(())
 }
 
-/// The held-snapshot fallback shared by the two refresh failure paths — a
+/// The held-snapshot fallback shared by the two refresh failure paths: a
 /// failed routing-table read and a failed identity admission. A known sticky
-/// mismatch outranks everything (a transient outage is no evidence it was
-/// repaired), a held snapshot beats a bare error, and only a first-ever failure
-/// with nothing held propagates the error.
+/// mismatch outranks everything, since a transient outage is no evidence it was
+/// repaired. Otherwise a held snapshot beats a bare error. Only a first-ever
+/// failure with nothing held propagates the error.
 fn held_or_error(
     mismatch: Option<&str>,
     prior: Option<Arc<ValidatedPublications>>,

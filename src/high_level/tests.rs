@@ -347,15 +347,17 @@ fn registrations_survive_resubscribe_cycle() -> Result<()> {
     })
 }
 
-/// `unsubscribe` drops the retained bundle so a later `subscribe` rebuilds a
-/// fresh one. The bundle's heartbeat registry holds the running consumer's
-/// poll-loop heartbeat; that heartbeat stops beating at shutdown, so reusing
-/// the registry across a resubscribe would fold a permanently-dead heartbeat
-/// into `is_stalled` and grow the registry without a removal path. Proven by
-/// the bundle being cleared on `unsubscribe` and by the `SharedDeps`
-/// construction id changing across the cycle. Falsify by retaining `self.deps`
-/// through `unsubscribe`: the bundle survives (first assert red) and the id is
-/// reused (second assert red).
+/// `unsubscribe` drops the retained bundle so the next `subscribe` builds a
+/// fresh one. The bundle's heartbeat registry tracks the running consumer's
+/// poll-loop heartbeat, which stops beating at shutdown. Reusing the bundle
+/// across a resubscribe would leave that dead heartbeat in `is_stalled` and
+/// grow the registry with no way to remove it.
+///
+/// This test checks two things: the bundle is cleared on `unsubscribe`, and
+/// the `SharedDeps` construction id changes across the resubscribe cycle. If
+/// `unsubscribe` retained `self.deps` instead, the bundle would survive and
+/// fail the first assertion. The construction id would then repeat and fail
+/// the second.
 #[test]
 fn unsubscribe_rebuilds_bundle_on_resubscribe() -> Result<()> {
     let fixture = create_test_client::<NoOpHandler>("resubscribe-fresh-bundle", None)?;
@@ -377,7 +379,7 @@ fn unsubscribe_rebuilds_bundle_on_resubscribe() -> Result<()> {
             "unsubscribe must drop the retained bundle"
         );
 
-        // A reader minted after the cycle draws from a freshly built bundle.
+        // A reader built after the cycle draws from the freshly built bundle.
         let second = fixture
             .client
             .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
@@ -391,16 +393,16 @@ fn unsubscribe_rebuilds_bundle_on_resubscribe() -> Result<()> {
     })
 }
 
-/// Builds a `SubsystemName`, surfacing the (non-`eyre`) name error.
+/// Builds a `SubsystemName`, converting its error into `eyre`.
 fn subsystem(name: &str) -> Result<SubsystemName> {
     SubsystemName::try_new(name).map_err(|error| eyre!("subsystem name: {error}"))
 }
 
-/// `state()` before and after `subscribe` draw from ONE retained bundle: the
-/// reader minted while `Configured` and the reader minted while `Running` carry
-/// the same `SharedDeps` construction id, proving the client builds the bundle
-/// once and reuses it across the state transition (and hands that same bundle
-/// to the consumer it starts).
+/// `state()` builds one bundle and reuses it across `subscribe`. The reader
+/// built while `Configured` and the reader built while `Running` carry the
+/// same `SharedDeps` construction id, proving the client reuses the bundle
+/// instead of building a second one. The consumer started by `subscribe`
+/// receives that same bundle.
 #[test]
 fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
     let fixture = create_test_client::<NoOpHandler>("share-one-bundle", None)?;
@@ -432,22 +434,26 @@ fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
     })
 }
 
-/// The owning group whose committed `cart` the reader admits.
+/// The consumer group under which the committed `cart` value is published.
 const GROUP: &str = "group-aaa";
 
-/// A reader minted from the client observes committed state present in the
-/// client's ONE retained `SharedDeps` bundle — the same in-memory cell store
-/// the running consumer holds — proving `client.state()` composes readers over
-/// the consumer's shared stores rather than a second set.
+/// A reader built from the client observes committed state in the client's
+/// single retained `SharedDeps` bundle. That bundle holds the same in-memory
+/// cell store the running consumer holds, so this proves `client.state()`
+/// composes readers over the consumer's shared stores instead of a separate
+/// set.
 ///
-/// A faithful end-to-end variant would drive the write through a produced Kafka
-/// record; the in-process mock cluster delivers no records (nor serves admin
-/// topic creation), so the committed write is seeded directly into the retained
-/// bundle's shared stores through the real owner `KeyedStateSession`
-/// (finalize then promote) — the reader suite's seeding — and read back through
-/// a reader the client composes. Falsify by breaking the bundle memoization (a
-/// fresh bundle per `state()`): the reader then reads empty stores and the
-/// assert goes red.
+/// A faithful end-to-end version of this test would drive the write through a
+/// produced Kafka record. The in-process mock cluster cannot do that: it
+/// delivers no records and does not serve admin topic creation. Instead this
+/// test seeds the committed write directly into the retained bundle's shared
+/// stores, using the same owner `KeyedStateSession` path (finalize then
+/// promote) as the reader-suite seeding helpers. It then reads the value back
+/// through a reader the client composes.
+///
+/// Falsify by breaking the bundle memoization so `state()` builds a fresh
+/// bundle every call: the reader would then read empty stores and the
+/// assertion would fail.
 #[test]
 fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
     let fixture = create_test_client::<NoOpHandler>("shared-bundle-ryow", None)?;
@@ -455,7 +461,8 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
         // Start the consumer so the retained bundle is the one it holds.
         fixture.client.subscribe(NoOpHandler).await?;
 
-        // Collect the scenario into a Result so shutdown runs on every path.
+        // Run the scenario in a block that returns Result, so shutdown below
+        // always runs, even if the scenario fails.
         let outcome: Result<()> = async {
             // The bundle the running consumer and the client's readers share.
             let deps = fixture

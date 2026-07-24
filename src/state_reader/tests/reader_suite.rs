@@ -1,31 +1,34 @@
-//! The backend-generic committed-read trace runner — the reader analogue of
+//! The backend-generic committed-read trace runner, the reader analogue of
 //! [`cell_suite`](crate::state::tests::cell_suite)'s `run_*_trace` family.
 //!
-//! Each runner drives a generated multi-event trace: every event is committed
-//! through the **real** owner
-//! [`KeyedStateSession`](crate::state::session::KeyedStateSession)
-//! (via [`owner_commit_cell`]), the same ops advance a plain
-//! `Option`/`BTreeMap`/`VecDeque` model, and after **every** event a freshly
-//! minted [`StateReader`] must answer point `get`, `get_many`, `stream`
-//! (forward and backward), and `len` exactly as the model — the
-//! committed==oracle invariant. Written once over a generic
-//! [`ReaderBackend`] and instantiated for both the memory reader
-//! (`reader_tests`) and a **live-Cassandra** reader (`cassandra_tests`).
+//! Each runner drives a generated multi-event trace. Every event is committed
+//! through the real owner
+//! [`KeyedStateSession`](crate::state::session::KeyedStateSession) via
+//! [`owner_commit_cell`], and the same ops advance a plain
+//! `Option`/`BTreeMap`/`VecDeque` model in lockstep. After every event, a
+//! freshly created [`StateReader`] must answer point `get`, `get_many`,
+//! `stream` (forward and backward), and `len` exactly as the model does. That
+//! is the invariant the whole suite checks: a committed read always matches
+//! the model. The runner is written once over a generic [`ReaderBackend`]. It
+//! is instantiated for the memory reader in `reader_tests` and for a
+//! live-Cassandra reader in `cassandra_tests`.
 //!
 //! The trace generators are reused wholesale from
 //! [`collection_suite`](crate::state::tests::collection_suite) (`MapOp`,
-//! `DequeOp`, `Trace`, `KEY_POOL`); only the degenerate [`ValueOp`] is new,
-//! since a Value has no removal. The runner ignores the generators' mid-handler
-//! `Commit`/`Get` ops — a reader observes committed state, and the runner
-//! promotes every event — so no new outcome path is generated.
+//! `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is new,
+//! since a Value has no removal. The runner ignores the generators'
+//! mid-handler `Commit`/`Get` ops. A reader only observes committed state, and
+//! the runner already promotes every event, so those ops add no new outcome
+//! to check.
 //!
-//! Witness guarantee (why the "drop first scan yield" falsification cannot
-//! false-pass by shrinking to empty): the ordered `stream` is asserted against
-//! the ordered model after **every** event, empty or not. Map/Deque generators
-//! are weighted toward `Set`/`Push`, so a non-empty, ordered, multi-entry state
-//! recurs; a counterexample keeps its witness because `Trace` shrink preserves
-//! event structure. An empty read is itself a real assertion (`stream` yields
-//! nothing, `get` is `None`).
+//! One property needs a note. A bug that only shows up on a non-empty scan
+//! must not be able to hide by shrinking its counterexample down to an empty
+//! trace. The ordered `stream` is asserted against the ordered model after
+//! every event, empty or not. The Map and Deque generators are weighted
+//! toward `Set`/`Push`, so a non-empty, ordered, multi-entry state keeps
+//! recurring. A counterexample keeps its witness because `Trace` shrink
+//! preserves event structure. An empty read is still a real assertion:
+//! `stream` yields nothing and `get` returns `None`.
 
 use super::support::{
     OwnerSession, ReaderBackend, collect_stream, owner_commit_cell, source_state_key, state_name,
@@ -48,9 +51,9 @@ use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 
-/// The fixed namespace one trace runs under: the routing coordinates the owner
-/// writes and the reader recomputes. Bundled so a runner takes one argument
-/// instead of five.
+/// The fixed routing coordinates one trace runs under. The owner writes
+/// through them and the reader independently recomputes them. Bundled so a
+/// runner takes one argument instead of five.
 pub(crate) struct ReaderCase<'a> {
     /// The subsystem the collection routes under.
     pub(crate) sub: &'a SubsystemName,
@@ -65,9 +68,9 @@ pub(crate) struct ReaderCase<'a> {
 }
 
 /// A degenerate value mutation: overwrite with a JSON number. A Value has no
-/// removal, so `Set` is the whole alphabet — enough for the committed
-/// round-trip (the reader either observes the last committed value or `None`
-/// before the first commit).
+/// removal, so `Set` is the only op a trace can generate. That is enough to
+/// check the committed round-trip: the reader either observes the last
+/// committed value, or `None` before the first commit.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ValueOp {
     /// Overwrite the committed value with `Value::from(b)`.
@@ -85,9 +88,9 @@ impl Arbitrary for ValueOp {
     }
 }
 
-/// Seeds the publication + frozen identity for `descriptor` so the reader
-/// admits the case's source, then returns the segment-qualified state key the
-/// owner writes under (and the reader recomputes).
+/// Publishes `descriptor`'s routing and freezes its identity so the reader
+/// will admit this case's source. Returns the segment-qualified state key the
+/// owner writes to, the same key the reader independently recomputes.
 async fn seed_source<B, D>(backend: &B, descriptor: D, case: &ReaderCase<'_>) -> Result<StateKey>
 where
     B: ReaderBackend,
@@ -240,13 +243,13 @@ async fn assert_map<B: ReaderBackend>(
 ///
 /// FALSIFICATION: perturb the reader's committed point read
 /// (`ReaderStores::read_committed`/`read_committed_many`) to drop or misorder
-/// an entry → the tracked-keyset `stream`/`get_many` diverges from the model on
-/// the first non-empty event. The wide committed-scan arm the keyset overflow
-/// falls back to is out of this property's reach (`KEY_POOL` stays under the
-/// keyset limit) and is covered separately — memory by
-/// [`scan_reads_only_pinned_source`](super::probe_tests), Cassandra by
-/// [`reader_deque_scan_committed`](super::cassandra_tests); do not re-add scan
-/// here.
+/// an entry → the keyset-backed `stream`/`get_many` diverges from the model on
+/// the first non-empty event. This property never reaches the wide
+/// committed-scan arm that keyset overflow falls back to, since `KEY_POOL`
+/// stays under the keyset limit. That fallback is covered separately: by
+/// [`scan_reads_only_pinned_source`](super::probe_tests) for memory, and by
+/// [`reader_deque_scan_committed`](super::cassandra_tests) for Cassandra. Do
+/// not re-add a scan case here.
 pub(super) async fn run_reader_map_trace<B: ReaderBackend>(
     backend: &B,
     descriptor: MapDescriptor<I64KeyCodec, JsonCodec>,
@@ -327,8 +330,9 @@ fn model_deque_ops(model: &mut VecDeque<Value>, ops: &[DequeOp]) {
     }
 }
 
-/// Asserts the reader's `len`, front-relative `get` (incl. the one-past-the-end
-/// `None`), and ordered `stream` (forward and backward) equal the `VecDeque`.
+/// Asserts the reader's `len`, front-relative `get`, and ordered `stream`
+/// (forward and backward) equal the `VecDeque` model. `get` is also checked
+/// one past the end, where it must return `None`.
 async fn assert_deque<B: ReaderBackend>(
     backend: &B,
     descriptor: DequeDescriptor<JsonCodec>,
@@ -362,13 +366,14 @@ async fn assert_deque<B: ReaderBackend>(
 /// Drives a Deque trace: commit each event's push/pop/clear, mirror into a
 /// `VecDeque`, and after every event assert the reader matches the model.
 ///
-/// FALSIFICATION: shifting the front-relative index in the reader's deque `get`
-/// → element 0 diverges; dropping the first entry of the deque stream's batch
-/// point read → the forward stream loses its front. The wide committed-scan
-/// fallback is out of reach (trace deques stay under
-/// `DEQUE_POINT_ITERATION_MAX`) and is covered by the live-Cassandra witness
-/// [`reader_deque_scan_committed`](super::cassandra_tests); do not re-add scan
-/// here.
+/// FALSIFICATION: shift the front-relative index in the reader's deque `get`
+/// → element 0 diverges. Drop the first entry of the deque stream's batch
+/// point read → the forward stream loses its front. This property never
+/// reaches the wide committed-scan fallback, since trace deques stay under
+/// `DEQUE_POINT_ITERATION_MAX`. That fallback is covered by the
+/// live-Cassandra witness
+/// [`reader_deque_scan_committed`](super::cassandra_tests). Do not re-add a
+/// scan case here.
 pub(super) async fn run_reader_deque_trace<B: ReaderBackend>(
     backend: &B,
     descriptor: DequeDescriptor<JsonCodec>,

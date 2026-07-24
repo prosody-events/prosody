@@ -115,9 +115,9 @@ pub(crate) fn test_session_with_armed(
     (KeyedStateSession::new(parts), cell_store)
 }
 
-/// Like [`test_session_parts`] but wires a first-write [`FirstWritePublisher`]
-/// into the session, so the settle-boundary publication arms can drive the
-/// barrier.
+/// Like [`test_session_parts`] but wires a [`FirstWritePublisher`] into the
+/// session, so a test can drive the first-write publication barrier that
+/// `Published` collections write through.
 pub(crate) fn test_session_with_publisher(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
@@ -462,8 +462,9 @@ fn keyset_limit_threads_into_the_collection_def() {
     assert_eq!(descriptor.keyset_limit(7).collection_def().keyset_limit, 7);
 }
 
-/// `.published(bool)` and `.read_cache(..)` thread into the collection def, and
-/// `.published` is a reversible flag, mirroring the other fluent setters.
+/// `.published(bool)` and `.read_cache(..)` thread into the collection def like
+/// the other fluent setters. `.published` is also reversible: a later call can
+/// flip visibility back to `Private`.
 #[test]
 fn visibility_and_read_cache_thread_into_the_collection_def() {
     use std::time::Duration;
@@ -629,10 +630,10 @@ fn collection_ops_export_operation_spans() -> Result<()> {
     Ok(())
 }
 
-/// Behavioral arm of the `CollectionScopeContainment` invariant. The type-level
-/// guarantee — a view pinned to one collection cannot address another — is
-/// enforced structurally by the API's lifetimes and bounds; this test pins the
-/// runtime behavior that guarantee pairs with.
+/// Behavioral arm of the `CollectionScopeContainment` invariant. A view pinned
+/// to one collection cannot address another. The API's lifetimes and bounds
+/// enforce that guarantee at the type level. This test pins the matching
+/// runtime behavior.
 mod scope_containment {
     use super::*;
     use crate::state::order_codec::Utf8KeyCodec;

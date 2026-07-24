@@ -242,13 +242,13 @@ impl CassandraCellResources {
         Self { session, queries }
     }
 
-    /// The oracle-free committed point read: the standalone reader's raw
-    /// primitive. Point-reads the `kind=Cell` row and projects
-    /// [`Cell::project_committed`] — never an in-flight provisional value,
-    /// never owner-side repair (no `help_read_window`, no oracle). An
-    /// absent row reads `None`. Shares the bind tuple with the resolving
-    /// [`CassandraStore`] via [`fetch_cell_row`], so the two paths cannot
-    /// diverge on addressing.
+    /// Reads one cell's committed value without consulting the oracle. This is
+    /// the read path a standalone reader uses, not the owner. It point-reads
+    /// the `kind=Cell` row and projects [`Cell::project_committed`]. It
+    /// never returns an in-flight provisional value and never runs
+    /// owner-side repair: no `help_read_window`, no oracle. An absent row
+    /// reads `None`. It point-reads through [`fetch_cell_row`], shared with
+    /// the resolving [`CassandraStore`].
     ///
     /// # Errors
     ///
@@ -267,11 +267,12 @@ impl CassandraCellResources {
         Ok(decode::try_decode_cell(row)?.project_committed().cloned())
     }
 
-    /// Batch twin of [`Self::read_committed`]: one section's coordinates in one
-    /// `IN` query, index-aligned to `batch` (`result[i]` answers `batch[i]`;
-    /// duplicate coordinates co-observe; an absent coordinate reads `None`).
-    /// Committed-only projection; the co-expiry TTL column is ignored (the
-    /// reader has no write-through cache to mirror it into).
+    /// The batch form of [`Self::read_committed`]. Reads one section's
+    /// coordinates in one `IN` query. The result is index-aligned to `batch`,
+    /// so `result[i]` answers `batch[i]`. Duplicate coordinates share one
+    /// lookup, and an absent coordinate reads `None`. Only the committed value
+    /// is projected. The TTL column is ignored: the reader has no write-through
+    /// cache to mirror it into.
     ///
     /// # Errors
     ///
@@ -309,18 +310,21 @@ impl CassandraCellResources {
         Ok(out)
     }
 
-    /// The oracle-free committed section scan: the reader's raw scan primitive.
-    /// Drives the shared [`page_cells`] pager and yields each present cell's
-    /// [`Cell::project_committed`] in `coordinate` order, honouring the scan's
-    /// `limit` over **present** yields. Skips `help_read_window` entirely —
-    /// owner-side durable repair a reader neither can nor may run. The
-    /// projection is sound without it: a provisional row's `prev` is committed
-    /// by construction, and a resolved row's `data` is a once-committed value.
-    /// A resolved row set before a committed-yet-unapplied section clear thus
-    /// reads stale-but-once-committed until the owner applies the clear — a
-    /// bounded-staleness case (see
-    /// [`Cell::project_committed`](crate::state::cell::Cell::project_committed)),
-    /// never an uncommitted read.
+    /// Scans a section's committed values without consulting the oracle. This
+    /// is the scan path a standalone reader uses, not the owner. It drives
+    /// the shared [`page_cells`] pager and yields each present cell's
+    /// [`Cell::project_committed`] in `coordinate` order. The scan's `limit`
+    /// counts only present yields. It skips `help_read_window`, the owner-side
+    /// durable repair a reader cannot and may not run.
+    ///
+    /// The projection is sound without that repair. A provisional row's `prev`
+    /// is committed by construction, and a resolved row's `data` was committed
+    /// at some earlier point. So a resolved row written before a committed but
+    /// not-yet-applied section clear reads a value that was once committed but
+    /// is now stale, until the owner applies the clear. That staleness is
+    /// bounded (see
+    /// [`Cell::project_committed`](crate::state::cell::Cell::project_committed)).
+    /// It is never an uncommitted read.
     pub(crate) fn scan_committed<'a>(
         &'a self,
         id: &'a CollectionId,
@@ -641,15 +645,16 @@ where
             // Read-help once before the pager opens (`help_read_window`): a
             // standing foreign clears-bearing marker is resolved so the scan
             // pages post-clear truth. Memo-backed — no durable marker read
-            // after the seed read. The raw reader variant
+            // after the seed read. The reader-only scan
             // ([`CassandraCellResources::scan_committed`]) skips this: it
-            // observes `prev`, committed by construction.
+            // observes `prev`, which is committed by construction.
             let standing = self.standing_marker(collection).await?;
             help_read_window(self, self.resolver.oracle(), &collection_ref, standing.as_ref(), own)
                 .await
                 .map_err(flatten_resolve)?;
-            // The shared row-pager core (`page_cells`): per-bound statement
-            // selection + decode + `past_end`, with no resolution and no limit.
+            // The shared paging core (`page_cells`): it selects the per-bound
+            // statement, decodes each row, and applies `past_end`. It applies
+            // no resolution and no limit.
             let pages = page_cells(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);
 
@@ -1847,12 +1852,12 @@ fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreEr
     ResolveCellError::Store(CassandraCellStoreError::from(error))
 }
 
-/// Point-reads one `kind=Cell` row with `statement`, generic over the selected
-/// row shape — the one bind tuple shared by the resolving
-/// [`CassandraStore::point_read`] and the oracle-free
-/// [`CassandraCellResources::read_committed`], so owner and reader address a
-/// cell identically. `read_cell` ([`RawCellRow`]) and `read_cell_ttl`
-/// ([`CellTtlRow`]) both ride it.
+/// Point-reads one `kind=Cell` row with `statement`, generic over the row shape
+/// selected. This is the single bind tuple shared by two callers: the resolving
+/// [`CassandraStore::point_read`], and
+/// [`CassandraCellResources::read_committed`] which reads without the oracle.
+/// Owner and reader thus address a cell identically. Both `read_cell`
+/// ([`RawCellRow`]) and `read_cell_ttl` ([`CellTtlRow`]) call it.
 async fn fetch_cell_row<R>(
     session: &CassandraSession,
     statement: &PreparedStatement,
@@ -1887,11 +1892,11 @@ where
 }
 
 /// Reads a section's `uniques` coordinates in one `IN` query, returning the
-/// matching rows **un-decoded**, each re-keyed to its clustering `coordinate` —
-/// the bind shared by the resolving [`CassandraStore::batch_read`] and the
-/// oracle-free [`CassandraCellResources::read_committed_many`]. See
-/// [`CassandraStore::batch_read`]'s superseded doc for the deferred-decode
-/// rationale; `uniques` is caller-deduped, non-empty, and `CELL_BATCH`-bounded.
+/// matching rows **un-decoded**, each re-keyed to its clustering `coordinate`.
+/// This is the bind shared by the resolving [`CassandraStore::batch_read`] and
+/// by [`CassandraCellResources::read_committed_many`], which reads without the
+/// oracle. See [`CassandraStore::batch_read`] for why decode is deferred to the
+/// caller. `uniques` is caller-deduped, non-empty, and `CELL_BATCH`-bounded.
 async fn fetch_cells_batch(
     session: &CassandraSession,
     queries: &CellQueries,
@@ -1932,16 +1937,17 @@ async fn fetch_cells_batch(
     Ok(out)
 }
 
-/// The shared section-scan row pager: opens the per-bound prepared statement
-/// (the 6-arm `(dir, start)` selection), builds the [`KeyedCellRow`] stream,
-/// and yields each decoded `(CellKey, Cell)` with the in-code `past_end` cutoff
-/// applied — **no limit and no resolution** (limit counts *present*
-/// post-projection cells, so it stays in each consumer's loop). Both the owner
-/// scan ([`CassandraStore::scan_inner`], which then applies `peek_read`) and
-/// the raw reader scan ([`CassandraCellResources::scan_committed`], which
-/// applies `project_committed`) consume it, so the physical paging cannot drift
-/// between them. Each `try_next` is wrapped in [`cooperative`] so a ready-row
-/// drain yields to the runtime every ~128 items.
+/// The shared section-scan row pager. It opens the prepared statement for the
+/// scan bounds (the six-arm `(dir, start)` selection), builds the
+/// [`KeyedCellRow`] stream, and yields each decoded `(CellKey, Cell)` with the
+/// in-code `past_end` cutoff applied. It applies no limit and no resolution.
+/// The limit counts present cells after projection, so each consumer keeps it
+/// in its own loop. Two callers consume this. The owner scan
+/// ([`CassandraStore::scan_inner`]) then applies `peek_read`; the reader scan
+/// ([`CassandraCellResources::scan_committed`]) then applies
+/// `project_committed`. Sharing this pager keeps their physical paging from
+/// drifting apart. Each `try_next` is wrapped in [`cooperative`] so a drain of
+/// ready rows yields to the runtime every ~128 items.
 fn page_cells<'a>(
     session: &'a CassandraSession,
     queries: &'a CellQueries,
@@ -1959,9 +1965,9 @@ fn page_cells<'a>(
         // The section-prefix bind values every scan statement shares.
         let prefix = (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section);
         let (seg, key, st, name, cell_kind, sect) = prefix;
-        // Statement selection and binding are one match: the bounded arms
-        // append the anchor coordinate (a 7-tuple), the `Unbounded` arms bind
-        // only the section prefix (a 6-tuple) — distinct Rust types, so the
+        // Statement selection and binding are one match. A bounded arm appends
+        // the anchor coordinate for a 7-tuple. An `Unbounded` arm binds only the
+        // section prefix for a 6-tuple. Those are distinct Rust types, so the
         // pager must open inside each arm.
         let pager = match (dir, start.as_ref()) {
             (Direction::Forward, ScanEdge::Included(c)) => {

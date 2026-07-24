@@ -67,9 +67,10 @@ impl MemoryCells {
     }
 
     /// The raw stored [`Cell`] at `(collection, cell)`, defaulting a missing
-    /// row to `Resolved(Committed(None))`. Oracle-free — shared by the
-    /// owner store's [`MemoryCellStore::read_raw`] and the reader's
-    /// [`Self::read_committed`], so neither can drift on the default shape.
+    /// row to `Resolved(Committed(None))`. This body applies no oracle. Both
+    /// the owner store's [`MemoryCellStore::read_raw`] and the reader's
+    /// [`Self::read_committed`] call it, so they cannot disagree on the default
+    /// shape.
     fn read_committed_cell(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
         self.inner
             .read_sync(&(collection.clone(), cell.clone()), |_, stored| {
@@ -78,9 +79,9 @@ impl MemoryCells {
             .unwrap_or_else(|| Cell::Resolved(Committed::new(None)))
     }
 
-    /// The oracle-free committed point read: the standalone reader's raw
-    /// primitive over the in-memory backend. Projects
-    /// [`Cell::project_committed`] — never an in-flight provisional value,
+    /// A committed point read that applies no oracle. This is what the
+    /// standalone reader uses against the in-memory backend. It projects
+    /// [`Cell::project_committed`], never an in-flight provisional value and
     /// never owner-side repair.
     pub(crate) fn read_committed(
         &self,
@@ -92,11 +93,11 @@ impl MemoryCells {
             .cloned()
     }
 
-    /// Batch twin of [`Self::read_committed`], index-aligned to `batch`
-    /// (mirroring Cassandra's
-    /// [`read_committed_many`](crate::state::cassandra::CassandraCellResources::read_committed_many)).
-    /// Memory has no batch statement, so a per-coordinate map read is the
-    /// in-tree idiom: no dedup, one `Option<Bytes>` per input position.
+    /// Batch form of [`Self::read_committed`], index-aligned to `batch`.
+    /// Mirrors Cassandra's
+    /// [`read_committed_many`](crate::state::cassandra::CassandraCellResources::read_committed_many).
+    /// Memory has no batch statement, so it reads each coordinate from the map
+    /// separately: no dedup, one `Option<Bytes>` per input position.
     pub(crate) fn read_committed_many(
         &self,
         collection: &CollectionId,
@@ -117,12 +118,13 @@ impl MemoryCells {
             .collect()
     }
 
-    /// The oracle-free committed section scan: mirrors
-    /// [`MemoryCellStore::scan_cells`]' snapshot-sort-yield shape **minus** the
-    /// read-help and oracle resolution, projecting [`Cell::project_committed`]
-    /// per raw cell. The per-item projection is wrapped in [`cooperative`] so a
-    /// large in-memory drain yields every ~128 items. Error type is
-    /// [`Infallible`] — an in-memory committed projection cannot fail.
+    /// A committed section scan that applies no oracle. It follows the same
+    /// snapshot, sort, then yield steps as [`MemoryCellStore::scan_cells`], but
+    /// skips the read-help and oracle resolution, projecting
+    /// [`Cell::project_committed`] for each raw cell. The per-item projection
+    /// is wrapped in [`cooperative`] so a large in-memory drain yields
+    /// every ~128 items. The error type is [`Infallible`]: an in-memory
+    /// committed projection cannot fail.
     pub(crate) fn scan_committed<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -238,8 +240,9 @@ where
     O: CommitOracle,
 {
     /// The raw stored cell at `(collection, cell)`, defaulting a missing row to
-    /// `Resolved(Committed(None))` — the oracle-free body now lives on
-    /// [`MemoryCells::read_committed_cell`], shared with the reader.
+    /// `Resolved(Committed(None))`. Delegates to
+    /// [`MemoryCells::read_committed_cell`], the oracle-free body shared with
+    /// the reader.
     fn read_raw(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
         self.cells.read_committed_cell(collection, cell)
     }
@@ -702,19 +705,18 @@ impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
     }
 }
 
-/// In-memory routing-only [`PublicationStore`].
+/// The in-memory [`PublicationStore`], used only for discovery.
 ///
-/// The discovery half of in-memory keyed state: a [`scc::TreeIndex`] over the
-/// full publication primary key `((subsystem, state_type, name), group_id,
-/// topic)`, so a `read_publications` is a prefix range over one
-/// `(subsystem, state_type, name)`. Cloning shares the `Arc`, mirroring the
-/// sibling memory stores.
+/// It holds a [`scc::TreeIndex`] keyed by the full publication primary key
+/// `((subsystem, state_type, name), group_id, topic)`. A `read_publications`
+/// is therefore a prefix range over one `(subsystem, state_type, name)`.
+/// Cloning shares the `Arc`, mirroring the sibling memory stores.
 ///
 /// Removal path: the [`remove`](PublicationStore::remove) verb drops one source
 /// row, and dropping the last handle drops the whole tree (mock-mode lifetime).
 /// The map is bounded by the live published `(group, topic)` set of the
-/// collections in play — no unbounded keyed growth, and no `Mutex` (scc is
-/// lock-free).
+/// collections in play, so there is no unbounded keyed growth. It uses no
+/// `Mutex`: scc is lock-free.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryPublicationStore {
     rows: Arc<TreeIndex<PublicationKey, StatePublication>>,
@@ -781,9 +783,9 @@ impl PublicationStore for MemoryPublicationStore {
 }
 
 /// One publication row's address in [`MemoryPublicationStore`]'s tree: the full
-/// primary key. Every field orders deterministically — [`Topic`] is
-/// `Intern<str>`, whose `Ord` delegates to the interned `str` (lexical) — so
-/// the `#[derive(Ord)]` total order is a valid tree ordering directly.
+/// primary key. Every field orders deterministically. In particular [`Topic`]
+/// is `Intern<str>`, whose `Ord` compares the interned `str` lexically. So the
+/// derived `Ord` total order is a valid tree ordering with no extra work.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PublicationKey {
     subsystem: SubsystemName,
@@ -795,9 +797,9 @@ struct PublicationKey {
 
 /// Bounding query for every [`PublicationKey`] of one
 /// `(subsystem, state_type, name)` — the `read_publications` sub-range.
-/// Compares on `(subsystem, state_type, name)`, ignoring `group_id`/`topic`,
-/// so the range spans exactly that collection's sources; see [`Edge`] for the
-/// strict-separator bounds.
+/// Compares on `(subsystem, state_type, name)` alone, ignoring `group_id` and
+/// `topic`, so the range spans exactly that collection's sources. See [`Edge`]
+/// for why each bound is a strict separator.
 #[derive(Clone, Eq, PartialEq)]
 struct PublicationScope {
     subsystem: SubsystemName,

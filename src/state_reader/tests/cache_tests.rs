@@ -1,17 +1,19 @@
-//! The read-through TTL cache invariants.
+//! Invariants of the read-through TTL cache.
 //!
-//! The staleness rules — stamp-at-issue age, the `age == ttl` miss boundary,
-//! negative caching, `StateName` no-aliasing, and per-ttl freshness windows
-//! over a shared entry — are proven together by [`prop_cache_staleness`] over
-//! random clock/get schedules against a plain `HashMap` model. The focused
-//! examples that survive pin invariants the serial schedule cannot express:
-//! concurrent single-flight, fill-mutates-clock timing, the batch newer-wins
-//! corner, and the byte-budget bound.
+//! [`prop_cache_staleness`] proves the staleness rules together over random
+//! clock and get schedules, checked against a plain `HashMap` model: the
+//! stamp-at-issue age, the `age == ttl` miss boundary, negative caching,
+//! `StateName` no-aliasing, and per-ttl freshness windows over a shared
+//! entry. The focused tests below pin invariants that schedule cannot
+//! express: concurrent single-flight, a fill that mutates the clock while it
+//! runs, the newer-wins comparison on a batch write-through, and the
+//! byte-budget bound.
 //!
-//! All deterministic over an injected millisecond clock — never a sleep. The
-//! cache is exercised directly (no stores) so each invariant is isolated. Each
-//! fill closure is written inline so the cache's `Fn() -> impl Future` bound is
-//! satisfied with a concrete future (no boxing, no `dyn`).
+//! Every test drives an injected millisecond clock instead of sleeping, so
+//! timing stays deterministic. The cache is exercised directly, with no
+//! stores underneath, so each invariant is isolated. Each fill closure is
+//! written inline because the cache's `Fn() -> impl Future` bound needs a
+//! concrete future, not a boxed `dyn`.
 
 use super::support::{fixed_clock_cache, topic};
 use crate::Key;
@@ -54,14 +56,16 @@ fn key(name: &str) -> Result<CacheKey> {
 // --- Staleness property -----------------------------------------------------
 
 /// The distinct collection names the schedule's key pool spans. They differ
-/// **only** by `StateName` (same source, partition key, cell), so a cache key
-/// that dropped `StateName` would collapse them and alias — the no-alias arm.
+/// **only** by `StateName`: same source, partition key, and cell. A cache key
+/// that dropped `StateName` would collapse them, aliasing one collection's
+/// entry onto another's.
 const CACHE_NAMES: [&str; 3] = ["cache-n0", "cache-n1", "cache-n2"];
 
-/// The per-get TTL pool the schedule draws from — the degenerate `0` (every
-/// read born stale), the minimum meaningful `1`, mid values, and a large window
-/// that never expires within a bounded schedule (the two-ttl-window arm reuses
-/// one key across these).
+/// The per-get TTL pool the schedule draws from: the degenerate `0` (every
+/// read is born stale), the minimum meaningful `1`, mid-range values, and one
+/// large enough to never expire within a bounded schedule. Reusing one key
+/// across different TTLs from this pool is how the property test exercises a
+/// freshness window that depends on the read, not just the key.
 const TTL_POOL: [u64; 5] = [0, 1, 10, 100, 1_000_000];
 
 /// The clock-advance pool (milliseconds). Sharing magnitudes with [`TTL_POOL`]
@@ -117,25 +121,28 @@ impl Arbitrary for CacheSchedule {
     }
 }
 
-/// The deterministic fill value for a pooled key: `Some(bytes[idx])` (distinct
-/// per key, so an alias would serve the wrong bytes) or the negative `None`.
+/// The deterministic fill value for a pooled key. `Some` carries a one-byte
+/// value derived from `key`, distinct per key so an alias would serve the
+/// wrong bytes. `present = false` yields the negative `None`.
 fn fill_value(key: u8, present: bool) -> Option<Bytes> {
     present.then(|| Bytes::from(vec![key]))
 }
 
-/// The stamp-at-issue age, the `age == ttl` miss, negative-entry refresh,
-/// `StateName` no-aliasing, and per-ttl freshness windows over a shared entry —
-/// all at once. A plain `HashMap<key, (issued_ms, value)>` model
-/// predicts, for every get, both the served value and whether a fill fired
-/// (`age < ttl` is a hit served from the entry; anything else is a miss that
-/// refills). Asserting the served value AND the running fill count after each
-/// step catches a stale hit (wrong count), an alias (wrong bytes), and a
-/// laundered stamp (wrong count) alike.
+/// One property proves five staleness rules at once: stamp-at-issue age, the
+/// `age == ttl` miss boundary, negative-entry refresh, `StateName`
+/// no-aliasing, and per-ttl freshness windows over a shared entry.
 ///
-/// FALSIFICATION: change `ReaderCache::fresh`'s `<` to `<=` → an `age == ttl`
-/// step serves a stale hit, so the fill count trails the model. Drop
-/// `StateName` from `CacheKey` → a later get of a different name hits the
-/// first's entry, serving the wrong bytes with no fill.
+/// A plain `HashMap<key, (issued_ms, value)>` model predicts, for every get,
+/// both the served value and whether a fill fires. A get is a hit served
+/// from the model's entry when `age < ttl`; otherwise it is a miss that
+/// refills. Asserting the served value and the running fill count after
+/// every step catches a stale hit as a wrong count, an alias as wrong bytes,
+/// and a laundered stamp as a wrong count.
+///
+/// Falsify: change `ReaderCache::fresh`'s `<` to `<=`. An `age == ttl` step
+/// then serves a stale hit, so the fill count trails the model. Or drop
+/// `StateName` from `CacheKey`: a later get of a different name then hits
+/// the first name's entry, serving the wrong bytes with no fill.
 #[test]
 fn prop_cache_staleness() {
     fn property(schedule: CacheSchedule) -> Result<bool> {
@@ -274,27 +281,27 @@ async fn cold_miss_is_single_flight() -> Result<()> {
 
 /// Regression pin: `write_through`'s newer-wins compares `seq` (issue order)
 /// alone, never the lexicographic `(issued_ms, seq)`. A later-issued fill that
-/// read an *earlier* millisecond must still win — the two orders disagree only
+/// read an *earlier* millisecond must still win. The two orders disagree only
 /// when the clock does not advance monotonically between issues, so the test
-/// drives it that way.
+/// drives the clock that way.
 ///
-/// The point fill is issued at a HIGH millisecond (stamp `ms 1000, seq 0`); the
-/// batch fill is issued later at a LOW millisecond (stamp `ms 1, seq 1`). A
-/// second, absent decoy key forces the batch fill to fire so its write-through
-/// runs against the occupied entry. Under seq-only the batch value (seq 1)
-/// wins; a lexicographic compare would rank `(1, 1) < (1000, 0)` and leave
-/// "v1".
+/// The point fill is issued at a HIGH millisecond, stamp `ms 1000, seq 0`.
+/// The batch fill is issued later at a LOW millisecond, stamp `ms 1, seq 1`.
+/// A second, absent decoy key forces the batch fill to fire, so its
+/// write-through runs against the occupied entry. Under seq-only ordering the
+/// batch value, seq 1, wins. A lexicographic compare would instead rank
+/// `(1, 1) < (1000, 0)` and leave "v1".
 ///
-/// Falsify: compare the full `Stamp` lexicographically in `write_through` — the
-/// read-back returns "v1" and the assert goes red.
+/// Falsify: compare the full `Stamp` lexicographically in `write_through`.
+/// The read-back then returns "v1" and the assert goes red.
 #[tokio::test]
 async fn batch_refill_overwrites_stale_entry() -> Result<()> {
     let (cache, now) = fixed_clock_cache(1 << 20);
     let k1 = key("batch")?;
     let k2 = key("batch-decoy")?;
 
-    // Point-fill k1 at a HIGH millisecond (issue stamp: ms 1000, seq 0); the ttl
-    // is large so k1 stays a fresh hit — the test turns on newer-wins, not on
+    // Point-fill k1 at a HIGH millisecond: issue stamp ms 1000, seq 0. The ttl
+    // is large so k1 stays a fresh hit. The test turns on newer-wins, not on
     // expiry.
     now.store(1000, Ordering::Relaxed);
     cache
@@ -305,7 +312,7 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
 
     // Batch-fill [k1, k2] issued later at an EARLIER millisecond (stamp: ms 1,
     // seq 1). k1 is still a fresh hit, but k2 is absent, so the fill fires and
-    // write-throughs k1 with the later-seq / earlier-ms stamp.
+    // writes k1 through with the later seq and the earlier millisecond.
     now.store(1, Ordering::Relaxed);
     let got = cache
         .get_many_cached(&[k1.clone(), k2], 1_000_000, || async {
@@ -317,8 +324,9 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
         .await?;
     assert_eq!(got[0], Some(Bytes::from_static(b"v2")));
 
-    // Read k1 back: seq-only newer-wins kept the batch value (seq 1 > 0) despite
-    // its earlier millisecond; the fill closure here must not run (k1 is a hit).
+    // Read k1 back. Seq-only newer-wins kept the batch value (seq 1 > 0)
+    // despite its earlier millisecond. The fill closure here must not run:
+    // k1 is a hit.
     let back = cache
         .get_cached(k1, 1_000_000, || async {
             Ok::<_, StateAccessError>(Some(Bytes::from_static(b"unused")))
@@ -329,12 +337,12 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
 }
 
 /// The batch read serves entirely from the cache when every key is a fresh
-/// hit (zero fills), and a single stale key triggers exactly ONE whole-batch
-/// refill — never a per-key fill.
+/// hit, firing zero fills. A single stale key triggers exactly ONE
+/// whole-batch refill, never a per-key fill.
 ///
 /// Falsify: drop the `hits.len() == keys.len()` all-hits shortcut in
-/// `get_many_cached` (always refetch) — the all-fresh second call then fills
-/// and the count reaches 2 before the clock ever advances.
+/// `get_many_cached` so it always refetches. The all-fresh second call then
+/// fills, and the count reaches 2 before the clock ever advances.
 #[tokio::test]
 async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     let (cache, now) = fixed_clock_cache(1 << 20);

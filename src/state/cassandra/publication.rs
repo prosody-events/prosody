@@ -1,12 +1,12 @@
 //! Cassandra-backed routing-only publication store.
 //!
 //! [`CassandraPublicationStore`] implements [`PublicationStore`] over the
-//! routing-only `keyed_state_publication` table provisioned by migration
-//! `20260722_create_keyed_state_publication.cql`. Reads are a single-partition
-//! clustering `SELECT`; upsert/remove are plain idempotent `INSERT`/`DELETE` —
-//! no LWT, no TTL, no client-set timestamp, because a source row carries only
-//! routing facts and last-write-wins ordering is fixed by the session's
-//! monotonic timestamp generator.
+//! `keyed_state_publication` table, provisioned by migration
+//! `20260722_create_keyed_state_publication.cql`. The table holds only routing
+//! facts. Reads are a single-partition clustering `SELECT`. Upsert and remove
+//! are plain idempotent `INSERT`/`DELETE`. They set no LWT, no TTL, and no
+//! client-set timestamp. Last-write-wins ordering from the session's monotonic
+//! timestamp generator is enough for these rows.
 
 use crate::Topic;
 use crate::cassandra::errors::CassandraStoreError;
@@ -130,7 +130,6 @@ cassandra_queries! {
     /// [`CassandraPublicationStore`].
     pub struct PublicationQueries {
         /// Idempotently records one `(group_id, topic)` source of a collection.
-        /// Plain `INSERT` — no LWT, no TTL, no client-set timestamp.
         upsert: (
             "INSERT INTO $keyspace.{} \
              (subsystem, state_type, name, group_id, topic, partition_count) \
@@ -138,7 +137,7 @@ cassandra_queries! {
             TABLE_KEYED_STATE_PUBLICATION
         ),
 
-        /// Removes one `(group_id, topic)` source — the named removal path.
+        /// Removes one `(group_id, topic)` source.
         /// Idempotent: deleting an absent row is a no-op.
         remove: (
             "DELETE FROM $keyspace.{} \
@@ -164,8 +163,8 @@ pub enum CassandraPublicationError {
     #[error("database error: {0:#}")]
     Database(#[from] CassandraStoreError),
 
-    /// A decoded `partition_count` was outside `[1, i32::MAX]` — a corrupt or
-    /// hand-edited routing row, classified `Permanent`.
+    /// A decoded `partition_count` was outside `[1, i32::MAX]`. The routing row
+    /// is corrupt or hand-edited, so this classifies `Permanent`.
     #[error("invalid partition count: {0}")]
     PartitionCount(#[from] PartitionCountError),
 }

@@ -879,11 +879,13 @@ mod staged_rollback {
     }
 }
 
-/// First-write publication at the settle boundary and the mid-handler
-/// `commit()` path: a `Published` collection's routing row is written *before*
-/// its committed state, a failing publication store blocks the write (never
-/// settles unpublished), and shutdown during publication abandons without
-/// staging.
+/// Tests for first-write publication at the settle boundary and the
+/// mid-handler `commit()` path.
+///
+/// A `Published` collection's routing row is written before its committed
+/// state. A failing publication store blocks the durable write rather than
+/// settling an unpublished collection. Shutdown during publication abandons
+/// the event without staging anything.
 mod settle_publication {
     use super::*;
     use crate::loader::MemoryLoader;
@@ -944,9 +946,9 @@ mod settle_publication {
         ))
     }
 
-    /// The resolved committed value of the collection's single Value cell — a
-    /// probe read against the durable store (a distinct probe identity so it
-    /// never aliases the event under test).
+    /// Reads the collection's single Value cell from the durable store,
+    /// resolved to its committed value. Uses a probe event identity distinct
+    /// from the event under test, so the read never aliases it.
     async fn committed_value(
         cell_store: &MemoryCellStore<FixedOracle>,
         id: &CollectionId,
@@ -1003,8 +1005,8 @@ mod settle_publication {
         StateName::try_new("wishlist").map_err(|e| eyre!("name: {e}"))
     }
 
-    /// A registry with BOTH `cart` and `wishlist` registered `Published`, so a
-    /// truthful-set test can register two published collections and write only
+    /// A registry with both `cart` and `wishlist` registered `Published`.
+    /// Lets a test register two published collections while writing only
     /// one.
     fn two_published_registry() -> Result<CollectionDefRegistry> {
         let mut registry = published_registry()?;
@@ -1021,10 +1023,10 @@ mod settle_publication {
         Ok(registry)
     }
 
-    /// Arm (a): the routing row is written BEFORE the durable state. The gated
-    /// upsert parks in settle step 0; while it is parked the cell is not yet
-    /// durable (finalize is step 1). Releasing the gate lets settle stage and
-    /// commit, and the row lands with the live count.
+    /// The routing row is written before the durable state. The gated upsert
+    /// parks in settle step 0, so the cell is not yet durable until finalize
+    /// runs in step 1. Releasing the gate lets settle stage and commit, and
+    /// the row lands with the live partition count.
     #[tokio::test]
     async fn publication_precedes_the_durable_write() -> Result<()> {
         let store = ScriptedPublicationStore::gated();
@@ -1079,10 +1081,11 @@ mod settle_publication {
         Ok(())
     }
 
-    /// Arm (f): a failing publication store BLOCKS the durable write — settle's
-    /// must-succeed publish loop retries forever, so while the store fails no
-    /// cell is durable and nothing commits. Once the store heals, both the row
-    /// and the cell land and the guard commits exactly once.
+    /// A failing publication store blocks the durable write. Settle's publish
+    /// loop must succeed, so it retries forever while the store keeps
+    /// failing: no cell is durable and nothing commits. Once the store
+    /// heals, both the row and the cell land, and the guard commits exactly
+    /// once.
     #[tokio::test(start_paused = true)]
     async fn failed_publication_blocks_the_write() -> Result<()> {
         let store = ScriptedPublicationStore::failing();
@@ -1152,8 +1155,9 @@ mod settle_publication {
         // before any upsert is attempted.
         let store = ScriptedPublicationStore::failing();
         let (context, cell_store, cart_id) = buffered_published(|c| c, store.clone(), 3).await?;
-        // Request shutdown AFTER the write is buffered (the write itself needs a
-        // live session); settle's publish loop then sees shutdown at its top.
+        // Request shutdown AFTER the write is buffered: the write itself needs
+        // a live session first. Settle's publish loop then sees shutdown at
+        // its top.
         context.request_shutdown();
         let handler = ProbeHandler::ok(0);
         let committed = Arc::new(AtomicUsize::new(0));
@@ -1182,10 +1186,10 @@ mod settle_publication {
         Ok(())
     }
 
-    /// Arm (i): the mid-handler `commit()` path publishes before its direct
-    /// durable write. A successful publication lets `commit()` write the cell;
-    /// a failing publication store makes `commit()` return `Err` and leaves NO
-    /// durable cell (the routing row gates `write_resolved`).
+    /// The mid-handler `commit()` path publishes before its direct durable
+    /// write. A successful publication lets `commit()` write the cell. A
+    /// failing publication store makes `commit()` return `Err` and leaves no
+    /// durable cell: the routing row gates `write_resolved`.
     #[tokio::test]
     async fn commit_path_publishes_before_write_resolved() -> Result<()> {
         // Success: commit publishes then writes.
@@ -1255,17 +1259,15 @@ mod settle_publication {
         Ok(())
     }
 
-    /// Arm (b): the truthful set. Publication advertises only the collections
-    /// the event actually WROTE — `publish_first_writes` iterates the dirty
-    /// overlay's `touched_collections`, never the registered set. This is the
-    /// defining choice of first-write publication over subscription
-    /// enumeration.
+    /// Publication advertises only the collections the event actually wrote.
+    /// `publish_first_writes` iterates the dirty overlay's
+    /// `touched_collections`, never the full registered set.
     ///
     /// Two `Published` collections are registered; the event writes only
-    /// `cart`. Settling publishes a row for `cart` and NONE for the unwritten
+    /// `cart`. Settling publishes a row for `cart` and none for the unwritten
     /// `wishlist`. Falsify by enumerating the registry instead of the touched
-    /// overlay in `KeyedStateSession::publish_first_writes`: `wishlist` gains a
-    /// row and the no-row assertion goes red.
+    /// overlay in `KeyedStateSession::publish_first_writes`: `wishlist` gains
+    /// a row and the no-row assertion goes red.
     #[tokio::test]
     async fn only_written_published_collections_are_advertised() -> Result<()> {
         let store = ScriptedPublicationStore::new();

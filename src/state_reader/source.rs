@@ -6,20 +6,22 @@ use crate::state_reader::error::StateReaderError;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// The most publication sources one collection may advertise. A collection
-/// beyond this fails `Permanent` ([`StateReaderError::TooManySources`]); the
-/// bound is liftable in a future release but never at runtime.
+/// The maximum number of publication sources one collection may advertise.
+/// A collection that advertises more fails `Permanent` with
+/// [`StateReaderError::TooManySources`]. A future release may raise the bound,
+/// but it never changes at runtime.
 pub(crate) const MAX_PUBLICATION_SOURCES: usize = 16;
 
 /// A source's **stable** identity: the publishing consumer group and the topic
 /// whose messages wrote the state.
 ///
-/// Deliberately **not** an ordinal index into the snapshot: a refresh can
-/// reorder or remove sources, and an index-keyed cache entry or pin would then
-/// alias a *different* source's cells — a committed-only violation, not mere
-/// staleness. Every cache key and pin carries this instead. `Ord` is
-/// lexicographic `(group_id, topic)`, giving the snapshot its deterministic
-/// source-preference order.
+/// This identity is not an ordinal index into the snapshot. A refresh can
+/// reorder or remove sources. A cache key or pin based on the index would then
+/// point at a *different* source's cells after a refresh. The reader would
+/// serve the wrong source's committed data, which is a correctness violation
+/// rather than mere staleness. Every cache key and pin carries this identity
+/// instead. `Ord` is lexicographic over `(group_id, topic)`, which gives the
+/// snapshot a deterministic order for preferring one source over another.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SourceId {
     /// The publishing consumer group.
@@ -29,8 +31,9 @@ pub(crate) struct SourceId {
 }
 
 /// One admitted source: its stable [`SourceId`] and the topic's Kafka partition
-/// count (for the reader's key→partition step). The count rides on the
-/// publication row, so the read path needs no live partition fetch.
+/// count. The reader uses the count to map a key to its partition. The count is
+/// stored on the publication row, so the read path needs no live partition
+/// fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Source {
     /// Stable identity.
@@ -39,31 +42,30 @@ pub(crate) struct Source {
     pub(crate) partition_count: PartitionCount,
 }
 
-/// A validated publication snapshot: a **non-empty**, `SourceId`-ordered,
-/// count-bounded list of sources whose per-group frozen identities matched the
-/// reader's descriptor at validation time.
+/// A validated publication snapshot. It is a **non-empty** list of at most
+/// [`MAX_PUBLICATION_SOURCES`] sources, ordered by [`SourceId`]. Every source's
+/// frozen identity matched the reader's descriptor at validation time.
 ///
-/// The restricted constructor ([`Self::new`], `pub(super)`) is the *only* way
-/// to mint one, so an unvalidated, empty, or oversized snapshot is
-/// unrepresentable in a [`ReadSession`](super::session::ReadSession): the
-/// reader stores the *absence* of a snapshot (an `Option`) rather than an empty
-/// one.
+/// [`Self::new`] is `pub(super)` and the only way to build one. An unvalidated,
+/// empty, or oversized snapshot is therefore unrepresentable in a
+/// [`ReadSession`](super::session::ReadSession). The reader stores `None` for
+/// the absence of a snapshot rather than an empty one.
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedPublications {
     sources: SmallVec<[Source; MAX_PUBLICATION_SOURCES]>,
 }
 
 impl ValidatedPublications {
-    /// Mints a validated snapshot from admitted sources, sorted by
+    /// Builds a validated snapshot from admitted sources, sorted by
     /// [`SourceId`].
     ///
     /// # Errors
     ///
-    /// Returns [`StateReaderError::TooManySources`] beyond
-    /// [`MAX_PUBLICATION_SOURCES`]. An **empty** `sources` also errors here
-    /// ([`StateReaderError::UnknownPublication`] is the caller's concern) — the
-    /// non-empty invariant is structural, so the caller stores `None` for an
-    /// empty admission rather than an empty snapshot.
+    /// Returns [`StateReaderError::TooManySources`] when `sources` holds more
+    /// than [`MAX_PUBLICATION_SOURCES`] entries. Returns
+    /// [`StateReaderError::UnknownPublication`] when `sources` is empty. The
+    /// non-empty invariant is structural, so the caller stores `None` rather
+    /// than building an empty snapshot.
     pub(super) fn new(
         mut sources: SmallVec<[Source; MAX_PUBLICATION_SOURCES]>,
         subsystem: &str,
@@ -97,11 +99,12 @@ mod tests {
     use crate::state_reader::PartitionCount;
     use internment::Intern;
 
-    /// Advertising more than [`MAX_PUBLICATION_SOURCES`] fails `TooManySources`
-    /// (Permanent) at mint — never a silent truncation.
+    /// Advertising more than [`MAX_PUBLICATION_SOURCES`] fails with
+    /// `TooManySources` (a `Permanent` error) at construction, never a silent
+    /// truncation.
     ///
-    /// Falsify: drop the length check in [`ValidatedPublications::new`] — the
-    /// oversized snapshot builds and the match arm is never reached.
+    /// Falsify: drop the length check in [`ValidatedPublications::new`]. The
+    /// oversized snapshot then builds and the match arm is never reached.
     #[test]
     fn oversized_snapshot_is_too_many_sources() -> color_eyre::Result<()> {
         let sources: SmallVec<[Source; MAX_PUBLICATION_SOURCES]> = (0..=MAX_PUBLICATION_SOURCES)

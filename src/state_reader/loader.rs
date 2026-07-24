@@ -1,4 +1,4 @@
-//! Backend carriage for the reader's message loader.
+//! Message loader backends for the reader.
 
 use crate::codec::Codec;
 use crate::consumer::message::ConsumerMessage;
@@ -9,13 +9,13 @@ use crate::loader::{
 use crate::{Offset, Partition, Topic};
 use thiserror::Error;
 
-/// The reader's message loader, carried as a closed enum so a Kafka-ref
-/// descriptor resolves through the same [`MessageLoader`] surface with no
-/// `dyn`. `Memory` backs the mock suites; `Kafka` the production reader.
+/// The reader's message loader. An enum over the two backends, so both resolve
+/// through one [`MessageLoader`] impl without `dyn`. `Kafka` loads from a live
+/// topic in production. `Memory` backs the mock test suites.
 ///
-/// Both arms' [`MessageLoader`] impls require `C::Payload: Clone` (the cache
-/// hands out clones of a loaded body), so this enum carries the same bound on
-/// its own `Clone` and `MessageLoader` impls rather than deriving them.
+/// Both arms' [`MessageLoader`] impls require `C::Payload: Clone`, because the
+/// cache hands out clones of a loaded body. This enum repeats that bound on its
+/// own `Clone` and `MessageLoader` impls.
 pub enum ReaderLoader<C: Codec> {
     /// Loads message bodies from Kafka (production).
     Kafka(KafkaLoader<C>),

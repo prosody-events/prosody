@@ -1338,8 +1338,9 @@ fn prop_memory_apply_idempotence() {
     QuickCheck::new().quickcheck(property as fn(ApplyTrace) -> Result<bool>);
 }
 
-/// Routing-only publication store over the memory backend. The Cassandra
-/// instantiation in [`state::cassandra::tests`] runs the same runner.
+/// The backend-generic publication-store contract over the memory backend.
+/// The Cassandra instantiation in `state::cassandra::tests` runs the same
+/// runner.
 #[test]
 fn prop_memory_publication_trace() {
     fn property(trace: PublicationTrace) -> Result<bool> {

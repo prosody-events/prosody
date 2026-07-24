@@ -33,13 +33,14 @@ impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
 
 /// Represents the current state of the consumer.
 ///
-/// The one shared infrastructure bundle ([`SharedDeps`]) lives on the states
-/// that can own one: `Configured` carries it as an `Option` (built lazily at
-/// the first [`state`](crate::high_level::HighLevelClient::state) or
-/// [`subscribe`](crate::high_level::HighLevelClient::subscribe)), and `Running`
-/// always carries it (subscribe builds it before starting the consumer). No
-/// bundle can exist without a config to build it from, so it is unrepresentable
-/// on `Unconfigured`/`ConfigurationFailed`.
+/// The shared infrastructure bundle ([`SharedDeps`]) lives only on states that
+/// have a config to build it from. `Configured` holds it as an `Option`, built
+/// lazily on the first call to
+/// [`state`](crate::high_level::HighLevelClient::state) or
+/// [`subscribe`](crate::high_level::HighLevelClient::subscribe). `Running`
+/// always holds it, because `subscribe` builds it before starting the consumer.
+/// `Unconfigured` and `ConfigurationFailed` have no config, so they cannot
+/// carry a bundle.
 #[derive(Educe, Default)]
 #[educe(Debug)]
 pub enum ConsumerState<T, C: Codec> {
@@ -52,8 +53,8 @@ pub enum ConsumerState<T, C: Codec> {
     Configured {
         /// The configuration to run when subscribed.
         config: ModeConfiguration,
-        /// The shared bundle, built lazily and retained across the
-        /// `Configured → Running` transition; `None` until first built.
+        /// The shared bundle, or `None` until first built. Built lazily and
+        /// reused when the consumer moves to `Running`.
         #[educe(Debug(ignore))]
         deps: Option<SharedDeps<C>>,
     },
@@ -66,7 +67,7 @@ pub enum ConsumerState<T, C: Codec> {
         /// The handler for processing messages.
         handler: T,
         /// The shared bundle handed to the running consumer and reused by any
-        /// reader minted while running.
+        /// reader built while running.
         #[educe(Debug(ignore))]
         deps: SharedDeps<C>,
     },

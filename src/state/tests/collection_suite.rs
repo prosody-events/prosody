@@ -237,10 +237,11 @@ impl<O: Arbitrary> Arbitrary for Trace<O> {
 }
 
 impl<O> Trace<O> {
-    /// The per-event op slices, in order — the reuse seam for the
-    /// standalone-reader committed-read runner, which drives this generator's
-    /// ops but promotes every event (a reader observes only committed state, so
-    /// the per-event outcome is irrelevant to it).
+    /// The per-event op slices, in order.
+    ///
+    /// The `state_reader` test suite replays these ops but always promotes
+    /// every event. A `StateReader` only observes committed state, so the
+    /// per-event outcome does not matter there.
     pub(crate) fn events_ops(&self) -> impl Iterator<Item = &[O]> + '_ {
         self.events.iter().map(|event| event.ops.as_slice())
     }

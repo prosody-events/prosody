@@ -251,8 +251,8 @@ where
         Self: 's;
 
     async fn mutate_permit(&self) -> Result<MutatePermit<'_>, StateAccessError> {
-        // Inert stub: every op is unreachable past `Unavailable`, so the mutate
-        // admission errors before minting a witness.
+        // Inert stub: every op fails with `Unavailable` first, so this never
+        // returns a witness.
         Err(StateAccessError::Unavailable)
     }
 
@@ -1130,10 +1130,10 @@ pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionI
     Ok(())
 }
 
-/// One recorded call against a [`ScriptedPublicationStore`]. Drives the
-/// ordering and truthful-set assertions of the first-write publication tests
-/// (a row appears with the live count; a collection that never writes gets no
-/// upsert; a private write never upserts).
+/// One recorded call against a [`ScriptedPublicationStore`]. The first-write
+/// publication tests check both order and content against this log: a live
+/// collection's row appears with the correct partition count, a collection
+/// that never writes gets no upsert, and a private write never upserts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PublicationCall {
     /// An `upsert` reached the store (recorded only for a successful,
@@ -1182,12 +1182,14 @@ struct ReleaseGate {
 pub(crate) struct ScriptedPublicationStore {
     inner: MemoryPublicationStore,
     calls: Arc<Mutex<Vec<PublicationCall>>>,
-    /// When set, every `upsert` returns a `Transient` error (signalling
-    /// `errored`) instead of applying — models a persistently-failing store.
+    /// When set, every `upsert` returns a `Transient` error instead of
+    /// applying, and adds a permit to `errored`. Models a store that keeps
+    /// failing until healed.
     fail: Arc<AtomicBool>,
-    /// When set, every `read_publications` returns an error of this category
-    /// (after recording the [`PublicationCall::Read`]) — models a store whose
-    /// rows will not decode (`Permanent`) or a transient read fault.
+    /// When set, every `read_publications` call still records the
+    /// [`PublicationCall::Read`], then returns an error of this category.
+    /// Use `Permanent` to model rows that fail to decode, or `Transient`
+    /// to model a temporary read fault.
     read_fail: Arc<Mutex<Option<ErrorCategory>>>,
     errored: Arc<Semaphore>,
     /// When present, a successful `upsert` blocks on the release gate.
@@ -1231,22 +1233,24 @@ impl ScriptedPublicationStore {
         self.fail.store(false, Ordering::Release);
     }
 
-    /// Makes every subsequent `read_publications` fail with `category` (after
-    /// recording the [`PublicationCall::Read`]) — drives reconciliation's
-    /// skip-on-`Permanent` and propagate-on-`Transient` arms.
+    /// Makes every subsequent `read_publications` call still record the
+    /// [`PublicationCall::Read`], then fail with `category`. Drives the
+    /// reconciliation tests: skip the row on `Permanent`, propagate the
+    /// error on `Transient`.
     pub(crate) fn fail_reads_with(&self, category: ErrorCategory) {
         *self.read_fail.lock() = Some(category);
     }
 
-    /// Clears a prior [`fail_reads_with`](Self::fail_reads_with), so subsequent
-    /// `read_publications` succeed again — lets a refresh property toggle a
-    /// routing-read outage on and off across rounds.
+    /// Clears a prior [`fail_reads_with`](Self::fail_reads_with) call, so
+    /// subsequent `read_publications` calls succeed again. Lets a refresh
+    /// property toggle read failures on and off across rounds.
     pub(crate) fn heal_reads(&self) {
         *self.read_fail.lock() = None;
     }
 
-    /// Waits until at least one upsert has failed — the deterministic signal
-    /// that the settle loop has attempted (and been blocked by) publication.
+    /// Waits until at least one upsert has failed. This is the deterministic
+    /// signal that the settle loop attempted publication and was blocked by
+    /// it.
     pub(crate) async fn wait_errored(&self) {
         if let Ok(permit) = self.errored.acquire().await {
             permit.forget();

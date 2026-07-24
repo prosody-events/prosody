@@ -298,7 +298,8 @@ where
     /// unknown, not unarmed.
     armed: ArmedKeys,
     /// The first-write publisher bound to this partition's topic, or `None`
-    /// when nothing is published. Cloned into every session this manager mints.
+    /// when nothing is published. Cloned into every session this manager
+    /// creates.
     publisher: Option<FirstWritePublisher>,
 }
 
@@ -488,9 +489,10 @@ pub struct StateManagerProvider<F, L> {
     consumer_group: Arc<str>,
     recovery_delay: CompactDuration,
     /// The provider-wide first-write publication template, or `None` when no
-    /// collection is published / no subsystem is configured. `acquire` binds
-    /// it to the partition's topic; the shared memo dedups across every session
-    /// this provider mints (see [`PublisherTemplate`]).
+    /// collection is published or no subsystem is configured. `acquire` binds
+    /// it to the partition's topic. The shared memo dedups publication
+    /// across every session this provider creates (see
+    /// [`PublisherTemplate`]).
     publisher_template: Option<PublisherTemplate>,
     /// Process-level latch for descriptor-identity validation. The identity
     /// table is group-global, so validating the registry against it is a

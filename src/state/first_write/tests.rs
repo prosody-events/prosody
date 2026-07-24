@@ -1,11 +1,13 @@
 //! Tests for the first-write publication barrier and startup reconciliation.
 //!
-//! These exercise [`FirstWritePublisher::ensure_one`] and
-//! [`reconcile_publications`] directly against a scripted publication store —
-//! the cheap, deterministic layer for the visibility gate, the count tripwire,
-//! the memo bound, and reconciliation. The settle-boundary ordering arms (a
-//! routing row precedes the durable write; a failing store blocks the write)
-//! live in the settle test module, which drives the whole sequence.
+//! These tests drive [`FirstWritePublisher::ensure_one`] and
+//! [`reconcile_publications`] directly against a scripted publication store, a
+//! cheap deterministic stand-in for the real one. They cover the visibility
+//! gate, the count tripwire, the memo capacity bound, and reconciliation.
+//!
+//! Settle-boundary ordering (a routing row is written before the durable
+//! write, and a failing store blocks the write) is tested separately, in the
+//! settle test module that drives the whole sequence.
 
 use std::sync::Arc;
 
@@ -144,7 +146,7 @@ async fn memo_dedups_second_write() -> Result<()> {
     Ok(())
 }
 
-/// Arm (c): a PRIVATE collection's write never consults the store — the
+/// A private collection's write never consults the store. This is the
 /// visibility gate that makes reconciliation's removal final.
 #[tokio::test]
 async fn private_collection_never_upserts() -> Result<()> {
@@ -162,9 +164,9 @@ async fn private_collection_never_upserts() -> Result<()> {
     Ok(())
 }
 
-/// Arm (c) continued: after reconciliation removes the group's row, a private
-/// write does not re-create it — removal stays final because the write path is
-/// visibility-gated.
+/// After reconciliation removes the group's row, a private write does not
+/// re-create it. Removal stays final because the write path is gated by
+/// visibility.
 #[tokio::test]
 async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -205,8 +207,8 @@ async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
     Ok(())
 }
 
-/// Arm (d): reconciliation removes this group's own rows and leaves other
-/// groups' rows untouched.
+/// Reconciliation removes this group's own rows and leaves other groups' rows
+/// untouched.
 #[tokio::test]
 async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -242,11 +244,11 @@ async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
     Ok(())
 }
 
-/// Arm (e): a pre-seeded row with a valid but wrong count is overwritten with
-/// the live count AND the `StableRouting` tripwire fires an error-level
-/// mismatch event — a warn-and-overwrite, never a hard failure. Asserting the
-/// event (not just the corrected row) is what keeps the removal of the tripwire
-/// warn from going undetected: the blind upsert corrects the row regardless.
+/// A pre-seeded row with a valid but stale count is overwritten with the live
+/// count, and the `StableRouting` tripwire logs an error-level mismatch event.
+/// The write warns and overwrites; it never fails. The test asserts the
+/// event as well as the corrected row, because the corrected row alone would
+/// not catch a regression that silently dropped the tripwire warning.
 #[tokio::test]
 async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -278,13 +280,13 @@ async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     Ok(())
 }
 
-/// Arm (g): the memo is capacity-bounded, so it re-runs the idempotent barrier
-/// for evicted entries — the RAM-bound guard. Publishing far more distinct
-/// `(collection, topic)` keys than the memo capacity, then re-publishing all of
-/// them, forces more upserts than there are keys (the evicted entries re-run).
-/// An insert-only memo (the `MarkerMemo.checked` bug class) would keep every
-/// key resident, so the second pass would upsert nothing and the total would
-/// equal the key count.
+/// The memo is capacity-bounded, so it re-runs the idempotent barrier for
+/// evicted entries. This guards against the memo growing without bound.
+/// Publishing far more distinct `(collection, topic)` keys than the memo
+/// capacity, then re-publishing all of them, forces more upserts than there
+/// are keys (the evicted entries re-run). An insert-only memo (the
+/// `MarkerMemo.checked` bug class) would keep every key resident, so the
+/// second pass would upsert nothing and the total would equal the key count.
 #[tokio::test]
 async fn memo_is_capacity_bounded() -> Result<()> {
     const KEYS: usize = 256;
@@ -329,8 +331,8 @@ async fn memo_is_capacity_bounded() -> Result<()> {
     Ok(())
 }
 
-/// Arm (h): the memo key includes the topic, so the same collection published
-/// under two topics yields two distinct rows (and two upserts).
+/// The memo key includes the topic, so the same collection published under
+/// two topics yields two distinct rows, and two upserts.
 #[tokio::test]
 async fn distinct_topics_publish_distinct_rows() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -358,22 +360,23 @@ async fn distinct_topics_publish_distinct_rows() -> Result<()> {
     Ok(())
 }
 
-/// The memo key includes the topic. One shared template (hence ONE shared memo)
-/// bound to two topics publishes the same collection twice — once per topic —
-/// because the topic distinguishes the two memo keys.
+/// The memo key includes the topic. Binding one shared template, and so one
+/// shared memo, to two topics publishes the same collection twice, once per
+/// topic, because the topic tells the two memo entries apart.
 ///
-/// This is the falsifiable guard the two-template
-/// [`distinct_topics_publish_distinct_rows`] cannot be: with independent
-/// templates each memo holds a single key, so dropping `topic` from
-/// [`PublicationMemoKey`] would still yield two upserts. Sharing one memo makes
-/// the field load-bearing — drop `topic` and the second topic hits the first's
-/// memo entry, suppressing its upsert (one row, not two) → red.
+/// This complements [`distinct_topics_publish_distinct_rows`], which uses two
+/// independent templates instead. There, each memo holds only one key, so
+/// dropping `topic` from [`PublicationMemoKey`] would still produce two
+/// upserts and the test would not catch the regression. Sharing one memo here
+/// forces the topic to do real work: drop it from the key, and the second
+/// topic overwrites the first topic's memo entry, suppressing its upsert. The
+/// row count would drop from two to one and this test would fail.
 #[tokio::test]
 async fn memo_key_includes_topic() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
-    // ONE template → one shared memo; two distinct topics.
+    // One shared template, so one shared memo; two distinct topics.
     let template = template(store.clone(), registry(StateVisibility::Published)?, 3, 64)?;
     let t1 = Intern::<str>::from("topic-1");
     let t2 = Intern::<str>::from("topic-2");
@@ -402,9 +405,9 @@ async fn memo_key_includes_topic() -> Result<()> {
 }
 
 /// The healthy no-op path: reconciliation over a store with no rows removes
-/// nothing. The read-failure degradations are pinned separately by
-/// [`reconcile_skips_collection_whose_reads_fail_permanent`] (skip) and
-/// [`reconcile_propagates_transient_read_failure`] (propagate).
+/// nothing. The read-failure cases are tested separately: see
+/// [`reconcile_skips_collection_whose_reads_fail_permanent`] for the skip case
+/// and [`reconcile_propagates_transient_read_failure`] for the propagate case.
 #[tokio::test]
 async fn reconcile_over_empty_store_is_a_noop() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -425,10 +428,10 @@ async fn reconcile_over_empty_store_is_a_noop() -> Result<()> {
     Ok(())
 }
 
-/// A `Published` collection's own row survives reconciliation: only
-/// registered-but-private names are swept, so a read-mostly published
-/// collection keeps its routing row across restart and a reader never loses
-/// discoverability of its still-committed state.
+/// A `Published` collection's own row survives reconciliation. Only names
+/// registered as private are swept, so a published collection keeps its
+/// routing row across restart, and a reader never loses the ability to find
+/// its still-committed state.
 #[tokio::test]
 async fn reconcile_keeps_published_collection_row() -> Result<()> {
     let store = ScriptedPublicationStore::new();
@@ -491,9 +494,9 @@ async fn reconcile_skips_collection_whose_reads_fail_permanent() -> Result<()> {
     Ok(())
 }
 
-/// A `Transient` read failure inside reconciliation propagates, so the caller's
-/// build-time retry re-runs — the classification split from the `Permanent`
-/// skip above.
+/// A `Transient` read failure inside reconciliation propagates, so the
+/// caller's build-time retry re-runs. This is the transient counterpart to
+/// the `Permanent` skip tested above.
 #[tokio::test]
 async fn reconcile_propagates_transient_read_failure() -> Result<()> {
     let store = ScriptedPublicationStore::new();

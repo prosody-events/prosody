@@ -3,23 +3,21 @@
 //! `quick_cache` has no native TTL, so this module supplies one over it. Two
 //! rules make it race-free (see [`ReaderCache`]):
 //!
-//! * **Unique [`Stamp`]** `(issued_ms, seq)` — bare milliseconds collide (two
-//!   fills in one millisecond, or a pinned test clock), and a colliding stamp
-//!   would let expiry evict a *newer* fill. The per-bundle `seq` counter makes
-//!   every issued store read's stamp unique and totally ordered by issue; TTL
-//!   age reads `issued_ms`, newer-wins reads `seq` (they are never conflated —
-//!   see [`Stamp`]).
-//! * **Stamp-at-issue** — the stamp is taken when the store read is *issued*,
-//!   not when it completes, so TTL bounds *age since observation began*: a slow
-//!   fill enters already-aged and cannot launder an old value into a fresh
-//!   window for a future reader.
+//! * **Unique [`Stamp`]** `(issued_ms, seq)`. Bare milliseconds collide when
+//!   two fills land in one millisecond, or when the test clock is frozen. A
+//!   colliding stamp would let expiry evict a newer fill. The per-bundle `seq`
+//!   counter makes every issued store read's stamp unique. See [`Stamp`] for
+//!   how the two fields stay separate.
+//! * **Stamp taken at issue.** The stamp is taken when the store read is
+//!   issued, not when it completes. TTL therefore bounds the age since the read
+//!   began. A slow fill enters already-aged, so it cannot pass an old value off
+//!   as fresh to a future reader.
 //!
-//! Hit-gating vs fill-serving: the `age >= ttl` gate applies to cache **hits**
-//! only. A **fill serves its own just-read store result unconditionally** — a
-//! store read reflects committed state as of ~completion, so it is fresh
-//! regardless of fill duration; stamp-at-issue only makes the cache *entry*
-//! expire conservatively for later readers. There is no fill-retry loop (it
-//! would risk livelock).
+//! The `age >= ttl` gate applies to cache hits only. A fill always serves the
+//! store result it just read. That result reflects committed state as of the
+//! fill's completion, so it is fresh no matter how long the fill took. Taking
+//! the stamp at issue only makes the cached entry expire conservatively for
+//! later readers. There is no fill-retry loop, which would risk livelock.
 
 use crate::Key;
 use crate::error::ErrorCategory;
@@ -40,24 +38,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// so a zero-byte negative entry still costs the budget something.
 const READER_CACHE_ENTRY_OVERHEAD: u64 = 64;
 
-/// A cache entry's issue token. The two fields answer two *different*
-/// questions and must never be conflated into one lexicographic order:
+/// A cache entry's issue token. The two fields answer two different questions,
+/// so they are never combined into one ordering:
 ///
-/// * `issued_ms` governs **TTL age** ([`ReaderCache::fresh`]) — wall-time since
-///   observation began.
-/// * `seq` governs **issue order** ([`ReaderCache::write_through`]'s
-///   newer-wins) — the per-bundle atomic counter is the *only* total order of
-///   when reads were issued.
+/// * `issued_ms` governs TTL age (see [`ReaderCache::fresh`]): the wall-time
+///   since observation began.
+/// * `seq` governs issue order (see [`ReaderCache::write_through`]'s
+///   newer-wins). The per-bundle atomic counter is the only total order of when
+///   reads were issued.
 ///
-/// They are deliberately not combined: `issued_ms` is read from the clock
-/// *before* the separate `fetch_add` of `seq`, so a fill that read an earlier
-/// millisecond can still be issued (get a higher `seq`) after one that read a
-/// later millisecond. A lexicographic `(issued_ms, seq)` compare would then let
-/// an older-issued fill overwrite a newer one — a stale-wins lost update. So
-/// newer-wins compares `seq` alone, and `Stamp` carries **no** `Ord` derive to
-/// keep that mistake uncompilable. Expiry compares the whole stamp for
-/// equality (`seq` makes it unique, so `remove_if` never evicts a racing
-/// newer fill).
+/// The clock is read before the separate `fetch_add` of `seq`. So a fill that
+/// read an earlier millisecond can still get a higher `seq` than one that read
+/// a later millisecond. Newer-wins therefore compares `seq` alone. Do not add
+/// an `Ord` derive and compare `(issued_ms, seq)`: an older-issued fill could
+/// then overwrite a newer one, losing the newer write. Expiry compares the
+/// whole stamp for equality. The unique `seq` means `remove_if` never evicts a
+/// racing newer fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stamp {
     /// Milliseconds since the epoch when the backing store read was issued.
@@ -68,9 +64,9 @@ pub(crate) struct Stamp {
 }
 
 /// The cache key: the stable [`SourceId`], the collection name, the partition
-/// key, and the cell. `SourceId` (never an ordinal) keeps entries from
-/// aliasing another source across a snapshot reorder; `StateName` keeps two
-/// collections sharing the cache from aliasing each other.
+/// key, and the cell. The [`SourceId`] is stable, never an ordinal, so an entry
+/// never aliases another source across a snapshot reorder. The [`StateName`]
+/// keeps two collections that share the cache from aliasing each other.
 pub(crate) type CacheKey = (SourceId, StateName, Key, CellKey);
 
 /// The cached value: the issue stamp and the committed bytes (or cached
@@ -81,8 +77,8 @@ type CacheVal = (Stamp, Option<Bytes>);
 /// `ahash`-hashed.
 type ReaderCacheInner = Cache<CacheKey, CacheVal, ReaderWeighter, ahash::RandomState>;
 
-/// A wall clock, injectable in tests — a local type, so the reader never
-/// imports a clock from the owner cache path.
+/// A wall clock, injectable in tests. The reader defines its own clock type
+/// rather than importing one from the owner-side cache.
 #[derive(Clone)]
 pub(crate) enum ReaderClock {
     /// Wall clock: milliseconds since the epoch.
@@ -129,11 +125,11 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
 /// One read-through, TTL-bounded, byte-budgeted cache, shared by every reader
 /// drawing from a bundle. Clone shares the underlying `Arc`s.
 ///
-/// One named accepted allocation lives downstream of a cache hit:
-/// `CellView`'s decode mutable-buffer fallback copies its input when that input
-/// is shared, and a cache hit's `Bytes` is always shared (the cache retains a
-/// reference). The uncached/store path stays zero-copy. The cache itself is
-/// zero-copy — every value is a `Bytes` refcount bump.
+/// One allocation is accepted downstream of a cache hit. `CellView`'s decode
+/// falls back to copying its input when that input is shared, and a cache hit's
+/// `Bytes` is always shared because the cache retains a reference. The uncached
+/// store path stays zero-copy. The cache itself is zero-copy: every value is a
+/// `Bytes` refcount bump.
 #[derive(Clone)]
 pub(crate) struct ReaderCache {
     inner: Arc<ReaderCacheInner>,
@@ -200,9 +196,9 @@ impl ReaderCache {
         self.clock.now_ms().saturating_sub(stamp.issued_ms) < ttl_ms
     }
 
-    /// The read-through point read: serve a fresh hit; expire a stale hit
-    /// atomically (only if still the observed stamp, so a newer racing fill is
-    /// never evicted) and refill single-flight through `fill`.
+    /// The read-through point read. Serve a fresh hit. Expire a stale hit,
+    /// removing it only if it still carries the observed stamp, so a newer
+    /// racing fill is never evicted. Then refill single-flight through `fill`.
     ///
     /// # Errors
     ///
@@ -240,9 +236,9 @@ impl ReaderCache {
     }
 
     /// The read-through batch read, index-aligned to `keys`. Serves the batch
-    /// entirely from the cache when every key is a fresh hit; otherwise issues
-    /// one batch store read (via `fill`), write-through each key newer-wins,
-    /// and returns the store answers.
+    /// entirely from the cache when every key is a fresh hit. Otherwise it
+    /// issues one batch store read through `fill`, writes each key back
+    /// newer-wins, and returns the store answers.
     ///
     /// # Errors
     ///
@@ -272,11 +268,10 @@ impl ReaderCache {
         // One shared issue stamp for the whole batch fill.
         let stamp = self.issue_stamp();
         let fresh = fill().await?;
-        // The write-through and the returned buffer are index-aligned to `keys`
-        // by construction of the store's batch read. Enforce it at this boundary
-        // in every build (not just a debug assert): a shorter fill would `zip`
-        // to a truncated, silently misaligned result, and an overlong one would
-        // cache only a prefix — so surface it as a store error instead.
+        // The store's batch read returns values index-aligned to `keys`. Check
+        // that alignment here in every build, not just a debug assert. A shorter
+        // fill would `zip` to a truncated, misaligned result. An overlong one
+        // would cache only a prefix. Surface either as a store error instead.
         if fresh.len() != keys.len() {
             return Err(StateAccessError::Store {
                 message: format!(
@@ -293,16 +288,15 @@ impl ReaderCache {
         Ok(fresh)
     }
 
-    /// Writes `value` for `key` newer-wins: under the shard lock an occupied
-    /// entry keeps the higher-stamped value (an older-issued fill completing
-    /// late loses); an absent entry is inserted through the guard.
+    /// Writes `value` for `key` newer-wins. Under the shard lock an occupied
+    /// entry keeps the higher-stamped value, so an older-issued fill that
+    /// completes late loses. An absent entry is inserted through the guard.
     async fn write_through(&self, key: &CacheKey, stamp: Stamp, value: Option<Bytes>) {
         let outcome = self
             .inner
             .entry_async(key, |_, existing: &mut CacheVal| {
-                // Newer-wins by issue order (`seq`), NOT by `(issued_ms, seq)`
-                // — see [`Stamp`]: a later-issued fill can carry an earlier
-                // millisecond, so a lexicographic compare would let it lose.
+                // Newer-wins compares `seq` alone, never `(issued_ms, seq)`.
+                // See [`Stamp`].
                 if stamp.seq > existing.0.seq {
                     *existing = (stamp, value.clone());
                 }

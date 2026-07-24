@@ -1,10 +1,10 @@
 //! Subsystem naming.
 //!
-//! A [`SubsystemName`] identifies a keyed-state subsystem — the logical unit a
-//! consumer group publishes state under and a reader addresses. It is neutral
-//! of Cassandra state on purpose: the same name will later route request/reply
-//! responders that need no durable state, so it lives at the crate root rather
-//! than under `state`.
+//! A [`SubsystemName`] identifies a keyed-state subsystem. That is the logical
+//! unit a consumer group publishes state under and a reader addresses. The name
+//! carries no durable state, so it lives at the crate root rather than under
+//! `state`. Request/reply responders that need no Cassandra state will reuse
+//! it.
 
 use crate::error::{ClassifyError, ErrorCategory};
 use std::borrow::Borrow;
@@ -47,9 +47,11 @@ impl AsRef<str> for SubsystemName {
 }
 
 /// Lets maps keyed by [`SubsystemName`] resolve `&str` lookups without
-/// allocating, mirroring [`StateName`](crate::state::StateName). Sound because
-/// the derived `Hash`/`Eq` delegate to the inner `str`, matching `str`'s own
-/// implementations.
+/// allocating, as [`StateName`](crate::state::StateName) does.
+///
+/// The `Borrow` contract requires `Hash` and `Eq` to agree between the owned
+/// and borrowed forms. The derived `Hash`/`Eq` delegate to the inner `str`, so
+/// they match `str`'s own implementations.
 impl Borrow<str> for SubsystemName {
     fn borrow(&self) -> &str {
         self.as_str()

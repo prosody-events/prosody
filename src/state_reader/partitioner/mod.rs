@@ -9,16 +9,16 @@ use crate::error::{ClassifyError, ErrorCategory};
 
 /// A Kafka topic's partition count, guaranteed to be in `[1, i32::MAX]`.
 ///
-/// Minted only via [`TryFrom<i32>`] — the publication-row decode boundary —
-/// so zero, negative, and oversized counts cannot exist past decode. The `i32`
-/// source domain caps the value at `i32::MAX` inherently; no runtime upper
-/// bound is checked because a larger value is unrepresentable in the input.
+/// Built only via [`TryFrom<i32>`], the boundary that decodes a publication
+/// row, so zero, negative, and oversized counts cannot exist past decode. The
+/// `i32` source already caps the value at `i32::MAX`, so no upper bound is
+/// checked at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartitionCount(NonZeroU32);
 
 impl PartitionCount {
-    /// One partition — the smallest valid count; a total fallback for
-    /// infallible const construction.
+    /// One partition, the smallest valid count. Used as the fallback for const
+    /// construction that cannot return an error.
     pub(crate) const MIN: Self = Self(NonZeroU32::MIN);
     /// The mock / in-memory topology's fixed partition count, matching
     /// `MockCluster::new(3)` and `create_topic(_, 3, 3)` in the crate root.
@@ -66,8 +66,7 @@ pub fn partition_for_key(key: &[u8], count: PartitionCount) -> Result<Partition,
     Ok((crc32fast::hash(key) % count.0.get()) as Partition)
 }
 
-/// The key was empty; librdkafka randomizes empty/NULL keys, so no
-/// deterministic partition exists.
+/// The key passed to [`partition_for_key`] was empty.
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("cannot compute a partition for an empty key")]
 pub struct EmptyKeyError;

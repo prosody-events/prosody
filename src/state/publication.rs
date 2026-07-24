@@ -1,10 +1,10 @@
 //! Routing-only keyed-state publication store.
 //!
-//! The durable discovery surface a reader consults to find which consumer
-//! groups publish a collection's state and under which topics. A
-//! [`StatePublication`] row carries ONLY routing facts — group, topic,
-//! partition count — never identity: a freely-upsertable row cannot hold frozen
-//! data, so identity is validated separately against `keyed_state_identity`.
+//! The durable table a reader consults to find which consumer groups publish
+//! a collection's state, and under which topics. A [`StatePublication`] row
+//! carries only routing facts: group, topic, and partition count. It never
+//! carries identity. A row that anyone can upsert cannot hold frozen data, so
+//! identity is validated separately against `keyed_state_identity`.
 
 use crate::Topic;
 use crate::error::ClassifyError;
@@ -31,12 +31,12 @@ pub struct StatePublication {
 /// topic)`.
 ///
 /// A reader discovers a collection's sources by reading one
-/// `(subsystem, state_type, name)` partition; a publisher advertises a source
-/// with an idempotent [`upsert`] and withdraws it with [`remove`], the named
-/// removal path (the memory store's RAM bound). No LWT, no TTL — a source row
-/// is plain routing data. The `state_type` in the address namespaces
-/// collections exactly as `keyed_state_identity` does, so a future internal
-/// (non-`Application`) namespace can publish without a schema change.
+/// `(subsystem, state_type, name)` partition. A publisher advertises a source
+/// with an idempotent [`upsert`] and withdraws it with [`remove`]. [`remove`]
+/// is the removal path that bounds the memory store's RAM. No LWT, no TTL: a
+/// source row is plain routing data. The `state_type` in the address
+/// namespaces collections exactly as `keyed_state_identity` does, so a future
+/// internal (non-`Application`) namespace can publish without a schema change.
 ///
 /// [`upsert`]: PublicationStore::upsert
 /// [`remove`]: PublicationStore::remove

@@ -760,21 +760,22 @@ impl KeyedStateInputs {
     /// Runs startup reconciliation and, when publishing is active, builds the
     /// first-write publisher template for one storage arm's publication store.
     ///
-    /// Reconciliation runs whenever a subsystem is configured — it retires this
-    /// group's routing rows for collections no longer published (the
-    /// `.published(false)` path), resting on the
-    /// zero/one-instance-per-partition invariant plus stop-then-start
-    /// deploy ordering. The template is built only when a collection is
-    /// actually published; otherwise there is nothing to advertise and
-    /// `None` disables the write-path barrier. The low-level
-    /// [`ProsodyConsumer::new`] constructor never calls this — it rejects
-    /// registrations.
+    /// Reconciliation runs whenever a subsystem is configured. It retires this
+    /// group's routing rows for collections no longer published, the
+    /// `.published(false)` path. Correctness rests on two facts: at most one
+    /// instance owns each partition, and a deploy stops the old instance
+    /// before starting the new one.
+    ///
+    /// The template is built only when a collection is actually published.
+    /// Otherwise there is nothing to advertise, and `None` disables the
+    /// first-write barrier. The low-level [`ProsodyConsumer::new`] constructor
+    /// never calls this: it rejects registrations.
     ///
     /// # Errors
     ///
-    /// A transient reconciliation failure (a broken publication store)
-    /// propagates so the caller's build fails and the deploy retries;
-    /// per-collection permanent decode failures are logged and skipped inside
+    /// A transient reconciliation failure, such as a broken publication store,
+    /// propagates so the caller's build fails and the deploy retries.
+    /// Per-collection permanent decode failures are logged and skipped inside
     /// [`reconcile_publications`].
     async fn publication_setup(
         &self,
@@ -975,9 +976,9 @@ async fn build_shared_state<C: Codec>(
     // no second session/publication store is built on the Configured→Running
     // transition.
     let shared = deps.map(SharedDeps::shared_storage);
-    // The bundle's registry when supplied (so the consumer's stall probe covers
-    // the shared loader's poll-loop heartbeat); a fresh one is minted ONLY on
-    // the no-bundle path.
+    // Take the bundle's heartbeat registry when supplied, so the consumer's
+    // stall probe covers the shared loader's poll-loop heartbeat. Build a fresh
+    // one only on the no-bundle path.
     let heartbeats = match deps {
         Some(deps) => deps.heartbeats().clone(),
         None => HeartbeatRegistry::new(
@@ -1111,11 +1112,11 @@ where
 /// Builds the keyed-state provider for a [`StorePair::Memory`] arm (and the
 /// stateless Cassandra arm): the in-memory durable store, backend factory, and
 /// the caller's in-memory message loader, wrapped in the partition state
-/// provider. The pipeline also hands it to message defer; other arms take the
-/// bundle's loader when one is supplied, else a fresh one. The factory is
-/// store-type agnostic — the commit oracle's trigger store handle arrives per
-/// partition via [`PartitionStateProvider::acquire`] — so the concrete return
-/// type serves any trigger backend.
+/// provider. The pipeline also hands this loader to message defer. Other arms
+/// take the bundle's loader when one is supplied, otherwise a fresh one.
+/// The factory is store-type agnostic — the commit oracle's trigger store
+/// handle arrives per partition via [`PartitionStateProvider::acquire`] — so
+/// the concrete return type serves any trigger backend.
 fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,
@@ -1130,9 +1131,9 @@ fn memory_state_provider<C: Codec>(
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
-    // `cells`/`identities` come from the shared bundle when one is supplied, so
-    // a reader minted from the same bundle observes this consumer's committed
-    // writes (mock read-your-writes); a no-bundle consumer passes fresh stores.
+    // `cells`/`identities` come from the shared bundle when one is supplied. A
+    // reader built from the same bundle then observes this consumer's committed
+    // writes (mock read-your-writes). A no-bundle consumer passes fresh stores.
     let backend = MemoryStateBackendFactory::new(
         cells,
         identities,
@@ -1145,9 +1146,11 @@ where
 
 /// The memory cell and identity stores backing the state provider. Returns the
 /// shared bundle's stores when one is supplied, so a reader built from the same
-/// bundle sees this consumer's committed writes; otherwise returns fresh
-/// stores. A Cassandra bundle cannot back a memory arm: the composition derives
-/// both from one config, so this mismatch is reported as
+/// bundle sees this consumer's committed writes. Otherwise returns fresh
+/// stores.
+///
+/// A Cassandra bundle cannot back a memory arm. The composition derives both
+/// from one config, so this mismatch is reported as
 /// [`ConsumerError::SharedDepsBackendMismatch`]. See [`cassandra_arm_inputs`]
 /// for the mirror.
 fn shared_memory_handles(
@@ -1165,7 +1168,7 @@ fn shared_memory_handles(
 /// The memory-arm inputs a consumer resolves from an optional shared bundle:
 /// `(loader, cells, identities, partition_counts)`. These come from the bundle
 /// when one is supplied, so a reader built from the same bundle sees this
-/// consumer's committed writes; otherwise they are fresh mock defaults.
+/// consumer's committed writes. Otherwise they are fresh mock defaults.
 type MemoryArmInputs<P> = (
     MemoryLoader<P>,
     MemoryCells,
@@ -1191,8 +1194,9 @@ where
 
 /// The Cassandra-arm inputs a consumer resolves from an optional shared bundle:
 /// the Kafka loader and the partition-count source. A supplied bundle's `Clone`
-/// shares the client and poll thread; otherwise the loader is freshly built. A
-/// memory bundle cannot back a Cassandra arm: that mismatch is reported as
+/// shares the client and poll thread. Otherwise the loader is freshly built.
+///
+/// A memory bundle cannot back a Cassandra arm. That mismatch is reported as
 /// [`ConsumerError::SharedDepsBackendMismatch`].
 fn cassandra_arm_inputs<C: Codec>(
     deps: Option<&SharedDeps<C>>,
@@ -1609,8 +1613,8 @@ where
                 identity_store,
                 publication_store,
             } => {
-                // One Kafka loader per consumer (a clone shares the client and
-                // poll thread), from the bundle when supplied — see
+                // One Kafka loader per consumer, from the bundle when supplied.
+                // A clone shares the client and poll thread. See
                 // `cassandra_arm_inputs`.
                 let (loader, partition_counts) =
                     cassandra_arm_inputs(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
@@ -2087,11 +2091,12 @@ pub enum KeyedStateInitError {
     RecoveryTtlMargin(#[from] RecoveryTtlMarginError),
 
     /// The local keyed-state cache's disk workspace could not be opened.
-    /// Type-erased with its classification preserved (the inner
-    /// `FjallClientError` is crate-internal and not part of the public
-    /// surface), mirroring the reader's
+    ///
+    /// The inner `FjallClientError` is crate-internal, so this variant carries
+    /// a rendered message plus the error's classification instead of the source
+    /// type. The reader's
     /// [`StateReaderError::Store`](crate::state_reader::StateReaderError::Store)
-    /// boundary.
+    /// uses the same boundary.
     #[error("failed to open the keyed-state cache: {message}")]
     Cache {
         /// Rendered cache-open error, full source chain.
@@ -2100,11 +2105,13 @@ pub enum KeyedStateInitError {
         category: ErrorCategory,
     },
 
-    /// Startup reconciliation of keyed-state publication routing rows failed
-    /// (a broken publication store). Type-erased with its classification
-    /// preserved — a per-collection permanent decode is logged and skipped, so
-    /// a surfaced error is the store itself (typically transient; the deploy
-    /// retries).
+    /// Startup reconciliation of keyed-state publication routing rows failed,
+    /// typically because the publication store was unreachable.
+    ///
+    /// This variant carries a rendered message plus the error's classification
+    /// instead of the source type. A per-collection permanent decode failure
+    /// is logged and skipped, so any error surfaced here comes from the store
+    /// itself. Such a failure is typically transient, and the deploy retries.
     #[error("keyed-state publication reconciliation failed: {message}")]
     Publication {
         /// Rendered reconciliation error, full source chain.

@@ -172,11 +172,11 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// Leaf contexts carry the session the partition loop minted for the
     /// event; wrapper contexts forward their inner context's session type
     /// (`type State = C::State`). State itself is Kafka-agnostic, so the
-    /// payload tie lives here: the session's loader yields `Self::Payload`,
-    /// which keeps Kafka-message handles fully typed inside generic handlers
-    /// without a payload appearing on [`CellRead`]/[`CellWrite`] — the `Loader`
-    /// associated type [`CellRead`] carries is pinned to the message loader
-    /// here.
+    /// payload tie lives here. The session's loader yields `Self::Payload`,
+    /// which keeps Kafka-message handles fully typed inside generic handlers.
+    /// Neither [`CellRead`] nor [`CellWrite`] names a payload; the `Loader`
+    /// associated type that [`CellRead`] carries is fixed to the message
+    /// loader here.
     type State: CellWrite<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a registered keyed-state collection, returning its typed handle.
@@ -288,7 +288,7 @@ pub trait TerminationSignals {
 /// # Type Parameters
 ///
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
-/// * `S`: The per-event [`CellWrite`] session; its payload pins
+/// * `S`: The per-event [`CellWrite`] session; its payload fixes
 ///   [`EventContext::Payload`].
 #[derive(Educe)]
 #[educe(Clone(bound()), Debug(bound = ""))]

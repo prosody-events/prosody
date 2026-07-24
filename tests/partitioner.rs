@@ -1,13 +1,12 @@
-//! Live-Kafka cross-check that [`prosody::state_reader::partition_for_key`]
-//! reproduces the partition the producer's pinned `consistent_random`
-//! partitioner actually assigns.
+//! Live-Kafka test proving [`prosody::state_reader::partition_for_key`]
+//! reproduces the partition Kafka's `consistent_random` partitioner assigns.
 //!
-//! For random non-empty keys produced to a prime-partition-count topic, the
-//! consumed partition (Kafka's ground truth, read straight off
-//! `msg.partition()`) must equal the value the reader's routing primitive
-//! computes for that key. A prime partition count avoids power-of-two low-bit
-//! masking artifacts. This is the property that proves `crc32fast` matches
-//! librdkafka's CRC; the golden vectors only freeze drift.
+//! The test produces random keys to a topic with a prime number of
+//! partitions. For each key, the partition Kafka actually delivers the message
+//! to must equal the partition `partition_for_key` computes for that key. This
+//! is the property that proves `crc32fast` matches librdkafka's CRC. Unit tests
+//! with fixed golden vectors only catch drift after this match is established;
+//! they cannot prove the match holds in the first place.
 
 #![recursion_limit = "256"]
 
@@ -41,9 +40,9 @@ const RECV_HANG_GUARD: Duration = Duration::from_secs(30);
 /// Prime partition count: avoids power-of-two low-bit masking artifacts.
 const PRIME_PARTITIONS: u16 = 31;
 
-/// File-local handler forwarding each message's `(key, partition)` to a channel
-/// and committing. `partition()` is Kafka's ground truth for the delivered
-/// record, independent of anything the reader computes.
+/// Test handler that forwards each message's key and partition to a channel,
+/// then commits. `msg.partition()` is Kafka's ground truth for where the
+/// record landed, not anything the reader computed.
 #[derive(Clone)]
 struct PartitionCaptureHandler {
     tx: Sender<(String, Partition)>,
@@ -78,9 +77,9 @@ impl EventHandler for PartitionCaptureHandler {
     async fn shutdown(self) {}
 }
 
-/// The consumed partition for every produced key equals
-/// `partition_for_key(key, count)` — the producer's pinned partitioner and the
-/// reader's routing primitive agree.
+/// The partition Kafka delivers each produced key to always equals
+/// `partition_for_key(key, count)`. This proves the producer's partitioner
+/// and the reader's partition lookup agree.
 #[tokio::test]
 async fn consumed_partition_matches_partition_for_key() -> Result<()> {
     init_test_logging();
@@ -135,8 +134,8 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
                 "key {key}: consumed partition {observed} != computed {want}",
             );
         }
-        // A dropped message would surface as a hang above, never a false pass;
-        // this pins that exactly `n` were observed (no extra deliveries).
+        // A dropped message would surface as a hang above, never a false pass.
+        // This check confirms exactly `n` messages arrived, with no extras.
         common::expect_no_event(&mut rx, Duration::from_millis(500)).await?;
         Ok(())
     }

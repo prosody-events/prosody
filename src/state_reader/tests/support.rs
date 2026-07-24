@@ -1,14 +1,14 @@
 //! Shared scaffolding for the reader suites.
 //!
-//! Three concerns live here: the **owner-write harness** that seeds committed
-//! (and, for the window arm, provisional) state through the real
-//! [`KeyedStateSession`]; the **scripted fault source**
-//! ([`ScriptedCellSource`]) and **counting identity store**
-//! ([`CountingIdentityStore`]) the closed [`ReaderStores::Scripted`] arm
-//! carries; and the **bundle/reader builders** the suites compose readers
-//! from. Committed state is never hand-written at a cell address — it always
-//! flows through the owner session, so the reader reads exactly what the owner
-//! wrote under the segment [`partition_segment_id`] computes.
+//! Three things live here. The owner-write harness seeds committed state,
+//! and for the window arm provisional state, through the real
+//! [`KeyedStateSession`]. The closed [`ReaderStores::Scripted`] arm is backed
+//! by [`ScriptedCellSource`] and [`CountingIdentityStore`]. The bundle and
+//! reader builders compose readers for the suites.
+//!
+//! Committed state is never hand-written at a cell address. It always flows
+//! through the owner session, so the reader reads exactly what the owner
+//! wrote, under the segment that [`partition_segment_id`] computes.
 
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -87,16 +87,16 @@ pub(crate) fn topic(name: &str) -> Topic {
 
 // --- Owner-write harness ----------------------------------------------------
 
-/// The owner backend the seeding session runs over, generic over the cell store
-/// `C`. The oracle is always the fixed committed one (a pure seed never
-/// resolves a foreign provisional), and the identity type is **phantom** — the
-/// session never reads it (see [`SessionParts`]), so one type serves every
-/// backend. Only `C` varies: [`MemoryCellStore`] for the memory reader,
-/// `CassandraStore<FixedOracle>` for the live-Cassandra reader.
+/// The owner backend the seeding session runs over, generic over the cell
+/// store `C`. The oracle is always the fixed committed one: a pure seed
+/// never resolves a foreign provisional. The identity type is phantom: the
+/// session never reads it. See [`SessionParts`] for why one type serves
+/// every backend. Only `C` varies: [`MemoryCellStore`] for the memory
+/// reader, `CassandraStore<FixedOracle>` for the live-Cassandra reader.
 pub(super) type OwnerBackend<C> = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
 
-/// The real per-event session the seeding handles bind over, over cell store
-/// `C`.
+/// The real per-event session the seeding handles bind over, generic over
+/// cell store `C`.
 pub(super) type OwnerSession<C> = KeyedStateSession<OwnerBackend<C>, MemoryLoader<Value>>;
 
 /// A registry with `descriptor` registered under `def`.
@@ -111,9 +111,9 @@ pub(crate) fn registry_of<D: StateDescriptor>(
     Ok(Arc::new(registry))
 }
 
-/// The segment the owner writes under (and the reader recomputes) for one
-/// source. The single fabricated-identifier authority — never a hand-invented
-/// id.
+/// The segment the owner writes under for one source, which the reader also
+/// recomputes independently. Tests call this instead of hand-building a
+/// segment id.
 pub(crate) fn source_state_key(
     topic: Topic,
     group: &str,
@@ -152,11 +152,11 @@ fn owner_session<C: CellStore>(
     })
 }
 
-/// Finalizes and promotes: the event's staged cells become committed. The full
-/// owner settle for a committed write. Promotion calls the store's settlement
-/// verb directly — it never consults the oracle — so it returns `Resolved` on
-/// any healthy store (memory or Cassandra); a non-`Resolved` outcome is a real
-/// failure the seed must surface.
+/// Finalizes and promotes: the event's staged cells become committed. This
+/// is the full owner settle for a committed write. Promotion calls the
+/// store's settlement verb directly; it never consults the oracle. It
+/// returns `Resolved` on any healthy store, memory or Cassandra. A
+/// non-`Resolved` outcome is a real failure the seed must surface.
 async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
     if let Finalized::Staged(staged) = session
         .finalize()
@@ -169,10 +169,11 @@ async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
     Ok(())
 }
 
-/// Finalizes **without** promoting: the staged provisional cells are durable
-/// but the committed value stays at its prior contents — exactly the
-/// commit→promote window a cross-group reader must read `prev` from. Dropping
-/// the receipt is the "committed step not yet applied" state.
+/// Finalizes without promoting: the staged provisional cells are durable,
+/// but the committed value stays at its prior contents. This is the
+/// commit-to-promote window; a cross-group reader must read `prev` from it.
+/// Dropping the receipt leaves the write in the "committed step not yet
+/// applied" state.
 async fn stage_only<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
     let _staged = session
         .finalize()
@@ -205,8 +206,9 @@ where
     promote(session).await
 }
 
-/// [`owner_commit_cell`] over an in-memory cell store — the memory-backed
-/// seeding entry point the scripted probe/refresh suites write through.
+/// [`owner_commit_cell`] over an in-memory cell store. This is the
+/// memory-backed seeding entry point the scripted probe and refresh suites
+/// write through.
 pub(crate) async fn owner_commit<D, F, Fut>(
     cells: &MemoryCells,
     registry: &Arc<CollectionDefRegistry>,
@@ -224,8 +226,8 @@ where
     owner_commit_cell(cell, registry, state_key, descriptor, event, ops).await
 }
 
-/// [`owner_commit`] but leaves the event in the commit→promote window (staged,
-/// not promoted) — the provisional-projection driver.
+/// [`owner_commit`], but stops after staging and never promotes. Tests use
+/// it to drive reads of provisional state.
 pub(super) async fn owner_stage<D, F, Fut>(
     cells: &MemoryCells,
     registry: &Arc<CollectionDefRegistry>,
@@ -373,12 +375,12 @@ impl MemoryHarness {
 
 // --- Backend-generic reader seam --------------------------------------------
 
-/// The seam the backend-generic committed-read runner
-/// (`reader_suite::run_reader_*_trace`) drives, so ONE runner body proves the
-/// committed==oracle invariant over both the memory reader and a live-Cassandra
-/// reader. An impl bundles the owner-seed cell store (seeded through the real
-/// [`KeyedStateSession`] via [`owner_commit_cell`]), the control-plane seeding,
-/// and the reader `deps` bundle — the three pieces that differ by backend.
+/// The seam that `reader_suite::run_reader_*_trace` drives. One runner body
+/// proves that committed state matches the oracle for both the memory
+/// reader and a live Cassandra reader. An implementation supplies the three
+/// pieces that differ by backend: the owner-seed cell store, seeded through
+/// the real [`KeyedStateSession`] via [`owner_commit_cell`]; the
+/// control-plane seeding; and the reader's `deps` bundle.
 pub(super) trait ReaderBackend {
     /// The owner-seed cell store: [`MemoryCellStore`] for memory, the shared
     /// `CassandraStore<FixedOracle>` for Cassandra.
@@ -388,9 +390,9 @@ pub(super) trait ReaderBackend {
     fn registry(&self) -> Arc<CollectionDefRegistry>;
 
     /// A cell store to seed one event through. Cloning shares the committed
-    /// backing (memory cells / Cassandra rows) across a trace's events, and —
-    /// on Cassandra — the one `MarkerMemo`/`MarkerPresence` lifecycle the store
-    /// owns.
+    /// backing, memory cells or Cassandra rows, across a trace's events. On
+    /// Cassandra, cloning also shares the one `MarkerMemo`/`MarkerPresence`
+    /// lifecycle the store owns.
     fn owner_cell(&self) -> Self::OwnerCell;
 
     /// Advertises `(group, topic)` as a source of `name` and freezes `identity`
@@ -405,9 +407,9 @@ pub(super) trait ReaderBackend {
         identity: &DurableDescriptorIdentity,
     ) -> Result<()>;
 
-    /// A fresh reader bundle over this backend's stores (a fresh cache each
-    /// call, so a per-event reader observes current committed state, not a
-    /// stale cache).
+    /// A fresh reader bundle over this backend's stores. Each call gets a
+    /// fresh cache, so a per-event reader observes current committed state
+    /// instead of a stale one.
     fn deps(&self) -> SharedDeps<JsonCodec>;
 }
 
@@ -486,11 +488,11 @@ pub(super) enum FaultPoint {
     AfterYields(usize),
 }
 
-/// A committed cell source that can fault deterministically per source. Wraps a
-/// real [`MemoryCells`] for the actual committed data (seeded through the owner
-/// harness); the closed [`ReaderStores::Scripted`] arm carries it because the
-/// two production arms cannot script a mid-stream scan error (Memory is
-/// `Infallible`, Cassandra needs a live cluster).
+/// A committed cell source that can fault deterministically per source. It
+/// wraps a real [`MemoryCells`] for the actual committed data, seeded
+/// through the owner harness. The closed [`ReaderStores::Scripted`] arm
+/// carries it because neither production arm can script a mid-stream scan
+/// error: Memory is `Infallible`, and Cassandra needs a live cluster.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
@@ -520,10 +522,10 @@ impl ScriptedCellSource {
         self.faults.read_sync(&segment, |_, fault| *fault)
     }
 
-    /// Committed reads recorded for the source addressed by `segment` — mirrors
-    /// [`CountingIdentityStore::reads`], keyed per source so a test can assert
-    /// which sources a probe touched (e.g. a scan pins one source and never
-    /// opens the decoy).
+    /// Committed reads recorded for the source addressed by `segment`. This
+    /// mirrors [`CountingIdentityStore::reads`], keyed per source so a test
+    /// can assert which sources a probe touched. For example, a scan can pin
+    /// one source and never open the decoy.
     pub(super) fn reads(&self, segment: SegmentId) -> usize {
         self.reads
             .read_sync(&segment, |_, count| *count)
@@ -587,9 +589,10 @@ impl ScriptedCellSource {
             futures::pin_mut!(source);
             let mut yielded = 0usize;
             loop {
-                // Budget is checked BEFORE pulling: the fault fires after exactly
-                // `n` yields regardless of the stream's length (a stream ending
-                // at exactly `n` still faults), and no (n+1)-th item is fetched.
+                // The budget check happens before pulling the next item, not
+                // after. The fault fires after exactly `n` yields, even when
+                // the stream would have ended exactly there. No item beyond
+                // the nth is ever fetched.
                 if limit.is_some_and(|n| yielded >= n) {
                     Err(StateAccessError::store(&ScriptedFaultError))?;
                 }
@@ -608,8 +611,8 @@ impl ScriptedCellSource {
     }
 }
 
-/// A scripted store fault (always `Transient`, never `Terminal` — the reader
-/// layer's posture).
+/// A scripted store fault. It always classifies as `Transient`, never
+/// `Terminal`, matching the reader layer's posture.
 #[derive(Debug, Error)]
 #[error("scripted cell-source fault")]
 pub(super) struct ScriptedFaultError;
@@ -622,9 +625,9 @@ impl ClassifyError for ScriptedFaultError {
 
 // --- Counting identity store ------------------------------------------------
 
-/// A [`DescriptorIdentityStore`] counting every `read_identity` — the probe for
-/// "an already-admitted source is never re-validated." Wraps a real memory
-/// identity store; cloning shares the counter.
+/// A [`DescriptorIdentityStore`] that counts every `read_identity` call. It
+/// tests that an already-admitted source is never re-validated. It wraps a
+/// real memory identity store; cloning shares the counter.
 #[derive(Clone, Default)]
 pub(crate) struct CountingIdentityStore {
     inner: MemoryDescriptorIdentityStore,
@@ -692,19 +695,17 @@ pub(super) fn scripted_deps(
     )
 }
 
-/// A captured scripted-env context: one source's store triple plus the
-/// routing constants and descriptor a probe/refresh test drives it with.
-/// Bundles the binding block (`ScriptedCellSource`/`ScriptedPublicationStore`/
-/// `CountingIdentityStore` construction, descriptor/name/subsystem/count/
-/// registry) that recurred across the probe and refresh suites, plus the
-/// downstream per-source seeding (`source_state_key` + `owner_commit`/
-/// `fault_at` + `publish_scripted`) and reader construction (`scripted_deps` +
-/// `StateReader::new_eager`/`new_with_interval`) every scripted suite repeats.
+/// One source's store triple, plus the routing constants and descriptor a
+/// probe or refresh test drives it with. It bundles the construction every
+/// scripted suite repeats: the stores and registry, per-source seeding
+/// through [`Self::commit`] and [`Self::fault`], control-plane advertising
+/// through [`Self::publish`], and reader construction through [`Self::deps`]
+/// and [`Self::reader_eager`].
 ///
-/// Fields are exposed to the tests it serves: a script that seeds the
-/// control-plane stores directly (bypassing [`Self::publish`]), or that needs
-/// the raw [`ScriptedCellSource`] to assert its source-call trace, reaches
-/// them as `env.cells`/`env.publications`/etc.
+/// Fields stay public within the module so a test can reach past the
+/// builder methods: seed the control-plane stores directly instead of going
+/// through [`Self::publish`], or read [`ScriptedCellSource`] directly to
+/// assert its source-call trace.
 pub(super) struct ScriptedEnv<D> {
     pub(super) cells: ScriptedCellSource,
     pub(super) publications: ScriptedPublicationStore,
@@ -717,9 +718,10 @@ pub(super) struct ScriptedEnv<D> {
 }
 
 impl<D: StateDescriptor> ScriptedEnv<D> {
-    /// A fresh scripted env for `descriptor`, registered under its own name
-    /// (the single fabricated-identifier authority `descriptor.name()` — the
-    /// same string every source's frozen identity asserts against).
+    /// A fresh scripted env for `descriptor`, registered under its own name.
+    /// Every test calls `descriptor.name()` for this, never inventing a name
+    /// by hand, so a source's frozen identity always asserts against the
+    /// same string.
     pub(super) fn new(descriptor: D) -> Result<Self> {
         Ok(Self {
             cells: ScriptedCellSource::new(),
@@ -734,8 +736,8 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     }
 
     /// Seeds one source's committed state for `group`/`tp` through the real
-    /// owner session, returning the segment-qualified state key it wrote
-    /// under (and the reader recomputes).
+    /// owner session. Returns the segment-qualified state key it wrote
+    /// under; the reader recomputes the same key independently.
     pub(super) async fn commit<F, Fut>(
         &self,
         group: &str,
@@ -795,8 +797,8 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         self.deps_with_cache(ReaderCache::with_budget(1 << 20))
     }
 
-    /// [`Self::deps`] over an explicit `cache` — the sticky-mismatch test's
-    /// fixed-clock driver.
+    /// [`Self::deps`] over an explicit `cache`. The sticky-mismatch test
+    /// drives its clock through this.
     pub(super) fn deps_with_cache(&self, cache: ReaderCache) -> SharedDeps<JsonCodec> {
         scripted_deps(
             self.cells.clone(),
@@ -813,8 +815,9 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
             .map_err(|e| eyre!("reader: {e}"))
     }
 
-    /// A reader over an explicit `cache` with a non-zero refresh interval —
-    /// the sticky-mismatch test's cached-snapshot-fast-path driver.
+    /// A reader over an explicit `cache` with a non-zero refresh interval.
+    /// The sticky-mismatch test drives its cached-snapshot fast path through
+    /// this.
     pub(super) fn reader_with_interval(
         &self,
         cache: ReaderCache,

@@ -91,11 +91,11 @@ where
 {
     producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
-    /// The consumer state, which owns the one shared infrastructure bundle
-    /// ([`SharedDeps`]) on its `Configured`/`Running` variants — built lazily
-    /// at the first point of need ([`Self::state`] or [`Self::subscribe`]) and
-    /// retained across the `Configured → Running` transition, so no state
-    /// transition constructs a second session/loader/memory store.
+    /// The consumer state. On its `Configured` and `Running` variants it owns
+    /// the one shared infrastructure bundle ([`SharedDeps`]). The bundle is
+    /// built lazily on first use, by [`Self::state`] or [`Self::subscribe`],
+    /// and retained across the `Configured → Running` transition. No state
+    /// transition builds a second session, loader, or memory store.
     consumer: Mutex<ConsumerState<T, C>>,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
@@ -254,9 +254,9 @@ where
         }
     }
 
-    /// The client's retained shared bundle, if one has been built. The test
-    /// hook the composition suite uses to seed committed state into the exact
-    /// stores the running consumer and the client's readers share.
+    /// The client's retained shared bundle, if one has been built. This test
+    /// hook lets the composition suite seed committed state into the exact
+    /// stores that the running consumer and the client's readers share.
     #[cfg(test)]
     pub(crate) async fn retained_deps(&self) -> Option<SharedDeps<C>> {
         match &*self.consumer.lock().await {
@@ -269,9 +269,9 @@ where
     /// Composes a standalone [`StateReader`] over this client's one shared
     /// bundle, for `descriptor` routed under `subsystem`.
     ///
-    /// Valid once the consumer is `Configured` or `Running` — both draw from
-    /// the same retained bundle, so a reader minted before `subscribe` and one
-    /// minted after share one session/loader/memory store.
+    /// Valid once the consumer is `Configured` or `Running`. Both draw from
+    /// the same retained bundle. A reader built before `subscribe` and one
+    /// built after therefore share one session, loader, and memory store.
     ///
     /// # Errors
     ///
@@ -336,12 +336,9 @@ where
             },
         };
 
-        // Build the consumer. `take` moved the config out, so on any failure we
-        // undo both below: restore the `Configured` state (a transient build
-        // failure must stay retryable, not wedge the client `Unconfigured`) and
-        // drop the bundle (it holds an open scylla session, a live rdkafka poll
-        // thread, and a registered heartbeat that would otherwise strand
-        // unusable). The next `subscribe` then rebuilds a fresh one.
+        // Build the consumer. `take` moved the config out, so any failure must
+        // undo both: the match below restores `Configured` and drops the
+        // bundle. See there for why each step is needed.
         let built: Result<_, HighLevelClientError<C::Error>> = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
@@ -405,10 +402,11 @@ where
         let consumer = match built {
             Ok(consumer) => consumer,
             Err(error) => {
-                // Restore the configured state so a transient build failure is
-                // retryable, dropping the bundle (its open scylla session, live
-                // rdkafka poll thread, and registered heartbeat would otherwise
-                // strand). The next `subscribe` rebuilds a fresh one.
+                // Restore the configured state so a transient build failure
+                // stays retryable. Drop the bundle: its open scylla session,
+                // live rdkafka poll thread, and registered heartbeat would
+                // otherwise be stranded. The next `subscribe` rebuilds a
+                // fresh one.
                 *consumer_ref = ConsumerState::Configured { config, deps: None };
                 return Err(error);
             }
@@ -437,11 +435,10 @@ where
 
             // Restore `Configured` without a bundle: the taken `Running.deps`
             // is dropped here. Its heartbeat registry holds this consumer's
-            // poll-loop heartbeat, which stops beating at shutdown; reusing the
-            // same registry on a later `subscribe` would fold that
-            // permanently-dead heartbeat into `is_stalled` forever and grow the
-            // registry without a removal path. The next `subscribe` rebuilds a
-            // fresh bundle.
+            // poll-loop heartbeat, which stops beating at shutdown. Reusing the
+            // same registry on a later `subscribe` would count that dead
+            // heartbeat in `is_stalled` forever and grow the registry with no
+            // removal path. The next `subscribe` rebuilds a fresh bundle.
             match take(consumer_ref) {
                 state @ (ConsumerState::Unconfigured
                 | ConsumerState::ConfigurationFailed(_)
@@ -533,12 +530,13 @@ where
     }
 }
 
-/// Builds the one shared infrastructure bundle from a mode configuration. The
-/// bundle depends only on the trigger-store backend, group id, and cache budget
-/// — all mode-independent — so the same build serves any mode (mirrors the
-/// Cassandra-session reuse in `StorePair::new`). `InMemory` is exactly mock
-/// mode, so its bundle carries the shared in-memory stores that give a reader
-/// minted from it read-your-writes against the running consumer.
+/// Builds the one shared infrastructure bundle from a mode configuration.
+/// The bundle depends only on the trigger-store backend, group id, and cache
+/// budget, all of which are mode-independent, so the same build serves any
+/// mode. This mirrors the Cassandra-session reuse in `StorePair::new`.
+/// `InMemory` is exactly mock mode. Its bundle carries the shared in-memory
+/// stores, so a reader built from it gets read-your-writes against the
+/// running consumer.
 async fn build_shared_deps<C: Codec>(
     mode: &ModeConfiguration,
 ) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>

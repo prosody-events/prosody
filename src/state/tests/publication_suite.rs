@@ -1,25 +1,27 @@
 //! Backend-generic routing-only publication-store suite.
 //!
-//! Random upsert/re-upsert/remove traces over a small pool vs a `BTreeMap`
-//! oracle keyed by the full primary key `(subsystem, state_type, name, group,
-//! topic)`; equivalence is asserted after EVERY op by re-reading every
-//! `(subsystem, state_type, name)` triple in the pool. Instantiated by the
-//! memory suite
-//! (`QUICKCHECK_TESTS`) and the Cassandra suite (`INTEGRATION_TESTS`). Every
-//! backend must satisfy the same invariants:
+//! Drives random upsert/re-upsert/remove traces over a small pool of
+//! publication sources against a `BTreeMap` oracle. The oracle is keyed by the
+//! full primary key `(subsystem, state_type, name, group, topic)`. After every
+//! operation the suite re-reads every `(subsystem, state_type, name)` triple in
+//! the pool and asserts the result matches the oracle.
 //!
-//! * **Upsert idempotence** — re-`Upsert` of an existing `(group, topic)`
-//!   overwrites the routing facts in place; a duplicate would surface as an
-//!   extra row in the sorted set-equality.
-//! * **Remove** — after a `Remove`, that source is gone from the read.
-//! * **Subsystem/`state_type`/name isolation** — the pool holds the same name
-//!   under two subsystems and two state types, and the same `(group, topic)`
-//!   under different names, so any key that ignored one of the three would leak
-//!   rows across partitions.
+//! The memory suite runs this trace `QUICKCHECK_TESTS` times. The Cassandra
+//! suite runs it `INTEGRATION_TESTS` times. Every backend must satisfy the
+//! same invariants:
 //!
-//! The model is a plain `BTreeMap`, never a re-implementation of the store. No
-//! identity is tested here — a publication row carries none (it is validated
-//! against `keyed_state_identity` at acquisition).
+//! * **Upsert idempotence.** Re-`Upsert` of an existing `(group, topic)`
+//!   overwrites the routing facts in place. A duplicate would show up as an
+//!   extra row in the sorted set comparison.
+//! * **Remove.** After a `Remove`, that source is gone from the read.
+//! * **Subsystem, state-type, and name isolation.** The pool holds the same
+//!   name under two subsystems and two state types, and the same `(group,
+//!   topic)` under different names. A key that ignored any of the three would
+//!   leak rows across partitions.
+//!
+//! The model is a plain `BTreeMap`, never a re-implementation of the store.
+//! No identity is tested here. A publication row carries no identity. Identity
+//! is validated against `keyed_state_identity` when the row is acquired.
 
 use crate::Topic;
 use crate::state::publication::{PublicationStore, StatePublication};
@@ -46,10 +48,11 @@ const GROUPS: [&str; 3] = ["g0", "g1", "g2"];
 /// The topics the pool spans.
 const TOPICS: [&str; 2] = ["t0", "t1"];
 
-/// A full-PK oracle key: `(subsystem, state_type, name, group, topic)`.
+/// The oracle key: the full primary key
+/// `(subsystem, state_type, name, group, topic)`.
 type OracleKey = (String, i8, String, String, String);
 
-/// The full-PK oracle key for one publication source.
+/// Builds the oracle key for one publication source.
 fn oracle_key(
     subsystem: &SubsystemName,
     state_type: StateType,
@@ -66,9 +69,11 @@ fn oracle_key(
     )
 }
 
-/// Resolves a subsystem seed to a name from the pool. `token` namespaces the
-/// subsystem pool so concurrent/repeated runs against the shared keyspace never
-/// collide, while the distinct subsystems within a run give isolation coverage.
+/// Resolves a subsystem seed to a name from the pool.
+///
+/// `token` namespaces the subsystem pool so concurrent test runs against the
+/// shared keyspace never collide. The distinct subsystems within one run still
+/// give isolation coverage.
 fn subsystem_for(token: &str, seed: u8) -> Result<SubsystemName> {
     Ok(SubsystemName::try_new(format!(
         "{token}-s{}",
@@ -165,9 +170,10 @@ impl Arbitrary for PublicationTrace {
 
 /// Drives `store` and a plain `BTreeMap` model through `trace`, asserting
 /// equivalence after every op by re-reading every pool
-/// `(subsystem, state_type, name)`.
-/// Returns `Ok(false)` on a model divergence (a real invariant break); store
-/// errors propagate.
+/// `(subsystem, state_type, name)` triple.
+///
+/// Returns `Ok(false)` on a model divergence, meaning a real invariant broke.
+/// Store errors propagate as `Err`.
 pub(crate) async fn run_publication_trace<S>(
     store: &S,
     token: &str,
@@ -231,10 +237,10 @@ where
             }
         }
 
-        // Re-read every pool (subsystem, state_type, name) and compare sorted
-        // set-equality against the oracle's matching prefix. Content, not
-        // order — PublicationStore makes no clustering-order guarantee (both
-        // backends happen to return group/topic-ascending anyway).
+        // Re-reads every pool (subsystem, state_type, name) triple and compares
+        // against the oracle as sorted sets, not in read order. `PublicationStore`
+        // makes no clustering-order guarantee. Both backends currently return
+        // rows sorted by group and topic anyway.
         for s in 0..u8::try_from(SUBSYSTEMS)? {
             for t in 0..u8::try_from(STATE_TYPES.len())? {
                 for n in 0..u8::try_from(NAMES.len())? {

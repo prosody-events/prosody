@@ -2,16 +2,16 @@
 //! publication suites.
 //!
 //! These run the same [`identity_suite`](crate::state::tests::identity_suite)
-//! and [`publication_suite`](crate::state::tests::publication_suite) runners as
-//! the memory suite against [`CassandraDescriptorIdentityStore`]'s
+//! and [`publication_suite`](crate::state::tests::publication_suite) runners
+//! as the memory suite, but against the real Cassandra stores.
+//! [`CassandraDescriptorIdentityStore`] implements
 //! [`DescriptorIdentityStore`](crate::state::descriptor_identity::DescriptorIdentityStore)
-//! impl over the real `keyed_state_identity` table and
-//! [`CassandraPublicationStore`]'s
-//! [`PublicationStore`](crate::state::publication::PublicationStore)
-//! impl over `keyed_state_publication` — so the production point-read, the
+//! over the `keyed_state_identity` table. [`CassandraPublicationStore`]
+//! implements [`PublicationStore`](crate::state::publication::PublicationStore)
+//! over `keyed_state_publication`. Both run the production point-read, the
 //! `INSERT … IF NOT EXISTS` LWT, the conflict-row name-matched decoding, and
-//! the routing upsert/remove/read all run under the same invariants the models
-//! check. Each iteration uses a fresh `group_id`, so the shared keyspace never
+//! the routing upsert/remove/read under the same invariants the models check.
+//! Each iteration uses a fresh `group_id`, so the shared keyspace never
 //! collides across runs.
 
 use super::identity::{CassandraDescriptorIdentityStore, IdentityQueries};
@@ -49,9 +49,9 @@ async fn publication_setup() -> Result<CassandraPublicationStore> {
 
 /// The backend-generic publication contract over Cassandra — the same runner
 /// the memory suite drives. A fresh subsystem token per iteration keeps the
-/// shared keyspace collision-free. Connecting via `CassandraStore::new` applies
-/// the new migration to `prosody_test`, so this test also proves it applies
-/// cleanly.
+/// shared keyspace collision-free. `CassandraStore::new` runs the
+/// `keyed_state_publication` migration on connect, so this test also proves
+/// that migration applies cleanly to `prosody_test`.
 #[test]
 fn prop_cassandra_publication_trace() {
     fn prop(trace: PublicationTrace) -> TestResult {

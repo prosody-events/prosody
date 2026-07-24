@@ -16,21 +16,24 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// Pins the element type of both cache-size fields — `cache_size_bytes` and its
-/// structural twin `read_cache_size_bytes` — to `NonZeroU64`, the choice that
-/// makes each field's documented "rejected at build" contract hold. The build
-/// path is `from_option_env(STATE_CACHE_SIZE_ENV)?` (and the read twin's
-/// `STATE_READ_CACHE_SIZE_ENV`), which parses a present value with
-/// `<Option<NonZeroU64>>::Item::from_str`; each closure fails to compile if
-/// that field's type ever weakens (e.g. to `Option<u64>`, which would silently
-/// accept `0`), and the assertions below prove that element type accepts a
-/// positive byte count and rejects zero, negative, non-numeric, empty, and
-/// out-of-`u64` values. The `"0"` rejection is load-bearing: it is the sole
-/// value distinguishing `NonZeroU64` from a plain `u64`. One parse-contract
-/// test covers both fields because they share an identical element type — the
-/// sweep stops there deliberately. The env-read wiring itself
-/// (`from_option_env`, [`super::STATE_CACHE_SIZE_ENV`]) is trusted std, so this
-/// needs none of the `unsafe` env mutation a full build-path test would.
+/// Pins the element type of `cache_size_bytes` and its structural twin
+/// `read_cache_size_bytes` to `NonZeroU64`. That type is what makes each
+/// field's documented "rejected at build" contract hold. If either field's
+/// type ever weakened to `Option<u64>`, it would silently accept `0`, and one
+/// of these closures would fail to compile.
+///
+/// The build path parses a present value with
+/// `<Option<NonZeroU64>>::Item::from_str`, reached through `from_option_env`
+/// reading `STATE_CACHE_SIZE_ENV` or `STATE_READ_CACHE_SIZE_ENV`. The
+/// assertions below prove `NonZeroU64` accepts a positive byte count and
+/// rejects zero, negative, non-numeric, empty, and out-of-`u64` values. The
+/// `"0"` rejection is the one case that distinguishes `NonZeroU64` from a
+/// plain `u64`.
+///
+/// One test covers both fields since they share the same element type. The
+/// env-read wiring itself (`from_option_env`, [`super::STATE_CACHE_SIZE_ENV`])
+/// is trusted std, so this needs none of the `unsafe` env mutation a full
+/// build-path test would.
 const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.cache_size_bytes;
 const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.read_cache_size_bytes;
 
@@ -82,10 +85,10 @@ fn zero_recovery_delay_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// A read-cache TTL that truncates to zero milliseconds is rejected — every
-/// cached entry would be born stale (the reader-construction check's config
-/// twin) — while a millisecond-or-larger TTL and the explicit `None` opt-out
-/// both validate.
+/// A read-cache TTL under one millisecond truncates to zero, so every cached
+/// entry would be born stale. Validation rejects it here, mirroring the check
+/// applied when the reader is constructed. A TTL of one millisecond or more,
+/// and the explicit `None` opt-out, both validate.
 #[test]
 fn sub_millisecond_read_cache_ttl_is_rejected() -> Result<()> {
     use std::time::Duration;

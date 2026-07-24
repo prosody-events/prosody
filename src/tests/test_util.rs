@@ -141,9 +141,9 @@ impl CapturedEvents {
     }
 }
 
-/// Tracing layer capturing every event at or above `max_level` in severity
-/// (WARN captures WARN and ERROR), rendering each field — the `message`
-/// included — into [`CapturedEvents`].
+/// Tracing layer that captures every event at or above `max_level` in
+/// severity. Setting `max_level` to WARN also captures ERROR events. It
+/// renders every field, including `message`, into [`CapturedEvents`].
 struct EventCaptureLayer {
     max_level: Level,
     events: CapturedEvents,
@@ -177,16 +177,19 @@ impl Visit for EventVisitor {
     }
 }
 
-/// Installs a subscriber capturing every tracing event at or above `max_level`
-/// in severity for the current thread, returning the shared [`CapturedEvents`]
-/// and the guard that keeps the subscriber active. Unlike [`captured_spans`]
-/// (which scopes a synchronous closure), the guard-based form spans an `async`
-/// test body — a `#[tokio::test]` runs its awaits on the calling thread, so the
-/// thread-local default stays live across them. Drop the guard to uninstall.
+/// Installs a subscriber that captures every tracing event at or above
+/// `max_level` in severity for the current thread. Returns the shared
+/// [`CapturedEvents`] buffer and the guard that keeps the subscriber active.
+/// Drop the guard to uninstall it.
 ///
-/// The event analog of [`captured_spans`], for asserting that a specific
-/// diagnostic log fired — the `captured_spans` `OTel` pipeline records only
-/// span data, not free-standing events.
+/// Use this instead of [`captured_spans`] when the test body is `async`.
+/// [`captured_spans`] only scopes a synchronous closure. A `#[tokio::test]`
+/// runs its awaits on the calling thread, so the thread-local subscriber
+/// installed here stays active across them.
+///
+/// This is the event analog of [`captured_spans`]: use it to assert that a
+/// specific diagnostic log fired. The `captured_spans` `OTel` pipeline
+/// records only span data, not free-standing events.
 #[must_use]
 pub(crate) fn capture_events(max_level: Level) -> (CapturedEvents, DefaultGuard) {
     let events = CapturedEvents::default();

@@ -1,19 +1,24 @@
 //! Property and example suites for the standalone reader.
 //!
-//! Every arm is deterministic: committed state is seeded through the **real**
-//! owner [`KeyedStateSession`](crate::state::session::KeyedStateSession)
-//! (set/finalize/promote), the reader then reads it back over the oracle-free
-//! carriers, and time is an injected [`ReaderClock`](super::cache::ReaderClock)
-//! — never a sleep. The scaffolding (backend-generic owner-write harness,
-//! scripted fault source, counting identity store, source-call trace) lives in
-//! [`support`]; the test families split by invariant.
+//! Every arm is deterministic. Committed state is seeded through the
+//! **real** owner
+//! [`KeyedStateSession`](crate::state::session::KeyedStateSession),
+//! using its set/finalize/promote calls. The reader then reads that state
+//! back through the stores that bypass the commit oracle. Time comes from
+//! an injected [`ReaderClock`](super::cache::ReaderClock), never a sleep.
 //!
-//! The committed==oracle invariant is proven **once** by the backend-generic
-//! [`reader_suite`] runner (`run_reader_{value,map,deque}_trace`), instantiated
-//! for the memory reader in [`reader_tests`] and for a **live-Cassandra**
-//! reader in [`cassandra_tests`] — the `cell_suite` idiom. Fault, refresh, and
-//! cache invariants stay scripted/clock-only (production backends cannot inject
-//! faults): [`probe_tests`], [`refresh_tests`], [`cache_tests`].
+//! The scaffolding lives in [`support`]: a backend-generic owner-write
+//! harness, a scripted fault source, a counting identity store, and a
+//! source-call trace. The test families below split by invariant.
+//!
+//! The invariant that committed state always matches the oracle is proven
+//! once, by the backend-generic [`reader_suite`] runner
+//! (`run_reader_{value,map,deque}_trace`). It runs against the memory reader
+//! in [`reader_tests`] and against a **live Cassandra** reader in
+//! [`cassandra_tests`], following the same pattern as `cell_suite`. Fault,
+//! refresh, and cache invariants stay scripted and clock-only, since
+//! production backends cannot inject faults. They live in [`probe_tests`],
+//! [`refresh_tests`], and [`cache_tests`].
 
 pub(crate) mod support;
 

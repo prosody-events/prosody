@@ -2,12 +2,17 @@ use color_eyre::Result;
 
 use super::{EmptyKeyError, PartitionCount, partition_for_key};
 
-/// Frozen `(key, count) → partition` contract for the `consistent_random`
-/// partitioner. The `b"123456789"` rows are anchored to the externally
-/// published CRC-32/ISO-HDLC constant `crc32(b"123456789") == 0xCBF43926`
-/// (= `3_421_780_262`), so they pin the mapping independent of the code under
-/// test; the remaining rows extend drift coverage over other fixed keys. A
-/// change to any expected value reddens this test — that is the contract.
+/// Frozen `(key, count) → partition` table for the `consistent_random`
+/// partitioner.
+///
+/// The `b"123456789"` rows are pinned to the published CRC-32/ISO-HDLC check
+/// value `crc32(b"123456789") == 0xCBF43926` (`3_421_780_262`). That ties the
+/// expected partitions to a value computed outside this crate, not to the
+/// code under test. The remaining rows cover other fixed keys.
+///
+/// If the partitioner's key-to-partition mapping ever changes, one of these
+/// rows will fail. That is the point of a golden test: it catches
+/// accidental drift in the mapping.
 const GOLDEN: &[(&[u8], i32, i32)] = &[
     (b"123456789", 31, 14),
     (b"123456789", 7, 5),

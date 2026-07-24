@@ -73,9 +73,9 @@ pub type ClearedSections = SmallVec<[Section; SECTIONS_INLINE]>;
 /// sections it cleared (dirty clear markers), and its [`CellSnapshot`].
 pub type TouchedCollection = ((StateType, StateName), ClearedSections, CellSnapshot);
 
-/// One event's distinct touched `(state_type, name)` collections — the
-/// keys-only projection [`DirtyStore::touched_collections`] yields, inline for
-/// the common handful.
+/// One event's distinct touched `(state_type, name)` collections, inline for
+/// the common handful. This is the collection identity alone, without cell
+/// payloads; [`DirtyStore::touched_collections`] returns it.
 pub type TouchedCollectionNames = SmallVec<[(StateType, StateName); COLLECTIONS_INLINE]>;
 
 /// One event's touched collections — the `finalize` work-list, inline for the
@@ -310,12 +310,11 @@ impl DirtyStore {
         grouped
     }
 
-    /// The distinct `(state_type, name)` collections this event's (one `key`)
-    /// dirty overlay touched — the marker and entry ranges projected to their
-    /// collection identity, cloning no cell values or snapshots. This is
-    /// [`Self::touched`] without the per-cell payload: the first-write
-    /// publisher needs only the collection names, so cloning the full
-    /// [`CellSnapshot`] there would be a redundant hot-path allocation.
+    /// The distinct `(state_type, name)` collections this event's dirty overlay
+    /// touched, for the single `key`. Projects the marker and entry ranges to
+    /// their collection identity. Clones no cell values or snapshots. This is
+    /// [`Self::touched`] without the per-cell payload, for callers that need
+    /// only the collection names.
     #[must_use]
     pub fn touched_collections(&self, key: &Key) -> TouchedCollectionNames {
         let guard = Guard::new();

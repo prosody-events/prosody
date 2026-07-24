@@ -1,14 +1,15 @@
 //! End-to-end reads through the public [`StateReader`].
 //!
-//! The committed round-trip for Value / Map / Deque is the memory instantiation
-//! of the backend-generic [`reader_suite`](super::reader_suite) runner
-//! (`prop_reader_*_committed`); the focused examples below pin invariants too
-//! narrow to generalize: the commit→promote window (unprovable post-promotion),
-//! Kafka-ref resolution through the loader, identity validation, and the
-//! boundary errors.
+//! The committed round-trip for Value / Map / Deque is the memory
+//! instantiation of the backend-generic [`reader_suite`](super::reader_suite)
+//! runner (`prop_reader_*_committed`). The focused tests below pin invariants
+//! that runner cannot reach: the commit-to-promote window, since the runner
+//! always promotes before reading; Kafka-ref resolution through the loader;
+//! identity validation; and the boundary errors.
 //!
-//! Committed state is seeded through the real owner session; the reader reads
-//! it back over the oracle-free carriers under the segment the owner wrote.
+//! Committed state is seeded through the real owner session. The reader
+//! reads it back through the stores that bypass the commit oracle, under the
+//! segment the owner wrote.
 
 use super::reader_suite::{
     ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
@@ -32,12 +33,13 @@ use futures::executor::block_on;
 use serde_json::Value;
 use std::time::Duration;
 
-/// Instantiates a memory `prop_reader_<kind>_committed` test: builds a fresh
-/// [`MemoryReaderBackend`] for `$descriptor_ctor($name)`, drives an arbitrary
-/// `Trace<$op>` through `$runner`, and asserts the committed==oracle
-/// invariant. `QUICKCHECK_TESTS` sets the iteration count. The three
-/// instantiations below are byte-identical but for the descriptor
-/// constructor, collection name, trace op, and runner.
+/// Instantiates a memory `prop_reader_<kind>_committed` test.
+///
+/// Builds a fresh [`MemoryReaderBackend`] for `$descriptor_ctor($name)`,
+/// drives an arbitrary `Trace<$op>` through `$runner`, and asserts the
+/// committed value always matches the oracle model. `QUICKCHECK_TESTS` sets
+/// the iteration count. The three instantiations below differ only in the
+/// descriptor constructor, collection name, trace op, and runner.
 macro_rules! reader_prop {
     ($test_name:ident, $op:ty, $descriptor_ctor:expr, $name:expr, $runner:ident) => {
         #[test]
@@ -168,16 +170,16 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
     Ok(())
 }
 
-/// The bundle-wide default read-cache TTL (`KeyedStateConfiguration::
-/// read_cache_ttl` fed through `SharedDeps::with_default_read_cache_ttl`)
-/// applies to a descriptor that never called `.read_cache(...)`: within the
-/// TTL the reader serves the cached committed value even after the owner
-/// commits a newer one. With the default cleared (`None`), the same second
-/// read observes the new commit — descriptor-silent reads stay uncached.
+/// A descriptor that never calls `.read_cache(...)` falls back to the
+/// bundle-wide default TTL (`KeyedStateConfiguration::read_cache_ttl`,
+/// applied through `SharedDeps::with_default_read_cache_ttl`). Within that
+/// TTL the reader keeps serving the cached committed value even after the
+/// owner commits a newer one. When the bundle default is `None`, the
+/// descriptor stays uncached: the second read always sees the new commit.
 ///
 /// Falsify: drop the `.or(deps.default_read_cache_ttl())` resolution in the
-/// reader's constructor — the cached arm never engages and the first arm's
-/// second read sees `2`.
+/// reader's constructor. Then the cached arm never engages, and the first
+/// case's second read sees `2` instead of `1`.
 #[tokio::test]
 async fn bundle_default_read_cache_ttl_applies_when_descriptor_is_silent() -> Result<()> {
     for (default_ttl, expected_second_read) in [
@@ -226,8 +228,8 @@ async fn bundle_default_read_cache_ttl_applies_when_descriptor_is_silent() -> Re
         let reader = StateReader::new(&deps, sub, descriptor)?;
         assert_eq!(reader.get(key.clone()).await?, Some(Value::from(1i64)));
 
-        // A newer committed value is what distinguishes a cached read (still
-        // serves 1 inside the TTL) from an uncached one (sees 2).
+        // A newer committed value distinguishes the two cases. A cached read
+        // still returns 1 inside the TTL; an uncached read returns 2.
         owner_commit(
             &harness.cells,
             &registry,
@@ -252,12 +254,14 @@ async fn bundle_default_read_cache_ttl_applies_when_descriptor_is_silent() -> Re
     Ok(())
 }
 
-/// A bundle default that truncates to zero milliseconds is rejected at reader
-/// construction exactly like a descriptor-set TTL: the reader validates the
-/// *resolved* policy, so a degenerate env-sourced default cannot slip through.
+/// A bundle default that truncates to zero milliseconds fails reader
+/// construction exactly like a descriptor-set TTL would. The reader
+/// validates the *resolved* policy, not just the descriptor's own setting,
+/// so a degenerate default read from configuration cannot slip through.
 ///
-/// Falsify: validate the descriptor's TTL before the bundle-default
-/// resolution — the descriptor-silent reader validates `None` and constructs.
+/// Falsify: move the TTL validation before the bundle-default resolution.
+/// The descriptor is silent, so it validates `None` and the reader
+/// constructs instead of rejecting.
 #[tokio::test]
 async fn zero_ms_bundle_default_is_rejected_at_reader_construction() -> Result<()> {
     let harness = MemoryHarness::new();
@@ -272,16 +276,17 @@ async fn zero_ms_bundle_default_is_rejected_at_reader_construction() -> Result<(
     }
 }
 
-/// A Kafka-message-ref Value: the owner writes a `MessageRef` (the Kafka
-/// coordinates of the message in hand), and the standalone reader reads the
-/// committed ref and resolves it to the full message body through
-/// `ReaderLoader::Memory` — the same read path as a plain Value, only the
-/// loader arm differs. Owner and reader carry the same collection under
-/// different loader types (`MemoryLoader` vs `ReaderLoader`), which share one
-/// structural identity (codec `message-ref`, value kind, unit key).
+/// The owner writes a `MessageRef`, the Kafka coordinates of the message it
+/// has in hand. The standalone reader reads the committed ref and resolves
+/// it to the full message body through `ReaderLoader::Memory`. This is the
+/// same read path as a plain Value; only the loader arm differs.
 ///
-/// Falsify: never seed the loader body — the resolve returns a loader error
-/// instead of the message and the assert reds.
+/// The owner and the reader use different loader types, `MemoryLoader` and
+/// `ReaderLoader`, but the same collection: they share one structural
+/// identity (codec `message-ref`, value kind, unit key).
+///
+/// Falsify: never seed the loader body. The resolve then returns a loader
+/// error instead of the message, and the assertion goes red.
 #[tokio::test]
 async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
     use crate::consumer::message::ConsumerMessage;
@@ -367,13 +372,13 @@ async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
     Ok(())
 }
 
-/// A source whose frozen identity differs from the reader's descriptor in any
-/// one field fails `IdentityMismatch` (Permanent); an unperturbed identity
-/// acquires; a raw unknown `kind` discriminant compares unequal (never a decode
-/// failure).
+/// A source whose frozen identity differs from the reader's descriptor in
+/// any one field fails with `IdentityMismatch` (Permanent). An unperturbed
+/// identity acquires normally. A raw, unknown `kind` discriminant compares
+/// unequal instead of failing to decode.
 ///
-/// Falsify: widen `descriptor_identity::validate` to compare only `format_id`
-/// — the kind-perturbed arm then acquires instead of failing.
+/// Falsify: widen `descriptor_identity::validate` to compare only
+/// `format_id`. Then the kind-perturbed case acquires instead of failing.
 #[tokio::test]
 async fn identity_mismatch_is_permanent() -> Result<()> {
     use crate::state::descriptor_identity::DescriptorIdentityStore;
@@ -398,8 +403,8 @@ async fn identity_mismatch_is_permanent() -> Result<()> {
     fmt_perturbed.format_id = format!("{}-x", base.format_id);
     let mut key_fmt_perturbed = base.clone();
     key_fmt_perturbed.key_format_id = format!("{}-x", base.key_format_id);
-    // A raw discriminant no CollectionKindId uses — compares unequal, never a
-    // decode failure.
+    // A raw discriminant that no CollectionKindId uses. It compares unequal
+    // instead of failing to decode.
     let mut unknown_kind = base.clone();
     unknown_kind.kind = 127;
 
@@ -457,11 +462,13 @@ async fn identity_mismatch_is_permanent() -> Result<()> {
     Ok(())
 }
 
-/// An empty key is rejected `EmptyKey` before any acquisition; a collection
-/// with no publication rows fails `UnknownPublication` (Transient).
+/// An empty key is rejected with `EmptyKey` before any acquisition. A
+/// collection with no publication rows fails with `UnknownPublication`
+/// (Transient).
 ///
-/// Falsify: drop the `key.is_empty()` guard in `StateReader::session` — the
-/// empty-key read no longer short-circuits and the `EmptyKey` arm is unreached.
+/// Falsify: drop the `key.is_empty()` guard in `StateReader::session`. The
+/// empty-key read no longer short-circuits, and the `EmptyKey` arm is never
+/// reached.
 #[tokio::test]
 async fn boundary_errors() -> Result<()> {
     let harness = MemoryHarness::new();

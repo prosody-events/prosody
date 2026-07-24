@@ -1,43 +1,43 @@
-//! The per-operation read session realizing probe-and-pin.
+//! The per-operation read session that runs probe-and-pin.
 //!
-//! A [`ReadSession`] implements [`CellRead`] **only** — it has no mutator
-//! bounds, so a reader-minted handle cannot express a mutation (the
-//! `ReadOnlyHandleCannotMutate` invariant). One session is minted per
-//! `StateReader` operation and captures an immutable snapshot, so one logical
-//! operation resolves against one exact source set and pins at most one source
-//! (the `SingleSourceCoherence` invariant).
+//! A [`ReadSession`] implements [`CellRead`] only. It has no mutator bound, so
+//! a handle built from a reader cannot express a mutation. Call this the
+//! `ReadOnlyHandleCannotMutate` invariant. One session is built per
+//! `StateReader` operation and captures an immutable snapshot. One logical
+//! operation therefore resolves against one exact source set and pins at most
+//! one source. Call this the `SingleSourceCoherence` invariant.
 //!
-//! Of these guarantees two are structural — `ReadOnlyHandleCannotMutate` (no
-//! mutator bound exists) and committed-only (the only value a session can
-//! materialize is
-//! [`Cell::project_committed`](crate::state::cell::Cell::project_committed)).
-//! `SingleSourceCoherence` is **not** purely type-enforced: it rests on a
-//! runtime serialization invariant — the unpinned reads within one operation
-//! MUST be issued sequentially, each pinning before the next begins. Every read
-//! path here obeys it (a probe runs to a pin, then later calls address the
-//! pin), so a torn two-source view is unreachable today; a future *concurrent*
-//! batched probe would have to restore single-flight over the pin to keep it.
+//! Two of these guarantees are structural. `ReadOnlyHandleCannotMutate` holds
+//! because no mutator bound exists. Committed-only holds because the only value
+//! a session can materialize is
+//! [`Cell::project_committed`](crate::state::cell::Cell::project_committed).
 //!
-//! Probe-and-pin — the reader's source-selection strategy:
+//! `SingleSourceCoherence` is not purely type-enforced. It rests on a runtime
+//! rule: the unpinned reads within one operation must be issued sequentially,
+//! each pinning before the next begins. Every read path here obeys that rule. A
+//! probe runs to a pin, then later calls address the pin, so a torn two-source
+//! view cannot occur. A concurrent batched probe added later would have to keep
+//! this sequential-pin behavior to preserve the invariant.
 //!
-//! * **Point read / `get_many`** — issue the read to every source concurrently,
-//!   but resolve **in source order** with early exit. A [`FuturesOrdered`]
-//!   yields strictly in push (source) order regardless of completion timing, so
-//!   the lowest-ordered source with data always wins the pin — a fast `None`
-//!   from a non-owner can never beat a slow `Some` from the owner. A source
-//!   that errors is skipped (error remembered); data beats a skipped error; no
-//!   data plus at least one error is an error. Once pinned, later calls address
-//!   the pinned source directly and never touch the others.
-//! * **Scan** — probe sources **sequentially**; the first stream to yield a
-//!   cell pins, a post-pin mid-stream error terminates with `Err` (no restart
-//!   would double-yield), a pre-yield error is skipped, an empty source falls
-//!   through.
+//! Probe-and-pin is the reader's source-selection strategy:
 //!
-//! Once pinned, every later call addresses the pinned source directly — even
-//! on `None`/`Err`; the probe never reruns inside an operation. Determinism is
-//! **source-preference order**, not a stable pin under transient faults
-//! (`A=Err,B=Some` pins B; a later run with `A=Some` pins A) — an
-//! availability/staleness difference, never a committed-only violation.
+//! * **Point read and `get_many`** issue the read to every source concurrently
+//!   and resolve in source order with early exit. A [`FuturesOrdered`] yields
+//!   in push order regardless of completion timing, so the lowest-ordered
+//!   source with data always wins the pin. A fast `None` from a non-owner can
+//!   never beat a slow `Some` from the owner. A source that errors is skipped
+//!   and its error remembered. Data beats a skipped error. No data plus at
+//!   least one error is an error.
+//! * **Scan** probes sources sequentially. The first stream to yield a cell
+//!   pins. A mid-stream error after the pin terminates with `Err`, because a
+//!   restart would double-yield. An error before any yield is skipped. An empty
+//!   source falls through to the next.
+//!
+//! Once pinned, every later call addresses the pinned source directly, even on
+//! `None` or `Err`. The probe never reruns within an operation. Determinism is
+//! source-preference order, not a stable pin under transient faults: with
+//! `A=Err` and `B=Some` the pin is B, and a later run with `A=Some` pins A.
+//! That is an availability difference, never a committed-only violation.
 
 use crate::Key;
 use crate::codec::Codec;
@@ -66,9 +66,9 @@ use tokio::task::coop::cooperative;
 /// A per-operation read-only session over a collection's validated publication
 /// snapshot. Implements [`CellRead`] only.
 ///
-/// Public because it appears in the `FromSession` bounds on
-/// [`StateReader`](super::StateReader)'s read methods (mirroring the owner's
-/// public `KeyedStateSession`); its fields and constructor stay crate-internal,
+/// It is public because it appears in the `FromSession` bounds on
+/// [`StateReader`](super::StateReader)'s read methods, mirroring the owner's
+/// public `KeyedStateSession`. Its fields and constructor stay crate-internal,
 /// so a downstream crate can name it in a bound but can neither build one nor
 /// reach a cell through it.
 pub struct ReadSession<C: Codec> {
@@ -102,7 +102,7 @@ impl<C: Codec> Clone for ReadSession<C> {
 }
 
 impl<C: Codec> ReadSession<C> {
-    /// Mints a session for one operation over `snapshot`, with a fresh pin.
+    /// Builds a session for one operation over `snapshot`, with a fresh pin.
     pub(crate) fn new(
         snapshot: Arc<ValidatedPublications>,
         stores: ReaderStores,
@@ -126,10 +126,11 @@ impl<C: Codec> ReadSession<C> {
         }
     }
 
-    /// Computes the backing collection id for `source`: `partition_for_key` →
-    /// `partition_segment_id(topic, partition, group)` → [`CollectionId`]. The
-    /// key is non-empty by construction (rejected at the `StateReader`
-    /// boundary), so `partition_for_key` never errors here in practice.
+    /// Computes the backing [`CollectionId`] for `source`. The key routes to a
+    /// partition via `partition_for_key`, then to a segment via
+    /// `partition_segment_id`. The key is non-empty by construction, since
+    /// empty keys are rejected at the `StateReader` boundary, so
+    /// `partition_for_key` never errors here in practice.
     fn collection_id_for(&self, source: &Source) -> Result<CollectionId, StateAccessError> {
         let partition = partition_for_key(self.key.as_bytes(), source.partition_count)
             .map_err(|e| StateAccessError::store(&e))?;
@@ -165,8 +166,9 @@ impl<C: Codec> ReadSession<C> {
             Some(ttl) => {
                 let ttl_ms = ttl.as_millis() as u64;
                 let key = self.cache_key(source, cell);
-                // `collection_id_for` (key murmur + segment routing) runs only
-                // on a cache miss — the fill closure — never on a hit.
+                // `collection_id_for` does key murmur and segment routing. It
+                // runs only inside the fill closure on a cache miss, never on a
+                // hit.
                 self.cache
                     .get_cached(key, ttl_ms, || async {
                         let id = self.collection_id_for(source)?;
@@ -279,13 +281,12 @@ where
             return self.cached_point(source, cell).await;
         }
         let sources = self.snapshot.sources();
-        // `FuturesOrdered` heap-allocates a node per source (≤
-        // `MAX_PUBLICATION_SOURCES`). Kept over a hand-rolled poll loop on a
-        // pinned `SmallVec`: this is a per-operation, I/O-bound cross-group read
-        // (not the per-message/per-cell steady state the alloc rule targets), so
-        // a bounded 16-node allocation alongside the store reads is not a
-        // pessimization, and the ordered-with-early-exit fan-out reads far
-        // clearer than the zero-alloc alternative.
+        // `FuturesOrdered` heap-allocates one node per source, bounded by
+        // `MAX_PUBLICATION_SOURCES`. This is a per-operation, I/O-bound
+        // cross-group read, not the per-message or per-cell steady state the
+        // allocation rule targets. A bounded 16-node allocation alongside the
+        // store reads is acceptable here. Do not replace it with a hand-rolled
+        // poll loop over a `SmallVec` to avoid the allocation.
         let mut ordered = FuturesOrdered::new();
         for source in sources {
             ordered.push_back(cooperative(
@@ -297,10 +298,10 @@ where
         while let Some(result) = ordered.next().await {
             match result {
                 Ok(Some(value)) => {
-                    // Discarding the `set` result is safe only because unpinned
-                    // reads in one operation are issued sequentially (see the
-                    // `SingleSourceCoherence` note): this is the first pin, so
-                    // the `OnceLock` is empty and the set succeeds.
+                    // Discarding the `set` result is safe because unpinned reads
+                    // in one operation are issued sequentially (the
+                    // `SingleSourceCoherence` invariant). This is the first pin,
+                    // so the `OnceLock` is empty and the set succeeds.
                     let _ = self.pin.set(sources[idx].clone());
                     return Ok(Some(value));
                 }
@@ -345,9 +346,8 @@ where
             match result {
                 Ok(buffer) => {
                     if buffer.iter().any(Option::is_some) {
-                        // Safe to discard only under the sequential-read
-                        // serialization (see the `SingleSourceCoherence` note):
-                        // the first pin always finds the `OnceLock` empty.
+                        // First pin, so the set succeeds and discarding its
+                        // result is safe; see the `get` pin above.
                         let _ = self.pin.set(sources[idx].clone());
                         return Ok(buffer);
                     }
@@ -364,10 +364,11 @@ where
             idx += 1;
         }
         match (all_none, first_err) {
-            // Data was returned early above, so among the remaining outcomes an
-            // error outranks an all-`None` buffer: absence is not provable
-            // through a source that failed (mirrors the point read, where a
-            // remembered error beats the `None` answers).
+            // A data-bearing buffer already returned early above. Among the
+            // remaining outcomes an error outranks an all-`None` buffer, because
+            // absence cannot be proven through a source that failed. This
+            // mirrors the point read, where a remembered error beats the `None`
+            // answers.
             (_, Some(error)) => Err(error),
             (Some(buffer), None) => Ok(buffer),
             // Unreachable: the snapshot is non-empty, so at least one source
@@ -393,11 +394,11 @@ where
                 return;
             }
             // Unpinned sequential probe. This is the general `CellRead::scan`
-            // contract for a fresh session; the public Map/Deque reader streams
-            // never reach it, because each first reads its keyset/bounds cell
+            // contract for a fresh session. The public Map and Deque reader
+            // streams never reach it: each first reads its keyset or bounds cell
             // through the point fan-out (`get`), which pins before any scan is
-            // issued (or yields no scan at all). Kept as the correct behavior
-            // for an unpinned scan, not dead — do not delete it as "unreachable".
+            // issued, or yields no scan at all. This is correct behavior for an
+            // unpinned scan, not dead code. Do not delete it as unreachable.
             let sources = self.snapshot.sources();
             let mut first_err = None;
             let mut pinned = false;
@@ -417,8 +418,9 @@ where
                         }
                         Some(Err(error)) => {
                             if yielded_any {
-                                // Post-pin mid-stream error: terminate, never
-                                // restart (a restart would double-yield/skip).
+                                // Mid-stream error after the pin. Terminate,
+                                // never restart, because a restart would
+                                // double-yield or skip cells.
                                 Err(error)?;
                             } else if first_err.is_none() {
                                 first_err = Some(error);

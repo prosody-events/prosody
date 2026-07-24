@@ -2,8 +2,8 @@ use super::SubsystemName;
 use crate::error::{ClassifyError, ErrorCategory};
 use quickcheck::{QuickCheck, TestResult};
 
-/// A trimmed-non-empty name is accepted and round-trips as its trimmed form; a
-/// blank (empty or all-whitespace) name is rejected.
+/// A name that is non-blank after trimming is accepted and stored in its
+/// trimmed form. A blank name (empty or all-whitespace) is rejected.
 #[test]
 fn prop_subsystem_name_trims_and_rejects_blank() {
     fn prop(name: String) -> TestResult {
@@ -22,7 +22,8 @@ fn prop_subsystem_name_trims_and_rejects_blank() {
     QuickCheck::new().quickcheck(prop as fn(String) -> TestResult);
 }
 
-/// Explicit blank boundaries the generator rarely hits verbatim.
+/// Covers blank-name boundary cases that quickcheck's random generator rarely
+/// produces exactly.
 #[test]
 fn blank_subsystem_names_rejected() {
     for blank in ["", "   ", "\t\n"] {

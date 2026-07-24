@@ -84,12 +84,12 @@ fn last_seen() -> MessageDescriptor<KafkaLoader<JsonCodec>> {
 /// [`Registered`] token (see the module doc).
 const LAST_SEEN: &str = "last_seen";
 
-/// A second Kafka-message collection the handler records the current message
-/// into, registered `.published(true)` in the publication test so a standalone
-/// [`StateReader`] can read it back — exercising the reader's Kafka loader arm
+/// A second Kafka-message collection recorded alongside `last_seen`. The
+/// publication test registers it `.published(true)` so a standalone
+/// [`StateReader`] can read it back through the reader's Kafka loader arm
 /// (`ReaderLoader::Kafka`), which resolves a message-ref cell by re-fetching
-/// the body from Kafka. `last_seen` cannot serve this because it stays private
-/// (its absent routing row is asserted end-to-end).
+/// its body from Kafka. `last_seen` stays private, so it can't demonstrate
+/// this path.
 const RECEIPT: &str = "receipt";
 
 /// What the handler saw, streamed to the test for content assertions.
@@ -153,7 +153,8 @@ impl CartHandler {
             .await?;
 
         // Record the same message into the published receipt collection so a
-        // cross-group reader can resolve it back through the Kafka loader arm.
+        // reader in a different consumer group can resolve it through the
+        // Kafka loader arm.
         ctx.clone()
             .boxed()
             .message_value_state(RECEIPT)?
@@ -340,8 +341,8 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
     let mut keyed_state = KeyedStateConfiguration::default();
     let cart = keyed_state.register(cart());
     let _last_seen = keyed_state.register(last_seen());
-    // Registered so the handler's erased write resolves; stays private here (no
-    // subsystem is configured in this test).
+    // Registered so the handler's erased write to `RECEIPT` resolves. It stays
+    // private here because this test configures no subsystem.
     let _receipt = keyed_state.register(message_state::<KafkaLoader<JsonCodec>>(RECEIPT));
     let handler = CartHandler {
         observations_tx,
@@ -446,10 +447,11 @@ async fn verify_observations(rx: &mut Receiver<Observation>, second: &Value) -> 
 
 /// A `Published` collection's first durable write publishes a routing row into
 /// `keyed_state_publication` carrying the topic's live Kafka partition count.
-/// Mirrors the round-trip test, but `cart` is `.published(true)` under a
-/// configured subsystem; after the writes are observably durable (the timer
-/// read-back fires only after both message events settle), the row is present
-/// with the correct group, topic, and partition count.
+/// This mirrors the round-trip test, but registers `cart` `.published(true)`
+/// under a configured subsystem. The timer read-back fires only after both
+/// message events settle, so the writes are already durable by the time it
+/// fires. The test then asserts the row is present with the correct group,
+/// topic, and partition count.
 #[tokio::test]
 async fn test_published_collection_writes_routing_row() -> Result<()> {
     init_test_logging();
@@ -483,18 +485,19 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
 
     let (observations_tx, mut observations_rx) = channel(10);
 
-    // `cart` is published under a subsystem; `last_seen` stays private. The
-    // subsystem is minted fresh per run: the publication table is keyed by
-    // `(subsystem, name)` and the reader discovers every group that published
-    // under it, so a fixed name would accumulate one source row per run against
-    // the shared keyspace and eventually breach `MAX_PUBLICATION_SOURCES`.
+    // `cart` is published under a subsystem. `last_seen` stays private.
+    // The subsystem name is generated fresh for each run. The publication
+    // table is keyed by `(subsystem, name)`, and the reader discovers every
+    // group that published under it. A fixed name would accumulate one
+    // source row per run against the shared keyspace, eventually breaching
+    // `MAX_PUBLICATION_SOURCES`.
     let subsystem = SubsystemName::try_new(format!("orders-{}", Uuid::new_v4()))
         .map_err(|e| eyre!("subsystem: {e}"))?;
     let mut keyed_state = KeyedStateConfiguration::default();
     keyed_state.subsystem = Some(subsystem.clone());
     let cart = keyed_state.register(cart().published(true));
     let _last_seen = keyed_state.register(last_seen());
-    // A published Kafka-message collection: its routing row lets a standalone
+    // A published Kafka-message collection. Its routing row lets a standalone
     // reader discover the source and resolve the cell through the Kafka loader.
     let _receipt =
         keyed_state.register(message_state::<KafkaLoader<JsonCodec>>(RECEIPT).published(true));
@@ -537,14 +540,14 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
     let outcome = async {
         producer.send([], topic, key, first).await?;
         producer.send([], topic, key, second.clone()).await?;
-        // The timer read-back fires only after both message events fully settle
-        // (per-key serialization), so by the time it is observed the cart's
+        // The timer read-back fires only after both message events settle,
+        // thanks to per-key serialization. By the time it fires, the cart's
         // publication row is durable.
         verify_observations(&mut observations_rx, &second).await?;
         assert_routing_row(&subsystem, &group_id, topic).await?;
-        // The published cart is now durable and advertised: a standalone
-        // Cassandra-backed reader discovers the source, validates identity, and
-        // reads the committed value over the production read path.
+        // The published cart is now durable and advertised. A standalone
+        // Cassandra-backed reader discovers the source, validates identity,
+        // and reads the committed value over the production read path.
         read_cart_via_standalone_reader(&subsystem, &consumer_config, key).await
     }
     .await;
@@ -554,19 +557,20 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
 }
 
 /// Reads the published `cart` value back through a standalone Cassandra-backed
-/// [`StateReader`] — exercising the full production read wiring end-to-end:
+/// [`StateReader`]. This exercises the full production read path end to end:
 /// `SharedDeps::connect`, publication-source discovery, frozen-identity
-/// validation against the reader's descriptor, probe-and-pin, and the committed
-/// projection. The read is expected to observe exactly the value the pipeline
-/// consumer committed.
+/// validation against the reader's descriptor, probe-and-pin, and the
+/// committed projection. The read must observe exactly the value the
+/// pipeline consumer committed.
 async fn read_cart_via_standalone_reader(
     subsystem: &SubsystemName,
     consumer_config: &ConsumerConfiguration,
     key: &str,
 ) -> Result<()> {
     // One `connect` opens the session, prepares the reader's queries, and
-    // builds the Kafka loader (required by the Cassandra bundle but never
-    // consulted for a plain Value; a Kafka-ref collection would exercise it).
+    // builds the Kafka loader. The Cassandra bundle requires the loader, but
+    // this test never consults it for a plain `Value`. A Kafka-ref
+    // collection would exercise it.
     let budget = NonZeroU64::new(1_048_576_u64).ok_or_else(|| eyre!("nonzero budget"))?;
     let deps =
         SharedDeps::<JsonCodec>::connect(consumer_config, &common::test_cassandra_config(), budget)
@@ -579,12 +583,13 @@ async fn read_cart_via_standalone_reader(
         "standalone reader must observe the committed cart, got {value:?}"
     );
 
-    // The published receipt is a Kafka-message cell: reading it through the
-    // reader exercises `ReaderLoader::Kafka`, resolving the committed message
-    // ref by re-fetching the body from Kafka over the production loader. The
-    // reader binds the same message identity under its own `ReaderLoader` (the
-    // resolver id is loader-independent), so the source discovered above serves
-    // the second message the consumer recorded (offset 1, body `banana`).
+    // The published receipt is a Kafka-message cell. Reading it through the
+    // reader exercises `ReaderLoader::Kafka`, which resolves the committed
+    // message ref by re-fetching its body from Kafka through the production
+    // loader. The reader binds the same message identity under its own
+    // `ReaderLoader` because the resolver id does not depend on the loader.
+    // The source discovered above therefore serves the second message the
+    // consumer recorded: offset 1, body `banana`.
     let receipt_reader = StateReader::new(
         &deps,
         subsystem.clone(),
@@ -607,7 +612,7 @@ async fn read_cart_via_standalone_reader(
     Ok(())
 }
 
-/// Reads the `keyed_state_publication` table directly and asserts exactly one
+/// Reads the `keyed_state_publication` table directly. Asserts exactly one
 /// routing row for `group_id` under `(subsystem, cart)`, carrying `topic` and
 /// the topic's live partition count (1, since the test topic has one
 /// partition).
@@ -640,8 +645,8 @@ async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: To
     );
 
     // The private `last_seen` collection was durably written alongside `cart`
-    // but never publishes: its routing row must be absent end-to-end (the
-    // visibility gate against the real table, not just the mock stores).
+    // but never publishes. Its routing row must be absent here too, and this
+    // assertion checks the real table rather than a mock store.
     let private = StateName::try_new(LAST_SEEN).map_err(|e| eyre!("name: {e}"))?;
     ensure!(
         publication_store

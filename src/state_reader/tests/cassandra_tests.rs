@@ -5,16 +5,17 @@
 //! `CassandraStore<FixedOracle>` and reads it back through the production
 //! oracle-free carriers ([`CassandraCellResources`]). The same
 //! `run_reader_{value,map,deque}_trace` runner the memory suite uses
-//! ([`reader_suite`](super::reader_suite)) runs here over live CQL, closing the
-//! Cassandra-coverage gap (Value + Map + Deque + scan + two-group probe).
+//! ([`reader_suite`](super::reader_suite)) runs here over live CQL, adding
+//! Cassandra coverage for Value, Map, Deque, scans, and the two-group probe.
 //!
-//! Isolation (per TESTING.md's Cassandra row rule): the shared `prosody_test`
-//! keyspace, a fresh subsystem/group/key token minted **inside** each
-//! evaluation, `partition_count = 1` (so `partition_for_key` trivially agrees
-//! with the owner's write partition), and fixed per-kind descriptor names whose
-//! `structural_identity` differs by kind. A fresh group id yields a fresh
-//! `UUIDv5` segment, so cell rows are disjoint; a fresh subsystem yields a
-//! fresh publication partition; a fresh key isolates the reader cache.
+//! Isolation follows TESTING.md's Cassandra row rule. Each evaluation runs in
+//! the shared `prosody_test` keyspace and generates a fresh subsystem, group,
+//! and key token before it starts. `partition_count` is always `1`, so
+//! `partition_for_key` trivially agrees with the owner's write partition. Each
+//! kind uses a fixed descriptor name, and the three names differ so their
+//! `structural_identity` values differ too. A fresh group id yields a fresh
+//! `UUIDv5` segment, so cell rows stay disjoint. A fresh subsystem yields a
+//! fresh publication partition, and a fresh key isolates the reader cache.
 
 use super::reader_suite::{
     ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
@@ -59,11 +60,11 @@ use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// The live-Cassandra [`ReaderBackend`]. Holds ONE
-/// `CassandraStore<FixedOracle>` (shared session + prepared queries + one
-/// `MarkerMemo`/`MarkerPresence` lifecycle), cloned into a fresh owner session
-/// per event; the reader reads through [`CassandraCellResources`] over the same
-/// session and queries.
+/// The live-Cassandra [`ReaderBackend`]. It holds one
+/// `CassandraStore<FixedOracle>`, which bundles a shared session, prepared
+/// queries, and one `MarkerMemo`/`MarkerPresence` lifecycle. That store is
+/// cloned into a fresh owner session for each event. The reader reads through
+/// [`CassandraCellResources`] over the same session and the same queries.
 struct CassandraReaderBackend {
     store: CassandraCellStore<FixedOracle>,
     cells: CassandraCellResources,
@@ -119,23 +120,25 @@ impl ReaderBackend for CassandraReaderBackend {
                 publications: self.publications.clone(),
                 identities: self.identities.clone(),
             },
-            // Value/Map/Deque never consult the loader; the memory arm avoids a
-            // live Kafka consumer config while keeping the REAL Cassandra
-            // cell/publication/identity stores under test.
+            // Value/Map/Deque never consult the loader. The in-memory loader avoids
+            // a live Kafka consumer config here, while the cell, publication, and
+            // identity stores stay the real Cassandra implementations under test.
             ReaderLoader::Memory(MemoryLoader::new()),
             ReaderCache::with_budget(1 << 20),
         )
     }
 }
 
-/// The fixed per-kind names — distinct so each kind's `structural_identity`
-/// differs and no first-kind name freezes the identity for the others.
+/// Names for the three registered kinds. Each name is distinct, so each
+/// kind's `structural_identity` differs instead of collapsing onto whichever
+/// kind registered first.
 const VALUE_NAME: &str = "reader-value";
 const MAP_NAME: &str = "reader-map";
 const DEQUE_NAME: &str = "reader-deque";
 
-/// The reader's fixed topic (fixed avoids topic-intern growth; isolation is by
-/// group/subsystem/key).
+/// The reader's fixed topic. Keeping it fixed avoids growing the topic intern
+/// table. Isolation between evaluations comes from the group, subsystem, and
+/// key instead.
 fn reader_topic() -> Topic {
     Intern::<str>::from("reader-topic")
 }
@@ -207,11 +210,12 @@ fn namespace() -> Result<(SubsystemName, String, Key)> {
     ))
 }
 
-/// Instantiates a live-Cassandra `prop_cassandra_reader_<kind>` test: a fresh
-/// [`cassandra_backend`] and namespace, `$runner` driven over an arbitrary
-/// `Trace<$op>` for `$descriptor_ctor($name)`, scaled by `INTEGRATION_TESTS`.
-/// The three instantiations below are byte-identical but for the descriptor
-/// constructor, collection name, trace op, and runner.
+/// Instantiates a live-Cassandra `prop_cassandra_reader_<kind>` test. Each
+/// evaluation builds a fresh [`cassandra_backend`] and namespace, then runs
+/// `$runner` over an arbitrary `Trace<$op>` for `$descriptor_ctor($name)`,
+/// scaled by `INTEGRATION_TESTS`. The three instantiations below are
+/// identical except for the descriptor constructor, collection name, trace
+/// op, and runner.
 macro_rules! cassandra_reader_prop {
     ($test_name:ident, $op:ty, $descriptor_ctor:expr, $name:expr, $runner:ident) => {
         #[test]
@@ -238,7 +242,8 @@ macro_rules! cassandra_reader_prop {
     };
 }
 
-// The committed==oracle Value property over live Cassandra.
+// The Value property: committed state must equal the oracle, over live
+// Cassandra.
 cassandra_reader_prop!(
     prop_cassandra_reader_value,
     ValueOp,
@@ -247,8 +252,8 @@ cassandra_reader_prop!(
     run_reader_value_trace
 );
 
-// The committed==oracle Map property over live Cassandra (point + `get_many` +
-// ordered stream).
+// The Map property: committed state must equal the oracle, over live
+// Cassandra (point reads, `get_many`, and the ordered stream).
 cassandra_reader_prop!(
     prop_cassandra_reader_map,
     MapOp,
@@ -257,8 +262,8 @@ cassandra_reader_prop!(
     run_reader_map_trace
 );
 
-// The committed==oracle Deque property over live Cassandra (len +
-// front-relative get + ordered stream).
+// The Deque property: committed state must equal the oracle, over live
+// Cassandra (len, front-relative get, and the ordered stream).
 cassandra_reader_prop!(
     prop_cassandra_reader_deque,
     DequeOp,
@@ -267,13 +272,13 @@ cassandra_reader_prop!(
     run_reader_deque_trace
 );
 
-/// Probe-and-pin over TWO admitted live-Cassandra sources: the lowest-ordered
-/// `SourceId` group answers. Both groups commit divergent Values under one
-/// fresh subsystem; `-00 < -01` lexicographically, so the reader must observe
-/// `-00`'s value.
+/// A probe-and-pin test over two admitted live-Cassandra sources: the
+/// lowest-ordered `SourceId` group must answer. Both groups commit divergent
+/// values under one fresh subsystem. Because `-00` sorts lexicographically
+/// before `-01`, the reader must observe `-00`'s value.
 ///
-/// FALSIFICATION: reverse `ValidatedPublications::new`'s sort
-/// (`b.id.cmp(&a.id)`) → the higher group pins → the assert reds.
+/// FALSIFICATION: reverse `ValidatedPublications::new`'s sort to
+/// `b.id.cmp(&a.id)`. The higher group then pins, and the assert goes red.
 #[test]
 fn reader_two_group_lowest_wins() -> Result<()> {
     init_test_logging();
@@ -323,17 +328,17 @@ fn reader_two_group_lowest_wins() -> Result<()> {
     })
 }
 
-/// A committed-scan witness for the reader's live-Cassandra deque carrier. A
-/// window one past `DEQUE_POINT_ITERATION_MAX` forces the reader stream off its
-/// point-read arm onto `CassandraCellResources::scan_committed`; the small
-/// trace collections never reach it. The whole window is committed through the
-/// real owner in ONE event, then the reader streams it forward and backward and
-/// both must equal the ordered model — exercising the reader carrier's
-/// committed-projection scan loop.
+/// Exercises the reader's live-Cassandra deque scan path for committed data.
+/// A window one element past `DEQUE_POINT_ITERATION_MAX` forces the reader
+/// stream off its point-read arm and onto
+/// `CassandraCellResources::scan_committed`. The small trace collections used
+/// elsewhere never reach that path. The whole window is committed through the
+/// real owner in a single event. The reader then streams it forward and
+/// backward, and both directions must equal the ordered model.
 ///
 /// FALSIFICATION: drop the first yield in
-/// `CassandraCellResources::scan_committed` → the forward stream loses its
-/// front element and the assert reds.
+/// `CassandraCellResources::scan_committed`. The forward stream then loses
+/// its front element and the assert goes red.
 #[test]
 fn reader_deque_scan_committed() -> Result<()> {
     init_test_logging();

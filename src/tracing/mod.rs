@@ -1,10 +1,9 @@
 //! Initializes and configures distributed tracing for the application.
 //!
-//! This module sets up OpenTelemetry with an optional OTLP exporter and
-//! integrates it with the tracing subscriber. OpenTelemetry initialization is
-//! graceful - if exporter configuration fails, the system continues with a
-//! no-op tracer. This provides functionality to create a customizable tracing
-//! setup with optional additional layers.
+//! Sets up OpenTelemetry with an optional OTLP exporter and integrates it with
+//! the tracing subscriber. Initialization is graceful. If exporter
+//! configuration fails, the system continues with a no-op tracer. An optional
+//! additional subscriber layer can be added.
 
 use opentelemetry::global::set_meter_provider;
 use opentelemetry::trace::TracerProvider;
@@ -33,9 +32,9 @@ mod tests;
 
 /// Provider handles retained by [`initialize_tracing`].
 ///
-/// `force_flush`/`shutdown` live on the providers, and the global subscriber
-/// keeps the export pipeline alive for the life of the process — so unless
-/// the handles are retained here, telemetry buffered in the batch span
+/// `force_flush` and `shutdown` are methods on the providers. The global
+/// subscriber keeps the export pipeline alive for the life of the process.
+/// Unless the handles are retained here, telemetry buffered in the batch span
 /// processor and periodic metric reader can never be exported before exit.
 /// [`flush_telemetry`] and [`shutdown_telemetry`] read this slot.
 struct OtelProviders {
@@ -48,13 +47,12 @@ static PROVIDERS: OnceLock<OtelProviders> = OnceLock::new();
 /// Initializes the tracing system with optional OpenTelemetry and OTLP
 /// exporter.
 ///
-/// This function sets up the tracing subscriber with an OpenTelemetry layer and
-/// sets it as the global default subscriber. OpenTelemetry exporter
-/// initialization is attempted but failures are handled gracefully - if the
-/// exporter cannot be configured (e.g., missing endpoint, protocol errors), the
-/// function continues with a no-op tracer that doesn't export traces. This
-/// ensures the application can still run with local tracing even when telemetry
-/// infrastructure is unavailable.
+/// Sets up the tracing subscriber with an OpenTelemetry layer and installs it
+/// as the global default subscriber. Exporter initialization is attempted but
+/// failures are handled gracefully. If the exporter cannot be configured (for
+/// example a missing endpoint or a protocol error), the function continues with
+/// a no-op tracer that does not export traces. The application still runs with
+/// local tracing even when telemetry infrastructure is unavailable.
 ///
 /// An optional additional layer can be added to the tracing subscriber; pass
 /// `Identity` for `T` when there is none.
@@ -119,7 +117,7 @@ where
     set_meter_provider(meter_provider.clone());
 
     // `set_global_default` succeeds at most once per process, so the slot is
-    // necessarily empty here; the guard covers a future reordering.
+    // necessarily empty here. The guard covers a future reordering of these steps.
     PROVIDERS
         .set(OtelProviders {
             tracer: trace_provider,
@@ -133,18 +131,18 @@ where
 /// Exports all buffered telemetry (spans and metrics) without tearing the
 /// pipeline down.
 ///
-/// The batch span processor and periodic metric reader export on an interval,
-/// so telemetry recorded shortly before process exit is lost unless exported
-/// explicitly. Use this when the process keeps running — e.g. when one of
-/// several clients shuts down; call [`shutdown_telemetry`] at process exit.
-/// A safe no-op when [`initialize_tracing`] has not run.
+/// The batch span processor and periodic metric reader export on an interval.
+/// Telemetry recorded shortly before process exit is lost unless exported
+/// explicitly. Use this when the process keeps running, for example when one
+/// of several clients shuts down. Call [`shutdown_telemetry`] at process exit
+/// instead. A safe no-op when [`initialize_tracing`] has not run.
 ///
-/// Blocks until the export completes — call it after async work has settled,
+/// Blocks until the export completes. Call it after async work has settled,
 /// never from inside a handler.
 ///
 /// # Errors
 ///
-/// Returns an error if the span or metric exporter fails to flush; both are
+/// Returns an error if the span or metric exporter fails to flush. Both are
 /// attempted regardless.
 pub fn flush_telemetry() -> Result<(), TracingError> {
     let Some(providers) = PROVIDERS.get() else {
@@ -161,16 +159,16 @@ pub fn flush_telemetry() -> Result<(), TracingError> {
 ///
 /// Call once at process exit, after all clients have stopped. Spans and
 /// metrics recorded afterwards are silently dropped. A safe no-op when
-/// [`initialize_tracing`] has not run; see [`flush_telemetry`] for a
-/// mid-run flush that keeps the pipeline alive.
+/// [`initialize_tracing`] has not run. See [`flush_telemetry`] for a mid-run
+/// flush that keeps the pipeline alive.
 ///
-/// Blocks until the final export completes — call it after async work has
+/// Blocks until the final export completes. Call it after async work has
 /// settled, never from inside a handler.
 ///
 /// # Errors
 ///
-/// Returns an error if the span or metric pipeline fails to shut down (which
-/// includes shutting down twice); both are attempted regardless.
+/// Returns an error if the span or metric pipeline fails to shut down, which
+/// includes shutting down twice. Both are attempted regardless.
 pub fn shutdown_telemetry() -> Result<(), TracingError> {
     let Some(providers) = PROVIDERS.get() else {
         return Ok(());
@@ -201,7 +199,7 @@ fn build_exporter() -> Result<SpanExporter, TracingError> {
         return Err(TracingError::MissingOtlpEndpoint);
     }
 
-    // Create and install the OpenTelemetry tracer
+    // Determine the transport protocol, defaulting to http/protobuf
     let protocol =
         env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "http/protobuf".to_owned());
 
@@ -259,7 +257,7 @@ fn build_metric_exporter() -> Result<MetricExporter, TracingError> {
 /// Errors that can occur during tracing initialization.
 #[derive(Debug, Error)]
 pub enum TracingError {
-    /// OTLP exporter could not be configured because no endpoint was configured
+    /// No OTLP endpoint was configured, so the exporter cannot be built.
     #[error(
         "missing OTEL_EXPORTER_OTLP_ENDPOINT environment variable; can't initialize OTLP exporter"
     )]
@@ -295,9 +293,9 @@ pub enum TracingError {
 
 /// Initializes test tracing infrastructure.
 ///
-/// This function is thread-safe and can be called multiple times - the
-/// initialization will only happen once. Call this at the beginning of any
-/// test that uses tracing or OpenTelemetry span operations.
+/// This function is thread-safe and can be called multiple times. The
+/// initialization happens only once. Call this at the beginning of any test
+/// that uses tracing or OpenTelemetry span operations.
 ///
 /// Defaults to ERROR level to reduce test noise. Set `PROSODY_LOG` environment
 /// variable to override (e.g., `PROSODY_LOG=debug cargo test`).

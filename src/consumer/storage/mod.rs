@@ -80,17 +80,18 @@ pub(crate) enum StorePair {
     },
 }
 
-/// Already-constructed shareable storage handed to [`StorePair::new`] so a
-/// consumer that receives a [`SharedDeps`](crate::state_reader::SharedDeps)
-/// bundle reuses the bundle's session (Cassandra) or in-memory stores rather
-/// than building a second one. A closed enum (no `dyn`); its backend must match
-/// the [`StorePair`] backend the same configuration selects — the composition
-/// derives both from one configuration, so a mismatch is unreachable.
+/// Storage already built elsewhere, handed to [`StorePair::new`] to reuse
+/// instead of building a second copy. A consumer that receives a
+/// [`SharedDeps`](crate::state_reader::SharedDeps) bundle passes the bundle's
+/// Cassandra session or in-memory stores here. The backend must match the one
+/// [`StorePair`] selects for the same configuration. Both derive from a single
+/// configuration, so a mismatch cannot occur.
 pub(crate) enum SharedStorage {
-    /// In-memory stores from a mock-mode bundle. Only `publications` is
-    /// [`StorePair`]'s; `cells`/`identities` are the consumer's keyed-state
-    /// backend, carried here so the same instances back both the reader and the
-    /// consumer's state provider (mock read-your-writes).
+    /// In-memory stores from a mock-mode bundle. `publications` is the store
+    /// [`StorePair`] itself owns. `cells` and `identities` are the consumer's
+    /// keyed-state backend, carried here so one set of instances backs both the
+    /// reader and the consumer's state provider. That sharing is what makes
+    /// mock read-your-writes work.
     Memory {
         /// Committed cell store shared with the reader.
         cells: MemoryCells,
@@ -100,16 +101,16 @@ pub(crate) enum SharedStorage {
         publications: MemoryPublicationStore,
     },
     /// The pre-built Cassandra session and the bundle's already-prepared
-    /// keyed-state store handles. [`StorePair::new`] reuses `cells`/
-    /// `identities`/`publications` verbatim (they carry the reader's prepared
-    /// cell/identity/publication statements) and prepares only the remaining
-    /// trigger/defer/dedup statements against `store`; one scylla session and
-    /// one set of keyed-state prepared statements exist cluster-wide for the
-    /// consumer and the reader bundle.
+    /// keyed-state store handles. [`StorePair::new`] reuses `cells`,
+    /// `identities`, and `publications` verbatim, since they already carry the
+    /// reader's prepared cell, identity, and publication statements. It
+    /// prepares only the remaining trigger, defer, and dedup statements against
+    /// `store`. One scylla session and one set of keyed-state prepared
+    /// statements then serve both the consumer and the reader bundle.
     Cassandra {
-        /// The shared scylla session handle (keyspace from the caller's
-        /// `TriggerStoreConfiguration`, which the composition builds from the
-        /// same `CassandraConfiguration` as the bundle's session).
+        /// The shared scylla session handle. Its keyspace comes from the
+        /// caller's `TriggerStoreConfiguration`, built from the same
+        /// `CassandraConfiguration` as the bundle's session.
         store: CassandraStore,
         /// Keyed-state cell-store resources prepared by the bundle.
         cells: CassandraCellResources,
@@ -135,11 +136,11 @@ impl StorePair {
     ///
     /// When `shared` is `Some`, the pair reuses that already-constructed
     /// storage (the mock publication store, or the pre-built Cassandra
-    /// session) instead of building a fresh one; `None` builds everything
-    /// internally. The backend of `shared` must match the backend `(mock,
-    /// config)` selects — the composition derives both from one
-    /// configuration, so a mismatch cannot arise and the `_` fallbacks
-    /// below build fresh only on that unreachable path.
+    /// session) instead of building a fresh one. When `None`, it builds
+    /// everything internally. [`SharedStorage`] documents why `shared`'s
+    /// backend always matches the one selected here; the `_` fallbacks
+    /// below build fresh only on the mismatch path that guarantee rules
+    /// out.
     pub(crate) async fn new(
         config: &TriggerStoreConfiguration,
         mock: bool,
@@ -172,9 +173,8 @@ impl StorePair {
         };
 
         // One shared session for every Cassandra store below. When a bundle is
-        // supplied, reuse its already-connected session — its keyspace must
-        // match `cass_config.keyspace`, which holds because the composition
-        // builds the bundle and this config from one `CassandraConfiguration`.
+        // supplied, reuse its already-connected session instead of connecting
+        // again.
         let store = match shared {
             Some(SharedStorage::Cassandra { store, .. }) => store.clone(),
             _ => CassandraStore::new(cass_config).await?,

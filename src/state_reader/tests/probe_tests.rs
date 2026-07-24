@@ -1,14 +1,17 @@
 //! Probe-and-pin over multiple sources, driven through the scripted fault
 //! source.
 //!
-//! The source-selection semantics — the lowest-`SourceId` source with data
-//! wins, an errored source is skipped, data beats a skipped error, all-empty is
-//! `None`/empty, and no-data-plus-an-error is `Err` — are proven together by
-//! [`prop_probe_and_pin`] over random fault scripts, for both the point fan-out
-//! (`get`/`len`) and the pinned scan (`stream`). The focused examples pin
-//! invariants the script model does not express: the batch (`get_many`) error
-//! precedence and single-source splice, the post-pin mid-stream scan error, and
-//! the source-call trace proving a pinned scan never opens the decoy.
+//! Selection picks the lowest-`SourceId` source that has data, and skips a
+//! source that errored on open. Data always beats a skipped error. If every
+//! source is empty the read is `None`/empty; if there is no data but some
+//! source errored, the read is `Err`. [`prop_probe_and_pin`] proves all of
+//! this together over random fault scripts, for both the point fan-out
+//! (`get`/`len`) and the pinned scan (`stream`).
+//!
+//! The focused tests below cover invariants the script model does not
+//! express: `get_many` batch error precedence, `get_many` single-source
+//! splicing, a mid-stream scan error after a source has pinned, and a
+//! source-call trace proving a pinned scan never opens the decoy source.
 
 use super::support::{
     CountingIdentityStore, FaultPoint, GROUP_A, GROUP_B, ScriptedCellSource, ScriptedEnv,
@@ -32,32 +35,33 @@ use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::iter::{empty, once};
 
-/// A deque length forcing the range-scan stream arm (> the point-get ceiling),
-/// so the scan probe path is exercised.
+/// A deque length above the point-get ceiling, forcing the range-scan stream
+/// arm to be exercised.
 const SCAN_ARM_LEN: usize = 130;
 
 // --- Probe-and-pin property -------------------------------------------------
 
 /// The ordered group pool the fault script assigns sources to. Lexicographic
-/// order (`g0 < g1 < …`) makes `SourceId` order equal index order, so the
-/// model's "lowest source" is `sources[0]`.
+/// order (`g0 < g1 < …`) makes `SourceId` order match index order. The
+/// model's "lowest source" is therefore `sources[0]`.
 const GROUP_POOL: [&str; 4] = ["probe-g0", "probe-g1", "probe-g2", "probe-g3"];
 
-/// The per-source deque lengths the script draws from: small (the chunked
-/// point-get stream arm) through one past the range-scan ceiling
-/// ([`SCAN_ARM_LEN`]), so both stream arms are exercised.
+/// The per-source deque lengths the script draws from. The small lengths
+/// exercise the chunked point-get stream arm; [`SCAN_ARM_LEN`] is one past
+/// the range-scan ceiling, exercising that arm too.
 const LEN_POOL: [usize; 4] = [1, 2, 3, SCAN_ARM_LEN];
 
 /// One source's disposition.
 #[derive(Clone, Copy, Debug)]
 enum SourceDisposition {
-    /// No committed data (bounds absent) — skipped in selection.
+    /// No committed data: bounds are absent, so selection skips this source.
     Empty,
     /// A dense deque of `LEN_POOL[idx]` elements, tagged by source index so a
     /// wrong pin serves visibly wrong values.
     Data(u8),
-    /// A committed read that errors before any row (`FaultPoint::AtOpen`) — the
-    /// bounds point read fails, so selection skips it (remembering the error).
+    /// A committed read that errors before any row (`FaultPoint::AtOpen`). The
+    /// bounds point read fails, so selection skips this source but remembers
+    /// the error.
     FaultOpen,
 }
 
@@ -72,8 +76,8 @@ impl Arbitrary for SourceDisposition {
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         match self {
-            // Shrink toward the simplest disposition (Empty), and a data
-            // length toward its smallest.
+            // Shrink toward the simplest disposition (Empty), and shrink a
+            // data length toward its smallest.
             Self::Empty => Box::new(empty()),
             Self::Data(idx) => Box::new(once(Self::Empty).chain(idx.shrink().map(Self::Data))),
             Self::FaultOpen => Box::new(once(Self::Empty)),
@@ -97,8 +101,9 @@ impl Arbitrary for FaultScript {
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        // Keep at least one source (an empty snapshot is a different, structural
-        // case), otherwise shrink each disposition and drop trailing sources.
+        // Keep at least one source; an empty snapshot is a different,
+        // structural case. Otherwise shrink each disposition and drop
+        // trailing sources.
         let sources = self.sources.clone();
         Box::new(
             sources
@@ -109,15 +114,15 @@ impl Arbitrary for FaultScript {
     }
 }
 
-/// The tagged element value at index `j` of source `idx` — distinct per source
-/// so a mis-pin is visible.
+/// The tagged element value at index `j` of source `idx`. Values are distinct
+/// per source, so a mis-pin is visible.
 fn element(idx: usize, j: usize) -> Value {
     Value::from((idx as i64) * 1000 + j as i64)
 }
 
-/// The selection the point fan-out resolves to under a script: the first
-/// data-bearing source in `SourceId` (index) order, or the absence of one plus
-/// whether any earlier source errored.
+/// The selection the point fan-out resolves to under a script. If any source
+/// has data, it is the first one in `SourceId` (index) order. Otherwise the
+/// selection depends on whether an earlier source errored.
 enum Selection {
     /// Source `idx` with a dense `len`-element deque pins.
     Pinned { idx: usize, len: usize },
@@ -148,15 +153,16 @@ fn selection(script: &FaultScript) -> Selection {
     }
 }
 
-/// The lowest-`SourceId` source with committed data answers every read; an
-/// errored source is skipped, data beats a skipped error, all-empty is
-/// `None`/empty, and no-data-plus-an-error is `Err` — for both the point
-/// fan-out (`get`/`len`) and the pinned scan (`stream`, forward and backward).
+/// The lowest-`SourceId` source with committed data answers every read. An
+/// errored source is skipped; data beats a skipped error. All sources empty
+/// gives `None`/empty, and no data plus an earlier error gives `Err`. This
+/// holds for the point fan-out (`get`/`len`) and for the pinned scan,
+/// `stream` in both directions.
 ///
 /// FALSIFICATION: short-circuit `Err` at the first source in `ReadSession::get`
-/// (session.rs) instead of skipping → a `FaultOpen`-then-`Data` script errors
-/// where data exists → mismatch. Reverse the snapshot source order → a higher
-/// source pins → the tagged value diverges.
+/// (session.rs) instead of skipping. A `FaultOpen`-then-`Data` script then
+/// errors where data exists. Reverse the snapshot source order and a higher
+/// source pins instead, so the tagged value diverges.
 #[test]
 fn prop_probe_and_pin() {
     fn property(script: FaultScript) -> Result<bool> {
@@ -201,8 +207,9 @@ async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
 /// The concrete deque reader the probe property drives.
 type DequeReader = StateReader<DequeDescriptor<JsonCodec>, JsonCodec>;
 
-/// Asserts the reader's point (`len`/`get`) and scan (`stream`) reads match the
-/// point-fan-out selection the script resolves to.
+/// Asserts the reader's point reads and scan match the point-fan-out
+/// selection the script resolves to. Point reads are `len` and `get`; the
+/// scan is `stream`.
 async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> Result<bool> {
     match selection {
         Selection::Pinned { idx, len } => {
@@ -245,13 +252,14 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
 
 // --- Focused survivors ------------------------------------------------------
 
-/// A mid-stream error after the scan has pinned a source terminates with `Err`
-/// (no silent restart that would double-yield or skip). Needs the range-scan
-/// arm and a precise fault position, which the arm-agnostic
-/// [`prop_probe_and_pin`] does not model.
+/// A mid-stream error after the scan has pinned a source terminates with
+/// `Err`. There is no silent restart that would double-yield or skip data.
+/// This needs the range-scan arm and a precise fault position, and the fault
+/// script [`prop_probe_and_pin`] draws from has no mid-stream fault point to
+/// express it.
 ///
-/// Falsify: restart on a post-pin error — the reader yields a duplicated prefix
-/// or swallows the error.
+/// Falsify: restart on a post-pin error. The reader would then yield a
+/// duplicated prefix or swallow the error.
 #[tokio::test]
 async fn scan_midstream_error_propagates() -> Result<()> {
     let env = ScriptedEnv::new(deque_state::<JsonCodec>("d-mid"))?;
@@ -277,23 +285,24 @@ async fn scan_midstream_error_propagates() -> Result<()> {
         .await?
         .collect::<Vec<_>>()
         .await;
-    // Five yielded prefix elements, then an error terminates the stream — no
-    // restart, no duplicated prefix.
+    // Five yielded prefix elements, then an error terminates the stream.
     assert_eq!(items.len(), 6, "five-element prefix + terminating error");
     assert!(items[..5].iter().all(Result::is_ok), "prefix yielded");
     assert!(items[5].is_err(), "mid-stream error terminates");
     Ok(())
 }
 
-/// `get_many`: when the lowest source errors and the next answers with an
-/// all-`None` buffer (it holds none of the batch cells), the read is an `Err` —
-/// absence is not provable through a failed source, exactly as the point read
-/// treats no-data-plus-an-error. The batch (`get_many`) error precedence is a
-/// narrow invariant the deque script does not exercise. Source A (lowest)
-/// faults at open; source B is admitted but empty.
+/// When the lowest source errors and the next source answers with an
+/// all-`None` buffer, `get_many` returns `Err`. The all-`None` buffer means B
+/// holds none of the batch's cells, but absence is not provable through a
+/// failed source. This mirrors how a point read treats no data plus an error.
+/// The deque fault script never exercises this batch case, so it gets its
+/// own test: source A (lowest) faults at open, and source B is admitted but
+/// empty.
 ///
-/// Falsify: return the remembered all-`None` buffer instead of the error — the
-/// Transient store failure is masked as a false batch-absence.
+/// Falsify: return the remembered all-`None` buffer instead of the error.
+/// That would mask a transient store failure as a false absence for the
+/// batch.
 #[tokio::test]
 async fn get_many_error_beats_all_none() -> Result<()> {
     let cells = ScriptedCellSource::new();
@@ -347,14 +356,14 @@ async fn get_many_error_beats_all_none() -> Result<()> {
     }
 }
 
-/// Single-source coherence: the lowest-ordered source with any `Some` answers
-/// the ENTIRE `get_many` batch — never a per-cell splice from a different
-/// source. Source A (lowest) holds only key 0; source B holds only key 1. The
-/// batch resolves entirely from A, so key 1 reads `None` (A's answer), never
-/// B's tagged value.
+/// The lowest-ordered source with any `Some` answers the entire `get_many`
+/// batch. There is no per-cell splice from a different source. Source A
+/// (lowest) holds only key 0; source B holds only key 1. The batch resolves
+/// entirely from A, so key 1 reads `None`, A's answer, never B's tagged
+/// value.
 ///
-/// Falsify: splice per cell (fill each absent slot from the next source) — key
-/// 1 then carries B's value and the `None` assert goes red.
+/// Falsify: splice per cell, filling each absent slot from the next source.
+/// Key 1 would then carry B's value and the `None` assert goes red.
 #[tokio::test]
 async fn get_many_answers_from_one_source() -> Result<()> {
     let cells = ScriptedCellSource::new();
@@ -372,7 +381,8 @@ async fn get_many_answers_from_one_source() -> Result<()> {
     let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
     let sk_b = source_state_key(tp_b, GROUP_B, &key, count)?;
 
-    // A (lowest) has only key 0; B (decoy) has only key 1, tagged distinctly.
+    // A is the lowest source and holds only key 0; B is the decoy and holds
+    // only key 1, tagged distinctly.
     owner_commit(
         &cells.cells(),
         &registry,
@@ -437,14 +447,15 @@ async fn get_many_answers_from_one_source() -> Result<()> {
     Ok(())
 }
 
-/// Single-source coherence for a scan, proven by the source-call trace: the
-/// lowest-ordered source with data pins and answers the whole scan; the decoy
-/// source B is never read (its recorded read count stays zero) — the deque's
-/// bounds read pins A, and every later read addresses that one pinned source.
+/// The lowest-ordered source with data pins and answers the whole scan. This
+/// test proves it through the source-call trace: the decoy source B is never
+/// read, so its recorded read count stays zero. The deque's bounds read pins
+/// source A, and every later read in the scan addresses that one pinned
+/// source.
 ///
-/// Falsify: reverse the snapshot's source-preference order (pin the *highest*
-/// source) — B pins instead, its values answer the scan, and both its read
-/// count and the value assert go red.
+/// Falsify: reverse the snapshot's source-preference order, pinning the
+/// highest source instead. Then B pins, its values answer the scan, and both
+/// its read count and the value assert go red.
 #[tokio::test]
 async fn scan_reads_only_pinned_source() -> Result<()> {
     let env = ScriptedEnv::new(deque_state::<JsonCodec>("d-coherent"))?;
@@ -453,8 +464,8 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
     let tp_a = topic("topic-a");
     let tp_b = topic("topic-b");
 
-    // Both sources hold a full deque (wide enough for the range-scan arm); A
-    // (group-aaa) is the lowest and must answer alone. B's values are tagged
+    // Both sources hold a full deque, wide enough for the range-scan arm. A
+    // is the lowest source and must answer alone. B's values are tagged
     // distinctly so a splice would be visible.
     let mut segments = Vec::new();
     for (group, tp, base, event) in [

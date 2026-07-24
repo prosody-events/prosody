@@ -1,16 +1,19 @@
 //! Snapshot acquisition and the three-outcome refresh rule.
 //!
-//! [`prop_snapshot_refresh`] proves the whole rule over random refresh
-//! scripts: withdrawals apply unconditionally, an already-admitted source is
-//! never re-validated (the identity-read count is the witness), a failed
-//! routing read keeps the prior snapshot, an emptied routing table fails
-//! `UnknownPublication`, and a table whose every new source lacks a frozen
-//! identity fails `IdentityUnavailable`. The single focused example
-//! [`identity_mismatch_sticky`] pins the present-but-unequal sticky behavior,
-//! which needs precise interval + clock control the property does not model.
+//! [`prop_snapshot_refresh`] proves the whole rule over random refresh scripts.
+//! Withdrawals apply unconditionally. An already-admitted source is never
+//! re-validated: the property proves this by counting identity-store reads.
+//! A failed routing read keeps the prior snapshot. An emptied routing table
+//! fails with `UnknownPublication`. A table whose every new source lacks a
+//! frozen identity fails with `IdentityUnavailable`.
 //!
-//! Every reader here refreshes on every operation (`new_eager`) unless it needs
-//! the cached fast path (the sticky example uses `new_with_interval`).
+//! The focused example [`identity_mismatch_sticky`] covers the one case the
+//! property does not: an identity that is present but disagrees with the
+//! descriptor. That needs precise interval and clock control the property
+//! does not model.
+//!
+//! Every reader here refreshes on every operation (`new_eager`), except the
+//! sticky example, which uses `new_with_interval` for the cached fast path.
 
 use super::support::{
     CountingIdentityStore, GROUP_A, GROUP_B, ScriptedEnv, fixed_clock_cache, topic,
@@ -36,9 +39,9 @@ use std::sync::atomic::Ordering;
 
 // --- Snapshot-refresh property ----------------------------------------------
 
-/// The ordered source pool the refresh script drives, `g0 < g1 < g2` so
-/// `SourceId` order equals index order and the lowest admitted source is the
-/// lowest index.
+/// The ordered source pool the refresh script drives: `g0 < g1 < g2`.
+/// `SourceId` order equals index order, so the lowest admitted source is
+/// always the lowest index.
 const REFRESH_GROUPS: [&str; 3] = ["refresh-g0", "refresh-g1", "refresh-g2"];
 
 /// One source's edit in a refresh round.
@@ -50,8 +53,8 @@ enum SourceEdit {
     Admit,
     /// Withdraw its publication row (identity untouched).
     Withdraw,
-    /// Advertise it but seed no identity — a new such group reads as
-    /// missing-identity.
+    /// Advertise it but seed no identity. A group newly advertised this way
+    /// reads as missing an identity.
     PresentNoIdentity,
 }
 
@@ -146,7 +149,7 @@ enum Expect {
     ReadError,
 }
 
-/// The committed value source `idx` holds.
+/// The committed value that source `idx` holds.
 fn element(idx: usize) -> Value {
     Value::from(idx as i64)
 }
@@ -227,7 +230,8 @@ async fn run_snapshot_refresh(script: RefreshScript) -> Result<bool> {
     Ok(true)
 }
 
-/// The scripted control-plane plus routing constants one refresh trace edits.
+/// Bundles the scripted publication and identity stores with the routing
+/// constants one refresh trace uses.
 struct RefreshFixture {
     publications: ScriptedPublicationStore,
     identities: CountingIdentityStore,
@@ -342,17 +346,17 @@ fn outcome_matches(expect: &Expect, observed: &Result<Option<Value>, StateReader
     }
 }
 
-// --- Focused survivor -------------------------------------------------------
+// --- Sticky identity mismatch -----------------------------------------------
 
-/// A present-but-unequal identity is sticky: once a source's frozen identity
-/// disagrees with the descriptor, EVERY read within the refresh interval — and
-/// a failed refresh past it — surfaces the Permanent `IdentityMismatch`, never
-/// the admitted (valid) subset. Folds both former sticky examples (the
-/// within-interval cached fast path and the survives-a-failed-refresh path).
+/// A frozen identity that disagrees with the descriptor is sticky. Once a
+/// source's identity mismatches, every read within the refresh interval
+/// surfaces the Permanent `IdentityMismatch`. So does a failed refresh past
+/// the interval. Neither ever falls back to the admitted, valid subset.
 ///
-/// `GROUP_A` carries a matching identity (admitted); `GROUP_B` a perturbed one
-/// (present-but-unequal). The property does not model mismatch (it needs
-/// precise interval + clock control), so this stays a focused example.
+/// `GROUP_A` carries a matching identity, so it stays admitted. `GROUP_B`
+/// carries a perturbed identity that disagrees with the descriptor. The
+/// property above does not model a mismatched identity: doing so needs
+/// precise interval and clock control. This test covers that case instead.
 ///
 /// Falsify: drop the sticky-mismatch cached-path branch in
 /// `StateReader::snapshot` → op 2 within the interval serves A's `Ok(None)`.
@@ -368,7 +372,7 @@ async fn identity_mismatch_sticky() -> Result<()> {
 
     // A: matching identity → admitted.
     env.publish(GROUP_A, tp_a).await;
-    // B: advertised, but its frozen identity is perturbed → present-but-unequal.
+    // B: advertised, but its identity is perturbed to disagree with the descriptor.
     env.publications
         .seed(
             &env.sub,
@@ -393,7 +397,7 @@ async fn identity_mismatch_sticky() -> Result<()> {
     // A non-zero interval so op 2 takes the cached-snapshot fast path.
     let reader = env.reader_with_interval(cache, 60_000)?;
 
-    // Op 1 (t=0): the initial refresh detects B's mismatch (A is still admitted).
+    // Op 1, at t=0: the initial refresh detects B's mismatch. A is still admitted.
     match reader.get(key.clone()).await {
         Err(StateReaderError::IdentityMismatch { .. }) => {}
         other => bail!("op 1 expected IdentityMismatch, got {other:?}"),

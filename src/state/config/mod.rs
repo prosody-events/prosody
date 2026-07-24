@@ -30,10 +30,12 @@ const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE_BYTES";
 /// Environment variable for the default read-cache TTL of composed readers.
 const STATE_READ_CACHE_TTL_ENV: &str = "PROSODY_STATE_READ_CACHE_TTL";
 
-/// Built-in default read-cache TTL. Well inside the staleness envelope
-/// cross-group reads already accept (the commit→apply window converges via
-/// the recovery sweep, [`DEFAULT_RECOVERY_DELAY_SECS`] = 30s; routing
-/// snapshots refresh every 60s), while collapsing hot-key read storms.
+/// Built-in default read-cache TTL, applied when the client composes readers
+/// and no other TTL is set. Five seconds trades a small staleness window for
+/// fewer repeated store reads on hot keys. It stays well within the delay
+/// reads already tolerate. The recovery sweep converges committed values
+/// within [`DEFAULT_RECOVERY_DELAY_SECS`] seconds, and routing snapshots
+/// refresh every 60 seconds.
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Environment variable for the `StateRecovery` backstop delay.
@@ -105,13 +107,13 @@ pub struct KeyedStateConfiguration {
     #[builder(default = "from_option_env(STATE_CACHE_SIZE_ENV)?")]
     pub cache_size_bytes: Option<NonZeroU64>,
 
-    /// Byte budget for the reader-side read-through cache the high-level client
-    /// sizes when it composes standalone readers.
+    /// Byte budget for the reader-side read-through cache. The high-level
+    /// client sizes this cache when it composes standalone readers.
     ///
     /// `None` (the default) follows
-    /// [`cache_size_bytes`](Self::cache_size_bytes), then a built-in
-    /// default — one knob unless overridden. Only the composing client
-    /// reads it; a consumer never opens a reader cache.
+    /// [`cache_size_bytes`](Self::cache_size_bytes), then a built-in default,
+    /// so one setting covers both caches unless overridden. Only the composing
+    /// client reads this value. A consumer never opens a reader cache.
     ///
     /// Environment variable: `PROSODY_STATE_READ_CACHE_SIZE_BYTES` (a positive
     /// integer count of bytes; `0`, negative, non-numeric, and
@@ -119,20 +121,20 @@ pub struct KeyedStateConfiguration {
     #[builder(default = "from_option_env(STATE_READ_CACHE_SIZE_ENV)?")]
     pub read_cache_size_bytes: Option<NonZeroU64>,
 
-    /// Default read-cache TTL for the readers this client composes: how long a
-    /// `StateReader` may serve a collection's reads from its cache before
-    /// re-reading the store. Defaults to 5 seconds — well inside the staleness
-    /// envelope cross-group reads already accept (see the recovery sweep on
-    /// [`Self::recovery_delay`]). `None` disables the default, leaving reads
-    /// uncached unless a descriptor opts in; a descriptor's explicit
-    /// `.read_cache(...)` always wins over this default. Like every read-cache
-    /// setting it is consumed only by composed readers — never by the owning
-    /// consumer's writes, and unrelated to a collection's durable TTL.
+    /// Default read-cache TTL for the readers this client composes. It sets how
+    /// long a `StateReader` may serve a collection's reads from cache before
+    /// re-reading the store. Defaults to 5 seconds, well inside the delay reads
+    /// already tolerate (see the recovery sweep on [`Self::recovery_delay`]).
+    ///
+    /// `None` disables the default, so reads stay uncached unless a descriptor
+    /// opts in. A descriptor's explicit `.read_cache(...)` always wins over
+    /// this default. This setting affects only composed readers, never the
+    /// owning consumer's writes. It is unrelated to a collection's durable TTL.
     ///
     /// Environment variable: `PROSODY_STATE_READ_CACHE_TTL` (a humantime
     /// duration such as `5s` or `750ms`; `none` disables caching for
-    /// descriptor-silent collections). Must not truncate to zero milliseconds
-    /// — every cached entry would be born stale.
+    /// collections a descriptor leaves silent). Must not truncate to zero
+    /// milliseconds: every cached entry would be born stale.
     #[builder(
         default = "from_option_duration_env_with_fallback(STATE_READ_CACHE_TTL_ENV, \
                    DEFAULT_READ_CACHE_TTL)?"
@@ -141,17 +143,16 @@ pub struct KeyedStateConfiguration {
     pub read_cache_ttl: Option<Duration>,
 
     /// Subsystem this consumer publishes keyed state under. Required whenever
-    /// any registered collection is `.published(true)` — a published collection
+    /// any registered collection is `.published(true)`. A published collection
     /// with no subsystem is rejected at build
     /// ([`RegisterStateError::PublishedWithoutSubsystem`]). `None` (the
     /// default) is valid for consumers that publish nothing.
     ///
-    /// Keep this set across the deploy that un-publishes a collection: startup
+    /// Keep this set across the deploy that un-publishes a collection. Startup
     /// reconciliation withdraws a collection's routing row only while it is
     /// still registered `Private` under a configured subsystem. Dropping the
-    /// subsystem (or the registration) in the same deploy as
-    /// `.published(false)` strands the row instead of withdrawing it (see
-    /// [`StateVisibility`]).
+    /// subsystem or the registration in the same deploy as `.published(false)`
+    /// strands the row instead of withdrawing it. See [`StateVisibility`].
     #[builder(default)]
     pub subsystem: Option<SubsystemName>,
 

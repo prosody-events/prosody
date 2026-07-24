@@ -87,8 +87,8 @@ pub const TABLE_KEYED_STATE_CELL: &str = "keyed_state_cell";
 /// Table for the frozen group-global keyed-state descriptor identities.
 pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 
-/// Table for the routing-only keyed-state publication rows readers discover
-/// sources through.
+/// Table for keyed-state publication rows. These carry only routing
+/// information: a reader uses them to find the sources it reads from.
 pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
 
 /// Cassandra's maximum TTL in seconds (~20 years).

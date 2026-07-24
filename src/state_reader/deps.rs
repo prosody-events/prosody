@@ -1,18 +1,16 @@
 //! The reader's shared infrastructure bundle.
 //!
-//! [`SharedDeps`] is the one named owner of every handle a cross-group reader
-//! and the owning consumer share: the backend stores, the message loader, the
-//! byte-budgeted read-through cache, the topic partition-count source, and the
-//! heartbeat registry. Building one bundle and cloning its handles onward —
-//! into several [`StateReader`](super::StateReader)s and into the consumer that
-//! writes the state — is how the crate honors construct-once-clone-handles:
-//! exactly one scylla session and one Kafka client back a whole process.
+//! [`SharedDeps`] owns every handle that a cross-group reader and the owning
+//! consumer share: the backend stores, the message loader, the byte-budgeted
+//! read-through cache, the topic partition-count source, and the heartbeat
+//! registry. Build one bundle, then clone its handles into several
+//! [`StateReader`](super::StateReader)s and into the consumer that writes the
+//! state. Cloning shares handles, so exactly one scylla session and one Kafka
+//! client back the whole process.
 //!
-//! Every field is a cheap-clone handle, so cloning the bundle clones handles,
+//! Every field is a cheap-clone handle, so cloning the bundle shares handles,
 //! never resources. [`SharedDeps::connect`] opens the Cassandra session,
-//! prepares the reader's queries, and builds the Kafka loader; the registry is
-//! built **first** because [`KafkaLoader::new`] registers its poll-loop
-//! heartbeat at construction and must have somewhere to report.
+//! prepares the reader's queries, and builds the Kafka loader.
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
@@ -49,9 +47,10 @@ pub(crate) const DEFAULT_READER_CACHE_SIZE_BYTES: NonZeroU64 = match NonZeroU64:
 };
 
 /// A monotonic per-construction id, copied verbatim by [`SharedDeps::clone`]
-/// and into every [`StateReader`](super::StateReader) it mints. Two readers
-/// carry the same id iff they descend from the same real construction, so the
-/// composition test can prove "exactly one bundle" without a racy global count.
+/// and into every [`StateReader`](super::StateReader) built from this bundle.
+/// Two readers carry the same id exactly when they descend from the same
+/// construction, so the composition test can prove "exactly one bundle"
+/// without a racy global count.
 #[cfg(test)]
 static NEXT_DEPS_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -65,15 +64,15 @@ fn next_instance_id() -> u64 {
 /// handles (see the module docs).
 pub struct SharedDeps<C: Codec> {
     stores: ReaderStores,
-    // `Arc` over an already-cheap-clone enum so this bundle's `Clone` needs no
-    // `C::Payload: Clone` bound — `ReaderLoader<C>: Clone` would require it.
+    // `Arc` over an already-cheap-clone enum, so this bundle's `Clone` needs no
+    // `C::Payload: Clone` bound. Cloning `ReaderLoader<C>` directly would need it.
     loader: Arc<ReaderLoader<C>>,
     cache: ReaderCache,
     partition_counts: PartitionCounts,
     heartbeats: HeartbeatRegistry,
-    /// Bundle-wide default read-cache TTL for readers whose descriptor does
-    /// not set `.read_cache(...)`; the composing client feeds
-    /// `KeyedStateConfiguration::read_cache_ttl` through here.
+    /// Bundle-wide default read-cache TTL. Set through
+    /// [`Self::with_default_read_cache_ttl`], which owns how it interacts with
+    /// per-descriptor TTLs.
     default_read_cache_ttl: Option<Duration>,
     #[cfg(test)]
     instance_id: u64,
@@ -96,11 +95,11 @@ impl<C: Codec> Clone for SharedDeps<C> {
 
 impl<C: Codec> SharedDeps<C> {
     /// An in-memory bundle over the given shared stores and loader, with a
-    /// wall-clock cache sized to `budget` declared bytes. The mock arm the
-    /// consumer's mock mode composes readers from. `group_id`/`stall_threshold`
-    /// seed the heartbeat registry — unused only from the reader's `is_stalled`
-    /// view, since a mock has no loader poll loop — so the bundle's shape
-    /// matches [`Self::connect`].
+    /// wall-clock cache sized to `budget` declared bytes. The consumer's mock
+    /// mode composes readers from this bundle. `group_id` and `stall_threshold`
+    /// seed the heartbeat registry so the bundle's shape matches
+    /// [`Self::connect`]. A mock has no loader poll loop, so the reader's
+    /// `is_stalled` view never observes them.
     #[must_use]
     pub fn memory(
         group_id: String,
@@ -135,7 +134,7 @@ impl<C: Codec> SharedDeps<C> {
     /// The registry is built first: [`KafkaLoader::new`] registers its
     /// poll-loop heartbeat at construction, so a loader built before the
     /// registry would have nowhere to report. The one session (`store`) is
-    /// cloned into every store handle; the keyspace comes from
+    /// cloned into every store handle. The keyspace comes from
     /// `cassandra_config`, which the composition also feeds to the consumer's
     /// `StorePair`, so session and keyspace stay consistent.
     ///
@@ -200,8 +199,8 @@ impl<C: Codec> SharedDeps<C> {
     /// Returns this bundle with `ttl` as its default read-cache TTL, applied
     /// to readers whose descriptor does not set `.read_cache(...)` explicitly
     /// (an explicit descriptor TTL always wins). The composing client feeds
-    /// `KeyedStateConfiguration::read_cache_ttl` through here; `None` leaves
-    /// descriptor-silent collections uncached.
+    /// `KeyedStateConfiguration::read_cache_ttl` through here. `None` leaves
+    /// collections that set no descriptor TTL uncached.
     #[must_use]
     pub fn with_default_read_cache_ttl(mut self, ttl: Option<Duration>) -> Self {
         self.default_read_cache_ttl = ttl;
@@ -325,7 +324,7 @@ impl<C: Codec> SharedDeps<C> {
         }
     }
 
-    /// The construction id shared by every clone and every reader minted from
+    /// The construction id shared by every clone and every reader built from
     /// this bundle (see [`NEXT_DEPS_ID`]).
     #[cfg(test)]
     pub(crate) fn instance_id(&self) -> u64 {
