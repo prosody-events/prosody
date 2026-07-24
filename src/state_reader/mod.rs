@@ -29,6 +29,13 @@ pub(crate) use deps::DEFAULT_READER_CACHE_SIZE_BYTES;
 pub use deps::SharedDeps;
 pub use error::StateReaderError;
 pub use loader::{ReaderLoader, ReaderLoaderError};
+// Deliberately public: `partition_for_key` is the librdkafka-compatible routing
+// primitive the reader ecosystem (and the cross-language clients) must compute
+// the same as the producer's pinned partitioner — cross-checked against live
+// Kafka in `tests/partitioner.rs`. Its error `EmptyKeyError` and
+// `PartitionCount` with its `TryFrom` error `PartitionCountError` are therefore
+// public too (they sit in that public signature and the public
+// `PartitionCount::try_from`).
 pub use partitioner::{EmptyKeyError, PartitionCount, PartitionCountError, partition_for_key};
 pub use reader::StateReader;
 pub use session::ReadSession;

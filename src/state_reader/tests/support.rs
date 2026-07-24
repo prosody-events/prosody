@@ -65,10 +65,9 @@ pub(super) const SUBSYSTEM: &str = "orders";
 pub(super) const GROUP_A: &str = "group-aaa";
 pub(super) const GROUP_B: &str = "group-zzz";
 
-/// The mock topology's fixed partition count (matches
-/// [`PartitionCount::MOCK`]).
+/// The mock topology's fixed partition count.
 pub(crate) fn mock_count() -> PartitionCount {
-    PartitionCount::try_from(3).unwrap_or(PartitionCount::MIN)
+    PartitionCount::MOCK
 }
 
 /// The subsystem name.

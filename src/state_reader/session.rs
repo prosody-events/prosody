@@ -7,15 +7,27 @@
 //! operation resolves against one exact source set and pins at most one source
 //! (the `SingleSourceCoherence` invariant).
 //!
+//! Of these guarantees two are structural — `ReadOnlyHandleCannotMutate` (no
+//! mutator bound exists) and committed-only (the only value a session can
+//! materialize is
+//! [`Cell::project_committed`](crate::state::cell::Cell::project_committed)).
+//! `SingleSourceCoherence` is **not** purely type-enforced: it rests on a
+//! runtime serialization invariant — the unpinned reads within one operation
+//! MUST be issued sequentially, each pinning before the next begins. Every read
+//! path here obeys it (a probe runs to a pin, then later calls address the
+//! pin), so a torn two-source view is unreachable today; a future *concurrent*
+//! batched probe would have to restore single-flight over the pin to keep it.
+//!
 //! Probe-and-pin (see the plan's "Source selection"):
 //!
 //! * **Point read / `get_many`** — issue the read to every source concurrently,
-//!   but resolve **in source order** with early exit: a [`FuturesOrdered`]
-//!   polls all pushed futures each poll yet yields strictly in push (source)
-//!   order, so a fast `None` from a non-owner never beats a slow `Some` from
-//!   the owner. The lowest-ordered source with data wins and pins; a source
+//!   but resolve **in source order** with early exit. A [`FuturesOrdered`]
+//!   yields strictly in push (source) order regardless of completion timing, so
+//!   the lowest-ordered source with data always wins the pin — a fast `None`
+//!   from a non-owner can never beat a slow `Some` from the owner. A source
 //!   that errors is skipped (error remembered); data beats a skipped error; no
-//!   data plus at least one error is an error.
+//!   data plus at least one error is an error. Once pinned, later calls address
+//!   the pinned source directly and never touch the others.
 //! * **Scan** — probe sources **sequentially**; the first stream to yield a
 //!   cell pins, a post-pin mid-stream error terminates with `Err` (no restart
 //!   would double-yield), a pre-yield error is skipped, an empty source falls
@@ -286,6 +298,10 @@ where
         while let Some(result) = ordered.next().await {
             match result {
                 Ok(Some(value)) => {
+                    // Discarding the `set` result is safe only because unpinned
+                    // reads in one operation are issued sequentially (see the
+                    // `SingleSourceCoherence` note): this is the first pin, so
+                    // the `OnceLock` is empty and the set succeeds.
                     let _ = self.pin.set(sources[idx].clone());
                     return Ok(Some(value));
                 }
@@ -330,6 +346,9 @@ where
             match result {
                 Ok(buffer) => {
                     if buffer.iter().any(Option::is_some) {
+                        // Safe to discard only under the sequential-read
+                        // serialization (see the `SingleSourceCoherence` note):
+                        // the first pin always finds the `OnceLock` empty.
                         let _ = self.pin.set(sources[idx].clone());
                         return Ok(buffer);
                     }

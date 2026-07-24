@@ -270,6 +270,11 @@ impl ReaderCache {
         // One shared issue stamp for the whole batch fill.
         let stamp = self.issue_stamp();
         let fresh = fill().await?;
+        debug_assert_eq!(
+            fresh.len(),
+            keys.len(),
+            "batch fill must answer every key (the write-through zip aligns by index)"
+        );
         for (key, value) in keys.iter().zip(fresh.iter()) {
             self.write_through(key, stamp, value.clone()).await;
         }

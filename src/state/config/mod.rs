@@ -112,6 +112,13 @@ pub struct KeyedStateConfiguration {
     /// with no subsystem is rejected at build
     /// ([`RegisterStateError::PublishedWithoutSubsystem`]). `None` (the
     /// default) is valid for consumers that publish nothing.
+    ///
+    /// Keep this set across the deploy that un-publishes a collection: startup
+    /// reconciliation withdraws a collection's routing row only while it is
+    /// still registered `Private` under a configured subsystem. Dropping the
+    /// subsystem (or the registration) in the same deploy as
+    /// `.published(false)` strands the row instead of withdrawing it (see
+    /// [`StateVisibility`]).
     #[builder(default)]
     pub subsystem: Option<SubsystemName>,
 

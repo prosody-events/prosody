@@ -82,8 +82,14 @@ impl Cell {
     ///
     /// This is the committed-projection primitive the standalone
     /// [`StateReader`](crate::state_reader::StateReader) observes: one point
-    /// read, committed-only, possibly stale by the single in-flight event. The
-    /// oracle-free carriers it flows through —
+    /// read, committed-only. It can be stale in two ways, both permitted by the
+    /// bounded-staleness contract: a `Provisional` cell hides the single
+    /// in-flight event's outcome behind its committed `prev`; and a `Resolved`
+    /// cell whose value predates a *committed-yet-unapplied* change (e.g. a
+    /// section clear that has committed but whose row deletions the owner has
+    /// not yet applied) reads the old-but-once-committed value until the owner
+    /// converges it via its recovery sweep or next commit. Neither is an
+    /// uncommitted read. The oracle-free carriers it flows through —
     /// `read_committed`/`read_committed_many`/`scan_committed` on both the
     /// Cassandra and memory backends — all resolve values through it.
     #[must_use]

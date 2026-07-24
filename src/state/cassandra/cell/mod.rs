@@ -313,8 +313,14 @@ impl CassandraCellResources {
     /// Drives the shared [`page_cells`] pager and yields each present cell's
     /// [`Cell::project_committed`] in `coordinate` order, honouring the scan's
     /// `limit` over **present** yields. Skips `help_read_window` entirely —
-    /// owner-side durable repair a reader neither can nor may run; `prev` is
-    /// committed by construction, so the projection is sound without it.
+    /// owner-side durable repair a reader neither can nor may run. The
+    /// projection is sound without it: a provisional row's `prev` is committed
+    /// by construction, and a resolved row's `data` is a once-committed value.
+    /// A resolved row set before a committed-yet-unapplied section clear thus
+    /// reads stale-but-once-committed until the owner applies the clear — a
+    /// bounded-staleness case (see
+    /// [`Cell::project_committed`](crate::state::cell::Cell::project_committed)),
+    /// never an uncommitted read.
     pub(crate) fn scan_committed<'a>(
         &'a self,
         id: &'a CollectionId,

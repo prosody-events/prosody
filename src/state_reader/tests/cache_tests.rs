@@ -321,6 +321,60 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
     Ok(())
 }
 
+/// The batch read serves entirely from the cache when every key is a fresh
+/// hit (zero fills), and a single stale key triggers exactly ONE whole-batch
+/// refill — never a per-key fill.
+///
+/// Falsify: drop the `hits.len() == keys.len()` all-hits shortcut in
+/// `get_many_cached` (always refetch) — the all-fresh second call then fills
+/// and the count reaches 2 before the clock ever advances.
+#[tokio::test]
+async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
+    let (cache, now) = fixed_clock_cache(1 << 20);
+    let keys = [key("batch-0")?, key("batch-1")?];
+    let fills = Arc::new(AtomicUsize::new(0));
+    let fill = || {
+        let fills = fills.clone();
+        async move {
+            fills.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, StateAccessError>(vec![
+                Some(Bytes::from_static(b"a")),
+                Some(Bytes::from_static(b"b")),
+            ])
+        }
+    };
+
+    // Cold: one batch fill seeds both keys at t=0.
+    cache.get_many_cached(&keys, 100, fill).await?;
+    assert_eq!(fills.load(Ordering::Relaxed), 1, "cold batch fills once");
+
+    // Both still fresh at t=0: the all-hits shortcut serves from cache.
+    let served = cache.get_many_cached(&keys, 100, fill).await?;
+    assert_eq!(
+        served,
+        vec![
+            Some(Bytes::from_static(b"a")),
+            Some(Bytes::from_static(b"b"))
+        ]
+    );
+    assert_eq!(
+        fills.load(Ordering::Relaxed),
+        1,
+        "an all-fresh batch is served without a fill"
+    );
+
+    // Advance past the ttl: the first probed key is stale, so exactly one
+    // whole-batch refill fires (a single fill, not one per key).
+    now.store(100, Ordering::Relaxed);
+    cache.get_many_cached(&keys, 100, fill).await?;
+    assert_eq!(
+        fills.load(Ordering::Relaxed),
+        2,
+        "one stale key refetches the whole batch exactly once"
+    );
+    Ok(())
+}
+
 /// Declared weight never exceeds the byte budget across a fill trace.
 #[tokio::test]
 async fn declared_weight_bounded_by_budget() -> Result<()> {

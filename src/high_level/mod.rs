@@ -311,6 +311,13 @@ where
             .read_cache_size_bytes
             .or(keyed_state.cache_size_bytes)
             .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES);
+        // The bundle depends only on the trigger-store backend, group id, and
+        // cache budget — all mode-independent — so memoizing the first caller's
+        // build and reusing it for every later `state`/`subscribe` is sound
+        // regardless of mode (mirrors the Cassandra-session reuse in
+        // `StorePair::new`). `InMemory` is exactly mock mode, so its bundle
+        // carries the shared in-memory stores that give a reader minted from it
+        // read-your-writes against the running consumer.
         let deps = match trigger_store {
             TriggerStoreConfiguration::InMemory => SharedDeps::memory(
                 consumer.group_id.clone(),
@@ -399,8 +406,13 @@ where
             }
         };
 
-        // Initialize the consumer based on the mode configuration
-        let consumer = match &config {
+        // Build the consumer. On any failure after `shared_deps` memoized the
+        // bundle above and `take` moved the config out, the retained bundle is
+        // dropped below: it holds an open scylla session, a live rdkafka poll
+        // thread, and a registered heartbeat that would otherwise strand
+        // unusable for the client's lifetime (the config is gone, so it is
+        // never reused). The next `subscribe` then rebuilds a fresh one.
+        let built: Result<_, HighLevelClientError<C::Error>> = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
                 retry,
@@ -408,58 +420,65 @@ where
                 defer,
                 common,
                 trigger_store,
-            } => {
-                ProsodyConsumer::<C>::pipeline_consumer(
-                    consumer,
-                    trigger_store,
-                    PipelineMiddlewareConfiguration {
-                        retry: retry.clone(),
-                        monopolization: monopolization.clone(),
-                        defer: defer.clone(),
-                    },
-                    common,
-                    self.telemetry.clone(),
-                    handler.clone(),
-                    deps,
-                )
-                .await?
-            }
+            } => ProsodyConsumer::<C>::pipeline_consumer(
+                consumer,
+                trigger_store,
+                PipelineMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    monopolization: monopolization.clone(),
+                    defer: defer.clone(),
+                },
+                common,
+                self.telemetry.clone(),
+                handler.clone(),
+                deps,
+            )
+            .await
+            .map_err(Into::into),
             ModeConfiguration::LowLatency {
                 consumer,
                 retry,
                 failure_topic,
                 common,
                 trigger_store,
-            } => {
-                ProsodyConsumer::low_latency_consumer(
-                    consumer,
-                    trigger_store,
-                    LowLatencyMiddlewareConfiguration {
-                        retry: retry.clone(),
-                        failure_topic: failure_topic.clone(),
-                    },
-                    common,
-                    self.producer.clone(),
-                    self.telemetry.clone(),
-                    handler.clone(),
-                    deps,
-                )
-                .await?
-            }
+            } => ProsodyConsumer::low_latency_consumer(
+                consumer,
+                trigger_store,
+                LowLatencyMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    failure_topic: failure_topic.clone(),
+                },
+                common,
+                self.producer.clone(),
+                self.telemetry.clone(),
+                handler.clone(),
+                deps,
+            )
+            .await
+            .map_err(Into::into),
             ModeConfiguration::BestEffort {
                 consumer,
                 common,
                 trigger_store,
-            } => {
-                ProsodyConsumer::<C>::best_effort_consumer(
-                    consumer,
-                    trigger_store,
-                    common,
-                    self.telemetry.clone(),
-                    handler.clone(),
-                    deps,
-                )
-                .await?
+            } => ProsodyConsumer::<C>::best_effort_consumer(
+                consumer,
+                trigger_store,
+                common,
+                self.telemetry.clone(),
+                handler.clone(),
+                deps,
+            )
+            .await
+            .map_err(Into::into),
+        };
+
+        let consumer = match built {
+            Ok(consumer) => consumer,
+            Err(error) => {
+                // Drop the retained bundle under the held consumer lock,
+                // preserving the consumer -> deps lock order.
+                *self.deps.lock().await = None;
+                return Err(error);
             }
         };
 

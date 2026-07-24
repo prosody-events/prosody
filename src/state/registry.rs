@@ -66,6 +66,15 @@ pub enum StateVisibility {
     Private,
 
     /// Discoverable by cross-group readers through the publication table.
+    ///
+    /// Retiring a published collection MUST go through `.published(false)` with
+    /// the registration and the consumer's `subsystem` **retained** for one
+    /// stop-then-start deploy: startup reconciliation only sweeps the routing
+    /// rows of still-registered, `Private`, subsystem-configured names.
+    /// Deleting the registration outright, or dropping the `subsystem`
+    /// config, strands the `(subsystem, name)` routing row — and with `TTL
+    /// = None` the stranded row (and its cells) stay
+    /// cross-group-discoverable indefinitely.
     Published,
 }
 

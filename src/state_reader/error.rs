@@ -98,14 +98,14 @@ pub enum StateReaderError {
 
 impl StateReaderError {
     /// Type-erases a store/publication/identity error into [`Self::Store`],
-    /// capturing its classification.
+    /// capturing its classification clamped to the client posture.
     pub(crate) fn store<E>(error: &E) -> Self
     where
         E: ClassifyError + Error,
     {
         Self::Store {
             message: error.to_string(),
-            category: error.classify_error(),
+            category: client_category(error.classify_error()),
         }
     }
 }
@@ -122,7 +122,77 @@ impl ClassifyError for StateReaderError {
             | Self::InvalidReadCache { .. }
             | Self::Unsupported { .. } => ErrorCategory::Permanent,
             Self::Store { category, .. } => *category,
-            Self::Access(error) => error.classify_error(),
+            Self::Access(error) => client_category(error.classify_error()),
+        }
+    }
+}
+
+/// Clamps an upstream classification to the reader's client posture:
+/// `Terminal` folds to `Transient`, everything else passes through. The reader
+/// is a leaf, FFI-exposable client with no middleware above it to consume a
+/// `Terminal` ("shut the client down" is meaningless for an ownerless
+/// cross-group reader; a faulted loader or driver may recover on a retry).
+/// Mirrors the owner-side fold in
+/// [`ErasedStateError::from_classified`](crate::consumer::event_context::ErasedStateError).
+fn client_category(category: ErrorCategory) -> ErrorCategory {
+    match category {
+        ErrorCategory::Terminal => ErrorCategory::Transient,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic upstream error that classifies `Terminal` — a shut-down
+    /// Kafka loader or a scylla driver fault as they reach the reader.
+    #[derive(Debug, Error)]
+    #[error("synthetic terminal")]
+    struct SyntheticTerminal;
+
+    impl ClassifyError for SyntheticTerminal {
+        fn classify_error(&self) -> ErrorCategory {
+            ErrorCategory::Terminal
+        }
+    }
+
+    /// No constructible [`StateReaderError`] classifies `Terminal`: the reader
+    /// is a leaf client with no middleware to consume one. The two type-erasing
+    /// arms carry an upstream classification, so both are driven with a
+    /// `Terminal`-emitting fault through the production `store`/`load`
+    /// boundaries.
+    ///
+    /// FALSIFICATION: drop the `client_category` clamp — the `store(...)` and
+    /// `Access(load(...))` cases then classify `Terminal` and the assert fires.
+    #[test]
+    fn no_variant_leaks_terminal_to_the_client() {
+        let cases = [
+            StateReaderError::UnknownPublication {
+                subsystem: "orders".into(),
+                name: "cart".into(),
+            },
+            StateReaderError::IdentityMismatch {
+                group: "group-a".into(),
+            },
+            StateReaderError::IdentityUnavailable {
+                name: "cart".into(),
+            },
+            StateReaderError::TooManySources { found: 9, max: 4 },
+            StateReaderError::EmptyKey,
+            StateReaderError::InvalidReadCache { reason: "zero ttl" },
+            StateReaderError::Unsupported {
+                reason: "empty name",
+            },
+            StateReaderError::store(&SyntheticTerminal),
+            StateReaderError::Access(StateAccessError::load(&SyntheticTerminal)),
+        ];
+        for case in cases {
+            assert_ne!(
+                case.classify_error(),
+                ErrorCategory::Terminal,
+                "variant leaked Terminal: {case}"
+            );
         }
     }
 }

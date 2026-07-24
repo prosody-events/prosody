@@ -155,6 +155,7 @@ use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
 use crate::consumer::probes::ProbeServer;
 use crate::consumer::storage::{SharedStorage, StorePair};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, KafkaLoaderConfiguration, MemoryLoader, MessageLoader};
@@ -785,7 +786,10 @@ impl KeyedStateInputs {
         };
         reconcile_publications(&store, &self.registry, &subsystem, &self.group)
             .await
-            .map_err(|error| KeyedStateInitError::Publication(error.to_string()))?;
+            .map_err(|error| KeyedStateInitError::Publication {
+                message: format!("{error:#}"),
+                category: error.classify_error(),
+            })?;
         if !self.registry.has_published() {
             return Ok(None);
         }
@@ -1141,17 +1145,21 @@ where
 
 /// The memory cell + identity stores that back the state provider: the shared
 /// bundle's instances when one was supplied (so a reader minted from the same
-/// bundle reads-your-writes), otherwise fresh stores. An incoherent
-/// Cassandra-bundle-on-a-memory-arm (unreachable — the composition derives both
-/// from one config) falls through to fresh.
+/// bundle reads-your-writes), otherwise fresh stores. A Cassandra bundle handed
+/// to a memory arm is an incoherent-backend bug — unreachable by construction
+/// (the composition derives both from one config) — surfaced as
+/// [`ConsumerError::SharedDepsBackendMismatch`] rather than silently swapping
+/// in fresh, unshared stores (which would break mock read-your-writes),
+/// mirroring the Cassandra arm's [`cassandra_arm_inputs`].
 fn shared_memory_handles(
     shared: Option<SharedStorage>,
-) -> (MemoryCells, MemoryDescriptorIdentityStore) {
+) -> Result<(MemoryCells, MemoryDescriptorIdentityStore), ConsumerError> {
     match shared {
         Some(SharedStorage::Memory {
             cells, identities, ..
-        }) => (cells, identities),
-        _ => (MemoryCells::new(), MemoryDescriptorIdentityStore::new()),
+        }) => Ok((cells, identities)),
+        Some(SharedStorage::Cassandra { .. }) => Err(ConsumerError::SharedDepsBackendMismatch),
+        None => Ok((MemoryCells::new(), MemoryDescriptorIdentityStore::new())),
     }
 }
 
@@ -1169,17 +1177,17 @@ type MemoryArmInputs<P> = (
 fn memory_arm_inputs<C: Codec>(
     deps: Option<&SharedDeps<C>>,
     shared: Option<SharedStorage>,
-) -> MemoryArmInputs<C::Payload>
+) -> Result<MemoryArmInputs<C::Payload>, ConsumerError>
 where
     C::Payload: Clone,
 {
     let loader = deps.and_then(SharedDeps::memory_loader).unwrap_or_default();
-    let (cells, identities) = shared_memory_handles(shared);
+    let (cells, identities) = shared_memory_handles(shared)?;
     let partition_counts = deps.map_or_else(
         || PartitionCounts::Memory(PartitionCount::MOCK),
         SharedDeps::partition_counts,
     );
-    (loader, cells, identities, partition_counts)
+    Ok((loader, cells, identities, partition_counts))
 }
 
 /// The Cassandra-arm inputs a consumer resolves from an optional shared bundle:
@@ -1241,7 +1249,10 @@ where
         &keyed_state.config.cache_dir,
         keyed_state.config.cache_size_bytes,
     )
-    .map_err(|error| KeyedStateInitError::Cache(error.to_string()))?;
+    .map_err(|error| KeyedStateInitError::Cache {
+        message: format!("{error:#}"),
+        category: error.classify_error(),
+    })?;
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
         cell_store,
@@ -1558,7 +1569,7 @@ where
             } => {
                 // Memory/mock arm inputs come from the bundle when supplied, else fresh.
                 let (loader, cells, identities, partition_counts) =
-                    memory_arm_inputs(deps.as_ref(), shared);
+                    memory_arm_inputs(deps.as_ref(), shared)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
@@ -1688,7 +1699,7 @@ where
                 ..
             } => {
                 let (loader, cells, identities, partition_counts) =
-                    memory_arm_inputs(deps.as_ref(), shared);
+                    memory_arm_inputs(deps.as_ref(), shared)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
@@ -1810,7 +1821,7 @@ where
                 ..
             } => {
                 let (loader, cells, identities, partition_counts) =
-                    memory_arm_inputs(deps.as_ref(), shared);
+                    memory_arm_inputs(deps.as_ref(), shared)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
@@ -2078,14 +2089,31 @@ pub enum KeyedStateInitError {
     RecoveryTtlMargin(#[from] RecoveryTtlMarginError),
 
     /// The local keyed-state cache's disk workspace could not be opened.
-    #[error("failed to open the keyed-state cache: {0:#}")]
-    Cache(String),
+    /// Type-erased with its classification preserved (the inner
+    /// `FjallClientError` is crate-internal and not part of the public
+    /// surface), mirroring the reader's
+    /// [`StateReaderError::Store`](crate::state_reader::StateReaderError::Store)
+    /// boundary.
+    #[error("failed to open the keyed-state cache: {message}")]
+    Cache {
+        /// Rendered cache-open error, full source chain.
+        message: String,
+        /// The cache error's captured classification.
+        category: ErrorCategory,
+    },
 
     /// Startup reconciliation of keyed-state publication routing rows failed
-    /// (a broken publication store). Transient — the deploy retries; a
-    /// per-collection permanent decode is logged and skipped, not surfaced.
-    #[error("keyed-state publication reconciliation failed: {0}")]
-    Publication(String),
+    /// (a broken publication store). Type-erased with its classification
+    /// preserved — a per-collection permanent decode is logged and skipped, so
+    /// a surfaced error is the store itself (typically transient; the deploy
+    /// retries).
+    #[error("keyed-state publication reconciliation failed: {message}")]
+    Publication {
+        /// Rendered reconciliation error, full source chain.
+        message: String,
+        /// The reconciliation error's captured classification.
+        category: ErrorCategory,
+    },
 
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`] constructor, which runs no state middleware to

@@ -82,8 +82,13 @@ struct Admission {
 ///
 /// Built from a [`SharedDeps`] bundle with [`StateReader::new`]. Reads observe
 /// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
-/// of one source per operation, with honest bounded staleness governed by the
-/// descriptor's [`ReadCache`] policy. The reader is generic over the collection
+/// of one source per operation, with honest bounded staleness. The descriptor's
+/// [`ReadCache`] TTL bounds one staleness source (a cached value's age); a
+/// second, independent source is the owner's commit→apply window — a
+/// once-committed value read before the owner applies a committed-yet-unapplied
+/// change (see `project_committed` above), which converges via the owner's
+/// recovery sweep or its next commit, not via the read cache. The reader is
+/// generic over the collection
 /// descriptor `D` and the message codec `C`; the read methods live in
 /// descriptor-specialized impl blocks (Value, Map, Deque), each a thin bind +
 /// delegate over the shared read machinery.

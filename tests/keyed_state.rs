@@ -43,7 +43,7 @@ use prosody::state::descriptor::{
     CellStateError, Registered, StateDescriptor, ValueDescriptor, value_state,
 };
 use prosody::state::publication::PublicationStore;
-use prosody::state_reader::{SharedDeps, StateReader};
+use prosody::state_reader::{ReaderLoader, SharedDeps, StateReader};
 use prosody::subsystem::SubsystemName;
 use prosody::telemetry::Telemetry;
 use prosody::timers::datetime::{CompactDateTime, CompactDateTimeError};
@@ -83,6 +83,14 @@ fn last_seen() -> MessageDescriptor<KafkaLoader<JsonCodec>> {
 /// (whose handle's `.set()`/`.get()` it calls) rather than a typed
 /// [`Registered`] token (see the module doc).
 const LAST_SEEN: &str = "last_seen";
+
+/// A second Kafka-message collection the handler records the current message
+/// into, registered `.published(true)` in the publication test so a standalone
+/// [`StateReader`] can read it back — exercising the reader's Kafka loader arm
+/// (`ReaderLoader::Kafka`), which resolves a message-ref cell by re-fetching
+/// the body from Kafka. `last_seen` cannot serve this because it stays private
+/// (its absent routing row is asserted end-to-end).
+const RECEIPT: &str = "receipt";
 
 /// What the handler saw, streamed to the test for content assertions.
 #[derive(Debug)]
@@ -141,6 +149,14 @@ impl CartHandler {
         ctx.clone()
             .boxed()
             .message_value_state(LAST_SEEN)?
+            .set(message.clone())
+            .await?;
+
+        // Record the same message into the published receipt collection so a
+        // cross-group reader can resolve it back through the Kafka loader arm.
+        ctx.clone()
+            .boxed()
+            .message_value_state(RECEIPT)?
             .set(message)
             .await?;
 
@@ -324,6 +340,9 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
     let mut keyed_state = KeyedStateConfiguration::default();
     let cart = keyed_state.register(cart());
     let _last_seen = keyed_state.register(last_seen());
+    // Registered so the handler's erased write resolves; stays private here (no
+    // subsystem is configured in this test).
+    let _receipt = keyed_state.register(message_state::<KafkaLoader<JsonCodec>>(RECEIPT));
     let handler = CartHandler {
         observations_tx,
         cart,
@@ -470,6 +489,10 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
     keyed_state.subsystem = Some(subsystem.clone());
     let cart = keyed_state.register(cart().published(true));
     let _last_seen = keyed_state.register(last_seen());
+    // A published Kafka-message collection: its routing row lets a standalone
+    // reader discover the source and resolve the cell through the Kafka loader.
+    let _receipt =
+        keyed_state.register(message_state::<KafkaLoader<JsonCodec>>(RECEIPT).published(true));
     let handler = CartHandler {
         observations_tx,
         cart,
@@ -549,6 +572,32 @@ async fn read_cart_via_standalone_reader(
     ensure!(
         value == Some(json!(["apple", "banana"])),
         "standalone reader must observe the committed cart, got {value:?}"
+    );
+
+    // The published receipt is a Kafka-message cell: reading it through the
+    // reader exercises `ReaderLoader::Kafka`, resolving the committed message
+    // ref by re-fetching the body from Kafka over the production loader. The
+    // reader binds the same message identity under its own `ReaderLoader` (the
+    // resolver id is loader-independent), so the source discovered above serves
+    // the second message the consumer recorded (offset 1, body `banana`).
+    let receipt_reader = StateReader::new(
+        &deps,
+        subsystem.clone(),
+        message_state::<ReaderLoader<JsonCodec>>(RECEIPT),
+    )?;
+    let receipt = receipt_reader
+        .get(key)
+        .await?
+        .ok_or_else(|| eyre!("standalone reader observed no published receipt"))?;
+    ensure!(
+        receipt.offset() == 1,
+        "receipt must reference the second message's offset, got {}",
+        receipt.offset()
+    );
+    ensure!(
+        receipt.payload() == &json!({ "id": "evt-2", "item": "banana" }),
+        "receipt must re-fetch the second message's body, got {}",
+        receipt.payload()
     );
     Ok(())
 }
