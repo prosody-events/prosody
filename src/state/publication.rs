@@ -32,14 +32,15 @@ pub struct StatePublication {
 ///
 /// A reader discovers a collection's sources by reading one
 /// `(subsystem, state_type, name)` partition. A publisher advertises a source
-/// with an idempotent [`upsert`] and withdraws it with [`remove`]. [`remove`]
-/// is the removal path that bounds the memory store's RAM. No LWT, no TTL: a
-/// source row is plain routing data. The `state_type` in the address
-/// namespaces collections exactly as `keyed_state_identity` does, so a future
-/// internal (non-`Application`) namespace can publish without a schema change.
+/// with an idempotent [`upsert`] and withdraws its whole slice with
+/// [`remove_group`]. [`remove_group`] is the removal path that bounds the
+/// memory store's RAM. No LWT, no TTL: a source row is plain routing data. The
+/// `state_type` in the address namespaces collections exactly as
+/// `keyed_state_identity` does, so a future internal (non-`Application`)
+/// namespace can publish without a schema change.
 ///
 /// [`upsert`]: PublicationStore::upsert
-/// [`remove`]: PublicationStore::remove
+/// [`remove_group`]: PublicationStore::remove_group
 pub trait PublicationStore: Clone + Send + Sync + 'static {
     /// Backend error; classified for the settle-path retry posture.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -58,18 +59,20 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
         row: &StatePublication,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes the `(group_id, topic)` source of `(subsystem, state_type,
-    /// name)`. Idempotent — removing an absent row is a no-op.
+    /// Removes every source of `(subsystem, state_type, name)` published by
+    /// `group_id`, whatever topics it published under. `group_id` is the first
+    /// clustering column, so this is one prefix removal rather than a read
+    /// followed by a delete per topic. Other groups' rows are untouched.
+    /// Idempotent — removing an absent slice is a no-op.
     ///
     /// # Errors
     /// Backend failure.
-    fn remove(
+    fn remove_group(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         group_id: &str,
-        topic: Topic,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// All published sources of `(subsystem, state_type, name)` — one

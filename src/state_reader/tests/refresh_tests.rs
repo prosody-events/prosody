@@ -272,9 +272,9 @@ impl RefreshFixture {
                 }
                 SourceEdit::Withdraw => {
                     self.publications
-                        .remove(&self.sub, StateType::Application, &self.name, group, tp)
+                        .remove_group(&self.sub, StateType::Application, &self.name, group)
                         .await
-                        .map_err(|e| eyre!("remove: {e}"))?;
+                        .map_err(|e| eyre!("remove_group: {e}"))?;
                     advertised[idx] = false;
                 }
                 SourceEdit::PresentNoIdentity => {

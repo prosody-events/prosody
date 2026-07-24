@@ -13,7 +13,10 @@
 //! * **Upsert idempotence.** Re-`Upsert` of an existing `(group, topic)`
 //!   overwrites the routing facts in place. A duplicate would show up as an
 //!   extra row in the sorted set comparison.
-//! * **Remove.** After a `Remove`, that source is gone from the read.
+//! * **Group-slice removal.** A `Remove` drops every source the group published
+//!   under the collection, whatever topics those were, and nothing outside that
+//!   slice. A removal that reached one topic only, or that spilled into a
+//!   sibling group, diverges from the model on the next read.
 //! * **Subsystem, state-type, and name isolation.** The pool holds the same
 //!   name under two subsystems and two state types, and the same `(group,
 //!   topic)` under different names. A key that ignored any of the three would
@@ -119,13 +122,12 @@ enum PublicationOp {
         count: u8,
     },
 
-    /// Remove the `(group, topic)` source of `(sub, st, name)`.
+    /// Remove every source of `(sub, st, name)` published by `group`.
     Remove {
         sub: u8,
         st: u8,
         name: u8,
         group: u8,
-        topic: u8,
     },
 }
 
@@ -146,7 +148,6 @@ impl Arbitrary for PublicationOp {
                 st: u8::arbitrary(g),
                 name: u8::arbitrary(g),
                 group: u8::arbitrary(g),
-                topic: u8::arbitrary(g),
             }
         }
     }
@@ -222,18 +223,23 @@ where
                 st,
                 name,
                 group,
-                topic,
             } => {
                 let subsystem = subsystem_for(token, sub)?;
                 let state_type = state_type_for(st);
                 let name = name_for(name)?;
                 let group = group_for(group);
-                let topic = topic_for(topic);
                 store
-                    .remove(&subsystem, state_type, &name, group, topic)
+                    .remove_group(&subsystem, state_type, &name, group)
                     .await
-                    .map_err(|e| eyre!("remove failed: {e}"))?;
-                oracle.remove(&oracle_key(&subsystem, state_type, &name, group, topic));
+                    .map_err(|e| eyre!("remove_group failed: {e}"))?;
+                // The model drops the whole group slice, every topic of it —
+                // and nothing outside it.
+                oracle.retain(|(sub, st, nm, grp, _topic), _| {
+                    !(sub == subsystem.as_str()
+                        && *st == i8::from(state_type)
+                        && nm == name.as_str()
+                        && grp == group)
+                });
             }
         }
 

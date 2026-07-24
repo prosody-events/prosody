@@ -359,9 +359,9 @@ mod tests;
 /// `section_snapshot` answering empty after a `clear_section`, i.e. buffered
 /// writes silently dropped from the stage. Point removal keeps every later
 /// seek sound (pinned by `clear_section_keeps_sibling_section_ranges` in the
-/// sibling tests). The doomed-key snapshot is bounded by what this event
-/// buffered, inline for the common handful of cells.
-fn remove_span<K, V, Q>(tree: &scc::TreeIndex<K, V>, range: RangeInclusive<Q>)
+/// sibling tests). The doomed-key snapshot is bounded by the span's size,
+/// inline for the common handful of entries.
+pub(in crate::state) fn remove_span<K, V, Q>(tree: &scc::TreeIndex<K, V>, range: RangeInclusive<Q>)
 where
     K: Clone + Ord,
     Q: scc::Comparable<K>,

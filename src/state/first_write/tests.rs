@@ -91,11 +91,16 @@ fn publisher(
     Ok(template(store, registry, count, 64)?.bind(topic()))
 }
 
-/// A row for `(GROUP, TOPIC, count)`.
+/// A row for `(group, TOPIC, count)`.
 fn row(group: &str, count: i32) -> Result<StatePublication> {
+    row_on(group, topic(), count)
+}
+
+/// A row for `(group, topic, count)`.
+fn row_on(group: &str, topic: Topic, count: i32) -> Result<StatePublication> {
     Ok(StatePublication {
         group_id: Arc::from(group),
-        topic: topic(),
+        topic,
         partition_count: PartitionCount::try_from(count)?,
     })
 }
@@ -207,24 +212,26 @@ async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
     Ok(())
 }
 
-/// Reconciliation removes this group's own rows and leaves other groups' rows
-/// untouched.
+/// Reconciliation removes this group's whole slice — every topic it published
+/// the collection under — in one prefix removal, and leaves other groups' rows
+/// untouched. Seeding the own group under two topics is what makes the single
+/// removal meaningful: a per-topic removal would have to read the rows first
+/// and issue one call per topic.
 #[tokio::test]
-async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
+async fn reconcile_removes_own_group_slice_keeps_others() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
-    store
-        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
-        .await;
-    store
-        .seed(
-            &subsystem,
-            StateType::Application,
-            &name,
-            &row(OTHER_GROUP, 5)?,
-        )
-        .await;
+    let second = Intern::<str>::from("orders-topic-2");
+    for row in [
+        row(GROUP, 3)?,
+        row_on(GROUP, second, 3)?,
+        row(OTHER_GROUP, 5)?,
+    ] {
+        store
+            .seed(&subsystem, StateType::Application, &name, &row)
+            .await;
+    }
 
     reconcile_publications(
         &PublicationBackend::Scripted(store.clone()),
@@ -235,12 +242,18 @@ async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
     .await?;
 
     let rows = store.rows(&subsystem, StateType::Application, &name).await;
-    assert_eq!(rows.len(), 1, "only the own row is removed");
+    assert_eq!(rows.len(), 1, "every own-group topic is removed");
     assert_eq!(
         rows[0].group_id.as_ref(),
         OTHER_GROUP,
         "the other group's row is retained"
     );
+    let removes = store
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, PublicationCall::Remove { .. }))
+        .count();
+    assert_eq!(removes, 1, "one prefix removal, not one call per topic");
     Ok(())
 }
 
@@ -404,17 +417,18 @@ async fn memo_key_includes_topic() -> Result<()> {
     Ok(())
 }
 
-/// The healthy no-op path: reconciliation over a store with no rows removes
-/// nothing. The read-failure cases are tested separately: see
-/// [`reconcile_skips_collection_whose_reads_fail_permanent`] for the skip case
-/// and [`reconcile_propagates_transient_read_failure`] for the propagate case.
+/// Reconciliation never reads: it removes each private name's own slice blind.
+/// That is what keeps a corrupt sibling row — one that would fail to decode —
+/// from blocking the sweep. Over an empty store the removal is a harmless no-op
+/// and the store stays empty.
 #[tokio::test]
-async fn reconcile_over_empty_store_is_a_noop() -> Result<()> {
+async fn reconcile_removes_blind_without_reading() -> Result<()> {
     let store = ScriptedPublicationStore::new();
+    let subsystem = subsystem()?;
     reconcile_publications(
         &PublicationBackend::Scripted(store.clone()),
         &registry(StateVisibility::Private)?,
-        &subsystem()?,
+        &subsystem,
         GROUP,
     )
     .await?;
@@ -422,8 +436,15 @@ async fn reconcile_over_empty_store_is_a_noop() -> Result<()> {
         !store
             .calls()
             .iter()
-            .any(|c| matches!(c, PublicationCall::Remove { .. })),
-        "nothing to remove from an empty store"
+            .any(|c| matches!(c, PublicationCall::Read { .. })),
+        "reconciliation must not read the rows it retires"
+    );
+    assert!(
+        store
+            .rows(&subsystem, StateType::Application, &cart_name()?)
+            .await
+            .is_empty(),
+        "an empty store stays empty"
     );
     Ok(())
 }
@@ -462,50 +483,18 @@ async fn reconcile_keeps_published_collection_row() -> Result<()> {
     Ok(())
 }
 
-/// A `Permanent` read failure inside reconciliation is logged and skipped, not
-/// propagated (a corrupt sibling row that will not decode must not wedge
-/// startup). The own row is left in place — nothing was removed.
+/// A `Transient` removal failure inside reconciliation propagates, so the
+/// caller's build-time retry re-runs rather than the deploy proceeding with a
+/// retired collection still advertised.
 #[tokio::test]
-async fn reconcile_skips_collection_whose_reads_fail_permanent() -> Result<()> {
+async fn reconcile_propagates_transient_remove_failure() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
     store
         .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
         .await;
-    store.fail_reads_with(ErrorCategory::Permanent);
-
-    // Returns Ok despite the read failure — the collection is skipped.
-    reconcile_publications(
-        &PublicationBackend::Scripted(store.clone()),
-        &registry(StateVisibility::Private)?,
-        &subsystem,
-        GROUP,
-    )
-    .await?;
-
-    assert!(
-        !store
-            .calls()
-            .iter()
-            .any(|c| matches!(c, PublicationCall::Remove { .. })),
-        "a Permanent read failure skips the collection; nothing is removed"
-    );
-    Ok(())
-}
-
-/// A `Transient` read failure inside reconciliation propagates, so the
-/// caller's build-time retry re-runs. This is the transient counterpart to
-/// the `Permanent` skip tested above.
-#[tokio::test]
-async fn reconcile_propagates_transient_read_failure() -> Result<()> {
-    let store = ScriptedPublicationStore::new();
-    let subsystem = subsystem()?;
-    let name = cart_name()?;
-    store
-        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
-        .await;
-    store.fail_reads_with(ErrorCategory::Transient);
+    store.fail_removes_with(ErrorCategory::Transient);
 
     let result = reconcile_publications(
         &PublicationBackend::Scripted(store.clone()),
@@ -517,7 +506,15 @@ async fn reconcile_propagates_transient_read_failure() -> Result<()> {
 
     assert!(
         result.is_err(),
-        "a Transient read failure propagates so the build-time retry re-runs"
+        "a Transient removal failure propagates so the build-time retry re-runs"
+    );
+    assert_eq!(
+        store
+            .rows(&subsystem, StateType::Application, &name)
+            .await
+            .len(),
+        1,
+        "the failed removal left the row in place"
     );
     Ok(())
 }

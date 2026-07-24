@@ -5,7 +5,7 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
 };
-use super::dirty::Edge;
+use super::dirty::{Edge, remove_span};
 use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::publication::{PublicationStore, StatePublication};
@@ -712,8 +712,9 @@ impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
 /// is therefore a prefix range over one `(subsystem, state_type, name)`.
 /// Cloning shares the `Arc`, mirroring the sibling memory stores.
 ///
-/// Removal path: the [`remove`](PublicationStore::remove) verb drops one source
-/// row, and dropping the last handle drops the whole tree (mock-mode lifetime).
+/// Removal path: the [`remove_group`](PublicationStore::remove_group) verb
+/// drops one group's whole slice of a collection, and dropping the last handle
+/// drops the whole tree (mock-mode lifetime).
 /// The map is bounded by the live published `(group, topic)` set of the
 /// collections in play, so there is no unbounded keyed growth. It uses no
 /// `Mutex`: scc is lock-free.
@@ -747,21 +748,17 @@ impl PublicationStore for MemoryPublicationStore {
         Ok(())
     }
 
-    async fn remove(
+    async fn remove_group(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         group_id: &str,
-        topic: Topic,
     ) -> Result<(), Self::Error> {
-        self.rows.remove_sync(&PublicationKey {
-            subsystem: subsystem.clone(),
-            state_type,
-            name: name.clone(),
-            group_id: Arc::from(group_id),
-            topic,
-        });
+        remove_span(
+            &self.rows,
+            PublicationScope::group_range(subsystem, state_type, name, group_id),
+        );
         Ok(())
     }
 
@@ -795,16 +792,19 @@ struct PublicationKey {
     topic: Topic,
 }
 
-/// Bounding query for every [`PublicationKey`] of one
-/// `(subsystem, state_type, name)` — the `read_publications` sub-range.
-/// Compares on `(subsystem, state_type, name)` alone, ignoring `group_id` and
-/// `topic`, so the range spans exactly that collection's sources. See [`Edge`]
-/// for why each bound is a strict separator.
+/// Bounding query for a span of [`PublicationKey`]s. Compares on
+/// `(subsystem, state_type, name)` and, when `group_id` is set, on the group
+/// too, ignoring everything past that. So [`range`](Self::range) spans one
+/// collection's sources — the `read_publications` sub-range — and
+/// [`group_range`](Self::group_range) spans one group's slice of it, whatever
+/// topics that group published under. See [`Edge`] for why each bound is a
+/// strict separator.
 #[derive(Clone, Eq, PartialEq)]
 struct PublicationScope {
     subsystem: SubsystemName,
     state_type: StateType,
     name: StateName,
+    group_id: Option<Arc<str>>,
     edge: Edge,
 }
 
@@ -816,13 +816,34 @@ impl PublicationScope {
         state_type: StateType,
         name: &StateName,
     ) -> RangeInclusive<Self> {
-        let at = |edge| Self {
+        Self::spanning(subsystem, state_type, name, None)
+    }
+
+    /// The inclusive separator pair spanning one group's sources of
+    /// `(subsystem, state_type, name)`.
+    fn group_range(
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+        group_id: &str,
+    ) -> RangeInclusive<Self> {
+        Self::spanning(subsystem, state_type, name, Some(Arc::from(group_id)))
+    }
+
+    fn spanning(
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+        group_id: Option<Arc<str>>,
+    ) -> RangeInclusive<Self> {
+        let at = |edge, group_id| Self {
             subsystem: subsystem.clone(),
             state_type,
             name: name.clone(),
+            group_id,
             edge,
         };
-        at(Edge::Low)..=at(Edge::High)
+        at(Edge::Low, group_id.clone())..=at(Edge::High, group_id)
     }
 
     fn cmp_key(&self, key: &PublicationKey) -> Ordering {
@@ -830,6 +851,11 @@ impl PublicationScope {
             .cmp(&key.subsystem)
             .then(self.state_type.cmp(&key.state_type))
             .then(self.name.cmp(&key.name))
+            .then_with(|| {
+                self.group_id.as_ref().map_or(Ordering::Equal, |group| {
+                    group.as_ref().cmp(key.group_id.as_ref())
+                })
+            })
     }
 }
 

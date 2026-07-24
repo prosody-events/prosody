@@ -3,7 +3,6 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
-use crate::Topic;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
@@ -1148,14 +1147,12 @@ pub(crate) enum PublicationCall {
         /// The recorded live partition count.
         partition_count: i32,
     },
-    /// A `remove` reached the store.
+    /// A `remove_group` reached the store.
     Remove {
         /// The collection name.
         name: String,
-        /// The group whose row was removed.
+        /// The group whose slice was removed.
         group: String,
-        /// The topic.
-        topic: String,
     },
     /// A `read_publications` reached the store.
     Read {
@@ -1191,6 +1188,10 @@ pub(crate) struct ScriptedPublicationStore {
     /// Use `Permanent` to model rows that fail to decode, or `Transient`
     /// to model a temporary read fault.
     read_fail: Arc<Mutex<Option<ErrorCategory>>>,
+    /// When set, every `remove_group` call still records the
+    /// [`PublicationCall::Remove`], then returns an error of this category
+    /// instead of applying. Models a store that cannot retire a routing slice.
+    remove_fail: Arc<Mutex<Option<ErrorCategory>>>,
     errored: Arc<Semaphore>,
     /// When present, a successful `upsert` blocks on the release gate.
     gate: Option<Arc<ReleaseGate>>,
@@ -1204,6 +1205,7 @@ impl ScriptedPublicationStore {
             calls: Arc::new(Mutex::new(Vec::new())),
             fail: Arc::new(AtomicBool::new(false)),
             read_fail: Arc::new(Mutex::new(None)),
+            remove_fail: Arc::new(Mutex::new(None)),
             errored: Arc::new(Semaphore::new(0)),
             gate: None,
         }
@@ -1235,10 +1237,15 @@ impl ScriptedPublicationStore {
 
     /// Makes every subsequent `read_publications` call still record the
     /// [`PublicationCall::Read`], then fail with `category`. Drives the
-    /// reconciliation tests: skip the row on `Permanent`, propagate the
-    /// error on `Transient`.
+    /// reader's read-failure paths.
     pub(crate) fn fail_reads_with(&self, category: ErrorCategory) {
         *self.read_fail.lock() = Some(category);
+    }
+
+    /// Makes every subsequent `remove_group` call fail with `category`. Drives
+    /// the reconciliation propagate-on-failure test.
+    pub(crate) fn fail_removes_with(&self, category: ErrorCategory) {
+        *self.remove_fail.lock() = Some(category);
     }
 
     /// Clears a prior [`fail_reads_with`](Self::fail_reads_with) call, so
@@ -1352,21 +1359,22 @@ impl PublicationStore for ScriptedPublicationStore {
             .map_err(|e| match e {})
     }
 
-    async fn remove(
+    async fn remove_group(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         group_id: &str,
-        topic: Topic,
     ) -> Result<(), Self::Error> {
         self.calls.lock().push(PublicationCall::Remove {
             name: name.as_str().to_owned(),
             group: group_id.to_owned(),
-            topic: topic.to_string(),
         });
+        if let Some(category) = *self.remove_fail.lock() {
+            return Err(ScriptedPublicationError(category));
+        }
         self.inner
-            .remove(subsystem, state_type, name, group_id, topic)
+            .remove_group(subsystem, state_type, name, group_id)
             .await
             .map_err(|e| match e {})
     }

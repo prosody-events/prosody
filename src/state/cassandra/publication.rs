@@ -3,12 +3,12 @@
 //! [`CassandraPublicationStore`] implements [`PublicationStore`] over the
 //! `keyed_state_publication` table, provisioned by migration
 //! `20260722_create_keyed_state_publication.cql`. The table holds only routing
-//! facts. Reads are a single-partition clustering `SELECT`. Upsert and remove
-//! are plain idempotent `INSERT`/`DELETE`. They set no LWT, no TTL, and no
-//! client-set timestamp. Last-write-wins ordering from the session's monotonic
+//! facts. Reads are a single-partition clustering `SELECT`. An upsert is a
+//! plain idempotent `INSERT`; retiring a group is one clustering-prefix
+//! `DELETE` over its `group_id`. They set no LWT, no TTL, and no client-set
+//! timestamp. Last-write-wins ordering from the session's monotonic
 //! timestamp generator is enough for these rows.
 
-use crate::Topic;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore as CassandraSession, TABLE_KEYED_STATE_PUBLICATION};
 use crate::cassandra_queries;
@@ -69,24 +69,17 @@ impl PublicationStore for CassandraPublicationStore {
         Ok(())
     }
 
-    async fn remove(
+    async fn remove_group(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         group_id: &str,
-        topic: Topic,
     ) -> Result<(), Self::Error> {
         self.cql()
             .execute_unpaged(
-                &self.queries.remove,
-                (
-                    subsystem.as_str(),
-                    state_type,
-                    name.as_str(),
-                    group_id,
-                    topic.as_ref(),
-                ),
+                &self.queries.remove_group,
+                (subsystem.as_str(), state_type, name.as_str(), group_id),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -137,12 +130,12 @@ cassandra_queries! {
             TABLE_KEYED_STATE_PUBLICATION
         ),
 
-        /// Removes one `(group_id, topic)` source.
-        /// Idempotent: deleting an absent row is a no-op.
-        remove: (
+        /// Removes every source published by one group — a clustering-prefix
+        /// range delete on `group_id`, so no read and no per-topic statement.
+        /// Idempotent: deleting an absent slice is a no-op.
+        remove_group: (
             "DELETE FROM $keyspace.{} \
-             WHERE subsystem = ? AND state_type = ? AND name = ? \
-             AND group_id = ? AND topic = ?",
+             WHERE subsystem = ? AND state_type = ? AND name = ? AND group_id = ?",
             TABLE_KEYED_STATE_PUBLICATION
         ),
 

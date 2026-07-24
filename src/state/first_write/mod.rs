@@ -15,11 +15,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use quick_cache::sync::Cache;
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use thiserror::Error;
+use tokio::task::coop::cooperative;
 use tokio::task::{JoinError, spawn_blocking};
 use tracing::error;
 
@@ -31,7 +33,7 @@ use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::CollectionDefRegistry;
 #[cfg(test)]
 use crate::state::tests::support::{ScriptedPublicationError, ScriptedPublicationStore};
-use crate::state::{StateName, StateType};
+use crate::state::{STATE_FANOUT_CONCURRENCY, StateName, StateType};
 use crate::state_reader::{PartitionCount, PartitionCountError};
 use crate::subsystem::SubsystemName;
 
@@ -84,25 +86,24 @@ impl PublicationBackend {
         Ok(())
     }
 
-    /// Removes the `(group_id, topic)` source of `(subsystem, state_type,
-    /// name)`.
-    async fn remove(
+    /// Removes every source of `(subsystem, state_type, name)` published by
+    /// `group_id`.
+    async fn remove_group(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         group_id: &str,
-        topic: Topic,
     ) -> Result<(), PublicationBackendError> {
         match self {
             Self::Cassandra(store) => {
                 store
-                    .remove(subsystem, state_type, name, group_id, topic)
+                    .remove_group(subsystem, state_type, name, group_id)
                     .await?;
             }
             Self::Memory(store) => {
                 match store
-                    .remove(subsystem, state_type, name, group_id, topic)
+                    .remove_group(subsystem, state_type, name, group_id)
                     .await
                 {
                     Ok(()) => {}
@@ -112,7 +113,7 @@ impl PublicationBackend {
             #[cfg(test)]
             Self::Scripted(store) => {
                 store
-                    .remove(subsystem, state_type, name, group_id, topic)
+                    .remove_group(subsystem, state_type, name, group_id)
                     .await?;
             }
         }
@@ -401,13 +402,15 @@ impl FirstWritePublisher {
 ///
 /// Convergence rests on the zero-or-one-instance-per-partition invariant plus
 /// running at every startup: with stop-then-start deploy ordering the
-/// last-started instance reconciles after the final old-generation write. A
-/// corrupt sibling row that will not decode is logged and skipped (it cannot be
-/// cleaned), never a startup wedge.
+/// last-started instance reconciles after the final old-generation write.
+///
+/// Each private name costs exactly one clustering-prefix removal of this
+/// group's slice — no read, so a corrupt sibling row can never block the
+/// sweep. The names are independent partitions, so the removals fan out.
 ///
 /// # Errors
 ///
-/// A transient read/remove failure propagates so the caller's build-time retry
+/// A transient removal failure propagates so the caller's build-time retry
 /// re-runs; the operation is idempotent.
 pub(crate) async fn reconcile_publications(
     store: &PublicationBackend,
@@ -415,37 +418,26 @@ pub(crate) async fn reconcile_publications(
     subsystem: &SubsystemName,
     group: &str,
 ) -> Result<(), PublicationError> {
-    // Own the registered set up front: streaming borrowed registry items into
-    // the awaits below would keep the registry borrowed across `.await`.
     // Routing rows use the same `(state_type, name)` namespacing as the
     // registry, so the private-name sweep addresses each collection exactly.
-    let collections: Vec<(StateType, StateName)> = registry
-        .collections()
-        .filter(|(state_type, name)| !registry.is_published(*state_type, name))
-        .map(|(state_type, name)| (state_type, name.clone()))
-        .collect();
-    for (state_type, name) in &collections {
-        let rows = match store.read_publications(subsystem, *state_type, name).await {
-            Ok(rows) => rows,
-            Err(error) if error.classify_error() == ErrorCategory::Permanent => {
-                error!(
-                    collection = %name.as_str(),
-                    "keyed-state publication reconciliation skipped a collection whose rows will \
-                     not decode: {error:#}"
-                );
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        for row in rows {
-            if row.group_id.as_ref() == group {
-                store
-                    .remove(subsystem, *state_type, name, &row.group_id, row.topic)
-                    .await?;
-            }
-        }
-    }
-    Ok(())
+    // `cooperative` wraps each removal so the fan-out yields to the runtime
+    // every ~128 collections rather than draining in one poll.
+    stream::iter(
+        registry
+            .collections()
+            .filter(|(state_type, name)| !registry.is_published(*state_type, name)),
+    )
+    .map(|(state_type, name)| {
+        cooperative(async move {
+            store
+                .remove_group(subsystem, state_type, name, group)
+                .await
+                .map_err(PublicationError::from)
+        })
+    })
+    .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+    .try_for_each(|()| async { Ok(()) })
+    .await
 }
 
 /// Error surfaced by the publication barrier and reconciliation.
