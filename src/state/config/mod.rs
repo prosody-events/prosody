@@ -126,14 +126,15 @@ pub struct KeyedStateConfiguration {
     /// re-reading the store. Defaults to 5 seconds, well inside the delay reads
     /// already tolerate (see the recovery sweep on [`Self::recovery_delay`]).
     ///
-    /// `None` disables the default, so reads stay uncached unless a descriptor
-    /// opts in. A descriptor's explicit `.read_cache(...)` always wins over
-    /// this default. This setting affects only composed readers, never the
+    /// `None` disables the inherited default. A descriptor can replace this
+    /// TTL or select
+    /// [`ReadCachePolicy::Disabled`](crate::state::ReadCachePolicy)
+    /// to bypass it. This setting affects only composed readers, never the
     /// owning consumer's writes. It is unrelated to a collection's durable TTL.
     ///
     /// Environment variable: `PROSODY_STATE_READ_CACHE_TTL` (a humantime
-    /// duration such as `5s` or `750ms`; `none` disables caching for
-    /// collections a descriptor leaves silent). Must not truncate to zero
+    /// duration such as `5s` or `750ms`; `none` disables the inherited
+    /// default). Must not truncate to zero
     /// milliseconds: every cached entry would be born stale.
     #[builder(
         default = "from_option_duration_env_with_fallback(STATE_READ_CACHE_TTL_ENV, \

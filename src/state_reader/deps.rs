@@ -71,8 +71,8 @@ pub struct SharedDeps<C: Codec> {
     partition_counts: PartitionCounts,
     heartbeats: HeartbeatRegistry,
     /// Bundle-wide default read-cache TTL. Set through
-    /// [`Self::with_default_read_cache_ttl`], which owns how it interacts with
-    /// per-descriptor TTLs.
+    /// [`Self::with_default_read_cache_ttl`]. Collection policies can replace
+    /// or disable it.
     default_read_cache_ttl: Option<Duration>,
     #[cfg(test)]
     instance_id: u64,
@@ -196,11 +196,10 @@ impl<C: Codec> SharedDeps<C> {
         })
     }
 
-    /// Returns this bundle with `ttl` as its default read-cache TTL, applied
-    /// to readers whose descriptor does not set `.read_cache(...)` explicitly
-    /// (an explicit descriptor TTL always wins). The composing client feeds
-    /// `KeyedStateConfiguration::read_cache_ttl` through here. `None` leaves
-    /// collections that set no descriptor TTL uncached.
+    /// Returns this bundle with `ttl` as its inherited read-cache TTL.
+    /// Descriptor policies can replace or disable it. The composing client
+    /// feeds `KeyedStateConfiguration::read_cache_ttl` through here. `None`
+    /// leaves inherited policies uncached.
     #[must_use]
     pub fn with_default_read_cache_ttl(mut self, ttl: Option<Duration>) -> Self {
         self.default_read_cache_ttl = ttl;

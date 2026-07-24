@@ -61,7 +61,24 @@ use futures::stream::{FuturesOrdered, Stream, StreamExt};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::task::coop::cooperative;
+
+/// A collection definition whose inherited reader-cache policy is resolved.
+#[derive(Clone, Copy)]
+pub(crate) struct ReaderCollectionDef {
+    collection: CollectionDef,
+    read_cache_ttl: Option<Duration>,
+}
+
+impl ReaderCollectionDef {
+    pub(crate) fn new(collection: CollectionDef, read_cache_ttl: Option<Duration>) -> Self {
+        Self {
+            collection,
+            read_cache_ttl,
+        }
+    }
+}
 
 /// A per-operation read-only session over a collection's validated publication
 /// snapshot. Implements [`CellRead`] only.
@@ -77,7 +94,7 @@ pub struct ReadSession<C: Codec> {
     loader: Arc<ReaderLoader<C>>,
     cache: ReaderCache,
     key: Key,
-    def: CollectionDef,
+    def: ReaderCollectionDef,
     state_type: StateType,
     name: StateName,
     /// The pinned source, shared across the operation's handle clones so every
@@ -109,7 +126,7 @@ impl<C: Codec> ReadSession<C> {
         loader: Arc<ReaderLoader<C>>,
         cache: ReaderCache,
         key: Key,
-        def: CollectionDef,
+        def: ReaderCollectionDef,
         state_type: StateType,
         name: StateName,
     ) -> Self {
@@ -244,11 +261,11 @@ where
     }
 
     fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
-        self.def.ttl.is_some()
+        self.def.collection.ttl.is_some()
     }
 
     fn collection_keyset_limit(&self, _state_type: StateType, _name: &StateName) -> usize {
-        self.def.keyset_limit
+        self.def.collection.keyset_limit
     }
 
     fn collection_capacity(
@@ -256,7 +273,7 @@ where
         _state_type: StateType,
         _name: &StateName,
     ) -> Option<NonZeroUsize> {
-        self.def.capacity
+        self.def.collection.capacity
     }
 
     fn verify_state_registration(

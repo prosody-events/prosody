@@ -72,7 +72,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
 use crate::state::cell_key::Section;
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
-use crate::state::registry::{CollectionDef, StateVisibility};
+use crate::state::registry::{CollectionDef, ReadCachePolicy, StateVisibility};
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::CELL_BATCH;
 use crate::state::{CollectionKindId, CommitMode, StateType, StoreOutcome};
@@ -82,7 +82,6 @@ use internment::Intern;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
-use std::time::Duration;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -485,21 +484,22 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
         self.with_collection_def(def)
     }
 
-    /// Sets the **read-only client's cache TTL**: how long a
-    /// [`StateReader`](crate::state_reader::StateReader) may serve this
-    /// collection's reads from its cache before re-reading the store.
-    /// Unset (the default), every read hits the durable store. Sub-second
-    /// TTLs are supported; a TTL that truncates to zero milliseconds is
-    /// rejected at reader construction.
+    /// Sets the **read-only client's cache policy**.
+    ///
+    /// A [`std::time::Duration`] sets this collection's TTL. Pass
+    /// [`ReadCachePolicy::Disabled`] to read the durable store on every
+    /// operation. Unset collections inherit the reader client's default.
+    /// Sub-second TTLs are supported; a TTL that truncates to zero milliseconds
+    /// is rejected at reader construction.
     ///
     /// Applies only in the read-only client, which consumes it from the
     /// descriptor *the reader itself* passes to `StateReader::new` /
     /// `client.state`. On the owning consumer it is inert: it never affects
     /// writes, owner reads, or the durable retention set by [`Self::ttl`].
     #[must_use]
-    fn read_cache(self, ttl: Duration) -> Self {
+    fn read_cache(self, policy: impl Into<ReadCachePolicy>) -> Self {
         let mut def = self.collection_def();
-        def.read_cache_ttl = Some(ttl);
+        def.read_cache = policy.into();
         self.with_collection_def(def)
     }
 }

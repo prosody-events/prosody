@@ -20,13 +20,15 @@ use super::support::{
 };
 use crate::Key;
 use crate::codec::JsonCodec;
-use crate::state::StateType;
-use crate::state::descriptor::{DescriptorIdentity, deque_state, map_state, value_state};
+use crate::state::descriptor::{
+    DescriptorIdentity, StateDescriptor, deque_state, map_state, value_state,
+};
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDef;
 use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
+use crate::state::{ReadCachePolicy, StateType};
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor::block_on;
@@ -170,24 +172,29 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
     Ok(())
 }
 
-/// A descriptor that never calls `.read_cache(...)` falls back to the
-/// bundle-wide default TTL (`KeyedStateConfiguration::read_cache_ttl`,
-/// applied through `SharedDeps::with_default_read_cache_ttl`). Within that
-/// TTL the reader keeps serving the cached committed value even after the
-/// owner commits a newer one. When the bundle default is `None`, the
-/// descriptor stays uncached: the second read always sees the new commit.
+/// An inherited policy uses the bundle-wide default TTL. A disabled policy
+/// bypasses that default. Within an effective TTL the reader keeps serving the
+/// cached committed value after the owner commits a newer one.
 ///
-/// Falsify: drop the `.or(deps.default_read_cache_ttl())` resolution in the
-/// reader's constructor. Then the cached arm never engages, and the first
-/// case's second read sees `2` instead of `1`.
+/// Falsify: resolve [`ReadCachePolicy::Disabled`] to the bundle default. The
+/// disabled case then returns the cached `1` instead of the new commit.
 #[tokio::test]
-async fn bundle_default_read_cache_ttl_applies_when_descriptor_is_silent() -> Result<()> {
-    for (default_ttl, expected_second_read) in [
-        (Some(Duration::from_mins(5)), Value::from(1i64)),
-        (None, Value::from(2i64)),
+async fn read_cache_policy_resolves_against_the_bundle_default() -> Result<()> {
+    for (policy, default_ttl, expected_second_read) in [
+        (
+            ReadCachePolicy::Inherit,
+            Some(Duration::from_mins(5)),
+            Value::from(1i64),
+        ),
+        (
+            ReadCachePolicy::Disabled,
+            Some(Duration::from_mins(5)),
+            Value::from(2i64),
+        ),
+        (ReadCachePolicy::Inherit, None, Value::from(2i64)),
     ] {
         let harness = MemoryHarness::new();
-        let descriptor = value_state::<JsonCodec>("v-bundle-ttl");
+        let descriptor = value_state::<JsonCodec>("v-bundle-ttl").read_cache(policy);
         let name = state_name("v-bundle-ttl")?;
         let sub = subsystem()?;
         let tp = topic("orders");
@@ -248,19 +255,19 @@ async fn bundle_default_read_cache_ttl_applies_when_descriptor_is_silent() -> Re
         assert_eq!(
             reader.get(key).await?,
             Some(expected_second_read),
-            "second read under bundle default {default_ttl:?}"
+            "second read under {policy:?} with bundle default {default_ttl:?}"
         );
     }
     Ok(())
 }
 
 /// A bundle default that truncates to zero milliseconds fails reader
-/// construction exactly like a descriptor-set TTL would. The reader
-/// validates the *resolved* policy, not just the descriptor's own setting,
+/// construction exactly like an explicit collection TTL would. The reader
+/// validates the resolved policy, not just the collection's own setting,
 /// so a degenerate default read from configuration cannot slip through.
 ///
 /// Falsify: move the TTL validation before the bundle-default resolution.
-/// The descriptor is silent, so it validates `None` and the reader
+/// The collection inherits, so it validates `None` and the reader
 /// constructs instead of rejecting.
 #[tokio::test]
 async fn zero_ms_bundle_default_is_rejected_at_reader_construction() -> Result<()> {

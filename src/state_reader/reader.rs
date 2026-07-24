@@ -26,12 +26,11 @@ use crate::state::descriptor::{
 use crate::state::descriptor_identity::{self, DurableDescriptorIdentity};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state::publication::StatePublication;
-use crate::state::registry::CollectionDef;
 use crate::state_reader::cache::{ReaderCache, ReaderClock};
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::loader::ReaderLoader;
-use crate::state_reader::session::ReadSession;
+use crate::state_reader::session::{ReadSession, ReaderCollectionDef};
 use crate::state_reader::source::{
     MAX_PUBLICATION_SOURCES, Source, SourceId, ValidatedPublications,
 };
@@ -99,7 +98,7 @@ pub struct StateReader<D, C: Codec> {
     descriptor: D,
     subsystem: SubsystemName,
     name: StateName,
-    def: CollectionDef,
+    def: ReaderCollectionDef,
     stores: ReaderStores,
     loader: Arc<ReaderLoader<C>>,
     cache: ReaderCache,
@@ -122,13 +121,12 @@ where
     ///
     /// The heavy handles (backend stores, message loader, byte-budgeted cache)
     /// are cloned from `deps`, so composing one bundle and building several
-    /// readers shares one session and cache. The descriptor's read-cache TTL
-    /// and its collection name are validated here — the two
-    /// construction-time failures.
+    /// readers shares one session and cache. The effective read-cache TTL and
+    /// collection name are validated here.
     ///
     /// # Errors
     ///
-    /// Returns [`StateReaderError::InvalidReadCache`] when the descriptor's
+    /// Returns [`StateReaderError::InvalidReadCache`] when the effective
     /// read-cache TTL is degenerate (zero or sub-millisecond), or
     /// [`StateReaderError::Unsupported`] when the collection name is empty.
     pub fn new(
@@ -147,13 +145,10 @@ where
         descriptor: D,
         refresh_interval_ms: u64,
     ) -> Result<Self, StateReaderError> {
-        let mut def = descriptor.collection_def();
-        // Descriptor-explicit read-cache TTL wins; the bundle-wide default
-        // (`KeyedStateConfiguration::read_cache_ttl` fed through the deps)
-        // fills in only when the descriptor is silent. The resolved value is
-        // validated, so a degenerate env-sourced default fails here too.
-        def.read_cache_ttl = def.read_cache_ttl.or(deps.default_read_cache_ttl());
-        validate_read_cache(def.read_cache_ttl)?;
+        let collection = descriptor.collection_def();
+        let read_cache_ttl = collection.read_cache.resolve(deps.default_read_cache_ttl());
+        validate_read_cache(read_cache_ttl)?;
+        let def = ReaderCollectionDef::new(collection, read_cache_ttl);
         let name =
             StateName::try_new(descriptor.name()).map_err(|_| StateReaderError::Unsupported {
                 reason: "collection name is empty",

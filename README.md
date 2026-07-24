@@ -192,9 +192,8 @@ Any other service reads it through the same high-level client, naming the
 subsystem and the same collection shape:
 
 ```rust,ignore
-// `.read_cache` is the read-only client's cache policy — how long this reader
-// may serve a value from cache before re-reading the store. It is unrelated to
-// the owner's `.ttl` (durable retention) and inert on the owning consumer.
+// `.read_cache` overrides the read-only client's inherited cache policy. It is
+// unrelated to the owner's `.ttl` and inert on the owning consumer.
 let cart = value_state("cart").read_cache(Duration::from_secs(5));
 let reader = client.state(SubsystemName::try_new("carts")?, cart).await?;
 let cart = reader.get("user-1").await?; // committed value from the owning group
@@ -205,16 +204,17 @@ the reader's own writes — read from a single publication source per operation.
 Reads are cached for 5 seconds by default. Override the default per process
 with `PROSODY_STATE_READ_CACHE_TTL` (`none` disables caching), or per
 collection with `.read_cache(...)`, which always wins over the process
-default. A cached value was the store's committed answer within the last cache
-TTL. There is no ordering guarantee across sources. The two TTLs never
-interact: `.ttl` bounds how long the owner's written state is **retained**
-(Cassandra `USING TTL`, seconds granularity); `.read_cache` bounds how
-**stale** this read-only client tolerates a cached value (sub-second
-`Duration`s are fine). A process with no consumer of its own can build a
-reader directly from a `SharedDeps` bundle (`SharedDeps::connect` +
-`StateReader::new`); the high-level client shares one
-bundle across its consumer and all readers, so composing a reader never opens a
-second Cassandra session, Kafka loader, or cache.
+default. Pass `ReadCachePolicy::Disabled` to `.read_cache(...)` when one
+collection must always read the store despite an enabled process default. A
+cached value was the store's committed answer within the last cache TTL. There
+is no ordering guarantee across sources. The two TTLs never interact: `.ttl`
+bounds how long the owner's written state is **retained** (Cassandra `USING
+TTL`, seconds granularity); `.read_cache` bounds how **stale** this read-only
+client tolerates a cached value (sub-second `Duration`s are fine). A process
+with no consumer of its own can build a reader directly from a `SharedDeps`
+bundle (`SharedDeps::connect` + `StateReader::new`); the high-level client
+shares one bundle across its consumer and all readers, so composing a reader
+never opens a second Cassandra session, Kafka loader, or cache.
 
 **Retiring a published collection.** To stop publishing, flip the collection to
 `.published(false)` but keep its registration and the consumer's `subsystem` for

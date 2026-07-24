@@ -77,6 +77,40 @@ pub enum StateVisibility {
     Published,
 }
 
+/// How a standalone reader caches this collection's committed cells.
+///
+/// The client supplies the inherited TTL. A collection can accept that
+/// default, disable caching, or replace it with its own TTL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadCachePolicy {
+    /// Use the reader client's default policy.
+    #[default]
+    Inherit,
+
+    /// Read the durable store on every operation.
+    Disabled,
+
+    /// Cache reads for this duration.
+    Ttl(Duration),
+}
+
+impl From<Duration> for ReadCachePolicy {
+    fn from(ttl: Duration) -> Self {
+        Self::Ttl(ttl)
+    }
+}
+
+impl ReadCachePolicy {
+    /// Resolves this collection policy against the reader client's default.
+    pub(crate) fn resolve(self, inherited: Option<Duration>) -> Option<Duration> {
+        match self {
+            Self::Inherit => inherited,
+            Self::Disabled => None,
+            Self::Ttl(ttl) => Some(ttl),
+        }
+    }
+}
+
 /// Operational per-collection settings.
 ///
 /// Carries the collection's operational settings: TTL, [`CommitMode`],
@@ -149,15 +183,13 @@ pub struct CollectionDef {
     /// ([`RegisterStateError::PublishedWithoutSubsystem`]).
     pub visibility: StateVisibility,
 
-    /// The read-only client's cache TTL: how long a `StateReader` may serve
-    /// this collection's reads from its cache before re-reading the store.
-    /// `None` (the default) means every read hits the durable store.
-    /// Runtime-only, like [`StateVisibility`]. The reader consumes it from its
-    /// own descriptor; it is inert on the owning consumer and unrelated to the
-    /// durable write [`ttl`](Self::ttl). Sub-second TTLs are supported. A TTL
-    /// that truncates to zero milliseconds is rejected at reader construction,
-    /// where the policy is consumed.
-    pub read_cache_ttl: Option<Duration>,
+    /// The read-only client's cache policy.
+    ///
+    /// The default inherits the reader client's TTL. The reader consumes this
+    /// from its own descriptor.
+    /// Runtime-only, like [`StateVisibility`]. It is inert on the owning
+    /// consumer and unrelated to the durable write [`ttl`](Self::ttl).
+    pub read_cache: ReadCachePolicy,
 }
 
 impl CollectionDef {
@@ -173,7 +205,7 @@ impl CollectionDef {
             keyset_limit: DEFAULT_KEYSET_LIMIT,
             capacity: None,
             visibility: StateVisibility::default(),
-            read_cache_ttl: None,
+            read_cache: ReadCachePolicy::default(),
         }
     }
 }

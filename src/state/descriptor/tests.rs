@@ -462,16 +462,24 @@ fn keyset_limit_threads_into_the_collection_def() {
     assert_eq!(descriptor.keyset_limit(7).collection_def().keyset_limit, 7);
 }
 
-/// `.published(bool)` and `.read_cache(..)` thread into the collection def like
-/// the other fluent setters. `.published` is also reversible: a later call can
-/// flip visibility back to `Private`.
+/// `.published(bool)` and every read-cache policy thread into the collection
+/// def. `.published` is also reversible.
 #[test]
 fn visibility_and_read_cache_thread_into_the_collection_def() {
+    use crate::state::ReadCachePolicy;
     use std::time::Duration;
+
     let ttl = Duration::from_secs(30);
     let def = cart().published(true).read_cache(ttl).collection_def();
     assert_eq!(def.visibility, StateVisibility::Published);
-    assert_eq!(def.read_cache_ttl, Some(ttl));
+    assert_eq!(def.read_cache, ReadCachePolicy::Ttl(ttl));
+    assert_eq!(
+        cart()
+            .read_cache(ReadCachePolicy::Disabled)
+            .collection_def()
+            .read_cache,
+        ReadCachePolicy::Disabled,
+    );
     assert_eq!(
         cart()
             .published(true)
