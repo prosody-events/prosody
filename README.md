@@ -195,7 +195,7 @@ subsystem and the same collection shape:
 // `.read_cache` is the read-only client's cache policy — how long this reader
 // may serve a value from cache before re-reading the store. It is unrelated to
 // the owner's `.ttl` (durable retention) and inert on the owning consumer.
-let cart = value_state("cart").read_cache(ReadCache::Cached { ttl: Duration::from_secs(5) });
+let cart = value_state("cart").read_cache(Duration::from_secs(5));
 let reader = client.state(SubsystemName::try_new("carts")?, cart).await?;
 let cart = reader.get("user-1").await?; // committed value from the owning group
 ```

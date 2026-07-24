@@ -78,43 +78,6 @@ pub enum StateVisibility {
     Published,
 }
 
-/// A published collection's cache policy in the **read-only client** — how
-/// long a `StateReader` may serve a value from its cache before re-reading
-/// the store. Runtime-only, like [`StateVisibility`], and consumed solely by
-/// the reader; on the owning consumer it is inert and never affects writes or
-/// the durable write TTL. Sub-second TTLs are supported ([`Duration`]);
-/// a TTL that truncates to zero milliseconds is rejected at reader
-/// construction. The byte budget is not here — a single bundle-wide budget on
-/// the reader's shared deps bounds every cache; this only declares whether a
-/// collection is cached and its entry TTL.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReadCache {
-    /// Every read hits the durable store (the default).
-    #[default]
-    Uncached,
-
-    /// Cache read values for `ttl`. Validated at reader acquisition (a later
-    /// slice), where it is consumed — not at registration.
-    Cached {
-        /// How long a cached read value stays fresh.
-        ttl: Duration,
-    },
-}
-
-impl ReadCache {
-    /// The fresh-window TTL for cached reads, or `None` when uncached.
-    ///
-    /// The accessor the standalone reader consumes so its read path selects a
-    /// cache policy without naming the owner's `Cached` cell-cache wrapper.
-    #[must_use]
-    pub(crate) fn ttl(&self) -> Option<Duration> {
-        match self {
-            Self::Uncached => None,
-            Self::Cached { ttl } => Some(*ttl),
-        }
-    }
-}
-
 /// Operational per-collection settings.
 ///
 /// Carries the collection's per-write operational settings — TTL,
@@ -189,10 +152,15 @@ pub struct CollectionDef {
     /// ([`RegisterStateError::PublishedWithoutSubsystem`]).
     pub visibility: StateVisibility,
 
-    /// Read-side cache policy for cross-group readers. Runtime-only; see
-    /// [`ReadCache`]. Consumed by the reader (a later slice), inert on the
-    /// owning consumer.
-    pub read_cache: ReadCache,
+    /// The read-only client's cache TTL: how long a `StateReader` may serve
+    /// this collection's reads from its cache before re-reading the store.
+    /// `None` (the default) means every read hits the durable store.
+    /// Runtime-only, like [`StateVisibility`], and consumed solely by the
+    /// reader from its own descriptor — inert on the owning consumer, and
+    /// unrelated to the durable write [`ttl`](Self::ttl). Sub-second TTLs are
+    /// supported; a TTL that truncates to zero milliseconds is rejected at
+    /// reader construction, where the policy is consumed.
+    pub read_cache_ttl: Option<Duration>,
 }
 
 impl CollectionDef {
@@ -208,7 +176,7 @@ impl CollectionDef {
             keyset_limit: DEFAULT_KEYSET_LIMIT,
             capacity: None,
             visibility: StateVisibility::default(),
-            read_cache: ReadCache::default(),
+            read_cache_ttl: None,
         }
     }
 }

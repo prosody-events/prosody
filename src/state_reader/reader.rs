@@ -26,7 +26,7 @@ use crate::state::descriptor::{
 use crate::state::descriptor_identity::{self, DurableDescriptorIdentity};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state::publication::StatePublication;
-use crate::state::registry::{CollectionDef, ReadCache};
+use crate::state::registry::CollectionDef;
 use crate::state_reader::cache::{ReaderCache, ReaderClock};
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::error::StateReaderError;
@@ -41,6 +41,7 @@ use futures::stream::{self, Stream, StreamExt};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::coop::cooperative;
 use tracing::warn;
@@ -83,7 +84,7 @@ struct Admission {
 /// Built from a [`SharedDeps`] bundle with [`StateReader::new`]. Reads observe
 /// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
 /// of one source per operation, with honest bounded staleness. The descriptor's
-/// [`ReadCache`] TTL bounds one staleness source (a cached value's age); a
+/// read-cache TTL bounds one staleness source (a cached value's age); a
 /// second, independent source is the owner's commit→apply window — a
 /// once-committed value read before the owner applies a committed-yet-unapplied
 /// change (see `project_committed` above), which converges via the owner's
@@ -119,8 +120,8 @@ where
     ///
     /// The heavy handles (backend stores, message loader, byte-budgeted cache)
     /// are cloned from `deps`, so composing one bundle and minting several
-    /// readers shares one session and cache. The descriptor's [`ReadCache`]
-    /// policy and its collection name are validated here — the two
+    /// readers shares one session and cache. The descriptor's read-cache TTL
+    /// and its collection name are validated here — the two
     /// construction-time failures.
     ///
     /// # Errors
@@ -145,7 +146,7 @@ where
         refresh_interval_ms: u64,
     ) -> Result<Self, StateReaderError> {
         let def = descriptor.collection_def();
-        validate_read_cache(def.read_cache)?;
+        validate_read_cache(def.read_cache_ttl)?;
         let name =
             StateName::try_new(descriptor.name()).map_err(|_| StateReaderError::Unsupported {
                 reason: "collection name is empty",
@@ -424,8 +425,8 @@ where
 /// Rejects a degenerate read-cache TTL. A cache policy whose TTL truncates
 /// to zero milliseconds would make every entry born stale, so it fails
 /// `Permanent` at construction.
-fn validate_read_cache(read_cache: ReadCache) -> Result<(), StateReaderError> {
-    if let Some(ttl) = read_cache.ttl()
+fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
+    if let Some(ttl) = ttl
         && ttl.as_millis() == 0
     {
         return Err(StateReaderError::InvalidReadCache {

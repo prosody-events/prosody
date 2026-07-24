@@ -153,7 +153,7 @@ impl<C: Codec> ReadSession<C> {
         source: &Source,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        match self.def.read_cache.ttl() {
+        match self.def.read_cache_ttl {
             None => {
                 let id = self.collection_id_for(source)?;
                 self.stores.read_committed(&id, cell).await
@@ -181,7 +181,7 @@ impl<C: Codec> ReadSession<C> {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        match self.def.read_cache.ttl() {
+        match self.def.read_cache_ttl {
             None => {
                 let id = self.collection_id_for(source)?;
                 self.stores.read_committed_many(&id, section, batch).await
