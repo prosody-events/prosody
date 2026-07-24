@@ -192,19 +192,35 @@ Any other service reads it through the same high-level client, naming the
 subsystem and the same collection shape:
 
 ```rust,ignore
-let reader = client.state(SubsystemName::try_new("carts")?, value_state("cart")).await?;
+// `.read_cache` is the read-only client's cache policy — how long this reader
+// may serve a value from cache before re-reading the store. It is unrelated to
+// the owner's `.ttl` (durable retention) and inert on the owning consumer.
+let cart = value_state("cart").read_cache(ReadCache::Cached { ttl: Duration::from_secs(5) });
+let reader = client.state(SubsystemName::try_new("carts")?, cart).await?;
 let cart = reader.get("user-1").await?; // committed value from the owning group
 ```
 
 A reader observes only **committed** state — never an in-flight value and never
 the reader's own writes — read from a single publication source per operation.
-Reads are served through a time-bounded (TTL) cache, so a returned value was the
-store's committed answer within the last refresh interval; there is no ordering
-guarantee across sources. A process with no consumer of its own can build a
+By default every read hits the durable store; a reader opts a collection into
+its cache with `.read_cache`, after which a returned value was the store's
+committed answer within the last cache TTL. There is no ordering guarantee
+across sources. The two TTLs never interact: `.ttl` bounds how long the owner's
+written state is **retained** (Cassandra `USING TTL`, seconds granularity);
+`.read_cache` bounds how **stale** this read-only client tolerates a cached
+value (sub-second `Duration`s are fine). A process with no consumer of its own can build a
 reader directly from a `SharedDeps` bundle (`SharedDeps::connect` +
 `StateReader::new`); the high-level client shares one
 bundle across its consumer and all readers, so composing a reader never opens a
 second Cassandra session, Kafka loader, or cache.
+
+**Retiring a published collection.** To stop publishing, flip the collection to
+`.published(false)` but keep its registration and the consumer's `subsystem` for
+one full stop-then-start deploy. Startup reconciliation removes the routing row
+only for a still-registered, private, subsystem-configured collection, so that
+deploy is what withdraws it. Deleting the registration (or dropping the
+`subsystem`) outright strands the routing row: with no TTL it — and the
+collection's committed state — stay cross-group-discoverable indefinitely.
 
 ## Quality of Service
 

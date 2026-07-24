@@ -433,8 +433,13 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     #[must_use]
     fn with_collection_def(self, def: CollectionDef) -> Self;
 
-    /// Sets the collection's TTL (the per-write Cassandra `USING TTL`),
-    /// validated against the ceiling and the recovery delay at registration.
+    /// Sets the collection's **durable write TTL** — the per-write Cassandra
+    /// `USING TTL` bounding how long stored state is retained — validated
+    /// against the ceiling and the recovery delay at registration. Seconds
+    /// granularity ([`CompactDuration`]), matching what Cassandra can store.
+    ///
+    /// This governs retention only, never read freshness: the read-only
+    /// client's cache TTL is the separate [`Self::read_cache`] policy.
     #[must_use]
     fn ttl(self, ttl: CompactDuration) -> Self {
         let mut def = self.collection_def();
@@ -479,8 +484,14 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
         self.with_collection_def(def)
     }
 
-    /// Sets the collection's read-side cache policy for cross-group readers.
-    /// Inert on the owning consumer; consumed by the reader.
+    /// Sets the **read-only client's cache policy**: how long a
+    /// [`StateReader`](crate::state_reader::StateReader) may serve this
+    /// collection's reads from its cache before re-reading the store.
+    ///
+    /// Applies only in the read-only client, which consumes it from the
+    /// descriptor *the reader itself* passes to `StateReader::new` /
+    /// `client.state`. On the owning consumer it is inert: it never affects
+    /// writes, owner reads, or the durable retention set by [`Self::ttl`].
     #[must_use]
     fn read_cache(self, read_cache: ReadCache) -> Self {
         let mut def = self.collection_def();

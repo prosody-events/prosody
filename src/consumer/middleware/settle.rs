@@ -210,10 +210,15 @@ pub(super) enum ArmOutcome {
 /// (invariant 8): a `Published` collection's committed state is undiscoverable
 /// by a cross-group reader until its routing row exists, so the row must
 /// precede the stage. [`publish_first_writes`] therefore retries **every**
-/// non-shutdown failure — transient, terminal, *and* permanent — forever; the
-/// unconditional (blind) idempotent upsert makes a poisoning `Permanent`
-/// unreachable, so retrying is
-/// the correct posture ("durable state with no row is unwritable"). The only
+/// non-shutdown failure — transient, terminal, *and* permanent — forever, the
+/// same posture as `arm_backstop`.
+///
+/// A `Permanent` is reachable here, not unwritable: a dropped or misconfigured
+/// publication table surfaces `CassandraPublicationError::Database`, which
+/// classifies `Permanent`. Because the barrier retries even that forever, such
+/// a schema-level fault wedges dispatch until an operator repairs the schema.
+/// That wedge is the accepted tradeoff — strictly preferable to committing a
+/// collection's published state with no routing row to advertise it. The only
 /// non-`Published` outcome is a shutdown, which abandons before anything
 /// stages.
 enum PublishOutcome {

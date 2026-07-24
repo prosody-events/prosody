@@ -243,7 +243,7 @@ async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     drop(guard);
 
     assert!(
-        events.contains("keyed-state publication partition count mismatch"),
+        events.contains("keyed-state publication partition count changed"),
         "the mismatch tripwire must fire an error-level event when the stored count disagrees \
          with the live count"
     );

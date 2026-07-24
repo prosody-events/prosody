@@ -78,10 +78,15 @@ pub enum StateVisibility {
     Published,
 }
 
-/// A published collection's read-side cache policy. Runtime-only, like
-/// [`StateVisibility`]. The byte budget is not here — a single bundle-wide
-/// budget on the reader's shared deps bounds every cache; this only declares
-/// whether a collection is cached and its entry TTL.
+/// A published collection's cache policy in the **read-only client** — how
+/// long a `StateReader` may serve a value from its cache before re-reading
+/// the store. Runtime-only, like [`StateVisibility`], and consumed solely by
+/// the reader; on the owning consumer it is inert and never affects writes or
+/// the durable write TTL. Sub-second TTLs are supported ([`Duration`]);
+/// a TTL that truncates to zero milliseconds is rejected at reader
+/// construction. The byte budget is not here — a single bundle-wide budget on
+/// the reader's shared deps bounds every cache; this only declares whether a
+/// collection is cached and its entry TTL.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadCache {
     /// Every read hits the durable store (the default).
@@ -281,6 +286,16 @@ impl CollectionDefRegistry {
                 name,
                 limit: def.keyset_limit,
             });
+        }
+        // Publication routing rows are keyed `(subsystem, name)` with no
+        // `state_type`, and the reader routes cells under a hardcoded
+        // `StateType::Application`. A `Published` collection under any other
+        // state type would strand its cells under a namespace no reader
+        // addresses, so it is rejected here — the single choke point every
+        // registration funnels through. Only `Application` exists in production;
+        // this enforces the assumption the reconciliation sweep relies on.
+        if def.visibility == StateVisibility::Published && state_type != StateType::Application {
+            return Err(RegisterStateError::PublishedNonApplicationStateType { name });
         }
         let namespace = self.defs.entry(state_type).or_default();
         match namespace.get(&name) {
@@ -514,10 +529,59 @@ pub enum RegisterStateError {
         /// The published collection lacking a subsystem.
         name: StateName,
     },
+
+    /// A collection declared `.published(true)` under a [`StateType`] other
+    /// than [`StateType::Application`]. Publication routing rows carry no
+    /// `state_type` and the reader addresses cells under `Application` only, so
+    /// publishing any other state type would strand its cells in an
+    /// unaddressable namespace. Rejected at registration.
+    #[error(
+        "published state collection {name:?} is not a StateType::Application collection; only \
+         Application collections may be published"
+    )]
+    PublishedNonApplicationStateType {
+        /// The published collection under a non-Application state type.
+        name: StateName,
+    },
 }
 
 impl ClassifyError for RegisterStateError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Permanent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CollectionDef, CollectionDefRegistry, RegisterStateError, StateVisibility};
+    use crate::codec::JsonCodec;
+    use crate::state::StateType;
+    use crate::state::descriptor::{DescriptorIdentity, value_state};
+    use color_eyre::eyre::Result;
+
+    /// A `Published` collection registered under a non-`Application` state type
+    /// is rejected at the single registration choke point: publication routing
+    /// rows carry no `state_type` and the reader addresses `Application` cells
+    /// only, so any other type would be unaddressable. Proven with the
+    /// `#[cfg(test)]` `Framework` state type; the `Application` arm shows the
+    /// guard is state-type specific, not a blanket published ban.
+    #[test]
+    fn published_non_application_state_type_rejected() -> Result<()> {
+        let identity = value_state::<JsonCodec>("cart").structural_identity();
+        let mut def = CollectionDef::new(None);
+        def.visibility = StateVisibility::Published;
+
+        let mut registry = CollectionDefRegistry::default();
+        registry.register_identity(StateType::Application, "cart", identity.clone(), def)?;
+
+        let result = registry.register_identity(StateType::Framework, "cart", identity, def);
+        assert!(
+            matches!(
+                result,
+                Err(RegisterStateError::PublishedNonApplicationStateType { .. })
+            ),
+            "expected PublishedNonApplicationStateType, got {result:?}"
+        );
+        Ok(())
     }
 }
