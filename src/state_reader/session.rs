@@ -188,7 +188,7 @@ impl<C: Codec> ReadSession<C> {
             }
             Some(ttl) => {
                 let ttl_ms = ttl.as_millis() as u64;
-                let keys: Vec<CacheKey> = batch
+                let keys: CellBuffer<CacheKey> = batch
                     .iter()
                     .map(|coordinate| {
                         self.cache_key(
@@ -202,17 +202,12 @@ impl<C: Codec> ReadSession<C> {
                     .collect();
                 // `collection_id_for` runs only when the batch fill fires (a
                 // miss), never when the batch is served entirely from the cache.
-                let values = self
-                    .cache
+                self.cache
                     .get_many_cached(&keys, ttl_ms, || async {
                         let id = self.collection_id_for(source)?;
-                        self.stores
-                            .read_committed_many(&id, section, batch)
-                            .await
-                            .map(|buffer| buffer.into_iter().collect::<Vec<_>>())
+                        self.stores.read_committed_many(&id, section, batch).await
                     })
-                    .await?;
-                Ok(values.into_iter().collect())
+                    .await
             }
         }
     }

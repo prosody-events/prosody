@@ -26,6 +26,7 @@ use crate::error::ErrorCategory;
 use crate::state::StateName;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::CellKey;
+use crate::state::store::CellBuffer;
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
 use quick_cache::Weighter;
@@ -251,12 +252,12 @@ impl ReaderCache {
         keys: &[CacheKey],
         ttl_ms: u64,
         fill: F,
-    ) -> Result<Vec<Option<Bytes>>, StateAccessError>
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Vec<Option<Bytes>>, StateAccessError>>,
+        Fut: Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>>,
     {
-        let mut hits: Vec<Option<Bytes>> = Vec::with_capacity(keys.len());
+        let mut hits: CellBuffer<Option<Bytes>> = CellBuffer::with_capacity(keys.len());
         for key in keys {
             match self.inner.get(key) {
                 Some((stamp, value)) if self.fresh(stamp, ttl_ms) => hits.push(value),

@@ -531,23 +531,36 @@ where
     /// Streams the committed live entries of the map under partition `key` in
     /// key order (ascending for [`Direction::Forward`]).
     ///
-    /// The returned stream owns the per-operation session, so every chunk
-    /// addresses the one pinned source.
-    pub fn stream<K: Into<Key>>(
+    /// The session is acquired up front and moved into the stream, so the
+    /// returned stream is self-contained (owns its handles) and a binding can
+    /// hold it beyond the reader's borrow.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`] from acquiring the session (empty key,
+    /// acquisition/identity failures); per-source read failures surface as
+    /// stream items.
+    pub async fn stream<K: Into<Key>>(
         &self,
         key: K,
         dir: Direction,
-    ) -> impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + '_ {
-        let key = key.into();
-        async_stream::try_stream! {
-            let session = self.session(key).await?;
-            let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+    ) -> Result<
+        impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
+        StateReaderError,
+    >
+    where
+        V: 'static,
+        ResolvedOf<V>: 'static,
+    {
+        let session = self.session(key.into()).await?;
+        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        Ok(async_stream::try_stream! {
             let inner = handle.stream(dir);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
             }
-        }
+        })
     }
 }
 
@@ -593,23 +606,36 @@ where
     /// Streams the committed live elements under partition `key` in index order
     /// (front to back for [`Direction::Forward`]).
     ///
-    /// The returned stream owns the per-operation session, so every chunk
-    /// addresses the one pinned source.
-    pub fn stream<K: Into<Key>>(
+    /// The session is acquired up front and moved into the stream, so the
+    /// returned stream is self-contained (owns its handles) and a binding can
+    /// hold it beyond the reader's borrow.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`] from acquiring the session (empty key,
+    /// acquisition/identity failures); per-source read failures surface as
+    /// stream items.
+    pub async fn stream<K: Into<Key>>(
         &self,
         key: K,
         dir: Direction,
-    ) -> impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + '_ {
-        let key = key.into();
-        async_stream::try_stream! {
-            let session = self.session(key).await?;
-            let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+    ) -> Result<
+        impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + 'static,
+        StateReaderError,
+    >
+    where
+        T: 'static,
+        ResolvedOf<T>: 'static,
+    {
+        let session = self.session(key.into()).await?;
+        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        Ok(async_stream::try_stream! {
             let inner = handle.stream(dir);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
             }
-        }
+        })
     }
 }
 
