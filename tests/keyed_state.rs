@@ -483,8 +483,13 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
 
     let (observations_tx, mut observations_rx) = channel(10);
 
-    // `cart` is published under a subsystem; `last_seen` stays private.
-    let subsystem = SubsystemName::try_new("orders").map_err(|e| eyre!("subsystem: {e}"))?;
+    // `cart` is published under a subsystem; `last_seen` stays private. The
+    // subsystem is minted fresh per run: the publication table is keyed by
+    // `(subsystem, name)` and the reader discovers every group that published
+    // under it, so a fixed name would accumulate one source row per run against
+    // the shared keyspace and eventually breach `MAX_PUBLICATION_SOURCES`.
+    let subsystem = SubsystemName::try_new(format!("orders-{}", Uuid::new_v4()))
+        .map_err(|e| eyre!("subsystem: {e}"))?;
     let mut keyed_state = KeyedStateConfiguration::default();
     keyed_state.subsystem = Some(subsystem.clone());
     let cart = keyed_state.register(cart().published(true));
