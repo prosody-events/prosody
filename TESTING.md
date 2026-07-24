@@ -94,6 +94,19 @@ banned:
 When you write or convert a test, spot-check it: break the invariant once
 (inject an `Err`, bypass the guard), confirm the test fails, then revert.
 
+## No compile-fail tests
+
+Never write a test whose purpose is to prove that code **fails to compile** —
+no compile-fail fixtures, no `tests/compile_fail/*.rs` paired with a `.stderr`
+snapshot. A type-level "cannot" guarantee — a reader handle cannot mutate, a
+sealed trait cannot be implemented downstream, a constructor is crate-private —
+is enforced by the *absence* of the API surface. It is evident from the design,
+and once stated as an invariant at the type that owns it, no test re-establishes
+it. Such fixtures also rot: the expected `.stderr` is a snapshot of one
+compiler's diagnostic text, so a routine toolchain or dependency bump reds the
+suite for a reason unrelated to the invariant. State the guarantee in a doc
+comment on the owning type and let the compiler be the enforcement.
+
 ## Deleting and folding tests
 
 Delete a test only when a **named** surviving test provably covers the same

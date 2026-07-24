@@ -631,10 +631,10 @@ fn collection_ops_export_operation_spans() -> Result<()> {
     Ok(())
 }
 
-/// Behavioral arm of the `CollectionScopeContainment` invariant. The
-/// *discriminating* proof is the trybuild compile-fail golden
-/// (`tests/compile_fail/cellview_scope_is_pinned.rs`); this pins the runtime
-/// behavior the type-level proof pairs with.
+/// Behavioral arm of the `CollectionScopeContainment` invariant. The type-level
+/// guarantee — a view pinned to one collection cannot address another — is
+/// enforced structurally by the API's lifetimes and bounds; this test pins the
+/// runtime behavior that guarantee pairs with.
 mod scope_containment {
     use super::*;
     use crate::state::order_codec::Utf8KeyCodec;
