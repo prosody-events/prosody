@@ -136,24 +136,26 @@ impl ReaderStores {
         }
     }
 
-    /// Reads all published sources of `(subsystem, name)` — one partition read.
+    /// Reads all published sources of `(subsystem, state_type, name)` — one
+    /// partition read.
     pub(crate) async fn read_publications(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> Result<Vec<StatePublication>, StateReaderError> {
         match self {
             Self::Cassandra { publications, .. } => publications
-                .read_publications(subsystem, name)
+                .read_publications(subsystem, state_type, name)
                 .await
                 .map_err(|e| StateReaderError::store(&e)),
             Self::Memory { publications, .. } => publications
-                .read_publications(subsystem, name)
+                .read_publications(subsystem, state_type, name)
                 .await
                 .map_err(|e| StateReaderError::store(&e)),
             #[cfg(test)]
             Self::Scripted { publications, .. } => publications
-                .read_publications(subsystem, name)
+                .read_publications(subsystem, state_type, name)
                 .await
                 .map_err(|e| StateReaderError::store(&e)),
         }

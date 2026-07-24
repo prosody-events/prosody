@@ -71,6 +71,10 @@ pub struct SharedDeps<C: Codec> {
     cache: ReaderCache,
     partition_counts: PartitionCounts,
     heartbeats: HeartbeatRegistry,
+    /// Bundle-wide default read-cache TTL for readers whose descriptor does
+    /// not set `.read_cache(...)`; the composing client feeds
+    /// `KeyedStateConfiguration::read_cache_ttl` through here.
+    default_read_cache_ttl: Option<Duration>,
     #[cfg(test)]
     instance_id: u64,
 }
@@ -83,6 +87,7 @@ impl<C: Codec> Clone for SharedDeps<C> {
             cache: self.cache.clone(),
             partition_counts: self.partition_counts.clone(),
             heartbeats: self.heartbeats.clone(),
+            default_read_cache_ttl: self.default_read_cache_ttl,
             #[cfg(test)]
             instance_id: self.instance_id,
         }
@@ -116,6 +121,7 @@ impl<C: Codec> SharedDeps<C> {
             cache: ReaderCache::with_budget(budget),
             partition_counts: PartitionCounts::Memory(PartitionCount::MOCK),
             heartbeats: HeartbeatRegistry::new(group_id, stall_threshold),
+            default_read_cache_ttl: None,
             #[cfg(test)]
             instance_id: next_instance_id(),
         }
@@ -185,9 +191,21 @@ impl<C: Codec> SharedDeps<C> {
                 bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
             },
             heartbeats,
+            default_read_cache_ttl: None,
             #[cfg(test)]
             instance_id: next_instance_id(),
         })
+    }
+
+    /// Returns this bundle with `ttl` as its default read-cache TTL, applied
+    /// to readers whose descriptor does not set `.read_cache(...)` explicitly
+    /// (an explicit descriptor TTL always wins). The composing client feeds
+    /// `KeyedStateConfiguration::read_cache_ttl` through here; `None` leaves
+    /// descriptor-silent collections uncached.
+    #[must_use]
+    pub fn with_default_read_cache_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.default_read_cache_ttl = ttl;
+        self
     }
 
     /// A bundle over arbitrary reader stores, loader, and cache — the seam the
@@ -206,6 +224,7 @@ impl<C: Codec> SharedDeps<C> {
             cache,
             partition_counts: PartitionCounts::Memory(PartitionCount::MOCK),
             heartbeats: HeartbeatRegistry::new("reader-test".to_owned(), Duration::from_secs(30)),
+            default_read_cache_ttl: None,
             instance_id: next_instance_id(),
         }
     }
@@ -228,6 +247,10 @@ impl<C: Codec> SharedDeps<C> {
 
     pub(crate) fn cache(&self) -> &ReaderCache {
         &self.cache
+    }
+
+    pub(crate) fn default_read_cache_ttl(&self) -> Option<Duration> {
+        self.default_read_cache_ttl
     }
 
     /// The bundle's heartbeat registry, cloned into the consumer so its stall
@@ -278,9 +301,9 @@ impl<C: Codec> SharedDeps<C> {
         }
     }
 
-    /// The bundle's Kafka loader (a `Clone` shares the client/poll thread), or
-    /// `None` for a memory bundle — an incoherent Cassandra consumer arm that
-    /// receives a memory bundle rejects on this `None`.
+    /// The bundle's Kafka loader, or `None` for a memory bundle. A `Clone`
+    /// shares the client and poll thread. A Cassandra consumer arm handed a
+    /// memory bundle rejects on this `None`.
     pub(crate) fn kafka_loader(&self) -> Option<KafkaLoader<C>>
     where
         C::Payload: Clone,

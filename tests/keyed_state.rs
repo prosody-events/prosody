@@ -37,12 +37,12 @@ use prosody::consumer::{
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::loader::KafkaLoader;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::state::StateName;
 use prosody::state::cassandra::{CassandraPublicationStore, PublicationQueries};
 use prosody::state::descriptor::{
     CellStateError, Registered, StateDescriptor, ValueDescriptor, value_state,
 };
 use prosody::state::publication::PublicationStore;
+use prosody::state::{StateName, StateType};
 use prosody::state_reader::{ReaderLoader, SharedDeps, StateReader};
 use prosody::subsystem::SubsystemName;
 use prosody::telemetry::Telemetry;
@@ -617,7 +617,7 @@ async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: To
     let publication_store = CassandraPublicationStore::new(store, queries);
     let name = StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?;
     let rows = publication_store
-        .read_publications(subsystem, &name)
+        .read_publications(subsystem, StateType::Application, &name)
         .await?;
     let own: Vec<_> = rows
         .into_iter()
@@ -645,7 +645,7 @@ async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: To
     let private = StateName::try_new(LAST_SEEN).map_err(|e| eyre!("name: {e}"))?;
     ensure!(
         publication_store
-            .read_publications(subsystem, &private)
+            .read_publications(subsystem, StateType::Application, &private)
             .await?
             .is_empty(),
         "a private collection must never write a routing row"

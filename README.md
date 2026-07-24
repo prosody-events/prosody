@@ -202,13 +202,15 @@ let cart = reader.get("user-1").await?; // committed value from the owning group
 
 A reader observes only **committed** state — never an in-flight value and never
 the reader's own writes — read from a single publication source per operation.
-By default every read hits the durable store; a reader opts a collection into
-its cache with `.read_cache`, after which a returned value was the store's
-committed answer within the last cache TTL. There is no ordering guarantee
-across sources. The two TTLs never interact: `.ttl` bounds how long the owner's
-written state is **retained** (Cassandra `USING TTL`, seconds granularity);
-`.read_cache` bounds how **stale** this read-only client tolerates a cached
-value (sub-second `Duration`s are fine). A process with no consumer of its own can build a
+Reads are cached for 5 seconds by default. Override the default per process
+with `PROSODY_STATE_READ_CACHE_TTL` (`none` disables caching), or per
+collection with `.read_cache(...)`, which always wins over the process
+default. A cached value was the store's committed answer within the last cache
+TTL. There is no ordering guarantee across sources. The two TTLs never
+interact: `.ttl` bounds how long the owner's written state is **retained**
+(Cassandra `USING TTL`, seconds granularity); `.read_cache` bounds how
+**stale** this read-only client tolerates a cached value (sub-second
+`Duration`s are fine). A process with no consumer of its own can build a
 reader directly from a `SharedDeps` bundle (`SharedDeps::connect` +
 `StateReader::new`); the high-level client shares one
 bundle across its consumer and all readers, so composing a reader never opens a

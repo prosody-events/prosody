@@ -82,6 +82,31 @@ fn zero_recovery_delay_is_rejected() -> Result<()> {
     Ok(())
 }
 
+/// A read-cache TTL that truncates to zero milliseconds is rejected — every
+/// cached entry would be born stale (the reader-construction check's config
+/// twin) — while a millisecond-or-larger TTL and the explicit `None` opt-out
+/// both validate.
+#[test]
+fn sub_millisecond_read_cache_ttl_is_rejected() -> Result<()> {
+    use std::time::Duration;
+    let degenerate = KeyedStateConfiguration::builder()
+        .read_cache_ttl(Some(Duration::from_micros(500)))
+        .build()?;
+    assert!(
+        degenerate.validate().is_err(),
+        "a sub-millisecond read_cache_ttl must fail validation"
+    );
+    let valid = KeyedStateConfiguration::builder()
+        .read_cache_ttl(Some(Duration::from_millis(1)))
+        .build()?;
+    valid.validate()?;
+    let disabled = KeyedStateConfiguration::builder()
+        .read_cache_ttl(None)
+        .build()?;
+    disabled.validate()?;
+    Ok(())
+}
+
 /// Indefinite retention (`None`) is always allowed — the TTL ceiling
 /// guards only oversized `Some` values, never the opt-out.
 #[test]

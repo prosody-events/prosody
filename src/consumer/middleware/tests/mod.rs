@@ -1057,7 +1057,9 @@ mod settle_publication {
         store.release();
         task.await.map_err(|e| eyre!("settle task: {e}"))?;
 
-        let rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        let rows = store
+            .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
+            .await;
         assert_eq!(rows.len(), 1, "the routing row landed");
         assert_eq!(
             i32::from(rows[0].partition_count),
@@ -1117,7 +1119,9 @@ mod settle_publication {
             .map_err(|_| eyre!("settle did not finish after the store healed"))?
             .map_err(|e| eyre!("settle task: {e}"))?;
 
-        let rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        let rows = store
+            .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
+            .await;
         assert_eq!(
             rows.len(),
             1,
@@ -1170,7 +1174,7 @@ mod settle_publication {
         );
         assert!(
             store
-                .rows(&subsystem()?, &cart_state_name()?)
+                .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
                 .await
                 .is_empty(),
             "no routing row is written on the shutdown-abandon path",
@@ -1206,7 +1210,9 @@ mod settle_publication {
         );
 
         let cart_id = CollectionId::new(state_key, StateType::Application, cart_state_name()?);
-        let rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        let rows = store
+            .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
+            .await;
         assert_eq!(rows.len(), 1, "commit() published a routing row");
         assert_eq!(i32::from(rows[0].partition_count), 3_i32);
         assert!(
@@ -1241,7 +1247,7 @@ mod settle_publication {
         );
         assert!(
             store
-                .rows(&subsystem()?, &cart_state_name()?)
+                .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
                 .await
                 .is_empty(),
             "no routing row when the failing store rejects the upsert",
@@ -1311,12 +1317,18 @@ mod settle_publication {
         );
         assert!(
             store
-                .rows(&subsystem()?, &wishlist_state_name()?)
+                .rows(
+                    &subsystem()?,
+                    StateType::Application,
+                    &wishlist_state_name()?
+                )
                 .await
                 .is_empty(),
             "no routing row for a published collection that never wrote",
         );
-        let cart_rows = store.rows(&subsystem()?, &cart_state_name()?).await;
+        let cart_rows = store
+            .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
+            .await;
         assert_eq!(
             cart_rows.len(),
             1,

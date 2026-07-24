@@ -8,7 +8,7 @@
 
 use crate::Topic;
 use crate::error::ClassifyError;
-use crate::state::StateName;
+use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
 use std::error::Error;
@@ -27,12 +27,16 @@ pub struct StatePublication {
     pub partition_count: PartitionCount,
 }
 
-/// Durable routing table over `((subsystem, name), group_id, topic)`.
+/// Durable routing table over `((subsystem, state_type, name), group_id,
+/// topic)`.
 ///
-/// A reader discovers a collection's sources by reading one `(subsystem, name)`
-/// partition; a publisher advertises a source with an idempotent [`upsert`] and
-/// withdraws it with [`remove`], the named removal path (the memory store's RAM
-/// bound). No LWT, no TTL — a source row is plain routing data.
+/// A reader discovers a collection's sources by reading one
+/// `(subsystem, state_type, name)` partition; a publisher advertises a source
+/// with an idempotent [`upsert`] and withdraws it with [`remove`], the named
+/// removal path (the memory store's RAM bound). No LWT, no TTL — a source row
+/// is plain routing data. The `state_type` in the address namespaces
+/// collections exactly as `keyed_state_identity` does, so a future internal
+/// (non-`Application`) namespace can publish without a schema change.
 ///
 /// [`upsert`]: PublicationStore::upsert
 /// [`remove`]: PublicationStore::remove
@@ -40,32 +44,36 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
     /// Backend error; classified for the settle-path retry posture.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Idempotently records `row` under `(subsystem, name)`. Re-upsert of the
-    /// same `(group_id, topic)` overwrites the routing facts in place.
+    /// Idempotently records `row` under `(subsystem, state_type, name)`.
+    /// Re-upsert of the same `(group_id, topic)` overwrites the routing facts
+    /// in place.
     ///
     /// # Errors
     /// Backend failure (e.g. Cassandra unavailable).
     fn upsert(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         row: &StatePublication,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes the `(group_id, topic)` source of `(subsystem, name)`.
-    /// Idempotent — removing an absent row is a no-op.
+    /// Removes the `(group_id, topic)` source of `(subsystem, state_type,
+    /// name)`. Idempotent — removing an absent row is a no-op.
     ///
     /// # Errors
     /// Backend failure.
     fn remove(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         group_id: &str,
         topic: Topic,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// All published sources of `(subsystem, name)` — one partition read.
+    /// All published sources of `(subsystem, state_type, name)` — one
+    /// partition read.
     ///
     /// # Errors
     /// Backend failure, or (Cassandra backend) a decoded partition count
@@ -73,6 +81,7 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
     fn read_publications(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> impl Future<Output = Result<Vec<StatePublication>, Self::Error>> + Send;
 }

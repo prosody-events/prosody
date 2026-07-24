@@ -78,6 +78,7 @@ pub struct ReadSession<C: Codec> {
     cache: ReaderCache,
     key: Key,
     def: CollectionDef,
+    state_type: StateType,
     name: StateName,
     /// The pinned source, shared across the operation's handle clones so every
     /// call after the first data-bearing probe addresses one source.
@@ -93,6 +94,7 @@ impl<C: Codec> Clone for ReadSession<C> {
             cache: self.cache.clone(),
             key: self.key.clone(),
             def: self.def,
+            state_type: self.state_type,
             name: self.name.clone(),
             pin: self.pin.clone(),
         }
@@ -108,6 +110,7 @@ impl<C: Codec> ReadSession<C> {
         cache: ReaderCache,
         key: Key,
         def: CollectionDef,
+        state_type: StateType,
         name: StateName,
     ) -> Self {
         Self {
@@ -117,6 +120,7 @@ impl<C: Codec> ReadSession<C> {
             cache,
             key,
             def,
+            state_type,
             name,
             pin: Arc::new(OnceLock::new()),
         }
@@ -133,7 +137,7 @@ impl<C: Codec> ReadSession<C> {
         let state_key = StateKey::new(segment, self.key.clone());
         Ok(CollectionId::new(
             state_key,
-            StateType::Application,
+            self.state_type,
             self.name.clone(),
         ))
     }

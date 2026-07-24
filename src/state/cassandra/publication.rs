@@ -13,8 +13,8 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore as CassandraSession, TABLE_KEYED_STATE_PUBLICATION};
 use crate::cassandra_queries;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::StateName;
 use crate::state::publication::{PublicationStore, StatePublication};
+use crate::state::{StateName, StateType};
 use crate::state_reader::{PartitionCount, PartitionCountError};
 use crate::subsystem::SubsystemName;
 use internment::Intern;
@@ -48,6 +48,7 @@ impl PublicationStore for CassandraPublicationStore {
     async fn upsert(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         row: &StatePublication,
     ) -> Result<(), Self::Error> {
@@ -56,6 +57,7 @@ impl PublicationStore for CassandraPublicationStore {
                 &self.queries.upsert,
                 (
                     subsystem.as_str(),
+                    state_type,
                     name.as_str(),
                     row.group_id.as_ref(),
                     row.topic.as_ref(),
@@ -70,6 +72,7 @@ impl PublicationStore for CassandraPublicationStore {
     async fn remove(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         group_id: &str,
         topic: Topic,
@@ -77,7 +80,13 @@ impl PublicationStore for CassandraPublicationStore {
         self.cql()
             .execute_unpaged(
                 &self.queries.remove,
-                (subsystem.as_str(), name.as_str(), group_id, topic.as_ref()),
+                (
+                    subsystem.as_str(),
+                    state_type,
+                    name.as_str(),
+                    group_id,
+                    topic.as_ref(),
+                ),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -87,13 +96,14 @@ impl PublicationStore for CassandraPublicationStore {
     async fn read_publications(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> Result<Vec<StatePublication>, Self::Error> {
         let rows = self
             .cql()
             .execute_unpaged(
                 &self.queries.read_publications,
-                (subsystem.as_str(), name.as_str()),
+                (subsystem.as_str(), state_type, name.as_str()),
             )
             .await
             .map_err(CassandraStoreError::from)?
@@ -123,8 +133,8 @@ cassandra_queries! {
         /// Plain `INSERT` — no LWT, no TTL, no client-set timestamp.
         upsert: (
             "INSERT INTO $keyspace.{} \
-             (subsystem, name, group_id, topic, partition_count) \
-             VALUES (?, ?, ?, ?, ?)",
+             (subsystem, state_type, name, group_id, topic, partition_count) \
+             VALUES (?, ?, ?, ?, ?, ?)",
             TABLE_KEYED_STATE_PUBLICATION
         ),
 
@@ -132,7 +142,8 @@ cassandra_queries! {
         /// Idempotent: deleting an absent row is a no-op.
         remove: (
             "DELETE FROM $keyspace.{} \
-             WHERE subsystem = ? AND name = ? AND group_id = ? AND topic = ?",
+             WHERE subsystem = ? AND state_type = ? AND name = ? \
+             AND group_id = ? AND topic = ?",
             TABLE_KEYED_STATE_PUBLICATION
         ),
 
@@ -140,7 +151,7 @@ cassandra_queries! {
         /// scan, no `ALLOW FILTERING`.
         read_publications: (
             "SELECT group_id, topic, partition_count \
-             FROM $keyspace.{} WHERE subsystem = ? AND name = ?",
+             FROM $keyspace.{} WHERE subsystem = ? AND state_type = ? AND name = ?",
             TABLE_KEYED_STATE_PUBLICATION
         ),
     }

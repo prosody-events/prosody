@@ -61,62 +61,86 @@ pub(crate) enum PublicationBackend {
 }
 
 impl PublicationBackend {
-    /// Idempotently records `row` under `(subsystem, name)`.
+    /// Idempotently records `row` under `(subsystem, state_type, name)`.
     async fn upsert(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         row: &StatePublication,
     ) -> Result<(), PublicationBackendError> {
         match self {
-            Self::Cassandra(store) => store.upsert(subsystem, name, row).await?,
+            Self::Cassandra(store) => store.upsert(subsystem, state_type, name, row).await?,
             // Memory's error is `Infallible`; the empty match discharges it
             // without a fallible unwrap and without a `?` (which would need an
             // unwritable `From<!>`).
-            Self::Memory(store) => match store.upsert(subsystem, name, row).await {
+            Self::Memory(store) => match store.upsert(subsystem, state_type, name, row).await {
                 Ok(()) => {}
                 Err(e) => match e {},
             },
             #[cfg(test)]
-            Self::Scripted(store) => store.upsert(subsystem, name, row).await?,
+            Self::Scripted(store) => store.upsert(subsystem, state_type, name, row).await?,
         }
         Ok(())
     }
 
-    /// Removes the `(group_id, topic)` source of `(subsystem, name)`.
+    /// Removes the `(group_id, topic)` source of `(subsystem, state_type,
+    /// name)`.
     async fn remove(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         group_id: &str,
         topic: Topic,
     ) -> Result<(), PublicationBackendError> {
         match self {
-            Self::Cassandra(store) => store.remove(subsystem, name, group_id, topic).await?,
-            Self::Memory(store) => match store.remove(subsystem, name, group_id, topic).await {
-                Ok(()) => {}
-                Err(e) => match e {},
-            },
+            Self::Cassandra(store) => {
+                store
+                    .remove(subsystem, state_type, name, group_id, topic)
+                    .await?;
+            }
+            Self::Memory(store) => {
+                match store
+                    .remove(subsystem, state_type, name, group_id, topic)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => match e {},
+                }
+            }
             #[cfg(test)]
-            Self::Scripted(store) => store.remove(subsystem, name, group_id, topic).await?,
+            Self::Scripted(store) => {
+                store
+                    .remove(subsystem, state_type, name, group_id, topic)
+                    .await?;
+            }
         }
         Ok(())
     }
 
-    /// All published sources of `(subsystem, name)` — one partition read.
+    /// All published sources of `(subsystem, state_type, name)` — one
+    /// partition read.
     async fn read_publications(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> Result<Vec<StatePublication>, PublicationBackendError> {
         match self {
-            Self::Cassandra(store) => Ok(store.read_publications(subsystem, name).await?),
-            Self::Memory(store) => match store.read_publications(subsystem, name).await {
-                Ok(rows) => Ok(rows),
-                Err(e) => match e {},
-            },
+            Self::Cassandra(store) => {
+                Ok(store.read_publications(subsystem, state_type, name).await?)
+            }
+            Self::Memory(store) => {
+                match store.read_publications(subsystem, state_type, name).await {
+                    Ok(rows) => Ok(rows),
+                    Err(e) => match e {},
+                }
+            }
             #[cfg(test)]
-            Self::Scripted(store) => Ok(store.read_publications(subsystem, name).await?),
+            Self::Scripted(store) => {
+                Ok(store.read_publications(subsystem, state_type, name).await?)
+            }
         }
     }
 }
@@ -334,7 +358,10 @@ impl FirstWritePublisher {
         // divergence loudly: the tripwire detects the misconfiguration but
         // cannot recover the stranded keys. A read error skips the diagnostic;
         // the blind upsert below still overwrites.
-        if let Ok(rows) = t.store.read_publications(&t.subsystem, name).await
+        if let Ok(rows) = t
+            .store
+            .read_publications(&t.subsystem, state_type, name)
+            .await
             && let Some(stored) = rows
                 .iter()
                 .find(|r| r.group_id.as_ref() == t.group.as_ref() && r.topic == self.topic)
@@ -356,7 +383,7 @@ impl FirstWritePublisher {
             topic: self.topic,
             partition_count: live,
         };
-        t.store.upsert(&t.subsystem, name, &row).await?;
+        t.store.upsert(&t.subsystem, state_type, name, &row).await?;
         t.memo.insert(key, ());
         Ok(())
     }
@@ -396,21 +423,16 @@ pub(crate) async fn reconcile_publications(
 ) -> Result<(), PublicationError> {
     // Own the registered set up front: streaming borrowed registry items into
     // the awaits below would keep the registry borrowed across `.await`.
-    //
-    // The publication table is keyed by `(subsystem, name)` while the registry
-    // is keyed by `(state_type, name)`. Publication is restricted to
-    // `StateType::Application` at registration
-    // ([`RegisterStateError::PublishedNonApplicationStateType`]), so at most one
-    // state type ever backs a routing row and filtering the private-name set per
-    // `(state_type, name)` is exact. Lifting that restriction would require
-    // "sweep a name only when no registration of that name is Published".
-    let collections: Vec<StateName> = registry
+    // Routing rows are addressed by `(subsystem, state_type, name)` — the same
+    // `(state_type, name)` namespacing as the registry — so the private-name
+    // sweep addresses each collection exactly.
+    let collections: Vec<(StateType, StateName)> = registry
         .collections()
         .filter(|(state_type, name)| !registry.is_published(*state_type, name))
-        .map(|(_state_type, name)| name.clone())
+        .map(|(state_type, name)| (state_type, name.clone()))
         .collect();
-    for name in &collections {
-        let rows = match store.read_publications(subsystem, name).await {
+    for (state_type, name) in &collections {
+        let rows = match store.read_publications(subsystem, *state_type, name).await {
             Ok(rows) => rows,
             Err(error) if error.classify_error() == ErrorCategory::Permanent => {
                 error!(
@@ -425,7 +447,7 @@ pub(crate) async fn reconcile_publications(
         for row in rows {
             if row.group_id.as_ref() == group {
                 store
-                    .remove(subsystem, name, &row.group_id, row.topic)
+                    .remove(subsystem, *state_type, name, &row.group_id, row.topic)
                     .await?;
             }
         }

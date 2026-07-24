@@ -261,7 +261,7 @@ async fn seed_memory_publication(
     identity: &DurableDescriptorIdentity,
 ) {
     publications
-        .upsert(subsystem, name, publication)
+        .upsert(subsystem, StateType::Application, name, publication)
         .await
         .unwrap_or_else(|e| match e {});
     identities
@@ -319,6 +319,7 @@ pub(super) async fn publish_scripted<D: StateDescriptor>(
     publications
         .seed(
             subsystem,
+            StateType::Application,
             name,
             &StatePublication {
                 group_id: Arc::from(group),

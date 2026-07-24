@@ -18,11 +18,11 @@ use super::support::{
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::ErrorCategory;
-use crate::state::StateName;
 use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::tests::support::ScriptedPublicationStore;
+use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::state_reader::StateReaderError;
 use crate::subsystem::SubsystemName;
@@ -257,7 +257,9 @@ impl RefreshFixture {
             match edit {
                 SourceEdit::Leave => {}
                 SourceEdit::Admit => {
-                    self.publications.seed(&self.sub, &self.name, &row).await;
+                    self.publications
+                        .seed(&self.sub, StateType::Application, &self.name, &row)
+                        .await;
                     if !identity_seeded[idx] {
                         self.identities.seed(group, &self.identity).await;
                         identity_seeded[idx] = true;
@@ -266,13 +268,15 @@ impl RefreshFixture {
                 }
                 SourceEdit::Withdraw => {
                     self.publications
-                        .remove(&self.sub, &self.name, group, tp)
+                        .remove(&self.sub, StateType::Application, &self.name, group, tp)
                         .await
                         .map_err(|e| eyre!("remove: {e}"))?;
                     advertised[idx] = false;
                 }
                 SourceEdit::PresentNoIdentity => {
-                    self.publications.seed(&self.sub, &self.name, &row).await;
+                    self.publications
+                        .seed(&self.sub, StateType::Application, &self.name, &row)
+                        .await;
                     advertised[idx] = true;
                 }
             }
@@ -368,6 +372,7 @@ async fn identity_mismatch_sticky() -> Result<()> {
     env.publications
         .seed(
             &env.sub,
+            StateType::Application,
             &env.name,
             &StatePublication {
                 group_id: Arc::from(GROUP_B),

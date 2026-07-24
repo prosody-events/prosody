@@ -570,8 +570,8 @@ where
         .read_cache_size_bytes
         .or(keyed_state.cache_size_bytes)
         .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES);
-    match trigger_store {
-        TriggerStoreConfiguration::InMemory => Ok(SharedDeps::memory(
+    let deps = match trigger_store {
+        TriggerStoreConfiguration::InMemory => SharedDeps::memory(
             consumer.group_id.clone(),
             consumer.stall_threshold,
             MemoryCells::new(),
@@ -579,11 +579,12 @@ where
             MemoryDescriptorIdentityStore::new(),
             MemoryLoader::new(),
             budget.get(),
-        )),
+        ),
         TriggerStoreConfiguration::Cassandra(cassandra) => {
-            Ok(SharedDeps::connect(consumer, cassandra, budget).await?)
+            SharedDeps::connect(consumer, cassandra, budget).await?
         }
-    }
+    };
+    Ok(deps.with_default_read_cache_ttl(keyed_state.read_cache_ttl))
 }
 
 /// Identifies which topics from the given list are missing in the Kafka

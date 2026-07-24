@@ -109,7 +109,9 @@ async fn published_first_write_upserts_live_count() -> Result<()> {
         .await?;
 
     assert_eq!(store.upserts_for("cart", TOPIC), 1, "exactly one upsert");
-    let rows = store.rows(&subsystem()?, &cart_name()?).await;
+    let rows = store
+        .rows(&subsystem()?, StateType::Application, &cart_name()?)
+        .await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         i32::from(rows[0].partition_count),
@@ -169,7 +171,9 @@ async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
     let subsystem = subsystem()?;
     let name = cart_name()?;
     // Seed the group's own row (as if it was published in a prior generation).
-    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+    store
+        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
+        .await;
 
     // The collection is now registered Private; reconciliation removes the row.
     let registry = registry(StateVisibility::Private)?;
@@ -181,7 +185,10 @@ async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
     )
     .await?;
     assert!(
-        store.rows(&subsystem, &name).await.is_empty(),
+        store
+            .rows(&subsystem, StateType::Application, &name)
+            .await
+            .is_empty(),
         "reconciliation removed the own row"
     );
 
@@ -189,7 +196,10 @@ async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
     let publisher = publisher(store.clone(), registry, 3)?;
     publisher.ensure_one(StateType::Application, &name).await?;
     assert!(
-        store.rows(&subsystem, &name).await.is_empty(),
+        store
+            .rows(&subsystem, StateType::Application, &name)
+            .await
+            .is_empty(),
         "the private write must not resurrect the row"
     );
     Ok(())
@@ -202,8 +212,17 @@ async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
-    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
-    store.seed(&subsystem, &name, &row(OTHER_GROUP, 5)?).await;
+    store
+        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
+        .await;
+    store
+        .seed(
+            &subsystem,
+            StateType::Application,
+            &name,
+            &row(OTHER_GROUP, 5)?,
+        )
+        .await;
 
     reconcile_publications(
         &PublicationBackend::Scripted(store.clone()),
@@ -213,7 +232,7 @@ async fn reconcile_removes_own_group_keeps_others() -> Result<()> {
     )
     .await?;
 
-    let rows = store.rows(&subsystem, &name).await;
+    let rows = store.rows(&subsystem, StateType::Application, &name).await;
     assert_eq!(rows.len(), 1, "only the own row is removed");
     assert_eq!(
         rows[0].group_id.as_ref(),
@@ -234,7 +253,9 @@ async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     let subsystem = subsystem()?;
     let name = cart_name()?;
     // A valid but stale count (Kafka can only grow partition counts).
-    store.seed(&subsystem, &name, &row(GROUP, 1)?).await;
+    store
+        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 1)?)
+        .await;
 
     let publisher = publisher(store.clone(), registry(StateVisibility::Published)?, 3)?;
     let (events, guard) = capture_events(Level::ERROR);
@@ -247,7 +268,7 @@ async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
         "the mismatch tripwire must fire an error-level event when the stored count disagrees \
          with the live count"
     );
-    let rows = store.rows(&subsystem, &name).await;
+    let rows = store.rows(&subsystem, StateType::Application, &name).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         i32::from(rows[0].partition_count),
@@ -327,7 +348,7 @@ async fn distinct_topics_publish_distinct_rows() -> Result<()> {
         .ensure_one(StateType::Application, &name)
         .await?;
 
-    let mut rows = store.rows(&subsystem, &name).await;
+    let mut rows = store.rows(&subsystem, StateType::Application, &name).await;
     rows.sort_by(|a, b| a.topic.as_ref().cmp(b.topic.as_ref()));
     assert_eq!(rows.len(), 2, "one row per topic");
     assert_eq!(rows[0].topic.as_ref(), "topic-1");
@@ -375,7 +396,7 @@ async fn memo_key_includes_topic() -> Result<()> {
         1,
         "the second topic published through the SAME memo — the topic keys it apart"
     );
-    let rows = store.rows(&subsystem, &name).await;
+    let rows = store.rows(&subsystem, StateType::Application, &name).await;
     assert_eq!(rows.len(), 2, "one row per topic despite the shared memo");
     Ok(())
 }
@@ -413,7 +434,9 @@ async fn reconcile_keeps_published_collection_row() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
-    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+    store
+        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
+        .await;
 
     reconcile_publications(
         &PublicationBackend::Scripted(store.clone()),
@@ -430,7 +453,7 @@ async fn reconcile_keeps_published_collection_row() -> Result<()> {
             .any(|c| matches!(c, PublicationCall::Remove { .. })),
         "a still-published collection's row must not be swept"
     );
-    let rows = store.rows(&subsystem, &name).await;
+    let rows = store.rows(&subsystem, StateType::Application, &name).await;
     assert_eq!(rows.len(), 1, "the published row survives");
     assert_eq!(rows[0].group_id.as_ref(), GROUP);
     Ok(())
@@ -444,7 +467,9 @@ async fn reconcile_skips_collection_whose_reads_fail_permanent() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
-    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+    store
+        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
+        .await;
     store.fail_reads_with(ErrorCategory::Permanent);
 
     // Returns Ok despite the read failure — the collection is skipped.
@@ -474,7 +499,9 @@ async fn reconcile_propagates_transient_read_failure() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     let name = cart_name()?;
-    store.seed(&subsystem, &name, &row(GROUP, 3)?).await;
+    store
+        .seed(&subsystem, StateType::Application, &name, &row(GROUP, 3)?)
+        .await;
     store.fail_reads_with(ErrorCategory::Transient);
 
     let result = reconcile_publications(

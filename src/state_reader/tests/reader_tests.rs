@@ -19,6 +19,7 @@ use super::support::{
 };
 use crate::Key;
 use crate::codec::JsonCodec;
+use crate::state::StateType;
 use crate::state::descriptor::{DescriptorIdentity, deque_state, map_state, value_state};
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::order_codec::I64KeyCodec;
@@ -167,6 +168,110 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
     Ok(())
 }
 
+/// The bundle-wide default read-cache TTL (`KeyedStateConfiguration::
+/// read_cache_ttl` fed through `SharedDeps::with_default_read_cache_ttl`)
+/// applies to a descriptor that never called `.read_cache(...)`: within the
+/// TTL the reader serves the cached committed value even after the owner
+/// commits a newer one. With the default cleared (`None`), the same second
+/// read observes the new commit — descriptor-silent reads stay uncached.
+///
+/// Falsify: drop the `.or(deps.default_read_cache_ttl())` resolution in the
+/// reader's constructor — the cached arm never engages and the first arm's
+/// second read sees `2`.
+#[tokio::test]
+async fn bundle_default_read_cache_ttl_applies_when_descriptor_is_silent() -> Result<()> {
+    for (default_ttl, expected_second_read) in [
+        (Some(Duration::from_mins(5)), Value::from(1i64)),
+        (None, Value::from(2i64)),
+    ] {
+        let harness = MemoryHarness::new();
+        let descriptor = value_state::<JsonCodec>("v-bundle-ttl");
+        let name = state_name("v-bundle-ttl")?;
+        let sub = subsystem()?;
+        let tp = topic("orders");
+        let count = mock_count();
+        let key = Key::from("user-9");
+        let state_key = source_state_key(tp, GROUP_A, &key, count)?;
+        let registry = registry_of(&descriptor, CollectionDef::new(None))?;
+
+        owner_commit(
+            &harness.cells,
+            &registry,
+            &state_key,
+            descriptor,
+            1,
+            |handle| async move {
+                handle
+                    .set(Value::from(1i64))
+                    .await
+                    .map_err(|e| eyre!("set: {e}"))?;
+                Ok(())
+            },
+        )
+        .await?;
+        publish_source(
+            (&harness.publications, &harness.identities),
+            &sub,
+            &name,
+            GROUP_A,
+            tp,
+            count,
+            &descriptor,
+        )
+        .await;
+
+        let deps = harness
+            .deps(1 << 20)
+            .with_default_read_cache_ttl(default_ttl);
+        let reader = StateReader::new(&deps, sub, descriptor)?;
+        assert_eq!(reader.get(key.clone()).await?, Some(Value::from(1i64)));
+
+        // A newer committed value is what distinguishes a cached read (still
+        // serves 1 inside the TTL) from an uncached one (sees 2).
+        owner_commit(
+            &harness.cells,
+            &registry,
+            &state_key,
+            descriptor,
+            2,
+            |handle| async move {
+                handle
+                    .set(Value::from(2i64))
+                    .await
+                    .map_err(|e| eyre!("set: {e}"))?;
+                Ok(())
+            },
+        )
+        .await?;
+        assert_eq!(
+            reader.get(key).await?,
+            Some(expected_second_read),
+            "second read under bundle default {default_ttl:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A bundle default that truncates to zero milliseconds is rejected at reader
+/// construction exactly like a descriptor-set TTL: the reader validates the
+/// *resolved* policy, so a degenerate env-sourced default cannot slip through.
+///
+/// Falsify: validate the descriptor's TTL before the bundle-default
+/// resolution — the descriptor-silent reader validates `None` and constructs.
+#[tokio::test]
+async fn zero_ms_bundle_default_is_rejected_at_reader_construction() -> Result<()> {
+    let harness = MemoryHarness::new();
+    let descriptor = value_state::<JsonCodec>("v-zero-default");
+    let deps = harness
+        .deps(1 << 20)
+        .with_default_read_cache_ttl(Some(Duration::from_nanos(1)));
+    match StateReader::new(&deps, subsystem()?, descriptor) {
+        Err(StateReaderError::InvalidReadCache { .. }) => Ok(()),
+        Err(other) => bail!("expected InvalidReadCache, got {other:?}"),
+        Ok(_) => bail!("expected InvalidReadCache, got a reader"),
+    }
+}
+
 /// A Kafka-message-ref Value: the owner writes a `MessageRef` (the Kafka
 /// coordinates of the message in hand), and the standalone reader reads the
 /// committed ref and resolves it to the full message body through
@@ -309,6 +414,7 @@ async fn identity_mismatch_is_permanent() -> Result<()> {
             .publications
             .upsert(
                 &sub,
+                StateType::Application,
                 &name,
                 &StatePublication {
                     group_id: Arc::from(GROUP_A),

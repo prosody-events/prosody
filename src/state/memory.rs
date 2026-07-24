@@ -705,9 +705,10 @@ impl DescriptorIdentityStore for MemoryDescriptorIdentityStore {
 /// In-memory routing-only [`PublicationStore`].
 ///
 /// The discovery half of in-memory keyed state: a [`scc::TreeIndex`] over the
-/// full publication primary key `((subsystem, name), group_id, topic)`, so a
-/// `read_publications` is a prefix range over one `(subsystem, name)`. Cloning
-/// shares the `Arc`, mirroring the sibling memory stores.
+/// full publication primary key `((subsystem, state_type, name), group_id,
+/// topic)`, so a `read_publications` is a prefix range over one
+/// `(subsystem, state_type, name)`. Cloning shares the `Arc`, mirroring the
+/// sibling memory stores.
 ///
 /// Removal path: the [`remove`](PublicationStore::remove) verb drops one source
 /// row, and dropping the last handle drops the whole tree (mock-mode lifetime).
@@ -733,23 +734,28 @@ impl PublicationStore for MemoryPublicationStore {
     async fn upsert(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         row: &StatePublication,
     ) -> Result<(), Self::Error> {
-        self.rows
-            .upsert_sync(publication_key(subsystem, name, row), row.clone());
+        self.rows.upsert_sync(
+            publication_key(subsystem, state_type, name, row),
+            row.clone(),
+        );
         Ok(())
     }
 
     async fn remove(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         group_id: &str,
         topic: Topic,
     ) -> Result<(), Self::Error> {
         self.rows.remove_sync(&PublicationKey {
             subsystem: subsystem.clone(),
+            state_type,
             name: name.clone(),
             group_id: Arc::from(group_id),
             topic,
@@ -760,12 +766,13 @@ impl PublicationStore for MemoryPublicationStore {
     async fn read_publications(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> Result<Vec<StatePublication>, Self::Error> {
         let guard = Guard::new();
         let out = self
             .rows
-            .range(PublicationScope::range(subsystem, name), &guard)
+            .range(PublicationScope::range(subsystem, state_type, name), &guard)
             .map(|(_key, row)| row.clone())
             .collect();
         drop(guard);
@@ -780,27 +787,36 @@ impl PublicationStore for MemoryPublicationStore {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PublicationKey {
     subsystem: SubsystemName,
+    state_type: StateType,
     name: StateName,
     group_id: Arc<str>,
     topic: Topic,
 }
 
-/// Bounding query for every [`PublicationKey`] of one `(subsystem, name)` —
-/// the `read_publications` sub-range. Compares on `(subsystem, name)`, ignoring
-/// `group_id`/`topic`, so the range spans exactly that collection's sources;
-/// see [`Edge`] for the strict-separator bounds.
+/// Bounding query for every [`PublicationKey`] of one
+/// `(subsystem, state_type, name)` — the `read_publications` sub-range.
+/// Compares on `(subsystem, state_type, name)`, ignoring `group_id`/`topic`,
+/// so the range spans exactly that collection's sources; see [`Edge`] for the
+/// strict-separator bounds.
 #[derive(Clone, Eq, PartialEq)]
 struct PublicationScope {
     subsystem: SubsystemName,
+    state_type: StateType,
     name: StateName,
     edge: Edge,
 }
 
 impl PublicationScope {
-    /// The inclusive separator pair spanning `(subsystem, name)`'s sources.
-    fn range(subsystem: &SubsystemName, name: &StateName) -> RangeInclusive<Self> {
+    /// The inclusive separator pair spanning `(subsystem, state_type, name)`'s
+    /// sources.
+    fn range(
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+    ) -> RangeInclusive<Self> {
         let at = |edge| Self {
             subsystem: subsystem.clone(),
+            state_type,
             name: name.clone(),
             edge,
         };
@@ -810,6 +826,7 @@ impl PublicationScope {
     fn cmp_key(&self, key: &PublicationKey) -> Ordering {
         self.subsystem
             .cmp(&key.subsystem)
+            .then(self.state_type.cmp(&key.state_type))
             .then(self.name.cmp(&key.name))
     }
 }
@@ -829,11 +846,13 @@ impl scc::Comparable<PublicationKey> for PublicationScope {
 /// Builds the tree key for one publication source.
 fn publication_key(
     subsystem: &SubsystemName,
+    state_type: StateType,
     name: &StateName,
     row: &StatePublication,
 ) -> PublicationKey {
     PublicationKey {
         subsystem: subsystem.clone(),
+        state_type,
         name: name.clone(),
         group_id: row.group_id.clone(),
         topic: row.topic,

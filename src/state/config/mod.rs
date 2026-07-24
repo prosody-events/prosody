@@ -5,7 +5,10 @@ use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
 use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
-use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
+use crate::util::{
+    from_duration_env_with_fallback, from_env_with_fallback,
+    from_option_duration_env_with_fallback, from_option_env,
+};
 use derive_builder::Builder;
 use std::env;
 use std::num::NonZeroU64;
@@ -23,6 +26,15 @@ const STATE_CACHE_SIZE_ENV: &str = "PROSODY_STATE_CACHE_SIZE_BYTES";
 /// Environment variable for the reader-side read-through cache capacity, in
 /// bytes.
 const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE_BYTES";
+
+/// Environment variable for the default read-cache TTL of composed readers.
+const STATE_READ_CACHE_TTL_ENV: &str = "PROSODY_STATE_READ_CACHE_TTL";
+
+/// Built-in default read-cache TTL. Well inside the staleness envelope
+/// cross-group reads already accept (the commit→apply window converges via
+/// the recovery sweep, [`DEFAULT_RECOVERY_DELAY_SECS`] = 30s; routing
+/// snapshots refresh every 60s), while collapsing hot-key read storms.
+const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_STATE_RECOVERY_DELAY";
@@ -107,6 +119,27 @@ pub struct KeyedStateConfiguration {
     #[builder(default = "from_option_env(STATE_READ_CACHE_SIZE_ENV)?")]
     pub read_cache_size_bytes: Option<NonZeroU64>,
 
+    /// Default read-cache TTL for the readers this client composes: how long a
+    /// `StateReader` may serve a collection's reads from its cache before
+    /// re-reading the store. Defaults to 5 seconds — well inside the staleness
+    /// envelope cross-group reads already accept (see the recovery sweep on
+    /// [`Self::recovery_delay`]). `None` disables the default, leaving reads
+    /// uncached unless a descriptor opts in; a descriptor's explicit
+    /// `.read_cache(...)` always wins over this default. Like every read-cache
+    /// setting it is consumed only by composed readers — never by the owning
+    /// consumer's writes, and unrelated to a collection's durable TTL.
+    ///
+    /// Environment variable: `PROSODY_STATE_READ_CACHE_TTL` (a humantime
+    /// duration such as `5s` or `750ms`; `none` disables caching for
+    /// descriptor-silent collections). Must not truncate to zero milliseconds
+    /// — every cached entry would be born stale.
+    #[builder(
+        default = "from_option_duration_env_with_fallback(STATE_READ_CACHE_TTL_ENV, \
+                   DEFAULT_READ_CACHE_TTL)?"
+    )]
+    #[validate(custom(function = "validate_read_cache_ttl"))]
+    pub read_cache_ttl: Option<Duration>,
+
     /// Subsystem this consumer publishes keyed state under. Required whenever
     /// any registered collection is `.published(true)` — a published collection
     /// with no subsystem is rejected at build
@@ -135,6 +168,11 @@ impl Default for KeyedStateConfiguration {
                 .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
             cache_size_bytes: from_option_env(STATE_CACHE_SIZE_ENV).unwrap_or_default(),
             read_cache_size_bytes: from_option_env(STATE_READ_CACHE_SIZE_ENV).unwrap_or_default(),
+            read_cache_ttl: from_option_duration_env_with_fallback(
+                STATE_READ_CACHE_TTL_ENV,
+                DEFAULT_READ_CACHE_TTL,
+            )
+            .unwrap_or(Some(DEFAULT_READ_CACHE_TTL)),
             subsystem: None,
             registrations: Vec::new(),
         }
@@ -248,6 +286,13 @@ fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
 fn validate_recovery_delay(recovery_delay: &CompactDuration) -> Result<(), ValidationError> {
     if recovery_delay.seconds() == 0 {
         return Err(ValidationError::new("recovery_delay_zero"));
+    }
+    Ok(())
+}
+
+fn validate_read_cache_ttl(ttl: &Duration) -> Result<(), ValidationError> {
+    if ttl.as_millis() == 0 {
+        return Err(ValidationError::new("read_cache_ttl_zero_ms"));
     }
     Ok(())
 }

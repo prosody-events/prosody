@@ -1275,10 +1275,11 @@ impl ScriptedPublicationStore {
     pub(crate) async fn seed(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         row: &StatePublication,
     ) {
-        let _ = self.inner.upsert(subsystem, name, row).await;
+        let _ = self.inner.upsert(subsystem, state_type, name, row).await;
     }
 
     /// A snapshot of the recorded calls, in order.
@@ -1304,10 +1305,11 @@ impl ScriptedPublicationStore {
     pub(crate) async fn rows(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> Vec<StatePublication> {
         self.inner
-            .read_publications(subsystem, name)
+            .read_publications(subsystem, state_type, name)
             .await
             .unwrap_or_default()
     }
@@ -1319,6 +1321,7 @@ impl PublicationStore for ScriptedPublicationStore {
     async fn upsert(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         row: &StatePublication,
     ) -> Result<(), Self::Error> {
@@ -1340,7 +1343,7 @@ impl PublicationStore for ScriptedPublicationStore {
         });
         // Inner store is `Infallible`; the empty match discharges it.
         self.inner
-            .upsert(subsystem, name, row)
+            .upsert(subsystem, state_type, name, row)
             .await
             .map_err(|e| match e {})
     }
@@ -1348,6 +1351,7 @@ impl PublicationStore for ScriptedPublicationStore {
     async fn remove(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
         group_id: &str,
         topic: Topic,
@@ -1358,7 +1362,7 @@ impl PublicationStore for ScriptedPublicationStore {
             topic: topic.to_string(),
         });
         self.inner
-            .remove(subsystem, name, group_id, topic)
+            .remove(subsystem, state_type, name, group_id, topic)
             .await
             .map_err(|e| match e {})
     }
@@ -1366,6 +1370,7 @@ impl PublicationStore for ScriptedPublicationStore {
     async fn read_publications(
         &self,
         subsystem: &SubsystemName,
+        state_type: StateType,
         name: &StateName,
     ) -> Result<Vec<StatePublication>, Self::Error> {
         self.calls.lock().push(PublicationCall::Read {
@@ -1375,7 +1380,7 @@ impl PublicationStore for ScriptedPublicationStore {
             return Err(ScriptedPublicationError(category));
         }
         self.inner
-            .read_publications(subsystem, name)
+            .read_publications(subsystem, state_type, name)
             .await
             .map_err(|e| match e {})
     }

@@ -145,7 +145,12 @@ where
         descriptor: D,
         refresh_interval_ms: u64,
     ) -> Result<Self, StateReaderError> {
-        let def = descriptor.collection_def();
+        let mut def = descriptor.collection_def();
+        // Descriptor-explicit read-cache TTL wins; the bundle-wide default
+        // (`KeyedStateConfiguration::read_cache_ttl` fed through the deps)
+        // fills in only when the descriptor is silent. The resolved value is
+        // validated, so a degenerate env-sourced default fails here too.
+        def.read_cache_ttl = def.read_cache_ttl.or(deps.default_read_cache_ttl());
         validate_read_cache(def.read_cache_ttl)?;
         let name =
             StateName::try_new(descriptor.name()).map_err(|_| StateReaderError::Unsupported {
@@ -227,7 +232,7 @@ where
         let prior = state.snapshot.clone();
         let rows = match self
             .stores
-            .read_publications(&self.subsystem, &self.name)
+            .read_publications(&self.subsystem, self.descriptor.state_type(), &self.name)
             .await
         {
             Ok(rows) => rows,
@@ -417,6 +422,7 @@ where
             self.cache.clone(),
             key,
             self.def,
+            self.descriptor.state_type(),
             self.name.clone(),
         ))
     }

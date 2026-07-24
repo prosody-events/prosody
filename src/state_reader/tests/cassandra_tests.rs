@@ -27,7 +27,6 @@ use crate::Topic;
 use crate::cassandra::CassandraStore as CassandraConn;
 use crate::codec::JsonCodec;
 use crate::loader::MemoryLoader;
-use crate::state::StateName;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CassandraStore as CassandraCellStore, CellQueries, IdentityQueries, PublicationQueries,
@@ -42,6 +41,7 @@ use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
 use crate::state::tests::support::FixedOracle;
+use crate::state::{StateName, StateType};
 use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::loader::ReaderLoader;
@@ -95,6 +95,7 @@ impl ReaderBackend for CassandraReaderBackend {
         self.publications
             .upsert(
                 subsystem,
+                StateType::Application,
                 name,
                 &StatePublication {
                     group_id: Arc::from(group),

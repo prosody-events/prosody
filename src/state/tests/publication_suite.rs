@@ -1,9 +1,10 @@
 //! Backend-generic routing-only publication-store suite.
 //!
 //! Random upsert/re-upsert/remove traces over a small pool vs a `BTreeMap`
-//! oracle keyed by the full primary key `(subsystem, name, group, topic)`;
-//! equivalence is asserted after EVERY op by re-reading every `(subsystem,
-//! name)` pair in the pool. Instantiated by the memory suite
+//! oracle keyed by the full primary key `(subsystem, state_type, name, group,
+//! topic)`; equivalence is asserted after EVERY op by re-reading every
+//! `(subsystem, state_type, name)` triple in the pool. Instantiated by the
+//! memory suite
 //! (`QUICKCHECK_TESTS`) and the Cassandra suite (`INTEGRATION_TESTS`). Every
 //! backend must satisfy the same invariants:
 //!
@@ -11,18 +12,19 @@
 //!   overwrites the routing facts in place; a duplicate would surface as an
 //!   extra row in the sorted set-equality.
 //! * **Remove** — after a `Remove`, that source is gone from the read.
-//! * **Subsystem/name isolation** — the pool holds the same name under two
-//!   subsystems and the same `(group, topic)` under different names, so any key
-//!   that ignored subsystem or name would leak rows across partitions.
+//! * **Subsystem/`state_type`/name isolation** — the pool holds the same name
+//!   under two subsystems and two state types, and the same `(group, topic)`
+//!   under different names, so any key that ignored one of the three would leak
+//!   rows across partitions.
 //!
 //! The model is a plain `BTreeMap`, never a re-implementation of the store. No
 //! identity is tested here — a publication row carries none (it is validated
 //! against `keyed_state_identity` at acquisition).
 
 use crate::Topic;
-use crate::state::StateName;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::tests::cell_suite::capped_vec;
+use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, eyre};
@@ -34,6 +36,9 @@ use std::sync::Arc;
 /// The distinct subsystems the pool spans, so the same name recurs across
 /// subsystems (isolation).
 const SUBSYSTEMS: usize = 2;
+/// The state types the pool spans, so the same name recurs across namespaces
+/// (isolation). `Framework` is the test-only second namespace.
+const STATE_TYPES: [StateType; 2] = [StateType::Application, StateType::Framework];
 /// The collection names the pool spans.
 const NAMES: [&str; 3] = ["c0", "c1", "c2"];
 /// The publishing groups the pool spans.
@@ -41,13 +46,20 @@ const GROUPS: [&str; 3] = ["g0", "g1", "g2"];
 /// The topics the pool spans.
 const TOPICS: [&str; 2] = ["t0", "t1"];
 
-/// A full-PK oracle key: `(subsystem, name, group, topic)`.
-type OracleKey = (String, String, String, String);
+/// A full-PK oracle key: `(subsystem, state_type, name, group, topic)`.
+type OracleKey = (String, i8, String, String, String);
 
 /// The full-PK oracle key for one publication source.
-fn oracle_key(subsystem: &SubsystemName, name: &StateName, group: &str, topic: Topic) -> OracleKey {
+fn oracle_key(
+    subsystem: &SubsystemName,
+    state_type: StateType,
+    name: &StateName,
+    group: &str,
+    topic: Topic,
+) -> OracleKey {
     (
         subsystem.as_str().to_owned(),
+        i8::from(state_type),
         name.as_str().to_owned(),
         group.to_owned(),
         topic.as_ref().to_owned(),
@@ -62,6 +74,11 @@ fn subsystem_for(token: &str, seed: u8) -> Result<SubsystemName> {
         "{token}-s{}",
         usize::from(seed) % SUBSYSTEMS
     ))?)
+}
+
+/// Resolves a state-type seed to a namespace from the pool.
+fn state_type_for(seed: u8) -> StateType {
+    STATE_TYPES[usize::from(seed) % STATE_TYPES.len()]
 }
 
 /// Resolves a name seed to a collection name from the pool.
@@ -87,18 +104,20 @@ fn count_for(seed: u8) -> Result<PartitionCount> {
 /// One store operation in a [`PublicationTrace`].
 #[derive(Clone, Debug)]
 enum PublicationOp {
-    /// Upsert `(group, topic, count)` under `(sub, name)`.
+    /// Upsert `(group, topic, count)` under `(sub, st, name)`.
     Upsert {
         sub: u8,
+        st: u8,
         name: u8,
         group: u8,
         topic: u8,
         count: u8,
     },
 
-    /// Remove the `(group, topic)` source of `(sub, name)`.
+    /// Remove the `(group, topic)` source of `(sub, st, name)`.
     Remove {
         sub: u8,
+        st: u8,
         name: u8,
         group: u8,
         topic: u8,
@@ -110,6 +129,7 @@ impl Arbitrary for PublicationOp {
         if bool::arbitrary(g) {
             Self::Upsert {
                 sub: u8::arbitrary(g),
+                st: u8::arbitrary(g),
                 name: u8::arbitrary(g),
                 group: u8::arbitrary(g),
                 topic: u8::arbitrary(g),
@@ -118,6 +138,7 @@ impl Arbitrary for PublicationOp {
         } else {
             Self::Remove {
                 sub: u8::arbitrary(g),
+                st: u8::arbitrary(g),
                 name: u8::arbitrary(g),
                 group: u8::arbitrary(g),
                 topic: u8::arbitrary(g),
@@ -143,7 +164,8 @@ impl Arbitrary for PublicationTrace {
 }
 
 /// Drives `store` and a plain `BTreeMap` model through `trace`, asserting
-/// equivalence after every op by re-reading every pool `(subsystem, name)`.
+/// equivalence after every op by re-reading every pool
+/// `(subsystem, state_type, name)`.
 /// Returns `Ok(false)` on a model divergence (a real invariant break); store
 /// errors propagate.
 pub(crate) async fn run_publication_trace<S>(
@@ -159,12 +181,14 @@ where
         match op {
             PublicationOp::Upsert {
                 sub,
+                st,
                 name,
                 group,
                 topic,
                 count,
             } => {
                 let subsystem = subsystem_for(token, sub)?;
+                let state_type = state_type_for(st);
                 let name = name_for(name)?;
                 let group = group_for(group);
                 let topic = topic_for(topic);
@@ -172,6 +196,7 @@ where
                 store
                     .upsert(
                         &subsystem,
+                        state_type,
                         &name,
                         &StatePublication {
                             group_id: Arc::from(group),
@@ -182,58 +207,67 @@ where
                     .await
                     .map_err(|e| eyre!("upsert failed: {e}"))?;
                 oracle.insert(
-                    oracle_key(&subsystem, &name, group, topic),
+                    oracle_key(&subsystem, state_type, &name, group, topic),
                     i32::from(count),
                 );
             }
             PublicationOp::Remove {
                 sub,
+                st,
                 name,
                 group,
                 topic,
             } => {
                 let subsystem = subsystem_for(token, sub)?;
+                let state_type = state_type_for(st);
                 let name = name_for(name)?;
                 let group = group_for(group);
                 let topic = topic_for(topic);
                 store
-                    .remove(&subsystem, &name, group, topic)
+                    .remove(&subsystem, state_type, &name, group, topic)
                     .await
                     .map_err(|e| eyre!("remove failed: {e}"))?;
-                oracle.remove(&oracle_key(&subsystem, &name, group, topic));
+                oracle.remove(&oracle_key(&subsystem, state_type, &name, group, topic));
             }
         }
 
-        // Re-read every pool (subsystem, name) and compare sorted set-equality
-        // against the oracle's matching prefix. Content, not order —
-        // PublicationStore makes no clustering-order guarantee (both backends
-        // happen to return group/topic-ascending anyway).
+        // Re-read every pool (subsystem, state_type, name) and compare sorted
+        // set-equality against the oracle's matching prefix. Content, not
+        // order — PublicationStore makes no clustering-order guarantee (both
+        // backends happen to return group/topic-ascending anyway).
         for s in 0..u8::try_from(SUBSYSTEMS)? {
-            for n in 0..u8::try_from(NAMES.len())? {
-                let subsystem = subsystem_for(token, s)?;
-                let name = name_for(n)?;
-                let mut got: Vec<(String, String, i32)> = store
-                    .read_publications(&subsystem, &name)
-                    .await
-                    .map_err(|e| eyre!("read_publications failed: {e}"))?
-                    .into_iter()
-                    .map(|p| {
-                        (
-                            p.group_id.to_string(),
-                            p.topic.as_ref().to_owned(),
-                            i32::from(p.partition_count),
-                        )
-                    })
-                    .collect();
-                got.sort();
-                let mut expected: Vec<(String, String, i32)> = oracle
-                    .iter()
-                    .filter(|((sub, nm, ..), _)| sub == subsystem.as_str() && nm == name.as_str())
-                    .map(|((_, _, group, topic), count)| (group.clone(), topic.clone(), *count))
-                    .collect();
-                expected.sort();
-                if got != expected {
-                    return Ok(false);
+            for t in 0..u8::try_from(STATE_TYPES.len())? {
+                for n in 0..u8::try_from(NAMES.len())? {
+                    let subsystem = subsystem_for(token, s)?;
+                    let state_type = state_type_for(t);
+                    let name = name_for(n)?;
+                    let mut got: Vec<(String, String, i32)> = store
+                        .read_publications(&subsystem, state_type, &name)
+                        .await
+                        .map_err(|e| eyre!("read_publications failed: {e}"))?
+                        .into_iter()
+                        .map(|p| {
+                            (
+                                p.group_id.to_string(),
+                                p.topic.as_ref().to_owned(),
+                                i32::from(p.partition_count),
+                            )
+                        })
+                        .collect();
+                    got.sort();
+                    let mut expected: Vec<(String, String, i32)> = oracle
+                        .iter()
+                        .filter(|((sub, st, nm, ..), _)| {
+                            sub == subsystem.as_str()
+                                && *st == i8::from(state_type)
+                                && nm == name.as_str()
+                        })
+                        .map(|((.., group, topic), count)| (group.clone(), topic.clone(), *count))
+                        .collect();
+                    expected.sort();
+                    if got != expected {
+                        return Ok(false);
+                    }
                 }
             }
         }

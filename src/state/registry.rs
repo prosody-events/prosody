@@ -255,13 +255,9 @@ impl CollectionDefRegistry {
                 limit: def.keyset_limit,
             });
         }
-        // Publication routing rows are keyed `(subsystem, name)` with no
-        // `state_type`, and the reader routes cells under a hardcoded
-        // `StateType::Application`. A `Published` collection under any other
-        // state type would strand its cells under a namespace no reader
-        // addresses, so it is rejected here — the single choke point every
-        // registration funnels through. Only `Application` exists in production;
-        // this enforces the assumption the reconciliation sweep relies on.
+        // Policy: only Application collections may be published today. The
+        // routing table and reader already carry `state_type`, so lifting this
+        // is a matter of deleting the check.
         if def.visibility == StateVisibility::Published && state_type != StateType::Application {
             return Err(RegisterStateError::PublishedNonApplicationStateType { name });
         }
@@ -499,10 +495,8 @@ pub enum RegisterStateError {
     },
 
     /// A collection declared `.published(true)` under a [`StateType`] other
-    /// than [`StateType::Application`]. Publication routing rows carry no
-    /// `state_type` and the reader addresses cells under `Application` only, so
-    /// publishing any other state type would strand its cells in an
-    /// unaddressable namespace. Rejected at registration.
+    /// than [`StateType::Application`]. Publishing internal state is not yet
+    /// supported; this is a policy check, not a storage limitation.
     #[error(
         "published state collection {name:?} is not a StateType::Application collection; only \
          Application collections may be published"
