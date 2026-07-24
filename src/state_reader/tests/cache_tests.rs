@@ -18,18 +18,20 @@ use crate::Key;
 use crate::state::StateName;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::store::CellBuffer;
 use crate::state_reader::cache::CacheKey;
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::executor::block_on;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
+use smallvec::smallvec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A cache key for the given collection name and one fixed cell.
-fn key(name: &str) -> Result<CacheKey> {
+/// A cache key for the given collection name at cell coordinate `coord`.
+fn key_at(name: &str, coord: Vec<u8>) -> Result<CacheKey> {
     Ok((
         SourceId {
             group_id: Arc::from("group-aaa"),
@@ -39,9 +41,14 @@ fn key(name: &str) -> Result<CacheKey> {
         Key::from("user-1"),
         CellKey {
             section: Section::new(0),
-            coordinate: Coordinate::from_bytes(vec![0]),
+            coordinate: Coordinate::from_bytes(coord),
         },
     ))
+}
+
+/// A cache key for the given collection name and one fixed cell.
+fn key(name: &str) -> Result<CacheKey> {
+    key_at(name, vec![0])
 }
 
 // --- Staleness property -----------------------------------------------------
@@ -302,7 +309,7 @@ async fn batch_refill_overwrites_stale_entry() -> Result<()> {
     now.store(1, Ordering::Relaxed);
     let got = cache
         .get_many_cached(&[k1.clone(), k2], 1_000_000, || async {
-            Ok::<_, StateAccessError>(vec![
+            Ok::<_, StateAccessError>(smallvec![
                 Some(Bytes::from_static(b"v2")),
                 Some(Bytes::from_static(b"decoy")),
             ])
@@ -337,7 +344,7 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
         let fills = fills.clone();
         async move {
             fills.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, StateAccessError>(vec![
+            Ok::<_, StateAccessError>(smallvec![
                 Some(Bytes::from_static(b"a")),
                 Some(Bytes::from_static(b"b")),
             ])
@@ -350,13 +357,11 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
 
     // Both still fresh at t=0: the all-hits shortcut serves from cache.
     let served = cache.get_many_cached(&keys, 100, fill).await?;
-    assert_eq!(
-        served,
-        vec![
-            Some(Bytes::from_static(b"a")),
-            Some(Bytes::from_static(b"b"))
-        ]
-    );
+    let expected: CellBuffer<Option<Bytes>> = smallvec![
+        Some(Bytes::from_static(b"a")),
+        Some(Bytes::from_static(b"b"))
+    ];
+    assert_eq!(served, expected);
     assert_eq!(
         fills.load(Ordering::Relaxed),
         1,
@@ -382,18 +387,7 @@ async fn declared_weight_bounded_by_budget() -> Result<()> {
     let (cache, _now) = fixed_clock_cache(budget);
     let value = Bytes::from(vec![0u8; 256]);
     for i in 0..200u32 {
-        let k: CacheKey = (
-            SourceId {
-                group_id: Arc::from("group-aaa"),
-                topic: topic("t"),
-            },
-            StateName::try_new("weighted")?,
-            Key::from("user-1"),
-            CellKey {
-                section: Section::new(0),
-                coordinate: Coordinate::from_bytes(i.to_be_bytes().to_vec()),
-            },
-        );
+        let k = key_at("weighted", i.to_be_bytes().to_vec())?;
         let value = value.clone();
         cache
             .get_cached(k, 1_000_000, || {

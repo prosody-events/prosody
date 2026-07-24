@@ -11,9 +11,9 @@
 //! the source-call trace proving a pinned scan never opens the decoy.
 
 use super::support::{
-    CountingIdentityStore, FaultPoint, GROUP_A, GROUP_B, ScriptedCellSource, collect_stream,
-    mock_count, owner_commit, publish_scripted, registry_of, scripted_deps, source_state_key,
-    state_name, subsystem, topic,
+    CountingIdentityStore, FaultPoint, GROUP_A, GROUP_B, ScriptedCellSource, ScriptedEnv,
+    collect_stream, mock_count, owner_commit, publish_scripted, registry_of, scripted_deps,
+    source_state_key, state_name, subsystem, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
@@ -166,65 +166,35 @@ fn prop_probe_and_pin() {
 }
 
 async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
-    let descriptor = deque_state::<JsonCodec>("probe-dq");
-    let name = state_name("probe-dq")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(deque_state::<JsonCodec>("probe-dq"))?;
     let key = Key::from("user-1");
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
 
     for (idx, disposition) in script.sources.iter().enumerate() {
         let group = GROUP_POOL[idx];
         let tp = topic(GROUP_POOL[idx]);
-        let state_key = source_state_key(tp, group, &key, count)?;
         match disposition {
             SourceDisposition::Empty => {}
             SourceDisposition::FaultOpen => {
-                cells.fault_at(state_key.segment_id, FaultPoint::AtOpen);
+                env.fault(group, tp, &key, FaultPoint::AtOpen)?;
             }
             SourceDisposition::Data(len_idx) => {
                 let len = LEN_POOL[*len_idx as usize];
-                owner_commit(
-                    &cells.cells(),
-                    &registry,
-                    &state_key,
-                    descriptor,
-                    idx as u128 + 1,
-                    move |handle| async move {
-                        for j in 0..len {
-                            handle
-                                .push_back(element(idx, j))
-                                .await
-                                .map_err(|e| eyre!("push: {e}"))?;
-                        }
-                        Ok(())
-                    },
-                )
+                env.commit(group, tp, &key, idx as u128 + 1, move |handle| async move {
+                    for j in 0..len {
+                        handle
+                            .push_back(element(idx, j))
+                            .await
+                            .map_err(|e| eyre!("push: {e}"))?;
+                    }
+                    Ok(())
+                })
                 .await?;
             }
         }
-        publish_scripted(
-            (&publications, &identities),
-            &sub,
-            &name,
-            group,
-            tp,
-            count,
-            &descriptor,
-        )
-        .await;
+        env.publish(group, tp).await;
     }
 
-    let deps = scripted_deps(
-        cells,
-        publications,
-        identities,
-        ReaderCache::with_budget(1 << 20),
-    );
-    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+    let reader = env.reader_eager()?;
     Box::pin(assert_probe(&reader, &key, selection(&script))).await
 }
 
@@ -238,11 +208,11 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
         Selection::Pinned { idx, len } => {
             let expected: Vec<Value> = (0..len).map(|j| element(idx, j)).collect();
             let forward = Box::pin(collect_stream(
-                reader.stream(key.clone(), Direction::Forward),
+                reader.stream(key.clone(), Direction::Forward).await?,
             ))
             .await?;
             let backward = Box::pin(collect_stream(
-                reader.stream(key.clone(), Direction::Backward),
+                reader.stream(key.clone(), Direction::Backward).await?,
             ))
             .await?;
             Ok(reader.len(key.clone()).await? == len
@@ -256,6 +226,7 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
             // every read errors.
             let streamed: Vec<Result<Value, StateReaderError>> = reader
                 .stream(key.clone(), Direction::Forward)
+                .await?
                 .collect::<Vec<_>>()
                 .await;
             Ok(reader.len(key.clone()).await.is_err()
@@ -265,7 +236,7 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
         Selection::EmptyOnly => Ok(reader.len(key.clone()).await? == 0
             && reader.get(key.clone(), 0).await?.is_none()
             && Box::pin(collect_stream(
-                reader.stream(key.clone(), Direction::Forward),
+                reader.stream(key.clone(), Direction::Forward).await?,
             ))
             .await?
             .is_empty()),
@@ -283,56 +254,27 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
 /// or swallows the error.
 #[tokio::test]
 async fn scan_midstream_error_propagates() -> Result<()> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
-    let descriptor = deque_state::<JsonCodec>("d-mid");
-    let name = state_name("d-mid")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(deque_state::<JsonCodec>("d-mid"))?;
     let key = Key::from("user-1");
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
 
     let tp_a = topic("topic-a");
-    let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
-    owner_commit(
-        &cells.cells(),
-        &registry,
-        &sk_a,
-        descriptor,
-        1,
-        |h| async move {
-            for i in 0..SCAN_ARM_LEN {
-                h.push_back(Value::from(i as i64))
-                    .await
-                    .map_err(|e| eyre!("push: {e}"))?;
-            }
-            Ok(())
-        },
-    )
+    env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
+        for i in 0..SCAN_ARM_LEN {
+            h.push_back(Value::from(i as i64))
+                .await
+                .map_err(|e| eyre!("push: {e}"))?;
+        }
+        Ok(())
+    })
     .await?;
     // Yield exactly five present cells, then fault mid-stream.
-    cells.fault_at(sk_a.segment_id, FaultPoint::AfterYields(5));
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp_a,
-        count,
-        &descriptor,
-    )
-    .await;
+    env.fault(GROUP_A, tp_a, &key, FaultPoint::AfterYields(5))?;
+    env.publish(GROUP_A, tp_a).await;
 
-    let deps = scripted_deps(
-        cells,
-        publications,
-        identities,
-        ReaderCache::with_budget(1 << 20),
-    );
-    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+    let reader = env.reader_eager()?;
     let items: Vec<Result<Value, StateReaderError>> = reader
         .stream(key, Direction::Forward)
+        .await?
         .collect::<Vec<_>>()
         .await;
     // Five yielded prefix elements, then an error terminates the stream — no
@@ -505,74 +447,40 @@ async fn get_many_answers_from_one_source() -> Result<()> {
 /// count and the value assert go red.
 #[tokio::test]
 async fn scan_reads_only_pinned_source() -> Result<()> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
-    let descriptor = deque_state::<JsonCodec>("d-coherent");
-    let name = state_name("d-coherent")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(deque_state::<JsonCodec>("d-coherent"))?;
     let key = Key::from("user-1");
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
 
     let tp_a = topic("topic-a");
     let tp_b = topic("topic-b");
-    let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
-    let sk_b = source_state_key(tp_b, GROUP_B, &key, count)?;
 
     // Both sources hold a full deque (wide enough for the range-scan arm); A
     // (group-aaa) is the lowest and must answer alone. B's values are tagged
     // distinctly so a splice would be visible.
-    for (sk, base, event) in [(&sk_a, 0i64, 1u128), (&sk_b, 1000i64, 2u128)] {
-        owner_commit(
-            &cells.cells(),
-            &registry,
-            sk,
-            descriptor,
-            event,
-            |h| async move {
+    let mut segments = Vec::new();
+    for (group, tp, base, event) in [
+        (GROUP_A, tp_a, 0i64, 1u128),
+        (GROUP_B, tp_b, 1000i64, 2u128),
+    ] {
+        let state_key = env
+            .commit(group, tp, &key, event, move |h| async move {
                 for i in 0..SCAN_ARM_LEN {
                     h.push_back(Value::from(base + i as i64))
                         .await
                         .map_err(|e| eyre!("push: {e}"))?;
                 }
                 Ok(())
-            },
-        )
-        .await?;
+            })
+            .await?;
+        segments.push(state_key.segment_id);
+        env.publish(group, tp).await;
     }
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp_a,
-        count,
-        &descriptor,
-    )
-    .await;
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_B,
-        tp_b,
-        count,
-        &descriptor,
-    )
-    .await;
+    let (segment_a, segment_b) = (segments[0], segments[1]);
 
-    let cells_probe = cells.clone();
-    let deps = scripted_deps(
-        cells,
-        publications,
-        identities,
-        ReaderCache::with_budget(1 << 20),
-    );
-    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+    let reader = env.reader_eager()?;
 
     let scanned: Vec<Value> = reader
         .stream(key, Direction::Forward)
+        .await?
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -582,12 +490,9 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
         scanned, expected,
         "the whole scan resolves from the lowest source A"
     );
-    assert!(
-        cells_probe.reads(sk_a.segment_id) >= 1,
-        "source A was scanned"
-    );
+    assert!(env.cells.reads(segment_a) >= 1, "source A was scanned");
     assert_eq!(
-        cells_probe.reads(sk_b.segment_id),
+        env.cells.reads(segment_b),
         0,
         "source B (decoy) was never opened"
     );

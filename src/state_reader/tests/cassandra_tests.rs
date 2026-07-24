@@ -206,89 +206,65 @@ fn namespace() -> Result<(SubsystemName, String, Key)> {
     ))
 }
 
-/// The committed==oracle Value property over live Cassandra.
-#[test]
-fn prop_cassandra_reader_value() {
-    fn property(trace: Trace<ValueOp>) -> TestResult {
-        finish(TEST_RUNTIME.block_on(async {
-            let backend = cassandra_backend().await?;
-            let (sub, group, key) = namespace()?;
-            let case = ReaderCase {
-                sub: &sub,
-                group: &group,
-                topic: reader_topic(),
-                key: &key,
-                count: PartitionCount::MIN,
-            };
-            run_reader_value_trace(&backend, value_state::<JsonCodec>(VALUE_NAME), &case, trace)
-                .await
-        }))
-    }
-    init_test_logging();
-    QuickCheck::new()
-        .tests(integration_test_count(25))
-        .quickcheck(property as fn(Trace<ValueOp>) -> TestResult);
+/// Instantiates a live-Cassandra `prop_cassandra_reader_<kind>` test: a fresh
+/// [`cassandra_backend`] and namespace, `$runner` driven over an arbitrary
+/// `Trace<$op>` for `$descriptor_ctor($name)`, scaled by `INTEGRATION_TESTS`.
+/// The three instantiations below are byte-identical but for the descriptor
+/// constructor, collection name, trace op, and runner.
+macro_rules! cassandra_reader_prop {
+    ($test_name:ident, $op:ty, $descriptor_ctor:expr, $name:expr, $runner:ident) => {
+        #[test]
+        fn $test_name() {
+            fn property(trace: Trace<$op>) -> TestResult {
+                finish(TEST_RUNTIME.block_on(async {
+                    let backend = cassandra_backend().await?;
+                    let (sub, group, key) = namespace()?;
+                    let case = ReaderCase {
+                        sub: &sub,
+                        group: &group,
+                        topic: reader_topic(),
+                        key: &key,
+                        count: PartitionCount::MIN,
+                    };
+                    Box::pin($runner(&backend, $descriptor_ctor($name), &case, trace)).await
+                }))
+            }
+            init_test_logging();
+            QuickCheck::new()
+                .tests(integration_test_count(25))
+                .quickcheck(property as fn(Trace<$op>) -> TestResult);
+        }
+    };
 }
 
-/// The committed==oracle Map property over live Cassandra (point + `get_many` +
-/// ordered stream).
-#[test]
-fn prop_cassandra_reader_map() {
-    fn property(trace: Trace<MapOp>) -> TestResult {
-        finish(TEST_RUNTIME.block_on(async {
-            let backend = cassandra_backend().await?;
-            let (sub, group, key) = namespace()?;
-            let case = ReaderCase {
-                sub: &sub,
-                group: &group,
-                topic: reader_topic(),
-                key: &key,
-                count: PartitionCount::MIN,
-            };
-            Box::pin(run_reader_map_trace(
-                &backend,
-                map_state::<I64KeyCodec, JsonCodec>(MAP_NAME),
-                &case,
-                trace,
-            ))
-            .await
-        }))
-    }
-    init_test_logging();
-    QuickCheck::new()
-        .tests(integration_test_count(25))
-        .quickcheck(property as fn(Trace<MapOp>) -> TestResult);
-}
+// The committed==oracle Value property over live Cassandra.
+cassandra_reader_prop!(
+    prop_cassandra_reader_value,
+    ValueOp,
+    value_state::<JsonCodec>,
+    VALUE_NAME,
+    run_reader_value_trace
+);
 
-/// The committed==oracle Deque property over live Cassandra (len +
-/// front-relative get + ordered stream).
-#[test]
-fn prop_cassandra_reader_deque() {
-    fn property(trace: Trace<DequeOp>) -> TestResult {
-        finish(TEST_RUNTIME.block_on(async {
-            let backend = cassandra_backend().await?;
-            let (sub, group, key) = namespace()?;
-            let case = ReaderCase {
-                sub: &sub,
-                group: &group,
-                topic: reader_topic(),
-                key: &key,
-                count: PartitionCount::MIN,
-            };
-            Box::pin(run_reader_deque_trace(
-                &backend,
-                deque_state::<JsonCodec>(DEQUE_NAME),
-                &case,
-                trace,
-            ))
-            .await
-        }))
-    }
-    init_test_logging();
-    QuickCheck::new()
-        .tests(integration_test_count(25))
-        .quickcheck(property as fn(Trace<DequeOp>) -> TestResult);
-}
+// The committed==oracle Map property over live Cassandra (point + `get_many` +
+// ordered stream).
+cassandra_reader_prop!(
+    prop_cassandra_reader_map,
+    MapOp,
+    map_state::<I64KeyCodec, JsonCodec>,
+    MAP_NAME,
+    run_reader_map_trace
+);
+
+// The committed==oracle Deque property over live Cassandra (len +
+// front-relative get + ordered stream).
+cassandra_reader_prop!(
+    prop_cassandra_reader_deque,
+    DequeOp,
+    deque_state::<JsonCodec>,
+    DEQUE_NAME,
+    run_reader_deque_trace
+);
 
 /// Probe-and-pin over TWO admitted live-Cassandra sources: the lowest-ordered
 /// `SourceId` group answers. Both groups commit divergent Values under one
@@ -400,14 +376,17 @@ fn reader_deque_scan_committed() -> Result<()> {
         let reader = StateReader::new(&deps, sub, descriptor)?;
         let model: Vec<Value> = (0..width).map(|i| Value::from(i as i64)).collect();
         let forward = Box::pin(collect_stream(
-            reader.stream(key.clone(), Direction::Forward),
+            reader.stream(key.clone(), Direction::Forward).await?,
         ))
         .await?;
         ensure!(
             forward == model,
             "forward scan must equal the ordered model"
         );
-        let backward = Box::pin(collect_stream(reader.stream(key, Direction::Backward))).await?;
+        let backward = Box::pin(collect_stream(
+            reader.stream(key, Direction::Backward).await?,
+        ))
+        .await?;
         let mut expect_backward = model;
         expect_backward.reverse();
         ensure!(

@@ -37,18 +37,18 @@ use crate::state_reader::cache::{ReaderCache, ReaderClock};
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::loader::ReaderLoader;
 use crate::state_reader::stores::ReaderStores;
-use crate::state_reader::{PartitionCount, StateReaderError, partition_for_key};
+use crate::state_reader::{PartitionCount, StateReader, StateReaderError, partition_for_key};
 use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use crate::{Key, SegmentId, Topic};
+use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail, eyre};
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use internment::Intern;
-use parking_lot::Mutex;
+use scc::hash_map::Entry;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
@@ -493,11 +493,11 @@ pub(super) enum FaultPoint {
 #[derive(Clone, Default)]
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
-    faults: Arc<Mutex<HashMap<SegmentId, FaultPoint>>>,
+    faults: Arc<scc::HashMap<SegmentId, FaultPoint, RandomState>>,
     /// Per-source committed-read counter — the source-call trace. Cloning
     /// shares it, so a test reads the count after moving the source into a
     /// bundle.
-    reads: Arc<Mutex<HashMap<SegmentId, usize>>>,
+    reads: Arc<scc::HashMap<SegmentId, usize, RandomState>>,
 }
 
 impl ScriptedCellSource {
@@ -512,11 +512,11 @@ impl ScriptedCellSource {
 
     /// Arms a fault for the source addressed by `segment`.
     pub(super) fn fault_at(&self, segment: SegmentId, fault: FaultPoint) {
-        self.faults.lock().insert(segment, fault);
+        self.faults.upsert_sync(segment, fault);
     }
 
     fn fault_of(&self, segment: SegmentId) -> Option<FaultPoint> {
-        self.faults.lock().get(&segment).copied()
+        self.faults.read_sync(&segment, |_, fault| *fault)
     }
 
     /// Committed reads recorded for the source addressed by `segment` — mirrors
@@ -524,11 +524,18 @@ impl ScriptedCellSource {
     /// which sources a probe touched (e.g. a scan pins one source and never
     /// opens the decoy).
     pub(super) fn reads(&self, segment: SegmentId) -> usize {
-        self.reads.lock().get(&segment).copied().unwrap_or(0)
+        self.reads
+            .read_sync(&segment, |_, count| *count)
+            .unwrap_or(0)
     }
 
     fn record_read(&self, segment: SegmentId) {
-        *self.reads.lock().entry(segment).or_insert(0) += 1;
+        match self.reads.entry_sync(segment) {
+            Entry::Vacant(slot) => {
+                slot.insert_entry(1);
+            }
+            Entry::Occupied(mut entry) => *entry.get_mut() += 1,
+        }
     }
 
     pub(crate) fn read_committed(
@@ -684,6 +691,145 @@ pub(super) fn scripted_deps(
     )
 }
 
+/// A captured scripted-env context: one source's store triple plus the
+/// routing constants and descriptor a probe/refresh test drives it with.
+/// Bundles the binding block (`ScriptedCellSource`/`ScriptedPublicationStore`/
+/// `CountingIdentityStore` construction, descriptor/name/subsystem/count/
+/// registry) that recurred across the probe and refresh suites, plus the
+/// downstream per-source seeding (`source_state_key` + `owner_commit`/
+/// `fault_at` + `publish_scripted`) and reader construction (`scripted_deps` +
+/// `StateReader::new_eager`/`new_with_interval`) every scripted suite repeats.
+///
+/// Fields are exposed to the tests it serves: a script that seeds the
+/// control-plane stores directly (bypassing [`Self::publish`]), or that needs
+/// the raw [`ScriptedCellSource`] to assert its source-call trace, reaches
+/// them as `env.cells`/`env.publications`/etc.
+pub(super) struct ScriptedEnv<D> {
+    pub(super) cells: ScriptedCellSource,
+    pub(super) publications: ScriptedPublicationStore,
+    pub(super) identities: CountingIdentityStore,
+    pub(super) descriptor: D,
+    pub(super) name: StateName,
+    pub(super) sub: SubsystemName,
+    pub(super) count: PartitionCount,
+    registry: Arc<CollectionDefRegistry>,
+}
+
+impl<D: StateDescriptor> ScriptedEnv<D> {
+    /// A fresh scripted env for `descriptor`, registered under its own name
+    /// (the single fabricated-identifier authority `descriptor.name()` — the
+    /// same string every source's frozen identity asserts against).
+    pub(super) fn new(descriptor: D) -> Result<Self> {
+        Ok(Self {
+            cells: ScriptedCellSource::new(),
+            publications: ScriptedPublicationStore::new(),
+            identities: CountingIdentityStore::new(),
+            registry: registry_of(&descriptor, CollectionDef::new(None))?,
+            descriptor,
+            name: state_name(descriptor.name())?,
+            sub: subsystem()?,
+            count: mock_count(),
+        })
+    }
+
+    /// Seeds one source's committed state for `group`/`tp` through the real
+    /// owner session, returning the segment-qualified state key it wrote
+    /// under (and the reader recomputes).
+    pub(super) async fn commit<F, Fut>(
+        &self,
+        group: &str,
+        tp: Topic,
+        key: &Key,
+        event: u128,
+        ops: F,
+    ) -> Result<StateKey>
+    where
+        F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let state_key = source_state_key(tp, group, key, self.count)?;
+        owner_commit(
+            &self.cells.cells(),
+            &self.registry,
+            &state_key,
+            self.descriptor,
+            event,
+            ops,
+        )
+        .await?;
+        Ok(state_key)
+    }
+
+    /// Arms a fault for `group`/`tp`'s source, returning its state key.
+    pub(super) fn fault(
+        &self,
+        group: &str,
+        tp: Topic,
+        key: &Key,
+        fault: FaultPoint,
+    ) -> Result<StateKey> {
+        let state_key = source_state_key(tp, group, key, self.count)?;
+        self.cells.fault_at(state_key.segment_id, fault);
+        Ok(state_key)
+    }
+
+    /// Advertises `group`/`tp` as a source and freezes its identity to match
+    /// this env's descriptor, so the reader admits it.
+    pub(super) async fn publish(&self, group: &str, tp: Topic) {
+        publish_scripted(
+            (&self.publications, &self.identities),
+            &self.sub,
+            &self.name,
+            group,
+            tp,
+            self.count,
+            &self.descriptor,
+        )
+        .await;
+    }
+
+    /// A reader-dep bundle over this env's stores with a fresh wall-clock
+    /// cache.
+    pub(super) fn deps(&self) -> SharedDeps<JsonCodec> {
+        self.deps_with_cache(ReaderCache::with_budget(1 << 20))
+    }
+
+    /// [`Self::deps`] over an explicit `cache` — the sticky-mismatch test's
+    /// fixed-clock driver.
+    pub(super) fn deps_with_cache(&self, cache: ReaderCache) -> SharedDeps<JsonCodec> {
+        scripted_deps(
+            self.cells.clone(),
+            self.publications.clone(),
+            self.identities.clone(),
+            cache,
+        )
+    }
+
+    /// An eager reader (refreshes every operation) over [`Self::deps`].
+    pub(super) fn reader_eager(&self) -> Result<StateReader<D, JsonCodec>> {
+        let deps = self.deps();
+        StateReader::new_eager(&deps, self.sub.clone(), self.descriptor)
+            .map_err(|e| eyre!("reader: {e}"))
+    }
+
+    /// A reader over an explicit `cache` with a non-zero refresh interval —
+    /// the sticky-mismatch test's cached-snapshot-fast-path driver.
+    pub(super) fn reader_with_interval(
+        &self,
+        cache: ReaderCache,
+        refresh_interval_ms: u64,
+    ) -> Result<StateReader<D, JsonCodec>> {
+        let deps = self.deps_with_cache(cache);
+        StateReader::new_with_interval(
+            &deps,
+            self.sub.clone(),
+            self.descriptor,
+            refresh_interval_ms,
+        )
+        .map_err(|e| eyre!("reader: {e}"))
+    }
+}
+
 /// A cache with a fixed, test-driven clock over `budget` declared bytes,
 /// returning the shared millisecond handle the test advances (never a sleep).
 pub(super) fn fixed_clock_cache(budget: u64) -> (ReaderCache, Arc<AtomicU64>) {
@@ -696,10 +842,5 @@ pub(super) fn fixed_clock_cache(budget: u64) -> (ReaderCache, Arc<AtomicU64>) {
 pub(super) async fn collect_stream<T>(
     stream: impl Stream<Item = Result<T, StateReaderError>>,
 ) -> Result<Vec<T>> {
-    futures::pin_mut!(stream);
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        out.push(item?);
-    }
-    Ok(out)
+    Ok(stream.try_collect().await?)
 }

@@ -31,73 +31,69 @@ use futures::executor::block_on;
 use serde_json::Value;
 use std::time::Duration;
 
-/// The reader observes exactly the committed Value the owner wrote, over an
-/// arbitrary overwrite trace — the memory instantiation of
-/// [`run_reader_value_trace`]. `QUICKCHECK_TESTS` sets the iteration count.
-#[test]
-fn prop_reader_value_committed() {
-    fn property(trace: Trace<ValueOp>) -> Result<bool> {
-        let descriptor = value_state::<JsonCodec>("reader-value");
-        let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
-        let sub = subsystem()?;
-        let key = Key::from("user-1");
-        let case = ReaderCase {
-            sub: &sub,
-            group: GROUP_A,
-            topic: topic("orders"),
-            key: &key,
-            count: mock_count(),
-        };
-        block_on(run_reader_value_trace(&backend, descriptor, &case, trace))
-    }
-    quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<ValueOp>) -> Result<bool>);
+/// Instantiates a memory `prop_reader_<kind>_committed` test: builds a fresh
+/// [`MemoryReaderBackend`] for `$descriptor_ctor($name)`, drives an arbitrary
+/// `Trace<$op>` through `$runner`, and asserts the committed==oracle
+/// invariant. `QUICKCHECK_TESTS` sets the iteration count. The three
+/// instantiations below are byte-identical but for the descriptor
+/// constructor, collection name, trace op, and runner.
+macro_rules! reader_prop {
+    ($test_name:ident, $op:ty, $descriptor_ctor:expr, $name:expr, $runner:ident) => {
+        #[test]
+        fn $test_name() {
+            fn property(trace: Trace<$op>) -> Result<bool> {
+                let descriptor = $descriptor_ctor($name);
+                let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
+                let sub = subsystem()?;
+                let key = Key::from("user-1");
+                let case = ReaderCase {
+                    sub: &sub,
+                    group: GROUP_A,
+                    topic: topic("orders"),
+                    key: &key,
+                    count: mock_count(),
+                };
+                block_on($runner(&backend, descriptor, &case, trace))
+            }
+            quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<$op>) -> Result<bool>);
+        }
+    };
 }
 
-/// The reader's point `get`, `get_many`, and ordered `stream` equal a
-/// `BTreeMap` model of the committed live entries after every event, over an
-/// arbitrary set/remove/clear trace — the memory instantiation of
-/// [`run_reader_map_trace`].
-#[test]
-fn prop_reader_map_committed() {
-    fn property(trace: Trace<MapOp>) -> Result<bool> {
-        let descriptor = map_state::<I64KeyCodec, JsonCodec>("reader-map");
-        let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
-        let sub = subsystem()?;
-        let key = Key::from("user-1");
-        let case = ReaderCase {
-            sub: &sub,
-            group: GROUP_A,
-            topic: topic("orders"),
-            key: &key,
-            count: mock_count(),
-        };
-        block_on(run_reader_map_trace(&backend, descriptor, &case, trace))
-    }
-    quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<MapOp>) -> Result<bool>);
-}
+// The reader observes exactly the committed Value the owner wrote, over an
+// arbitrary overwrite trace — the memory instantiation of
+// `run_reader_value_trace`.
+reader_prop!(
+    prop_reader_value_committed,
+    ValueOp,
+    value_state::<JsonCodec>,
+    "reader-value",
+    run_reader_value_trace
+);
 
-/// The reader's `len`, front-relative `get`, and ordered `stream` equal a
-/// `VecDeque` model of the committed elements after every event, over an
-/// arbitrary push/pop/clear trace — the memory instantiation of
-/// [`run_reader_deque_trace`].
-#[test]
-fn prop_reader_deque_committed() {
-    fn property(trace: Trace<DequeOp>) -> Result<bool> {
-        let descriptor = deque_state::<JsonCodec>("reader-deque");
-        let backend = MemoryReaderBackend::new(&descriptor, CollectionDef::new(None))?;
-        let sub = subsystem()?;
-        let key = Key::from("user-1");
-        let case = ReaderCase {
-            sub: &sub,
-            group: GROUP_A,
-            topic: topic("orders"),
-            key: &key,
-            count: mock_count(),
-        };
-        block_on(run_reader_deque_trace(&backend, descriptor, &case, trace))
-    }
-    quickcheck::QuickCheck::new().quickcheck(property as fn(Trace<DequeOp>) -> Result<bool>);
-}
+// The reader's point `get`, `get_many`, and ordered `stream` equal a
+// `BTreeMap` model of the committed live entries after every event, over an
+// arbitrary set/remove/clear trace — the memory instantiation of
+// `run_reader_map_trace`.
+reader_prop!(
+    prop_reader_map_committed,
+    MapOp,
+    map_state::<I64KeyCodec, JsonCodec>,
+    "reader-map",
+    run_reader_map_trace
+);
+
+// The reader's `len`, front-relative `get`, and ordered `stream` equal a
+// `VecDeque` model of the committed elements after every event, over an
+// arbitrary push/pop/clear trace — the memory instantiation of
+// `run_reader_deque_trace`.
+reader_prop!(
+    prop_reader_deque_committed,
+    DequeOp,
+    deque_state::<JsonCodec>,
+    "reader-deque",
+    run_reader_deque_trace
+);
 
 /// In the commit→promote window (owner staged a provisional cell but has not
 /// promoted), the reader observes the committed `prev`, never the in-flight

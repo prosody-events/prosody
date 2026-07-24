@@ -13,9 +13,7 @@
 //! the cached fast path (the sticky example uses `new_with_interval`).
 
 use super::support::{
-    CountingIdentityStore, GROUP_A, GROUP_B, ScriptedCellSource, fixed_clock_cache, mock_count,
-    owner_commit, publish_scripted, registry_of, scripted_deps, source_state_key, state_name,
-    subsystem, topic,
+    CountingIdentityStore, GROUP_A, GROUP_B, ScriptedEnv, fixed_clock_cache, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
@@ -24,11 +22,9 @@ use crate::state::StateName;
 use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::publication::{PublicationStore, StatePublication};
-use crate::state::registry::CollectionDef;
 use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state_reader::PartitionCount;
-use crate::state_reader::cache::ReaderCache;
-use crate::state_reader::{StateReader, StateReaderError};
+use crate::state_reader::StateReaderError;
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor::block_on;
@@ -171,18 +167,12 @@ fn prop_snapshot_refresh() {
 }
 
 async fn run_snapshot_refresh(script: RefreshScript) -> Result<bool> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
     let descriptor = value_state::<JsonCodec>("refresh-v");
-    let name = state_name("refresh-v")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(descriptor)?;
     let key = Key::from("user-1");
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
     let identity = DurableDescriptorIdentity::from_identity(
         descriptor.state_type(),
-        name.as_str(),
+        env.name.as_str(),
         &descriptor.structural_identity(),
     );
 
@@ -190,38 +180,24 @@ async fn run_snapshot_refresh(script: RefreshScript) -> Result<bool> {
     // by the publication/identity control plane the rounds edit.
     for (idx, group) in REFRESH_GROUPS.iter().enumerate() {
         let tp = topic(group);
-        let state_key = source_state_key(tp, group, &key, count)?;
-        owner_commit(
-            &cells.cells(),
-            &registry,
-            &state_key,
-            descriptor,
-            idx as u128 + 1,
-            move |handle| async move {
-                handle
-                    .set(element(idx))
-                    .await
-                    .map_err(|e| eyre!("set: {e}"))
-            },
-        )
+        env.commit(group, tp, &key, idx as u128 + 1, move |handle| async move {
+            handle
+                .set(element(idx))
+                .await
+                .map_err(|e| eyre!("set: {e}"))
+        })
         .await?;
     }
 
     let fixture = RefreshFixture {
-        publications: publications.clone(),
-        identities: identities.clone(),
-        sub: sub.clone(),
-        name: name.clone(),
+        publications: env.publications.clone(),
+        identities: env.identities.clone(),
+        sub: env.sub.clone(),
+        name: env.name.clone(),
         identity,
-        count,
+        count: env.count,
     };
-    let deps = scripted_deps(
-        cells,
-        publications,
-        identities,
-        ReaderCache::with_budget(1 << 20),
-    );
-    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+    let reader = env.reader_eager()?;
 
     // Model state.
     let mut advertised = [false; REFRESH_GROUPS.len()];
@@ -379,54 +355,38 @@ fn outcome_matches(expect: &Expect, observed: &Result<Option<Value>, StateReader
 /// Drop the failed-read sticky arm in `refresh` → op 3 serves A's subset.
 #[tokio::test]
 async fn identity_mismatch_sticky() -> Result<()> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
     let descriptor = value_state::<JsonCodec>("v-sticky");
-    let name = state_name("v-sticky")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(descriptor)?;
     let key = Key::from("user-1");
 
     let tp_a = topic("topic-a");
     let tp_b = topic("topic-b");
 
     // A: matching identity → admitted.
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp_a,
-        count,
-        &descriptor,
-    )
-    .await;
+    env.publish(GROUP_A, tp_a).await;
     // B: advertised, but its frozen identity is perturbed → present-but-unequal.
-    publications
+    env.publications
         .seed(
-            &sub,
-            &name,
+            &env.sub,
+            &env.name,
             &StatePublication {
                 group_id: Arc::from(GROUP_B),
                 topic: tp_b,
-                partition_count: count,
+                partition_count: env.count,
             },
         )
         .await;
     let mut perturbed = DurableDescriptorIdentity::from_identity(
         descriptor.state_type(),
-        name.as_str(),
+        env.name.as_str(),
         &descriptor.structural_identity(),
     );
     perturbed.kind = perturbed.kind.wrapping_add(1);
-    identities.seed(GROUP_B, &perturbed).await;
+    env.identities.seed(GROUP_B, &perturbed).await;
 
     let (cache, clock) = fixed_clock_cache(1 << 20);
-    let publications_edit = publications.clone();
-    let deps = scripted_deps(cells, publications, identities, cache);
     // A non-zero interval so op 2 takes the cached-snapshot fast path.
-    let reader = StateReader::new_with_interval(&deps, sub, descriptor, 60_000)?;
+    let reader = env.reader_with_interval(cache, 60_000)?;
 
     // Op 1 (t=0): the initial refresh detects B's mismatch (A is still admitted).
     match reader.get(key.clone()).await {
@@ -441,7 +401,7 @@ async fn identity_mismatch_sticky() -> Result<()> {
     }
     // Elapse the interval and make every routing read fail.
     clock.store(120_000, Ordering::Relaxed);
-    publications_edit.fail_reads_with(ErrorCategory::Transient);
+    env.publications.fail_reads_with(ErrorCategory::Transient);
     // Op 3 (stale → refresh, read fails): the sticky mismatch outranks the
     // admitted subset even though the routing read failed.
     match reader.get(key).await {

@@ -220,14 +220,14 @@ async fn assert_map<B: ReaderBackend>(
     }
     let expect_forward: Vec<(i64, Value)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
     let forward = Box::pin(collect_stream(
-        reader.stream(case.key.clone(), Direction::Forward),
+        reader.stream(case.key.clone(), Direction::Forward).await?,
     ))
     .await?;
     if forward != expect_forward {
         return Ok(false);
     }
     let backward = Box::pin(collect_stream(
-        reader.stream(case.key.clone(), Direction::Backward),
+        reader.stream(case.key.clone(), Direction::Backward).await?,
     ))
     .await?;
     let mut expect_backward = expect_forward;
@@ -346,14 +346,14 @@ async fn assert_deque<B: ReaderBackend>(
         }
     }
     let forward = Box::pin(collect_stream(
-        reader.stream(case.key.clone(), Direction::Forward),
+        reader.stream(case.key.clone(), Direction::Forward).await?,
     ))
     .await?;
     if forward != model.iter().cloned().collect::<Vec<_>>() {
         return Ok(false);
     }
     let backward = Box::pin(collect_stream(
-        reader.stream(case.key.clone(), Direction::Backward),
+        reader.stream(case.key.clone(), Direction::Backward).await?,
     ))
     .await?;
     Ok(backward == model.iter().rev().cloned().collect::<Vec<_>>())
