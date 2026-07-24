@@ -406,12 +406,13 @@ where
             }
         };
 
-        // Build the consumer. On any failure after `shared_deps` memoized the
-        // bundle above and `take` moved the config out, the retained bundle is
-        // dropped below: it holds an open scylla session, a live rdkafka poll
-        // thread, and a registered heartbeat that would otherwise strand
-        // unusable for the client's lifetime (the config is gone, so it is
-        // never reused). The next `subscribe` then rebuilds a fresh one.
+        // Build the consumer. `take` moved the config out and `shared_deps`
+        // memoized the bundle above, so on any failure we undo both below:
+        // restore the `Configured` state (a transient build failure must stay
+        // retryable, not wedge the client `Unconfigured`) and drop the retained
+        // bundle (it holds an open scylla session, a live rdkafka poll thread,
+        // and a registered heartbeat that would otherwise strand unusable). The
+        // next `subscribe` then rebuilds a fresh one.
         let built: Result<_, HighLevelClientError<C::Error>> = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
@@ -475,8 +476,10 @@ where
         let consumer = match built {
             Ok(consumer) => consumer,
             Err(error) => {
-                // Drop the retained bundle under the held consumer lock,
-                // preserving the consumer -> deps lock order.
+                // Restore the configured state so a transient build failure is
+                // retryable, then drop the retained bundle under the held
+                // consumer lock (preserving the consumer -> deps lock order).
+                *consumer_ref = ConsumerState::Configured(config);
                 *self.deps.lock().await = None;
                 return Err(error);
             }

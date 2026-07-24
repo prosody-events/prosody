@@ -18,7 +18,7 @@
 //! pin), so a torn two-source view is unreachable today; a future *concurrent*
 //! batched probe would have to restore single-flight over the pin to keep it.
 //!
-//! Probe-and-pin (see the plan's "Source selection"):
+//! Probe-and-pin — the reader's source-selection strategy:
 //!
 //! * **Point read / `get_many`** — issue the read to every source concurrently,
 //!   but resolve **in source order** with early exit. A [`FuturesOrdered`]

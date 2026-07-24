@@ -22,6 +22,7 @@
 //! would risk livelock).
 
 use crate::Key;
+use crate::error::ErrorCategory;
 use crate::state::StateName;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::CellKey;
@@ -270,11 +271,21 @@ impl ReaderCache {
         // One shared issue stamp for the whole batch fill.
         let stamp = self.issue_stamp();
         let fresh = fill().await?;
-        debug_assert_eq!(
-            fresh.len(),
-            keys.len(),
-            "batch fill must answer every key (the write-through zip aligns by index)"
-        );
+        // The write-through and the returned buffer are index-aligned to `keys`
+        // by construction of the store's batch read. Enforce it at this boundary
+        // in every build (not just a debug assert): a shorter fill would `zip`
+        // to a truncated, silently misaligned result, and an overlong one would
+        // cache only a prefix — so surface it as a store error instead.
+        if fresh.len() != keys.len() {
+            return Err(StateAccessError::Store {
+                message: format!(
+                    "batch fill returned {} values for {} keys",
+                    fresh.len(),
+                    keys.len()
+                ),
+                category: ErrorCategory::Permanent,
+            });
+        }
         for (key, value) in keys.iter().zip(fresh.iter()) {
             self.write_through(key, stamp, value.clone()).await;
         }

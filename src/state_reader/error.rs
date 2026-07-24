@@ -121,7 +121,7 @@ impl ClassifyError for StateReaderError {
             | Self::EmptyKey
             | Self::InvalidReadCache { .. }
             | Self::Unsupported { .. } => ErrorCategory::Permanent,
-            Self::Store { category, .. } => *category,
+            Self::Store { category, .. } => client_category(*category),
             Self::Access(error) => client_category(error.classify_error()),
         }
     }
@@ -163,8 +163,14 @@ mod tests {
     /// `Terminal`-emitting fault through the production `store`/`load`
     /// boundaries.
     ///
-    /// FALSIFICATION: drop the `client_category` clamp — the `store(...)` and
-    /// `Access(load(...))` cases then classify `Terminal` and the assert fires.
+    /// The clamp must hold even for a `Store` value constructed directly with a
+    /// `Terminal` category (bypassing [`StateReaderError::store`]), because the
+    /// variant and its fields are public — so `classify_error` folds on read,
+    /// not only `store(...)` on capture.
+    ///
+    /// FALSIFICATION: drop the `client_category` clamp from either the
+    /// `store(...)` capture or the `classify_error` `Store`/`Access` arms — a
+    /// `Terminal` then reaches classification and the assert fires.
     #[test]
     fn no_variant_leaks_terminal_to_the_client() {
         let cases = [
@@ -186,6 +192,12 @@ mod tests {
             },
             StateReaderError::store(&SyntheticTerminal),
             StateReaderError::Access(StateAccessError::load(&SyntheticTerminal)),
+            // Directly constructed (not via `store`), so only a fold on read
+            // keeps this from leaking Terminal.
+            StateReaderError::Store {
+                message: "directly constructed terminal".into(),
+                category: ErrorCategory::Terminal,
+            },
         ];
         for case in cases {
             assert_ne!(

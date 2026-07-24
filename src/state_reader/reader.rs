@@ -173,8 +173,7 @@ where
     /// The refresh-if-stale acquisition, returning the validated snapshot every
     /// read resolves against.
     ///
-    /// Refresh follows the three-outcome rule (see the plan's "Acquisition and
-    /// refresh"):
+    /// Refresh follows a three-outcome rule:
     ///
     /// * a **failed** routing-table read keeps the previous acquisition outcome
     ///   — a held snapshot is returned, but a known sticky mismatch still
@@ -236,15 +235,7 @@ where
             // outranks that subset: a transient outage is no evidence the
             // mismatch was repaired, so it stays sticky through the outage
             // rather than being demoted to `Ok(subset)`.
-            Err(error) => {
-                return match (&state.mismatch, prior) {
-                    (Some(group), _) => Err(StateReaderError::IdentityMismatch {
-                        group: group.clone(),
-                    }),
-                    (None, Some(snapshot)) => Ok(snapshot),
-                    (None, None) => Err(error),
-                };
-            }
+            Err(error) => return held_or_error(state.mismatch.as_deref(), prior, error),
         };
 
         if rows.is_empty() {
@@ -254,7 +245,14 @@ where
             return Err(self.unknown_publication());
         }
 
-        let admission = self.admit(&rows, prior.as_deref()).await?;
+        let admission = match self.admit(&rows, prior.as_deref()).await {
+            Ok(admission) => admission,
+            // An identity-read failure mid-admit is a transient outage on the
+            // same footing as a failed routing read: no evidence a known sticky
+            // mismatch was repaired, so it must not mask it (nor demote a held
+            // snapshot to a bare error).
+            Err(error) => return held_or_error(state.mismatch.as_deref(), prior, error),
+        };
 
         // Withdrawals took effect on `admitted` regardless of outcome; store it
         // (or its absence) before surfacing a mismatch so a later refresh sees
@@ -435,6 +433,25 @@ fn validate_read_cache(read_cache: ReadCache) -> Result<(), StateReaderError> {
         });
     }
     Ok(())
+}
+
+/// The held-snapshot fallback shared by the two refresh failure paths — a
+/// failed routing-table read and a failed identity admission. A known sticky
+/// mismatch outranks everything (a transient outage is no evidence it was
+/// repaired), a held snapshot beats a bare error, and only a first-ever failure
+/// with nothing held propagates the error.
+fn held_or_error(
+    mismatch: Option<&str>,
+    prior: Option<Arc<ValidatedPublications>>,
+    error: StateReaderError,
+) -> Result<Arc<ValidatedPublications>, StateReaderError> {
+    match (mismatch, prior) {
+        (Some(group), _) => Err(StateReaderError::IdentityMismatch {
+            group: group.to_owned(),
+        }),
+        (None, Some(snapshot)) => Ok(snapshot),
+        (None, None) => Err(error),
+    }
 }
 
 // --- Value (and Kafka-message-ref) reads -----------------------------------
