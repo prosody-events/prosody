@@ -32,6 +32,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::try_join;
 use tracing::debug;
 
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
@@ -98,14 +99,24 @@ pub(crate) enum SharedStorage {
         /// Routing-only publication store shared with the reader.
         publications: MemoryPublicationStore,
     },
-    /// The pre-built Cassandra session handle. Its prepared statements are
-    /// re-prepared against this session inside [`StorePair::new`]; one scylla
-    /// session exists cluster-wide for the consumer and the reader bundle.
+    /// The pre-built Cassandra session and the bundle's already-prepared
+    /// keyed-state store handles. [`StorePair::new`] reuses `cells`/
+    /// `identities`/`publications` verbatim (they carry the reader's prepared
+    /// cell/identity/publication statements) and prepares only the remaining
+    /// trigger/defer/dedup statements against `store`; one scylla session and
+    /// one set of keyed-state prepared statements exist cluster-wide for the
+    /// consumer and the reader bundle.
     Cassandra {
         /// The shared scylla session handle (keyspace from the caller's
         /// `TriggerStoreConfiguration`, which the composition builds from the
         /// same `CassandraConfiguration` as the bundle's session).
         store: CassandraStore,
+        /// Keyed-state cell-store resources prepared by the bundle.
+        cells: CassandraCellResources,
+        /// Descriptor-identity store prepared by the bundle.
+        identities: CassandraDescriptorIdentityStore,
+        /// Routing-only publication store prepared by the bundle.
+        publications: CassandraPublicationStore,
     },
 }
 
@@ -165,7 +176,7 @@ impl StorePair {
         // match `cass_config.keyspace`, which holds because the composition
         // builds the bundle and this config from one `CassandraConfiguration`.
         let store = match shared {
-            Some(SharedStorage::Cassandra { store }) => store.clone(),
+            Some(SharedStorage::Cassandra { store, .. }) => store.clone(),
             _ => CassandraStore::new(cass_config).await?,
         };
         let keyspace = &cass_config.keyspace;
@@ -206,14 +217,32 @@ impl StorePair {
             dedup_cache_capacity,
         );
 
-        let cell_queries = Arc::new(CellQueries::new(store.session(), keyspace).await?);
-        let cell_store = CassandraCellResources::new(store.clone(), cell_queries);
-        let identity_queries = Arc::new(IdentityQueries::new(store.session(), keyspace).await?);
-        let identity_store = CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
-
-        let publication_queries =
-            Arc::new(PublicationQueries::new(store.session(), keyspace).await?);
-        let publication_store = CassandraPublicationStore::new(store.clone(), publication_queries);
+        // Reuse the bundle's already-prepared keyed-state stores when supplied;
+        // otherwise prepare the three independent query sets concurrently.
+        let (cell_store, identity_store, publication_store) =
+            if let Some(SharedStorage::Cassandra {
+                cells,
+                identities,
+                publications,
+                ..
+            }) = shared
+            {
+                (cells.clone(), identities.clone(), publications.clone())
+            } else {
+                let (cell_queries, identity_queries, publication_queries) = try_join!(
+                    CellQueries::new(store.session(), keyspace),
+                    IdentityQueries::new(store.session(), keyspace),
+                    PublicationQueries::new(store.session(), keyspace),
+                )?;
+                (
+                    CassandraCellResources::new(store.clone(), Arc::new(cell_queries)),
+                    CassandraDescriptorIdentityStore::new(
+                        store.clone(),
+                        Arc::new(identity_queries),
+                    ),
+                    CassandraPublicationStore::new(store.clone(), Arc::new(publication_queries)),
+                )
+            };
 
         Ok(Self::Cassandra {
             trigger_provider,

@@ -91,18 +91,14 @@ where
 {
     producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
+    /// The consumer state, which owns the one shared infrastructure bundle
+    /// ([`SharedDeps`]) on its `Configured`/`Running` variants — built lazily
+    /// at the first point of need ([`Self::state`] or [`Self::subscribe`]) and
+    /// retained across the `Configured → Running` transition, so no state
+    /// transition constructs a second session/loader/memory store.
     consumer: Mutex<ConsumerState<T, C>>,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
-    /// The one shared infrastructure bundle this client owns for its whole
-    /// lifecycle. Built lazily at the first point of need ([`Self::state`]
-    /// while `Configured`, or [`Self::subscribe`]), retained across
-    /// `Configured→Running`, and handed to the consumer it starts, so no state
-    /// transition constructs a second session/loader/memory store.
-    ///
-    /// Lock order: acquire `consumer` before `deps`, always.
-    #[educe(Debug(ignore))]
-    deps: Mutex<Option<SharedDeps<C>>>,
 }
 
 impl<T, C: Codec> HighLevelClient<T, C>
@@ -209,7 +205,6 @@ where
             consumer,
             propagator: new_propagator(),
             telemetry,
-            deps: Mutex::new(None),
         })
     }
 
@@ -251,7 +246,7 @@ where
     {
         let mut guard = self.consumer.lock().await;
         match &mut *guard {
-            ConsumerState::Configured(config) => Ok(config.register(descriptor)),
+            ConsumerState::Configured { config, .. } => Ok(config.register(descriptor)),
             ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
             ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
                 Err(HighLevelClientError::UnconfiguredConsumer)
@@ -264,76 +259,11 @@ where
     /// stores the running consumer and the client's readers share.
     #[cfg(test)]
     pub(crate) async fn retained_deps(&self) -> Option<SharedDeps<C>> {
-        self.deps.lock().await.clone()
-    }
-
-    /// Returns the client's one shared infrastructure bundle, building it from
-    /// `mode` on first call and retaining it across the Configured -> Running
-    /// transition. `unsubscribe` drops it (see there); the next `subscribe`
-    /// rebuilds a fresh bundle.
-    ///
-    /// The caller must already hold the `consumer` lock (this locks `deps`
-    /// under it — the invariant lock order). A second call clones the retained
-    /// handle; it never constructs a second session/loader/memory store.
-    async fn shared_deps(
-        &self,
-        mode: &ModeConfiguration,
-    ) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>
-    where
-        C::Payload: Clone,
-    {
-        let mut guard = self.deps.lock().await;
-        if let Some(deps) = guard.as_ref() {
-            return Ok(deps.clone());
+        match &*self.consumer.lock().await {
+            ConsumerState::Configured { deps, .. } => deps.clone(),
+            ConsumerState::Running { deps, .. } => Some(deps.clone()),
+            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => None,
         }
-        let (consumer, keyed_state, trigger_store) = match mode {
-            ModeConfiguration::Pipeline {
-                consumer,
-                common,
-                trigger_store,
-                ..
-            }
-            | ModeConfiguration::LowLatency {
-                consumer,
-                common,
-                trigger_store,
-                ..
-            }
-            | ModeConfiguration::BestEffort {
-                consumer,
-                common,
-                trigger_store,
-            } => (consumer, &common.keyed_state, trigger_store),
-        };
-        // One knob: the reader cache follows `read_cache_size_bytes`, then
-        // `cache_size_bytes`, then the built-in default.
-        let budget = keyed_state
-            .read_cache_size_bytes
-            .or(keyed_state.cache_size_bytes)
-            .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES);
-        // The bundle depends only on the trigger-store backend, group id, and
-        // cache budget — all mode-independent — so memoizing the first caller's
-        // build and reusing it for every later `state`/`subscribe` is sound
-        // regardless of mode (mirrors the Cassandra-session reuse in
-        // `StorePair::new`). `InMemory` is exactly mock mode, so its bundle
-        // carries the shared in-memory stores that give a reader minted from it
-        // read-your-writes against the running consumer.
-        let deps = match trigger_store {
-            TriggerStoreConfiguration::InMemory => SharedDeps::memory(
-                consumer.group_id.clone(),
-                consumer.stall_threshold,
-                MemoryCells::new(),
-                MemoryPublicationStore::new(),
-                MemoryDescriptorIdentityStore::new(),
-                MemoryLoader::new(),
-                budget.get(),
-            ),
-            TriggerStoreConfiguration::Cassandra(cassandra) => {
-                SharedDeps::connect(consumer, cassandra, budget).await?
-            }
-        };
-        *guard = Some(deps.clone());
-        Ok(deps)
     }
 
     /// Composes a standalone [`StateReader`] over this client's one shared
@@ -357,14 +287,8 @@ where
         D: StateDescriptor,
         C::Payload: Clone,
     {
-        let guard = self.consumer.lock().await;
-        let mode = match &*guard {
-            ConsumerState::Configured(config) | ConsumerState::Running { config, .. } => config,
-            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
-                return Err(HighLevelClientError::UnconfiguredConsumer);
-            }
-        };
-        let deps = self.shared_deps(mode).await?;
+        let mut guard = self.consumer.lock().await;
+        let deps = shared_deps(&mut guard).await?;
         StateReader::new(&deps, subsystem, descriptor).map_err(HighLevelClientError::StateReader)
     }
 
@@ -382,37 +306,42 @@ where
         C::Payload: crate::EventType + Clone,
     {
         let mut guard = self.consumer.lock().await;
-
-        // Build (or reuse) the one shared bundle while the config is still
-        // available — before `take` — so the running consumer and any reader
-        // share it. Only `Configured` has a config to build from; other states
-        // fall through to their existing errors below.
-        let deps = match &*guard {
-            ConsumerState::Configured(config) => Some(self.shared_deps(config).await?),
-            _ => None,
-        };
-
         let consumer_ref = &mut *guard;
 
-        let config = match take(consumer_ref) {
+        // Take the state out. Only `Configured` proceeds; the others restore
+        // themselves (or leave `Unconfigured`) and return their errors.
+        let (config, existing_deps) = match take(consumer_ref) {
             ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
             ConsumerState::ConfigurationFailed(error) => {
                 return Err(HighLevelClientError::ConsumerConfiguration(error));
             }
-            ConsumerState::Configured(config) => config,
+            ConsumerState::Configured { config, deps } => (config, deps),
             running @ ConsumerState::Running { .. } => {
                 *consumer_ref = running;
                 return Err(HighLevelClientError::AlreadySubscribed);
             }
         };
 
-        // Build the consumer. `take` moved the config out and `shared_deps`
-        // memoized the bundle above, so on any failure we undo both below:
-        // restore the `Configured` state (a transient build failure must stay
-        // retryable, not wedge the client `Unconfigured`) and drop the retained
-        // bundle (it holds an open scylla session, a live rdkafka poll thread,
-        // and a registered heartbeat that would otherwise strand unusable). The
-        // next `subscribe` then rebuilds a fresh one.
+        // Build (or reuse the memoized) bundle now that we own the config, so
+        // the running consumer and any reader share it. A build failure here
+        // must stay retryable, so restore `Configured` (no bundle) and return.
+        let deps = match existing_deps {
+            Some(deps) => deps,
+            None => match build_shared_deps(&config).await {
+                Ok(deps) => deps,
+                Err(error) => {
+                    *consumer_ref = ConsumerState::Configured { config, deps: None };
+                    return Err(error);
+                }
+            },
+        };
+
+        // Build the consumer. `take` moved the config out, so on any failure we
+        // undo both below: restore the `Configured` state (a transient build
+        // failure must stay retryable, not wedge the client `Unconfigured`) and
+        // drop the bundle (it holds an open scylla session, a live rdkafka poll
+        // thread, and a registered heartbeat that would otherwise strand
+        // unusable). The next `subscribe` then rebuilds a fresh one.
         let built: Result<_, HighLevelClientError<C::Error>> = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
@@ -432,7 +361,7 @@ where
                 common,
                 self.telemetry.clone(),
                 handler.clone(),
-                deps,
+                Some(deps.clone()),
             )
             .await
             .map_err(Into::into),
@@ -453,7 +382,7 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                deps,
+                Some(deps.clone()),
             )
             .await
             .map_err(Into::into),
@@ -467,7 +396,7 @@ where
                 common,
                 self.telemetry.clone(),
                 handler.clone(),
-                deps,
+                Some(deps.clone()),
             )
             .await
             .map_err(Into::into),
@@ -477,10 +406,10 @@ where
             Ok(consumer) => consumer,
             Err(error) => {
                 // Restore the configured state so a transient build failure is
-                // retryable, then drop the retained bundle under the held
-                // consumer lock (preserving the consumer -> deps lock order).
-                *consumer_ref = ConsumerState::Configured(config);
-                *self.deps.lock().await = None;
+                // retryable, dropping the bundle (its open scylla session, live
+                // rdkafka poll thread, and registered heartbeat would otherwise
+                // strand). The next `subscribe` rebuilds a fresh one.
+                *consumer_ref = ConsumerState::Configured { config, deps: None };
                 return Err(error);
             }
         };
@@ -489,6 +418,7 @@ where
             consumer,
             config,
             handler,
+            deps,
         };
 
         Ok(())
@@ -505,31 +435,27 @@ where
             let mut guard = self.consumer.lock().await;
             let consumer_ref = &mut *guard;
 
-            let consumer = match take(consumer_ref) {
+            // Restore `Configured` without a bundle: the taken `Running.deps`
+            // is dropped here. Its heartbeat registry holds this consumer's
+            // poll-loop heartbeat, which stops beating at shutdown; reusing the
+            // same registry on a later `subscribe` would fold that
+            // permanently-dead heartbeat into `is_stalled` forever and grow the
+            // registry without a removal path. The next `subscribe` rebuilds a
+            // fresh bundle.
+            match take(consumer_ref) {
                 state @ (ConsumerState::Unconfigured
                 | ConsumerState::ConfigurationFailed(_)
-                | ConsumerState::Configured(_)) => {
+                | ConsumerState::Configured { .. }) => {
                     *consumer_ref = state;
                     return Err(HighLevelClientError::NotSubscribed);
                 }
                 ConsumerState::Running {
                     consumer, config, ..
                 } => {
-                    *consumer_ref = ConsumerState::Configured(config);
+                    *consumer_ref = ConsumerState::Configured { config, deps: None };
                     consumer
                 }
-            };
-
-            // Drop the retained bundle. Its heartbeat registry holds this
-            // consumer's poll-loop heartbeat, which stops beating at shutdown;
-            // reusing the same registry on a later `subscribe` would fold that
-            // permanently-dead heartbeat into `is_stalled` forever and grow the
-            // registry without a removal path. The next `subscribe` rebuilds a
-            // fresh bundle. Cleared while holding the consumer lock to preserve
-            // the consumer -> deps lock order.
-            *self.deps.lock().await = None;
-
-            consumer
+            }
         };
 
         info!("shutting down consumer");
@@ -568,15 +494,95 @@ fn check_topic_existence<S, C: Codec, D: Codec>(
 where
     C::Payload: crate::EventIdentity,
 {
-    let ConsumerState::Configured(mode_config) = &consumer_state else {
+    let ConsumerState::Configured { config, .. } = &consumer_state else {
         return Ok(());
     };
 
-    let missing_topics = missing_topics(producer, mode_config.configured_topics())?;
+    let missing_topics = missing_topics(producer, config.configured_topics())?;
     if missing_topics.is_empty() {
         Ok(())
     } else {
         Err(HighLevelClientError::TopicsNotFound(missing_topics))
+    }
+}
+
+/// Returns the shared bundle for the given consumer state, building and
+/// memoizing it into a `Configured` state on first need. The caller holds the
+/// `consumer` lock, so this exclusive `&mut` access is race-free. `Running`
+/// already carries its bundle; `Unconfigured`/`ConfigurationFailed` have no
+/// config to build from and error.
+async fn shared_deps<T, C: Codec>(
+    state: &mut ConsumerState<T, C>,
+) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>
+where
+    C::Payload: Clone,
+{
+    match state {
+        ConsumerState::Running { deps, .. } => Ok(deps.clone()),
+        ConsumerState::Configured { config, deps } => {
+            if let Some(existing) = deps.as_ref() {
+                return Ok(existing.clone());
+            }
+            let built = build_shared_deps(config).await?;
+            *deps = Some(built.clone());
+            Ok(built)
+        }
+        ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
+            Err(HighLevelClientError::UnconfiguredConsumer)
+        }
+    }
+}
+
+/// Builds the one shared infrastructure bundle from a mode configuration. The
+/// bundle depends only on the trigger-store backend, group id, and cache budget
+/// — all mode-independent — so the same build serves any mode (mirrors the
+/// Cassandra-session reuse in `StorePair::new`). `InMemory` is exactly mock
+/// mode, so its bundle carries the shared in-memory stores that give a reader
+/// minted from it read-your-writes against the running consumer.
+async fn build_shared_deps<C: Codec>(
+    mode: &ModeConfiguration,
+) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>
+where
+    C::Payload: Clone,
+{
+    let (consumer, keyed_state, trigger_store) = match mode {
+        ModeConfiguration::Pipeline {
+            consumer,
+            common,
+            trigger_store,
+            ..
+        }
+        | ModeConfiguration::LowLatency {
+            consumer,
+            common,
+            trigger_store,
+            ..
+        }
+        | ModeConfiguration::BestEffort {
+            consumer,
+            common,
+            trigger_store,
+        } => (consumer, &common.keyed_state, trigger_store),
+    };
+    // One knob: the reader cache follows `read_cache_size_bytes`, then
+    // `cache_size_bytes`, then the built-in default.
+    let budget = keyed_state
+        .read_cache_size_bytes
+        .or(keyed_state.cache_size_bytes)
+        .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES);
+    match trigger_store {
+        TriggerStoreConfiguration::InMemory => Ok(SharedDeps::memory(
+            consumer.group_id.clone(),
+            consumer.stall_threshold,
+            MemoryCells::new(),
+            MemoryPublicationStore::new(),
+            MemoryDescriptorIdentityStore::new(),
+            MemoryLoader::new(),
+            budget.get(),
+        )),
+        TriggerStoreConfiguration::Cassandra(cassandra) => {
+            Ok(SharedDeps::connect(consumer, cassandra, budget).await?)
+        }
     }
 }
 

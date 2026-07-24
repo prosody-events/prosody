@@ -35,6 +35,7 @@ use crate::state_reader::stores::ReaderStores;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::try_join;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -153,26 +154,19 @@ impl<C: Codec> SharedDeps<C> {
             .map_err(|e| StateReaderError::store(&e))?;
         let keyspace = &cassandra_config.keyspace;
 
-        let cell_queries = Arc::new(
-            CellQueries::new(store.session(), keyspace)
-                .await
-                .map_err(|e| StateReaderError::store(&e))?,
-        );
-        let cells = CassandraCellResources::new(store.clone(), cell_queries);
-
-        let identity_queries = Arc::new(
-            IdentityQueries::new(store.session(), keyspace)
-                .await
-                .map_err(|e| StateReaderError::store(&e))?,
-        );
-        let identities = CassandraDescriptorIdentityStore::new(store.clone(), identity_queries);
-
-        let publication_queries = Arc::new(
-            PublicationQueries::new(store.session(), keyspace)
-                .await
-                .map_err(|e| StateReaderError::store(&e))?,
-        );
-        let publications = CassandraPublicationStore::new(store.clone(), publication_queries);
+        // The three query sets each need only session + keyspace, so prepare
+        // them concurrently rather than paying three serial round trips.
+        let (cell_queries, identity_queries, publication_queries) = try_join!(
+            CellQueries::new(store.session(), keyspace),
+            IdentityQueries::new(store.session(), keyspace),
+            PublicationQueries::new(store.session(), keyspace),
+        )
+        .map_err(|e| StateReaderError::store(&e))?;
+        let cells = CassandraCellResources::new(store.clone(), Arc::new(cell_queries));
+        let identities =
+            CassandraDescriptorIdentityStore::new(store.clone(), Arc::new(identity_queries));
+        let publications =
+            CassandraPublicationStore::new(store.clone(), Arc::new(publication_queries));
 
         // Registers the loader's poll-loop heartbeat into the registry built
         // above — the reason the registry is constructed first.
@@ -253,8 +247,15 @@ impl<C: Codec> SharedDeps<C> {
     /// building its own.
     pub(crate) fn shared_storage(&self) -> SharedStorage {
         match &self.stores {
-            ReaderStores::Cassandra { cells, .. } => SharedStorage::Cassandra {
+            ReaderStores::Cassandra {
+                cells,
+                publications,
+                identities,
+            } => SharedStorage::Cassandra {
                 store: cells.session.clone(),
+                cells: cells.clone(),
+                identities: identities.clone(),
+                publications: publications.clone(),
             },
             ReaderStores::Memory {
                 cells,
