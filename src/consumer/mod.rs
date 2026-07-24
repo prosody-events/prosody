@@ -1143,14 +1143,13 @@ where
     keyed_state.provider(backend, loader, publisher_template)
 }
 
-/// The memory cell + identity stores that back the state provider: the shared
-/// bundle's instances when one was supplied (so a reader minted from the same
-/// bundle reads-your-writes), otherwise fresh stores. A Cassandra bundle handed
-/// to a memory arm is an incoherent-backend bug — unreachable by construction
-/// (the composition derives both from one config) — surfaced as
-/// [`ConsumerError::SharedDepsBackendMismatch`] rather than silently swapping
-/// in fresh, unshared stores (which would break mock read-your-writes),
-/// mirroring the Cassandra arm's [`cassandra_arm_inputs`].
+/// The memory cell and identity stores backing the state provider. Returns the
+/// shared bundle's stores when one is supplied, so a reader built from the same
+/// bundle sees this consumer's committed writes; otherwise returns fresh
+/// stores. A Cassandra bundle cannot back a memory arm: the composition derives
+/// both from one config, so this mismatch is reported as
+/// [`ConsumerError::SharedDepsBackendMismatch`]. See [`cassandra_arm_inputs`]
+/// for the mirror.
 fn shared_memory_handles(
     shared: Option<SharedStorage>,
 ) -> Result<(MemoryCells, MemoryDescriptorIdentityStore), ConsumerError> {
@@ -1164,9 +1163,9 @@ fn shared_memory_handles(
 }
 
 /// The memory-arm inputs a consumer resolves from an optional shared bundle:
-/// `(loader, cells, identities, partition_counts)` — the bundle's when one is
-/// supplied (so a reader minted from the same bundle reads-your-writes),
-/// otherwise fresh mock defaults.
+/// `(loader, cells, identities, partition_counts)`. These come from the bundle
+/// when one is supplied, so a reader built from the same bundle sees this
+/// consumer's committed writes; otherwise they are fresh mock defaults.
 type MemoryArmInputs<P> = (
     MemoryLoader<P>,
     MemoryCells,
@@ -1191,11 +1190,10 @@ where
 }
 
 /// The Cassandra-arm inputs a consumer resolves from an optional shared bundle:
-/// the Kafka loader (the bundle's `Clone` shares the client and poll thread,
-/// else a freshly built one) and the partition-count source. A memory bundle
-/// handed to a Cassandra arm is an incoherent-backend bug — unreachable by
-/// construction — surfaced as [`ConsumerError::SharedDepsBackendMismatch`]
-/// rather than an unwrap.
+/// the Kafka loader and the partition-count source. A supplied bundle's `Clone`
+/// shares the client and poll thread; otherwise the loader is freshly built. A
+/// memory bundle cannot back a Cassandra arm: that mismatch is reported as
+/// [`ConsumerError::SharedDepsBackendMismatch`].
 fn cassandra_arm_inputs<C: Codec>(
     deps: Option<&SharedDeps<C>>,
     consumer_config: &ConsumerConfiguration,

@@ -161,6 +161,24 @@ designs are where bloat and bug re-introduction live:
 - Write doc comments for a reader unfamiliar with the codebase: help them
   navigate the concept. Lead with what the reader needs — what the thing is,
   how to use it, what guarantee it gives — not the internal mechanism.
+- **Short declarative sentences, one idea each.** The banned shape is the
+  six-line sentence that chains clauses with dashes and nests parentheticals
+  three deep. At most one parenthetical aside per comment, never nested; a
+  sentence that needs a second dash or parenthesis gets split instead.
+- **Never argue with an imagined reviewer.** "X rather than Y (which would
+  break Z), mirroring W" is design-review prose. State what the code does and
+  the invariant it upholds. Mention a rejected alternative only when a
+  maintainer would plausibly reintroduce it, as its own plain sentence: "Do
+  not swap in fresh stores here: mock read-your-writes depends on sharing."
+- **No invented compound jargon.** Ad-hoc hyphenated noun chains
+  ("incoherent-backend bug", "reads-your-writes bundle",
+  "unreachable-by-construction") compress meaning the reader does not yet
+  have; spell the idea out in ordinary words. Established terms that name one
+  precise mechanism (last-write-wins, read-your-writes as a consistency level)
+  keep their standard form.
+- **Read-aloud test:** a comment you cannot read aloud in one breath, or that
+  a colleague could not paraphrase back after one hearing, gets rewritten
+  before it lands.
 - Docs address the future reader, never the current conversation: no
   review-response prose, no "the reviewer/advisor said", no phrasing copied
   from scratch plans or design docs. Restate the invariant in the code's own
