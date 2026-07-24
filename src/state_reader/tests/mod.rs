@@ -4,8 +4,8 @@
 //! **real** owner
 //! [`KeyedStateSession`](crate::state::session::KeyedStateSession),
 //! using its set/finalize/promote calls. The reader then reads that state
-//! back through the stores that bypass the commit oracle. Time comes from
-//! an injected [`ReaderClock`](super::cache::ReaderClock), never a sleep.
+//! back through the stores that bypass the commit oracle. Time comes from a
+//! mocked [`quanta::Clock`], advanced explicitly, never a sleep.
 //!
 //! The scaffolding lives in [`support`]: a backend-generic owner-write
 //! harness, a scripted fault source, a counting identity store, and a

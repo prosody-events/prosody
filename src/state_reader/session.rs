@@ -181,13 +181,12 @@ impl<C: Codec> ReadSession<C> {
                 self.stores.read_committed(&id, cell).await
             }
             Some(ttl) => {
-                let ttl_ms = ttl.as_millis() as u64;
                 let key = self.cache_key(source, cell);
                 // `collection_id_for` does key murmur and segment routing. It
                 // runs only inside the fill closure on a cache miss, never on a
                 // hit.
                 self.cache
-                    .get_cached(key, ttl_ms, || async {
+                    .get_cached(key, ttl, || async {
                         let id = self.collection_id_for(source)?;
                         self.stores.read_committed(&id, cell).await
                     })
@@ -210,7 +209,6 @@ impl<C: Codec> ReadSession<C> {
                 self.stores.read_committed_many(&id, section, batch).await
             }
             Some(ttl) => {
-                let ttl_ms = ttl.as_millis() as u64;
                 let keys: CellBuffer<CacheKey> = batch
                     .iter()
                     .map(|coordinate| {
@@ -226,7 +224,7 @@ impl<C: Codec> ReadSession<C> {
                 // `collection_id_for` runs only when the batch fill fires (a
                 // miss), never when the batch is served entirely from the cache.
                 self.cache
-                    .get_many_cached(&keys, ttl_ms, || async {
+                    .get_many_cached(&keys, ttl, || async {
                         let id = self.collection_id_for(source)?;
                         self.stores.read_committed_many(&id, section, batch).await
                     })

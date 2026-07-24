@@ -85,24 +85,27 @@ fn zero_recovery_delay_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// A read-cache TTL under one millisecond truncates to zero, so every cached
-/// entry would be born stale. Validation rejects it here, mirroring the check
-/// applied when the reader is constructed. A TTL of one millisecond or more,
-/// and the explicit `None` opt-out, both validate.
+/// A zero read-cache TTL would make every cached entry born stale. Validation
+/// rejects it here, mirroring the check applied when the reader is constructed.
+/// A sub-millisecond TTL is valid — reader age is measured against a
+/// nanosecond-resolution monotonic clock — and so are longer TTLs and the
+/// explicit `None` opt-out.
 #[test]
-fn sub_millisecond_read_cache_ttl_is_rejected() -> Result<()> {
+fn zero_read_cache_ttl_is_rejected() -> Result<()> {
     use std::time::Duration;
     let degenerate = KeyedStateConfiguration::builder()
-        .read_cache_ttl(Some(Duration::from_micros(500)))
+        .read_cache_ttl(Some(Duration::ZERO))
         .build()?;
     assert!(
         degenerate.validate().is_err(),
-        "a sub-millisecond read_cache_ttl must fail validation"
+        "a zero read_cache_ttl must fail validation"
     );
-    let valid = KeyedStateConfiguration::builder()
-        .read_cache_ttl(Some(Duration::from_millis(1)))
-        .build()?;
-    valid.validate()?;
+    for ttl in [Duration::from_micros(500), Duration::from_millis(1)] {
+        let valid = KeyedStateConfiguration::builder()
+            .read_cache_ttl(Some(ttl))
+            .build()?;
+        valid.validate()?;
+    }
     let disabled = KeyedStateConfiguration::builder()
         .read_cache_ttl(None)
         .build()?;

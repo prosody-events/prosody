@@ -33,7 +33,7 @@ use crate::state::session::{Finalized, KeyedStateSession, SessionParts, Terminat
 use crate::state::store::{CellBuffer, CellStore, CoordinateBatch};
 use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore, probe};
 use crate::state::{EventRef, PartitionBackend, StateName, StateType};
-use crate::state_reader::cache::{ReaderCache, ReaderClock};
+use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::loader::ReaderLoader;
 use crate::state_reader::stores::ReaderStores;
@@ -47,12 +47,13 @@ use bytes::Bytes;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::{Stream, StreamExt, TryStreamExt};
 use internment::Intern;
+use quanta::{Clock, Mock};
 use scc::hash_map::Entry;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -821,25 +822,20 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     pub(super) fn reader_with_interval(
         &self,
         cache: ReaderCache,
-        refresh_interval_ms: u64,
+        refresh_interval: Duration,
     ) -> Result<StateReader<D, JsonCodec>> {
         let deps = self.deps_with_cache(cache);
-        StateReader::new_with_interval(
-            &deps,
-            self.sub.clone(),
-            self.descriptor,
-            refresh_interval_ms,
-        )
-        .map_err(|e| eyre!("reader: {e}"))
+        StateReader::new_with_interval(&deps, self.sub.clone(), self.descriptor, refresh_interval)
+            .map_err(|e| eyre!("reader: {e}"))
     }
 }
 
-/// A cache with a fixed, test-driven clock over `budget` declared bytes,
-/// returning the shared millisecond handle the test advances (never a sleep).
-pub(super) fn fixed_clock_cache(budget: u64) -> (ReaderCache, Arc<AtomicU64>) {
-    let now = Arc::new(AtomicU64::new(0));
-    let cache = ReaderCache::with_clock(budget, ReaderClock::Fixed(now.clone()));
-    (cache, now)
+/// A cache with a mocked clock over `budget` declared bytes, returning the
+/// [`Mock`] handle the test advances (never a sleep). The mock starts at zero
+/// and only moves forward, mirroring the monotonic clock production uses.
+pub(super) fn mock_clock_cache(budget: u64) -> (ReaderCache, Arc<Mock>) {
+    let (clock, mock) = Clock::mock();
+    (ReaderCache::with_clock(budget, clock), mock)
 }
 
 /// Collects a fallible reader stream into a `Vec`, surfacing the first error.

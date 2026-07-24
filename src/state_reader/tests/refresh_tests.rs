@@ -16,7 +16,7 @@
 //! sticky example, which uses `new_with_interval` for the cached fast path.
 
 use super::support::{
-    CountingIdentityStore, GROUP_A, GROUP_B, ScriptedEnv, fixed_clock_cache, topic,
+    CountingIdentityStore, GROUP_A, GROUP_B, ScriptedEnv, mock_clock_cache, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
@@ -35,7 +35,7 @@ use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::iter::{empty, once};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 // --- Snapshot-refresh property ----------------------------------------------
 
@@ -393,9 +393,9 @@ async fn identity_mismatch_sticky() -> Result<()> {
     perturbed.kind = perturbed.kind.wrapping_add(1);
     env.identities.seed(GROUP_B, &perturbed).await;
 
-    let (cache, clock) = fixed_clock_cache(1 << 20);
+    let (cache, mock) = mock_clock_cache(1 << 20);
     // A non-zero interval so op 2 takes the cached-snapshot fast path.
-    let reader = env.reader_with_interval(cache, 60_000)?;
+    let reader = env.reader_with_interval(cache, Duration::from_mins(1))?;
 
     // Op 1, at t=0: the initial refresh detects B's mismatch. A is still admitted.
     match reader.get(key.clone()).await {
@@ -409,7 +409,7 @@ async fn identity_mismatch_sticky() -> Result<()> {
         other => bail!("op 2 (within interval) expected a sticky IdentityMismatch, got {other:?}"),
     }
     // Elapse the interval and make every routing read fail.
-    clock.store(120_000, Ordering::Relaxed);
+    mock.increment(Duration::from_mins(2));
     env.publications.fail_reads_with(ErrorCategory::Transient);
     // Op 3 (stale → refresh, read fails): the sticky mismatch outranks the
     // admitted subset even though the routing read failed.

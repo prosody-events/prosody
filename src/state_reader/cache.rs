@@ -3,11 +3,11 @@
 //! `quick_cache` has no native TTL, so this module supplies one over it. Two
 //! rules make it race-free (see [`ReaderCache`]):
 //!
-//! * **Unique [`Stamp`]** `(issued_ms, seq)`. Bare milliseconds collide when
-//!   two fills land in one millisecond, or when the test clock is frozen. A
-//!   colliding stamp would let expiry evict a newer fill. The per-bundle `seq`
-//!   counter makes every issued store read's stamp unique. See [`Stamp`] for
-//!   how the two fields stay separate.
+//! * **Unique [`Stamp`]** `(issued, seq)`. Two fills can read one instant: a
+//!   mocked clock stands still between increments, and concurrent readers can
+//!   land on the same tick. A colliding stamp would let expiry evict a newer
+//!   fill. The per-bundle `seq` counter makes every issued store read's stamp
+//!   unique. See [`Stamp`] for how the two fields stay separate.
 //! * **Stamp taken at issue.** The stamp is taken when the store read is
 //!   issued, not when it completes. TTL therefore bounds the age since the read
 //!   began. A slow fill enters already-aged, so it cannot pass an old value off
@@ -27,12 +27,13 @@ use crate::state::cell_key::CellKey;
 use crate::state::store::CellBuffer;
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
+use quanta::{Clock, Instant};
 use quick_cache::Weighter;
 use quick_cache::sync::{Cache, DefaultLifecycle, EntryAction, EntryResult};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Fixed per-entry accounting overhead added to every entry's declared weight,
 /// so a zero-byte negative entry still costs the budget something.
@@ -41,23 +42,29 @@ const READER_CACHE_ENTRY_OVERHEAD: u64 = 64;
 /// A cache entry's issue token. The two fields answer two different questions,
 /// so they are never combined into one ordering:
 ///
-/// * `issued_ms` governs TTL age (see [`ReaderCache::fresh`]): the wall-time
+/// * `issued` governs TTL age (see [`ReaderCache::fresh`]): the time elapsed
 ///   since observation began.
 /// * `seq` governs issue order (see [`ReaderCache::write_through`]'s
 ///   newer-wins). The per-bundle atomic counter is the only total order of when
 ///   reads were issued.
 ///
 /// The clock is read before the separate `fetch_add` of `seq`. So a fill that
-/// read an earlier millisecond can still get a higher `seq` than one that read
-/// a later millisecond. Newer-wins therefore compares `seq` alone. Do not add
-/// an `Ord` derive and compare `(issued_ms, seq)`: an older-issued fill could
-/// then overwrite a newer one, losing the newer write. Expiry compares the
-/// whole stamp for equality. The unique `seq` means `remove_if` never evicts a
+/// read an earlier instant can still get a higher `seq` than one that read a
+/// later instant. Newer-wins therefore compares `seq` alone. Do not add an
+/// `Ord` derive and compare `(issued, seq)`: an older-issued fill could then
+/// overwrite a newer one, losing the newer write. Expiry compares the whole
+/// stamp for equality. The unique `seq` means `remove_if` never evicts a
 /// racing newer fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stamp {
-    /// Milliseconds since the epoch when the backing store read was issued.
-    issued_ms: u64,
+    /// When the backing store read was issued, on a monotonic clock.
+    ///
+    /// TTL age is elapsed time, so it is never measured on the wall clock. A
+    /// backwards NTP step would floor every entry's age at zero and serve stale
+    /// values indefinitely. A forwards step would expire the whole cache at
+    /// once. A [`quanta::Instant`] only moves forward, so age is always the
+    /// real elapsed time.
+    issued: Instant,
     /// Per-bundle monotonic issue counter, unique and totally ordered across
     /// all issued reads — the newer-wins key.
     seq: u64,
@@ -76,31 +83,6 @@ type CacheVal = (Stamp, Option<Bytes>);
 /// The concrete `quick_cache` instance the reader shares, byte-weighted and
 /// `ahash`-hashed.
 type ReaderCacheInner = Cache<CacheKey, CacheVal, ReaderWeighter, ahash::RandomState>;
-
-/// A wall clock, injectable in tests. The reader defines its own clock type
-/// rather than importing one from the owner-side cache.
-#[derive(Clone)]
-pub(crate) enum ReaderClock {
-    /// Wall clock: milliseconds since the epoch.
-    Wall,
-    /// A test clock advanced explicitly, never by sleeping.
-    #[cfg(test)]
-    Fixed(Arc<AtomicU64>),
-}
-
-impl ReaderClock {
-    /// Milliseconds since the epoch.
-    pub(crate) fn now_ms(&self) -> u64 {
-        match self {
-            Self::Wall => match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(elapsed) => elapsed.as_millis() as u64,
-                Err(_) => 0,
-            },
-            #[cfg(test)]
-            Self::Fixed(now) => now.load(Ordering::Relaxed),
-        }
-    }
-}
 
 /// Byte weigher: key byte length + value byte length + a fixed overhead. The
 /// budget bounds **declared weight** (bytes + overhead), never process RSS.
@@ -133,25 +115,27 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
 #[derive(Clone)]
 pub(crate) struct ReaderCache {
     inner: Arc<ReaderCacheInner>,
-    clock: ReaderClock,
+    clock: Clock,
     seq: Arc<AtomicU64>,
 }
 
 impl ReaderCache {
-    /// A wall-clock cache holding up to `budget` declared bytes.
+    /// A cache holding up to `budget` declared bytes, aged on the process
+    /// monotonic clock.
     #[must_use]
     pub(crate) fn with_budget(budget: u64) -> Self {
-        Self::build(budget, ReaderClock::Wall)
+        Self::build(budget, Clock::new())
     }
 
-    /// A cache with an injected clock, for deterministic TTL tests.
+    /// A cache with an injected clock, for deterministic TTL tests. Pair it
+    /// with [`quanta::Clock::mock`] and advance the returned handle.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_clock(budget: u64, clock: ReaderClock) -> Self {
+    pub(crate) fn with_clock(budget: u64, clock: Clock) -> Self {
         Self::build(budget, clock)
     }
 
-    fn build(budget: u64, clock: ReaderClock) -> Self {
+    fn build(budget: u64, clock: Clock) -> Self {
         // Estimate item count from the budget and the fixed overhead, so
         // quick_cache sizes its shards sensibly; the byte budget is the real
         // bound.
@@ -177,23 +161,28 @@ impl ReaderCache {
     }
 
     /// A clone of the cache's clock, so the reader's snapshot-refresh cadence
-    /// and the cache's TTL age observe the same (possibly injected) time.
-    pub(crate) fn clock(&self) -> ReaderClock {
+    /// and the cache's TTL age observe the same (possibly mocked) time.
+    pub(crate) fn clock(&self) -> Clock {
         self.clock.clone()
     }
 
-    /// A fresh, unique issue stamp (`seq` monotonic, `issued_ms` from the
-    /// clock).
+    /// A fresh, unique issue stamp: the clock's current instant and the next
+    /// issue sequence.
     fn issue_stamp(&self) -> Stamp {
+        self.stamp_at(self.clock.now())
+    }
+
+    /// [`Self::issue_stamp`] at an explicit issue instant.
+    fn stamp_at(&self, issued: Instant) -> Stamp {
         Stamp {
-            issued_ms: self.clock.now_ms(),
+            issued,
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
         }
     }
 
-    /// Whether an entry stamped `stamp` is still fresh under `ttl_ms`.
-    fn fresh(&self, stamp: Stamp, ttl_ms: u64) -> bool {
-        self.clock.now_ms().saturating_sub(stamp.issued_ms) < ttl_ms
+    /// Whether an entry stamped `stamp` is still fresh under `ttl`.
+    fn fresh(&self, stamp: Stamp, ttl: Duration) -> bool {
+        self.clock.now().duration_since(stamp.issued) < ttl
     }
 
     /// The read-through point read. Serve a fresh hit. Expire a stale hit,
@@ -206,7 +195,7 @@ impl ReaderCache {
     pub(crate) async fn get_cached<F, Fut>(
         &self,
         key: CacheKey,
-        ttl_ms: u64,
+        ttl: Duration,
         fill: F,
     ) -> Result<Option<Bytes>, StateAccessError>
     where
@@ -216,7 +205,7 @@ impl ReaderCache {
         loop {
             match self.inner.get_value_or_guard_async(&key).await {
                 Ok((stamp, value)) => {
-                    if self.fresh(stamp, ttl_ms) {
+                    if self.fresh(stamp, ttl) {
                         return Ok(value);
                     }
                     // Stale for this reader: evict iff still this exact stamp,
@@ -246,7 +235,7 @@ impl ReaderCache {
     pub(crate) async fn get_many_cached<F, Fut>(
         &self,
         keys: &[CacheKey],
-        ttl_ms: u64,
+        ttl: Duration,
         fill: F,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
     where
@@ -256,7 +245,7 @@ impl ReaderCache {
         let mut hits: CellBuffer<Option<Bytes>> = CellBuffer::with_capacity(keys.len());
         for key in keys {
             match self.inner.get(key) {
-                Some((stamp, value)) if self.fresh(stamp, ttl_ms) => hits.push(value),
+                Some((stamp, value)) if self.fresh(stamp, ttl) => hits.push(value),
                 // A single miss refetches the whole batch, so probing the
                 // remaining keys is wasted work — stop at the first.
                 _ => break,
@@ -295,7 +284,7 @@ impl ReaderCache {
         let outcome = self
             .inner
             .entry_async(key, |_, existing: &mut CacheVal| {
-                // Newer-wins compares `seq` alone, never `(issued_ms, seq)`.
+                // Newer-wins compares `seq` alone, never `(issued, seq)`.
                 // See [`Stamp`].
                 if stamp.seq > existing.0.seq {
                     *existing = (stamp, value.clone());
@@ -306,5 +295,23 @@ impl ReaderCache {
         if let EntryResult::Vacant(guard) = outcome {
             let _ = guard.insert((stamp, value));
         }
+    }
+
+    /// [`Self::write_through`] at an explicit issue instant, taking the next
+    /// issue sequence.
+    ///
+    /// The newer-wins pin needs an entry issued at an *earlier* instant with a
+    /// *later* sequence. In production that pair comes from two fills
+    /// interleaving between the clock read and the `seq` increment, which no
+    /// test can schedule deterministically, and a monotonic clock can never
+    /// hand it out in issue order. So the pin builds the pair here.
+    #[cfg(test)]
+    pub(crate) async fn write_through_at(
+        &self,
+        key: &CacheKey,
+        issued: Instant,
+        value: Option<Bytes>,
+    ) {
+        self.write_through(key, self.stamp_at(issued), value).await;
     }
 }

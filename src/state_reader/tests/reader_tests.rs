@@ -261,21 +261,21 @@ async fn read_cache_policy_resolves_against_the_bundle_default() -> Result<()> {
     Ok(())
 }
 
-/// A bundle default that truncates to zero milliseconds fails reader
-/// construction exactly like an explicit collection TTL would. The reader
-/// validates the resolved policy, not just the collection's own setting,
-/// so a degenerate default read from configuration cannot slip through.
+/// A zero bundle default fails reader construction exactly like an explicit
+/// collection TTL would. The reader validates the resolved policy, not just the
+/// collection's own setting, so a degenerate default read from configuration
+/// cannot slip through.
 ///
 /// Falsify: move the TTL validation before the bundle-default resolution.
 /// The collection inherits, so it validates `None` and the reader
 /// constructs instead of rejecting.
 #[tokio::test]
-async fn zero_ms_bundle_default_is_rejected_at_reader_construction() -> Result<()> {
+async fn zero_bundle_default_is_rejected_at_reader_construction() -> Result<()> {
     let harness = MemoryHarness::new();
     let descriptor = value_state::<JsonCodec>("v-zero-default");
     let deps = harness
         .deps(1 << 20)
-        .with_default_read_cache_ttl(Some(Duration::from_nanos(1)));
+        .with_default_read_cache_ttl(Some(Duration::ZERO));
     match StateReader::new(&deps, subsystem()?, descriptor) {
         Err(StateReaderError::InvalidReadCache { .. }) => Ok(()),
         Err(other) => bail!("expected InvalidReadCache, got {other:?}"),

@@ -26,7 +26,7 @@ use crate::state::descriptor::{
 use crate::state::descriptor_identity::{self, DurableDescriptorIdentity};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state::publication::StatePublication;
-use crate::state_reader::cache::{ReaderCache, ReaderClock};
+use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::loader::ReaderLoader;
@@ -37,6 +37,7 @@ use crate::state_reader::source::{
 use crate::state_reader::stores::ReaderStores;
 use crate::subsystem::SubsystemName;
 use futures::stream::{self, Stream, StreamExt};
+use quanta::{Clock, Instant};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -47,10 +48,10 @@ use tracing::warn;
 
 /// The default snapshot-refresh cadence: a source list changes rarely, so the
 /// reader re-reads the routing table at most once per minute per collection.
-const DEFAULT_REFRESH_INTERVAL_MS: u64 = 60_000;
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 
 /// The reader's cached view of a collection's publication sources plus the
-/// wall-clock instant the view was last refreshed.
+/// instant the view was last refreshed.
 ///
 /// The snapshot is an `Option`. An **absent** snapshot is stored as `None`,
 /// never as an empty [`ValidatedPublications`]. Absence means no admitted
@@ -65,7 +66,9 @@ struct SnapshotState {
     /// cached snapshot. A refresh that re-reads and re-validates clears it
     /// automatically.
     mismatch: Option<String>,
-    refreshed_at_ms: u64,
+    /// When the last refresh completed. `None` until the first one, which is
+    /// why a fresh reader always refreshes on its first read.
+    refreshed_at: Option<Instant>,
 }
 
 /// The running result of a refresh's identity validation: the admitted
@@ -102,8 +105,8 @@ pub struct StateReader<D, C: Codec> {
     stores: ReaderStores,
     loader: Arc<ReaderLoader<C>>,
     cache: ReaderCache,
-    clock: ReaderClock,
-    refresh_interval_ms: u64,
+    clock: Clock,
+    refresh_interval: Duration,
     snapshot: Mutex<SnapshotState>,
     /// The source bundle's construction id, copied verbatim so a test can prove
     /// two readers descend from the same [`SharedDeps`] construction.
@@ -127,23 +130,23 @@ where
     /// # Errors
     ///
     /// Returns [`StateReaderError::InvalidReadCache`] when the effective
-    /// read-cache TTL is degenerate (zero or sub-millisecond), or
-    /// [`StateReaderError::Unsupported`] when the collection name is empty.
+    /// read-cache TTL is zero, or [`StateReaderError::Unsupported`] when the
+    /// collection name is empty.
     pub fn new(
         deps: &SharedDeps<C>,
         subsystem: SubsystemName,
         descriptor: D,
     ) -> Result<Self, StateReaderError> {
-        Self::with_refresh_interval(deps, subsystem, descriptor, DEFAULT_REFRESH_INTERVAL_MS)
+        Self::with_refresh_interval(deps, subsystem, descriptor, DEFAULT_REFRESH_INTERVAL)
     }
 
     /// [`Self::new`] with an explicit refresh cadence — the tests drive it to
-    /// `0` so every operation refreshes the snapshot.
+    /// [`Duration::ZERO`] so every operation refreshes the snapshot.
     fn with_refresh_interval(
         deps: &SharedDeps<C>,
         subsystem: SubsystemName,
         descriptor: D,
-        refresh_interval_ms: u64,
+        refresh_interval: Duration,
     ) -> Result<Self, StateReaderError> {
         let collection = descriptor.collection_def();
         let read_cache_ttl = collection.read_cache.resolve(deps.default_read_cache_ttl());
@@ -162,11 +165,11 @@ where
             loader: deps.loader().clone(),
             cache: deps.cache().clone(),
             clock: deps.cache().clock(),
-            refresh_interval_ms,
+            refresh_interval,
             snapshot: Mutex::new(SnapshotState {
                 snapshot: None,
                 mismatch: None,
-                refreshed_at_ms: 0,
+                refreshed_at: None,
             }),
             #[cfg(test)]
             deps_instance_id: deps.instance_id(),
@@ -203,8 +206,11 @@ where
     /// thundering herd of reads all refresh at once.
     async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
         let mut state = self.snapshot.lock().await;
-        let now = self.clock.now_ms();
-        if now.saturating_sub(state.refreshed_at_ms) < self.refresh_interval_ms {
+        let now = self.clock.now();
+        if state
+            .refreshed_at
+            .is_some_and(|at| now.duration_since(at) < self.refresh_interval)
+        {
             // A sticky mismatch outranks the cached snapshot: a Permanent
             // misconfiguration surfaces on every read, never masked by the
             // admitted subset. An absent snapshot with no mismatch falls
@@ -226,7 +232,7 @@ where
     async fn refresh(
         &self,
         state: &mut SnapshotState,
-        now: u64,
+        now: Instant,
     ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
         let prior = state.snapshot.clone();
         let rows = match self
@@ -246,7 +252,7 @@ where
         if rows.is_empty() {
             state.snapshot = None;
             state.mismatch = None;
-            state.refreshed_at_ms = now;
+            state.refreshed_at = Some(now);
             return Err(self.unknown_publication());
         }
 
@@ -273,7 +279,7 @@ where
             )?))
         };
         state.mismatch.clone_from(&admission.mismatch);
-        state.refreshed_at_ms = now;
+        state.refreshed_at = Some(now);
 
         if let Some(group) = admission.mismatch {
             return Err(StateReaderError::IdentityMismatch { group });
@@ -426,15 +432,15 @@ where
     }
 }
 
-/// Rejects a degenerate read-cache TTL. A cache policy whose TTL truncates
-/// to zero milliseconds would make every entry born stale, so it fails
-/// `Permanent` at construction.
+/// Rejects a degenerate read-cache TTL. A zero TTL would make every entry born
+/// stale, so it fails `Permanent` at construction. Sub-millisecond TTLs are
+/// supported: age is measured against a nanosecond-resolution monotonic clock.
 fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
     if let Some(ttl) = ttl
-        && ttl.as_millis() == 0
+        && ttl.is_zero()
     {
         return Err(StateReaderError::InvalidReadCache {
-            reason: "cache ttl truncates to zero milliseconds",
+            reason: "cache ttl is zero",
         });
     }
     Ok(())
@@ -657,19 +663,20 @@ where
         subsystem: SubsystemName,
         descriptor: D,
     ) -> Result<Self, StateReaderError> {
-        Self::with_refresh_interval(deps, subsystem, descriptor, 0)
+        Self::with_refresh_interval(deps, subsystem, descriptor, Duration::ZERO)
     }
 
     /// A reader with an explicit non-zero refresh interval — the driver for the
-    /// sticky-mismatch test, which needs the cached-snapshot fast path
-    /// (`now - refreshed_at_ms < interval`) to fire on the second operation.
+    /// sticky-mismatch test, which needs the cached-snapshot fast path (the age
+    /// since the last refresh still inside the interval) to fire on the second
+    /// operation.
     pub(crate) fn new_with_interval(
         deps: &SharedDeps<C>,
         subsystem: SubsystemName,
         descriptor: D,
-        refresh_interval_ms: u64,
+        refresh_interval: Duration,
     ) -> Result<Self, StateReaderError> {
-        Self::with_refresh_interval(deps, subsystem, descriptor, refresh_interval_ms)
+        Self::with_refresh_interval(deps, subsystem, descriptor, refresh_interval)
     }
 
     /// The source bundle's construction id (see [`SharedDeps::instance_id`]).

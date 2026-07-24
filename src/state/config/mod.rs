@@ -134,8 +134,7 @@ pub struct KeyedStateConfiguration {
     ///
     /// Environment variable: `PROSODY_STATE_READ_CACHE_TTL` (a humantime
     /// duration such as `5s` or `750ms`; `none` disables the inherited
-    /// default). Must not truncate to zero
-    /// milliseconds: every cached entry would be born stale.
+    /// default). Must not be zero: every cached entry would be born stale.
     #[builder(
         default = "from_option_duration_env_with_fallback(STATE_READ_CACHE_TTL_ENV, \
                    DEFAULT_READ_CACHE_TTL)?"
@@ -293,8 +292,8 @@ fn validate_recovery_delay(recovery_delay: &CompactDuration) -> Result<(), Valid
 }
 
 fn validate_read_cache_ttl(ttl: &Duration) -> Result<(), ValidationError> {
-    if ttl.as_millis() == 0 {
-        return Err(ValidationError::new("read_cache_ttl_zero_ms"));
+    if ttl.is_zero() {
+        return Err(ValidationError::new("read_cache_ttl_zero"));
     }
     Ok(())
 }

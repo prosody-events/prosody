@@ -489,8 +489,8 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// A [`std::time::Duration`] sets this collection's TTL. Pass
     /// [`ReadCachePolicy::Disabled`] to read the durable store on every
     /// operation. Unset collections inherit the reader client's default.
-    /// Sub-second TTLs are supported; a TTL that truncates to zero milliseconds
-    /// is rejected at reader construction.
+    /// Sub-second TTLs are supported; a zero TTL is rejected at reader
+    /// construction.
     ///
     /// Applies only in the read-only client, which consumes it from the
     /// descriptor *the reader itself* passes to `StateReader::new` /
