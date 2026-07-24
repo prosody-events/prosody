@@ -215,6 +215,7 @@ designs are where bloat and bug re-introduction live:
 - Never add self-attribution to branch names, commits, PR titles, PR descriptions, or code comments.
 - Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`).
 - PR titles and descriptions are written for a reader who is **not** intimately familiar with the project. Be readable, well written, and well styled. Lead with what changed and why; assume nothing about the reader's session context.
+- **Never hard-wrap paragraphs in GitHub PR descriptions, PR comments, or issue text.** GitHub renders literal newlines, so a paragraph wrapped at 80 columns displays as ragged broken lines instead of flowing to the layout. Each prose paragraph is one single line; blank lines separate paragraphs. (Column-wrapping stays correct where it belongs: code, commit message bodies, and markdown files read in editors.)
 - **PR descriptions never include a test plan or a list of verification steps.** Reviewers don't need a checklist of what you ran — they need to understand what changed and why. Test coverage belongs in the tests themselves.
 - **Never run `git reset` or `git checkout` that would destroy uncommitted or committed changes without explicit human permission.** This includes `git reset --hard`, `git checkout -- <path>`, and switching branches over a dirty working tree. Prefer `git stash`, an explicit commit, or `git restore --staged <path>` when the goal is just to unstage. Read-only git commands (`status`, `diff`, `log`) are always fine.
 
