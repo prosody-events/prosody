@@ -239,6 +239,14 @@ designs are where bloat and bug re-introduction live:
 
 ## Code Organization
 
+**Maximum file size: 500 lines.** A file that exceeds it is subdivided into
+modules. Split along a seam the code already has — a group of methods serving
+one concern, a type and its impls, a family of related free functions — and
+give each module a doc comment naming what it owns. Re-export from the parent
+`mod.rs` so the split is invisible to callers and no import churns. A split
+that only balances line counts, cutting a coherent unit in half, is worse than
+the long file; find the real seam.
+
 **Order within files (topological by dependencies):**
 
 1. Constants → Statics → Types → Implementations → Functions → Errors (bottom)
