@@ -32,7 +32,7 @@ use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::state_reader::StateReaderError;
-use crate::state_reader::reader::REFRESH_BACKOFF;
+use crate::state_reader::reader::{ABSENT_BACKOFF, REFRESH_BACKOFF};
 use crate::state_reader::source::MAX_PUBLICATION_SOURCES;
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, bail, eyre};
@@ -366,15 +366,29 @@ fn outcome_matches(expect: &Expect, observed: &Result<Option<Value>, StateReader
 
 // --- Failed-refresh pacing --------------------------------------------------
 
+/// The refresh interval the pacing property's reader runs with.
+///
+/// Every [`Advance`] except `Long` lands inside it, so a completed refresh
+/// stays fresh across the shorter steps. That is what makes the absent window
+/// observable: an absence outlives its own deadline while still inside this
+/// interval, and only excluding it from freshness lets the next read re-read.
+const PACING_INTERVAL: Duration = REFRESH_BACKOFF;
+
 /// How far one pacing step moves the mock clock before its read.
+///
+/// The two windows differ in length, so the steps are chosen to land on both
+/// sides of each: `Short` stays inside either, `Absent` lands exactly on the
+/// absent deadline while still inside a failure window, and `Long` clears both.
 #[derive(Clone, Copy, Debug)]
 enum Advance {
-    /// Not at all, so the read lands inside any open pacing window.
+    /// Not at all, so the read lands inside any open window.
     None,
-    /// Half a window, so two steps are needed to cross one deadline.
-    Half,
-    /// A whole window, landing exactly on the deadline a failing step opened.
-    Full,
+    /// Half the absent window, so two steps are needed to cross it.
+    Short,
+    /// Exactly the absent window, which a failure window outlives.
+    Absent,
+    /// The whole failure window, landing on the later of the two deadlines.
+    Long,
 }
 
 impl Advance {
@@ -382,18 +396,20 @@ impl Advance {
     fn duration(self) -> Duration {
         match self {
             Self::None => Duration::ZERO,
-            Self::Half => REFRESH_BACKOFF / 2,
-            Self::Full => REFRESH_BACKOFF,
+            Self::Short => ABSENT_BACKOFF / 2,
+            Self::Absent => ABSENT_BACKOFF,
+            Self::Long => REFRESH_BACKOFF,
         }
     }
 }
 
 impl Arbitrary for Advance {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 3 {
+        match u8::arbitrary(g) % 4 {
             0 => Self::None,
-            1 => Self::Half,
-            _ => Self::Full,
+            1 => Self::Short,
+            2 => Self::Absent,
+            _ => Self::Long,
         }
     }
 
@@ -405,11 +421,12 @@ impl Arbitrary for Advance {
     }
 }
 
-/// One pacing step: how far the clock moves, then whether the routing read
-/// fails.
+/// One pacing step: how far the clock moves, whether the collection is
+/// advertised, and whether the routing read fails.
 #[derive(Clone, Copy, Debug)]
 struct PacingStep {
     advance: Advance,
+    published: bool,
     fail: bool,
 }
 
@@ -417,20 +434,35 @@ impl Arbitrary for PacingStep {
     fn arbitrary(g: &mut Gen) -> Self {
         Self {
             advance: Advance::arbitrary(g),
+            published: bool::arbitrary(g),
             fail: bool::arbitrary(g),
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let advance = self.advance;
-        let fail = self.fail;
-        // Shrink toward no outage, then toward a clock that does not move.
+        let Self {
+            advance,
+            published,
+            fail,
+        } = *self;
+        // Shrink toward no outage, then toward a published collection, then
+        // toward a clock that does not move.
         let healed = fail.then_some(Self {
             advance,
+            published,
             fail: false,
         });
-        let slower = advance.shrink().map(move |advance| Self { advance, fail });
-        Box::new(healed.into_iter().chain(slower))
+        let advertised = (!published).then_some(Self {
+            advance,
+            published: true,
+            fail,
+        });
+        let slower = advance.shrink().map(move |advance| Self {
+            advance,
+            published,
+            fail,
+        });
+        Box::new(healed.into_iter().chain(advertised).chain(slower))
     }
 }
 
@@ -455,21 +487,44 @@ impl Arbitrary for PacingScript {
     }
 }
 
-/// A failed refresh paces the next attempt by `REFRESH_BACKOFF`. Every read
-/// inside that window serves the held outcome without touching the store, and
-/// the first read at or past the deadline re-reads the routing table. Proven
-/// over random outage and clock-advance scripts against a model of the window.
+/// What the reader's acquisition holds, mirroring `Acquired`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// Nothing acquired: a fresh reader, or one whose absence a failed refresh
+    /// discarded.
+    Nothing,
+    /// A validated snapshot.
+    Sources,
+    /// A completed refresh that found no publication row.
+    Absent,
+}
+
+/// Neither refresh outcome that yields no snapshot may re-read the routing
+/// table on every read. A failed refresh paces the next attempt by
+/// `REFRESH_BACKOFF`; one that finds no publisher paces by the shorter
+/// `ABSENT_BACKOFF`. Inside either window a read serves the held outcome
+/// without touching the store, and the first read at or past the deadline
+/// re-reads. Proven over random outage, publish/withdraw, and clock-advance
+/// scripts against a model of both windows.
 ///
-/// The reader refreshes on every operation, so pacing is the only thing that
-/// can suppress a routing read: the model's expected read count is exact.
+/// The absence is deliberately **not** durable across an outage: a failed
+/// refresh discards it, because "no publisher yet" is the one claim that read
+/// could not confirm. Sources survive so reads keep working.
 ///
-/// FALSIFICATION: drop the `paced` term from `StateReader::snapshot`'s gate → a
-/// read inside the window re-reads the routing table → the read-count assert
-/// reds. Leave pacing behind on a completed refresh (give
-/// `SnapshotState::refreshed` a `retry_after`) → a read after a success is
-/// suppressed → red. Fall through to the store instead of `RefreshUnavailable`
-/// when paced with nothing held → a script whose first step fails sees a store
-/// error where the model expects `RefreshUnavailable` → red.
+/// Pacing and the refresh interval are the only two things that suppress a
+/// routing read, and both are modelled, so the expected read count is exact.
+/// The interval is [`PACING_INTERVAL`], long enough that an absence's shorter
+/// window expires well inside it.
+///
+/// FALSIFICATION: drop the `within_pacing` term from `StateReader::snapshot`'s
+/// gate → a read inside either window re-reads the routing table → the
+/// read-count assert reds. Stop pacing an absence (drop the `Acquired::Absent`
+/// arm in `acquire`) → a script that stays unpublished re-reads every step →
+/// red. Include an absence in `is_fresh` → the read after the absent deadline
+/// is suppressed → red. Let `failed` keep an absence → a fail step after an
+/// unpublished one serves `UnknownPublication` where the model expects the
+/// store error → red. Fall through to the store instead of
+/// `RefreshUnavailable` when paced with nothing held → red.
 #[test]
 fn prop_refresh_pacing() {
     fn property(script: PacingScript) -> Result<bool> {
@@ -487,21 +542,29 @@ async fn run_refresh_pacing(script: PacingScript) -> Result<bool> {
         handle.set(element(0)).await.map_err(|e| eyre!("set: {e}"))
     })
     .await?;
-    env.publish(GROUP_A, tp).await;
 
     let (cache, mock) = mock_clock_cache(1 << 20);
-    let reader = env.reader_eager_with_cache(cache)?;
+    let reader = env.reader_with_interval(cache, PACING_INTERVAL)?;
 
-    // Model state: elapsed mock time, when pacing next permits an attempt, and
-    // whether a snapshot has ever been admitted.
+    // Model state: elapsed mock time, when pacing next permits an attempt, when
+    // the last refresh completed, and what it acquired.
     let mut elapsed = Duration::ZERO;
     let mut retry_after: Option<Duration> = None;
-    let mut held = false;
+    let mut refreshed_at: Option<Duration> = None;
+    let mut held = Held::Nothing;
 
     for step in script.steps {
         let advance = step.advance.duration();
         mock.increment(advance);
         elapsed += advance;
+        if step.published {
+            env.publish(GROUP_A, tp).await;
+        } else {
+            env.publications
+                .remove_group(&env.sub, StateType::Application, &env.name, GROUP_A)
+                .await
+                .map_err(|e| eyre!("remove_group: {e}"))?;
+        }
         if step.fail {
             env.publications.fail_reads_with(ErrorCategory::Transient);
         } else {
@@ -509,25 +572,41 @@ async fn run_refresh_pacing(script: PacingScript) -> Result<bool> {
         }
 
         let paced = retry_after.is_some_and(|deadline| elapsed < deadline);
-        let (expect, expected_reads) = if paced {
-            let served = if held {
-                Expect::Value(0)
-            } else {
-                Expect::RefreshUnavailable
+        // An absence never counts as fresh: only its own shorter window paces
+        // it, so a publisher that appears is admitted within `ABSENT_BACKOFF`.
+        let fresh = held != Held::Absent
+            && refreshed_at.is_some_and(|at| elapsed.saturating_sub(at) < PACING_INTERVAL);
+
+        let (expect, expected_reads) = if paced || fresh {
+            // Inside a window: serve what is held, touching no store.
+            let served = match held {
+                Held::Sources => Expect::Value(0),
+                Held::Absent => Expect::UnknownPublication,
+                Held::Nothing => Expect::RefreshUnavailable,
             };
             (served, 0)
         } else if step.fail {
             retry_after = Some(elapsed + REFRESH_BACKOFF);
-            let served = if held {
-                Expect::Value(0)
-            } else {
-                Expect::ReadError
+            // Sources survive the outage; an unconfirmed absence does not.
+            if held == Held::Absent {
+                held = Held::Nothing;
+                refreshed_at = None;
+            }
+            let served = match held {
+                Held::Sources => Expect::Value(0),
+                _ => Expect::ReadError,
             };
             (served, 1)
-        } else {
+        } else if step.published {
             retry_after = None;
-            held = true;
+            refreshed_at = Some(elapsed);
+            held = Held::Sources;
             (Expect::Value(0), 1)
+        } else {
+            retry_after = Some(elapsed + ABSENT_BACKOFF);
+            refreshed_at = Some(elapsed);
+            held = Held::Absent;
+            (Expect::UnknownPublication, 1)
         };
 
         let reads_before = env.publications.reads();

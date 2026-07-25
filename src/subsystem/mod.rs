@@ -46,6 +46,14 @@ impl AsRef<str> for SubsystemName {
     }
 }
 
+/// Shares the name's backing allocation, so an error or log field that needs an
+/// owned name never copies the bytes.
+impl From<&SubsystemName> for Arc<str> {
+    fn from(name: &SubsystemName) -> Self {
+        Arc::clone(&name.0)
+    }
+}
+
 /// Lets maps keyed by [`SubsystemName`] resolve `&str` lookups without
 /// allocating, as [`StateName`](crate::state::StateName) does.
 ///

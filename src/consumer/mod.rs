@@ -667,6 +667,27 @@ pub struct LowLatencyMiddlewareConfiguration {
     pub failure_topic: FailureTopicConfiguration,
 }
 
+/// What every processing mode needs before its mode-specific middleware: the
+/// three configuration sections and the infrastructure to build on.
+///
+/// These four are one parameter because they are consumed as a unit. Every
+/// constructor hands the whole thing to `build_shared_state`, which validates
+/// the configuration and opens (or reuses) the storage behind it.
+pub struct ConsumerSetup<'a, C: Codec> {
+    /// Kafka consumer settings: group, topics, mock mode, stall threshold.
+    pub consumer: &'a ConsumerConfiguration,
+    /// Backend settings for the timer trigger store.
+    pub trigger_store: &'a TriggerStoreConfiguration,
+    /// Settings every mode shares, keyed state and deduplication included.
+    pub common: &'a CommonConfiguration,
+    /// Infrastructure to reuse instead of composing fresh handles.
+    ///
+    /// The high-level client passes the bundle it already built, so one
+    /// Cassandra session and one Kafka loader back the whole process. `None`
+    /// makes the consumer compose its own.
+    pub deps: Option<SharedDeps<C>>,
+}
+
 /// High-level Kafka consumer implementation.
 ///
 /// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
@@ -936,16 +957,13 @@ fn validate_recovery_ttl_margin(
 /// Builds the storage core shared by every constructor: the deduplication
 /// store pair, keyed-state inputs, and heartbeat registry.
 ///
-/// Validates `consumer_config` and `keyed_state_config` up front, before
+/// Validates the consumer and keyed-state configuration up front, before
 /// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The
 /// canonical `consumer_config.validate()` in [`initialize_consumer`] remains
 /// the single invariant chokepoint; this early validation is the fail-fast
 /// guard.
 async fn build_shared_state<C: Codec>(
-    consumer_config: &ConsumerConfiguration,
-    trigger_store_config: &TriggerStoreConfiguration,
-    common_config: &CommonConfiguration,
-    deps: Option<&SharedDeps<C>>,
+    setup: &ConsumerSetup<'_, C>,
 ) -> Result<
     (
         StorePair,
@@ -955,6 +973,13 @@ async fn build_shared_state<C: Codec>(
     ),
     ConsumerError,
 > {
+    let ConsumerSetup {
+        consumer: consumer_config,
+        trigger_store: trigger_store_config,
+        common: common_config,
+        deps,
+    } = setup;
+    let deps = deps.as_ref();
     consumer_config.validate()?;
     // Clone (never drain) the registered keyed-state config: callers pass
     // `common_config` by reference and retain the intact configuration, so a
@@ -1005,12 +1030,9 @@ async fn build_shared_state<C: Codec>(
 /// for [`ProsodyConsumer::pipeline_consumer`], enforcing the keyed-state
 /// deduplication gate.
 async fn prepare_pipeline_stack<C: Codec>(
-    consumer_config: &ConsumerConfiguration,
-    trigger_store_config: &TriggerStoreConfiguration,
+    setup: &ConsumerSetup<'_, C>,
     pipeline_config: PipelineMiddlewareConfiguration,
-    common_config: &CommonConfiguration,
     telemetry: Telemetry,
-    deps: Option<&SharedDeps<C>>,
 ) -> Result<
     (
         StorePair,
@@ -1025,8 +1047,7 @@ async fn prepare_pipeline_stack<C: Codec>(
         monopolization: monopolization_config,
         defer: defer_config,
     } = pipeline_config;
-    let (stores, keyed_state, heartbeats, shared) =
-        build_shared_state(consumer_config, trigger_store_config, common_config, deps).await?;
+    let (stores, keyed_state, heartbeats, shared) = build_shared_state(setup).await?;
     let monopolization_middleware =
         MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
     let failure_tracker = FailureTracker::new(
@@ -1037,9 +1058,9 @@ async fn prepare_pipeline_stack<C: Codec>(
     );
 
     let stack = PipelineMiddlewareStack {
-        consumer_config: consumer_config.clone(),
+        consumer_config: setup.consumer.clone(),
         defer_config,
-        common_config: common_config.clone(),
+        common_config: setup.common.clone(),
         failure_tracker,
         monopolization_middleware,
         retry_middleware: RetryMiddleware::new(retry_config)?,
@@ -1539,27 +1560,18 @@ where
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
     pub async fn pipeline_consumer<T>(
-        consumer_config: &ConsumerConfiguration,
-        trigger_store_config: &TriggerStoreConfiguration,
+        setup: ConsumerSetup<'_, C>,
         pipeline_config: PipelineMiddlewareConfiguration,
-        common_config: &CommonConfiguration,
         telemetry: Telemetry,
         handler: T,
-        deps: Option<SharedDeps<C>>,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone,
     {
-        let (stores, keyed_state, stack, shared) = prepare_pipeline_stack(
-            consumer_config,
-            trigger_store_config,
-            pipeline_config,
-            common_config,
-            telemetry,
-            deps.as_ref(),
-        )
-        .await?;
+        let (stores, keyed_state, stack, shared) =
+            prepare_pipeline_stack(&setup, pipeline_config, telemetry).await?;
+        let deps = setup.deps;
 
         match stores {
             StorePair::Memory {
@@ -1667,31 +1679,24 @@ where
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
     pub async fn low_latency_consumer<T>(
-        consumer_config: &ConsumerConfiguration,
-        trigger_store_config: &TriggerStoreConfiguration,
+        setup: ConsumerSetup<'_, C>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
-        common_config: &CommonConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
-        deps: Option<SharedDeps<C>>,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let topic_config = low_latency_config.failure_topic;
-        let (stores, keyed_state, heartbeats, shared) = build_shared_state(
-            consumer_config,
-            trigger_store_config,
-            common_config,
-            deps.as_ref(),
-        )
-        .await?;
+        let (stores, keyed_state, heartbeats, shared) = build_shared_state(&setup).await?;
         let version = keyed_state.version.clone();
         let retry_middleware = RetryMiddleware::new(low_latency_config.retry)?;
-        let topic_middleware =
-            FailureTopicMiddleware::new(topic_config, consumer_config.group_id.clone(), producer)?;
+        let topic_middleware = FailureTopicMiddleware::new(
+            low_latency_config.failure_topic,
+            setup.consumer.group_id.clone(),
+            producer,
+        )?;
         // dedup is inside the common block; failure-topic/retry layer OUTSIDE it.
         match stores {
             StorePair::Memory {
@@ -1701,7 +1706,7 @@ where
                 ..
             } => {
                 let (loader, cells, identities, partition_counts) =
-                    memory_arm_inputs(deps.as_ref(), shared)?;
+                    memory_arm_inputs(setup.deps.as_ref(), shared)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
@@ -1717,8 +1722,8 @@ where
                     publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
-                    common_config,
-                    consumer_config,
+                    setup.common,
+                    setup.consumer,
                     telemetry.clone(),
                     dedup_provider,
                 )?
@@ -1727,7 +1732,7 @@ where
                 .layer(retry_middleware) // retry writing to the failure topic indefinitely
                 .into_provider(handler);
                 initialize_consumer::<_, _, _, C>(
-                    consumer_config,
+                    setup.consumer,
                     version,
                     provider,
                     trigger_provider,
@@ -1745,7 +1750,7 @@ where
                 ..
             } => {
                 let (loader, partition_counts) =
-                    cassandra_arm_inputs(deps.as_ref(), consumer_config, &heartbeats)?;
+                    cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &heartbeats)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Cassandra(publication_store),
@@ -1761,8 +1766,8 @@ where
                     publisher_template,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
-                    common_config,
-                    consumer_config,
+                    setup.common,
+                    setup.consumer,
                     telemetry.clone(),
                     dedup_provider,
                 )?
@@ -1771,7 +1776,7 @@ where
                 .layer(retry_middleware)
                 .into_provider(handler);
                 initialize_consumer::<_, _, _, C>(
-                    consumer_config,
+                    setup.consumer,
                     version,
                     provider,
                     trigger_provider,
@@ -1791,24 +1796,15 @@ where
     /// only be used for development or for services where occasional
     /// message loss is acceptable.
     pub(crate) async fn best_effort_consumer<T>(
-        consumer_config: &ConsumerConfiguration,
-        trigger_store_config: &TriggerStoreConfiguration,
-        common_config: &CommonConfiguration,
+        setup: ConsumerSetup<'_, C>,
         telemetry: Telemetry,
         handler: T,
-        deps: Option<SharedDeps<C>>,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats, shared) = build_shared_state(
-            consumer_config,
-            trigger_store_config,
-            common_config,
-            deps.as_ref(),
-        )
-        .await?;
+        let (stores, keyed_state, heartbeats, shared) = build_shared_state(&setup).await?;
         let version = keyed_state.version.clone();
 
         // dedup lives inside the common block; `log` (which swallows failures)
@@ -1823,7 +1819,7 @@ where
                 ..
             } => {
                 let (loader, cells, identities, partition_counts) =
-                    memory_arm_inputs(deps.as_ref(), shared)?;
+                    memory_arm_inputs(setup.deps.as_ref(), shared)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Memory(publication_store),
@@ -1839,15 +1835,15 @@ where
                     publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
-                    common_config,
-                    consumer_config,
+                    setup.common,
+                    setup.consumer,
                     telemetry.clone(),
                     dedup_provider,
                 )?
                 .layer(LogMiddleware::new())
                 .into_provider(handler);
                 initialize_consumer::<_, _, _, C>(
-                    consumer_config,
+                    setup.consumer,
                     version,
                     provider,
                     trigger_provider,
@@ -1865,7 +1861,7 @@ where
                 ..
             } => {
                 let (loader, partition_counts) =
-                    cassandra_arm_inputs(deps.as_ref(), consumer_config, &heartbeats)?;
+                    cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &heartbeats)?;
                 let publisher_template = keyed_state
                     .publication_setup(
                         PublicationBackend::Cassandra(publication_store),
@@ -1881,15 +1877,15 @@ where
                     publisher_template,
                 )?;
                 let provider = build_common_middleware::<_, C::Payload>(
-                    common_config,
-                    consumer_config,
+                    setup.common,
+                    setup.consumer,
                     telemetry.clone(),
                     dedup_provider,
                 )?
                 .layer(LogMiddleware::new())
                 .into_provider(handler);
                 initialize_consumer::<_, _, _, C>(
-                    consumer_config,
+                    setup.consumer,
                     version,
                     provider,
                     trigger_provider,

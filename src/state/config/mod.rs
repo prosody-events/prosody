@@ -14,6 +14,7 @@ use std::env;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing::warn;
 use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
@@ -163,17 +164,32 @@ pub struct KeyedStateConfiguration {
 impl Default for KeyedStateConfiguration {
     fn default() -> Self {
         Self {
-            cache_dir: from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir())
-                .unwrap_or_else(|_| default_cache_dir()),
-            recovery_delay: recovery_delay_from_env()
-                .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
-            cache_size_bytes: from_option_env(STATE_CACHE_SIZE_ENV).unwrap_or_default(),
-            read_cache_size_bytes: from_option_env(STATE_READ_CACHE_SIZE_ENV).unwrap_or_default(),
-            read_cache_ttl: from_option_duration_env_with_fallback(
+            cache_dir: or_fallback(
+                STATE_CACHE_DIR_ENV,
+                from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir()),
+                default_cache_dir,
+            ),
+            recovery_delay: or_fallback(RECOVERY_DELAY_ENV, recovery_delay_from_env(), || {
+                CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)
+            }),
+            cache_size_bytes: or_fallback(
+                STATE_CACHE_SIZE_ENV,
+                from_option_env(STATE_CACHE_SIZE_ENV),
+                || None,
+            ),
+            read_cache_size_bytes: or_fallback(
+                STATE_READ_CACHE_SIZE_ENV,
+                from_option_env(STATE_READ_CACHE_SIZE_ENV),
+                || None,
+            ),
+            read_cache_ttl: or_fallback(
                 STATE_READ_CACHE_TTL_ENV,
-                DEFAULT_READ_CACHE_TTL,
-            )
-            .unwrap_or(Some(DEFAULT_READ_CACHE_TTL)),
+                from_option_duration_env_with_fallback(
+                    STATE_READ_CACHE_TTL_ENV,
+                    DEFAULT_READ_CACHE_TTL,
+                ),
+                || Some(DEFAULT_READ_CACHE_TTL),
+            ),
             subsystem: None,
             registrations: Vec::new(),
         }
@@ -262,6 +278,25 @@ fn default_cache_dir() -> PathBuf {
         .join("prosody")
         .join("keyed-state")
         .join(Uuid::new_v4().simple().to_string())
+}
+
+/// Substitutes a default for a malformed environment override, logging what was
+/// rejected.
+///
+/// [`Default`] has nowhere to report a parse error, and dropping one silently
+/// is the worse outcome: an operator who mistypes an override gets a consumer
+/// running on defaults with no signal that the override was ignored. Only a
+/// malformed value reaches here — an unset variable already yields the
+/// fallback. The builder path surfaces the same error properly.
+fn or_fallback<T>(env_var: &str, parsed: Result<T, String>, fallback: impl FnOnce() -> T) -> T {
+    parsed.unwrap_or_else(|error| {
+        warn!(
+            env = env_var,
+            error = %error,
+            "malformed keyed-state environment override; using the default instead"
+        );
+        fallback()
+    })
 }
 
 /// Reads [`RECOVERY_DELAY_ENV`] as a duration, falling back to

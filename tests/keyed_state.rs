@@ -31,7 +31,7 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonConfiguration, ConsumerConfiguration, DemandType, KeyedStateConfiguration,
+    CommonConfiguration, ConsumerConfiguration, ConsumerSetup, DemandType, KeyedStateConfiguration,
     MessageDescriptor, PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::error::{ClassifyError, ErrorCategory};
@@ -366,13 +366,15 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-        &consumer_config,
-        &common::create_cassandra_trigger_store_config(),
+        ConsumerSetup {
+            consumer: &consumer_config,
+            trigger_store: &common::create_cassandra_trigger_store_config(),
+            common: &common_config,
+            deps: None,
+        },
         pipeline_config,
-        &common_config,
         telemetry,
         handler,
-        None,
     )
     .await?;
 
@@ -523,13 +525,15 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-        &consumer_config,
-        &common::create_cassandra_trigger_store_config(),
+        ConsumerSetup {
+            consumer: &consumer_config,
+            trigger_store: &common::create_cassandra_trigger_store_config(),
+            common: &common_config,
+            deps: None,
+        },
         pipeline_config,
-        &common_config,
         telemetry,
         handler,
-        None,
     )
     .await?;
 

@@ -104,10 +104,19 @@ impl PublicationStore for CassandraPublicationStore {
             .map_err(CassandraStoreError::from)?;
         let mut out = Vec::with_capacity(rows.rows_num());
         for row in rows
-            .rows::<(&str, &str, i32)>()
+            .rows::<(&str, &str, Option<i32>)>()
             .map_err(CassandraStoreError::from)?
         {
             let (group_id, topic, partition_count) = row.map_err(CassandraStoreError::from)?;
+            // `upsert` always binds a count, so a NULL means the row was
+            // hand-edited or partially written. Decoding it as `Option` keeps
+            // that a Permanent data rejection; decoding it as `i32` would make
+            // scylla raise a Terminal deserialization error instead.
+            let partition_count =
+                partition_count.ok_or_else(|| CassandraPublicationError::NullPartitionCount {
+                    group_id: group_id.to_owned(),
+                    topic: topic.to_owned(),
+                })?;
             out.push(StatePublication {
                 group_id: Arc::from(group_id),
                 topic: Intern::<str>::from(topic),
@@ -160,6 +169,17 @@ pub enum CassandraPublicationError {
     /// is corrupt or hand-edited, so this classifies `Permanent`.
     #[error("invalid partition count: {0}")]
     PartitionCount(#[from] PartitionCountError),
+
+    /// A routing row's `partition_count` was NULL. Same corrupt-row cause as
+    /// [`Self::PartitionCount`], and likewise `Permanent`. The group and topic
+    /// identify the row to repair.
+    #[error("null partition count in routing row for group {group_id}, topic {topic}")]
+    NullPartitionCount {
+        /// The publishing group whose routing row is malformed.
+        group_id: String,
+        /// The topic that row advertises.
+        topic: String,
+    },
 }
 
 impl ClassifyError for CassandraPublicationError {
@@ -167,6 +187,7 @@ impl ClassifyError for CassandraPublicationError {
         match self {
             Self::Database(e) => e.classify_error(),
             Self::PartitionCount(e) => e.classify_error(),
+            Self::NullPartitionCount { .. } => ErrorCategory::Permanent,
         }
     }
 }

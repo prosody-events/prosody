@@ -23,7 +23,7 @@ use rdkafka::error::KafkaError;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
 use tokio::task::{JoinError, spawn_blocking};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::Topic;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -305,10 +305,10 @@ impl FirstWritePublisher {
     /// 1. fetch the topic's live partition count (must ride the caller's retry
     ///    posture);
     /// 2. **best-effort** own-row read to detect a changed partition count. A
-    ///    read failure skips it and never blocks the upsert, since step 3
-    ///    overwrites the row regardless. A stored count that differs from the
-    ///    live count is logged at `error!` and the row is overwritten with the
-    ///    live count (see below);
+    ///    read failure is logged at `warn!` and skips the check; it never
+    ///    blocks the upsert, since step 3 overwrites the row regardless. A
+    ///    stored count that differs from the live count is logged at `error!`
+    ///    and the row is overwritten with the live count (see below);
     /// 3. blind idempotent upsert of `{group, topic, live_count}` — this is the
     ///    barrier;
     /// 4. latch the memo, **only after** the upsert is acknowledged.
@@ -351,27 +351,39 @@ impl FirstWritePublisher {
         // Detect a changed partition count. A stored own-row count that differs
         // from the live count means the topic was repartitioned, which is
         // unsupported (see this method's doc). Log it as an error. The blind
-        // upsert below overwrites the row with the live count either way. A read
-        // error skips this check.
-        if let Ok(rows) = t
+        // upsert below overwrites the row with the live count either way, so a
+        // read failure only costs the check.
+        match t
             .store
             .read_publications(&t.subsystem, state_type, name)
             .await
-            && let Some(stored) = rows
-                .iter()
-                .find(|r| r.group_id.as_ref() == t.group.as_ref() && r.topic == self.topic)
-            && stored.partition_count != live
         {
-            error!(
+            Ok(rows) => {
+                if let Some(stored) = rows
+                    .iter()
+                    .find(|r| r.group_id.as_ref() == t.group.as_ref() && r.topic == self.topic)
+                    && stored.partition_count != live
+                {
+                    error!(
+                        collection = %name.as_str(),
+                        topic = %self.topic.as_ref(),
+                        stored = i32::from(stored.partition_count),
+                        live = i32::from(live),
+                        "keyed-state publication partition count changed for a topic backing \
+                         keyed state: keys written under the previous partition count are no \
+                         longer reachable by owner or readers; partition expansion on such topics \
+                         is unsupported. Overwriting the routing row with the live count to keep \
+                         readers consistent with the owner."
+                    );
+                }
+            }
+            Err(error) => warn!(
                 collection = %name.as_str(),
                 topic = %self.topic.as_ref(),
-                stored = i32::from(stored.partition_count),
-                live = i32::from(live),
-                "keyed-state publication partition count changed for a topic backing keyed state: \
-                 keys written under the previous partition count are no longer reachable by owner \
-                 or readers; partition expansion on such topics is unsupported. Overwriting the \
-                 routing row with the live count to keep readers consistent with the owner."
-            );
+                error = %error,
+                "reading the routing row before the publication upsert failed; skipping the \
+                 repartition check. The upsert proceeds with the live partition count."
+            ),
         }
         let row = StatePublication {
             group_id: t.group.clone(),

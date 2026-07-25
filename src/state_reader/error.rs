@@ -25,9 +25,9 @@ pub enum StateReaderError {
     #[error("no publication rows for {subsystem}/{name}")]
     UnknownPublication {
         /// The subsystem the reader routed under.
-        subsystem: String,
+        subsystem: Arc<str>,
         /// The collection name.
-        name: String,
+        name: Arc<str>,
     },
 
     /// A source's frozen descriptor identity disagrees with the reader's
@@ -56,7 +56,7 @@ pub enum StateReaderError {
     #[error("no source has a frozen identity yet for {name}")]
     IdentityUnavailable {
         /// The collection name.
-        name: String,
+        name: Arc<str>,
     },
 
     /// The collection advertises more publication sources than the reader

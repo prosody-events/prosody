@@ -14,8 +14,9 @@ use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, Sche
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{
-    ConsumerConfigurationBuilder, ConsumerError, KeyedStateConfiguration,
-    LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
+    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerError,
+    ConsumerSetup, KeyedStateConfiguration, LowLatencyMiddlewareConfiguration,
+    PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
@@ -348,17 +349,14 @@ where
                 common,
                 trigger_store,
             } => ProsodyConsumer::<C>::pipeline_consumer(
-                consumer,
-                trigger_store,
+                setup(consumer, trigger_store, common, &deps),
                 PipelineMiddlewareConfiguration {
                     retry: retry.clone(),
                     monopolization: monopolization.clone(),
                     defer: defer.clone(),
                 },
-                common,
                 self.telemetry.clone(),
                 handler.clone(),
-                Some(deps.clone()),
             )
             .await
             .map_err(Into::into),
@@ -369,17 +367,14 @@ where
                 common,
                 trigger_store,
             } => ProsodyConsumer::low_latency_consumer(
-                consumer,
-                trigger_store,
+                setup(consumer, trigger_store, common, &deps),
                 LowLatencyMiddlewareConfiguration {
                     retry: retry.clone(),
                     failure_topic: failure_topic.clone(),
                 },
-                common,
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                Some(deps.clone()),
             )
             .await
             .map_err(Into::into),
@@ -388,12 +383,9 @@ where
                 common,
                 trigger_store,
             } => ProsodyConsumer::<C>::best_effort_consumer(
-                consumer,
-                trigger_store,
-                common,
+                setup(consumer, trigger_store, common, &deps),
                 self.telemetry.clone(),
                 handler.clone(),
-                Some(deps.clone()),
             )
             .await
             .map_err(Into::into),
@@ -531,6 +523,24 @@ where
 }
 
 /// Builds the one shared infrastructure bundle from a mode configuration.
+/// Pairs a mode's configuration sections with the client's shared
+/// infrastructure. Every mode passes the same bundle, so a consumer the client
+/// builds always reuses the one Cassandra session and loader the client already
+/// opened.
+fn setup<'a, C: Codec>(
+    consumer: &'a ConsumerConfiguration,
+    trigger_store: &'a TriggerStoreConfiguration,
+    common: &'a CommonConfiguration,
+    deps: &SharedDeps<C>,
+) -> ConsumerSetup<'a, C> {
+    ConsumerSetup {
+        consumer,
+        trigger_store,
+        common,
+        deps: Some(deps.clone()),
+    }
+}
+
 /// The bundle depends only on the trigger-store backend, group id, and cache
 /// budget, all of which are mode-independent, so the same build serves any
 /// mode. This mirrors the Cassandra-session reuse in `StorePair::new`.

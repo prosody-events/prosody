@@ -14,7 +14,7 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonConfiguration, ConsumerConfiguration, KeyedStateConfiguration,
+    CommonConfiguration, ConsumerConfiguration, ConsumerSetup, KeyedStateConfiguration,
     PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
@@ -90,13 +90,15 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-        &consumer_config,
-        &common::create_cassandra_trigger_store_config(),
+        ConsumerSetup {
+            consumer: &consumer_config,
+            trigger_store: &common::create_cassandra_trigger_store_config(),
+            common: &common_config,
+            deps: None,
+        },
         pipeline_config,
-        &common_config,
         telemetry,
         handler,
-        None,
     )
     .await?;
 
