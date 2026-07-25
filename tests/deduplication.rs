@@ -86,7 +86,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         scheduler: SchedulerConfigurationBuilder::default().build()?,
         timeout: TimeoutConfigurationBuilder::default().build()?,
         dedup: DeduplicationConfigurationBuilder::default().build()?,
-        keyed_state: KeyedStateConfiguration::default(),
+        keyed_state: KeyedStateConfiguration::builder().build()?,
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(

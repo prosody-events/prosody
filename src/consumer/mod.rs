@@ -2151,6 +2151,15 @@ pub struct RecoveryTtlMarginError {
     required: u64,
 }
 
+/// Collapses the two hops from a keyed-state configuration failure, so
+/// `ConsumerBuilders::new()?` works directly in a function returning
+/// [`ConsumerError`].
+impl From<KeyedStateConfigurationBuilderError> for ConsumerError {
+    fn from(error: KeyedStateConfigurationBuilderError) -> Self {
+        Self::KeyedState(KeyedStateInitError::Configuration(error))
+    }
+}
+
 impl From<CassandraTriggerStoreError> for ConsumerError {
     fn from(e: CassandraTriggerStoreError) -> Self {
         Self::CassandraTriggerStore(Box::new(e))

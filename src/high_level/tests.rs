@@ -204,7 +204,7 @@ fn create_test_client<T>(group_id: &str, source_system: Option<&str>) -> Result<
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
-        ..Default::default()
+        ..ConsumerBuilders::new()?
     };
     let cassandra_builder = CassandraConfigurationBuilder::default();
 

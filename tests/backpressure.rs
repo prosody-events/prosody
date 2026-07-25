@@ -59,7 +59,7 @@ async fn test_backpressure() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        KeyedStateConfiguration::default(),
+        KeyedStateConfiguration::builder().build()?,
         CloneProvider::new(slow_handler),
         Telemetry::new(),
     )

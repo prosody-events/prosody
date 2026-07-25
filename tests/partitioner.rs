@@ -98,7 +98,7 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        KeyedStateConfiguration::default(),
+        KeyedStateConfiguration::builder().build()?,
         CloneProvider::new(PartitionCaptureHandler { tx }),
         Telemetry::new(),
     )

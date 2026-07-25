@@ -15,8 +15,8 @@ use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{
     CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerError,
-    ConsumerSetup, KeyedStateConfiguration, LowLatencyMiddlewareConfiguration,
-    PipelineMiddlewareConfiguration, ProsodyConsumer,
+    ConsumerSetup, KeyedStateConfiguration, KeyedStateConfigurationBuilderError,
+    LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
@@ -58,7 +58,12 @@ mod tests;
 ///
 /// Bundles all consumer-related configuration builders to reduce parameter
 /// count in `HighLevelClient::new`.
-#[derive(Default)]
+///
+/// Build a starting set with [`Self::new`]. It applies every default, and is
+/// fallible only because the keyed-state section reads environment overrides:
+/// an override the operator supplied but got wrong fails here instead of being
+/// replaced by a default. There is no `Default` impl, which could not report
+/// that.
 pub struct ConsumerBuilders {
     /// Consumer configuration builder.
     pub consumer: ConsumerConfigurationBuilder,
@@ -81,6 +86,31 @@ pub struct ConsumerBuilders {
     pub keyed_state: KeyedStateConfiguration,
     /// Telemetry emitter configuration.
     pub emitter: TelemetryEmitterConfiguration,
+}
+
+impl ConsumerBuilders {
+    /// Every builder at its default, with the keyed-state section resolved from
+    /// the environment.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyedStateConfigurationBuilderError`] when a `PROSODY_STATE_*`
+    /// override is set to a value that cannot be parsed. An unset or blank
+    /// variable takes its default and never errors.
+    pub fn new() -> Result<Self, KeyedStateConfigurationBuilderError> {
+        Ok(Self {
+            consumer: ConsumerConfigurationBuilder::default(),
+            retry: RetryConfigurationBuilder::default(),
+            failure_topic: FailureTopicConfigurationBuilder::default(),
+            scheduler: SchedulerConfigurationBuilder::default(),
+            monopolization: MonopolizationConfigurationBuilder::default(),
+            defer: DeferConfigurationBuilder::default(),
+            dedup: DeduplicationConfigurationBuilder::default(),
+            timeout: TimeoutConfigurationBuilder::default(),
+            keyed_state: KeyedStateConfiguration::builder().build()?,
+            emitter: TelemetryEmitterConfiguration::default(),
+        })
+    }
 }
 
 /// A combined client that manages both producer and consumer operations.

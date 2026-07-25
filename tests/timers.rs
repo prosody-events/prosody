@@ -471,7 +471,7 @@ fn build_inline_replacement_client(
             topic: telemetry_topic.to_owned(),
             enabled: true,
         },
-        ..Default::default()
+        ..ConsumerBuilders::new()?
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();

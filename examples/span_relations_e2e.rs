@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
     let mut cassandra_config = CassandraConfigurationBuilder::default();
     cassandra_config.nodes(vec!["localhost:9042".to_owned()]);
 
-    let mut keyed_state = KeyedStateConfiguration::default();
+    let mut keyed_state = KeyedStateConfiguration::builder().build()?;
     let cart = keyed_state.register(value_state("cart"));
     let counts = keyed_state.register(map_state::<Utf8KeyCodec, JsonCodec>("counts"));
     let log = keyed_state.register(deque_state("log"));
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
         keyed_state,
-        ..ConsumerBuilders::default()
+        ..ConsumerBuilders::new()?
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);

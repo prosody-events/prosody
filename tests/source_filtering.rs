@@ -78,7 +78,7 @@ async fn run_scenario(
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        KeyedStateConfiguration::default(),
+        KeyedStateConfiguration::builder().build()?,
         CloneProvider::new(ChannelHandler::new(tx)),
         Telemetry::new(),
     )

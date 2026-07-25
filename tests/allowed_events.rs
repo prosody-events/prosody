@@ -60,7 +60,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        KeyedStateConfiguration::default(),
+        KeyedStateConfiguration::builder().build()?,
         CloneProvider::new(ChannelHandler::new(messages_tx)),
         Telemetry::new(),
     )

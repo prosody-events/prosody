@@ -22,20 +22,21 @@ use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
-    ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
+    ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers, WatermarkVersion,
 };
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
-use crate::timers::duration::CompactDuration;
+use crate::timers::duration::{CompactDuration, CompactDurationError};
 use crate::timers::store::TriggerStoreProvider;
 use crate::{EventIdentity, EventType, Partition, Topic};
 
@@ -113,8 +114,13 @@ pub(super) struct Context<F, PL> {
 /// configuration and captures the handler provider and per-partition factories
 /// into a partition-manager factory closure. This discharges the provider
 /// trait bounds in one place; the returned [`Context`] carries only the
-/// payload-erased factory. Fails with a [`BuildError`] if the configured
-/// `allowed_events` prefixes cannot be compiled into a filter automaton.
+/// payload-erased factory.
+///
+/// # Errors
+///
+/// [`ContextError`] when the configured `allowed_events` prefixes cannot be
+/// compiled into a filter automaton, or `slab_size` is outside
+/// [`CompactDuration`]'s range.
 pub(super) fn new_context<T, P, SP, PL>(
     config: &ConsumerConfiguration,
     handler_provider: T,
@@ -123,7 +129,7 @@ pub(super) fn new_context<T, P, SP, PL>(
     registry: ManagerRegistry<PL>,
     telemetry: TelemetrySender,
     version: Arc<str>,
-) -> Result<Context<impl MakeManager<PL>, PL>, BuildError>
+) -> Result<Context<impl MakeManager<PL>, PL>, ContextError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
@@ -144,10 +150,10 @@ where
         })
         .transpose()?;
 
-    let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
-        error!("invalid timer slab size: {error:#}; using default");
-        CompactDuration::new(10 * 60)
-    });
+    // A slab size the operator set but that cannot be represented is rejected
+    // here. Substituting a default would silently run the timer system at a
+    // granularity nobody asked for.
+    let timer_slab_size = CompactDuration::try_from(config.slab_size)?;
 
     let timer_semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| {
         Arc::new(Semaphore::new(config.max_uncommitted))
@@ -300,5 +306,33 @@ where
         }
 
         debug!("rebalance completed");
+    }
+}
+
+/// Errors raised while building a [`Context`] from consumer configuration.
+///
+/// Both arms are supplied-but-invalid configuration, so neither has a sensible
+/// default to fall back to.
+#[derive(Debug, Error)]
+pub(super) enum ContextError {
+    /// The `allowed_events` prefixes could not be compiled into a filter
+    /// automaton.
+    #[error("invalid allowed_events filter: {0}")]
+    AllowedEvents(#[from] BuildError),
+
+    /// `slab_size` is outside [`CompactDuration`]'s representable range.
+    #[error("invalid timer slab size: {0}")]
+    SlabSize(#[from] CompactDurationError),
+}
+
+/// Surfaces a context-build failure through the consumer's public error type.
+/// Both arms already have a [`ConsumerError`] variant, so the public surface is
+/// unchanged.
+impl From<ContextError> for ConsumerError {
+    fn from(error: ContextError) -> Self {
+        match error {
+            ContextError::AllowedEvents(error) => Self::AllowedEventsPattern(error),
+            ContextError::SlabSize(error) => Self::InvalidSlabSize(error),
+        }
     }
 }

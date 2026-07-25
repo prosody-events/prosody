@@ -803,7 +803,7 @@ fn build_client_with<T: FallibleHandler>(
             topic: telemetry_topic.to_owned(),
             enabled: emitter_enabled,
         },
-        ..Default::default()
+        ..ConsumerBuilders::new()?
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();

@@ -338,7 +338,7 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
     // can bind it; `last_seen` is reached through the erased seam by name
     // (see the module doc), so its token is only needed to register the
     // collection's identity, not held by the handler.
-    let mut keyed_state = KeyedStateConfiguration::default();
+    let mut keyed_state = KeyedStateConfiguration::builder().build()?;
     let cart = keyed_state.register(cart());
     let _last_seen = keyed_state.register(last_seen());
     // Registered so the handler's erased write to `RECEIPT` resolves. It stays
@@ -495,7 +495,7 @@ async fn test_published_collection_writes_routing_row() -> Result<()> {
     // `MAX_PUBLICATION_SOURCES`.
     let subsystem = SubsystemName::try_new(format!("orders-{}", Uuid::new_v4()))
         .map_err(|e| eyre!("subsystem: {e}"))?;
-    let mut keyed_state = KeyedStateConfiguration::default();
+    let mut keyed_state = KeyedStateConfiguration::builder().build()?;
     keyed_state.subsystem = Some(subsystem.clone());
     let cart = keyed_state.register(cart().published(true));
     let _last_seen = keyed_state.register(last_seen());

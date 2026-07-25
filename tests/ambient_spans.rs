@@ -115,7 +115,7 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
-        ..ConsumerBuilders::default()
+        ..ConsumerBuilders::new()?
     };
 
     let (sender, mut receiver) = channel(4);

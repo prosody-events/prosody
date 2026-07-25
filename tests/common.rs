@@ -388,7 +388,7 @@ impl ConsumerEnv {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &create_cassandra_trigger_store_config(),
-            KeyedStateConfiguration::default(),
+            KeyedStateConfiguration::builder().build()?,
             handler_provider,
             Telemetry::new(),
         )

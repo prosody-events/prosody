@@ -262,7 +262,7 @@ async fn test_producer_deduplication() -> Result<()> {
         let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &cfg,
             &common::create_cassandra_trigger_store_config(),
-            KeyedStateConfiguration::default(),
+            KeyedStateConfiguration::builder().build()?,
             CloneProvider::new(common::ChannelHandler::new(tx)),
             Telemetry::new(),
         )

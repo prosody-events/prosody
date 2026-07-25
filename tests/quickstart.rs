@@ -93,7 +93,7 @@ async fn quickstart() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
-        ..ConsumerBuilders::default()
+        ..ConsumerBuilders::new()?
     };
 
     let (sender, mut receiver) = channel(1);
